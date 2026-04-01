@@ -1,0 +1,42 @@
+FROM node:20-alpine AS builder
+WORKDIR /app
+RUN npm config set registry https://registry.npmmirror.com
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+RUN rm /etc/nginx/conf.d/default.conf
+RUN printf 'server {\n\
+  listen 80;\n\
+  server_name _;\n\
+  root /usr/share/nginx/html;\n\
+  index index.html;\n\
+  \n\
+  # 设置文件上传大小限制为 100MB\n\
+  client_max_body_size 100M;\n\
+  \n\
+  location / {\n\
+    try_files $uri $uri/ /index.html;\n\
+  }\n\
+  location /api/ {\n\
+    proxy_pass http://backend:8000;\n\
+    proxy_set_header Host $host;\n\
+    proxy_set_header X-Real-IP $remote_addr;\n\
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\
+    \n\
+    # API 代理的超时设置（大文件上传需要更长时间）\n\
+    proxy_read_timeout 300;\n\
+    proxy_connect_timeout 300;\n\
+    proxy_send_timeout 300;\n\
+    \n\
+    # SSE 流式代理（AG-UI 事件流）\n\
+    proxy_buffering off;\n\
+    proxy_cache off;\n\
+    proxy_set_header X-Accel-Buffering no;\n\
+    chunked_transfer_encoding on;\n\
+  }\n\
+}\n' > /etc/nginx/conf.d/default.conf
+EXPOSE 80
