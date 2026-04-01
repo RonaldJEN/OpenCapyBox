@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "example-server": {
+      "description": "Example MCP server (rename and configure as needed)",
+      "type": "streamable-http",
+      "url": "http://your-mcp-server:port/mcp/your-service",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE",
+        "Content-Type": "application/json"
+      },
+      "disabled": true
+    }
+  }
+}
