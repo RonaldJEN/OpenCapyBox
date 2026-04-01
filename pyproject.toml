@@ -1,0 +1,113 @@
+[project]
+name = "opencapybox"
+version = "0.1.0"
+description = "OpenCapyBox - Sandboxed AI Agent Platform with Memory and Skills"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "OpenCapyBox Contributors"}
+]
+license = {text = "Apache-2.0"}
+dependencies = [
+    # Core
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+    "httpx>=0.27.0",
+    "pyjwt>=2.10.1",
+    "requests>=2.31.0",
+    "tiktoken>=0.5.0",
+    "prompt-toolkit>=3.0.0",
+    # LLM Clients
+    "anthropic>=0.39.0",
+    "openai>=1.57.4",
+    "zhipuai>=2.0.0",
+    # Web Framework
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "sqlalchemy>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "python-multipart>=0.0.6",
+    # Sandbox
+    "opensandbox>=0.1.0",
+    # Scheduler (Cron tasks)
+    "apscheduler>=3.10.0",
+]
+
+# CLI 入口已移除（Web 模式專用，不再支持 CLI）
+# agent-cli = "src.agent.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=7.0.0",
+    "pytest-html>=4.1.0",
+    "coverage-badge>=1.1.0",
+    "pytest-json-report>=1.5.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "config*"]
+exclude = ["tests*", "data*"]
+
+[tool.setuptools.package-data]
+"src.agent" = ["skills/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+cache_dir = ".pytest_cache"
+asyncio_mode = "auto"
+# 基礎 pytest 配置（覆蓋率配置移到 run_tests.py 腳本中）
+addopts = [
+    "-v",
+    "--tb=short",
+]
+# 忽略特定警告
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/config/*.yaml",
+    "*/config/*.json",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "pass",
+]
+show_missing = true
+precision = 2
+
+[tool.pylint.messages_control]
+# Disable warnings for Tool.execute method signature differences
+# We intentionally use explicit parameters in subclasses for better type hints
+disable = [
+    "arguments-differ",  # Allow subclasses to have different parameter signatures
+]
+
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.2.0",
+    "pytest-cov>=7.0.0",
+    "pytest-xdist>=3.8.0",
+]

@@ -1,0 +1,70 @@
+# Git
+.git
+.gitignore
+.gitmodules
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+dist
+build
+.venv
+venv
+env
+
+# Node.js
+node_modules
+npm-debug.log
+yarn-error.log
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# 测试和覆盖率
+.pytest_cache
+.coverage
+htmlcov
+.tox
+
+# 文档
+*.md
+!README.md
+docs
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# 数据和日志
+backend/data
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# 临时文件
+.DS_Store
+.env
+.env.*
+*.tmp
+tmp
+temp
+
+# 前端构建产物（backend 镜像不需要）
+frontend/dist
+frontend/build
+frontend/node_modules
+
+# 工作空间和共享环境
+workspace
+shared_env
+workspaces
