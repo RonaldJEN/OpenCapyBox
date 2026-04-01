@@ -1,0 +1,107 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# ============================================
+# 第一层：系统依赖（很少变化，缓存优先级最高）
+# ============================================
+# 更换镜像源
+RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
+    sed -i 's|security.debian.org/debian-security|mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources
+
+# 安装系统依赖（包括 Node.js）
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    bash \
+    build-essential \
+    # 文档处理工具
+    pandoc \
+    libreoffice \
+    poppler-utils \
+    # Node.js 和 npm（使用 NodeSource 官方仓库）
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    # Playwright 依赖的系统库
+    && apt-get install -y \
+        libnss3 \
+        libnspr4 \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libdrm2 \
+        libxkbcommon0 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxfixes3 \
+        libxrandr2 \
+        libgbm1 \
+        libasound2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================
+# 第二层：Python/Node.js 工具配置（很少变化）
+# ============================================
+# 配置 pip 镜像
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 安装 uv
+RUN pip install uv
+
+# 配置镜像源
+ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+RUN npm config set registry https://registry.npmmirror.com
+
+# ============================================
+# 第三层：Python 依赖（只有依赖文件变化时才重装）
+# ============================================
+# 注意：docker-compose.yml 中 context 设为项目根目录
+COPY pyproject.toml uv.lock ./
+COPY requirements.txt ./
+
+# 创建最小 src 结构以支持 pip install（不用 -e，避免需要完整源码）
+RUN mkdir -p src && touch src/__init__.py
+
+# 安装 Python 依赖（这层会被缓存）
+RUN uv pip install --system . && \
+    uv pip install --system -r requirements.txt
+
+# ============================================
+# 第四层：npm 全局包（只有包列表变化时才重装）
+# ============================================
+RUN npm install -g \
+    pptxgenjs \
+    playwright \
+    sharp \
+    react \
+    react-dom \
+    react-icons \
+    pdf-lib \
+    pdfjs-dist \
+    docx \
+    @modelcontextprotocol/sdk \
+    zod \
+    axios \
+    fs-extra \
+    lodash \
+    cheerio \
+    marked \
+    && npx playwright install chromium
+
+# ============================================
+# 第五层：复制代码（代码变化不影响依赖缓存）
+# ============================================
+COPY src/ ./src/
+COPY models.yaml ./models.yaml
+
+# 创建必要目录
+RUN mkdir -p /app/data/database /app/data/workspaces /app/data/shared_env
+
+# 环境变量
+ENV PYTHONPATH=/app:$PYTHONPATH \
+    PYTHONUNBUFFERED=1 \
+    UV_VENV_CLEAR=1
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
