@@ -1,0 +1,188 @@
+# ============================================================
+# OpenCapyBox 模型配置表 (Model Registry)
+# ============================================================
+#
+# ⚠️  本文件僅管理 LLM 模型配置，不包含搜索工具等功能型 API Key。
+#     工具類 Key（如 BOCHA_SEARCH_APPCODE 搜索、GEMINI_API_KEY）請在 .env 中配置。
+#
+# 使用說明：
+#   1. 每個模型一個條目，頂層 key 即為 model_id
+#   2. api_key 支援 ${ENV_VAR} 語法引用環境變數
+#   3. api_base 是完整 URL（直接傳給 SDK，不再拼接後綴）
+#   4. 新增模型只需複製一個條目並修改即可
+#
+# reasoning_format 取值：
+#   - none                不支援思考過程
+#   - reasoning_content   OpenAI 協議 response.reasoning_content（GLM/Qwen/DeepSeek）
+#   - reasoning_details   OpenAI 協議 response.reasoning_details（MiniMax via OpenAI）
+#   - anthropic_thinking  Anthropic 協議原生 thinking content blocks
+#
+# reasoning_split / enable_thinking 僅對 provider=openai 生效：
+#   - reasoning_split:  發送 extra_body.reasoning_split = true
+#   - enable_thinking:  發送 extra_body.enable_thinking = true
+#
+# 環境變數對照（需在 .env 中配置）：
+#   LLM_API_KEY         — 阿里 DashScope 統一密鑰（Qwen / GLM / DeepSeek 三方模型）
+#   MINIMAX_API_KEY     — MiniMax 專用密鑰（如不使用 MiniMax 可不配置）
+#
+# ============================================================
+
+default_model: glm-5
+
+models:
+
+  # ======================== MiniMax (Anthropic 協議) ========================
+  # 需要配置 MINIMAX_API_KEY，未配置時自動停用
+
+  minimax-text-01:
+    display_name: "MiniMax-Text-01"
+    provider: anthropic
+    api_base: "https://api.minimax.chat/anthropic"
+    api_key: "${MINIMAX_API_KEY}"
+    model_name: "MiniMax-Text-01"
+    max_tokens: 16384
+    reasoning_format: anthropic_thinking
+    reasoning_split: false
+    enable_thinking: false
+    enabled: false
+    tags: [default]
+
+  minimax-m2:
+    display_name: "MiniMax-M2"
+    provider: anthropic
+    api_base: "https://api.minimaxi.com/anthropic"
+    api_key: "${MINIMAX_API_KEY}"
+    model_name: "MiniMax-M2"
+    max_tokens: 16384
+    reasoning_format: anthropic_thinking
+    reasoning_split: false
+    enable_thinking: false
+    enabled: false
+    tags: [thinking]
+
+  # ======================== MiniMax (OpenAI 協議) ========================
+
+  minimax-m2-openai:
+    display_name: "MiniMax-M2 (OpenAI)"
+    provider: openai
+    api_base: "https://api.minimaxi.com/v1"
+    api_key: "${MINIMAX_API_KEY}"
+    model_name: "MiniMax-M2"
+    max_tokens: 16384
+    reasoning_format: reasoning_details
+    reasoning_split: true
+    enable_thinking: false
+    enabled: false
+    tags: [thinking]
+
+  # ======================== 通义千问 Qwen（阿里 DashScope）========================
+  # 通過阿里 DashScope 統一接入，使用 LLM_API_KEY
+
+  qwen3.5-plus:
+    display_name: "通义千问qwen3.5-plus"
+    provider: openai
+    api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "${LLM_API_KEY}"
+    model_name: "qwen3.5-plus"
+    max_tokens: 65536
+    reasoning_format: reasoning_content
+    reasoning_split: true
+    enable_thinking: true
+    supports_image: true
+    max_images: 20
+    supports_video: false
+    max_videos: 0
+    enabled: true
+    tags: [default, thinking, preview]
+
+  # ======================== 智谱 GLM（阿里 DashScope 三方）========================
+  # 通過阿里 DashScope 統一接入，使用 LLM_API_KEY
+
+  glm-4.7:
+    display_name: "智谱 GLM-4.7"
+    provider: openai
+    api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "${LLM_API_KEY}"
+    model_name: "glm-4.7"
+    max_tokens: 32768
+    reasoning_format: reasoning_content
+    reasoning_split: true
+    enable_thinking: true
+    enabled: true
+    tags: [thinking]
+
+  glm-5:
+    display_name: "智谱 GLM-5"
+    provider: openai
+    api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "${LLM_API_KEY}"
+    model_name: "glm-5"
+    max_tokens: 32768
+    reasoning_format: reasoning_content
+    reasoning_split: true
+    enable_thinking: true
+    enabled: true
+    tags: [thinking]
+  # ======================== Kimi（月之暗面，阿里 DashScope 三方）========================
+  # 通過阿里 DashScope 統一接入，使用 LLM_API_KEY
+
+  kimi-2.5:
+    display_name: "Kimi 2.5"
+    provider: openai
+    api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "${LLM_API_KEY}"
+    model_name: "kimi-k2.5"
+    max_tokens: 32768
+    reasoning_format: reasoning_content
+    reasoning_split: true
+    enable_thinking: true
+    supports_image: true
+    max_images: 20
+    supports_video: false
+    max_videos: 0
+    enabled: true
+    tags: [thinking]
+  # ======================== DeepSeek（阿里 DashScope 三方）========================
+  # 通過阿里 DashScope 統一接入，使用 LLM_API_KEY
+
+  deepseek-v3.2:
+    display_name: "DeepSeek V3.2"
+    provider: openai
+    api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "${LLM_API_KEY}"
+    model_name: "deepseek-v3.2"
+    max_tokens: 65536
+    reasoning_format: reasoning_content
+    reasoning_split: true
+    enable_thinking: true
+    enabled: true
+    tags: [thinking, coding, long-context]
+
+# ============================================================
+# Embedding 模型配置
+# ============================================================
+# 用于记忆系统的向量检索。embedding_model 字段引用此处的 model_id
+# 若未配置 EMBEDDING_API_KEY 或 embedding_model 为空，将降级为 BM25 检索
+
+embedding_models:
+
+  # DashScope 通义千问 Embedding（推荐，与 LLM_API_KEY 共用）
+  text-embedding-v4:
+    display_name: "通义千问 text-embedding-v4"
+    api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "${LLM_API_KEY}"
+    model_name: "text-embedding-v4"
+    dimensions: 1024
+    enabled: true
+
+  # OpenAI Embedding
+  text-embedding-3-small:
+    display_name: "OpenAI text-embedding-3-small"
+    api_base: "https://api.openai.com/v1"
+    api_key: "${EMBEDDING_API_KEY}"
+    model_name: "text-embedding-3-small"
+    dimensions: 1536
+    enabled: false
+
+# 默认 Embedding 模型（引用上面的 key）
+default_embedding_model: text-embedding-v4
