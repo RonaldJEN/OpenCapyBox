@@ -13,14 +13,13 @@ dependencies = [
     "pydantic>=2.0.0",
     "pyyaml>=6.0.0",
     "httpx>=0.27.0",
-    "pyjwt>=2.10.1",
+    "pyjwt>=2.8.0",
     "requests>=2.31.0",
     "tiktoken>=0.5.0",
     "prompt-toolkit>=3.0.0",
     # LLM Clients
     "anthropic>=0.39.0",
     "openai>=1.57.4",
-    "zhipuai>=2.0.0",
     # Web Framework
     "fastapi>=0.104.0",
     "uvicorn>=0.24.0",
