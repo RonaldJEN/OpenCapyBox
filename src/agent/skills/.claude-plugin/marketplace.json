@@ -1,0 +1,71 @@
+{
+  "name": "anthropic-agent-skills",
+  "owner": {
+    "name": "Keith Lazuka",
+    "email": "klazuka@anthropic.com"
+  },
+  "metadata": {
+    "description": "Anthropic example skills — extended collection",
+    "version": "2.0.0"
+  },
+  "plugins": [
+    {
+      "name": "document-skills",
+      "description": "Collection of document processing suite including Excel, Word, PowerPoint, and PDF capabilities",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./xlsx",
+        "./docx",
+        "./pptx",
+        "./pdf",
+        "./nano-pdf",
+        "./markdown-to-html"
+      ]
+    },
+    {
+      "name": "developer-tools",
+      "description": "Core development workflow: Git, GitHub, issue automation, coding agents, and browser testing",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./git",
+        "./github",
+        "./gh-issues",
+        "./coding-agent",
+        "./playwright",
+        "./agent-browser"
+      ]
+    },
+    {
+      "name": "agent-intelligence",
+      "description": "Meta-cognitive skills: memory, reflection, self-improvement, brainstorming, skill management, and codebase analysis",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./memory",
+        "./reflection",
+        "./self-improving",
+        "./proactive-agent",
+        "./brainstorming",
+        "./skill-creator",
+        "./skill-vetter",
+        "./find-skills",
+        "./oracle",
+        "./session-logs"
+      ]
+    },
+    {
+      "name": "design-skills",
+      "description": "Frontend design, UI/UX guidance, Tailwind design systems, and canvas rendering",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./frontend-design",
+        "./ui-ux-pro-max",
+        "./tailwind-design-system",
+        "./canvas"
+      ]
+    }
+  ]
+}
