@@ -156,7 +156,7 @@ describe('Round 组件', () => {
   it('助手头像应该使用黑色背景', () => {
     const round = createMockRound();
 
-    const { container } = render(<Round round={round} isStreaming={false} />);
+    render(<Round round={round} isStreaming={false} />);
 
     const assistantLabel = screen.getByText('助手');
     const botAvatar = assistantLabel.parentElement?.previousElementSibling as HTMLElement | null;
