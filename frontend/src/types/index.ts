@@ -251,6 +251,19 @@ export interface InterruptDetails {
   payload?: any;
 }
 
+// AskUser 问题类型
+export interface AskUserOption {
+  label: string;
+  description: string;
+}
+
+export interface AskUserQuestion {
+  question: string;
+  header: string;
+  options: AskUserOption[];
+  multiSelect?: boolean;
+}
+
 // AG-UI 消息类型
 export interface AGUIMessage {
   id: string;
@@ -410,6 +423,7 @@ export interface RoundData {
   status: string;
   created_at: string;
   completed_at?: string;
+  interrupt?: InterruptDetails;
 }
 
 
@@ -453,7 +467,7 @@ export interface RunningSessionResponse {
 export interface StreamCallbacks {
   // 生命周期事件
   onRunStarted?: (threadId: string, runId: string) => void;
-  onRunFinished?: (threadId: string, runId: string, result: any, outcome: string) => void;
+  onRunFinished?: (threadId: string, runId: string, result: any, outcome: string, interrupt?: InterruptDetails) => void;
   onRunError?: (message: string, code?: string) => void;
   onStepStarted?: (stepName: string, timestamp?: number) => void;
   onStepFinished?: (stepName: string, timestamp?: number) => void;
@@ -489,7 +503,7 @@ export interface StreamCallbacks {
 
 // 订阅回调类型 (subscribeToRound)
 export interface SubscribeCallbacks {
-  onRunFinished?: (threadId: string, runId: string, result: any, outcome: string) => void;
+  onRunFinished?: (threadId: string, runId: string, result: any, outcome: string, interrupt?: InterruptDetails) => void;
   onRunError?: (message: string, code?: string) => void;
   onMessagesSnapshot?: (messages: AGUIMessage[]) => void;
   onStateSnapshot?: (snapshot: AgentState) => void;
