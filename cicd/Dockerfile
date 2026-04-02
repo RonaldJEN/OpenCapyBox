@@ -108,7 +108,7 @@ RUN chmod +x /app/entrypoint.sh
 RUN mkdir -p /app/data/database /app/data/workspaces /app/data/shared_env
 
 # ---------- 环境变量 ----------
-ENV PYTHONPATH=/app:$PYTHONPATH \
+ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1
 
 # 只暴露 80，nginx 统一入口
