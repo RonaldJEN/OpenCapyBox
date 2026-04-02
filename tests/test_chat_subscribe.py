@@ -178,24 +178,15 @@ class TestSubscribeEventTypes:
         assert data["message"] == "Run failed (status=failed)"
         assert data["code"] == "RUN_FAILED"
 
-    def test_failed_round_emits_error_then_finished(self):
-        """测试失败轮次先发 RUN_ERROR 再发 RUN_FINISHED(outcome=interrupt)"""
-        from src.agent.schema.agui_events import RunErrorEvent, RunFinishedEvent
+    def test_failed_round_emits_error_only(self):
+        """测试失败轮次仅发送 RUN_ERROR"""
+        from src.agent.schema.agui_events import RunErrorEvent
 
         error_event = RunErrorEvent(message="Run failed (status=failed)", code="RUN_FAILED")
-        finished_event = RunFinishedEvent(
-            threadId="session-123",
-            runId="failed-round-456",
-            result={"finalResponse": "", "stepCount": 2},
-            outcome="interrupt",
-        )
 
         err_data = error_event.model_dump(by_alias=True)
-        fin_data = finished_event.model_dump(by_alias=True)
 
         assert err_data["type"] == "RUN_ERROR"
-        assert fin_data["type"] == "RUN_FINISHED"
-        assert fin_data["outcome"] == "interrupt"
 
     def test_messages_snapshot_event_format(self):
         """测试 MESSAGES_SNAPSHOT 事件格式"""
@@ -336,29 +327,17 @@ class TestSubscribeRouteValidation:
         assert data["outcome"] == "success"
 
     def test_failed_round_immediate_response(self, mock_round_failed):
-        """测试失败轮次应立即返回 RUN_ERROR + RUN_FINISHED(outcome=interrupt)"""
+        """测试失败轮次应立即返回 RUN_ERROR"""
         round_obj = mock_round_failed
 
         should_return_immediately = round_obj.status in ("completed", "failed")
         assert should_return_immediately
 
-        from src.agent.schema.agui_events import RunErrorEvent, RunFinishedEvent
+        from src.agent.schema.agui_events import RunErrorEvent
 
         error_event = RunErrorEvent(message="Run failed (status=failed)", code="RUN_FAILED")
-        finished_event = RunFinishedEvent(
-            threadId="session-123",
-            runId=round_obj.id,
-            result={
-                "finalResponse": round_obj.final_response or "",
-                "stepCount": round_obj.step_count,
-            },
-            outcome="interrupt",
-        )
         err = error_event.model_dump(by_alias=True)
-        fin = finished_event.model_dump(by_alias=True)
         assert err["type"] == "RUN_ERROR"
-        assert fin["type"] == "RUN_FINISHED"
-        assert fin["outcome"] == "interrupt"
 
     def test_running_round_subscribe_logic(self, mock_round_running):
         """测试运行中轮次的订阅逻辑"""
@@ -583,28 +562,20 @@ class TestSubscribeEndToEnd:
         assert events[-1]["outcome"] == "success"
 
     def test_complete_flow_for_failed_round(self):
-        """测试失败轮次的完整 AG-UI 事件流：RUN_ERROR + RUN_FINISHED"""
+        """测试失败轮次的完整 AG-UI 事件流：仅 RUN_ERROR"""
         from src.agent.schema.agui_events import (
-            MessagesSnapshotEvent, RunErrorEvent, RunFinishedEvent,
+            MessagesSnapshotEvent, RunErrorEvent,
         )
 
         snapshot = MessagesSnapshotEvent(messages=[])
         error = RunErrorEvent(message="Run failed (status=failed)", code="RUN_FAILED")
-        finished = RunFinishedEvent(
-            threadId="session-123", runId="round-456",
-            result={"finalResponse": "", "stepCount": 1},
-            outcome="interrupt",
-        )
 
         events = [
             snapshot.model_dump(by_alias=True),
             error.model_dump(by_alias=True),
-            finished.model_dump(by_alias=True),
         ]
 
         assert events[1]["type"] == "RUN_ERROR"
-        assert events[2]["type"] == "RUN_FINISHED"
-        assert events[2]["outcome"] == "interrupt"
 
     @pytest.mark.asyncio
     async def test_complete_flow_for_running_round(self):
@@ -632,6 +603,60 @@ class TestSubscribeEndToEnd:
         finally:
             if round_id in _round_subscribers:
                 del _round_subscribers[round_id]
+
+    def test_resumed_round_emits_interrupt_not_success(self):
+        """测试 resumed 轮次应发 outcome=interrupt 而非 success
+
+        当轮次被中断后由新 run 接管（status='resumed'），
+        回放时不应把 outcome 设为 success，否则前端会误判为正常完成。
+        """
+        from src.agent.schema.agui_events import RunFinishedEvent
+
+        # 模拟 resumed 轮次的终态事件构造（与 chat.py 逻辑一致）
+        round_status = "resumed"
+        final_response = "被中断的回复"
+        step_count = 2
+
+        assert round_status in ("completed", "failed", "interrupted", "resumed")
+
+        # resumed 路径应发 interrupt
+        finished = RunFinishedEvent(
+            threadId="session-resumed", runId="round-resumed",
+            result={
+                "finalResponse": final_response,
+                "stepCount": step_count,
+                "reason": "resumed_by_new_run",
+            },
+            outcome="interrupt",
+        )
+        data = finished.model_dump(by_alias=True)
+
+        assert data["outcome"] == "interrupt", "resumed 轮次应为 interrupt 而非 success"
+        assert data["result"]["reason"] == "resumed_by_new_run"
+        assert data["type"] == "RUN_FINISHED"
+
+    def test_interrupted_round_emits_interrupt(self):
+        """测试 interrupted 轮次发 outcome=interrupt，并携带正确的中断详情"""
+        from src.agent.schema.agui_events import RunFinishedEvent, InterruptDetails
+
+        finished = RunFinishedEvent(
+            threadId="session-int", runId="round-int",
+            result={"finalResponse": "", "stepCount": 1},
+            outcome="interrupt",
+            interrupt=InterruptDetails(
+                id="int-1",
+                reason="input_required",
+                payload={"questions": [{"question": "请确认"}], "tool_call_id": "tc-1"},
+            ),
+        )
+        data = finished.model_dump(by_alias=True)
+
+        assert data["outcome"] == "interrupt"
+        assert data["interrupt"] is not None
+        assert data["interrupt"]["id"] == "int-1"
+        assert data["interrupt"]["reason"] == "input_required"
+        assert data["interrupt"]["payload"]["tool_call_id"] == "tc-1"
+        assert data["interrupt"]["payload"]["questions"][0]["question"] == "请确认"
 
 
 class TestSubscriberAbortScenarios:

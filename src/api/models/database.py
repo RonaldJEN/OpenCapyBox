@@ -72,6 +72,7 @@ def init_db():
 _PENDING_COLUMNS = [
     ("sessions", "model_id", "VARCHAR(50)"),
     ("rounds", "user_attachments", "TEXT"),
+    ("rounds", "interrupt_payload", "TEXT"),
 ]
 
 

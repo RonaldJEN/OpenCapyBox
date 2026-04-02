@@ -1,6 +1,8 @@
 """Agent 服务 - 连接 OpenCapyBox 核心"""
 import asyncio
+import json
 import logging
+import uuid
 from pathlib import Path
 from typing import List, Dict, Optional, AsyncIterator, Any
 
@@ -23,6 +25,7 @@ from src.agent.tools.memory_tools import (
     UpdateUserProfileTool,
 )
 from src.agent.tools.cron_tool import ManageCronTool
+from src.agent.tools.ask_user_tool import AskUserQuestionTool
 
 from src.api.services.history_service import HistoryService
 from src.api.services.sandbox_service import get_sandbox_service, get_sandbox_mount_path
@@ -55,6 +58,7 @@ class AgentService:
         self._next_sequence = 0  # in-memory counter for conversation_messages.sequence
         self.skill_loader = None  # 保存 skill_loader 引用
         self.cancel_token: asyncio.Event | None = None  # per-run 取消令牌
+        self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
         # 每個 session 使用沙箱內的隔離子目錄
         mount = get_sandbox_mount_path()
         self._workspace_dir = f"{mount}/sessions/{session_id}" if session_id else mount
@@ -299,6 +303,8 @@ class AgentService:
                 user_id=self.user_id,
                 scheduler=self._get_scheduler(),
             ),
+            # 用户交互工具（Human-in-the-Loop）
+            AskUserQuestionTool(),
         ]
 
         # 添加搜索工具（如果配置了 Bocha AppCode）
@@ -433,7 +439,6 @@ class AgentService:
         )
 
         if conv_msgs:
-            import json
             for msg in conv_msgs:
                 try:
                     content = json.loads(msg.content)
@@ -641,12 +646,11 @@ class AgentService:
 
         用於 Agent 上下文恢復，與 agui_events 互相獨立。
         """
-        import json as _json
         from src.api.models.conversation_message import ConversationMessage as ConvMsg
         db = self.history_service.db
         self._next_sequence += 1
         content_str = (
-            _json.dumps(content, ensure_ascii=False)
+            json.dumps(content, ensure_ascii=False)
             if not isinstance(content, str)
             else content
         )
@@ -685,7 +689,16 @@ class AgentService:
         if not self.agent:
             raise RuntimeError("Agent not initialized")
 
-        import uuid
+        # 如果有待处理的 ask_user 中断，用户发送新消息意味着跳过问题
+        if self.agent.has_pending_interrupt():
+            logger.info("用户发送新消息，清除待处理的 ask_user 中断")
+            try:
+                # 先持久化清理，再清内存状态，降低跨层状态不一致窗口
+                self.history_service.resolve_interrupted_rounds(self.session_id)
+            except Exception:
+                logger.exception("清理 interrupted 轮次失败，保留 pending interrupt 以便重试")
+            else:
+                self.agent.clear_pending_interrupt()
 
         # 正規化 + 校驗 + 構建輸入內容
         normalized_blocks = self._normalize_content_blocks(user_content)
@@ -713,94 +726,12 @@ class AgentService:
         # 持久化用戶消息到 conversation_messages
         self._save_conversation_message("user", agent_content, round_id=run_id)
 
-        # 用於追蹤最終響應
-        final_response: Optional[str] = None
-        step_count = 0
-        status = "running"
-        accumulated_content = ""
-        _dirty_memory = False  # 追踪本轮是否使用了记忆写入工具
-        _memory_write_tools = {"record_memory", "update_long_term_memory", "update_user"}
-        # 已知的记忆文件名（用于检测 write_file/edit_file 写入记忆文件的场景）
-        _memory_filenames = {"USER.md", "MEMORY.md", "SOUL.md", "AGENTS.md", "HEARTBEAT.md"}
-        _file_op_tracking: set[str] = set()  # 正在追踪的 write_file/edit_file tool_call_id
-
-        try:
-            # 透傳 Agent 事件流
-            async for event in self.agent.run_agui(
-                thread_id=self.session_id,
-                run_id=run_id,
-                cancel_token=self.cancel_token,
-            ):
-                # 存儲事件到數據庫
-                await self.history_service.save_agui_event(run_id, event)
-
-                # 追蹤最終響應
-                if event.type == EventType.TEXT_MESSAGE_CONTENT:
-                    accumulated_content += event.delta
-                elif event.type == EventType.TEXT_MESSAGE_END:
-                    final_response = accumulated_content
-                    # 持久化 assistant 回复到 conversation_messages
-                    if accumulated_content:
-                        self._save_conversation_message("assistant", accumulated_content, round_id=run_id)
-                    accumulated_content = ""
-                elif event.type == EventType.TOOL_CALL_START:
-                    # 检测记忆写入工具调用
-                    tool_name = getattr(event, "tool_call_name", "")
-                    if tool_name in _memory_write_tools:
-                        _dirty_memory = True
-                    elif tool_name in ("write_file", "edit_file"):
-                        # 追踪 write_file/edit_file 调用，后续通过 args 判断是否写入记忆文件
-                        tcid = getattr(event, "tool_call_id", "")
-                        if tcid:
-                            _file_op_tracking.add(tcid)
-                elif event.type == EventType.TOOL_CALL_ARGS:
-                    # 检测 write_file/edit_file 是否写入了已知的记忆文件路径
-                    if not _dirty_memory and _file_op_tracking:
-                        tcid = getattr(event, "tool_call_id", "")
-                        if tcid in _file_op_tracking:
-                            delta = getattr(event, "delta", "")
-                            if any(fn in delta for fn in _memory_filenames):
-                                _dirty_memory = True
-                                _file_op_tracking.discard(tcid)
-                elif event.type == EventType.TOOL_CALL_END:
-                    # 清理 write_file/edit_file 追踪
-                    tcid = getattr(event, "tool_call_id", "")
-                    _file_op_tracking.discard(tcid)
-                elif event.type == EventType.STEP_FINISHED:
-                    step_count += 1
-                elif event.type == EventType.RUN_FINISHED:
-                    status = "completed" if event.outcome == "success" else "failed"
-                elif event.type == EventType.RUN_ERROR:
-                    status = "failed"
-
-                yield event
-
-            # 完成 Round
-            self.history_service.complete_round(
-                round_id=run_id,
-                final_response=final_response,
-                step_count=step_count,
-                status=status,
-            )
-
-            # Round 结束后的异步后台任务（不阻塞 SSE 流）
-            task = asyncio.create_task(self._post_round_tasks(
-                sync_memory=_dirty_memory,
-                round_id=run_id,
-                user_message=user_message_for_history,
-                assistant_response=final_response,
-            ))
-            task.add_done_callback(self._on_post_round_done)
-
-        except Exception as e:
-            # 標記 Round 為失敗
-            self.history_service.complete_round(
-                round_id=run_id,
-                final_response=f"Agent執行失敗: {str(e)}",
-                step_count=step_count,
-                status="failed",
-            )
-            raise
+        async for event in self._run_round_stream(
+            run_id=run_id,
+            user_message=user_message_for_history,
+            error_label="Agent執行失敗",
+        ):
+            yield event
 
     @staticmethod
     def _on_post_round_done(task: asyncio.Task) -> None:
@@ -810,6 +741,239 @@ class AgentService:
         exc = task.exception()
         if exc:
             logger.error("后台 _post_round_tasks 异常: %s", exc, exc_info=exc)
+
+    @staticmethod
+    def _format_resume_user_message(answers: dict[str, str]) -> str:
+        """将 resume 回答格式化为可读的 Q/A 多行文本。"""
+        if not answers:
+            return "Q: (No question)\nA: [No preference]"
+
+        lines: list[str] = []
+        for index, (question_text, answer) in enumerate(answers.items()):
+            question = (question_text or "").strip() or "(Untitled question)"
+            selected = (answer or "").strip() or "[No preference]"
+            if index > 0:
+                lines.append("")
+            lines.extend([
+                f"Q: {question}",
+                f"A: {selected}",
+            ])
+
+        return "\n".join(lines)
+
+    def _load_persisted_interrupt(self, interrupt_id: str) -> dict[str, Any] | None:
+        """从数据库查找仍处于 interrupted 状态的中断详情。
+
+        该方法用于 Agent 内存状态丢失（例如 AgentPool TTL 回收）后的冷恢复。
+        """
+        from src.api.models.round import Round
+
+        db = self.history_service.db
+        candidates = (
+            db.query(Round)
+            .filter(Round.session_id == self.session_id, Round.status == "interrupted")
+            .order_by(Round.created_at.desc())
+            .all()
+        )
+
+        for round_obj in candidates:
+            raw_payload = getattr(round_obj, "interrupt_payload", None)
+            if not raw_payload:
+                continue
+
+            try:
+                payload = json.loads(raw_payload)
+            except (TypeError, json.JSONDecodeError):
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("id") != interrupt_id:
+                continue
+
+            details = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+            questions = details.get("questions") if isinstance(details.get("questions"), list) else []
+            return {
+                "interrupt_id": interrupt_id,
+                "tool_call_id": details.get("tool_call_id"),
+                "questions": questions,
+            }
+
+        return None
+
+    def has_pending_interrupt(self, interrupt_id: str) -> bool:
+        """检查是否存在匹配的待处理中断（内存态 + 持久化态）。"""
+        if self.agent and self.agent.has_pending_interrupt(interrupt_id):
+            return True
+        return self._load_persisted_interrupt(interrupt_id) is not None
+
+    async def resume_agui(
+        self,
+        interrupt_id: str,
+        answers: dict[str, str],
+    ) -> AsyncIterator[AGUIEvent]:
+        """从 ask_user 中断中恢复 Agent 执行。
+
+        使用 _resume_lock 防止并发 resume 调用。
+
+        Args:
+            interrupt_id: 中断 ID
+            answers: 用户答案 {question_text: answer_label}
+
+        Yields:
+            AGUIEvent: AG-UI 协议事件
+        """
+        if self._resume_lock.locked():
+            raise RuntimeError("另一个 resume 操作正在进行中，请等待完成后重试")
+
+        async with self._resume_lock:
+            if not self.agent:
+                raise RuntimeError("Agent not initialized")
+
+            resume_user_message = self._format_resume_user_message(answers)
+
+            if self.agent.has_pending_interrupt(interrupt_id):
+                # 热恢复：直接替换 ask_user 占位 tool_result
+                self.agent.resume_from_interrupt(interrupt_id, answers)
+            else:
+                # 冷恢复：内存中断状态已丢失，退化为注入用户回答继续对话
+                persisted_interrupt = self._load_persisted_interrupt(interrupt_id)
+                if not persisted_interrupt:
+                    raise ValueError("No pending interrupt to resume from")
+
+                logger.warning(
+                    "resume 进入冷恢复路径: session=%s, interrupt_id=%s",
+                    self.session_id,
+                    interrupt_id,
+                )
+                self.agent.add_user_message(resume_user_message)
+
+            # 将旧的 interrupted round 标记为 resumed，防止刷新后重复弹出
+            self.history_service.resolve_interrupted_rounds(self.session_id)
+
+            # 创建新的 run_id（恢复是一次新运行）
+            run_id = str(uuid.uuid4())
+
+            # 创建 Round（记录为 resume 操作）
+            self.history_service.create_round(
+                session_id=self.session_id,
+                round_id=run_id,
+                user_message=resume_user_message,
+                user_attachments=[],
+            )
+
+            # 持久化用户 resume 消息到 conversation_messages（用于上下文恢复）
+            self._save_conversation_message("user", resume_user_message, round_id=run_id)
+
+            async for event in self._run_round_stream(
+                run_id=run_id,
+                user_message=resume_user_message,
+                error_label="Resume 执行失败",
+            ):
+                yield event
+
+    async def _run_round_stream(
+        self,
+        run_id: str,
+        user_message: str,
+        error_label: str = "执行失败",
+    ) -> AsyncIterator[AGUIEvent]:
+        """共享的 round 事件流处理：追踪状态、持久化事件、完成 round。
+
+        chat_agui 和 resume_agui 在创建 round 后都委托到此方法。
+
+        Args:
+            run_id: 本轮运行 ID
+            user_message: 用户消息文本（用于后台任务）
+            error_label: 失败时的错误前缀
+        """
+        final_response: Optional[str] = None
+        step_count = 0
+        status = "running"
+        accumulated_content = ""
+        _interrupt_json: str | None = None
+        _dirty_memory = False
+        _memory_write_tools = {"record_memory", "update_long_term_memory", "update_user"}
+        _memory_filenames = {"USER.md", "MEMORY.md", "SOUL.md", "AGENTS.md", "HEARTBEAT.md"}
+        _file_op_tracking: set[str] = set()
+
+        try:
+            async for event in self.agent.run_agui(
+                thread_id=self.session_id,
+                run_id=run_id,
+                cancel_token=self.cancel_token,
+            ):
+                await self.history_service.save_agui_event(run_id, event)
+
+                if event.type == EventType.TEXT_MESSAGE_CONTENT:
+                    accumulated_content += event.delta
+                elif event.type == EventType.TEXT_MESSAGE_END:
+                    final_response = accumulated_content
+                    if accumulated_content:
+                        self._save_conversation_message("assistant", accumulated_content, round_id=run_id)
+                    accumulated_content = ""
+                elif event.type == EventType.TOOL_CALL_START:
+                    tool_name = getattr(event, "tool_call_name", "")
+                    if tool_name in _memory_write_tools:
+                        _dirty_memory = True
+                    elif tool_name in ("write_file", "edit_file"):
+                        tcid = getattr(event, "tool_call_id", "")
+                        if tcid:
+                            _file_op_tracking.add(tcid)
+                elif event.type == EventType.TOOL_CALL_ARGS:
+                    if not _dirty_memory and _file_op_tracking:
+                        tcid = getattr(event, "tool_call_id", "")
+                        if tcid in _file_op_tracking:
+                            delta = getattr(event, "delta", "")
+                            if any(fn in delta for fn in _memory_filenames):
+                                _dirty_memory = True
+                                _file_op_tracking.discard(tcid)
+                elif event.type == EventType.TOOL_CALL_END:
+                    tcid = getattr(event, "tool_call_id", "")
+                    _file_op_tracking.discard(tcid)
+                elif event.type == EventType.STEP_FINISHED:
+                    step_count += 1
+                elif event.type == EventType.RUN_FINISHED:
+                    if event.outcome == "success":
+                        status = "completed"
+                    elif event.outcome == "interrupt":
+                        status = "interrupted"
+                        if event.interrupt:
+                            _interrupt_json = json.dumps(
+                                event.interrupt.model_dump(exclude_none=True),
+                                ensure_ascii=False,
+                            )
+                    else:
+                        status = "failed"
+                elif event.type == EventType.RUN_ERROR:
+                    status = "failed"
+
+                yield event
+
+            self.history_service.complete_round(
+                round_id=run_id,
+                final_response=final_response,
+                step_count=step_count,
+                status=status,
+                interrupt_payload=_interrupt_json,
+            )
+
+            task = asyncio.create_task(self._post_round_tasks(
+                sync_memory=_dirty_memory,
+                round_id=run_id,
+                user_message=user_message,
+                assistant_response=final_response,
+            ))
+            task.add_done_callback(self._on_post_round_done)
+
+        except Exception as e:
+            self.history_service.complete_round(
+                round_id=run_id,
+                final_response=f"{error_label}: {str(e)}",
+                step_count=step_count,
+                status="failed",
+            )
+            raise
 
     async def _post_round_tasks(
         self,

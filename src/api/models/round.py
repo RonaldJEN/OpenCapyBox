@@ -66,6 +66,10 @@ class Round(Base):
     # "failed" = 執行失敗
     # "interrupted" = 已中斷（等待人工介入）
     status = Column(String(20), default="running")
+
+    # AG-UI InterruptDetails（JSON 字符串，僅 status="interrupted" 時有值）
+    # 存儲 {id, reason, payload} 用於刷新後恢復 Human-in-the-Loop 問題卡片
+    interrupt_payload = Column(Text, nullable=True)
     
     # 時間戳
     created_at = Column(DateTime, default=now_naive, index=True)

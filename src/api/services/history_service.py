@@ -46,8 +46,28 @@ class HistoryService:
         self.db.refresh(round_obj)
         return round_obj
 
+    def resolve_interrupted_rounds(self, session_id: str) -> int:
+        """将会话中所有 interrupted 轮次标记为已解决（清除 interrupt_payload）。
+
+        在 resume 成功创建新 round 之前调用，防止旧中断被前端重复恢复。
+        Returns:
+            被更新的轮次数量
+        """
+        updated = (
+            self.db.query(Round)
+            .filter(Round.session_id == session_id, Round.status == "interrupted")
+            .update(
+                {"status": "resumed", "interrupt_payload": None, "completed_at": now_naive()},
+                synchronize_session="fetch",
+            )
+        )
+        if updated:
+            self.db.commit()
+        return updated
+
     def complete_round(
-        self, round_id: str, final_response: str, step_count: int, status: str = "completed"
+        self, round_id: str, final_response: str, step_count: int,
+        status: str = "completed", interrupt_payload: str | None = None,
     ) -> Round:
         """完成对话轮次"""
         round_obj = self.db.query(Round).filter(Round.id == round_id).first()
@@ -55,7 +75,8 @@ class HistoryService:
             round_obj.final_response = final_response
             round_obj.step_count = step_count
             round_obj.status = status
-            round_obj.completed_at = now_naive()
+            round_obj.interrupt_payload = interrupt_payload
+            round_obj.completed_at = now_naive() if status != "interrupted" else None
             self.db.commit()
             self.db.refresh(round_obj)
         return round_obj
@@ -195,6 +216,14 @@ class HistoryService:
                 except json.JSONDecodeError:
                     attachments = []
 
+            # 解析 interrupt_payload（仅 interrupted 状态）
+            interrupt_details = None
+            if round_obj.status == "interrupted" and round_obj.interrupt_payload:
+                try:
+                    interrupt_details = json.loads(round_obj.interrupt_payload)
+                except json.JSONDecodeError:
+                    interrupt_details = None
+
             result.append(
                 {
                     "round_id": round_obj.id,
@@ -208,6 +237,7 @@ class HistoryService:
                     if round_obj.completed_at
                     else None,
                     "steps": steps,
+                    "interrupt": interrupt_details,
                 }
             )
 
