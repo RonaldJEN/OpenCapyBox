@@ -24,35 +24,16 @@
       ]
     },
     {
-      "name": "developer-tools",
-      "description": "Core development workflow: Git, GitHub, issue automation, coding agents, and browser testing",
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./git",
-        "./github",
-        "./gh-issues",
-        "./coding-agent",
-        "./playwright",
-        "./agent-browser"
-      ]
-    },
-    {
       "name": "agent-intelligence",
       "description": "Meta-cognitive skills: memory, reflection, self-improvement, brainstorming, skill management, and codebase analysis",
       "source": "./",
       "strict": false,
       "skills": [
-        "./memory",
         "./reflection",
         "./self-improving",
-        "./proactive-agent",
-        "./brainstorming",
         "./skill-creator",
         "./skill-vetter",
-        "./find-skills",
-        "./oracle",
-        "./session-logs"
+        "./oracle"
       ]
     },
     {
@@ -63,8 +44,7 @@
       "skills": [
         "./frontend-design",
         "./ui-ux-pro-max",
-        "./tailwind-design-system",
-        "./canvas"
+        "./tailwind-design-system"
       ]
     }
   ]
