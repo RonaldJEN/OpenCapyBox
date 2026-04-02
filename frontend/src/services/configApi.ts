@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { AxiosHeaders } from 'axios';
 
 // 复用主 API 的 axios 实例配置
 const client = axios.create({
@@ -11,10 +11,11 @@ const client = axios.create({
 client.interceptors.request.use((config) => {
   const accessToken = localStorage.getItem('accessToken');
   if (accessToken) {
-    config.headers = {
-      ...config.headers,
-      Authorization: `Bearer ${accessToken}`,
-    };
+    const headers = config.headers instanceof AxiosHeaders
+      ? config.headers
+      : new AxiosHeaders(config.headers);
+    headers.set('Authorization', `Bearer ${accessToken}`);
+    config.headers = headers;
   }
   return config;
 });
