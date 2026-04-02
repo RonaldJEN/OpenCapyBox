@@ -579,7 +579,8 @@ async def download_file(
     Args:
         preview: True 表示内联预览，False 表示强制下载
     """
-    logger.debug(f"文件{'\u9884\u89c8' if preview else '\u4e0b\u8f7d'}请求: session={chat_session_id}, path={file_path}")
+    action = "预览" if preview else "下载"
+    logger.debug(f"文件{action}请求: session={chat_session_id}, path={file_path}")
 
     # 验证会话属于该用户
     session = (
