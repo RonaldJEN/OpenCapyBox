@@ -192,6 +192,9 @@ class MemoryService:
 
         这些文件不存 DB，仅在沙箱中存在。Agent 完成引导后会自行删除。
 
+        仅在用户尚无任何对话记录时写入：有对话记录说明用户已经使用过，
+        不再重复上传引导文件。
+
         Args:
             user_id: 用户 ID
             sandbox: OpenSandbox 实例
@@ -199,6 +202,21 @@ class MemoryService:
         Returns:
             写入的文件数量
         """
+        # 如果用户已有对话记录（Round 表有记录），跳过 BOOTSTRAP.md
+        # 不查 Session 表：当前正在创建的 session 已 commit，会导致首次也被跳过
+        from src.api.models.round import Round
+        from src.api.models.session import Session
+        has_rounds = (
+            self.db.query(Round.id)
+            .join(Session, Round.session_id == Session.id)
+            .filter(Session.user_id == user_id)
+            .limit(1)
+            .first()
+        )
+        if has_rounds:
+            logger.debug("用户已有对话记录，跳过 BOOTSTRAP.md (user=%s)", user_id)
+            return 0
+
         from src.api.services.sandbox_service import get_sandbox_mount_path
 
         mount = get_sandbox_mount_path()

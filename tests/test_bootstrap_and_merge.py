@@ -130,11 +130,33 @@ class TestProvisionDefaultFiles:
 class TestProvisionSandboxTemplates:
     """provision_sandbox_templates 测试"""
 
+    def _mock_db_no_sessions(self):
+        """模拟无对话记录的 DB（新用户）"""
+        db = MagicMock()
+        mock_query = MagicMock()
+        mock_query.join.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.limit.return_value = mock_query
+        mock_query.first.return_value = None  # 无 round 记录
+        db.query.return_value = mock_query
+        return db
+
+    def _mock_db_has_sessions(self):
+        """模拟有对话记录的 DB（老用户）"""
+        db = MagicMock()
+        mock_query = MagicMock()
+        mock_query.join.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.limit.return_value = mock_query
+        mock_query.first.return_value = ("some-round-id",)  # 有 round 记录
+        db.query.return_value = mock_query
+        return db
+
     @pytest.mark.asyncio
     async def test_write_bootstrap_to_sandbox(self):
         from src.api.services.memory_service import MemoryService
 
-        db = MagicMock()
+        db = self._mock_db_no_sessions()
         sandbox = MagicMock()
         # 模拟文件不存在（抛异常）
         sandbox.files.read_file = AsyncMock(side_effect=FileNotFoundError("not found"))
@@ -154,7 +176,7 @@ class TestProvisionSandboxTemplates:
     async def test_skip_existing_bootstrap(self):
         from src.api.services.memory_service import MemoryService
 
-        db = MagicMock()
+        db = self._mock_db_no_sessions()
         sandbox = MagicMock()
         # 模拟文件已存在
         sandbox.files.read_file = AsyncMock(return_value="existing content")
@@ -163,6 +185,23 @@ class TestProvisionSandboxTemplates:
         svc = MemoryService(db)
         with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
             count = await svc.provision_sandbox_templates("existing-user", sandbox)
+
+        assert count == 0
+        sandbox.files.write_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skip_bootstrap_when_user_has_conversations(self):
+        """用户已有对话记录，不应再上传 BOOTSTRAP.md"""
+        from src.api.services.memory_service import MemoryService
+
+        db = self._mock_db_has_sessions()
+        sandbox = MagicMock()
+        sandbox.files.read_file = AsyncMock(side_effect=FileNotFoundError("not found"))
+        sandbox.files.write_file = AsyncMock()
+
+        svc = MemoryService(db)
+        with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
+            count = await svc.provision_sandbox_templates("returning-user", sandbox)
 
         assert count == 0
         sandbox.files.write_file.assert_not_called()

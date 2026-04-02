@@ -9,6 +9,7 @@ read_when:
 
 - **如果存在** → 逐条执行其中的指引，完成后 **立即用 bash 删除它**：`rm /home/user/BOOTSTRAP.md`
 - **如果不存在（报错）** → 正常，跳过进入对话
+- 第一次运行完成后删除/home/user/AGENTS.md首次运行的要求
 
 ## 工具使用规则（必读）
 
