@@ -231,7 +231,7 @@ You can freely install packages with pip or npm.
 
 Parameters:
   - command (required): Bash command to execute
-  - timeout (optional): Timeout in seconds (default: 120, max: 600) for foreground commands
+  - timeout (optional): Timeout in seconds (default: 10, max: 600) for foreground commands
   - run_in_background (optional): Set true for long-running commands (servers, etc.)
 
 Tips:
@@ -259,8 +259,8 @@ Examples:
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 120, max: 600). Only for foreground commands.",
-                    "default": 120,
+                    "description": "Timeout in seconds (default: 10, max: 600). Only for foreground commands.",
+                    "default": 10,
                 },
                 "run_in_background": {
                     "type": "boolean",
@@ -274,7 +274,7 @@ Examples:
     async def execute(
         self,
         command: str,
-        timeout: int = 120,
+        timeout: int = 10,
         run_in_background: bool = False,
     ) -> ToolResult:
         """在沙箱中執行命令"""
