@@ -1,8 +1,19 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useLayoutEffect, useState, useRef } from 'react';
 import { applyPatch, Operation } from 'fast-json-patch';
 
 import { apiService } from '../services/api';
-import { RoundData, FileInfo, AgentState, ModelInfo, ChatContentBlock, AttachmentInfo } from '../types';
+import {
+  RoundData,
+  FileInfo,
+  AgentState,
+  ModelInfo,
+  ChatContentBlock,
+  AttachmentInfo,
+  InterruptDetails,
+  AskUserQuestion,
+  StreamCallbacks,
+  StepData,
+} from '../types';
 import { compressImage } from '../utils/imageUtils';
 import { toFileInfo, isImageFile } from '../utils/fileUtils';
 import { Round } from './Round';
@@ -10,6 +21,7 @@ import { ArtifactsPanel } from './ArtifactsPanel';
 import { FilePreview } from './FilePreview';
 import { ModelSelector } from './ModelSelector';
 import { ChatInput } from './ChatInput';
+import { QuestionCard } from './QuestionCard';
 import {
   Loader2,
   AlertCircle,
@@ -40,6 +52,21 @@ interface ChatV2Props {
   onCreateSession?: (modelId?: string) => Promise<string>;
 }
 
+type StepUpdater = (patchOrFn: Partial<StepData> | ((step: StepData) => StepData)) => void;
+
+interface StreamCallbacksFactoryOptions {
+  tempRoundId: string;
+  getCurrentRunId: () => string;
+  setCurrentRunId: (runId: string) => void;
+  updateLastStep: StepUpdater;
+  setBusyFalse: () => void;
+  onStreamSuccess: () => void;
+  onStreamError: (errorMsg: string, code?: string) => void;
+  shouldRefreshTitleOnFirstRound?: boolean;
+  mirrorTextToFinalResponse?: boolean;
+  setRoundRunningOnStart?: boolean;
+}
+
 export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutionEnd, onPanelToggle, selectedModelId, onModelChange, availableModels = [], onCreateSession }: ChatV2Props) {
   const [rounds, setRounds] = useState<RoundData[]>([]);
   const [disableInitialMotion, setDisableInitialMotion] = useState(false);
@@ -58,7 +85,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
   // 暴露 agentState 供调试使用
   useEffect(() => {
-    if (process.env.NODE_ENV === 'development') {
+    if (import.meta.env.DEV) {
       (window as any).__agentState = agentState;
     }
   }, [agentState]);
@@ -100,6 +127,10 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [showScrollButton, setShowScrollButton] = useState(false);
 
+  // 🆕 Human-in-the-Loop 中断状态
+  const [pendingInterrupt, setPendingInterrupt] = useState<InterruptDetails | null>(null);
+  const [resuming, setResuming] = useState(false);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const prevRoundsLengthRef = useRef<number>(0);
@@ -107,6 +138,9 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const subscriptionAbortRef = useRef<(() => void) | null>(null); // 🆕 保存订阅取消函数
   const scrollPosBySessionRef = useRef<Record<string, number>>({});
   const pendingRestoreScrollRef = useRef<number | null>(null);
+  const suppressAutoScrollRef = useRef<boolean>(false); // 切会话期间抑制自动 smooth 滚动
+  const cronRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const titleRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 🆕 欢迎页「输入即创建」相关状态
   const [creatingSession, setCreatingSession] = useState(false);
@@ -184,10 +218,20 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         subscriptionAbortRef.current();
         subscriptionAbortRef.current = null;
       }
+      if (cronRefreshTimeoutRef.current) {
+        clearTimeout(cronRefreshTimeoutRef.current);
+        cronRefreshTimeoutRef.current = null;
+      }
+      if (titleRefreshTimeoutRef.current) {
+        clearTimeout(titleRefreshTimeoutRef.current);
+        titleRefreshTimeoutRef.current = null;
+      }
       setRounds([]);
       setInput('');
       setSending(false);
       setError('');
+      setPendingInterrupt(null);
+      setResuming(false);
       setAttachedFiles([]);
       setAvailableFiles([]);
       setShowFileAutocomplete(false);
@@ -198,12 +242,18 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       setLoading(false);
       setDisableInitialMotion(false);
       isInitialLoadRef.current = true;
+      suppressAutoScrollRef.current = false;
       pendingRestoreScrollRef.current = null;
       historyLoadedRef.current = false;
       return;
     }
 
     setDisableInitialMotion(true);
+
+    if (titleRefreshTimeoutRef.current) {
+      clearTimeout(titleRefreshTimeoutRef.current);
+      titleRefreshTimeoutRef.current = null;
+    }
 
     // 记录目标会话的滚动恢复位置（如果有）
     pendingRestoreScrollRef.current = scrollPosBySessionRef.current[sessionId] ?? null;
@@ -216,8 +266,12 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     }
 
     isInitialLoadRef.current = true; // 🆕 切换会话时重置为首次加载
+    suppressAutoScrollRef.current = true; // 切会话期间抑制自动 smooth 滚动
+    setIsAtBottom(false); // 避免会话切换瞬间误触发 smooth scroll
     historyLoadedRef.current = false; // 重置历史加载标记
     prevRoundsLengthRef.current = 0;
+    setPendingInterrupt(null); // 切换会话时清除旧的中断状态
+    setResuming(false);
     loadHistory();
 
     // 🆕 cleanup 函数：组件卸载或 sessionId 变化时取消订阅
@@ -226,6 +280,10 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         console.log('🧹 清理订阅');
         subscriptionAbortRef.current();
         subscriptionAbortRef.current = null;
+      }
+      if (titleRefreshTimeoutRef.current) {
+        clearTimeout(titleRefreshTimeoutRef.current);
+        titleRefreshTimeoutRef.current = null;
       }
     };
   }, [sessionId]);
@@ -260,15 +318,38 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     // 监听 CronHistory 手动触发的即时刷新事件
     const handleCronDone = () => {
       // 延迟 300ms 等后端落库完成
-      setTimeout(poll, 300);
+      if (cronRefreshTimeoutRef.current) {
+        clearTimeout(cronRefreshTimeoutRef.current);
+      }
+      cronRefreshTimeoutRef.current = setTimeout(() => {
+        cronRefreshTimeoutRef.current = null;
+        void poll();
+      }, 300);
     };
     window.addEventListener('cron-job-done', handleCronDone);
 
     return () => {
       if (timer) clearInterval(timer);
+      if (cronRefreshTimeoutRef.current) {
+        clearTimeout(cronRefreshTimeoutRef.current);
+        cronRefreshTimeoutRef.current = null;
+      }
       window.removeEventListener('cron-job-done', handleCronDone);
     };
   }, [sessionId, sending]);
+
+  useEffect(() => {
+    return () => {
+      if (cronRefreshTimeoutRef.current) {
+        clearTimeout(cronRefreshTimeoutRef.current);
+        cronRefreshTimeoutRef.current = null;
+      }
+      if (titleRefreshTimeoutRef.current) {
+        clearTimeout(titleRefreshTimeoutRef.current);
+        titleRefreshTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   // 僅在文件面板打開時拉取文件，避免僅載入歷史時觸發 /files 請求
   useEffect(() => {
@@ -277,53 +358,42 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     }
   }, [sessionId, isFilesOpen]);
 
-  // 🔥 智能滚动：
-  // - 切换会话后优先恢复上次 scrollTop（避免视觉跳动）
-  // - 后续仅当用户在底部时跟随新内容
-  useEffect(() => {
+  // 🔥 切换会话时：useLayoutEffect 在浏览器绘制前同步恢复 scrollTop，用户看不到跳动
+  useLayoutEffect(() => {
     const container = chatAreaRef.current;
+    if (!isInitialLoadRef.current || !container) return;
 
-    // 检查 rounds 是否真的更新了（新消息、新步骤等）
+    isInitialLoadRef.current = false;
+
+    const restoreTop = pendingRestoreScrollRef.current;
+    if (restoreTop !== null && Number.isFinite(restoreTop)) {
+      container.scrollTop = restoreTop;
+    }
+
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const atBottom = distanceFromBottom < 100;
+    setIsAtBottom(atBottom);
+    setShowScrollButton(!atBottom);
+
+    suppressAutoScrollRef.current = false;
+    pendingRestoreScrollRef.current = null;
+
+    prevRoundsLengthRef.current = rounds.reduce((sum, r) => sum + 1 + r.steps.length, 0);
+  }, [rounds, sessionId]);
+
+  // 🔥 流式新内容时：仅在用户位于底部时平滑滚动跟随
+  useEffect(() => {
+    if (suppressAutoScrollRef.current) return;
+
     const currentLength = rounds.reduce((sum, r) => sum + 1 + r.steps.length, 0);
     const hasNewContent = currentLength > prevRoundsLengthRef.current;
 
-    // 首次加载优先恢复滚动位置
-    if (isInitialLoadRef.current && container) {
-      requestAnimationFrame(() => {
-        const restoreTop = pendingRestoreScrollRef.current;
-        if (restoreTop !== null && Number.isFinite(restoreTop)) {
-          // 只有在位置确实变化时才设置，避免产生可见滚动动作
-          if (Math.abs(container.scrollTop - restoreTop) > 1) {
-            container.scrollTop = restoreTop;
-          }
-
-          const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-          const atBottom = distanceFromBottom < 100;
-          setIsAtBottom(atBottom);
-          setShowScrollButton(!atBottom);
-        } else {
-          // 没有历史位置：保持浏览器默认位置，不做任何滚动动作
-          const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-          const atBottom = distanceFromBottom < 100;
-          setIsAtBottom(atBottom);
-          setShowScrollButton(!atBottom);
-        }
-
-        isInitialLoadRef.current = false;
-        pendingRestoreScrollRef.current = null;
-      });
-
-      prevRoundsLengthRef.current = currentLength;
-      return;
-    }
-
-    // 后续更新：只有在用户位于底部时自动滚动
     if (hasNewContent && isAtBottom) {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
 
     prevRoundsLengthRef.current = currentLength;
-  }, [rounds, isAtBottom, sessionId]);
+  }, [rounds, isAtBottom]);
 
   // 🔥 监听滚动事件，检测用户是否在底部
   useEffect(() => {
@@ -376,12 +446,24 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           session_id: attachment.session_id || sessionId,
         })),
       })));
-      requestAnimationFrame(() => setDisableInitialMotion(false));
-
       // 检查是否有运行中的轮次，如果有则订阅更新
       const runningRound = response.rounds.find(r => r.status === 'running');
+
+      // 🆕 检查是否有中断的轮次，恢复 QuestionCard
+      if (!runningRound) {
+        const interruptedRound = [...response.rounds].reverse().find(
+          r => r.status === 'interrupted' && r.interrupt
+        );
+        if (interruptedRound?.interrupt) {
+          setPendingInterrupt(interruptedRound.interrupt);
+          setAgentState((prev) => ({ ...prev, status: 'waiting', lastUpdated: Date.now() }));
+          console.log(`⏸️ 恢复中断状态: ${interruptedRound.round_id}`);
+        }
+      }
+
       if (runningRound) {
         onExecutionStart?.(sessionId);
+        setDisableInitialMotion(false);
         setSending(true);
 
         console.log(`🔄 检测到运行中轮次 ${runningRound.round_id}，开始订阅更新...`);
@@ -592,19 +674,28 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           },
 
           // 运行完成
-          onRunFinished: (_threadId, runId, result, outcome) => {
+          onRunFinished: (_threadId, runId, result, outcome, interrupt) => {
             setRounds((prev) =>
               prev.map((round) =>
                 round.round_id === runId
                   ? {
                       ...round,
                       final_response: result?.finalResponse || round.final_response,
-                      status: outcome === 'success' ? 'completed' : outcome,
-                      completed_at: new Date().toISOString(),
+                      status: outcome === 'interrupt' ? 'interrupted' : (outcome === 'success' ? 'completed' : outcome),
+                      completed_at: outcome === 'interrupt' ? undefined : new Date().toISOString(),
                     }
                   : round
               )
             );
+            // 处理中断恢复
+            if (outcome === 'interrupt' && interrupt) {
+              setPendingInterrupt(interrupt);
+              setAgentState((prev) => ({ ...prev, status: 'waiting', lastUpdated: Date.now() }));
+              setSending(false);
+              subscriptionAbortRef.current = null;
+              console.log(`⏸️ 轮次 ${runId} 中断，等待用户输入`);
+              return;
+            }
             setSending(false);
             onExecutionEnd?.();
             subscriptionAbortRef.current = null;
@@ -614,6 +705,18 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           // 错误处理
           onRunError: (errorMsg) => {
             setError(errorMsg);
+            setRounds((prev) =>
+              prev.map((round) =>
+                round.round_id === runningRound.round_id
+                  ? {
+                      ...round,
+                      status: 'failed',
+                      completed_at: new Date().toISOString(),
+                      final_response: round.final_response || errorMsg,
+                    }
+                  : round
+              )
+            );
             setSending(false);
             onExecutionEnd?.();
             subscriptionAbortRef.current = null;
@@ -829,6 +932,362 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     }
   };
 
+  const markRoundFailed = (runId: string, message: string) => {
+    setRounds((prev) =>
+      prev.map((round) =>
+        round.round_id === runId
+          ? {
+              ...round,
+              status: 'failed',
+              completed_at: new Date().toISOString(),
+              final_response: round.final_response || message,
+            }
+          : round
+      )
+    );
+  };
+
+  const updateRoundFinalResponse = (runId: string, content: string) => {
+    setRounds((prev) =>
+      prev.map((round) =>
+        round.round_id === runId
+          ? { ...round, final_response: content }
+          : round
+      )
+    );
+  };
+
+  const createUpdateLastStep = (getRunId: () => string): StepUpdater => {
+    return (patchOrFn) => {
+      const runId = getRunId();
+      setRounds((prev) =>
+        prev.map((round) => {
+          if (round.round_id === runId && round.steps.length > 0) {
+            const steps = [...round.steps];
+            const lastStep = steps[steps.length - 1];
+            steps[steps.length - 1] = typeof patchOrFn === 'function'
+              ? patchOrFn(lastStep)
+              : { ...lastStep, ...patchOrFn };
+            return { ...round, steps };
+          }
+          return round;
+        })
+      );
+    };
+  };
+
+  const createStreamCallbacks = ({
+    tempRoundId,
+    getCurrentRunId,
+    setCurrentRunId,
+    updateLastStep,
+    setBusyFalse,
+    onStreamSuccess,
+    onStreamError,
+    shouldRefreshTitleOnFirstRound = false,
+    mirrorTextToFinalResponse = false,
+    setRoundRunningOnStart = false,
+  }: StreamCallbacksFactoryOptions): StreamCallbacks => ({
+    onRunStarted: (_threadId, runId) => {
+      setCurrentRunId(runId);
+
+      setRounds((prev) =>
+        prev.map((r) =>
+          r.round_id === tempRoundId
+            ? {
+                ...r,
+                round_id: runId,
+                ...(setRoundRunningOnStart ? { status: 'running' } : {}),
+              }
+            : r
+        )
+      );
+
+      setAgentState({
+        currentStep: 0,
+        status: 'running',
+        toolLogs: [],
+        lastUpdated: Date.now(),
+      });
+    },
+
+    onRunFinished: (_threadId, runId, result, outcome, interrupt) => {
+      const finalContent = streamingContentRef.current.textContent;
+      const targetRunId = runId || getCurrentRunId();
+      setCurrentRunId(targetRunId);
+      let shouldScheduleTitleRefresh = false;
+
+      setRounds((prev) => {
+        const updatedRounds = prev.map((round) => {
+          if (round.round_id === targetRunId) {
+            const completedSteps = round.steps.map((s) => ({
+              ...s,
+              status: s.status === 'streaming' || s.status === 'running' ? 'completed' : s.status,
+            }));
+
+            return {
+              ...round,
+              steps: completedSteps,
+              final_response: result?.finalResponse || finalContent || round.final_response,
+              status: outcome === 'interrupt' ? 'interrupted' : (outcome === 'success' ? 'completed' : outcome),
+              completed_at: outcome === 'interrupt' ? undefined : new Date().toISOString(),
+            };
+          }
+          return round;
+        });
+
+        if (shouldRefreshTitleOnFirstRound && updatedRounds.length === 1 && outcome === 'success') {
+          shouldScheduleTitleRefresh = true;
+        }
+
+        return updatedRounds;
+      });
+
+      if (shouldScheduleTitleRefresh) {
+        if (titleRefreshTimeoutRef.current) {
+          clearTimeout(titleRefreshTimeoutRef.current);
+        }
+        titleRefreshTimeoutRef.current = setTimeout(() => {
+          titleRefreshTimeoutRef.current = null;
+          console.log('🔄 第一轮对话完成，刷新会话列表获取标题');
+          onTitleUpdated?.();
+        }, 3000);
+      }
+
+      if (outcome === 'interrupt' && interrupt) {
+        setPendingInterrupt(interrupt);
+        setAgentState((prev) => ({
+          ...prev,
+          status: 'waiting',
+          lastUpdated: Date.now(),
+        }));
+        setBusyFalse();
+        return;
+      }
+
+      setAgentState((prev) => ({
+        ...prev,
+        status: 'completed',
+        lastUpdated: Date.now(),
+      }));
+
+      setBusyFalse();
+      onStreamSuccess();
+    },
+
+    onRunError: (errorMsg, code) => {
+      setError(`${errorMsg}${code ? ` (${code})` : ''}`);
+      markRoundFailed(getCurrentRunId(), errorMsg);
+      setBusyFalse();
+      setAgentState((prev) => ({ ...prev, status: 'error', lastUpdated: Date.now() }));
+      onStreamError(errorMsg, code);
+    },
+
+    onStepStarted: (_stepName, timestamp) => {
+      setAgentState((prev) => ({
+        ...prev,
+        currentStep: prev.currentStep + 1,
+        lastUpdated: Date.now(),
+      }));
+
+      setRounds((prev) =>
+        prev.map((round) => {
+          if (round.round_id === getCurrentRunId()) {
+            const newStepNumber = round.steps.length + 1;
+            const newStep = {
+              step_number: newStepNumber,
+              thinking: '',
+              assistant_content: '',
+              tool_calls: [],
+              tool_results: [],
+              status: 'streaming',
+              started_at_ts: timestamp,
+            };
+            return {
+              ...round,
+              steps: [...round.steps, newStep],
+              step_count: newStepNumber,
+            };
+          }
+          return round;
+        })
+      );
+    },
+
+    onStepFinished: (_stepName, timestamp) => {
+      updateLastStep({ status: 'completed', finished_at_ts: timestamp });
+    },
+
+    onTextMessageStart: (messageId, _role) => {
+      streamingContentRef.current.currentTextMessageId = messageId;
+      streamingContentRef.current.textContent = '';
+    },
+
+    onTextMessageContent: (_messageId, delta) => {
+      streamingContentRef.current.textContent += delta;
+      updateLastStep({ assistant_content: streamingContentRef.current.textContent });
+
+      if (mirrorTextToFinalResponse) {
+        updateRoundFinalResponse(getCurrentRunId(), streamingContentRef.current.textContent);
+      }
+    },
+
+    onTextMessageEnd: (_messageId) => {
+      streamingContentRef.current.currentTextMessageId = null;
+    },
+
+    onThinkingStart: (messageId, timestamp) => {
+      streamingContentRef.current.currentThinkingMessageId = messageId;
+      streamingContentRef.current.thinkingContent = '';
+      if (timestamp) {
+        updateLastStep({ thinking_start_ts: timestamp });
+      }
+    },
+
+    onThinkingContent: (_messageId, delta) => {
+      streamingContentRef.current.thinkingContent += delta;
+      updateLastStep({ thinking: streamingContentRef.current.thinkingContent });
+    },
+
+    onThinkingEnd: (_messageId, timestamp) => {
+      streamingContentRef.current.currentThinkingMessageId = null;
+      if (timestamp) {
+        updateLastStep({ thinking_end_ts: timestamp });
+      }
+    },
+
+    onToolCallStart: (toolCallId, toolName, _parentMessageId, timestamp) => {
+      streamingContentRef.current.toolArgs[toolCallId] = '';
+
+      setAgentState((prev) => ({
+        ...prev,
+        toolLogs: [
+          ...prev.toolLogs,
+          {
+            toolCallId,
+            toolName,
+            status: 'running',
+            startedAt: Date.now(),
+          },
+        ],
+        lastUpdated: Date.now(),
+      }));
+
+      updateLastStep((step) => ({
+        ...step,
+        tool_calls: [
+          ...step.tool_calls,
+          { id: toolCallId, name: toolName, input: {}, started_at_ts: timestamp },
+        ],
+      }));
+    },
+
+    onToolCallArgs: (toolCallId, delta) => {
+      streamingContentRef.current.toolArgs[toolCallId] =
+        (streamingContentRef.current.toolArgs[toolCallId] || '') + delta;
+
+      const argsString = streamingContentRef.current.toolArgs[toolCallId];
+      try {
+        const parsedArgs = JSON.parse(argsString);
+        updateLastStep((step) => {
+          const toolIndex = step.tool_calls.findIndex((toolCall) => toolCall.id === toolCallId);
+          if (toolIndex < 0) return step;
+          const updatedToolCalls = [...step.tool_calls];
+          updatedToolCalls[toolIndex] = { ...updatedToolCalls[toolIndex], input: parsedArgs };
+          return { ...step, tool_calls: updatedToolCalls };
+        });
+      } catch {
+        // JSON 尚未完整，继续累积
+      }
+    },
+
+    onToolCallEnd: (toolCallId, timestamp) => {
+      setAgentState((prev) => ({
+        ...prev,
+        toolLogs: prev.toolLogs.map((log) =>
+          log.toolCallId === toolCallId
+            ? { ...log, status: 'pending' as const, args: streamingContentRef.current.toolArgs[toolCallId] }
+            : log
+        ),
+        lastUpdated: Date.now(),
+      }));
+
+      updateLastStep((step) => {
+        const toolIndex = step.tool_calls.findIndex((toolCall) => toolCall.id === toolCallId);
+        if (toolIndex < 0) return step;
+        const updatedToolCalls = [...step.tool_calls];
+        updatedToolCalls[toolIndex] = { ...updatedToolCalls[toolIndex], ended_at_ts: timestamp };
+        return { ...step, tool_calls: updatedToolCalls };
+      });
+    },
+
+    onToolCallResult: (_messageId, toolCallId, content, timestamp, executionTimeMs) => {
+      setAgentState((prev) => ({
+        ...prev,
+        toolLogs: prev.toolLogs.map((log) =>
+          log.toolCallId === toolCallId
+            ? { ...log, status: 'completed' as const, result: content, completedAt: Date.now() }
+            : log
+        ),
+        lastUpdated: Date.now(),
+      }));
+
+      updateLastStep((step) => {
+        let resultObj = { success: true, content, error: undefined as string | undefined };
+        try {
+          const parsed = JSON.parse(content);
+          resultObj = {
+            success: !parsed.error,
+            content: parsed.output || content,
+            error: parsed.error,
+          };
+        } catch {
+          // 保持原始 content
+        }
+
+        return {
+          ...step,
+          tool_results: [
+            ...step.tool_results,
+            {
+              ...resultObj,
+              tool_call_id: toolCallId,
+              received_at_ts: timestamp,
+              execution_time_ms: executionTimeMs,
+            },
+          ],
+        };
+      });
+    },
+
+    onStateSnapshot: (snapshot) => {
+      setAgentState(snapshot);
+    },
+
+    onStateDelta: (delta) => {
+      setAgentState((prev) => {
+        try {
+          const result = applyPatch(prev, delta as Operation[], true, false);
+          return result.newDocument;
+        } catch (e) {
+          console.error('Failed to apply state patch:', e);
+          return prev;
+        }
+      });
+    },
+
+    onMessagesSnapshot: (messages) => {
+      console.log('📥 收到消息快照:', messages.length, '条消息');
+    },
+
+    onCustomEvent: (name, value) => {
+      if (name === 'title_updated') {
+        console.log('✅ 会话标题已更新:', value?.title);
+        onTitleUpdated?.();
+      }
+    },
+  });
+
   const handleSend = async () => {
     if ((!input.trim() && attachedFiles.length === 0) || sending || creatingSession) return;
 
@@ -890,8 +1349,10 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
     setInput('');
     setAttachedFiles([]);
+    setDisableInitialMotion(false);
     setSending(true);
     setError('');
+    setPendingInterrupt(null); // 清除未回答的中断
 
     // 重置流式内容累积器
     streamingContentRef.current = {
@@ -921,332 +1382,24 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
     // 当前轮次 ID（会在 RUN_STARTED 时更新）
     let currentRunId = tempRoundId;
-
-    // 通用 helper：更新当前 round 最后一个 step 的字段
-    // 支持直接合并对象，或传入函数做更复杂的更新
-    const updateLastStep = (patchOrFn: Partial<import('../types').StepData> | ((step: import('../types').StepData) => import('../types').StepData)) => {
-      setRounds((prev) =>
-        prev.map((round) => {
-          if (round.round_id === currentRunId && round.steps.length > 0) {
-            const steps = [...round.steps];
-            const lastStep = steps[steps.length - 1];
-            steps[steps.length - 1] = typeof patchOrFn === 'function'
-              ? patchOrFn(lastStep)
-              : { ...lastStep, ...patchOrFn };
-            return { ...round, steps };
-          }
-          return round;
-        })
-      );
-    };
+    const updateLastStep = createUpdateLastStep(() => currentRunId);
+    const streamCallbacks = createStreamCallbacks({
+      tempRoundId,
+      getCurrentRunId: () => currentRunId,
+      setCurrentRunId: (runId) => {
+        currentRunId = runId;
+      },
+      updateLastStep,
+      setBusyFalse: () => setSending(false),
+      onStreamSuccess: () => onExecutionEnd?.(),
+      onStreamError: () => onExecutionEnd?.(),
+      shouldRefreshTitleOnFirstRound: true,
+      mirrorTextToFinalResponse: false,
+      setRoundRunningOnStart: false,
+    });
 
     try {
-      await apiService.sendMessageStreamV2(targetSessionId, contentBlocks, {
-        // ============= 生命周期事件 =============
-
-        // RUN_STARTED - 更新临时 round 的 ID
-        onRunStarted: (_threadId, runId) => {
-          currentRunId = runId;
-
-          // 替换临时 round 为真实 round
-          setRounds((prev) =>
-            prev.map((r) =>
-              r.round_id === tempRoundId
-                ? { ...r, round_id: runId }
-                : r
-            )
-          );
-
-          // 初始化 agent 状态
-          setAgentState({
-            currentStep: 0,
-            status: 'running',
-            toolLogs: [],
-            lastUpdated: Date.now(),
-          });
-        },
-
-        // RUN_FINISHED - 完成运行
-        onRunFinished: (_threadId, runId, result, outcome) => {
-          // 最终化所有内容
-          const finalContent = streamingContentRef.current.textContent;
-
-          setRounds((prev) => {
-            const updatedRounds = prev.map((round) => {
-              if (round.round_id === runId) {
-                // 标记所有步骤为完成
-                const completedSteps = round.steps.map((s) => ({
-                  ...s,
-                  status: s.status === 'streaming' || s.status === 'running' ? 'completed' : s.status,
-                }));
-
-                return {
-                  ...round,
-                  steps: completedSteps,
-                  final_response: result?.finalResponse || finalContent || round.final_response,
-                  status: outcome === 'success' ? 'completed' : outcome,
-                  completed_at: new Date().toISOString(),
-                };
-              }
-              return round;
-            });
-
-            // 如果是第一轮对话完成，延迟刷新会话列表
-            if (updatedRounds.length === 1) {
-              setTimeout(() => {
-                console.log('🔄 第一轮对话完成，刷新会话列表获取标题');
-                onTitleUpdated?.();
-              }, 3000);
-            }
-
-            return updatedRounds;
-          });
-
-          // 更新 agent 状态
-          setAgentState((prev) => ({
-            ...prev,
-            status: 'completed',
-            lastUpdated: Date.now(),
-          }));
-
-          setSending(false);
-          onExecutionEnd?.();
-        },
-
-        // RUN_ERROR - 错误处理
-        onRunError: (errorMsg, code) => {
-          setError(`${errorMsg}${code ? ` (${code})` : ''}`);
-          setSending(false);
-          setAgentState((prev) => ({ ...prev, status: 'error', lastUpdated: Date.now() }));
-          onExecutionEnd?.();
-        },
-
-        // STEP_STARTED - 步骤开始
-        onStepStarted: (_stepName, timestamp) => {
-          setAgentState((prev) => ({
-            ...prev,
-            currentStep: prev.currentStep + 1,
-            lastUpdated: Date.now(),
-          }));
-
-          // 创建新步骤
-          setRounds((prev) =>
-            prev.map((round) => {
-              if (round.round_id === currentRunId) {
-                const newStepNumber = round.steps.length + 1;
-                const newStep = {
-                  step_number: newStepNumber,
-                  thinking: '',
-                  assistant_content: '',
-                  tool_calls: [],
-                  tool_results: [],
-                  status: 'streaming',
-                  started_at_ts: timestamp,
-                };
-                return {
-                  ...round,
-                  steps: [...round.steps, newStep],
-                  step_count: newStepNumber,
-                };
-              }
-              return round;
-            })
-          );
-        },
-
-        // STEP_FINISHED - 步骤完成
-        onStepFinished: (_stepName: string, timestamp?: number) => {
-          updateLastStep({ status: 'completed', finished_at_ts: timestamp });
-        },
-
-        // ============= 文本消息事件 =============
-
-        // TEXT_MESSAGE_START - 开始文本消息
-        onTextMessageStart: (messageId, _role) => {
-          streamingContentRef.current.currentTextMessageId = messageId;
-          streamingContentRef.current.textContent = '';
-        },
-
-        // TEXT_MESSAGE_CONTENT - 流式文本内容
-        onTextMessageContent: (_messageId, delta) => {
-          streamingContentRef.current.textContent += delta;
-
-          // 更新当前步骤的 assistant_content
-          updateLastStep({ assistant_content: streamingContentRef.current.textContent });
-        },
-
-        // TEXT_MESSAGE_END - 结束文本消息
-        onTextMessageEnd: (_messageId) => {
-          streamingContentRef.current.currentTextMessageId = null;
-        },
-
-        // ============= 思考过程事件 =============
-
-        // THINKING_TEXT_MESSAGE_START - 开始思考
-        onThinkingStart: (messageId, timestamp) => {
-          streamingContentRef.current.currentThinkingMessageId = messageId;
-          streamingContentRef.current.thinkingContent = '';
-
-          // 记录 thinking 开始时间戳
-          if (timestamp) {
-            updateLastStep({ thinking_start_ts: timestamp });
-          }
-        },
-
-        // THINKING_TEXT_MESSAGE_CONTENT - 流式思考内容
-        onThinkingContent: (_messageId, delta) => {
-          streamingContentRef.current.thinkingContent += delta;
-
-          // 更新当前步骤的 thinking
-          updateLastStep({ thinking: streamingContentRef.current.thinkingContent });
-        },
-
-        // THINKING_TEXT_MESSAGE_END - 结束思考
-        onThinkingEnd: (_messageId, timestamp) => {
-          streamingContentRef.current.currentThinkingMessageId = null;
-
-          // 记录 thinking 结束时间戳
-          if (timestamp) {
-            updateLastStep({ thinking_end_ts: timestamp });
-          }
-        },
-
-        // ============= 工具调用事件 =============
-
-        // TOOL_CALL_START - 开始工具调用
-        onToolCallStart: (toolCallId, toolName, _parentMessageId, timestamp) => {
-          streamingContentRef.current.toolArgs[toolCallId] = '';
-
-          // 添加工具日志
-          setAgentState((prev) => ({
-            ...prev,
-            toolLogs: [
-              ...prev.toolLogs,
-              {
-                toolCallId,
-                toolName,
-                status: 'running',
-                startedAt: Date.now(),
-              },
-            ],
-            lastUpdated: Date.now(),
-          }));
-
-          // 添加工具调用到当前步骤
-          updateLastStep((step) => ({
-            ...step,
-            tool_calls: [
-              ...step.tool_calls,
-              { name: toolName, input: {}, started_at_ts: timestamp },
-            ],
-          }));
-        },
-
-        // TOOL_CALL_ARGS - 流式工具参数
-        onToolCallArgs: (toolCallId, delta) => {
-          streamingContentRef.current.toolArgs[toolCallId] =
-            (streamingContentRef.current.toolArgs[toolCallId] || '') + delta;
-
-          // 尝试解析并更新工具调用参数
-          const argsString = streamingContentRef.current.toolArgs[toolCallId];
-          try {
-            const parsedArgs = JSON.parse(argsString);
-
-            updateLastStep((step) => {
-              const toolIndex = step.tool_calls.length - 1;
-              if (toolIndex < 0) return step;
-              const updatedToolCalls = [...step.tool_calls];
-              updatedToolCalls[toolIndex] = { ...updatedToolCalls[toolIndex], input: parsedArgs };
-              return { ...step, tool_calls: updatedToolCalls };
-            });
-          } catch {
-            // JSON 尚未完整，继续累积
-          }
-        },
-
-        // TOOL_CALL_END - 结束工具调用
-        onToolCallEnd: (toolCallId) => {
-          // 更新工具日志状态
-          setAgentState((prev) => ({
-            ...prev,
-            toolLogs: prev.toolLogs.map((log) =>
-              log.toolCallId === toolCallId
-                ? { ...log, status: 'pending' as const, args: streamingContentRef.current.toolArgs[toolCallId] }
-                : log
-            ),
-            lastUpdated: Date.now(),
-          }));
-        },
-
-        // TOOL_CALL_RESULT - 工具调用结果
-        onToolCallResult: (_messageId, toolCallId, content, timestamp, executionTimeMs) => {
-          // 更新工具日志
-          setAgentState((prev) => ({
-            ...prev,
-            toolLogs: prev.toolLogs.map((log) =>
-              log.toolCallId === toolCallId
-                ? { ...log, status: 'completed' as const, result: content, completedAt: Date.now() }
-                : log
-            ),
-            lastUpdated: Date.now(),
-          }));
-
-          // 添加工具结果到步骤
-          updateLastStep((step) => {
-            // 解析结果
-            let resultObj = { success: true, content, error: undefined };
-            try {
-              const parsed = JSON.parse(content);
-              resultObj = {
-                success: !parsed.error,
-                content: parsed.output || content,
-                error: parsed.error,
-              };
-            } catch {
-              // 保持原始 content
-            }
-            return {
-              ...step,
-              tool_results: [...step.tool_results, { ...resultObj, received_at_ts: timestamp, execution_time_ms: executionTimeMs }],
-            };
-          });
-        },
-
-        // ============= 状态管理事件 =============
-
-        // STATE_SNAPSHOT - 完整状态快照
-        onStateSnapshot: (snapshot) => {
-          setAgentState(snapshot);
-        },
-
-        // STATE_DELTA - JSON Patch 增量更新
-        onStateDelta: (delta) => {
-          setAgentState((prev) => {
-            try {
-              const result = applyPatch(prev, delta as Operation[], true, false);
-              return result.newDocument;
-            } catch (e) {
-              console.error('Failed to apply state patch:', e);
-              return prev;
-            }
-          });
-        },
-
-        // MESSAGES_SNAPSHOT - 消息快照（用于状态恢复）
-        onMessagesSnapshot: (messages) => {
-          console.log('📥 收到消息快照:', messages.length, '条消息');
-        },
-
-        // ============= 自定义事件 =============
-
-        // CUSTOM - 自定义事件（标题更新、心跳等）
-        onCustomEvent: (name, value) => {
-          if (name === 'title_updated') {
-            console.log('✅ 会话标题已更新:', value?.title);
-            onTitleUpdated?.();
-          }
-        },
-      });
+      await apiService.sendMessageStreamV2(targetSessionId, contentBlocks, streamCallbacks);
     } catch (err: any) {
       console.error('Failed to send message:', err);
 
@@ -1262,19 +1415,102 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     }
   };
 
-  // 🆕 判断输入区是否禁用（正在创建会话 or 正在发送）
-  const inputDisabled = sending || creatingSession;
+  // 🆕 判断输入区是否禁用（正在创建会话 or 正在发送/恢复）
+  // 注意：即使存在 pendingInterrupt，也允许用户直接发送新消息跳过中断问题。
+  const inputDisabled = sending || creatingSession || resuming;
 
   /** 当前发送按钮的 loading 文案（空 = 非 loading） */
-  const sendingLabel = creatingSession ? '创建中' : sending ? 'Running' : '';
+  const sendingLabel = creatingSession ? '创建中' : resuming ? 'Resuming' : sending ? 'Running' : '';
 
   /** 停止生成：调用后端 abort API，SSE 不断开，等后端推 RUN_FINISHED(interrupt) */
   const handleStop = async () => {
-    if (!sessionId || !sending) return;
+    if (!sessionId || !(sending || resuming)) return;
     try {
       await apiService.abortChat(sessionId);
     } catch (err) {
       console.warn('Abort request failed (Agent may have already finished):', err);
+    }
+  };
+
+  /** 🆕 提交中断回答，恢复 Agent 执行 */
+  const handleResumeSubmit = async (answers: Record<string, string>) => {
+    const interruptSnapshot = pendingInterrupt;
+    if (!sessionId || !interruptSnapshot?.id) return;
+
+    const interruptId = interruptSnapshot.id;
+    const resumeTempRoundId = `resume-temp-${Date.now()}`;
+    let currentResumeRunId = resumeTempRoundId;
+    const updateLastStep = createUpdateLastStep(() => currentResumeRunId);
+
+    const resumeEntries = Object.entries(answers);
+    const resumeUserMessage = resumeEntries.length > 0
+      ? resumeEntries
+          .map(([question, answer], index) => {
+            const safeQuestion = question?.trim() || '(Untitled question)';
+            const safeAnswer = answer?.trim() || '[No preference]';
+            return `${index > 0 ? '\n\n' : ''}Q: ${safeQuestion}\nA: ${safeAnswer}`;
+          })
+          .join('')
+      : 'Q: (No question)\nA: [No preference]';
+
+    setPendingInterrupt(null);
+    setResuming(true);
+    setError('');
+
+    // 追加一个新的 resume 轮次，保持旧 interrupted 轮次不变
+    setRounds((prev) => [
+      ...prev,
+      {
+        round_id: resumeTempRoundId,
+        user_message: resumeUserMessage,
+        user_attachments: [],
+        final_response: '',
+        steps: [],
+        step_count: 0,
+        status: 'running',
+        created_at: new Date().toISOString(),
+      },
+    ]);
+
+    // 重置流式内容累积器
+    streamingContentRef.current = {
+      currentTextMessageId: null,
+      currentThinkingMessageId: null,
+      textContent: '',
+      thinkingContent: '',
+      toolArgs: {},
+    };
+
+    onExecutionStart?.(sessionId);
+
+    const resumeCallbacks = createStreamCallbacks({
+      tempRoundId: resumeTempRoundId,
+      getCurrentRunId: () => currentResumeRunId,
+      setCurrentRunId: (runId) => {
+        currentResumeRunId = runId;
+      },
+      updateLastStep,
+      setBusyFalse: () => setResuming(false),
+      onStreamSuccess: () => onExecutionEnd?.(),
+      onStreamError: () => {
+        setPendingInterrupt(interruptSnapshot);
+        onExecutionEnd?.();
+      },
+      shouldRefreshTitleOnFirstRound: false,
+      mirrorTextToFinalResponse: true,
+      setRoundRunningOnStart: true,
+    });
+
+    try {
+      await apiService.resumeStream(sessionId, interruptId, answers, resumeCallbacks);
+    } catch (err: any) {
+      console.error('Failed to resume:', err);
+      const message = err.message || '恢复执行失败';
+      setError(message);
+      markRoundFailed(currentResumeRunId, message);
+      setPendingInterrupt(interruptSnapshot);
+      setResuming(false);
+      onExecutionEnd?.();
     }
   };
 
@@ -1372,7 +1608,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
                   sessionId={sessionId}
                   authSessionId={apiService.getUserId?.() || ''}
                   onPreviewAttachment={handlePreviewAttachment}
-                  isStreaming={sending && index === rounds.length - 1}
+                  isStreaming={(sending || resuming) && index === rounds.length - 1}
                   disableMotion={disableInitialMotion}
                 />
               ))}
@@ -1417,12 +1653,23 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           </div>
         )}
 
+        {/* 🆕 Human-in-the-Loop 问题浮层 — 盖在输入框上方 */}
+        {pendingInterrupt && pendingInterrupt.reason === 'input_required' && pendingInterrupt.payload?.questions && (pendingInterrupt.payload.questions as AskUserQuestion[]).length > 0 && (
+          <div className="relative z-20 px-4 md:px-8 mb-[-3.5rem] mx-auto w-full max-w-3xl">
+            <QuestionCard
+              questions={pendingInterrupt.payload.questions as AskUserQuestion[]}
+              onSubmit={handleResumeSubmit}
+              disabled={resuming}
+            />
+          </div>
+        )}
+
         {/* Input Area */}
         <ChatInput
           value={input}
           onChange={setInput}
           onSend={handleSend}
-          onStop={sending ? handleStop : undefined}
+          onStop={(sending || resuming) ? handleStop : undefined}
           disabled={inputDisabled}
           sendingLabel={sendingLabel}
           placeholder={sessionId ? '输入指令...' : '输入你的问题，按 Enter 开始对话...'}

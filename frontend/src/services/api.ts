@@ -269,21 +269,22 @@ class APIService {
     try {
       await doRequest();
     } catch (error: any) {
-      // 检测异常断开，尝试重连
-      if (!runCompleted && currentThreadId && currentRunId && retryCount < maxRetries) {
+      let lastError: any = error;
+
+      while (!runCompleted && currentThreadId && currentRunId && retryCount < maxRetries) {
         retryCount++;
         console.log(`⚠️ 连接断开，尝试重连 (${retryCount}/${maxRetries})...`);
 
-        await new Promise(r => setTimeout(r, 1000 * retryCount));
+        await new Promise((r) => setTimeout(r, 1000 * retryCount));
 
         try {
           const subscription = this.subscribeToRound(chatSessionId, currentRunId, {
             onMessagesSnapshot: callbacks.onMessagesSnapshot,
             onStateSnapshot: callbacks.onStateSnapshot,
             onStateDelta: callbacks.onStateDelta,
-            onRunFinished: (tid, rid, result, outcome) => {
+            onRunFinished: (tid, rid, result, outcome, interrupt) => {
               runCompleted = true;
-              callbacks.onRunFinished?.(tid, rid, result, outcome);
+              callbacks.onRunFinished?.(tid, rid, result, outcome, interrupt);
             },
             onRunError: callbacks.onRunError,
             onCustomEvent: callbacks.onCustomEvent,
@@ -292,14 +293,13 @@ class APIService {
           console.log('✅ 重连成功');
           return;
         } catch (retryError: any) {
+          lastError = retryError;
           console.error('❌ 重连失败:', retryError);
-          callbacks.onRunError?.(retryError.message || '重连失败');
-          throw retryError;
         }
-      } else {
-        callbacks.onRunError?.(error.message);
-        throw error;
       }
+
+      callbacks.onRunError?.(lastError?.message || '连接失败');
+      throw lastError;
     }
   }
 
@@ -321,7 +321,7 @@ class APIService {
 
       case 'RUN_FINISHED':
         onComplete();
-        callbacks.onRunFinished?.(event.threadId, event.runId, event.result, event.outcome || 'success');
+        callbacks.onRunFinished?.(event.threadId, event.runId, event.result, event.outcome || 'success', event.interrupt);
         break;
 
       case 'RUN_ERROR':
@@ -496,7 +496,7 @@ class APIService {
                       break;
 
                     case 'RUN_FINISHED':
-                      callbacks.onRunFinished?.(event.threadId, event.runId, event.result, event.outcome || 'success');
+                      callbacks.onRunFinished?.(event.threadId, event.runId, event.result, event.outcome || 'success', event.interrupt);
                       resolve();
                       return;
 
@@ -588,14 +588,18 @@ class APIService {
             const history = await this.getSessionHistoryV2(chatSessionId);
             const round = history.rounds.find((r: any) => r.round_id === runId);
             
-            if (round?.status === 'completed' || round?.status === 'failed') {
+            if (round?.status === 'completed' || round?.status === 'failed' || round?.status === 'interrupted') {
               // 輪次已完成，補發 onRunFinished 回調
               console.log(`✅ 检测到轮次 ${runId} 已完成 (status=${round.status})，恢复状态`);
-              const outcome = round.status === 'completed' ? 'success' : 'error';
+              const outcome = round.status === 'completed'
+                ? 'success'
+                : round.status === 'interrupted'
+                  ? 'interrupt'
+                  : 'error';
               callbacks.onRunFinished?.(chatSessionId, runId, {
                 finalResponse: round.final_response || '',
                 stepCount: round.step_count || 0,
-              }, outcome);
+              }, outcome, round.interrupt);
               resolve();
               return;
             }
@@ -613,6 +617,86 @@ class APIService {
       abort: () => abortController.abort(),
       getLatestSequence: () => latestSequence,
     };
+  }
+
+  // ========== Resume API (Human-in-the-Loop) ==========
+
+  /**
+   * 恢复被中断的 Agent 执行（SSE 流）
+   * 与 sendMessageStreamV2 共享同一套 AG-UI 事件处理逻辑
+   */
+  async resumeStream(
+    chatSessionId: string,
+    interruptId: string,
+    answers: Record<string, string>,
+    callbacks: StreamCallbacks,
+  ): Promise<void> {
+    const url = `/api/chat/${chatSessionId}/resume`;
+    let receivedTerminalEvent = false;
+
+    return new Promise((resolve, reject) => {
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...this.getAuthHeaders(),
+        },
+        body: JSON.stringify({ interrupt_id: interruptId, answers }),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errorText}`);
+          }
+
+          const reader = response.body?.getReader();
+          if (!reader) {
+            throw new Error('Response body is null');
+          }
+
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          while (true) {
+            const { done, value } = await reader.read();
+
+            if (done) {
+              if (!receivedTerminalEvent) {
+                const terminalError = new Error('Resume stream ended without terminal event');
+                callbacks.onRunError?.(terminalError.message);
+                reject(terminalError);
+                return;
+              }
+              resolve();
+              break;
+            }
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const data = line.slice(6);
+
+                try {
+                  const event = JSON.parse(data);
+                  if (event.type === 'RUN_FINISHED' || event.type === 'RUN_ERROR') {
+                    receivedTerminalEvent = true;
+                  }
+                  this.handleAGUIEvent(event, callbacks, () => {}, () => {});
+                } catch (e) {
+                  console.error('Failed to parse resume SSE data:', e, 'Line:', data);
+                }
+              }
+            }
+          }
+        })
+        .catch((error) => {
+          callbacks.onRunError?.(error.message);
+          reject(error);
+        });
+    });
   }
 
   // ========== 文件管理 API ==========

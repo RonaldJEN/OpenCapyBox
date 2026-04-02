@@ -11,9 +11,11 @@ vi.mock('../../services/api', () => ({
     getSessionHistoryV2: vi.fn(),
     getSessionFiles: vi.fn(),
     sendMessageStreamV2: vi.fn(),
+    resumeStream: vi.fn(),
     uploadFile: vi.fn(),
     getRunningSession: vi.fn(),
     createSession: vi.fn(),
+    abortChat: vi.fn(),
     getUserId: vi.fn(() => 'demo-session'),
   },
 }));
@@ -49,6 +51,20 @@ vi.mock('../../components/FilePreview', () => ({
   ),
 }));
 
+vi.mock('../../components/QuestionCard', () => ({
+  QuestionCard: ({ onSubmit, disabled }: any) => (
+    <div data-testid="question-card">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => onSubmit({ 'Which database should we use?': 'PostgreSQL' })}
+      >
+        Submit Question
+      </button>
+    </div>
+  ),
+}));
+
 describe('ChatV2 组件', () => {
   const mockRounds: RoundData[] = [
     {
@@ -76,6 +92,7 @@ describe('ChatV2 组件', () => {
       files: [],
       total: 0,
     });
+    vi.mocked(apiService.resumeStream).mockResolvedValue(undefined);
   });
 
   it('没有 sessionId 时应该显示欢迎页（含输入框）', () => {
@@ -441,5 +458,117 @@ describe('ChatV2 组件', () => {
         expect.any(Object)
       );
     });
+  });
+
+  it('resume 失败后应恢复问题卡片以便重试', async () => {
+    const interruptedRounds: RoundData[] = [
+      {
+        round_id: 'round-interrupted-1',
+        user_message: '请帮我选数据库',
+        final_response: '',
+        steps: [],
+        step_count: 0,
+        status: 'interrupted',
+        created_at: new Date().toISOString(),
+        interrupt: {
+          id: 'interrupt-1',
+          reason: 'input_required',
+          payload: {
+            questions: [
+              {
+                question: 'Which database should we use?',
+                header: 'Database',
+                options: [
+                  { label: 'PostgreSQL', description: 'Full SQL support' },
+                  { label: 'SQLite', description: 'Lightweight' },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    ];
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: interruptedRounds,
+      session_id: 'test-session',
+      total: interruptedRounds.length,
+    });
+    vi.mocked(apiService.resumeStream).mockRejectedValue(new Error('resume failed'));
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('question-card')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Submit Question'));
+
+    await waitFor(() => {
+      expect(apiService.resumeStream).toHaveBeenCalled();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('question-card')).toBeInTheDocument();
+      expect(screen.getByText(/resume failed/)).toBeInTheDocument();
+    });
+  });
+
+  it('interrupted 历史状态下输入框不应被锁死', async () => {
+    const interruptedRounds: RoundData[] = [
+      {
+        round_id: 'round-interrupted-2',
+        user_message: '请继续',
+        final_response: '',
+        steps: [],
+        step_count: 0,
+        status: 'interrupted',
+        created_at: new Date().toISOString(),
+        interrupt: {
+          id: 'interrupt-2',
+          reason: 'input_required',
+          payload: {
+            questions: [
+              {
+                question: 'Pick one?',
+                header: 'Choice',
+                options: [
+                  { label: 'A', description: 'Option A' },
+                  { label: 'B', description: 'Option B' },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    ];
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: interruptedRounds,
+      session_id: 'test-session',
+      total: interruptedRounds.length,
+    });
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('question-card')).toBeInTheDocument();
+    });
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+    expect(textarea).not.toBeDisabled();
+
+    fireEvent.change(textarea, { target: { value: '直接发新消息跳过中断' } });
+    expect(textarea.value).toBe('直接发新消息跳过中断');
   });
 });
