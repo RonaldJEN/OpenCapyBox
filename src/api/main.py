@@ -78,9 +78,22 @@ async def startup_event():
                     "final_response": "[系统重启，执行被中断]",
                 })
             )
+            # 重启后内存中的 _pending_interrupt 已丢失，interrupted 轮次无法恢复
+            zombie_count = (
+                db.query(Round)
+                .filter(Round.status == "interrupted")
+                .update({
+                    "status": "failed",
+                    "completed_at": now_naive(),
+                    "interrupt_payload": None,
+                    "final_response": "[系统重启，中断问答已失效]",
+                })
+            )
             db.commit()
             if stale_count:
                 print(f"⚠️  已清理 {stale_count} 个残留的 running 轮次（标记为 failed）")
+            if zombie_count:
+                print(f"⚠️  已清理 {zombie_count} 个残留的 interrupted 轮次（标记为 failed）")
     except Exception as e:
         print(f"⚠️  清理残留轮次失败: {e}")
 

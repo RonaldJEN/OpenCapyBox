@@ -2,6 +2,7 @@
 
 import json
 import asyncio
+import uuid
 from datetime import datetime
 from pathlib import Path
 import os
@@ -13,10 +14,11 @@ from .llm import LLMClient
 from .logger import AgentLogger
 from .schema import Message
 from .tools.base import Tool, ToolResult
+from .tools.ask_user_tool import ASK_USER_TOOL_NAME
 from .utils import calculate_display_width
 from .event_emitter import AGUIEventEmitter
 from .schema.agui_events import (
-    AGUIEvent, AgentState, EventType,
+    AGUIEvent, AgentState, EventType, InterruptDetails,
 )
 
 
@@ -147,10 +149,83 @@ class Agent:
         # 记忆刷新标记（每次 compaction 周期内最多触发一次）
         self._memory_flushed_this_compaction = False
 
+        # Human-in-the-Loop: ask_user 中断状态
+        self._pending_interrupt: dict[str, Any] | None = None
+
     def add_user_message(self, content: str | list[dict[str, Any]]):
         """Add a user message to history with current timestamp."""
         # 在用户消息中附加当前时间（保持轻量级，避免冗余）
         self.messages.append(Message(role="user", content=content))
+
+    def has_pending_interrupt(self, interrupt_id: str | None = None) -> bool:
+        """检查是否存在待处理中断。
+
+        Args:
+            interrupt_id: 可选。提供时会校验是否匹配指定中断 ID。
+        """
+        if not self._pending_interrupt:
+            return False
+        if interrupt_id is None:
+            return True
+        return self._pending_interrupt.get("interrupt_id") == interrupt_id
+
+    def get_pending_interrupt(self) -> dict[str, Any] | None:
+        """返回待处理中断快照，避免外部直接操作内部私有状态。"""
+        if not self._pending_interrupt:
+            return None
+        return dict(self._pending_interrupt)
+
+    def resume_from_interrupt(self, interrupt_id: str, answers: dict[str, str]) -> None:
+        """从 ask_user 中断中恢复，将用户答案注入对话历史。
+
+        Args:
+            interrupt_id: 中断 ID（必须匹配 _pending_interrupt）
+            answers: 用户答案 {question_text: answer_label}
+
+        Raises:
+            ValueError: 无待处理中断或 ID 不匹配
+        """
+        if not self._pending_interrupt:
+            raise ValueError("No pending interrupt to resume from")
+        if self._pending_interrupt["interrupt_id"] != interrupt_id:
+            raise ValueError(
+                f"Interrupt ID mismatch: expected {self._pending_interrupt['interrupt_id']}, got {interrupt_id}"
+            )
+
+        tool_call_id = self._pending_interrupt["tool_call_id"]
+
+        # 格式化答案为人类可读 + LLM 可理解的文本
+        answer_lines = []
+        for question_text, answer in answers.items():
+            answer_lines.append(f"- {question_text}: {answer}")
+        formatted_answers = "User answered:\n" + "\n".join(answer_lines) if answer_lines else "User provided no answers."
+
+        # 找到占位 tool_result 消息并替换 content
+        for msg in self.messages:
+            if (
+                msg.role == "tool"
+                and msg.tool_call_id == tool_call_id
+                and msg.content == "[Awaiting user response]"
+            ):
+                msg.content = formatted_answers
+                break
+
+        self._pending_interrupt = None
+
+    def clear_pending_interrupt(self, replacement_content: str = "User chose not to answer and sent a new message instead.") -> None:
+        """清除待处理的中断（用户发送了新消息而不是回答问题时调用）。"""
+        if not self._pending_interrupt:
+            return
+        tool_call_id = self._pending_interrupt["tool_call_id"]
+        for msg in self.messages:
+            if (
+                msg.role == "tool"
+                and msg.tool_call_id == tool_call_id
+                and msg.content == "[Awaiting user response]"
+            ):
+                msg.content = replacement_content
+                break
+        self._pending_interrupt = None
 
     def _required_tool_fields(self, tool: Tool) -> set[str]:
         """Extract required argument fields from tool schema."""
@@ -677,6 +752,87 @@ Requirements:
                             self.messages.append(cancel_msg)
                         yield emitter.step_finished(step_name)
                         yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
+                        return
+
+                    # 🛑 Human-in-the-Loop: ask_user 拦截点
+                    if function_name == ASK_USER_TOOL_NAME:
+                        questions_payload = arguments.get("questions", []) if isinstance(arguments, dict) else []
+
+                        # 防御性校验：空 questions 不应触发中断，返回错误结果继续执行
+                        if not questions_payload:
+                            error_msg = "ask_user called with empty questions list; skipping interrupt."
+                            yield emitter.tool_call_result(
+                                tool_call_id=tool_call_id,
+                                content=error_msg,
+                                execution_time_ms=0,
+                            )
+                            error_result_msg = Message(
+                                role="tool",
+                                content=error_msg,
+                                tool_call_id=tool_call_id,
+                                name=function_name,
+                            )
+                            self.messages.append(error_result_msg)
+                            continue
+
+                        interrupt_id = str(uuid.uuid4())
+
+                        print(f"\n{Colors.BRIGHT_MAGENTA}❓ Ask User:{Colors.RESET} {len(questions_payload)} question(s) — interrupting for user input")
+
+                        # 注入占位 tool_result（等待用户回答后替换）
+                        yield emitter.tool_call_result(
+                            tool_call_id=tool_call_id,
+                            content="[Awaiting user response]",
+                            execution_time_ms=0,
+                        )
+                        placeholder_msg = Message(
+                            role="tool",
+                            content="[Awaiting user response]",
+                            tool_call_id=tool_call_id,
+                            name=function_name,
+                        )
+                        self.messages.append(placeholder_msg)
+
+                        # 为剩余未处理的 tool_calls 注入 skipped 结果
+                        remaining_idx = response.tool_calls.index(tool_call) + 1
+                        for remaining_tc in response.tool_calls[remaining_idx:]:
+                            yield emitter.tool_call_start(
+                                tool_call_id=remaining_tc.id,
+                                tool_name=remaining_tc.function.name,
+                            )
+                            yield emitter.tool_call_end(remaining_tc.id)
+                            yield emitter.tool_call_result(
+                                tool_call_id=remaining_tc.id,
+                                content="[Skipped: user question pending]",
+                                execution_time_ms=0,
+                            )
+                            skip_msg = Message(
+                                role="tool",
+                                content="[Skipped: user question pending]",
+                                tool_call_id=remaining_tc.id,
+                                name=remaining_tc.function.name,
+                            )
+                            self.messages.append(skip_msg)
+
+                        # 保存中断状态
+                        self._pending_interrupt = {
+                            "interrupt_id": interrupt_id,
+                            "tool_call_id": tool_call_id,
+                            "questions": questions_payload,
+                        }
+
+                        yield emitter.step_finished(step_name)
+                        yield emitter.run_finished(
+                            outcome="interrupt",
+                            interrupt=InterruptDetails(
+                                id=interrupt_id,
+                                reason="input_required",
+                                payload={
+                                    "questions": questions_payload,
+                                    "tool_call_id": tool_call_id,
+                                },
+                            ),
+                        )
                         return
 
                     execution_time_ms = None

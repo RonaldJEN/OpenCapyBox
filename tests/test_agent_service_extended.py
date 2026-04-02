@@ -87,6 +87,7 @@ class TestAgentServiceChatAgui:
         history_service.create_round = MagicMock()
         history_service.complete_round = MagicMock()
         history_service.save_agui_event = AsyncMock()
+        history_service.resolve_interrupted_rounds = MagicMock(return_value=1)
 
         service = make_agent_service(history_service=history_service)
 
@@ -99,6 +100,22 @@ class TestAgentServiceChatAgui:
         service.agent = make_mock_agent(run_agui_fn=_run_agui)
         service.model_id = "mock-model"
         return service
+
+    @pytest.mark.asyncio
+    async def test_chat_agui_clears_interrupted_rounds_when_skipping_pending_interrupt(self, service):
+        service.agent._pending_interrupt = {
+            "interrupt_id": "iid-1",
+            "tool_call_id": "tc-1",
+            "questions": [{"question": "Q?"}],
+        }
+
+        async for _ in service.chat_agui([
+            {"type": "text", "text": "new request"},
+        ]):
+            pass
+
+        service.agent.clear_pending_interrupt.assert_called_once()
+        service.history_service.resolve_interrupted_rounds.assert_called_once_with("session-123")
 
     @pytest.mark.asyncio
     async def test_chat_agui_basic(self, service):
@@ -369,4 +386,72 @@ class TestWriteFileDirtyMemoryDetection:
         await self._run_dirty_test(
             args_deltas=[f'{{"path": "/home/user/{filename}", "content": "# Updated"}}'],
             expected_sync=True,
+        )
+
+
+class TestAgentServiceResumeAgui:
+    @pytest.fixture
+    def service(self):
+        history_service = MagicMock()
+        history_service.create_round = MagicMock()
+        history_service.complete_round = MagicMock()
+        history_service.save_agui_event = AsyncMock()
+        history_service.resolve_interrupted_rounds = MagicMock(return_value=1)
+
+        service = make_agent_service(history_service=history_service)
+
+        async def _run_agui(**kwargs):
+            yield TextMessageContentEvent(messageId="m1", delta="resume done")
+            yield TextMessageEndEvent(messageId="m1")
+            yield StepFinishedEvent(stepName="step-1")
+            yield RunFinishedEvent(threadId="session-123", runId=kwargs["run_id"], outcome="success")
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+        service.agent.has_pending_interrupt.return_value = True
+        service.model_id = "mock-model"
+        return service
+
+    @pytest.mark.asyncio
+    async def test_resume_agui_persists_resume_user_message(self, service):
+        answers = {"Which DB?": "PostgreSQL"}
+
+        with patch.object(service, "_save_conversation_message") as save_message:
+            async for _ in service.resume_agui("iid-1", answers):
+                pass
+
+        service.agent.resume_from_interrupt.assert_called_once_with("iid-1", answers)
+        assert any(
+            call.args and call.args[0] == "user" and "Q: Which DB?" in call.args[1]
+            for call in save_message.call_args_list
+        )
+        assert any(
+            call.args and call.args[0] == "assistant" and "resume done" in call.args[1]
+            for call in save_message.call_args_list
+        )
+
+    def test_has_pending_interrupt_falls_back_to_persisted_interrupt(self, service):
+        service.agent.has_pending_interrupt.return_value = False
+
+        with patch.object(service, "_load_persisted_interrupt", return_value={"interrupt_id": "iid-1"}):
+            assert service.has_pending_interrupt("iid-1") is True
+
+    @pytest.mark.asyncio
+    async def test_resume_agui_uses_cold_fallback_when_memory_interrupt_missing(self, service):
+        answers = {"Which DB?": "PostgreSQL"}
+        service.agent.has_pending_interrupt.return_value = False
+
+        with patch.object(service, "_load_persisted_interrupt", return_value={"interrupt_id": "iid-1"}):
+            with patch.object(service, "_save_conversation_message") as save_message:
+                async for _ in service.resume_agui("iid-1", answers):
+                    pass
+
+        service.agent.resume_from_interrupt.assert_not_called()
+        service.agent.add_user_message.assert_called_once()
+        injected_user_message = service.agent.add_user_message.call_args.args[0]
+        assert "Q: Which DB?" in injected_user_message
+        assert "A: PostgreSQL" in injected_user_message
+        service.history_service.resolve_interrupted_rounds.assert_called_once_with("session-123")
+        assert any(
+            call.args and call.args[0] == "user" and "Q: Which DB?" in call.args[1]
+            for call in save_message.call_args_list
         )

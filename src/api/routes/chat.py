@@ -19,7 +19,7 @@ from src.api.models.database import get_db
 from src.api.deps import get_current_user
 from src.api.models.session import Session
 from src.api.models.agui_event import AGUIEventLog
-from src.api.schemas.chat import SendMessageRequest
+from src.api.schemas.chat import SendMessageRequest, ResumeRequest
 from src.api.services.agent_pool_service import get_agent_pool
 from src.api.models.user_sandbox import UserSandbox
 from src.api.config import get_settings
@@ -28,11 +28,12 @@ import time
 from datetime import datetime
 from src.api.utils.timezone import now_naive
 # AG-UI 事件類型統一從 Agent 層導入
-from src.agent.schema.agui_events import AGUIEvent, RunStartedEvent, CustomEvent, EventType, RunErrorEvent, RunFinishedEvent, MessagesSnapshotEvent
+from src.agent.schema.agui_events import AGUIEvent, RunStartedEvent, CustomEvent, EventType, RunErrorEvent, RunFinishedEvent, MessagesSnapshotEvent, InterruptDetails
 from src.api.utils.agui_encoder import EventEncoder
 import asyncio
 import json
 import uuid
+import threading
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -68,6 +69,7 @@ def _extract_text_for_title(content_blocks) -> str:
 
 # 輪次訂閱者管理（round_id -> list of asyncio.Queue）
 _round_subscribers: dict[str, list[asyncio.Queue]] = {}
+_round_subscribers_lock = threading.Lock()
 
 
 @router.post("/{chat_session_id}/message/stream")
@@ -247,24 +249,150 @@ async def send_message_stream(
     )
 
 
+@router.post("/{chat_session_id}/resume")
+async def resume_interrupt(
+    chat_session_id: str,
+    request: ResumeRequest,
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """恢复被中断的 Agent 执行（Human-in-the-Loop）
+
+    当 Agent 调用 ask_user 工具后，运行中断等待用户回答。
+    前端收集用户答案后调用此端点恢复执行。
+    """
+    # 验证会话
+    session = (
+        db.query(Session)
+        .filter(Session.id == chat_session_id, Session.user_id == user_id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    # 获取 Agent Service
+    agent_pool = get_agent_pool()
+    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+    user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+
+    try:
+        agent_service = await agent_pool.get_or_create(
+            user_id=user_id,
+            session_id=user_id,
+            chat_session_id=chat_session_id,
+            db=db,
+            model_id=session.model_id,
+            sandbox_id=user_sandbox_id,
+        )
+    except Exception as e:
+        logger.error("Agent 获取失败: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Agent 获取失败，请稍后重试")
+
+    # 验证中断状态
+    if not agent_service.has_pending_interrupt(request.interrupt_id):
+        raise HTTPException(status_code=409, detail="没有待处理的中断（可能已过期或已恢复），或中断 ID 不匹配")
+
+    # 创建 per-run 取消令牌
+    cancel_token = asyncio.Event()
+    agent_service.cancel_token = cancel_token
+
+    async def event_generator():
+        current_run_id: str | None = None
+        try:
+            async for event in agent_service.resume_agui(
+                interrupt_id=request.interrupt_id,
+                answers=request.answers,
+            ):
+                if hasattr(event, 'run_id') and event.run_id:
+                    current_run_id = event.run_id
+
+                event_str = event_encoder.encode(event)
+
+                if current_run_id:
+                    event_dict = event.model_dump(by_alias=True, exclude_none=True)
+                    await _broadcast_to_subscribers(current_run_id, event_dict)
+
+                yield event_str
+
+                if event.type == EventType.RUN_FINISHED:
+                    if current_run_id:
+                        _cleanup_subscribers(current_run_id)
+
+        except Exception as e:
+            import traceback
+            error_detail = traceback.format_exc()
+            logger.error("Resume 事件流错误: %s\n%s", e, error_detail)
+            public_error_msg = "服务暂时不可用，请稍后重试"
+            try:
+                error_event = RunErrorEvent(message=public_error_msg, code="INTERNAL_ERROR")
+                yield event_encoder.encode(error_event)
+            except Exception:
+                fallback_json = json.dumps({
+                    "type": EventType.RUN_ERROR.value,
+                    "message": public_error_msg,
+                    "code": "INTERNAL_ERROR",
+                    "timestamp": datetime.now().timestamp() * 1000,
+                })
+                yield f"data: {fallback_json}\n\n"
+            if current_run_id:
+                _cleanup_subscribers(current_run_id)
+
+    session.updated_at = now_naive()
+    db.commit()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 
 # 🆕 辅助函数：广播事件给所有订阅者
 async def _broadcast_to_subscribers(round_id: str, event: dict):
     """向所有订阅该轮次的客户端广播事件（AG-UI 格式）"""
-    if round_id in _round_subscribers:
-        for queue in _round_subscribers[round_id]:
-            try:
-                await queue.put(event)
-            except Exception as e:
-                print(f"⚠️ 广播事件失败: {e}")
+    with _round_subscribers_lock:
+        subscribers = list(_round_subscribers.get(round_id, []))
+
+    if not subscribers:
+        return
+
+    failed_queues: list[asyncio.Queue] = []
+    for queue in subscribers:
+        try:
+            await queue.put(event)
+        except Exception as e:
+            failed_queues.append(queue)
+            print(f"⚠️ 广播事件失败: {e}")
+
+    if not failed_queues:
+        return
+
+    with _round_subscribers_lock:
+        active = _round_subscribers.get(round_id)
+        if not active:
+            return
+        for queue in failed_queues:
+            if queue in active:
+                active.remove(queue)
+        if not active:
+            del _round_subscribers[round_id]
 
 
 
 # 🆕 辅助函数：清理订阅者
 def _cleanup_subscribers(round_id: str):
     """清理已完成轮次的订阅者"""
-    if round_id in _round_subscribers:
-        del _round_subscribers[round_id]
+    removed = False
+    with _round_subscribers_lock:
+        if round_id in _round_subscribers:
+            del _round_subscribers[round_id]
+            removed = True
+    if removed:
         print(f"🧹 已清理轮次 {round_id} 的订阅者")
 
 
@@ -335,7 +463,7 @@ async def subscribe_to_round(
             # 在重放事件後刷新數據庫對象，獲取最新狀態
             db.refresh(round_obj)
 
-            if round_obj.status in ("completed", "failed"):
+            if round_obj.status in ("completed", "failed", "interrupted", "resumed"):
                 # 如果重放事件中已包含 RUN_FINISHED，直接返回不重複發送
                 if has_run_finished_in_replay:
                     print(f"✅ 重放事件已包含 RUN_FINISHED，輪次 {round_id} 訂閱正常結束")
@@ -350,14 +478,24 @@ async def subscribe_to_round(
                 yield event_encoder.encode(snapshot_event)
 
                 # 发送终态事件
-                # outcome: success（正常完成）/ interrupt（异常终止）
                 if round_obj.status == "failed":
-                    # failed 路径：先发 RUN_ERROR（携带错误详情），再发 RUN_FINISHED（终态收敛）
+                    # failed 路径：仅发 RUN_ERROR 后结束，避免误标为 interrupt
                     error_event = RunErrorEvent(
                          message="Run failed (status=failed)",
                          code="RUN_FAILED"
                     )
                     yield event_encoder.encode(error_event)
+                    return
+
+                if round_obj.status == "interrupted":
+                    # interrupted 路径：补发 RUN_FINISHED(outcome=interrupt) 并携带中断详情
+                    import json as _json
+                    _interrupt_details = None
+                    if round_obj.interrupt_payload:
+                        try:
+                            _interrupt_details = InterruptDetails(**_json.loads(round_obj.interrupt_payload))
+                        except Exception:
+                            _interrupt_details = None
                     complete_event = RunFinishedEvent(
                         threadId=chat_session_id,
                         runId=round_id,
@@ -365,11 +503,29 @@ async def subscribe_to_round(
                             "finalResponse": round_obj.final_response or "",
                             "stepCount": round_obj.step_count,
                         },
-                        outcome="interrupt"
+                        outcome="interrupt",
+                        interrupt=_interrupt_details,
                     )
                     yield event_encoder.encode(complete_event)
                     return
 
+                if round_obj.status == "resumed":
+                    # resumed 路径：该轮次曾被中断，已由新 run 接管
+                    # 语义上仍是 interrupt，不应标为 success
+                    complete_event = RunFinishedEvent(
+                        threadId=chat_session_id,
+                        runId=round_id,
+                        result={
+                            "finalResponse": round_obj.final_response or "",
+                            "stepCount": round_obj.step_count,
+                            "reason": "resumed_by_new_run",
+                        },
+                        outcome="interrupt",
+                    )
+                    yield event_encoder.encode(complete_event)
+                    return
+
+                # completed 路径
                 complete_event = RunFinishedEvent(
                     threadId=chat_session_id,
                     runId=round_id,
@@ -383,10 +539,12 @@ async def subscribe_to_round(
                 return  # 輪次已完成，結束訂閱
 
             # === 3. 輪次仍在運行，註冊為訂閱者 ===
-            if round_id not in _round_subscribers:
-                _round_subscribers[round_id] = []
-            _round_subscribers[round_id].append(subscriber_queue)
-            print(f"📡 新订阅者已注册到轮次 {round_id}，当前订阅者数: {len(_round_subscribers[round_id])}")
+            with _round_subscribers_lock:
+                if round_id not in _round_subscribers:
+                    _round_subscribers[round_id] = []
+                _round_subscribers[round_id].append(subscriber_queue)
+                subscriber_count = len(_round_subscribers[round_id])
+            print(f"📡 新订阅者已注册到轮次 {round_id}，当前订阅者数: {subscriber_count}")
 
             # 获取配置
             settings = get_settings()
@@ -432,9 +590,18 @@ async def subscribe_to_round(
 
         finally:
             # 移除订阅者
-            if round_id in _round_subscribers and subscriber_queue in _round_subscribers[round_id]:
-                _round_subscribers[round_id].remove(subscriber_queue)
-                print(f"📡 订阅者已从轮次 {round_id} 移除，剩余订阅者数: {len(_round_subscribers.get(round_id, []))}")
+            removed = False
+            remaining = 0
+            with _round_subscribers_lock:
+                queues = _round_subscribers.get(round_id)
+                if queues and subscriber_queue in queues:
+                    queues.remove(subscriber_queue)
+                    removed = True
+                    remaining = len(queues)
+                    if not queues:
+                        del _round_subscribers[round_id]
+            if removed:
+                print(f"📡 订阅者已从轮次 {round_id} 移除，剩余订阅者数: {remaining}")
 
     return StreamingResponse(
         subscribe_generator(),

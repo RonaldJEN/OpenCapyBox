@@ -475,6 +475,7 @@ def make_mock_agent(*, run_agui_fn=None):
     agent = MagicMock()
     agent.messages = []
     agent.add_user_message = MagicMock()
+    agent._pending_interrupt = None
     if run_agui_fn is not None:
         agent.run_agui = run_agui_fn
     return agent

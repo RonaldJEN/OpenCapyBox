@@ -72,18 +72,20 @@ class AGUIEventEmitter:
             run_id=self.run_id,
         )
     
-    def run_finished(self, outcome: str = "success", result: any = None) -> RunFinishedEvent:
+    def run_finished(self, outcome: str = "success", result: Any = None, interrupt: Any = None) -> RunFinishedEvent:
         """發射運行結束事件
         
         Args:
             outcome: 運行結果，"success" 或 "interrupt"
             result: 可選的運行結果數據
+            interrupt: 可選的中斷詳情（Human-in-the-Loop）
         """
         return RunFinishedEvent(
             thread_id=self.thread_id,
             run_id=self.run_id,
             outcome=outcome,
             result=result,
+            interrupt=interrupt,
         )
     
     def run_error(self, message: str, code: Optional[str] = None) -> RunErrorEvent:

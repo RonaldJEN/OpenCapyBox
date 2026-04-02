@@ -71,6 +71,16 @@ class SendMessageRequest(BaseModel):
     content: List[ContentBlock] = Field(..., min_length=1, description="用户消息内容块")
 
 
+class ResumeRequest(BaseModel):
+    """恢复中断请求（Human-in-the-Loop）"""
+
+    interrupt_id: str = Field(..., description="中断 ID（来自 InterruptDetails.id）")
+    answers: Dict[str, str] = Field(
+        ...,
+        description="用户答案，key 为问题文本，value 为选择的答案",
+    )
+
+
 
 # 🆕 新增 Round/Step 相关 Schema
 
@@ -110,6 +120,7 @@ class RoundData(BaseModel):
     status: str
     created_at: str
     completed_at: Optional[str] = None
+    interrupt: Optional[Dict[str, Any]] = None
 
 
 class ChatResponse(BaseModel):
