@@ -90,6 +90,7 @@ RUN npm install -g \
 
 # ---------- 后端代码 ----------
 COPY src/ ./src/
+COPY docs/sandbox_template/ ./docs/sandbox_template/
 COPY models.yaml ./models.yaml
 COPY init_db.py ./init_db.py
 
