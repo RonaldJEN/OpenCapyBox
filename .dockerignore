@@ -38,6 +38,7 @@ htmlcov
 *.md
 !README.md
 docs
+!docs/sandbox_template
 
 # Docker
 Dockerfile*
