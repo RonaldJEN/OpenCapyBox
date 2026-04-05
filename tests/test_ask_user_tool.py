@@ -383,3 +383,89 @@ class TestAnswerKeyIsQuestionText:
         tool_msg = next(m for m in agent.messages if m.role == "tool" and m.tool_call_id == "tc_ask_1")
         assert "SQLite" in tool_msg.content
         assert "Which database should we use?" in tool_msg.content
+
+
+# ============== AG-UI 协议一致性测试 ==============
+
+
+class TestAGUIProtocolConformance:
+    """验证 ask_user 中断/恢复流程符合 AG-UI 协议规范"""
+
+    @pytest.mark.asyncio
+    async def test_interrupt_saves_run_id_in_pending_state(self, tmp_path):
+        """中断时 _pending_interrupt 应包含 run_id（用于 resume 时设置 parentRunId）"""
+        llm = MockLLMClient()
+        llm.responses = [_make_ask_user_response()]
+
+        agent = make_agent(tmp_path, llm=llm, tools=[AskUserQuestionTool()])
+        agent.add_user_message("Help me choose")
+
+        await collect_agui_events(agent, run_id="original_run_123")
+
+        assert agent._pending_interrupt is not None
+        assert agent._pending_interrupt["run_id"] == "original_run_123"
+
+    @pytest.mark.asyncio
+    async def test_resume_run_started_has_parent_run_id(self, tmp_path):
+        """resume 后的 RUN_STARTED 事件应包含 parentRunId 指向被中断的运行"""
+        llm = MockLLMClient()
+        llm.responses = [_make_ask_user_response()]
+
+        agent = make_agent(tmp_path, llm=llm, tools=[AskUserQuestionTool()])
+        agent.add_user_message("Help")
+
+        # 第一次运行：触发中断
+        await collect_agui_events(agent, run_id="interrupted_run")
+        interrupt_id = agent._pending_interrupt["interrupt_id"]
+        parent_run_id = agent._pending_interrupt["run_id"]
+
+        assert parent_run_id == "interrupted_run"
+
+        # Resume
+        agent.resume_from_interrupt(interrupt_id, {
+            "Which database should we use?": "PostgreSQL",
+        })
+
+        # 第二次运行：传入 parent_run_id
+        llm.responses = [LLMResponse(content="Using PostgreSQL!", finish_reason="stop")]
+        events, event_types = await collect_agui_events(
+            agent, run_id="resume_run", parent_run_id=parent_run_id,
+        )
+
+        assert "RUN_STARTED" in event_types
+        run_started = [e for e in events if e.type.value == "RUN_STARTED"][0]
+        assert run_started.parent_run_id == "interrupted_run"
+
+    @pytest.mark.asyncio
+    async def test_normal_run_has_no_parent_run_id(self, tmp_path):
+        """普通运行（非 resume）的 RUN_STARTED 不应有 parentRunId"""
+        llm = MockLLMClient()
+        llm.responses = [LLMResponse(content="Hello!", finish_reason="stop")]
+
+        agent = make_agent(tmp_path, llm=llm, tools=[])
+        agent.add_user_message("Hi")
+
+        events, event_types = await collect_agui_events(agent)
+
+        run_started = [e for e in events if e.type.value == "RUN_STARTED"][0]
+        assert run_started.parent_run_id is None
+
+    @pytest.mark.asyncio
+    async def test_interrupt_event_has_required_fields(self, tmp_path):
+        """中断的 RUN_FINISHED 事件应包含 AG-UI 协议要求的所有字段"""
+        llm = MockLLMClient()
+        llm.responses = [_make_ask_user_response()]
+
+        agent = make_agent(tmp_path, llm=llm, tools=[AskUserQuestionTool()])
+        agent.add_user_message("Help")
+
+        events, _ = await collect_agui_events(agent)
+        rf = [e for e in events if e.type.value == "RUN_FINISHED"][0]
+
+        # AG-UI 协议要求
+        assert rf.outcome == "interrupt"
+        assert rf.interrupt is not None
+        assert rf.interrupt.id is not None  # interrupt.id 用于 resume 时回传
+        assert rf.interrupt.reason == "input_required"
+        assert rf.interrupt.payload is not None
+        assert "questions" in rf.interrupt.payload

@@ -35,15 +35,17 @@ class AGUIEventEmitter:
         yield emitter.run_finished()
     """
     
-    def __init__(self, thread_id: str, run_id: str):
+    def __init__(self, thread_id: str, run_id: str, parent_run_id: Optional[str] = None):
         """初始化事件發射器
         
         Args:
             thread_id: 對話線程 ID（等同於 session_id）
             run_id: 運行 ID（等同於 round_id）
+            parent_run_id: 父運行 ID（用於 resume 時關聯被中斷的運行）
         """
         self.thread_id = thread_id
         self.run_id = run_id
+        self.parent_run_id = parent_run_id
         self._sequence = 0
         
         # 流式狀態追蹤
@@ -70,6 +72,7 @@ class AGUIEventEmitter:
         return RunStartedEvent(
             thread_id=self.thread_id,
             run_id=self.run_id,
+            parent_run_id=self.parent_run_id,
         )
     
     def run_finished(self, outcome: str = "success", result: Any = None, interrupt: Any = None) -> RunFinishedEvent:

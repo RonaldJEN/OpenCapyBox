@@ -388,7 +388,7 @@ class MockRegistry:
 # ============== AGUI 事件收集 ==============
 
 
-async def collect_agui_events(agent, *, thread_id="test_thread", run_id="test_run"):
+async def collect_agui_events(agent, *, thread_id="test_thread", run_id="test_run", parent_run_id=None):
     """收集 agent.run_agui 产生的所有事件，返回 (events, event_types)。
 
     用法::
@@ -397,7 +397,7 @@ async def collect_agui_events(agent, *, thread_id="test_thread", run_id="test_ru
         assert "RUN_STARTED" in event_types
     """
     events = []
-    async for event in agent.run_agui(thread_id=thread_id, run_id=run_id):
+    async for event in agent.run_agui(thread_id=thread_id, run_id=run_id, parent_run_id=parent_run_id):
         events.append(event)
     event_types = [e.type.value for e in events]
     return events, event_types

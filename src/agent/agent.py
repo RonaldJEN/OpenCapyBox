@@ -486,6 +486,7 @@ Requirements:
         thread_id: str,
         run_id: str,
         cancel_token: Optional[asyncio.Event] = None,
+        parent_run_id: Optional[str] = None,
     ) -> AsyncIterator[AGUIEvent]:
         """執行 Agent 並輸出 AG-UI 事件流
         
@@ -495,6 +496,7 @@ Requirements:
             thread_id: 對話線程 ID（等同於 session_id）
             run_id: 運行 ID（等同於 round_id）
             cancel_token: 取消令牌，外部調用 .set() 可在下一個檢查點中斷執行
+            parent_run_id: 父運行 ID，用於 resume 時關聯被中斷的運行
             
         Yields:
             AGUIEvent: AG-UI 協議事件
@@ -504,7 +506,7 @@ Requirements:
                 print(f"Event: {event.type}")
         """
         # 初始化事件發射器
-        emitter = AGUIEventEmitter(thread_id, run_id)
+        emitter = AGUIEventEmitter(thread_id, run_id, parent_run_id=parent_run_id)
         
         # 開始日誌記錄
         self.logger.start_new_run()
@@ -819,6 +821,7 @@ Requirements:
                             "interrupt_id": interrupt_id,
                             "tool_call_id": tool_call_id,
                             "questions": questions_payload,
+                            "run_id": run_id,
                         }
 
                         yield emitter.step_finished(step_name)
