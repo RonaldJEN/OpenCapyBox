@@ -797,6 +797,7 @@ class AgentService:
                 "interrupt_id": interrupt_id,
                 "tool_call_id": details.get("tool_call_id"),
                 "questions": questions,
+                "run_id": round_obj.id,
             }
 
         return None
@@ -832,14 +833,22 @@ class AgentService:
 
             resume_user_message = self._format_resume_user_message(answers)
 
+            # 获取被中断运行的 ID，用于 AG-UI 协议的 parentRunId
+            interrupted_run_id: str | None = None
+
             if self.agent.has_pending_interrupt(interrupt_id):
                 # 热恢复：直接替换 ask_user 占位 tool_result
+                pending = self.agent.get_pending_interrupt()
+                if pending:
+                    interrupted_run_id = pending.get("run_id")
                 self.agent.resume_from_interrupt(interrupt_id, answers)
             else:
                 # 冷恢复：内存中断状态已丢失，退化为注入用户回答继续对话
                 persisted_interrupt = self._load_persisted_interrupt(interrupt_id)
                 if not persisted_interrupt:
                     raise ValueError("No pending interrupt to resume from")
+
+                interrupted_run_id = persisted_interrupt.get("run_id")
 
                 logger.warning(
                     "resume 进入冷恢复路径: session=%s, interrupt_id=%s",
@@ -869,6 +878,7 @@ class AgentService:
                 run_id=run_id,
                 user_message=resume_user_message,
                 error_label="Resume 执行失败",
+                parent_run_id=interrupted_run_id,
             ):
                 yield event
 
@@ -877,6 +887,7 @@ class AgentService:
         run_id: str,
         user_message: str,
         error_label: str = "执行失败",
+        parent_run_id: Optional[str] = None,
     ) -> AsyncIterator[AGUIEvent]:
         """共享的 round 事件流处理：追踪状态、持久化事件、完成 round。
 
@@ -886,6 +897,7 @@ class AgentService:
             run_id: 本轮运行 ID
             user_message: 用户消息文本（用于后台任务）
             error_label: 失败时的错误前缀
+            parent_run_id: 父运行 ID（resume 时为被中断的运行 ID）
         """
         final_response: Optional[str] = None
         step_count = 0
@@ -902,6 +914,7 @@ class AgentService:
                 thread_id=self.session_id,
                 run_id=run_id,
                 cancel_token=self.cancel_token,
+                parent_run_id=parent_run_id,
             ):
                 await self.history_service.save_agui_event(run_id, event)
 
