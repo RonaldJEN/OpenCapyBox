@@ -112,35 +112,65 @@ async def startup_event():
     print(f"✅ {settings.app_name} v{settings.app_version} 启动成功")
 
     # 启动 APScheduler 并注册用户 Cron 任务
+    # 多 worker 模式下，使用文件锁确保只有一个 worker 运行 scheduler
     try:
+        import tempfile
+        from filelock import FileLock, Timeout as LockTimeout
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from src.api.services.cron_service import register_user_jobs
         from src.api.models.user_sandbox import UserSandbox
         from src.api.models.database import SessionLocal
 
-        scheduler = AsyncIOScheduler()
-        with SessionLocal() as db:
-            active_users = (
-                db.query(UserSandbox.user_id)
-                .filter(UserSandbox.status == "active")
-                .all()
-            )
-            total_jobs = 0
-            for (uid,) in active_users:
-                total_jobs += register_user_jobs(db, uid, scheduler)
+        lock_path = os.path.join(tempfile.gettempdir(), "opencapybox_scheduler.lock")
+        scheduler_lock = FileLock(lock_path, timeout=0)
 
-        if total_jobs > 0:
-            scheduler.start()
-            app.state.scheduler = scheduler
-            print(f"✅ APScheduler 已启动: {total_jobs} 个 Cron 任务")
+        try:
+            scheduler_lock.acquire(timeout=0)  # 非阻塞，抢不到立即放弃
+        except LockTimeout:
+            app.state.scheduler = None
+            print("ℹ️  另一个 worker 已持有 scheduler 锁，本 worker 跳过调度")
         else:
+            # 本 worker 成为调度主节点
+            app.state._scheduler_lock = scheduler_lock  # 保持引用防止 GC 释放锁
+
+            scheduler = AsyncIOScheduler()
+            with SessionLocal() as db:
+                active_users = (
+                    db.query(UserSandbox.user_id)
+                    .filter(UserSandbox.status == "active")
+                    .all()
+                )
+                total_jobs = 0
+                for (uid,) in active_users:
+                    total_jobs += register_user_jobs(db, uid, scheduler)
+
             scheduler.start()
             app.state.scheduler = scheduler
-            print(f"ℹ️  无活跃 Cron 任务，APScheduler 已就绪")
-    except ImportError:
-        print("⚠️  APScheduler 未安装，Cron 自动调度不可用")
+            if total_jobs > 0:
+                print(f"✅ APScheduler 已启动: {total_jobs} 个 Cron 任务 (调度主节点)")
+            else:
+                print("ℹ️  无活跃 Cron 任务，APScheduler 已就绪 (调度主节点)")
+    except ImportError as e:
+        print(f"⚠️  依赖缺失，Cron 自动调度不可用: {e}")
     except Exception as e:
+        # 若本 worker 已获取锁但启动失败，释放锁让其他 worker 有机会接管
+        lock = getattr(app.state, "_scheduler_lock", None)
+        if lock:
+            lock.release(force=True)
+            app.state._scheduler_lock = None
         print(f"⚠️  Cron 调度注册失败: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """应用关闭时清理 scheduler 和文件锁"""
+    scheduler = getattr(app.state, "scheduler", None)
+    if scheduler:
+        scheduler.shutdown(wait=False)
+        print("✅ APScheduler 已关闭")
+    lock = getattr(app.state, "_scheduler_lock", None)
+    if lock:
+        lock.release(force=True)
 
 
 # 路由
