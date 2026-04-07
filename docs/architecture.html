@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>OpenCapyBox 架构图</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 32px;
+    }
+    h1 {
+      text-align: center;
+      font-size: 22px;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 6px;
+      letter-spacing: 0.05em;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 13px;
+      color: #64748b;
+      margin-bottom: 40px;
+    }
+    .canvas {
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    /* ===== Layout grid ===== */
+    .row {
+      display: flex;
+      align-items: stretch;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+    .col { display: flex; flex-direction: column; gap: 12px; }
+
+    /* ===== Box styles ===== */
+    .box {
+      border-radius: 12px;
+      padding: 20px 22px;
+      border: 1px solid;
+    }
+    .box-title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .box-title .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .tag {
+      font-size: 11px;
+      padding: 3px 9px;
+      border-radius: 100px;
+      white-space: nowrap;
+    }
+    .badge {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      letter-spacing: 0.06em;
+    }
+    .port {
+      font-size: 11px;
+      color: #94a3b8;
+      margin-top: 4px;
+    }
+    .desc {
+      font-size: 12px;
+      color: #94a3b8;
+      margin-top: 4px;
+      line-height: 1.6;
+    }
+
+    /* ===== Color themes ===== */
+    /* Frontend */
+    .frontend {
+      background: #0c1a2e;
+      border-color: #1e40af;
+    }
+    .frontend .box-title { color: #60a5fa; }
+    .frontend .dot { background: #3b82f6; }
+    .frontend .tag { background: #1e3a5f; color: #93c5fd; }
+
+    /* Main Service */
+    .main-svc {
+      background: #0f1d0f;
+      border-color: #166534;
+    }
+    .main-svc .box-title { color: #4ade80; }
+    .main-svc .dot { background: #22c55e; }
+    .main-svc .tag { background: #14532d; color: #86efac; }
+
+    /* Sandbox */
+    .sandbox {
+      background: #1c1009;
+      border-color: #92400e;
+    }
+    .sandbox .box-title { color: #fb923c; }
+    .sandbox .dot { background: #f97316; }
+    .sandbox .tag { background: #431407; color: #fdba74; }
+
+    /* LLM */
+    .llm {
+      background: #150c1e;
+      border-color: #6b21a8;
+    }
+    .llm .box-title { color: #c084fc; }
+    .llm .dot { background: #a855f7; }
+    .llm .tag { background: #3b0764; color: #e9d5ff; }
+
+    /* DB */
+    .db {
+      background: #111827;
+      border-color: #374151;
+    }
+    .db .box-title { color: #9ca3af; }
+    .db .dot { background: #6b7280; }
+    .db .tag { background: #1f2937; color: #d1d5db; }
+
+    /* ===== Arrow / connection section ===== */
+    .arrow-section {
+      position: relative;
+    }
+    svg.arrows {
+      width: 100%;
+      overflow: visible;
+    }
+
+    /* ===== Communication band ===== */
+    .comm-band {
+      border-radius: 12px;
+      padding: 16px 22px;
+      border: 1px dashed;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+    .comm-label {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+    }
+    .comm-item {
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    /* Frontend ↔ Main */
+    .comm-fe-ms {
+      background: #0d1f30;
+      border-color: #1d4ed8;
+    }
+    .comm-fe-ms .comm-label { color: #60a5fa; }
+    .comm-fe-ms .comm-item { background: #1e3a5f; color: #93c5fd; }
+
+    /* Main ↔ Sandbox */
+    .comm-ms-sb {
+      background: #1a1105;
+      border-color: #b45309;
+    }
+    .comm-ms-sb .comm-label { color: #fb923c; }
+    .comm-ms-sb .comm-item { background: #431407; color: #fdba74; }
+
+    /* Main → LLM */
+    .comm-llm {
+      background: #130d1c;
+      border-color: #7e22ce;
+    }
+    .comm-llm .comm-label { color: #c084fc; }
+    .comm-llm .comm-item { background: #3b0764; color: #e9d5ff; }
+
+    /* ===== Section headers ===== */
+    .section-label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #475569;
+      margin-bottom: 10px;
+      padding-left: 4px;
+    }
+
+    /* ===== Separator arrow ===== */
+    .arrow-connector {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #475569;
+      font-size: 18px;
+      min-width: 30px;
+    }
+    .arrow-connector.vertical {
+      flex-direction: column;
+      min-height: 28px;
+      font-size: 16px;
+    }
+
+    /* ===== Subbox ===== */
+    .subbox {
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-top: 8px;
+    }
+    .subbox-title {
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .subbox.agent { background: #152615; border: 1px solid #166534; }
+    .subbox.agent .subbox-title { color: #4ade80; }
+
+    /* ===== Inner layout ===== */
+    .inner-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .inner-item {
+      border-radius: 6px;
+      padding: 7px 10px;
+      font-size: 11px;
+    }
+    .inner-item .label { font-weight: 600; margin-bottom: 3px; }
+    .inner-item .items { color: #94a3b8; line-height: 1.5; }
+
+    .inner-item.green { background: #14532d; color: #86efac; }
+    .inner-item.green .items { color: #4ade80; }
+    .inner-item.orange { background: #431407; color: #fdba74; }
+    .inner-item.orange .items { color: #fb923c; }
+
+    /* ===== AG-UI events showcase ===== */
+    .events-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 8px;
+    }
+    .ev {
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: #1e3a5f;
+      color: #93c5fd;
+      font-family: monospace;
+    }
+    .ev.tool { background: #14532d; color: #86efac; }
+    .ev.state { background: #3b0764; color: #e9d5ff; }
+    .ev.life { background: #431407; color: #fdba74; }
+
+    /* ===== Flex helpers ===== */
+    .flex-1 { flex: 1; }
+    .w-full { width: 100%; }
+
+    /* ===== Two-column top area ===== */
+    .top-grid {
+      display: grid;
+      grid-template-columns: 1fr 2fr 1fr;
+      gap: 24px;
+      align-items: start;
+      margin-bottom: 24px;
+    }
+
+    /* ===== Responsive ===== */
+    @media (max-width: 768px) {
+      .top-grid { grid-template-columns: 1fr; }
+      .row { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+<div class="canvas">
+  <h1>OpenCapyBox 系统架构</h1>
+  <p class="subtitle">主服务 &amp; 沙箱双应用架构 · 通信协议概览</p>
+
+  <!-- ===== TOP ROW: Frontend | Main Service | Sandbox ===== -->
+  <div class="top-grid">
+
+    <!-- Frontend -->
+    <div class="box frontend">
+      <div class="box-title"><span class="dot"></span>前端应用</div>
+      <div class="port">React 18 + TypeScript · Vite · Port 3000</div>
+      <div class="tag-row">
+        <span class="tag">Chat UI</span>
+        <span class="tag">Session 管理</span>
+        <span class="tag">SSE 流解析</span>
+        <span class="tag">Agent 配置编辑</span>
+        <span class="tag">Cron 看板</span>
+        <span class="tag">文件浏览</span>
+      </div>
+    </div>
+
+    <!-- Main Service -->
+    <div class="box main-svc">
+      <div class="box-title"><span class="dot"></span>主服务（Main Service）</div>
+      <div class="port">FastAPI + SQLAlchemy · Port 8000</div>
+
+      <!-- Agent Core subbox -->
+      <div class="subbox agent">
+        <div class="subbox-title">Agent Core — 推理引擎</div>
+        <div class="inner-grid">
+          <div class="inner-item green">
+            <div class="label">LLM 循环</div>
+            <div class="items">多步推理 · 工具调用 · 思维链</div>
+          </div>
+          <div class="inner-item green">
+            <div class="label">Event Emitter</div>
+            <div class="items">AG-UI 事件生成 · SSE 广播</div>
+          </div>
+          <div class="inner-item green">
+            <div class="label">工具集（15+）</div>
+            <div class="items">Bash · 文件 · 记忆 · 搜索 · Cron</div>
+          </div>
+          <div class="inner-item green">
+            <div class="label">技能库（40+）</div>
+            <div class="items">动态加载 · Git Submodule</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tag-row" style="margin-top:10px;">
+        <span class="tag">AgentPoolService — TTL 缓存</span>
+        <span class="tag">MemoryService — BM25 + 向量检索</span>
+        <span class="tag">CronService — APScheduler</span>
+        <span class="tag">JWT 鉴权</span>
+        <span class="tag">SQLite 持久化</span>
+      </div>
+    </div>
+
+    <!-- Sandbox -->
+    <div class="box sandbox">
+      <div class="box-title"><span class="dot"></span>沙箱（OpenSandbox）</div>
+      <div class="port">容器化执行环境 · 每用户独立实例</div>
+
+      <div class="desc">沙箱文件系统：</div>
+      <div class="tag-row" style="margin-top:6px;">
+        <span class="tag">SOUL.md</span>
+        <span class="tag">USER.md</span>
+        <span class="tag">MEMORY.md</span>
+        <span class="tag">HEARTBEAT.md</span>
+        <span class="tag">sessions/{id}/</span>
+        <span class="tag">skills/</span>
+      </div>
+
+      <div class="desc" style="margin-top:10px;">执行能力：</div>
+      <div class="tag-row" style="margin-top:6px;">
+        <span class="tag">Shell 命令执行</span>
+        <span class="tag">文件读写</span>
+        <span class="tag">后台进程管理</span>
+        <span class="tag">会话隔离目录</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== COMMUNICATION BANDS ===== -->
+  <div class="section-label">通信协议</div>
+
+  <!-- Frontend ↔ Main Service -->
+  <div class="comm-band comm-fe-ms" style="margin-bottom:12px;">
+    <div class="comm-label">前端 ↔ 主服务</div>
+    <div class="comm-item">
+      <span>📡</span> SSE 流（AG-UI 协议）
+    </div>
+    <div class="comm-item">
+      <span>🔗</span> REST API
+    </div>
+    <div class="comm-item">
+      <span>🔑</span> JWT Bearer Token
+    </div>
+    <div class="comm-item" style="background:#1e3a5f; color:#93c5fd; font-family:monospace; font-size:11px;">
+      POST /api/chat/{session_id}/message/stream
+    </div>
+    <div class="comm-item">断线重连 · lastSequence 续传</div>
+  </div>
+
+  <!-- AG-UI Events -->
+  <div style="margin-bottom:14px; padding: 14px 18px; background:#0d1520; border:1px solid #1e3a5f; border-radius:10px;">
+    <div style="font-size:12px; font-weight:600; color:#60a5fa; margin-bottom:8px;">AG-UI 事件类型（22 种，经 SSE 流式推送）</div>
+    <div class="events-grid">
+      <span class="ev life">RUN_STARTED</span>
+      <span class="ev life">RUN_FINISHED</span>
+      <span class="ev life">RUN_ERROR</span>
+      <span class="ev life">STEP_STARTED</span>
+      <span class="ev life">STEP_FINISHED</span>
+      <span class="ev">TEXT_MESSAGE_START</span>
+      <span class="ev">TEXT_MESSAGE_CONTENT</span>
+      <span class="ev">TEXT_MESSAGE_END</span>
+      <span class="ev">THINKING_TEXT_MESSAGE_START</span>
+      <span class="ev">THINKING_TEXT_MESSAGE_CONTENT</span>
+      <span class="ev">THINKING_TEXT_MESSAGE_END</span>
+      <span class="ev tool">TOOL_CALL_START</span>
+      <span class="ev tool">TOOL_CALL_ARGS</span>
+      <span class="ev tool">TOOL_CALL_END</span>
+      <span class="ev tool">TOOL_CALL_RESULT</span>
+      <span class="ev state">STATE_SNAPSHOT</span>
+      <span class="ev state">STATE_DELTA</span>
+      <span class="ev state">MESSAGES_SNAPSHOT</span>
+      <span class="ev state">ACTIVITY_SNAPSHOT</span>
+      <span class="ev state">ACTIVITY_DELTA</span>
+      <span class="ev">CUSTOM</span>
+      <span class="ev">RAW</span>
+    </div>
+    <div style="margin-top:8px; font-size:11px; color:#475569;">
+      <span style="color:#fb923c">■</span> 生命周期 &nbsp;
+      <span style="color:#93c5fd">■</span> 消息文本 &nbsp;
+      <span style="color:#86efac">■</span> 工具调用 &nbsp;
+      <span style="color:#e9d5ff">■</span> 状态同步
+    </div>
+  </div>
+
+  <!-- Main Service ↔ Sandbox -->
+  <div class="comm-band comm-ms-sb" style="margin-bottom:12px;">
+    <div class="comm-label">主服务 ↔ 沙箱</div>
+    <div class="comm-item">🐚 BashTool — Shell 命令执行</div>
+    <div class="comm-item">📁 FileTool — 文件读写</div>
+    <div class="comm-item">⚙️ SandboxService REST API</div>
+    <div class="comm-item">创建 / 暂停 / 恢复 / 销毁沙箱实例</div>
+    <div class="comm-item">技能文件同步推送</div>
+  </div>
+
+  <!-- Main → LLM -->
+  <div class="comm-band comm-llm" style="margin-bottom:24px;">
+    <div class="comm-label">主服务 → LLM 提供商</div>
+    <div class="comm-item">OpenAI Protocol</div>
+    <div class="comm-item">Anthropic Protocol</div>
+    <div class="comm-item">models.yaml 声明式配置 · 热切换</div>
+  </div>
+
+  <!-- ===== BOTTOM ROW: DB + LLM Providers ===== -->
+  <div class="row">
+    <!-- DB -->
+    <div class="box db flex-1">
+      <div class="box-title"><span class="dot"></span>数据持久化（SQLite）</div>
+      <div class="tag-row">
+        <span class="tag">sessions — 会话</span>
+        <span class="tag">rounds — 对话轮次</span>
+        <span class="tag">agui_events — 事件日志</span>
+        <span class="tag">user_memory — 记忆文件</span>
+        <span class="tag">user_sandbox — 沙箱映射</span>
+        <span class="tag">cron_job — 定时任务</span>
+      </div>
+    </div>
+
+    <!-- LLM Providers -->
+    <div class="box llm flex-1">
+      <div class="box-title"><span class="dot"></span>LLM 提供商</div>
+      <div class="tag-row">
+        <span class="tag">Qwen（通义千问）</span>
+        <span class="tag">GLM（智谱清言）</span>
+        <span class="tag">Kimi（月之暗面）</span>
+        <span class="tag">DeepSeek</span>
+        <span class="tag">MiniMax</span>
+        <span class="tag">Claude（Anthropic）</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== FLOW DIAGRAM ===== -->
+  <div class="section-label">一次完整对话的数据流</div>
+  <div style="background:#0d1117; border:1px solid #1e293b; border-radius:12px; padding:20px 24px; overflow-x:auto;">
+    <div style="min-width:600px;">
+      <!-- Steps -->
+      <div style="display:flex; align-items:center; gap:0; flex-wrap:nowrap;">
+
+        <div style="text-align:center; min-width:110px;">
+          <div style="background:#1e3a5f; color:#93c5fd; border-radius:8px; padding:8px 10px; font-size:12px; font-weight:600;">① 用户发送</div>
+          <div style="font-size:10px; color:#475569; margin-top:4px;">前端</div>
+        </div>
+
+        <div style="flex:1; height:2px; background:linear-gradient(to right,#1e3a5f,#166534); min-width:24px;"></div>
+        <div style="color:#60a5fa; font-size:10px; white-space:nowrap; padding:0 4px;">REST POST</div>
+        <div style="flex:1; height:2px; background:linear-gradient(to right,#1e3a5f,#166534); min-width:24px;"></div>
+
+        <div style="text-align:center; min-width:120px;">
+          <div style="background:#14532d; color:#86efac; border-radius:8px; padding:8px 10px; font-size:12px; font-weight:600;">② Agent 推理</div>
+          <div style="font-size:10px; color:#475569; margin-top:4px;">主服务</div>
+        </div>
+
+        <div style="flex:1; height:2px; background:linear-gradient(to right,#166534,#92400e); min-width:24px;"></div>
+        <div style="color:#fb923c; font-size:10px; white-space:nowrap; padding:0 4px;">Bash/File API</div>
+        <div style="flex:1; height:2px; background:linear-gradient(to right,#166534,#92400e); min-width:24px;"></div>
+
+        <div style="text-align:center; min-width:100px;">
+          <div style="background:#431407; color:#fdba74; border-radius:8px; padding:8px 10px; font-size:12px; font-weight:600;">③ 沙箱执行</div>
+          <div style="font-size:10px; color:#475569; margin-top:4px;">OpenSandbox</div>
+        </div>
+
+        <div style="flex:1; height:2px; background:linear-gradient(to right,#92400e,#166534); min-width:24px;"></div>
+        <div style="color:#fb923c; font-size:10px; white-space:nowrap; padding:0 4px;">执行结果</div>
+        <div style="flex:1; height:2px; background:linear-gradient(to right,#92400e,#166534); min-width:24px;"></div>
+
+        <div style="text-align:center; min-width:120px;">
+          <div style="background:#3b0764; color:#e9d5ff; border-radius:8px; padding:8px 10px; font-size:12px; font-weight:600;">④ LLM 决策</div>
+          <div style="font-size:10px; color:#475569; margin-top:4px;">继续/结束</div>
+        </div>
+
+        <div style="flex:1; height:2px; background:linear-gradient(to right,#3b0764,#1e3a5f); min-width:24px;"></div>
+        <div style="color:#60a5fa; font-size:10px; white-space:nowrap; padding:0 4px;">SSE AG-UI</div>
+        <div style="flex:1; height:2px; background:linear-gradient(to right,#3b0764,#1e3a5f); min-width:24px;"></div>
+
+        <div style="text-align:center; min-width:110px;">
+          <div style="background:#1e3a5f; color:#93c5fd; border-radius:8px; padding:8px 10px; font-size:12px; font-weight:600;">⑤ 实时渲染</div>
+          <div style="font-size:10px; color:#475569; margin-top:4px;">前端流式展示</div>
+        </div>
+
+      </div>
+
+      <div style="margin-top:12px; font-size:11px; color:#475569; text-align:center;">
+        步骤 ②③④ 可循环多轮（多步工具调用），直到 Agent 判断任务完成，发送 RUN_FINISHED 事件结束本轮
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:32px; text-align:center; font-size:11px; color:#334155;">
+    OpenCapyBox Architecture · 2025
+  </div>
+</div>
+</body>
+</html>
