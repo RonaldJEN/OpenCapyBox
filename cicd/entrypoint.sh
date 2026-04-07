@@ -24,7 +24,7 @@ BACKEND_PID=$!
 # 等待后端就绪
 echo "[INFO] 等待后端就绪..."
 for i in $(seq 1 30); do
-    if curl -sf http://127.0.0.1:8000/api/v1/docs > /dev/null 2>&1; then
+    if curl -sf http://127.0.0.1:8000/api/docs > /dev/null 2>&1; then
         echo "[INFO] 后端已就绪"
         break
     fi
