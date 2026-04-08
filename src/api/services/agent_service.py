@@ -78,7 +78,16 @@ class AgentService:
                 "创建 LLM 客户端: model=%s, provider=%s, api_base=%s",
                 model_config.model_name, model_config.provider, model_config.api_base,
             )
-            llm_client = LLMClient.from_model_config(model_config)
+
+            # 收集 fallback 模型（排除當前主模型，按 YAML 順序）
+            fallback_configs = [
+                m for m in registry.list_models(enabled_only=True)
+                if m.id != model_config.id
+            ]
+            llm_client = LLMClient.from_model_config(
+                model_config,
+                fallback_configs=fallback_configs,
+            )
 
         except FileNotFoundError as e:
             # Registry 本身加載失敗（找不到 models.yaml）→ 走 .env fallback
@@ -641,6 +650,7 @@ class AgentService:
         role: str,
         content: Any,
         round_id: str | None = None,
+        token_count: int | None = None,
     ) -> None:
         """向 conversation_messages 表持久化一條消息。
 
@@ -660,6 +670,7 @@ class AgentService:
             sequence=self._next_sequence,
             role=role,
             content=content_str,
+            token_count=token_count,
         )
         db.add(msg)
         try:
@@ -910,7 +921,12 @@ class AgentService:
                 elif event.type == EventType.TEXT_MESSAGE_END:
                     final_response = accumulated_content
                     if accumulated_content:
-                        self._save_conversation_message("assistant", accumulated_content, round_id=run_id)
+                        # Extract token count from LLM usage if available
+                        tc = None
+                        usage = getattr(self.agent, 'last_llm_usage', None)
+                        if usage:
+                            tc = usage.total_tokens or None
+                        self._save_conversation_message("assistant", accumulated_content, round_id=run_id, token_count=tc)
                     accumulated_content = ""
                 elif event.type == EventType.TOOL_CALL_START:
                     tool_name = getattr(event, "tool_call_name", "")

@@ -16,8 +16,8 @@ class TestRetryConfig:
         """測試默認配置"""
         config = RetryConfig()
         assert config.enabled is True
-        assert config.max_retries == 3
-        assert config.initial_delay == 1.0
+        assert config.max_retries == 2
+        assert config.initial_delay == 0.5
         assert config.max_delay == 60.0
         assert config.exponential_base == 2.0
         assert config.retryable_exceptions == (Exception,)

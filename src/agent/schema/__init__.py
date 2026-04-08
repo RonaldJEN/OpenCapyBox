@@ -6,6 +6,7 @@ from .schema import (
     LLMResponse,
     Message,
     ToolCall,
+    TokenUsage,
 )
 
 from .agui_events import (
@@ -63,6 +64,7 @@ __all__ = [
     "LLMResponse",
     "Message",
     "ToolCall",
+    "TokenUsage",
     # AG-UI 事件類型
     "EventType",
     "AGUIEvent",

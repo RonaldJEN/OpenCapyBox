@@ -1,5 +1,6 @@
 """OpenAI LLM client implementation."""
 
+import asyncio
 import json
 import logging
 import uuid
@@ -9,10 +10,15 @@ from openai import AsyncOpenAI
 
 from ..retry import RetryConfig, async_retry
 from ..schema import FunctionCall, LLMResponse, Message, ToolCall
+from ..schema.schema import TokenUsage
 from .base import LLMClientBase
 from .json_parser import robust_json_parse
 
 logger = logging.getLogger(__name__)
+
+# 流式响应中单个 chunk 的最大等待时间（秒）
+# 超过此时间无新 chunk 到达，视为 LLM 无响应，触发重试
+STREAM_CHUNK_TIMEOUT = 30
 
 
 class OpenAIClient(LLMClientBase):
@@ -115,7 +121,7 @@ class OpenAIClient(LLMClientBase):
             logger.error(f"API response has empty choices array. Response: {response}")
             raise ValueError("API response has empty choices array")
 
-        return response.choices[0].message
+        return response
 
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
         """Convert tools to OpenAI format.
@@ -249,33 +255,45 @@ class OpenAIClient(LLMClientBase):
         """Parse OpenAI response into LLMResponse.
 
         Args:
-            response: OpenAI ChatCompletionMessage response
+            response: OpenAI ChatCompletion response (full response object)
 
         Returns:
             LLMResponse object
         """
+        # Extract message from full ChatCompletion response
+        message = response.choices[0].message if hasattr(response, 'choices') else response
+
+        # Extract usage from full response
+        usage = None
+        if hasattr(response, 'usage') and response.usage:
+            usage = TokenUsage(
+                prompt_tokens=getattr(response.usage, 'prompt_tokens', 0) or 0,
+                completion_tokens=getattr(response.usage, 'completion_tokens', 0) or 0,
+                total_tokens=getattr(response.usage, 'total_tokens', 0) or 0,
+            )
+
         # Extract text content
-        text_content = response.content or ""
+        text_content = message.content or ""
 
         # Extract thinking content - support both MiniMax and GLM formats
         thinking_content = ""
 
         # Method 1: GLM format - reasoning_content (string)
-        if hasattr(response, "reasoning_content") and response.reasoning_content:
-            thinking_content = response.reasoning_content
+        if hasattr(message, "reasoning_content") and message.reasoning_content:
+            thinking_content = message.reasoning_content
             logger.debug("Extracted reasoning from reasoning_content (GLM format)")
 
         # Method 2: MiniMax format - reasoning_details (list)
-        elif hasattr(response, "reasoning_details") and response.reasoning_details:
-            for detail in response.reasoning_details:
+        elif hasattr(message, "reasoning_details") and message.reasoning_details:
+            for detail in message.reasoning_details:
                 if hasattr(detail, "text"):
                     thinking_content += detail.text
             logger.debug("Extracted reasoning from reasoning_details (MiniMax format)")
 
         # Extract tool calls
         tool_calls = []
-        if response.tool_calls:
-            for i, tool_call in enumerate(response.tool_calls):
+        if message.tool_calls:
+            for i, tool_call in enumerate(message.tool_calls):
                 # Parse arguments from JSON string
                 arguments = json.loads(tool_call.function.arguments)
 
@@ -297,7 +315,8 @@ class OpenAIClient(LLMClientBase):
             content=text_content,
             thinking=thinking_content if thinking_content else None,
             tool_calls=tool_calls if tool_calls else None,
-            finish_reason="stop",  # OpenAI doesn't provide finish_reason in the message
+            finish_reason="stop",
+            usage=usage,
         )
 
     async def generate(
@@ -362,12 +381,33 @@ class OpenAIClient(LLMClientBase):
         thinking_content = ""
         tool_calls_dict = {}  # Map tool call index to accumulated data
         finish_reason = "stop"
+        usage_data = None
 
         # Use OpenAI SDK's streaming API
         # Note: create() returns a coroutine that needs to be awaited to get the stream
         stream = await self.client.chat.completions.create(**params)
 
-        async for chunk in stream:
+        chunk_iter = stream.__aiter__()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(chunk_iter.__anext__(), timeout=STREAM_CHUNK_TIMEOUT)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "LLM stream chunk timeout (%ds no data), will retry. model=%s",
+                    STREAM_CHUNK_TIMEOUT, self.model,
+                )
+                # 显式关闭底层 HTTP 连接，避免资源泄露
+                await stream.close()
+                raise TimeoutError(
+                    f"LLM stream stalled: no data received for {STREAM_CHUNK_TIMEOUT}s"
+                )
+
+            # Capture usage from final chunk (when stream_options include_usage is set)
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage_data = chunk.usage
+
             if not chunk.choices:
                 continue
 
@@ -496,11 +536,21 @@ class OpenAIClient(LLMClientBase):
                 )
             )
 
+        # Build usage
+        usage = None
+        if usage_data:
+            usage = TokenUsage(
+                prompt_tokens=getattr(usage_data, 'prompt_tokens', 0) or 0,
+                completion_tokens=getattr(usage_data, 'completion_tokens', 0) or 0,
+                total_tokens=getattr(usage_data, 'total_tokens', 0) or 0,
+            )
+
         return LLMResponse(
             content=text_content,
             thinking=thinking_content if thinking_content else None,
             tool_calls=tool_calls if tool_calls else None,
             finish_reason=finish_reason,
+            usage=usage,
         )
 
     async def generate_stream(
@@ -530,6 +580,7 @@ class OpenAIClient(LLMClientBase):
             "messages": request_params["api_messages"],
             "max_tokens": self.max_tokens,
             "stream": True,  # Enable streaming
+            "stream_options": {"include_usage": True},
         }
 
         # Add reasoning params from ModelConfig (no more model.startswith() branching)

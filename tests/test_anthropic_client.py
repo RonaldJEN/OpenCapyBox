@@ -38,14 +38,14 @@ class MockContentBlock:
 @pytest.fixture
 def anthropic_client():
     """基础 AnthropicClient"""
-    with patch('anthropic.Anthropic'):
+    with patch('anthropic.AsyncAnthropic'):
         return AnthropicClient(api_key="test-key")
 
 
 @pytest.fixture
 def anthropic_client_with_mock():
     """AnthropicClient + client.client = MagicMock()（用于 API 请求测试）"""
-    with patch('anthropic.Anthropic'):
+    with patch('anthropic.AsyncAnthropic'):
         client = AnthropicClient(api_key="test-key")
         client.client = MagicMock()
         return client
@@ -56,7 +56,7 @@ class TestAnthropicClientInit:
 
     def test_client_initialization(self):
         """測試客戶端初始化"""
-        with patch('anthropic.Anthropic') as mock_anthropic:
+        with patch('anthropic.AsyncAnthropic') as mock_anthropic:
             client = AnthropicClient(
                 api_key="test-key",
                 api_base="https://api.example.com",
@@ -69,7 +69,7 @@ class TestAnthropicClientInit:
 
     def test_client_with_retry_config(self):
         """測試帶重試配置的客戶端初始化"""
-        with patch('anthropic.Anthropic'):
+        with patch('anthropic.AsyncAnthropic'):
             retry_config = RetryConfig(max_retries=5, initial_delay=2.0)
             client = AnthropicClient(
                 api_key="test-key",
@@ -81,7 +81,7 @@ class TestAnthropicClientInit:
 
     def test_client_default_values(self):
         """測試客戶端默認值"""
-        with patch('anthropic.Anthropic'):
+        with patch('anthropic.AsyncAnthropic'):
             client = AnthropicClient(api_key="test-key")
 
             assert "minimaxi" in client.api_base.lower() or "anthropic" in client.api_base.lower()
@@ -288,7 +288,7 @@ class TestAnthropicClientMakeRequest:
         mock_response = MockAnthropicResponse(
             content=[MockContentBlock("text", text="Hello!")]
         )
-        client.client.messages.create = MagicMock(return_value=mock_response)
+        client.client.messages.create = AsyncMock(return_value=mock_response)
 
         result = await client._make_api_request(
             system_message="System",
@@ -305,7 +305,7 @@ class TestAnthropicClientMakeRequest:
         mock_response = MockAnthropicResponse(
             content=[MockContentBlock("text", text="Using tool")]
         )
-        client.client.messages.create = MagicMock(return_value=mock_response)
+        client.client.messages.create = AsyncMock(return_value=mock_response)
 
         tools = [{"name": "test", "description": "Test", "input_schema": {}}]
 
@@ -405,7 +405,7 @@ class TestAnthropicClientGenerate:
         mock_response = MockAnthropicResponse(
             content=[MockContentBlock("text", text="Generated text")]
         )
-        client.client.messages.create = MagicMock(return_value=mock_response)
+        client.client.messages.create = AsyncMock(return_value=mock_response)
 
         messages = [
             Message(role="user", content="Hello")
@@ -423,7 +423,7 @@ class TestAnthropicClientGenerate:
         mock_response = MockAnthropicResponse(
             content=[MockContentBlock("text", text="Response")]
         )
-        client.client.messages.create = MagicMock(return_value=mock_response)
+        client.client.messages.create = AsyncMock(return_value=mock_response)
 
         messages = [
             Message(role="system", content="You are helpful."),
@@ -453,7 +453,7 @@ class TestAnthropicClientGenerate:
             ],
             stop_reason="tool_use"
         )
-        client.client.messages.create = MagicMock(return_value=mock_response)
+        client.client.messages.create = AsyncMock(return_value=mock_response)
 
         tool = MockTool(name="test_tool")
 

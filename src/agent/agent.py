@@ -2,6 +2,7 @@
 
 import json
 import asyncio
+import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -18,8 +19,10 @@ from .tools.ask_user_tool import ASK_USER_TOOL_NAME
 from .utils import calculate_display_width
 from .event_emitter import AGUIEventEmitter
 from .schema.agui_events import (
-    AGUIEvent, AgentState, EventType, InterruptDetails,
+    AGUIEvent, AgentState, CustomEvent, EventType, InterruptDetails,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ANSI color codes
@@ -145,6 +148,9 @@ class Agent:
         # 🔥 Token缓存优化
         self._cached_token_count = 0
         self._cached_message_count = 0
+
+        # LLM 返回的真实 token 用量（每次 LLM 调用后更新）
+        self.last_llm_usage = None
 
         # 记忆刷新标记（每次 compaction 周期内最多触发一次）
         self._memory_flushed_this_compaction = False
@@ -566,6 +572,9 @@ Requirements:
                 event_queue = asyncio.Queue()
                 SENTINEL = object()
 
+                # 重置 usage，防止取消时读到上一轮的陈旧值
+                self.last_llm_usage = None
+
                 thinking_started = False
                 message_started = False
 
@@ -587,6 +596,23 @@ Requirements:
                     if event:
                         await event_queue.put(event)
 
+                async def on_failover_reset(model_id: str):
+                    """Failover 前重置流式狀態，避免前端收到重複內容"""
+                    nonlocal thinking_started, message_started
+                    if thinking_started:
+                        await event_queue.put(emitter.thinking_end())
+                        thinking_started = False
+                    if message_started:
+                        await event_queue.put(emitter.text_message_end())
+                        message_started = False
+                    await event_queue.put(CustomEvent(
+                        name="failover_reset",
+                        value={"model": model_id},
+                    ))
+                    logger.info("Failover reset: 已通知前端重置流式狀態 (next model: %s)", model_id)
+
+                self.llm.failover_notify = on_failover_reset
+
                 async def producer():
                     try:
                         return await self.llm.generate_stream(
@@ -603,13 +629,54 @@ Requirements:
                 # 启动生产者任务
                 producer_task = asyncio.create_task(producer())
 
-                # 消费循环
+                # 消费循环（带 cancel_token 检查，可在 LLM 调用期间响应取消）
+                cancelled_during_llm = False
+
+                # 构建 cancel 等待 future（如果有 cancel_token）
+                cancel_future: asyncio.Future | None = None
+                if cancel_token:
+                    cancel_future = asyncio.ensure_future(cancel_token.wait())
+
                 while True:
-                    item = await event_queue.get()
+                    get_task = asyncio.ensure_future(event_queue.get())
+                    wait_set: set[asyncio.Future] = {get_task}
+                    if cancel_future and not cancel_future.done():
+                        wait_set.add(cancel_future)
+
+                    done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+
+                    if cancel_future in done:
+                        # 用户取消
+                        get_task.cancel()
+                        cancelled_during_llm = True
+                        producer_task.cancel()
+                        try:
+                            await producer_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        break
+
+                    # queue.get() 完成
+                    item = get_task.result()
                     if item is SENTINEL:
                         break
                     if isinstance(item, AGUIEvent):
                         yield item
+
+                # 清理未使用的 cancel_future
+                if cancel_future and not cancel_future.done():
+                    cancel_future.cancel()
+
+                # 如果是 LLM 调用期间被用户取消
+                if cancelled_during_llm:
+                    logger.info("⏹️  用戶取消了執行 (LLM 調用期間)")
+                    if thinking_started:
+                        yield emitter.thinking_end()
+                    if message_started:
+                        yield emitter.text_message_end()
+                    yield emitter.step_finished(step_name)
+                    yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
+                    return
 
                 # 获取最终结果
                 result = await producer_task
@@ -630,6 +697,9 @@ Requirements:
                     return
 
                 response = result
+
+                # 记录 LLM 返回的 token 用量
+                self.last_llm_usage = response.usage
 
                 # 記錄 LLM 響應
                 self.logger.log_response(

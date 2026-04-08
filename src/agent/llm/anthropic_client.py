@@ -1,5 +1,6 @@
 """Anthropic LLM client implementation."""
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -8,10 +9,15 @@ import anthropic
 
 from ..retry import RetryConfig, async_retry
 from ..schema import FunctionCall, LLMResponse, Message, ToolCall
+from ..schema.schema import TokenUsage
 from .base import LLMClientBase
 from .json_parser import robust_json_parse
 
 logger = logging.getLogger(__name__)
+
+# 流式响应中单个事件的最大等待时间（秒）
+# 超过此时间无新事件到达，视为 LLM 无响应，触发重试
+STREAM_EVENT_TIMEOUT = 30
 
 
 class AnthropicClient(LLMClientBase):
@@ -43,11 +49,24 @@ class AnthropicClient(LLMClientBase):
         super().__init__(api_key, api_base, model, retry_config)
         self.max_tokens = max_tokens
 
-        # Initialize Anthropic client
-        self.client = anthropic.Anthropic(
+        # Initialize async Anthropic client (non-blocking for asyncio event loop)
+        self.client = anthropic.AsyncAnthropic(
             base_url=api_base,
             api_key=api_key,
         )
+
+    @staticmethod
+    def _extract_usage(response: Any):
+        """Extract token usage from Anthropic response."""
+        if hasattr(response, 'usage') and response.usage:
+            input_tokens = getattr(response.usage, 'input_tokens', 0) or 0
+            output_tokens = getattr(response.usage, 'output_tokens', 0) or 0
+            return TokenUsage(
+                prompt_tokens=input_tokens,
+                completion_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+            )
+        return None
 
     async def _make_api_request(
         self,
@@ -80,8 +99,8 @@ class AnthropicClient(LLMClientBase):
         if tools:
             params["tools"] = self._convert_tools(tools)
 
-        # Use Anthropic SDK's messages.create
-        response = self.client.messages.create(**params)
+        # Use Anthropic async SDK's messages.create
+        response = await self.client.messages.create(**params)
         return response
 
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
@@ -240,6 +259,7 @@ class AnthropicClient(LLMClientBase):
             thinking=thinking_content if thinking_content else None,
             tool_calls=tool_calls if tool_calls else None,
             finish_reason=response.stop_reason or "stop",
+            usage=self._extract_usage(response),
         )
 
     async def generate(
@@ -306,9 +326,28 @@ class AnthropicClient(LLMClientBase):
         thinking_content = ""
         tool_calls = []
 
-        # Use streaming API
-        with self.client.messages.stream(**params) as stream:
-            for event in stream:
+        # Use async streaming API (non-blocking for asyncio event loop)
+        async with self.client.messages.stream(**params) as stream:
+            event_iter = stream.__aiter__()
+            while True:
+                try:
+                    event = await asyncio.wait_for(event_iter.__anext__(), timeout=STREAM_EVENT_TIMEOUT)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Anthropic stream event timeout (%ds no data), will retry. model=%s",
+                        STREAM_EVENT_TIMEOUT, self.model,
+                    )
+                    # 立即關閉底層 HTTP 連接，避免 __aexit__ 嘗試讀取殘餘數據而阻塞
+                    try:
+                        await stream.close()
+                    except Exception:
+                        pass
+                    raise TimeoutError(
+                        f"Anthropic stream stalled: no data received for {STREAM_EVENT_TIMEOUT}s"
+                    )
+
                 # Handle different event types
                 if event.type == "content_block_start":
                     block = event.content_block
@@ -378,7 +417,7 @@ class AnthropicClient(LLMClientBase):
                                 last_tool["input"] = parsed_input
 
         # Get final message for finish_reason
-        final_message = stream.get_final_message()
+        final_message = await stream.get_final_message()
 
         # Convert tool_calls to ToolCall objects
         parsed_tool_calls = []
@@ -411,6 +450,7 @@ class AnthropicClient(LLMClientBase):
             thinking=thinking_content if thinking_content else None,
             tool_calls=parsed_tool_calls if parsed_tool_calls else None,
             finish_reason=final_message.stop_reason or "stop",
+            usage=self._extract_usage(final_message),
         )
 
     async def generate_stream(

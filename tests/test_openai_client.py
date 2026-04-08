@@ -383,7 +383,7 @@ class TestAPIRequest:
 
         result = await openai_client_with_reasoning._make_api_request([{"role": "user", "content": "test"}])
 
-        assert result == mock_message
+        assert result == mock_response
 
     @pytest.mark.asyncio
     async def test_api_request_with_tools(self, openai_client_with_reasoning):

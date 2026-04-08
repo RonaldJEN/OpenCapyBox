@@ -26,8 +26,8 @@ class RetryConfig:
     def __init__(
         self,
         enabled: bool = True,
-        max_retries: int = 3,
-        initial_delay: float = 1.0,
+        max_retries: int = 2,
+        initial_delay: float = 0.5,
         max_delay: float = 60.0,
         exponential_base: float = 2.0,
         retryable_exceptions: tuple[Type[Exception], ...] = (Exception,),
@@ -35,8 +35,8 @@ class RetryConfig:
         """
         Args:
             enabled: Whether to enable retry mechanism
-            max_retries: Maximum number of retries
-            initial_delay: Initial delay time (seconds)
+            max_retries: Maximum number of retries (default 2 for fast failover)
+            initial_delay: Initial delay time (seconds, default 0.5 for fast failover)
             max_delay: Maximum delay time (seconds)
             exponential_base: Exponential backoff base
             retryable_exceptions: Tuple of retryable exception types

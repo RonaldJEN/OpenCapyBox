@@ -37,6 +37,14 @@ class Message(BaseModel):
     name: str | None = None  # For tool role
 
 
+class TokenUsage(BaseModel):
+    """Token usage statistics from LLM API."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
 class LLMResponse(BaseModel):
     """LLM response."""
 
@@ -44,3 +52,4 @@ class LLMResponse(BaseModel):
     thinking: str | None = None  # Extended thinking blocks
     tool_calls: list[ToolCall] | None = None
     finish_reason: str
+    usage: TokenUsage | None = None
