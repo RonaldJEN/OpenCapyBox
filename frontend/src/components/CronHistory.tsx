@@ -25,6 +25,10 @@ const CronHistory: React.FC<Props> = ({ onClose }) => {
   const [loading, setLoading] = useState(false);
   const [triggering, setTriggering] = useState<string | null>(null);
   const [tab, setTab] = useState<'tasks' | 'history'>('tasks');
+  const [notice, setNotice] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
 
   // 加载数据
   useEffect(() => {
@@ -44,17 +48,32 @@ const CronHistory: React.FC<Props> = ({ onClose }) => {
     getCronRuns(selectedJob).then(setRuns).catch(console.error);
   }, [selectedJob]);
 
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), 2500);
+    return () => clearTimeout(timer);
+  }, [notice]);
+
   const handleTrigger = async (name: string) => {
     setTriggering(name);
     try {
-      await triggerCronJob(name);
-      // 通知 ChatV2 立即刷新
+      const result = await triggerCronJob(name);
+      setNotice({
+        type: 'success',
+        text: result.message || `任务 ${name} 已提交后台执行`,
+      });
+
+      // 通知 ChatV2 尝试即时刷新（若尚未完成，轮询会在后续检测到）
       window.dispatchEvent(new CustomEvent('cron-job-done'));
-      // 刷新历史
+
+      // 稍等后刷新历史，让 running 记录有时间落库
+      await new Promise((resolve) => setTimeout(resolve, 400));
       const newRuns = await getCronRuns(selectedJob);
       setRuns(newRuns);
     } catch (err) {
       console.error('触发失败:', err);
+      const message = err instanceof Error ? err.message : '提交任务失败';
+      setNotice({ type: 'error', text: message });
     } finally {
       setTriggering(null);
     }
@@ -76,6 +95,20 @@ const CronHistory: React.FC<Props> = ({ onClose }) => {
           </button>
         )}
       </div>
+
+      {notice && (
+        <div className="px-4 pt-3">
+          <div
+            className={`rounded-md border px-3 py-2 text-sm ${
+              notice.type === 'success'
+                ? 'border-green-200 bg-green-50 text-green-700'
+                : 'border-red-200 bg-red-50 text-red-700'
+            }`}
+          >
+            {notice.text}
+          </div>
+        </div>
+      )}
 
       {/* Tab bar */}
       <div className="flex border-b border-claude-border">
@@ -151,7 +184,7 @@ const CronHistory: React.FC<Props> = ({ onClose }) => {
                     disabled={triggering === task.name}
                     className="ml-3 px-3 py-1 text-xs font-medium rounded bg-claude-surface text-claude-accent hover:bg-claude-hover disabled:opacity-50"
                   >
-                    {triggering === task.name ? '执行中...' : '手动执行'}
+                    {triggering === task.name ? '提交中...' : '手动执行'}
                   </button>
                 </div>
               ))

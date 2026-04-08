@@ -7,7 +7,10 @@
 - POST /api/cron/jobs/{name}/run: 手动触发任务
 """
 
+import asyncio
 import logging
+from typing import Set
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session as DBSession
 
@@ -17,6 +20,9 @@ from src.api.services.cron_service import CronService, run_cron_job
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# 防止 asyncio.create_task 返回值被 GC 回收导致后台任务静默丢失
+_background_tasks: Set[asyncio.Task] = set()
 
 
 @router.get("/jobs")
@@ -67,7 +73,7 @@ async def trigger_job(
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    """手动触发指定的 Cron 任务"""
+    """手动触发指定的 Cron 任务（后台执行，立即返回）"""
     from src.api.models.cron_job import CronJob
 
     job = (
@@ -78,9 +84,20 @@ async def trigger_job(
     if not job:
         raise HTTPException(status_code=404, detail=f"任务 '{job_name}' 不存在")
 
-    result = await run_cron_job(user_id, job_name)
+    async def _run_in_background():
+        try:
+            await run_cron_job(user_id, job_name)
+        except Exception:
+            logger.exception("后台执行 Cron 任务失败 (user=%s, job=%s)", user_id, job_name)
+
+    task = asyncio.create_task(_run_in_background())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    logger.info("Cron 手动触发已提交后台执行 (user=%s, job=%s)", user_id, job_name)
     return {
         "job_name": job_name,
-        "status": "success" if result else "failed",
-        "output": result,
+        "status": "accepted",
+        "message": "后台任务已执行",
+        "output": None,
     }

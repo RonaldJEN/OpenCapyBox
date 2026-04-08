@@ -139,8 +139,8 @@ export async function getCronRuns(
 
 export async function triggerCronJob(
   jobName: string,
-): Promise<{ status: string; output: string | null }> {
-  const resp = await client.post<{ status: string; output: string | null }>(
+): Promise<{ job_name: string; status: string; message?: string; output: string | null }> {
+  const resp = await client.post<{ job_name: string; status: string; message?: string; output: string | null }>(
     `/cron/jobs/${jobName}/run`,
   );
   return resp.data;
