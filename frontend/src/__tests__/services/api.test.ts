@@ -93,11 +93,17 @@ describe('APIService', () => {
           abort: vi.fn(),
           getLatestSequence: () => 0,
         }))
-        .mockImplementationOnce(() => ({
-          promise: Promise.resolve(),
-          abort: vi.fn(),
-          getLatestSequence: () => 0,
-        }));
+        .mockImplementationOnce((...args: unknown[]) => {
+          const cbs = args[2] as {
+            onRunFinished?: (threadId: string, runId: string, result: any, outcome: string) => void;
+          };
+          // 模拟成功的 subscribe：先触发 onRunFinished 再 resolve
+          const promise = new Promise<void>((resolve) => {
+            cbs.onRunFinished?.('thread-1', 'run-1', {}, 'success');
+            resolve();
+          });
+          return { promise, abort: vi.fn(), getLatestSequence: () => 0 };
+        });
 
       const callbacks = {
         onRunError: vi.fn(),

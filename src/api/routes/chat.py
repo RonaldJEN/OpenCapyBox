@@ -32,8 +32,10 @@ from src.agent.schema.agui_events import AGUIEvent, RunStartedEvent, CustomEvent
 from src.api.utils.agui_encoder import EventEncoder
 import asyncio
 import json
+import traceback
 import uuid
 import threading
+from typing import AsyncIterator, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -70,6 +72,125 @@ def _extract_text_for_title(content_blocks) -> str:
 # 輪次訂閱者管理（round_id -> list of asyncio.Queue）
 _round_subscribers: dict[str, list[asyncio.Queue]] = {}
 _round_subscribers_lock = threading.Lock()
+
+
+# =========================================================================
+# SSE + 心跳保活通用助手
+# =========================================================================
+
+
+async def _sse_with_heartbeat(
+    event_source: AsyncIterator[AGUIEvent],
+    *,
+    on_run_finished: Callable[[str | None], Awaitable[AsyncIterator[str]]] | None = None,
+    error_message: str | None = None,
+):
+    """通用的 SSE 事件生成器，內建 producer/heartbeat/consumer 隊列模式。
+
+    Args:
+        event_source: Agent 層的 AG-UI 事件異步迭代器。
+        on_run_finished: 可選回調，在 RUN_FINISHED 事件之後調用，
+                         返回一個異步迭代器以 yield 額外的 SSE 字串（如標題更新）。
+        error_message: 錯誤時對外顯示的訊息；為 None 則使用實際異常訊息。
+    """
+    current_run_id: str | None = None
+    event_queue: asyncio.Queue = asyncio.Queue()
+    _SENTINEL = object()
+
+    settings = get_settings()
+
+    def now_ms():
+        return int(datetime.now().timestamp() * 1000)
+
+    # 生產者：消費 event_source → 放入隊列
+    async def producer():
+        try:
+            async for event in event_source:
+                await event_queue.put(event)
+        except Exception as e:
+            await event_queue.put(e)
+        finally:
+            await event_queue.put(_SENTINEL)
+
+    # 心跳：每 sse_heartbeat_interval 秒發送 CUSTOM heartbeat 事件
+    async def heartbeat():
+        try:
+            while True:
+                await asyncio.sleep(settings.sse_heartbeat_interval)
+                await event_queue.put(CustomEvent(
+                    name="heartbeat",
+                    value={"timestamp": now_ms()},
+                ))
+        except asyncio.CancelledError:
+            pass
+
+    producer_task = asyncio.create_task(producer())
+    heartbeat_task = asyncio.create_task(heartbeat())
+
+    try:
+        while True:
+            item = await event_queue.get()
+
+            if item is _SENTINEL:
+                break
+
+            if isinstance(item, Exception):
+                raise item
+
+            event = item
+
+            if hasattr(event, 'run_id') and event.run_id:
+                current_run_id = event.run_id
+
+            event_str = event_encoder.encode(event)
+
+            if current_run_id:
+                event_dict = event.model_dump(by_alias=True, exclude_none=True)
+                await _broadcast_to_subscribers(current_run_id, event_dict)
+
+            yield event_str
+
+            if event.type == EventType.RUN_FINISHED:
+                # 允許調用方注入額外事件（如標題更新）
+                if on_run_finished:
+                    async for extra in await on_run_finished(current_run_id):
+                        yield extra
+
+                if current_run_id:
+                    _cleanup_subscribers(current_run_id)
+                break
+
+    except Exception as e:
+        error_detail = traceback.format_exc()
+        logger.error("AG-UI 事件流錯誤: %s\n%s", e, error_detail)
+
+        display_msg = error_message or str(e)
+        display_code = "INTERNAL_ERROR" if error_message else type(e).__name__
+        try:
+            yield event_encoder.encode(RunErrorEvent(message=display_msg, code=display_code))
+        except Exception:
+            fallback_json = json.dumps({
+                "type": EventType.RUN_ERROR.value,
+                "message": display_msg,
+                "code": display_code,
+                "timestamp": datetime.now().timestamp() * 1000,
+            })
+            yield f"data: {fallback_json}\n\n"
+
+        if current_run_id:
+            _cleanup_subscribers(current_run_id)
+
+    finally:
+        heartbeat_task.cancel()
+        producer_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await producer_task
+        except asyncio.CancelledError:
+            pass
 
 
 @router.post("/{chat_session_id}/message/stream")
@@ -157,81 +278,29 @@ async def send_message_stream(
     cancel_token = asyncio.Event()
     agent_service.cancel_token = cancel_token
 
-    # 定義事件生成器
+    # 定義事件生成器（帶心跳保活，防止 nginx 超時斷連）
     async def event_generator():
-        nonlocal title_generation_task
-        
-        # 用於追蹤 run_id（用於訂閱者廣播）
-        current_run_id: str | None = None
-        event_queue = asyncio.Queue()
-        
-        try:
-            # 透傳 Agent 的 AG-UI 事件流
-            async for event in agent_service.chat_agui(
-                user_content=request.content,
-            ):
-                # 提取 run_id（用於訂閱者管理）
-                if hasattr(event, 'run_id') and event.run_id:
-                    current_run_id = event.run_id
-                
-                # 序列化事件
-                event_str = event_encoder.encode(event)
+        # RUN_FINISHED 後追加標題更新事件
+        async def on_run_finished(_run_id):
+            async def _extra():
+                if title_generation_task:
+                    try:
+                        title = await title_generation_task
+                        if title:
+                            title_event = CustomEvent(
+                                name="title_updated",
+                                value={"sessionId": chat_session_id, "title": title},
+                            )
+                            yield event_encoder.encode(title_event)
+                    except Exception as e:
+                        print(f"⚠️  等待標題生成失敗: {e}")
+            return _extra()
 
-                # 广播给订阅者（AG-UI 格式）
-                if current_run_id:
-                    # 获取事件字典用于广播
-                    # 注意：广播需要字典格式而非字符串
-                    event_dict = event.model_dump(by_alias=True, exclude_none=True)
-                    await _broadcast_to_subscribers(current_run_id, event_dict)
-
-                yield event_str
-
-                # 檢測運行結束事件
-                if event.type == EventType.RUN_FINISHED:
-                    # 等待標題生成完成
-                    if title_generation_task:
-                        try:
-                            title = await title_generation_task
-                            if title:
-                                # 發送標題更新事件
-                                title_event = CustomEvent(
-                                    name="title_updated",
-                                    value={"sessionId": chat_session_id, "title": title},
-                                )
-                                yield event_encoder.encode(title_event)
-                        except Exception as e:
-                            print(f"⚠️  等待標題生成失敗: {e}")
-                    
-                    # 清理訂閱者
-                    if current_run_id:
-                        _cleanup_subscribers(current_run_id)
-                        
-        except Exception as e:
-            import traceback
-            error_detail = traceback.format_exc()
-            print(f"\n❌ AG-UI 事件流錯誤: {str(e)}\n{error_detail}")
-
-            # 发送错误事件
-            try:
-                error_event = RunErrorEvent(
-                    message=str(e),
-                    code=type(e).__name__
-                )
-                yield event_encoder.encode(error_event)
-            except Exception as inner_e:
-                print(f"❌ 错误事件生成失败: {inner_e}")
-                # 兜底简单的 JSON
-                fallback_json = json.dumps({
-                    "type": EventType.RUN_ERROR.value,
-                    "message": str(e),
-                    "code": type(e).__name__,
-                    "timestamp": datetime.now().timestamp() * 1000
-                })
-                yield f"data: {fallback_json}\n\n"
-
-            # 清理訂閱者
-            if current_run_id:
-                _cleanup_subscribers(current_run_id)
+        async for chunk in _sse_with_heartbeat(
+            agent_service.chat_agui(user_content=request.content),
+            on_run_finished=on_run_finished,
+        ):
+            yield chunk
 
     # 更新會話活躍時間
     session.updated_at = now_naive()
@@ -297,45 +366,14 @@ async def resume_interrupt(
     agent_service.cancel_token = cancel_token
 
     async def event_generator():
-        current_run_id: str | None = None
-        try:
-            async for event in agent_service.resume_agui(
+        async for chunk in _sse_with_heartbeat(
+            agent_service.resume_agui(
                 interrupt_id=request.interrupt_id,
                 answers=request.answers,
-            ):
-                if hasattr(event, 'run_id') and event.run_id:
-                    current_run_id = event.run_id
-
-                event_str = event_encoder.encode(event)
-
-                if current_run_id:
-                    event_dict = event.model_dump(by_alias=True, exclude_none=True)
-                    await _broadcast_to_subscribers(current_run_id, event_dict)
-
-                yield event_str
-
-                if event.type == EventType.RUN_FINISHED:
-                    if current_run_id:
-                        _cleanup_subscribers(current_run_id)
-
-        except Exception as e:
-            import traceback
-            error_detail = traceback.format_exc()
-            logger.error("Resume 事件流错误: %s\n%s", e, error_detail)
-            public_error_msg = "服务暂时不可用，请稍后重试"
-            try:
-                error_event = RunErrorEvent(message=public_error_msg, code="INTERNAL_ERROR")
-                yield event_encoder.encode(error_event)
-            except Exception:
-                fallback_json = json.dumps({
-                    "type": EventType.RUN_ERROR.value,
-                    "message": public_error_msg,
-                    "code": "INTERNAL_ERROR",
-                    "timestamp": datetime.now().timestamp() * 1000,
-                })
-                yield f"data: {fallback_json}\n\n"
-            if current_run_id:
-                _cleanup_subscribers(current_run_id)
+            ),
+            error_message="服务暂时不可用，请稍后重试",
+        ):
+            yield chunk
 
     session.updated_at = now_naive()
     db.commit()

@@ -727,6 +727,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           onCustomEvent: (name, _value) => {
             if (name === 'title_updated') {
               onTitleUpdated?.();
+            } else if (name === 'failover_reset') {
+              console.log(`⚡ Failover: 切换到备用模型 ${_value?.model || ''}`);
             }
           },
         });
@@ -1284,6 +1286,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       if (name === 'title_updated') {
         console.log('✅ 会话标题已更新:', value?.title);
         onTitleUpdated?.();
+      } else if (name === 'failover_reset') {
+        console.log(`⚡ Failover: 切换到备用模型 ${value?.model || ''}`);
       }
     },
   });

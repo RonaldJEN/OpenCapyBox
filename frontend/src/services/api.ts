@@ -205,6 +205,18 @@ class APIService {
     const maxRetries = 3;
 
     const doRequest = async (): Promise<void> => {
+      const abortController = new AbortController();
+      let lastDataTime = Date.now();
+      const STALE_TIMEOUT_MS = 45_000; // 3x heartbeat interval (15s)
+
+      // Staleness timer: if no data received for 45s, abort the fetch
+      const staleTimer = setInterval(() => {
+        if (Date.now() - lastDataTime > STALE_TIMEOUT_MS) {
+          console.warn(`⚠️ SSE 连接超过 ${STALE_TIMEOUT_MS / 1000}s 无数据，主动断开`);
+          abortController.abort();
+        }
+      }, 10_000);
+
       return new Promise((resolve, reject) => {
         fetch(url, {
           method: 'POST',
@@ -213,6 +225,7 @@ class APIService {
             ...this.getAuthHeaders(),
           },
           body: JSON.stringify({ content }),
+          signal: abortController.signal,
         })
           .then(async (response) => {
             if (!response.ok) {
@@ -230,9 +243,15 @@ class APIService {
 
             while (true) {
               const { done, value } = await reader.read();
+              lastDataTime = Date.now();
 
               if (done) {
-                resolve();
+                if (runCompleted) {
+                  resolve();
+                } else {
+                  // SSE 流被異常關閉（如 nginx proxy_read_timeout），但 Agent 可能仍在運行
+                  reject(new Error('SSE_STREAM_CLOSED'));
+                }
                 break;
               }
 
@@ -260,7 +279,14 @@ class APIService {
             }
           })
           .catch((error) => {
-            reject(error);
+            if (error.name === 'AbortError') {
+              reject(new Error('SSE_STALE_TIMEOUT'));
+            } else {
+              reject(error);
+            }
+          })
+          .finally(() => {
+            clearInterval(staleTimer);
           });
       });
     };
@@ -269,37 +295,99 @@ class APIService {
     try {
       await doRequest();
     } catch (error: any) {
-      let lastError: any = error;
+      // 4xx 确定性错误不重试（参数错误、鉴权失败等）
+      const is4xx = /^HTTP 4\d{2}:/.test(error?.message || '');
+      if (is4xx) {
+        callbacks.onRunError?.(error.message, 'HTTP_CLIENT_ERROR');
+        return;
+      }
 
-      while (!runCompleted && currentThreadId && currentRunId && retryCount < maxRetries) {
+      // 重连循环：有 runId 时用 subscribe 恢复，没有时重试整个请求
+      while (!runCompleted && retryCount < maxRetries) {
         retryCount++;
         console.log(`⚠️ 连接断开，尝试重连 (${retryCount}/${maxRetries})...`);
-
         await new Promise((r) => setTimeout(r, 1000 * retryCount));
 
         try {
-          const subscription = this.subscribeToRound(chatSessionId, currentRunId, {
-            onMessagesSnapshot: callbacks.onMessagesSnapshot,
-            onStateSnapshot: callbacks.onStateSnapshot,
-            onStateDelta: callbacks.onStateDelta,
-            onRunFinished: (tid, rid, result, outcome, interrupt) => {
-              runCompleted = true;
-              callbacks.onRunFinished?.(tid, rid, result, outcome, interrupt);
-            },
-            onRunError: callbacks.onRunError,
-            onCustomEvent: callbacks.onCustomEvent,
-          });
-          await subscription.promise;
-          console.log('✅ 重连成功');
-          return;
+          if (currentThreadId && currentRunId) {
+            // 已有 runId → subscribe 断点续传
+            const subscription = this.subscribeToRound(chatSessionId, currentRunId, {
+              onMessagesSnapshot: callbacks.onMessagesSnapshot,
+              onStateSnapshot: callbacks.onStateSnapshot,
+              onStateDelta: callbacks.onStateDelta,
+              onRunFinished: (tid, rid, result, outcome, interrupt) => {
+                runCompleted = true;
+                callbacks.onRunFinished?.(tid, rid, result, outcome, interrupt);
+              },
+              onRunError: callbacks.onRunError,
+              onCustomEvent: callbacks.onCustomEvent,
+            });
+            await subscription.promise;
+            if (runCompleted) {
+              console.log('✅ 重连成功');
+              return;
+            }
+            // subscription resolved 但 runCompleted 仍为 false（不应发生，但防御性处理）
+            throw new Error('SSE_STREAM_CLOSED');
+          } else {
+            // 尚无 runId → 先检查后端是否已创建 running 轮次（避免重复 POST）
+            try {
+              const history = await this.getSessionHistoryV2(chatSessionId);
+              const runningRound = history.rounds
+                ?.filter((r: any) => r.status === 'running')
+                .sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+
+              if (runningRound) {
+                // 后端已受理请求，改为 subscribe
+                console.log(`🔍 检测到后端已有 running 轮次 ${runningRound.round_id}，改用 subscribe`);
+                currentRunId = runningRound.round_id;
+                currentThreadId = chatSessionId;
+                continue; // 进入下一轮循环，走 subscribe 分支
+              }
+            } catch (checkError) {
+              console.error('检查后端轮次失败:', checkError);
+            }
+            // 后端无 running 轮次 → 安全重试 POST
+            await doRequest();
+            console.log('✅ 重试请求成功');
+            return;
+          }
         } catch (retryError: any) {
-          lastError = retryError;
-          console.error('❌ 重连失败:', retryError);
+          console.error(`❌ 重连/重试失败 (${retryCount}/${maxRetries}):`, retryError);
         }
       }
 
-      callbacks.onRunError?.(lastError?.message || '连接失败');
-      throw lastError;
+      // 所有重试耗尽：检查后端轮次实际状态进行恢复
+      if (!runCompleted) {
+        if (currentRunId) {
+          try {
+            console.log(`🔍 重试耗尽，检查轮次 ${currentRunId} 实际状态...`);
+            const history = await this.getSessionHistoryV2(chatSessionId);
+            const round = history.rounds.find((r: any) => r.round_id === currentRunId);
+
+            if (round?.status === 'completed' || round?.status === 'failed' || round?.status === 'interrupted') {
+              const outcome = round.status === 'completed'
+                ? 'success'
+                : round.status === 'interrupted'
+                  ? 'interrupt'
+                  : 'error';
+              console.log(`✅ 轮次 ${currentRunId} 实际状态: ${round.status}，恢复 UI`);
+              callbacks.onRunFinished?.(currentThreadId || chatSessionId, currentRunId, {
+                finalResponse: round.final_response || '',
+                stepCount: round.step_count || 0,
+              }, outcome, round.interrupt);
+              return;
+            }
+          } catch (checkError) {
+            console.error('检查轮次状态失败:', checkError);
+          }
+          // 轮次仍在运行或状态检查失败，通知前端断连
+          callbacks.onRunError?.('连接已断开，Agent 可能仍在运行。请刷新页面查看结果', 'SSE_DISCONNECTED');
+        } else {
+          // 连 RUN_STARTED 都没收到，通过 onRunError 重置状态让用户可重新发送
+          callbacks.onRunError?.('连接已断开，请重新发送', 'SSE_DISCONNECTED');
+        }
+      }
     }
   }
 
@@ -325,6 +413,7 @@ class APIService {
         break;
 
       case 'RUN_ERROR':
+        onComplete();
         callbacks.onRunError?.(event.message, event.code);
         break;
 
@@ -434,6 +523,23 @@ class APIService {
     const url = `/api/chat/${chatSessionId}/round/${runId}/subscribe?last_sequence=${lastSequence}`;
     const abortController = new AbortController();
     let latestSequence = lastSequence;
+    let lastDataTime = Date.now();
+    const STALE_TIMEOUT_MS = 45_000;
+
+    // 区分 staleness 超时 vs 用户主动 abort
+    let isStaleAbort = false;
+
+    // Staleness timer: abort if no data for 45s
+    const staleTimer = setInterval(() => {
+      if (Date.now() - lastDataTime > STALE_TIMEOUT_MS) {
+        console.warn(`⚠️ 订阅连接超过 ${STALE_TIMEOUT_MS / 1000}s 无数据，主动断开`);
+        isStaleAbort = true;
+        abortController.abort();
+      }
+    }, 10_000);
+
+    // 追踪是否收到了终态事件（RUN_FINISHED）
+    let runFinishedReceived = false;
 
     const promise = new Promise<void>((resolve, reject) => {
       fetch(url, {
@@ -460,9 +566,15 @@ class APIService {
 
           while (true) {
             const { done, value } = await reader.read();
+            lastDataTime = Date.now();
 
             if (done) {
-              resolve();
+              if (runFinishedReceived) {
+                resolve();
+              } else {
+                // SSE 流关闭但未收到 RUN_FINISHED，可能是 nginx 断连
+                reject(new Error('SSE_STREAM_CLOSED'));
+              }
               break;
             }
 
@@ -496,14 +608,16 @@ class APIService {
                       break;
 
                     case 'RUN_FINISHED':
+                      runFinishedReceived = true;
                       callbacks.onRunFinished?.(event.threadId, event.runId, event.result, event.outcome || 'success', event.interrupt);
                       resolve();
                       return;
 
                     case 'RUN_ERROR':
+                      runFinishedReceived = true;
                       callbacks.onRunError?.(event.message, event.code);
-                      // 不 reject —— 等待后续 RUN_FINISHED 作为终态事件收敛
-                      break;
+                      resolve();
+                      return;
 
                     case 'CUSTOM':
                       callbacks.onCustomEvent?.(event.name, event.value);
@@ -577,8 +691,37 @@ class APIService {
         })
         .catch(async (error) => {
           if (error.name === 'AbortError') {
-            console.log('订阅已取消:', runId);
-            resolve();
+            if (!isStaleAbort) {
+              // 用户主动取消：直接静默 resolve
+              console.log('订阅已取消:', runId);
+              resolve();
+              return;
+            }
+            // staleness timeout：检查轮次实际状态进行恢复
+            console.warn(`⚠️ 订阅连接超时中断 (${runId})，尝试检查状态...`);
+            try {
+              const history = await this.getSessionHistoryV2(chatSessionId);
+              const round = history.rounds.find((r: any) => r.round_id === runId);
+              
+              if (round?.status === 'completed' || round?.status === 'failed' || round?.status === 'interrupted') {
+                console.log(`✅ 检测到轮次 ${runId} 已完成 (status=${round.status})，恢复状态`);
+                const outcome = round.status === 'completed'
+                  ? 'success'
+                  : round.status === 'interrupted'
+                    ? 'interrupt'
+                    : 'error';
+                callbacks.onRunFinished?.(chatSessionId, runId, {
+                  finalResponse: round.final_response || '',
+                  stepCount: round.step_count || 0,
+                }, outcome, round.interrupt);
+                resolve();
+                return;
+              }
+            } catch (checkError) {
+              console.error('检查轮次状态失败:', checkError);
+            }
+            // staleness 但轮次仍在运行，reject 让上层重连
+            reject(new Error('SSE_STALE_TIMEOUT'));
             return;
           }
           
@@ -609,6 +752,9 @@ class APIService {
           
           callbacks.onRunError?.(error.message);
           reject(error);
+        })
+        .finally(() => {
+          clearInterval(staleTimer);
         });
     });
 
