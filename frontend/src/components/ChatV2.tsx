@@ -120,8 +120,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const [attachedFiles, setAttachedFiles] = useState<FileInfo[]>([]);
   const [uploading, setUploading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-  const [availableFiles, setAvailableFiles] = useState<FileInfo[]>([]);
-  const [showFileAutocomplete, setShowFileAutocomplete] = useState(false);
 
   // 🔥 智能滚动状态
   const [isAtBottom, setIsAtBottom] = useState(true);
@@ -233,8 +231,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       setPendingInterrupt(null);
       setResuming(false);
       setAttachedFiles([]);
-      setAvailableFiles([]);
-      setShowFileAutocomplete(false);
       setPreviewFile(null);
       setPreviewSessionId('');
       setIsFilesOpen(false);
@@ -351,13 +347,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     };
   }, []);
 
-  // 僅在文件面板打開時拉取文件，避免僅載入歷史時觸發 /files 請求
-  useEffect(() => {
-    if (sessionId && isFilesOpen) {
-      loadAvailableFiles();
-    }
-  }, [sessionId, isFilesOpen]);
-
   // 🔥 切换会话时：useLayoutEffect 在浏览器绘制前同步恢复 scrollTop，用户看不到跳动
   useLayoutEffect(() => {
     const container = chatAreaRef.current;
@@ -416,16 +405,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     container.addEventListener('scroll', handleScroll);
     return () => container.removeEventListener('scroll', handleScroll);
   }, [sessionId]);
-
-  // 🆕 加载可用文件列表
-  const loadAvailableFiles = async () => {
-    try {
-      const response = await apiService.getSessionFiles(sessionId);
-      setAvailableFiles(response.files);
-    } catch (err) {
-      console.error('Failed to load files:', err);
-    }
-  };
 
   const scrollToBottom = (force: boolean = false) => {
     if (force) {
@@ -811,7 +790,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       }
 
       setAttachedFiles((prev) => [...prev, ...uploadedFiles]);
-      setAvailableFiles((prev) => [...prev, ...uploadedFiles]);
       console.log(`✅ 上传成功: ${uploadedFiles.length} 个文件`);
     } catch (err) {
       console.error('Failed to upload files:', err);
@@ -894,39 +872,12 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     setPreviewFile(normalizedFile);
   };
 
-  // 🆕 检测@输入,显示文件自动补全
+  // 🆕 检测输入变化
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const value = e.target.value;
-    setInput(value);
-
-    // 检测@符号
-    const cursorPosition = e.target.selectionStart;
-    const textBeforeCursor = value.substring(0, cursorPosition);
-    const lastAtIndex = textBeforeCursor.lastIndexOf('@');
-
-    if (lastAtIndex !== -1 && cursorPosition - lastAtIndex <= 20) {
-      // 首次使用 @ 文件補全時，按需拉取一次文件列表
-      if (sessionId && availableFiles.length === 0) {
-        loadAvailableFiles();
-      }
-
-      // 在@符号后面,显示自动补全
-      const searchText = textBeforeCursor.substring(lastAtIndex + 1);
-      const filteredFiles = availableFiles.filter(f =>
-        f.name.toLowerCase().includes(searchText.toLowerCase())
-      );
-
-      if (filteredFiles.length > 0) {
-        setShowFileAutocomplete(true);
-      } else {
-        setShowFileAutocomplete(false);
-      }
-    } else {
-      setShowFileAutocomplete(false);
-    }
+    setInput(e.target.value);
   };
 
-  // 🆕 选择@文件 - 光标插入由 ChatInput 内部处理，这里只管附件状态
+  // 🆕 选择文件附件
   const handleSelectFile = (file: FileInfo, _newInput: string) => {
     // 添加到附件列表(如果不存在)
     if (!attachedFiles.find(f => f.name === file.name)) {
@@ -1683,11 +1634,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           onInputDropHandled={() => setIsDragging(false)}
           onPreviewAttachment={sessionId ? handlePreviewAttachment : undefined}
           uploading={uploading}
-          availableFiles={availableFiles}
-          showFileAutocomplete={showFileAutocomplete}
           onInputChangeRaw={handleInputChange}
           onFileSelected={handleSelectFile}
-          onDismissAutocomplete={() => setShowFileAutocomplete(false)}
         />
       </div>
 

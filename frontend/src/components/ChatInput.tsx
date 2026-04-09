@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState } from 'react';
-import { ArrowUp, FileText, Loader2, Paperclip, Square, X } from 'lucide-react';
+import { ArrowUp, Loader2, Paperclip, Square, X } from 'lucide-react';
 import { FileInfo } from '../types';
 import { getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, isImageFile } from '../utils/fileUtils';
 
@@ -26,12 +26,9 @@ interface ChatInputProps {
   onPreviewAttachment?: (file: FileInfo) => void;
   uploading?: boolean;
 
-  // ---- @ 文件自动补全 ----
-  availableFiles?: FileInfo[];
-  showFileAutocomplete?: boolean;
+  // ---- 输入代理 ----
   onInputChangeRaw?: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
   onFileSelected?: (file: FileInfo, newInputValue: string) => void;
-  onDismissAutocomplete?: () => void;
 }
 
 /**
@@ -51,11 +48,8 @@ export function ChatInput({
   onInputDropHandled,
   onPreviewAttachment,
   uploading = false,
-  availableFiles = [],
-  showFileAutocomplete = false,
   onInputChangeRaw,
   onFileSelected,
-  onDismissAutocomplete,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -71,11 +65,6 @@ export function ChatInput({
   }, [value]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (showFileAutocomplete && e.key === 'Escape') {
-      e.preventDefault();
-      onDismissAutocomplete?.();
-      return;
-    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       onSend();
@@ -142,20 +131,6 @@ export function ChatInput({
 
   const hasContent = value.trim().length > 0 || attachedFiles.length > 0;
   const canSend = hasContent && !disabled;
-
-  const handleSelectFileInternal = (file: FileInfo) => {
-    const cursorPos = textareaRef.current?.selectionStart || 0;
-    const textBefore = value.substring(0, cursorPos);
-    const lastAt = textBefore.lastIndexOf('@');
-
-    let newValue = value;
-    if (lastAt !== -1) {
-      newValue = value.substring(0, lastAt) + `@${file.name}` + value.substring(cursorPos);
-      onChange(newValue);
-    }
-    onFileSelected?.(file, newValue);
-    onDismissAutocomplete?.();
-  };
 
   return (
     <div className="px-4 pb-5 pt-3 bg-claude-bg">
@@ -302,30 +277,6 @@ export function ChatInput({
             </div>
           </div>
 
-          {/* 文件自动补全 */}
-          {showFileAutocomplete && onFileSelected && (
-            <div className="absolute bottom-full left-0 right-0 mb-2 bg-white border border-claude-border rounded-xl shadow-xl max-h-60 overflow-y-auto z-50 animate-zoom-in">
-              <div className="px-3 py-2 text-xs font-medium text-claude-muted border-b border-claude-border">建议文件</div>
-              {availableFiles
-                .filter(f => {
-                  const cursorPos = textareaRef.current?.selectionStart || 0;
-                  const textBefore = value.substring(0, cursorPos);
-                  const lastAt = textBefore.lastIndexOf('@');
-                  const search = textBefore.substring(lastAt + 1).toLowerCase();
-                  return f.name.toLowerCase().includes(search);
-                })
-                .map((file, index) => (
-                  <button
-                    key={index}
-                    onClick={() => handleSelectFileInternal(file)}
-                    className="w-full px-4 py-2.5 text-left hover:bg-claude-hover flex items-center gap-3 transition-colors border-b border-claude-border/30 last:border-0"
-                  >
-                    <FileText className="w-4 h-4 text-claude-muted" />
-                    <span className="text-sm text-claude-text">{file.name}</span>
-                  </button>
-                ))}
-            </div>
-          )}
         </div>
 
         <p className="text-[10px] text-claude-muted mt-2 text-center">
