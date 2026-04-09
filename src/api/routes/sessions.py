@@ -30,8 +30,6 @@ from src.api.models.user_sandbox import UserSandbox
 from src.api.models.conversation_message import ConversationMessage
 from datetime import datetime
 from src.api.utils.timezone import now_naive
-from src.api.config import get_settings
-from opensandbox.models.filesystem import SearchEntry
 import shlex
 
 logger = logging.getLogger(__name__)
@@ -208,105 +206,90 @@ def _get_user_sandbox_id(db: DBSession, user_id: str) -> str | None:
     return user_sandbox.sandbox_id if user_sandbox else None
 
 
-async def _sandbox_list_files(sandbox, session_root: str) -> list[FileInfo]:
-    """從沙箱獲取文件列表。
-
-    當 sandbox_use_server_proxy=True 時直接使用 find 命令（避免 proxy
-    丟棄 GET query params 導致 files.search 400 的已知問題）；否則先嘗試
-    SDK files.search，失敗再回退到 find。
-    """
-    settings = get_settings()
-
-    # --- 嘗試 SDK files.search（僅非 proxy 模式） ---
-    if not settings.sandbox_use_server_proxy:
-        try:
-            entries = await sandbox.files.search(
-                SearchEntry(path=session_root, pattern="**")
-            )
-            files: list[FileInfo] = []
-            for entry in entries:
-                full_path = getattr(entry, "path", "")
-                if _should_skip_sandbox_path(full_path):
-                    continue
-                rel_path = to_sandbox_relative_path(full_path, session_root)
-                if not rel_path or rel_path.endswith("/"):
-                    continue
-                name = rel_path.rsplit("/", 1)[-1]
-                ext = name.rsplit(".", 1)[-1] if "." in name else "unknown"
-                modified_at = getattr(entry, "modified_at", None)
-                if hasattr(modified_at, "isoformat"):
-                    modified = modified_at.isoformat()
-                elif isinstance(modified_at, str):
-                    modified = modified_at
-                else:
-                    modified = datetime.utcnow().isoformat()
-                files.append(
-                    FileInfo(
-                        name=name,
-                        path=rel_path,
-                        size=int(getattr(entry, "size", 0) or 0),
-                        modified=modified,
-                        type=ext,
-                    )
-                )
-            files.sort(key=lambda f: f.modified, reverse=True)
-            return files
-        except Exception as e:
-            logger.debug("files.search 不可用，回退到 find 命令: %s", e)
-
-    # --- 命令回退（proxy 模式直接走這裡） ---
-    # 優先用 python 輸出 JSON（含 size / mtime），避免文件列表永遠顯示 0KB
-    py_cmd = f"""python3 - <<'PY'\nimport os, json\nroot = {session_root!r}\nout = []\nfor cur, _, names in os.walk(root):\n    for name in names:\n        path = os.path.join(cur, name)\n        try:\n            st = os.stat(path)\n        except OSError:\n            continue\n        out.append({{\"path\": path, \"size\": int(st.st_size), \"mtime\": float(st.st_mtime)}})\nprint(json.dumps(out, ensure_ascii=False))\nPY"""
+async def _sandbox_list_dir(
+    sandbox, target_dir: str, session_root: str
+) -> list[FileInfo]:
+    """列出沙箱中指定目錄的直接子項（目錄 + 文件）。"""
+    py_cmd = f"""python3 - <<'PY'
+import os, json
+d = {target_dir!r}
+out = []
+try:
+    names = os.listdir(d)
+except OSError:
+    names = []
+for n in names:
+    p = os.path.join(d, n)
+    try:
+        st = os.stat(p)
+    except OSError:
+        continue
+    out.append({{"name": n, "path": p, "size": int(st.st_size), "mtime": float(st.st_mtime), "is_dir": os.path.isdir(p)}})
+print(json.dumps(out, ensure_ascii=False))
+PY"""
     result = await sandbox.commands.run(py_cmd)
     stdout_text = _command_stdout_text(result)
-    files: list[FileInfo] = []
 
+    items: list[FileInfo] = []
     try:
         rows = json.loads(stdout_text) if stdout_text else []
-        if isinstance(rows, list):
-            for row in rows:
-                full_path = str(row.get("path", ""))
-                if _should_skip_sandbox_path(full_path):
-                    continue
-                rel_path = to_sandbox_relative_path(full_path, session_root)
-                if not rel_path or rel_path.endswith("/"):
-                    continue
-                name = rel_path.rsplit("/", 1)[-1]
-                ext = name.rsplit(".", 1)[-1] if "." in name else "unknown"
-                mtime = row.get("mtime")
-                try:
-                    modified = datetime.utcfromtimestamp(float(mtime)).isoformat()
-                except Exception:
-                    modified = datetime.utcnow().isoformat()
-                files.append(
-                    FileInfo(
-                        name=name,
-                        path=rel_path,
-                        size=int(row.get("size", 0) or 0),
-                        modified=modified,
-                        type=ext,
-                    )
-                )
-            files.sort(key=lambda f: f.modified, reverse=True)
-            return files
-    except Exception as e:
-        logger.debug("JSON 文件列表回退失敗，改用 find 純路徑模式: %s", e)
+    except Exception:
+        logger.debug("目錄列表 JSON 解析失敗，返回空列表")
+        return []
 
-    # 最終回退：find 純路徑（舊行為）
-    result = await sandbox.commands.run(
-        f"find {shlex.quote(session_root)} -type f 2>/dev/null"
-    )
-    lines = [
-        line.strip()
-        for line in _command_stdout_text(result).splitlines()
-        if line.strip()
-    ]
-    for line in lines:
-        info = _build_fileinfo_from_path(line, session_root)
-        if info:
-            files.append(info)
-    files.sort(key=lambda f: f.modified, reverse=True)
-    return files
+    if not isinstance(rows, list):
+        return []
+
+    for row in rows:
+        full_path = str(row.get("path", ""))
+        is_dir = bool(row.get("is_dir", False))
+
+        # 目錄路徑加 / 後綴以便 _should_skip_sandbox_path 正確匹配
+        check_path = full_path + "/" if is_dir else full_path
+        if _should_skip_sandbox_path(check_path):
+            continue
+
+        name = str(row.get("name", ""))
+        if not name or name.startswith("."):
+            continue
+
+        rel_path = to_sandbox_relative_path(full_path, session_root)
+        if rel_path is None:
+            continue
+
+        mtime = row.get("mtime")
+        try:
+            modified = datetime.utcfromtimestamp(float(mtime)).isoformat()
+        except Exception:
+            modified = datetime.utcnow().isoformat()
+
+        if is_dir:
+            items.append(
+                FileInfo(
+                    name=name,
+                    path=rel_path,
+                    size=0,
+                    modified=modified,
+                    type="directory",
+                    is_directory=True,
+                )
+            )
+        else:
+            ext = name.rsplit(".", 1)[-1] if "." in name else "unknown"
+            items.append(
+                FileInfo(
+                    name=name,
+                    path=rel_path,
+                    size=int(row.get("size", 0) or 0),
+                    modified=modified,
+                    type=ext,
+                    is_directory=False,
+                )
+            )
+
+    # 目錄在前、文件在後，各按名稱字母序
+    items.sort(key=lambda f: (0 if f.is_directory else 1, f.name.lower()))
+    return items
 
 
 @router.post("/create", response_model=CreateSessionResponse)
@@ -504,10 +487,11 @@ async def delete_session(
 @router.get("/{chat_session_id}/files", response_model=FileListResponse)
 async def get_session_files(
     chat_session_id: str,
+    path: str = Query("", description="子目录相对路径（空表示 session 根目录）"),
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    """获取会话的文件列表（from 沙箱）"""
+    """获取会话指定目录的内容列表（目录浏览模式）"""
     # 验证会话属于该用户
     session = (
         db.query(Session)
@@ -523,6 +507,16 @@ async def get_session_files(
     sandbox_service = get_sandbox_service()
     mount_path = sandbox_service.get_mount_path()
     session_root = f"{mount_path}/sessions/{chat_session_id}"
+
+    # 構建目標目錄並校驗路徑安全
+    if path:
+        target_dir = posixpath.normpath(f"{session_root}/{path}")
+    else:
+        target_dir = session_root
+    # 防止 ../ 穿越
+    if target_dir != session_root and not target_dir.startswith(session_root + "/"):
+        raise HTTPException(status_code=403, detail="路径越界")
+
     sandbox = sandbox_service.get_cached(user_id)
 
     if not sandbox:
@@ -534,7 +528,7 @@ async def get_session_files(
             return FileListResponse(files=[], total=0)
 
     try:
-        files = await _sandbox_list_files(sandbox, session_root)
+        files = await _sandbox_list_dir(sandbox, target_dir, session_root)
         return FileListResponse(files=files, total=len(files))
     except Exception as e:
         logger.warning("從沙箱獲取文件列表失敗: %s", e)

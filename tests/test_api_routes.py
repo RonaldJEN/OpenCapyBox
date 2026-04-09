@@ -586,157 +586,128 @@ class TestBuildFileinfoFromPath:
         assert info.type == "pdf"
 
 
-class TestSandboxListFiles:
-    """_sandbox_list_files 輔助函數測試（proxy vs 直連模式）"""
+class TestSandboxListDir:
+    """_sandbox_list_dir 輔助函數測試（目錄瀏覽模式）"""
 
     @pytest.mark.asyncio
-    async def test_proxy_mode_skips_files_search(self):
-        """proxy 模式下直接走 find 命令，不調用 files.search"""
-        from src.api.routes.sessions import _sandbox_list_files
+    async def test_list_dir_returns_files_and_dirs(self):
+        """列出目錄內的文件和子目錄"""
+        from src.api.routes.sessions import _sandbox_list_dir
 
         sandbox = MagicMock()
-        sandbox.files.search = AsyncMock()
         json_payload = json.dumps([
-            {"path": "/home/user/report.pdf", "size": 2048, "mtime": 1750000000.0},
-            {"path": "/home/user/data.csv", "size": 512, "mtime": 1750000100.0},
+            {"name": "report.pdf", "path": "/home/user/sessions/s1/report.pdf", "size": 2048, "mtime": 1750000000.0, "is_dir": False},
+            {"name": "data", "path": "/home/user/sessions/s1/data", "size": 0, "mtime": 1750000100.0, "is_dir": True},
+            {"name": "output.csv", "path": "/home/user/sessions/s1/output.csv", "size": 512, "mtime": 1750000200.0, "is_dir": False},
         ], ensure_ascii=False)
         sandbox.commands.run = AsyncMock(
             return_value=make_fake_execution(stdout_text=json_payload)
         )
 
-        fake_settings = MagicMock()
-        fake_settings.sandbox_use_server_proxy = True
+        items = await _sandbox_list_dir(sandbox, "/home/user/sessions/s1", "/home/user/sessions/s1")
 
-        with patch("src.api.routes.sessions.get_settings", return_value=fake_settings):
-            files = await _sandbox_list_files(sandbox, "/home/user")
-
-        # files.search 不應被調用
-        sandbox.files.search.assert_not_called()
-        # 命令被調用
         sandbox.commands.run.assert_called_once()
-        assert len(files) == 2
-        names = {f.name for f in files}
-        assert "report.pdf" in names
-        assert "data.csv" in names
-        assert {f.name: f.size for f in files}["report.pdf"] == 2048
+        assert len(items) == 3
+        # 目錄排在前面
+        assert items[0].name == "data"
+        assert items[0].is_directory is True
+        assert items[0].type == "directory"
+        assert items[0].size == 0
+        # 文件按名稱排序
+        assert items[1].name == "output.csv"
+        assert items[1].is_directory is False
+        assert items[1].size == 512
+        assert items[2].name == "report.pdf"
+        assert items[2].is_directory is False
+        assert items[2].size == 2048
 
     @pytest.mark.asyncio
-    async def test_direct_mode_uses_files_search(self):
-        """直連模式下優先使用 files.search SDK"""
-        from src.api.routes.sessions import _sandbox_list_files
+    async def test_list_dir_skips_system_paths(self):
+        """系統路徑被過濾"""
+        from src.api.routes.sessions import _sandbox_list_dir
 
-        entry = MagicMock()
-        entry.path = "/home/user/demo.txt"
-        entry.size = 42
-        entry.modified_at = "2025-06-01T12:00:00"
-
-        sandbox = MagicMock()
-        sandbox.files.search = AsyncMock(return_value=[entry])
-        sandbox.commands.run = AsyncMock()
-
-        fake_settings = MagicMock()
-        fake_settings.sandbox_use_server_proxy = False
-
-        with patch("src.api.routes.sessions.get_settings", return_value=fake_settings):
-            files = await _sandbox_list_files(sandbox, "/home/user")
-
-        # files.search 被調用
-        sandbox.files.search.assert_called_once()
-        # find 命令不應被調用
-        sandbox.commands.run.assert_not_called()
-        assert len(files) == 1
-        assert files[0].name == "demo.txt"
-        assert files[0].size == 42
-
-    @pytest.mark.asyncio
-    async def test_direct_mode_fallback_on_search_failure(self):
-        """直連模式下 files.search 失敗後回退到 find 命令"""
-        from src.api.routes.sessions import _sandbox_list_files
-
-        sandbox = MagicMock()
-        sandbox.files.search = AsyncMock(side_effect=Exception("Search files failed"))
-        sandbox.commands.run = AsyncMock(side_effect=[
-            make_fake_execution(stdout_text="not-json"),
-            make_fake_execution(stdout_text="/home/user/fallback.py"),
-        ])
-
-        fake_settings = MagicMock()
-        fake_settings.sandbox_use_server_proxy = False
-
-        with patch("src.api.routes.sessions.get_settings", return_value=fake_settings):
-            files = await _sandbox_list_files(sandbox, "/home/user")
-
-        # 兩者都被調用
-        sandbox.files.search.assert_called_once()
-        assert sandbox.commands.run.call_count == 2
-        assert len(files) == 1
-        assert files[0].name == "fallback.py"
-
-    @pytest.mark.asyncio
-    async def test_proxy_mode_skips_system_paths(self):
-        """proxy 模式下 find 結果中的系統路徑被過濾"""
-        from src.api.routes.sessions import _sandbox_list_files
-
-        stdout = json.dumps([
-            {"path": "/home/user/app.py", "size": 10, "mtime": 1750000000.0},
-            {"path": "/home/user/node_modules/pkg/index.js", "size": 11, "mtime": 1750000001.0},
-            {"path": "/home/user/__pycache__/mod.pyc", "size": 12, "mtime": 1750000002.0},
-            {"path": "/home/user/.agent_memory.json", "size": 13, "mtime": 1750000003.0},
-            {"path": "/home/user/result.xlsx", "size": 99, "mtime": 1750000004.0},
+        json_payload = json.dumps([
+            {"name": "app.py", "path": "/home/user/sessions/s1/app.py", "size": 10, "mtime": 1750000000.0, "is_dir": False},
+            {"name": "node_modules", "path": "/home/user/sessions/s1/node_modules", "size": 0, "mtime": 1750000001.0, "is_dir": True},
+            {"name": "__pycache__", "path": "/home/user/sessions/s1/__pycache__", "size": 0, "mtime": 1750000002.0, "is_dir": True},
+            {"name": ".agent_memory.json", "path": "/home/user/sessions/s1/.agent_memory.json", "size": 13, "mtime": 1750000003.0, "is_dir": False},
+            {"name": "result.xlsx", "path": "/home/user/sessions/s1/result.xlsx", "size": 99, "mtime": 1750000004.0, "is_dir": False},
         ], ensure_ascii=False)
         sandbox = MagicMock()
         sandbox.commands.run = AsyncMock(
-            return_value=make_fake_execution(stdout_text=stdout)
+            return_value=make_fake_execution(stdout_text=json_payload)
         )
 
-        fake_settings = MagicMock()
-        fake_settings.sandbox_use_server_proxy = True
+        items = await _sandbox_list_dir(sandbox, "/home/user/sessions/s1", "/home/user/sessions/s1")
 
-        with patch("src.api.routes.sessions.get_settings", return_value=fake_settings):
-            files = await _sandbox_list_files(sandbox, "/home/user")
-
-        names = {f.name for f in files}
+        names = {f.name for f in items}
         assert names == {"app.py", "result.xlsx"}
-        assert {f.name: f.size for f in files}["result.xlsx"] == 99
+        assert {f.name: f.size for f in items}["result.xlsx"] == 99
 
     @pytest.mark.asyncio
-    async def test_proxy_mode_empty_sandbox(self):
-        """proxy 模式下沙箱無文件時返回空列表"""
-        from src.api.routes.sessions import _sandbox_list_files
+    async def test_list_dir_empty(self):
+        """空目錄返回空列表"""
+        from src.api.routes.sessions import _sandbox_list_dir
 
         sandbox = MagicMock()
         sandbox.commands.run = AsyncMock(
-            return_value=make_fake_execution(stdout_text="")
+            return_value=make_fake_execution(stdout_text="[]")
         )
 
-        fake_settings = MagicMock()
-        fake_settings.sandbox_use_server_proxy = True
-
-        with patch("src.api.routes.sessions.get_settings", return_value=fake_settings):
-            files = await _sandbox_list_files(sandbox, "/home/user")
-
-        assert files == []
+        items = await _sandbox_list_dir(sandbox, "/home/user/sessions/s1", "/home/user/sessions/s1")
+        assert items == []
 
     @pytest.mark.asyncio
-    async def test_proxy_mode_json_parse_failure_fallback_to_find(self):
-        """JSON 解析失敗時，回退到舊 find 純路徑模式"""
-        from src.api.routes.sessions import _sandbox_list_files
+    async def test_list_dir_json_parse_failure(self):
+        """JSON 解析失敗時返回空列表"""
+        from src.api.routes.sessions import _sandbox_list_dir
 
         sandbox = MagicMock()
-        sandbox.commands.run = AsyncMock(side_effect=[
-            make_fake_execution(stdout_text="not-json"),
-            make_fake_execution(stdout_text="/home/user/fallback.txt"),
-        ])
+        sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(stdout_text="not-json")
+        )
 
-        fake_settings = MagicMock()
-        fake_settings.sandbox_use_server_proxy = True
+        items = await _sandbox_list_dir(sandbox, "/home/user/sessions/s1", "/home/user/sessions/s1")
+        assert items == []
 
-        with patch("src.api.routes.sessions.get_settings", return_value=fake_settings):
-            files = await _sandbox_list_files(sandbox, "/home/user")
+    @pytest.mark.asyncio
+    async def test_list_dir_relative_path_from_session_root(self):
+        """子目錄中的項目 path 相對於 session_root"""
+        from src.api.routes.sessions import _sandbox_list_dir
 
-        assert sandbox.commands.run.call_count == 2
-        assert len(files) == 1
-        assert files[0].name == "fallback.txt"
+        json_payload = json.dumps([
+            {"name": "chart.png", "path": "/home/user/sessions/s1/reports/chart.png", "size": 1024, "mtime": 1750000000.0, "is_dir": False},
+        ], ensure_ascii=False)
+        sandbox = MagicMock()
+        sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(stdout_text=json_payload)
+        )
+
+        items = await _sandbox_list_dir(sandbox, "/home/user/sessions/s1/reports", "/home/user/sessions/s1")
+
+        assert len(items) == 1
+        assert items[0].name == "chart.png"
+        assert items[0].path == "reports/chart.png"
+
+    @pytest.mark.asyncio
+    async def test_list_dir_skips_dotfiles(self):
+        """以點開頭的隱藏文件被跳過"""
+        from src.api.routes.sessions import _sandbox_list_dir
+
+        json_payload = json.dumps([
+            {"name": ".hidden", "path": "/home/user/sessions/s1/.hidden", "size": 0, "mtime": 1750000000.0, "is_dir": True},
+            {"name": ".env", "path": "/home/user/sessions/s1/.env", "size": 50, "mtime": 1750000001.0, "is_dir": False},
+            {"name": "visible.txt", "path": "/home/user/sessions/s1/visible.txt", "size": 100, "mtime": 1750000002.0, "is_dir": False},
+        ], ensure_ascii=False)
+        sandbox = MagicMock()
+        sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(stdout_text=json_payload)
+        )
+
+        items = await _sandbox_list_dir(sandbox, "/home/user/sessions/s1", "/home/user/sessions/s1")
+
+        assert len(items) == 1
+        assert items[0].name == "visible.txt"
 
 
 class TestAbortEndpoint:

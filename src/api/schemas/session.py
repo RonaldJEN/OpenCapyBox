@@ -47,6 +47,7 @@ class FileInfo(BaseModel):
     size: int = Field(..., description="文件大小（字节）")
     modified: str = Field(..., description="修改时间（ISO格式）")
     type: str = Field(..., description="文件类型（扩展名）")
+    is_directory: bool = Field(False, description="是否为目录")
 
 
 class UpdateSessionTitleRequest(BaseModel):
