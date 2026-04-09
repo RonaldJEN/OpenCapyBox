@@ -7,7 +7,7 @@ AG-UI 協議概念映射：
 
 此模型同時支持舊的 Round 命名和新的 AG-UI Run 命名。
 """
-from sqlalchemy import Column, String, Text, DateTime, Integer, ForeignKey
+from sqlalchemy import Column, String, Text, DateTime, Integer, ForeignKey, UniqueConstraint
 from datetime import datetime
 from .database import Base
 from src.api.utils.timezone import now_naive
@@ -24,6 +24,11 @@ class Round(Base):
     """
 
     __tablename__ = "rounds"
+    __table_args__ = (
+        # 注意：依賴 SQL 標準 NULL ≠ NULL 行為（SQLite, PostgreSQL 正確）。
+        # MySQL 8.0.16+ 需該約束只對非 NULL 值生效，如需遷移請驗證。
+        UniqueConstraint('session_id', 'idempotency_key', name='uq_round_session_idempkey'),
+    )
 
     # === AG-UI 標準字段 ===
     
@@ -71,6 +76,9 @@ class Round(Base):
     # 存儲 {id, reason, payload} 用於刷新後恢復 Human-in-the-Loop 問題卡片
     interrupt_payload = Column(Text, nullable=True)
     
+    # 幂等鍵（防止多 Worker 重複處理同一請求）
+    idempotency_key = Column(String(64), nullable=True)
+
     # 時間戳
     created_at = Column(DateTime, default=now_naive, index=True)
     completed_at = Column(DateTime, nullable=True)

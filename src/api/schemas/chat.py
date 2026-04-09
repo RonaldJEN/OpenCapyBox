@@ -69,6 +69,7 @@ class SendMessageRequest(BaseModel):
     """发送消息请求（V2：仅支持 content blocks）"""
 
     content: List[ContentBlock] = Field(..., min_length=1, description="用户消息内容块")
+    idempotency_key: Optional[str] = Field(default=None, max_length=64, description="幂等键（防止多 Worker 重复处理同一请求）")
 
 
 class ResumeRequest(BaseModel):

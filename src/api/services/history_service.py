@@ -5,6 +5,7 @@
 - AGUIEventLog: AG-UI 事件流（包含完整的步驟細節，用於 SSE 重連和歷史重建）
 """
 from sqlalchemy.orm import Session as DBSession
+from sqlalchemy.exc import IntegrityError
 from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.agui_event import AGUIEventLog
@@ -32,17 +33,36 @@ class HistoryService:
         round_id: str,
         user_message: str,
         user_attachments: Optional[List[Dict]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Round:
-        """创建新的对话轮次"""
+        """创建新的对话轮次
+        
+        若 idempotency_key 觸發唯一約束衝突，返回已有的 Round（其 id != round_id）。
+        調用方可通過比較 returned_round.id != round_id 判斷是否為重複請求。
+        """
         round_obj = Round(
             id=round_id,
             session_id=session_id,
             user_message=user_message,
             user_attachments=json.dumps(user_attachments or [], ensure_ascii=False),
             status="running",
+            idempotency_key=idempotency_key,
         )
         self.db.add(round_obj)
-        self.db.commit()
+        try:
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            # idempotency_key 唯一約束衝突 → 查詢已有 Round
+            if idempotency_key:
+                existing = (
+                    self.db.query(Round)
+                    .filter(Round.session_id == session_id, Round.idempotency_key == idempotency_key)
+                    .first()
+                )
+                if existing:
+                    return existing
+            raise
         self.db.refresh(round_obj)
         return round_obj
 

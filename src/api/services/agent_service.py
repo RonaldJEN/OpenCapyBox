@@ -28,12 +28,22 @@ from src.agent.tools.cron_tool import ManageCronTool
 from src.agent.tools.ask_user_tool import AskUserQuestionTool
 
 from src.api.services.history_service import HistoryService
+
 from src.api.services.sandbox_service import get_sandbox_service, get_sandbox_mount_path
 from src.api.config import get_settings
 from src.api.model_registry import get_model_registry
 from pathlib import Path as PathlibPath
 
 logger = logging.getLogger(__name__)
+
+
+class DuplicateRoundError(Exception):
+    """幂等衝突：另一個 Worker 已搶先創建了相同 idempotency_key 的 Round"""
+    def __init__(self, existing_round_id: str):
+        self.existing_round_id = existing_round_id
+        super().__init__(f"Duplicate round: {existing_round_id}")
+
+
 settings = get_settings()
 
 
@@ -657,6 +667,7 @@ class AgentService:
         用於 Agent 上下文恢復，與 agui_events 互相獨立。
         """
         from src.api.models.conversation_message import ConversationMessage as ConvMsg
+
         db = self.history_service.db
         self._next_sequence += 1
         content_str = (
@@ -682,6 +693,7 @@ class AgentService:
     async def chat_agui(
         self,
         user_content: list[Any],
+        idempotency_key: str | None = None,
     ) -> AsyncIterator[AGUIEvent]:
         """執行對話並輸出 AG-UI 事件流
         
@@ -724,13 +736,22 @@ class AgentService:
         # 創建運行 ID
         run_id = str(uuid.uuid4())
         
-        # 創建 Round
-        self.history_service.create_round(
+        # 創建 Round（含幂等性保護：若 idempotency_key 衝突，返回已有 Round）
+        created_round = self.history_service.create_round(
             session_id=self.session_id,
             round_id=run_id,
             user_message=user_message_for_history,
             user_attachments=user_attachments,
+            idempotency_key=idempotency_key,
         )
+
+        # 幂等衝突：另一個 Worker 已搶先創建了相同 idempotency_key 的 Round
+        if idempotency_key and created_round.id != run_id:
+            logger.warning(
+                "幂等衝突：已存在 Round %s (status=%s)，跳過重複執行 (key=%s)",
+                created_round.id, created_round.status, idempotency_key,
+            )
+            raise DuplicateRoundError(created_round.id)
         
         # 添加到 agent
         self.agent.add_user_message(agent_content)

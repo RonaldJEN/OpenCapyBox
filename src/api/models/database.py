@@ -73,11 +73,20 @@ _PENDING_COLUMNS = [
     ("sessions", "model_id", "VARCHAR(50)"),
     ("rounds", "user_attachments", "TEXT"),
     ("rounds", "interrupt_payload", "TEXT"),
+    ("rounds", "idempotency_key", "VARCHAR(64)"),
+]
+
+
+# 格式: (表名, 约束名, 列列表)
+# 用於在存量數據庫上補建 UNIQUE 約束（create_all 只在新建表時生效）
+# 注意：值均為可信硬編碼常量，直接用於 DDL 語句拼接
+_PENDING_UNIQUE_CONSTRAINTS = [
+    ("rounds", "uq_round_session_idempkey", ["session_id", "idempotency_key"]),
 ]
 
 
 def _migrate_add_columns():
-    """检查并添加缺失的列（幂等，仅在列不存在时执行 ALTER TABLE）"""
+    """检查并添加缺失的列和约束（幂等，仅在不存在时执行）"""
     inspector = inspect(engine)
     with engine.begin() as conn:
         for table_name, column_name, column_type in _PENDING_COLUMNS:
@@ -88,3 +97,23 @@ def _migrate_add_columns():
                 stmt = f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
                 conn.execute(text(stmt))
                 logger.info("DB 迁移: %s 表新增列 %s (%s)", table_name, column_name, column_type)
+
+        # 补建唯一约束（仅对存量库：如果已有覆盖相同列的唯一索引/约束则跳过）
+        for table_name, constraint_name, columns in _PENDING_UNIQUE_CONSTRAINTS:
+            if not inspector.has_table(table_name):
+                continue
+            cols_set = set(columns)
+            already_covered = any(
+                set(idx["column_names"]) == cols_set and idx.get("unique")
+                for idx in inspector.get_indexes(table_name)
+            ) or any(
+                set(uc["column_names"]) == cols_set
+                for uc in inspector.get_unique_constraints(table_name)
+            )
+            if already_covered:
+                logger.debug("DB 迁移: 唯一约束已存在，跳过 %s.%s", table_name, constraint_name)
+                continue
+            cols_str = ", ".join(columns)
+            stmt = f"CREATE UNIQUE INDEX IF NOT EXISTS {constraint_name} ON {table_name} ({cols_str})"
+            conn.execute(text(stmt))
+            logger.info("DB 迁移: 新建唯一约束 %s.%s (%s)", table_name, constraint_name, cols_str)
