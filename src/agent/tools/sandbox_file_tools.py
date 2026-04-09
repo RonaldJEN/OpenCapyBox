@@ -325,6 +325,7 @@ class SandboxWriteTool(Tool):
     def description(self) -> str:
         return (
             "Write text content to a file in the sandbox (UTF-8 encoding only). "
+            "Both 'path' and 'content' parameters are REQUIRED — always specify the file path. "
             "Cannot write binary files like .docx, .pdf, .xlsx - use appropriate scripts/tools for those formats. "
             "Will overwrite existing files completely. "
             "For existing files, you should read the file first using read_file. "

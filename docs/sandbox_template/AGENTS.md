@@ -21,6 +21,11 @@ read_when:
 - `write_file(path, content)` — 创建或完全覆盖文件（⚠️ 会覆盖全部内容，先 read 再 write）
 - `edit_file(path, old_str, new_str)` — 精确修改文件某个部分
 
+**⚠️ write_file 必须同时传 path 和 content，缺一不可：**
+```json
+write_file({ "path": "report.md", "content": "# Report\n..." })
+```
+
 **❌ 禁止用 bash 操作文件内容：** 不要用 `cat`、`echo >`、`sed`、`awk`、`heredoc` 读写文件。
 
 ### 会话目录与文件可见性（必读）
