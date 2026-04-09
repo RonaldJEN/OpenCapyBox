@@ -16,10 +16,11 @@ class TestRetryConfig:
         """測試默認配置"""
         config = RetryConfig()
         assert config.enabled is True
-        assert config.max_retries == 2
+        assert config.max_retries == 5
         assert config.initial_delay == 0.5
-        assert config.max_delay == 60.0
+        assert config.max_delay == 30.0
         assert config.exponential_base == 2.0
+        assert config.max_increment == 1.0
         assert config.retryable_exceptions == (Exception,)
 
     def test_custom_config(self):
@@ -41,33 +42,39 @@ class TestRetryConfig:
 
     def test_calculate_delay_first_attempt(self):
         """測試第一次嘗試的延遲計算"""
-        config = RetryConfig(initial_delay=1.0, exponential_base=2.0)
+        config = RetryConfig(initial_delay=1.0, exponential_base=2.0, max_increment=None)
         delay = config.calculate_delay(0)
         assert delay == 1.0  # 1.0 * 2^0 = 1.0
 
     def test_calculate_delay_second_attempt(self):
         """測試第二次嘗試的延遲計算"""
-        config = RetryConfig(initial_delay=1.0, exponential_base=2.0)
+        config = RetryConfig(initial_delay=1.0, exponential_base=2.0, max_increment=None)
         delay = config.calculate_delay(1)
         assert delay == 2.0  # 1.0 * 2^1 = 2.0
 
     def test_calculate_delay_third_attempt(self):
         """測試第三次嘗試的延遲計算"""
-        config = RetryConfig(initial_delay=1.0, exponential_base=2.0)
+        config = RetryConfig(initial_delay=1.0, exponential_base=2.0, max_increment=None)
         delay = config.calculate_delay(2)
         assert delay == 4.0  # 1.0 * 2^2 = 4.0
 
     def test_calculate_delay_respects_max_delay(self):
         """測試延遲計算不超過最大延遲"""
-        config = RetryConfig(initial_delay=1.0, exponential_base=2.0, max_delay=5.0)
+        config = RetryConfig(initial_delay=1.0, exponential_base=2.0, max_delay=5.0, max_increment=None)
         delay = config.calculate_delay(10)  # 1.0 * 2^10 = 1024
         assert delay == 5.0  # 應該限制在 max_delay
 
     def test_calculate_delay_with_different_base(self):
         """測試不同底數的指數退避"""
-        config = RetryConfig(initial_delay=0.5, exponential_base=3.0)
+        config = RetryConfig(initial_delay=0.5, exponential_base=3.0, max_increment=None)
         delay = config.calculate_delay(2)
         assert delay == 4.5  # 0.5 * 3^2 = 4.5
+
+    def test_calculate_delay_with_max_increment(self):
+        """測試帶增量上限的延遲序列"""
+        config = RetryConfig(initial_delay=0.5, exponential_base=2.0, max_increment=1.0)
+        delays = [config.calculate_delay(i) for i in range(5)]
+        assert delays == [0.5, 1.0, 2.0, 3.0, 4.0]
 
 
 class TestRetryExhaustedError:
@@ -266,6 +273,7 @@ class TestRetryDelayBehavior:
             initial_delay=1.0,
             exponential_base=2.0,
             max_delay=100.0,
+            max_increment=None,
         )
 
         @async_retry(config)

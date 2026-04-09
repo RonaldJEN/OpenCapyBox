@@ -26,19 +26,22 @@ class RetryConfig:
     def __init__(
         self,
         enabled: bool = True,
-        max_retries: int = 2,
+        max_retries: int = 5,
         initial_delay: float = 0.5,
-        max_delay: float = 60.0,
+        max_delay: float = 30.0,
         exponential_base: float = 2.0,
+        max_increment: float | None = 1.0,
         retryable_exceptions: tuple[Type[Exception], ...] = (Exception,),
     ):
         """
         Args:
             enabled: Whether to enable retry mechanism
-            max_retries: Maximum number of retries (default 2 for fast failover)
-            initial_delay: Initial delay time (seconds, default 0.5 for fast failover)
-            max_delay: Maximum delay time (seconds)
+            max_retries: Maximum number of retries (default 5)
+            initial_delay: Initial delay time (seconds)
+            max_delay: Maximum delay time (seconds, default 30)
             exponential_base: Exponential backoff base
+            max_increment: Maximum per-step delay increment (seconds);
+                None for pure exponential backoff
             retryable_exceptions: Tuple of retryable exception types
         """
         self.enabled = enabled
@@ -46,10 +49,11 @@ class RetryConfig:
         self.initial_delay = initial_delay
         self.max_delay = max_delay
         self.exponential_base = exponential_base
+        self.max_increment = max_increment
         self.retryable_exceptions = retryable_exceptions
 
     def calculate_delay(self, attempt: int) -> float:
-        """Calculate delay time (exponential backoff)
+        """Calculate delay time (exponential backoff with optional increment cap)
 
         Args:
             attempt: Current attempt number (starting from 0)
@@ -57,7 +61,12 @@ class RetryConfig:
         Returns:
             Delay time (seconds)
         """
-        delay = self.initial_delay * (self.exponential_base**attempt)
+        delay = self.initial_delay
+        for _ in range(attempt):
+            increment = delay * (self.exponential_base - 1)
+            if self.max_increment is not None:
+                increment = min(increment, self.max_increment)
+            delay += increment
         return min(delay, self.max_delay)
 
 
