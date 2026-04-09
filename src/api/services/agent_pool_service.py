@@ -7,6 +7,7 @@
 - 一用戶一沙箱：追蹤 user_id → {session_ids} 映射
 """
 
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -61,6 +62,7 @@ class AgentPoolService:
         self._session_user: dict[str, str] = {}             # chat_session_id → user_id
         self._user_sessions: dict[str, set[str]] = {}       # user_id → {chat_session_id}
         self._last_renew: dict[str, float] = {}             # user_id → last renew timestamp
+        self._create_locks: dict[str, asyncio.Lock] = {}    # chat_session_id → Lock
         self._ttl = ttl
         self._initialized = True
 
@@ -112,7 +114,7 @@ class AgentPoolService:
         Raises:
             Exception: Agent 初始化失敗時拋出
         """
-        # 先嘗試從緩存獲取
+        # 先嘗試從緩存獲取（無鎖快速路徑）
         if chat_session_id in self._cache:
             self._touch(chat_session_id)
             # 節流：每300秒才續租一次沙箱
@@ -127,6 +129,35 @@ class AgentPoolService:
                     return self._cache[chat_session_id]
             else:
                 return self._cache[chat_session_id]
+
+        # 使用 per-session 鎖防止同一 Worker 內並發創建同一 session 的 Agent
+        # 注意：此鎖僅作用於單進程（asyncio.Lock），跨 Worker 的唯一性保證依賴 DB 層約束
+        lock = self._create_locks.setdefault(chat_session_id, asyncio.Lock())
+
+        async with lock:
+            # Double-check：取得鎖後再次確認緩存
+            if chat_session_id in self._cache:
+                self._touch(chat_session_id)
+                return self._cache[chat_session_id]
+
+            return await self._create_agent_instance(
+                user_id=user_id,
+                chat_session_id=chat_session_id,
+                db=db,
+                model_id=model_id,
+                sandbox_id=sandbox_id,
+            )
+
+    async def _create_agent_instance(
+        self,
+        user_id: str,
+        chat_session_id: str,
+        db,
+        model_id: str | None,
+        sandbox_id: str | None,
+    ) -> "AgentService":
+        """創建 Agent 實例的內部實現（已在 per-session 鎖內部）"""
+        from src.api.services.agent_service import AgentService
 
         # 創建/恢復用戶級沙箱
         sandbox_service = get_sandbox_service()
@@ -219,6 +250,8 @@ class AgentPoolService:
         if chat_session_id in self._last_access:
             del self._last_access[chat_session_id]
 
+        self._create_locks.pop(chat_session_id, None)
+
         # 更新 user ↔ session 映射
         user_id = self._session_user.pop(chat_session_id, None)
         if user_id and user_id in self._user_sessions:
@@ -302,6 +335,7 @@ class AgentPoolService:
         self._session_user.clear()
         self._user_sessions.clear()
         self._last_renew.clear()
+        self._create_locks.clear()
         logger.info("已清空所有 Agent 緩存（共 %d 個）", count)
         return count
 

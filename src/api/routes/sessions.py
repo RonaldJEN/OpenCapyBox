@@ -347,33 +347,8 @@ async def create_session(
     db.commit()
     db.refresh(session)
 
-    # 🔥 創建沙箱 + 初始化 Agent
-    try:
-        logger.info("正在為新會話創建沙箱和初始化 Agent (session=%s, model=%s)", chat_session_id, resolved_model_id)
-
-        # 從 UserSandbox 查找該用戶現有 sandbox_id（用於 resume）
-        existing_sandbox_id = _get_user_sandbox_id(db, user_id)
-
-        # 使用 AgentPoolService 管理 Agent 實例（內含沙箱創建）
-        agent_pool = get_agent_pool()
-        await agent_pool.get_or_create(
-            user_id=user_id,
-            session_id=user_id,
-            chat_session_id=chat_session_id,
-            db=db,
-            model_id=resolved_model_id,
-            sandbox_id=existing_sandbox_id,
-        )
-        
-        logger.info("沙箱和 Agent 初始化成功 (session=%s)", chat_session_id)
-    except Exception as e:
-        # 即使沙箱創建失敗，允許會話創建成功
-        logger.error(
-            "沙箱/Agent 初始化失敗 (session=%s): %s: %s",
-            chat_session_id, type(e).__name__, e,
-            exc_info=True,
-        )
-        logger.warning("沙箱/Agent 初始化失敗，但會話已創建。將在第一次發消息時重試。")
+    # 沙箱 + Agent 初始化延遲到第一次發消息時執行（chat.py send_message_stream 中的 get_or_create）
+    # 避免在此處同步等待沙箱創建，防止 OCP HAProxy 30s 超時導致 504
 
     return CreateSessionResponse(
         session_id=chat_session_id,

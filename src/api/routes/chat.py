@@ -30,6 +30,10 @@ from src.api.utils.timezone import now_naive
 # AG-UI 事件類型統一從 Agent 層導入
 from src.agent.schema.agui_events import AGUIEvent, RunStartedEvent, CustomEvent, EventType, RunErrorEvent, RunFinishedEvent, MessagesSnapshotEvent, InterruptDetails
 from src.api.utils.agui_encoder import EventEncoder
+from src.api.services.agent_service import DuplicateRoundError
+from src.api.models.round import Round
+from src.api.services.history_service import HistoryService
+from src.api.models.database import SessionLocal
 import asyncio
 import json
 import traceback
@@ -164,8 +168,13 @@ async def _sse_with_heartbeat(
         error_detail = traceback.format_exc()
         logger.error("AG-UI 事件流錯誤: %s\n%s", e, error_detail)
 
-        display_msg = error_message or str(e)
-        display_code = "INTERNAL_ERROR" if error_message else type(e).__name__
+        # DuplicateRoundError: 發送 existing_round_id 供客戶端切換到 subscribe
+        if isinstance(e, DuplicateRoundError):
+            display_msg = e.existing_round_id
+            display_code = "ROUND_IN_PROGRESS"
+        else:
+            display_msg = error_message or str(e)
+            display_code = "INTERNAL_ERROR" if error_message else type(e).__name__
         try:
             yield event_encoder.encode(RunErrorEvent(message=display_msg, code=display_code))
         except Exception:
@@ -193,6 +202,60 @@ async def _sse_with_heartbeat(
             pass
 
 
+# =========================================================================
+# Agent 初始化助手
+# =========================================================================
+
+
+class _AgentInitFailed(Exception):
+    """Agent 初始化失敗（僅用於 generator 內部流轉）"""
+    pass
+
+
+def _start_agent_init(
+    *,
+    user_id: str,
+    chat_session_id: str,
+    db,
+    model_id: str | None,
+    sandbox_id: str | None,
+) -> asyncio.Task:
+    """啟動 Agent 初始化 Task，並順帶做節流清理。
+
+    返回的 Task 需要在心跳循環中 await 完成，再用 _resolve_agent_init 取結果。
+    """
+    agent_pool = get_agent_pool()
+
+    # 定期清理過期 Agent（節流：每60秒最多一次）
+    global _last_cleanup_time
+    now = time.time()
+    if now - _last_cleanup_time > 60:
+        _cleanup_task = asyncio.create_task(agent_pool.cleanup_expired_async())
+        _cleanup_task.add_done_callback(lambda t: logger.error("Agent 清理異常: %s", t.exception()) if not t.cancelled() and t.exception() else None)
+        _last_cleanup_time = now
+
+    return asyncio.create_task(agent_pool.get_or_create(
+        user_id=user_id,
+        session_id=user_id,
+        chat_session_id=chat_session_id,
+        db=db,
+        model_id=model_id,
+        sandbox_id=sandbox_id,
+    ))
+
+
+def _resolve_agent_init(init_task: asyncio.Task):
+    """從完成的 init_task 取出 AgentService，失敗時拋 _AgentInitFailed。"""
+    try:
+        return init_task.result()
+    except Exception as e:
+        logger.error("Agent 初始化失敗: %s: %s", type(e).__name__, e, exc_info=True)
+        error_msg = f"Agent 初始化失敗: {type(e).__name__}: {str(e)}"
+        if "api_key" in str(e).lower() or "apikey" in str(e).lower():
+            error_msg += "\n\n💡 提示：請檢查 .env 文件中的 LLM_API_KEY 配置是否正確"
+        raise _AgentInitFailed(error_msg) from e
+
+
 @router.post("/{chat_session_id}/message/stream")
 async def send_message_stream(
     chat_session_id: str,
@@ -214,93 +277,106 @@ async def send_message_stream(
     if session.status == "completed":
         raise HTTPException(status_code=410, detail="會話已完成")
 
-    # 使用 AgentPoolService 管理 Agent 實例
-    agent_pool = get_agent_pool()
-    
-    # 定期清理過期 Agent（節流：每60秒最多一次）
-    global _last_cleanup_time
-    now = time.time()
-    if now - _last_cleanup_time > 60:
-        await agent_pool.cleanup_expired_async()
-        _last_cleanup_time = now
+    # 幂等性保證依賴 DB 層 UniqueConstraint（history_service.create_round 的 IntegrityError 兜底）
+    # 無需在此做 SELECT fast-path：TOCTOU 窗口使其不可靠，省掉的只是一次 Agent 初始化嘗試
 
-    # 獲取或創建 Agent Service（sandbox_id 從 UserSandbox 表讀取）
+    # 預讀 sandbox_id 和 round_count（輕量查詢，不會超時）
     user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
     user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+    round_count = db.query(Round).filter(Round.session_id == chat_session_id).count()
+    model_id = session.model_id
 
-    try:
-        agent_service = await agent_pool.get_or_create(
+    # 定義事件生成器（Agent 初始化移入 generator 內部，讓 SSE 響應頭先返回，心跳保活撐住連接）
+    async def event_generator():
+        settings = get_settings()
+
+        # --- Agent 初始化（帶心跳保活，防止 HAProxy 30s 超時）---
+        init_task = _start_agent_init(
             user_id=user_id,
-            session_id=user_id,
             chat_session_id=chat_session_id,
             db=db,
-            model_id=session.model_id,
+            model_id=model_id,
             sandbox_id=user_sandbox_id,
         )
-    except Exception as e:
-        logger.error(
-            "Agent 初始化失敗: %s: %s", type(e).__name__, e, exc_info=True,
-        )
 
-        error_msg = f"Agent 初始化失敗: {type(e).__name__}: {str(e)}"
-        if "api_key" in str(e).lower() or "apikey" in str(e).lower():
-            error_msg += "\n\n💡 提示：請檢查 .env 文件中的 LLM_API_KEY 配置是否正確"
-        raise HTTPException(status_code=500, detail=error_msg)
+        try:
+            # 在初始化完成前持續發送心跳
+            while not init_task.done():
+                done, _ = await asyncio.wait({init_task}, timeout=settings.sse_heartbeat_interval)
+                if not done:
+                    yield event_encoder.encode(CustomEvent(
+                        name="heartbeat",
+                        value={"timestamp": int(datetime.now().timestamp() * 1000)},
+                    ))
 
-    # 標題生成任務（如果是第一條消息）
-    title_generation_task = None
-    from src.api.models.round import Round
-    from src.api.models.database import SessionLocal
+            agent_service = _resolve_agent_init(init_task)
+        except _AgentInitFailed as e:
+            yield event_encoder.encode(RunErrorEvent(message=str(e), code="AGENT_INIT_FAILED"))
+            return
+        finally:
+            if not init_task.done():
+                init_task.cancel()
+                try:
+                    await init_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
-    round_count = db.query(Round).filter(Round.session_id == chat_session_id).count()
-    if round_count == 0:
-        print(f"🏷️  檢測到第一條消息，啟動標題生成任務...")
+        # --- 標題生成任務（如果是第一條消息）---
+        title_generation_task = None
+        try:
+            if round_count == 0:
+                print(f"🏷️  檢測到第一條消息，啟動標題生成任務...")
 
-        async def generate_title_async():
-            try:
-                title_source = _extract_text_for_title(request.content)
-                title = await agent_service.generate_session_title(title_source)
-                with SessionLocal() as title_db:
-                    title_session = title_db.query(Session).filter(Session.id == chat_session_id).first()
-                    if title_session:
-                        title_session.title = title
-                        title_session.updated_at = now_naive()
-                        title_db.commit()
-                        print(f"✅ 會話標題已保存: {title}")
-                        return title
-            except Exception as e:
-                print(f"⚠️  標題生成失敗: {e}")
-                return None
-
-        title_generation_task = asyncio.create_task(generate_title_async())
-
-    # 創建 per-run 取消令牌
-    cancel_token = asyncio.Event()
-    agent_service.cancel_token = cancel_token
-
-    # 定義事件生成器（帶心跳保活，防止 nginx 超時斷連）
-    async def event_generator():
-        # RUN_FINISHED 後追加標題更新事件
-        async def on_run_finished(_run_id):
-            async def _extra():
-                if title_generation_task:
+                async def generate_title_async():
                     try:
-                        title = await title_generation_task
-                        if title:
-                            title_event = CustomEvent(
-                                name="title_updated",
-                                value={"sessionId": chat_session_id, "title": title},
-                            )
-                            yield event_encoder.encode(title_event)
+                        title_source = _extract_text_for_title(request.content)
+                        title = await agent_service.generate_session_title(title_source)
+                        with SessionLocal() as title_db:
+                            title_session = title_db.query(Session).filter(Session.id == chat_session_id).first()
+                            if title_session:
+                                title_session.title = title
+                                title_session.updated_at = now_naive()
+                                title_db.commit()
+                                print(f"✅ 會話標題已保存: {title}")
+                                return title
                     except Exception as e:
-                        print(f"⚠️  等待標題生成失敗: {e}")
-            return _extra()
+                        print(f"⚠️  標題生成失敗: {e}")
+                        return None
 
-        async for chunk in _sse_with_heartbeat(
-            agent_service.chat_agui(user_content=request.content),
-            on_run_finished=on_run_finished,
-        ):
-            yield chunk
+                title_generation_task = asyncio.create_task(generate_title_async())
+
+            # 創建 per-run 取消令牌
+            cancel_token = asyncio.Event()
+            agent_service.cancel_token = cancel_token
+
+            # RUN_FINISHED 後追加標題更新事件
+            async def on_run_finished(_run_id):
+                async def _extra():
+                    if title_generation_task:
+                        try:
+                            title = await title_generation_task
+                            if title:
+                                title_event = CustomEvent(
+                                    name="title_updated",
+                                    value={"sessionId": chat_session_id, "title": title},
+                                )
+                                yield event_encoder.encode(title_event)
+                        except Exception as e:
+                            print(f"⚠️  等待標題生成失敗: {e}")
+                return _extra()
+
+            async for chunk in _sse_with_heartbeat(
+                agent_service.chat_agui(
+                    user_content=request.content,
+                    idempotency_key=request.idempotency_key,
+                ),
+                on_run_finished=on_run_finished,
+                error_message="Agent 執行失敗",
+            ):
+                yield chunk
+        finally:
+            if title_generation_task and not title_generation_task.done():
+                title_generation_task.cancel()
 
     # 更新會話活躍時間
     session.updated_at = now_naive()
@@ -456,9 +532,6 @@ async def subscribe_to_round(
         last_sequence: 客戶端最後收到的事件序列號（0 表示從頭重放）
         user_id: 用戶 ID
     """
-    from src.api.models.round import Round
-    from src.api.services.history_service import HistoryService
-
     # 验证会话
     session = (
         db.query(Session)
