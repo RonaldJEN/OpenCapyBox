@@ -14,6 +14,16 @@ import type {
   SubscriptionResult,
 } from '../types';
 
+/**
+ * 幂等衝突：服務端已有對應 Round，客戶端應走 subscribe 路徑
+ */
+class RoundExistsError extends Error {
+  constructor(public readonly roundId: string, public readonly roundStatus: string) {
+    super('SSE_ROUND_EXISTS');
+    this.name = 'RoundExistsError';
+  }
+}
+
 class APIService {
   private client: AxiosInstance;
   private userId: string | null = null;
@@ -197,6 +207,9 @@ class APIService {
   ): Promise<void> {
     const url = `/api/chat/${chatSessionId}/message/stream`;
 
+    // 幂等键：防止多 Worker 重复处理同一请求
+    const idempotencyKey = crypto.randomUUID();
+
     // 状态追踪（用于断线重连）
     let currentThreadId: string | null = null;
     let currentRunId: string | null = null;
@@ -224,7 +237,7 @@ class APIService {
             'Content-Type': 'application/json',
             ...this.getAuthHeaders(),
           },
-          body: JSON.stringify({ content }),
+          body: JSON.stringify({ content, idempotency_key: idempotencyKey }),
           signal: abortController.signal,
         })
           .then(async (response) => {
@@ -272,6 +285,12 @@ class APIService {
                       runCompleted = true;
                     });
                   } catch (e) {
+                    // RoundExistsError: 更新 currentRunId 為已有的 round_id，讓重連循環 subscribe 到正確目標
+                    if (e instanceof RoundExistsError) {
+                      currentRunId = e.roundId;
+                      currentThreadId = chatSessionId;
+                      throw e;
+                    }
                     console.error('Failed to parse SSE data:', e, 'Line:', data);
                   }
                 }
@@ -413,6 +432,10 @@ class APIService {
         break;
 
       case 'RUN_ERROR':
+        // ROUND_IN_PROGRESS: 幂等冲突，message 中携带已有 round_id，抛错让重连循环走 subscribe
+        if (event.code === 'ROUND_IN_PROGRESS') {
+          throw new RoundExistsError(event.message, 'running');
+        }
         onComplete();
         callbacks.onRunError?.(event.message, event.code);
         break;
