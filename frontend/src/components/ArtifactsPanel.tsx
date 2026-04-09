@@ -1,12 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { apiService } from '../services/api';
 import { FileInfo } from '../types';
 import {
   Folder,
   X,
   Download,
-  Layers,
-  Loader2
+  ChevronLeft,
+  ChevronRight,
+  ArrowUp,
+  Loader2,
+  FolderOpen
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
@@ -21,8 +24,13 @@ interface ArtifactsPanelProps {
 
 export function ArtifactsPanel({ sessionId, isOpen, onClose, onFilePreview }: ArtifactsPanelProps) {
   const [isMounted, setIsMounted] = useState(isOpen);
-  const [files, setFiles] = useState<FileInfo[]>([]);
+  const [items, setItems] = useState<FileInfo[]>([]);
   const [loading, setLoading] = useState(false);
+  const [currentPath, setCurrentPath] = useState('');
+  const [pathHistory, setPathHistory] = useState<string[]>(['']);
+  const [historyIndex, setHistoryIndex] = useState(0);
+  // 用 ref 跟踪最新 path 防止竞态
+  const latestPathRef = useRef(currentPath);
 
   useEffect(() => {
     if (isOpen) {
@@ -30,24 +38,77 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, onFilePreview }: Ar
     }
   }, [isOpen]);
 
+  // 面板打开或 session 切换时重置到根目录
   useEffect(() => {
     if (isOpen && sessionId) {
-      loadFiles();
+      setCurrentPath('');
+      setPathHistory(['']);
+      setHistoryIndex(0);
     }
   }, [isOpen, sessionId]);
 
-  const loadFiles = async () => {
+  // currentPath 变化时加载目录
+  const loadDir = useCallback(async (path: string) => {
+    latestPathRef.current = path;
     setLoading(true);
     try {
-      const response = await apiService.getSessionFiles(sessionId);
-      setFiles(response.files);
+      const response = await apiService.getSessionFiles(sessionId, path || undefined);
+      // 防止旧请求覆盖新结果
+      if (latestPathRef.current === path) {
+        setItems(response.files);
+      }
     } catch (error) {
-      console.error('Failed to load files:', error);
+      console.error('Failed to load directory:', error);
+      if (latestPathRef.current === path) {
+        setItems([]);
+      }
     } finally {
-      setLoading(false);
+      if (latestPathRef.current === path) {
+        setLoading(false);
+      }
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (isOpen && sessionId) {
+      loadDir(currentPath);
+    }
+  }, [isOpen, sessionId, currentPath, loadDir]);
+
+  // --- 导航逻辑 ---
+  const navigateTo = (subPath: string) => {
+    const newHistory = pathHistory.slice(0, historyIndex + 1);
+    newHistory.push(subPath);
+    setPathHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+    setCurrentPath(subPath);
+  };
+
+  const goBack = () => {
+    if (historyIndex > 0) {
+      const newIndex = historyIndex - 1;
+      setHistoryIndex(newIndex);
+      setCurrentPath(pathHistory[newIndex]);
     }
   };
 
+  const goForward = () => {
+    if (historyIndex < pathHistory.length - 1) {
+      const newIndex = historyIndex + 1;
+      setHistoryIndex(newIndex);
+      setCurrentPath(pathHistory[newIndex]);
+    }
+  };
+
+  const goUp = () => {
+    if (!currentPath) return;
+    const parent = currentPath.includes('/')
+      ? currentPath.substring(0, currentPath.lastIndexOf('/'))
+      : '';
+    navigateTo(parent);
+  };
+
+  // --- 工具函数 ---
   const formatFileSize = (bytes: number): string => {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -60,6 +121,22 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, onFilePreview }: Ar
       await apiService.downloadFile(sessionId, file.path);
     } catch (error) {
       console.error('Failed to download file:', error);
+    }
+  };
+
+  const shortSessionId = sessionId.length > 12
+    ? sessionId.substring(0, 8) + '...'
+    : sessionId;
+
+  const displayPath = currentPath
+    ? `~/sessions/${shortSessionId}/${currentPath}`
+    : `~/sessions/${shortSessionId}`;
+
+  const handleItemClick = (item: FileInfo) => {
+    if (item.is_directory) {
+      navigateTo(item.path);
+    } else {
+      onFilePreview(item);
     }
   };
 
@@ -81,83 +158,119 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, onFilePreview }: Ar
       >
       <div className="h-full flex flex-col pt-12 bg-claude-bg">
         {/* Header */}
-        <div className="px-6 py-6 border-b border-claude-border flex items-center justify-between">
-          <span className="text-[16px] font-semibold flex items-center space-x-2">
-            <Folder size={18} className="text-claude-accent" />
-            <span className="tracking-tight text-claude-text">会话资源管理</span>
-          </span>
-          <button
-            type="button"
-            onClick={onClose}
-            className="hover:bg-claude-hover p-2 rounded-full active:scale-90 transition-all"
-          >
-            <X size={18} className="text-claude-muted" />
-          </button>
+        <div className="px-4 py-4 border-b border-claude-border">
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-[16px] font-semibold flex items-center space-x-2">
+              <Folder size={18} className="text-claude-accent" />
+              <span className="tracking-tight text-claude-text">会话资源管理</span>
+            </span>
+            <button
+              type="button"
+              onClick={onClose}
+              className="hover:bg-claude-hover p-2 rounded-full active:scale-90 transition-all"
+            >
+              <X size={18} className="text-claude-muted" />
+            </button>
+          </div>
+
+          {/* Navigation bar */}
+          <div className="flex items-center space-x-1">
+            <button
+              type="button"
+              onClick={goBack}
+              disabled={historyIndex <= 0}
+              className="p-1.5 rounded-lg hover:bg-claude-hover disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+              title="后退"
+            >
+              <ChevronLeft size={16} className="text-claude-muted" />
+            </button>
+            <button
+              type="button"
+              onClick={goForward}
+              disabled={historyIndex >= pathHistory.length - 1}
+              className="p-1.5 rounded-lg hover:bg-claude-hover disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+              title="前进"
+            >
+              <ChevronRight size={16} className="text-claude-muted" />
+            </button>
+            <button
+              type="button"
+              onClick={goUp}
+              disabled={!currentPath}
+              className="p-1.5 rounded-lg hover:bg-claude-hover disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+              title="上级目录"
+            >
+              <ArrowUp size={16} className="text-claude-muted" />
+            </button>
+            <div className="flex-1 ml-1 px-3 py-1.5 bg-claude-surface rounded-lg text-[11px] text-claude-muted truncate font-mono select-all" title={displayPath}>
+              {displayPath}
+            </div>
+          </div>
         </div>
 
-        {/* File List */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-3">
-          <p className="px-2 text-[10px] font-medium text-claude-muted uppercase tracking-widest mb-2">
-            最近生成的资产
-          </p>
-
+        {/* Directory listing */}
+        <div className="flex-1 overflow-y-auto p-3 space-y-1">
           {loading ? (
             <div className="flex items-center justify-center py-12">
               <Loader2 className="w-6 h-6 text-claude-muted animate-spin" />
             </div>
-          ) : files.length === 0 ? (
+          ) : items.length === 0 ? (
             <div className="py-12 text-center">
-              <Layers size={32} className="mx-auto mb-4 text-claude-border" />
-              <p className="text-[12px] text-claude-muted">暂无文件</p>
+              <FolderOpen size={32} className="mx-auto mb-4 text-claude-border" />
+              <p className="text-[12px] text-claude-muted">空目录</p>
             </div>
           ) : (
-            files.map((file) => (
+            items.map((item) => (
               <div
-                key={file.path}
-                onClick={() => onFilePreview(file)}
-                className="group relative flex items-center justify-between p-4 bg-white hover:bg-claude-hover rounded-2xl border border-claude-border hover:border-claude-border-strong transition-all cursor-pointer active:scale-[0.98]"
+                key={item.path}
+                onClick={() => handleItemClick(item)}
+                className="group flex items-center justify-between px-3 py-2.5 hover:bg-claude-hover rounded-xl transition-colors cursor-pointer active:scale-[0.99]"
               >
-                <div className="flex items-center space-x-4 overflow-hidden">
-                  <div className="w-10 h-10 bg-claude-surface rounded-xl flex items-center justify-center shrink-0">
-                    {(() => {
-                      const Icon = getFileIcon(file);
-                      return <Icon size={16} className={getFileIconClass(file)} />;
+                <div className="flex items-center space-x-3 overflow-hidden min-w-0">
+                  <div className="w-8 h-8 bg-claude-surface rounded-lg flex items-center justify-center shrink-0">
+                    {item.is_directory ? (
+                      <Folder size={15} className="text-claude-accent" />
+                    ) : (() => {
+                      const Icon = getFileIcon(item);
+                      return <Icon size={15} className={getFileIconClass(item)} />;
                     })()}
                   </div>
-                  <div className="truncate">
-                    <p className="text-[14px] font-medium text-claude-text truncate leading-tight tracking-tight">
-                      {file.name}
+                  <div className="truncate min-w-0">
+                    <p className="text-[13px] font-medium text-claude-text truncate leading-tight">
+                      {item.name}{item.is_directory ? '/' : ''}
                     </p>
-                    <p className="text-[11px] text-claude-muted mt-1">
-                      {formatFileSize(file.size)} · {formatDistanceToNow(new Date(file.modified), {
-                        addSuffix: true,
-                        locale: zhCN,
-                      })}
+                    <p className="text-[10px] text-claude-muted mt-0.5">
+                      {item.is_directory
+                        ? formatDistanceToNow(new Date(item.modified), { addSuffix: true, locale: zhCN })
+                        : `${formatFileSize(item.size)} · ${formatDistanceToNow(new Date(item.modified), { addSuffix: true, locale: zhCN })}`
+                      }
                     </p>
                   </div>
                 </div>
 
-                <div className="flex items-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button
-                    type="button"
-                    onClick={(e) => handleDownload(file, e)}
-                    className="p-2 hover:bg-claude-hover rounded-full text-claude-muted hover:text-claude-text transition-colors"
-                    title="下载资源"
-                  >
-                    <Download size={14} />
-                  </button>
-                </div>
+                {!item.is_directory && (
+                  <div className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                    <button
+                      type="button"
+                      onClick={(e) => handleDownload(item, e)}
+                      className="p-1.5 hover:bg-claude-surface rounded-lg text-claude-muted hover:text-claude-text transition-colors"
+                      title="下载"
+                    >
+                      <Download size={13} />
+                    </button>
+                  </div>
+                )}
               </div>
             ))
           )}
+        </div>
 
-          {/* Sync Indicator */}
-          <div className="mt-8 px-4 py-8 border-2 border-dashed border-claude-border/30 rounded-2xl flex flex-col items-center justify-center text-center opacity-40 select-none">
-            <Layers size={32} className="mb-4 text-claude-muted" />
-            <p className="text-[12px] font-medium text-claude-text tracking-tight">
-              AI 逻辑组件实时同步中
-            </p>
-          </div>
+        {/* Footer status bar */}
+        <div className="px-4 py-2.5 border-t border-claude-border flex items-center justify-between text-[10px] text-claude-muted">
+          <span>{items.length} 项</span>
+          <span className="truncate ml-2 font-mono" title={displayPath}>
+            {displayPath}
+          </span>
         </div>
       </div>
     </div>

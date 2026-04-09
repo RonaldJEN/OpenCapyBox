@@ -877,11 +877,13 @@ class APIService {
   // ========== 文件管理 API ==========
 
   /**
-   * 🆕 获取会话的文件列表
+   * 获取会话指定目录的内容列表（目录浏览模式）
    */
-  async getSessionFiles(chatSessionId: string): Promise<FileListResponse> {
+  async getSessionFiles(chatSessionId: string, path?: string): Promise<FileListResponse> {
+    const params = path ? { path } : undefined;
     const response = await this.client.get<FileListResponse>(
-      `/sessions/${chatSessionId}/files`
+      `/sessions/${chatSessionId}/files`,
+      { params }
     );
     return response.data;
   }

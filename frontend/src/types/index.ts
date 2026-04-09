@@ -444,6 +444,7 @@ export interface FileInfo {
   size: number;
   modified: string;
   type: string;
+  is_directory?: boolean;
   data_url?: string;
 }
 
