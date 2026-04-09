@@ -208,7 +208,13 @@ class APIService {
     const url = `/api/chat/${chatSessionId}/message/stream`;
 
     // 幂等键：防止多 Worker 重复处理同一请求
-    const idempotencyKey = crypto.randomUUID();
+    // crypto.randomUUID 需要安全上下文(HTTPS)，不可用时回退到 getRandomValues
+    const idempotencyKey = typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : Array.from(crypto.getRandomValues(new Uint8Array(16)),
+          (b, i) => ((i === 6 ? (b & 0x0f) | 0x40 : i === 8 ? (b & 0x3f) | 0x80 : b))
+            .toString(16).padStart(2, '0') + ([4, 6, 8, 10].includes(i) ? '-' : '')
+        ).join('');
 
     // 状态追踪（用于断线重连）
     let currentThreadId: string | null = null;
