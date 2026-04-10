@@ -236,6 +236,24 @@ class SandboxSessionService:
             logger.error("沙箱創建失敗 (user=%s): %s", user_id, e, exc_info=True)
             raise RuntimeError(f"沙箱創建失敗: {e}") from e
 
+    async def _query_sandbox_state(self, sandbox_id: str) -> str:
+        """查詢沙箱狀態（不經過容器，直接問 OpenSandbox API）
+
+        Returns:
+            小寫狀態字串，如 "running", "paused", "terminated" 等。
+            查詢失敗時返回空字串。
+        """
+        try:
+            from opensandbox.manager import SandboxManager
+            async with await SandboxManager.create(connection_config=self._config) as manager:
+                info = await manager.get_sandbox_info(sandbox_id)
+                state = str(getattr(getattr(info, "status", None), "state", "")).lower()
+            logger.debug("沙箱狀態查詢結果 (sandbox_id=%s): %s", sandbox_id, state)
+            return state
+        except Exception as e:
+            logger.debug("查詢沙箱狀態失敗 (sandbox_id=%s): %s", sandbox_id, e)
+            return ""
+
     async def get_or_resume(
         self, user_id: str, sandbox_id: str | None = None
     ) -> Sandbox:
@@ -271,29 +289,32 @@ class SandboxSessionService:
                 logger.warning("沙箱健康檢查失敗，移除快取 (user=%s)", user_id)
                 del self._cache[user_id]
 
-        # 2. 嘗試 connect（如果有 sandbox_id，優先連接已運行中的沙箱）
+        # 2. 有 sandbox_id → 先查狀態，再決定走 connect 還是 resume
         if sandbox_id:
-            try:
-                logger.info("正在連接沙箱 (user=%s, sandbox_id=%s)...", user_id, sandbox_id)
-                sandbox = await Sandbox.connect(
-                    sandbox_id,
-                    connection_config=self._config,
-                    connect_timeout=timedelta(seconds=settings.sandbox_ready_timeout_seconds),
-                )
+            sandbox_state = await self._query_sandbox_state(sandbox_id)
 
-                logger.info("沙箱連接成功 (user=%s, sandbox_id=%s)", user_id, sandbox_id)
-                self._cache[user_id] = sandbox
-                self._pushed_skills.setdefault(user_id, set())
-                return sandbox
+            # 2a. 非 paused → 先嘗試 connect
+            if sandbox_state != "paused":
+                try:
+                    logger.info("正在連接沙箱 (user=%s, sandbox_id=%s)...", user_id, sandbox_id)
+                    sandbox = await Sandbox.connect(
+                        sandbox_id,
+                        connection_config=self._config,
+                        connect_timeout=timedelta(seconds=settings.sandbox_ready_timeout_seconds),
+                    )
+                    logger.info("沙箱連接成功 (user=%s, sandbox_id=%s)", user_id, sandbox_id)
+                    self._cache[user_id] = sandbox
+                    self._pushed_skills.setdefault(user_id, set())
+                    return sandbox
+                except Exception as e:
+                    logger.warning(
+                        "沙箱連接失敗 (user=%s, sandbox_id=%s): %s — 嘗試 resume",
+                        user_id, sandbox_id, e,
+                    )
+            else:
+                logger.info("沙箱處於暫停狀態，跳過 connect 直接 resume (user=%s, sandbox_id=%s)", user_id, sandbox_id)
 
-            except Exception as e:
-                logger.warning(
-                    "沙箱連接失敗 (user=%s, sandbox_id=%s): %s — 嘗試 resume",
-                    user_id, sandbox_id, e,
-                )
-
-        # 3. 嘗試 resume（如果有 sandbox_id）
-        if sandbox_id:
+            # 2b. resume（paused 直接走這裡；非 paused 在 connect 失敗後 fallthrough 到這裡）
             try:
                 logger.info("正在恢復沙箱 (user=%s, sandbox_id=%s)...", user_id, sandbox_id)
                 sandbox = await Sandbox.resume(
@@ -301,20 +322,17 @@ class SandboxSessionService:
                     connection_config=self._config,
                     resume_timeout=timedelta(seconds=settings.sandbox_ready_timeout_seconds),
                 )
-
                 logger.info("沙箱恢復成功 (user=%s, sandbox_id=%s)", user_id, sandbox_id)
-
                 self._cache[user_id] = sandbox
                 self._pushed_skills.setdefault(user_id, set())
                 return sandbox
-
             except Exception as e:
                 logger.warning(
                     "沙箱恢復失敗 (user=%s, sandbox_id=%s): %s — 將創建新沙箱",
                     user_id, sandbox_id, e,
                 )
 
-        # 4. 所有嘗試均失敗 → 創建新沙箱
+        # 3. 所有嘗試均失敗 → 創建新沙箱
         return await self.create(user_id)
 
     async def pause(self, user_id: str) -> bool:
@@ -365,17 +383,11 @@ class SandboxSessionService:
         self._pushed_skills.pop(user_id, None)
 
         if not sandbox and sandbox_id:
-            # 快取中沒有，嘗試 connect
-            try:
-                sandbox = await Sandbox.connect(
-                    sandbox_id,
-                    connection_config=self._config,
-                )
-            except Exception as e:
-                logger.warning("connect 失敗 (sandbox_id=%s): %s — 嘗試 resume", sandbox_id, e)
+            # 查詢狀態，決定走 connect 還是 resume
+            sandbox_state = await self._query_sandbox_state(sandbox_id)
 
-            # connect 失敗，嘗試 resume
-            if not sandbox and sandbox_id:
+            if sandbox_state == "paused":
+                # paused → 直接 resume（避免 connect 卡死）
                 try:
                     sandbox = await Sandbox.resume(
                         sandbox_id,
@@ -383,11 +395,34 @@ class SandboxSessionService:
                         resume_timeout=timedelta(seconds=settings.sandbox_ready_timeout_seconds),
                     )
                 except Exception as e:
-                    logger.warning(
-                        "resume 也失敗 (sandbox_id=%s): %s — 無法清理持久化文件",
-                        sandbox_id, e,
-                    )
+                    logger.warning("resume 失敗 (sandbox_id=%s): %s — 無法清理持久化文件", sandbox_id, e)
                     return False
+            else:
+                # 非 paused → 嘗試 connect
+                try:
+                    sandbox = await Sandbox.connect(
+                        sandbox_id,
+                        connection_config=self._config,
+                        connect_timeout=timedelta(seconds=settings.sandbox_ready_timeout_seconds),
+                    )
+                except Exception as e:
+                    logger.warning("connect 失敗 (sandbox_id=%s): %s — 嘗試 resume", sandbox_id, e)
+                    sandbox = None
+
+                # connect 失敗 → 嘗試 resume
+                if not sandbox:
+                    try:
+                        sandbox = await Sandbox.resume(
+                            sandbox_id,
+                            connection_config=self._config,
+                            resume_timeout=timedelta(seconds=settings.sandbox_ready_timeout_seconds),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "resume 也失敗 (sandbox_id=%s): %s — 無法清理持久化文件",
+                            sandbox_id, e,
+                        )
+                        return False
 
         if not sandbox:
             logger.debug("無需銷毀：沙箱不存在 (user=%s)", user_id)
