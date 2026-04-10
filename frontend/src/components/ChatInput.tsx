@@ -49,7 +49,6 @@ export function ChatInput({
   onPreviewAttachment,
   uploading = false,
   onInputChangeRaw,
-  onFileSelected,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
