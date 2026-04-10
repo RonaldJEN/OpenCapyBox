@@ -77,6 +77,10 @@ def _extract_text_for_title(content_blocks) -> str:
 _round_subscribers: dict[str, list[asyncio.Queue]] = {}
 _round_subscribers_lock = threading.Lock()
 
+# 活躍的後台 Agent 運行任務（session_id -> producer task）
+# Agent 執行與 SSE 連接解耦：瀏覽器斷開後 Agent 繼續在後台運行
+_active_runners: dict[str, asyncio.Task] = {}
+
 
 # =========================================================================
 # SSE + 心跳保活通用助手
@@ -86,13 +90,19 @@ _round_subscribers_lock = threading.Lock()
 async def _sse_with_heartbeat(
     event_source: AsyncIterator[AGUIEvent],
     *,
+    session_id: str | None = None,
     on_run_finished: Callable[[str | None], Awaitable[AsyncIterator[str]]] | None = None,
     error_message: str | None = None,
 ):
     """通用的 SSE 事件生成器，內建 producer/heartbeat/consumer 隊列模式。
 
+    Producer 負責驅動 Agent 執行和廣播事件給訂閱者。當 SSE 連接斷開（瀏覽器關閉）
+    時，producer 不會被取消——Agent 繼續在後台運行，事件通過 DB 持久化和
+    subscriber 機制傳遞給重連的客戶端。
+
     Args:
         event_source: Agent 層的 AG-UI 事件異步迭代器。
+        session_id: 會話 ID，用於追蹤後台運行任務（傳入則啟用後台運行模式）。
         on_run_finished: 可選回調，在 RUN_FINISHED 事件之後調用，
                          返回一個異步迭代器以 yield 額外的 SSE 字串（如標題更新）。
         error_message: 錯誤時對外顯示的訊息；為 None 則使用實際異常訊息。
@@ -100,21 +110,45 @@ async def _sse_with_heartbeat(
     current_run_id: str | None = None
     event_queue: asyncio.Queue = asyncio.Queue()
     _SENTINEL = object()
+    _run_completed = False
+    _consumer_active = True  # SSE 消費者是否仍存活
 
     settings = get_settings()
 
     def now_ms():
         return int(datetime.now().timestamp() * 1000)
 
-    # 生產者：消費 event_source → 放入隊列
+    # 生產者：消費 event_source → 廣播 + 放入本地隊列
     async def producer():
+        nonlocal current_run_id
         try:
             async for event in event_source:
-                await event_queue.put(event)
+                if hasattr(event, 'run_id') and event.run_id:
+                    current_run_id = event.run_id
+                # 廣播給所有訂閱者（確保重連客戶端能收到實時事件）
+                if current_run_id:
+                    try:
+                        event_dict = event.model_dump(by_alias=True, exclude_none=True)
+                        await _broadcast_to_subscribers(current_run_id, event_dict)
+                    except Exception:
+                        pass
+                # 只在 SSE 消費者存活時才放入本地隊列
+                if _consumer_active:
+                    event_queue.put_nowait(event)
+        except asyncio.CancelledError:
+            # 被 abort 取消，傳播以觸發 event_source 的清理
+            raise
         except Exception as e:
-            await event_queue.put(e)
+            if _consumer_active:
+                event_queue.put_nowait(e)
         finally:
-            await event_queue.put(_SENTINEL)
+            if _consumer_active:
+                event_queue.put_nowait(_SENTINEL)
+            # 清理追蹤
+            if session_id:
+                _active_runners.pop(session_id, None)
+            if current_run_id:
+                _cleanup_subscribers(current_run_id)
 
     # 心跳：每 sse_heartbeat_interval 秒發送 CUSTOM heartbeat 事件
     async def heartbeat():
@@ -130,6 +164,10 @@ async def _sse_with_heartbeat(
 
     producer_task = asyncio.create_task(producer())
     heartbeat_task = asyncio.create_task(heartbeat())
+
+    # 註冊為活躍運行任務
+    if session_id:
+        _active_runners[session_id] = producer_task
 
     try:
         while True:
@@ -148,23 +186,24 @@ async def _sse_with_heartbeat(
 
             event_str = event_encoder.encode(event)
 
-            if current_run_id:
-                event_dict = event.model_dump(by_alias=True, exclude_none=True)
-                await _broadcast_to_subscribers(current_run_id, event_dict)
+            # 廣播已在 producer 中處理，此處僅 yield 給當前 SSE 連接
 
             yield event_str
 
             if event.type == EventType.RUN_FINISHED:
+                _run_completed = True
                 # 允許調用方注入額外事件（如標題更新）
                 if on_run_finished:
                     async for extra in await on_run_finished(current_run_id):
                         yield extra
+                break
 
-                if current_run_id:
-                    _cleanup_subscribers(current_run_id)
+            if event.type == EventType.RUN_ERROR:
+                _run_completed = True
                 break
 
     except Exception as e:
+        _run_completed = True
         error_detail = traceback.format_exc()
         logger.error("AG-UI 事件流錯誤: %s\n%s", e, error_detail)
 
@@ -186,18 +225,26 @@ async def _sse_with_heartbeat(
             })
             yield f"data: {fallback_json}\n\n"
 
-        if current_run_id:
-            _cleanup_subscribers(current_run_id)
-
     finally:
+        _consumer_active = False
         heartbeat_task.cancel()
-        producer_task.cancel()
+
+        if _run_completed:
+            # 運行已結束，清理 producer（通常已自行結束）
+            producer_task.cancel()
+            try:
+                await producer_task
+            except asyncio.CancelledError:
+                pass
+        else:
+            # SSE 斷開但 Agent 仍在運行 → 不取消 producer，讓 Agent 繼續後台執行
+            logger.info(
+                "SSE 連接斷開，Agent 繼續後台運行 (session=%s, run=%s)",
+                session_id, current_run_id,
+            )
+
         try:
             await heartbeat_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await producer_task
         except asyncio.CancelledError:
             pass
 
@@ -226,10 +273,10 @@ def _start_agent_init(
     """
     agent_pool = get_agent_pool()
 
-    # 定期清理過期 Agent（節流：每60秒最多一次）
+    # 定期清理過期 Agent（節流：每600秒最多一次）
     global _last_cleanup_time
     now = time.time()
-    if now - _last_cleanup_time > 60:
+    if now - _last_cleanup_time > 600:
         _cleanup_task = asyncio.create_task(agent_pool.cleanup_expired_async())
         _cleanup_task.add_done_callback(lambda t: logger.error("Agent 清理異常: %s", t.exception()) if not t.cancelled() and t.exception() else None)
         _last_cleanup_time = now
@@ -370,6 +417,7 @@ async def send_message_stream(
                     user_content=request.content,
                     idempotency_key=request.idempotency_key,
                 ),
+                session_id=chat_session_id,
                 on_run_finished=on_run_finished,
                 error_message="Agent 執行失敗",
             ):
@@ -447,6 +495,7 @@ async def resume_interrupt(
                 interrupt_id=request.interrupt_id,
                 answers=request.answers,
             ),
+            session_id=chat_session_id,
             error_message="服务暂时不可用，请稍后重试",
         ):
             yield chunk
@@ -733,8 +782,9 @@ async def abort_chat(
 ):
     """中止正在進行的 Agent 執行
 
-    設置 cancel_token，Agent 在下一個檢查點（step 開始 / 工具執行前）退出，
-    並通過仍然活躍的 SSE 連接推送 RUN_FINISHED(outcome=interrupt)。
+    1. 設置 cancel_token → Agent 在下一個檢查點退出
+    2. 取消後台 runner task → 立即中斷 LLM/工具等待
+    3. 若 Agent 已不存在但 round 仍 running → 直接更新 DB
     """
     # 驗證會話
     session = (
@@ -745,13 +795,41 @@ async def abort_chat(
     if not session:
         raise HTTPException(status_code=404, detail="會話不存在")
 
+    cancelled = False
+
+    # 1. 通過 cancel_token 通知 Agent（在下一個檢查點生效）
     agent_pool = get_agent_pool()
     agent_service = agent_pool.get(chat_session_id)
-    if not agent_service:
-        raise HTTPException(status_code=404, detail="該會話沒有正在執行的 Agent")
-
-    if agent_service.cancel_token:
+    if agent_service and agent_service.cancel_token:
         agent_service.cancel_token.set()
+        cancelled = True
+
+    # 2. 取消後台 runner task（立即中斷正在進行的 await）
+    runner = _active_runners.get(chat_session_id)
+    if runner and not runner.done():
+        runner.cancel()
+        cancelled = True
+
+    # 3. 兜底：若 Agent 已死但 round 仍 running，直接更新 DB
+    if not cancelled:
+        running_rounds = db.query(Round).filter(
+            Round.session_id == chat_session_id,
+            Round.status == "running",
+        ).all()
+        for r in running_rounds:
+            r.status = "failed"
+            r.final_response = "Aborted by user"
+        if running_rounds:
+            db.commit()
+            cancelled = True
+            # 通知訂閱者 run 已結束
+            for r in running_rounds:
+                error_event = RunErrorEvent(message="Aborted by user", code="USER_ABORT")
+                event_dict = error_event.model_dump(by_alias=True, exclude_none=True)
+                await _broadcast_to_subscribers(r.id, event_dict)
+                _cleanup_subscribers(r.id)
+
+    if cancelled:
         logger.info("已觸發取消: session=%s", chat_session_id)
         return {"status": "cancelled"}
     else:

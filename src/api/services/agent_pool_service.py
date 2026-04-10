@@ -12,7 +12,6 @@ import logging
 import time
 from typing import Optional
 
-from src.api.services.agent_service import AgentService
 from src.api.services.history_service import HistoryService
 from src.api.services.sandbox_service import get_sandbox_service
 from src.api.config import get_settings
@@ -63,6 +62,7 @@ class AgentPoolService:
         self._user_sessions: dict[str, set[str]] = {}       # user_id → {chat_session_id}
         self._last_renew: dict[str, float] = {}             # user_id → last renew timestamp
         self._create_locks: dict[str, asyncio.Lock] = {}    # chat_session_id → Lock
+        self._user_creating: set[str] = set()               # 正在創建 Agent 的 user_id 集合
         self._ttl = ttl
         self._initialized = True
 
@@ -157,6 +157,42 @@ class AgentPoolService:
         sandbox_id: str | None,
     ) -> "AgentService":
         """創建 Agent 實例的內部實現（已在 per-session 鎖內部）"""
+
+        # ★ 提前注冊 session 映射，防止 cleanup 誤判用戶無活躍 session 而暫停沙箱
+        self._touch(chat_session_id)
+        self._session_user[chat_session_id] = user_id
+        self._user_sessions.setdefault(user_id, set()).add(chat_session_id)
+        self._user_creating.add(user_id)
+
+        try:
+            return await self._do_create_agent(
+                user_id=user_id,
+                chat_session_id=chat_session_id,
+                db=db,
+                model_id=model_id,
+                sandbox_id=sandbox_id,
+            )
+        except Exception:
+            # 創建失敗：回滾提前注冊的映射
+            self._last_access.pop(chat_session_id, None)
+            self._session_user.pop(chat_session_id, None)
+            if user_id in self._user_sessions:
+                self._user_sessions[user_id].discard(chat_session_id)
+                if not self._user_sessions[user_id]:
+                    del self._user_sessions[user_id]
+            raise
+        finally:
+            self._user_creating.discard(user_id)
+
+    async def _do_create_agent(
+        self,
+        user_id: str,
+        chat_session_id: str,
+        db,
+        model_id: str | None,
+        sandbox_id: str | None,
+    ) -> "AgentService":
+        """實際創建 Agent 的邏輯（被 _create_agent_instance 包裝）"""
         from src.api.services.agent_service import AgentService
 
         # 創建/恢復用戶級沙箱
@@ -214,11 +250,9 @@ class AgentPoolService:
         except Exception as e:
             logger.warning("沙箱记忆同步/模板写入失败（非致命）: %s", e)
 
-        # 存入緩存，建立 user ↔ session 映射
+        # 存入緩存（session 映射已在 _create_agent_instance 提前注冊）
         self._cache[chat_session_id] = agent_service
         self._touch(chat_session_id)
-        self._session_user[chat_session_id] = user_id
-        self._user_sessions.setdefault(user_id, set()).add(chat_session_id)
 
         return agent_service
 
@@ -318,6 +352,14 @@ class AgentPoolService:
             logger.info("清理過期 Agent 緩存: %s", session_id)
 
         for user_id in users_to_pause:
+            # ★ 再次檢查：在 await 間隙可能有新 session 被注冊
+            if user_id in self._user_creating:
+                logger.info("用戶正在創建 Agent，跳過暫停沙箱: user=%s", user_id)
+                continue
+            current_sessions = self._user_sessions.get(user_id, set())
+            if current_sessions:
+                logger.info("用戶已有新活躍 session，跳過暫停沙箱: user=%s", user_id)
+                continue
             await sandbox_service.pause(user_id)
             logger.info("用戶所有 session 均過期，暫停沙箱: user=%s", user_id)
 
@@ -336,6 +378,7 @@ class AgentPoolService:
         self._user_sessions.clear()
         self._last_renew.clear()
         self._create_locks.clear()
+        self._user_creating.clear()
         logger.info("已清空所有 Agent 緩存（共 %d 個）", count)
         return count
 

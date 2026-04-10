@@ -309,6 +309,73 @@ class TestAgentPoolServiceUserSessions:
         assert "user-1" not in pool._user_sessions
         assert "user-2" in pool._user_sessions
 
+    @pytest.mark.asyncio
+    async def test_cleanup_skips_pause_when_user_creating(self):
+        """cleanup 在用户正在创建 Agent 时应跳过 pause"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=1)
+
+        expired_time = time.time() - 10
+        _inject_pool_session(pool, "session-A", "user-1", timestamp=expired_time)
+
+        # 模拟 user-1 正在创建 Agent
+        pool._user_creating.add("user-1")
+
+        mock_sandbox_service = AsyncMock()
+        mock_sandbox_service.pause = AsyncMock(return_value=True)
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            expired = await pool.cleanup_expired_async()
+
+        assert "session-A" in expired
+        # 用户正在创建 Agent，沙箱不应被 pause
+        mock_sandbox_service.pause.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_skips_pause_when_new_session_registered(self):
+        """cleanup 在 pause 前重新检查到新 session 时应跳过"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=1)
+
+        expired_time = time.time() - 10
+        _inject_pool_session(pool, "session-A", "user-1", timestamp=expired_time)
+
+        mock_sandbox_service = AsyncMock()
+
+        async def pause_side_effect(uid):
+            """模拟 pause 前已有新 session 注册"""
+            return True
+
+        mock_sandbox_service.pause = AsyncMock(side_effect=pause_side_effect)
+
+        # 在 remove 执行后、pause 执行前插入新 session
+        original_remove = pool.remove
+
+        def patched_remove(sid):
+            result = original_remove(sid)
+            # 模拟在 remove 和 pause 之间有新 session 注册
+            _inject_pool_session(pool, "session-B", "user-1")
+            return result
+
+        pool.remove = patched_remove
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            await pool.cleanup_expired_async()
+
+        # 因为 user-1 已有新 session-B，pause 不应被调用
+        mock_sandbox_service.pause.assert_not_called()
+
+    def test_user_creating_cleared_on_clear_all(self):
+        """clear_all 应清理 _user_creating"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        pool._user_creating.add("user-1")
+        pool.clear_all()
+        assert len(pool._user_creating) == 0
+
 
 # ============================================================
 # AgentService 测试
