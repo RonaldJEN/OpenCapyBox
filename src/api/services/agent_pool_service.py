@@ -12,6 +12,7 @@ import logging
 import time
 from typing import Optional
 
+from src.api.services.agent_service import AgentService
 from src.api.services.history_service import HistoryService
 from src.api.services.sandbox_service import get_sandbox_service
 from src.api.config import get_settings
