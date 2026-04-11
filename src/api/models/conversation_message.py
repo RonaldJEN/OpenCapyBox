@@ -33,6 +33,8 @@ class ConversationMessage(Base):
     content = Column(Text, nullable=False)
     # True = 已被摘要压缩，不参与上下文重建
     is_summary = Column(Boolean, default=False)
+    # True = 系统注入的合成消息（truncation retry / empty nudge / step reminder）
+    is_synthetic = Column(Boolean, default=False)
     # 估算 token 数（可选，用于 budget 计算）
     token_count = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=now_naive)

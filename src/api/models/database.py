@@ -74,6 +74,7 @@ _PENDING_COLUMNS = [
     ("rounds", "user_attachments", "TEXT"),
     ("rounds", "interrupt_payload", "TEXT"),
     ("rounds", "idempotency_key", "VARCHAR(64)"),
+    ("conversation_messages", "is_synthetic", "BOOLEAN DEFAULT 0"),
 ]
 
 

@@ -470,6 +470,7 @@ class TestContextAssembly:
         svc.user_id = "u1"
         svc.history_service = MagicMock()
         svc.history_service.db = MagicMock()
+        svc._token_limit = 80000
 
         files = {
             "soul_md": "你是一个友善的助手",
@@ -493,6 +494,7 @@ class TestContextAssembly:
         svc.user_id = "u1"
         svc.history_service = MagicMock()
         svc.history_service.db = MagicMock()
+        svc._token_limit = 80000
         # 绑定真实的 _truncate_to_tokens 以避免 mock 返回值
         svc._truncate_to_tokens = AgentService._truncate_to_tokens
 

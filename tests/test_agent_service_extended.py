@@ -270,6 +270,15 @@ class TestAgentServiceInitializeAgent:
                     await service.initialize_agent()
                     assert service.agent is not None
 
+    @pytest.mark.asyncio
+    async def test_initialize_agent_fail_fast_when_registry_unavailable(self, service):
+        with patch(
+            "src.api.services.agent_service.get_model_registry",
+            side_effect=FileNotFoundError("models.yaml missing"),
+        ):
+            with pytest.raises(RuntimeError, match="Model Registry 不可用"):
+                await service.initialize_agent()
+
 
 class TestValidateMultimodalBlocks:
     """_validate_multimodal_blocks 圖片大小校驗測試"""

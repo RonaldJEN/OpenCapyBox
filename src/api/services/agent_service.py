@@ -10,7 +10,7 @@ from opensandbox import Sandbox
 
 from src.agent.agent import Agent
 from src.agent.llm import LLMClient
-from src.agent.schema import LLMProvider, Message as AgentMessage
+from src.agent.schema import Message as AgentMessage
 from src.agent.schema.agui_events import AGUIEvent, EventType
 from src.agent.tools.sandbox_file_tools import SandboxReadTool, SandboxWriteTool, SandboxEditTool
 from src.agent.tools.sandbox_bash_tool import SandboxBashTool, SandboxBashOutputTool, SandboxBashKillTool, _BackgroundCommandTracker
@@ -84,6 +84,11 @@ class AgentService:
                 model_config = registry.get_default()
                 self.model_id = model_config.id
 
+            # 從模型配置推導 token_limit（Level 3 摘要觸發閾值）
+            # 預留 output tokens + 3000 buffer 給 system prompt，下界 8192
+            usable_input = model_config.context_window - model_config.max_tokens
+            self._token_limit = max(usable_input - 3000, 8192)
+
             logger.info(
                 "创建 LLM 客户端: model=%s, provider=%s, api_base=%s",
                 model_config.model_name, model_config.provider, model_config.api_base,
@@ -100,19 +105,18 @@ class AgentService:
             )
 
         except FileNotFoundError as e:
-            # Registry 本身加載失敗（找不到 models.yaml）→ 走 .env fallback
-            logger.warning("Model Registry 不可用 (%s)，使用 .env 全局配置", e)
-            llm_client = self._create_fallback_llm_client()
+            raise RuntimeError(
+                f"Model Registry 不可用: {e}. "
+                "請修復 models.yaml 配置後重試。"
+            ) from e
 
         except ValueError as e:
-            # 模型不存在/已停用/API key 缺失
-            # 先嘗試是否是 Registry 層面的結構性錯誤（如 YAML 格式壞了）
             if self.model_id and ("不存在" in str(e) or "已停用" in str(e)):
-                # 指定模型不可用 → 直接報錯，不走 fallback
                 raise
-            # 其他 ValueError（如 YAML 解析問題）→ 走 fallback
-            logger.warning("Model Registry 配置異常 (%s)，使用 .env 全局配置", e)
-            llm_client = self._create_fallback_llm_client()
+            raise RuntimeError(
+                f"Model Registry 配置異常: {e}. "
+                "請修復 models.yaml 或環境變數後重試。"
+            ) from e
 
         # === 新用户默认文件初始化（Bootstrap）===
         self._provision_default_files_if_needed()
@@ -138,29 +142,13 @@ class AgentService:
             tools=tools,
             max_steps=settings.agent_max_steps,
             workspace_dir=self._workspace_dir,  # 沙箱中的工作目錄
-            token_limit=settings.agent_token_limit,
+            token_limit=self._token_limit,
+            context_window=model_config.context_window,
+            max_output_tokens=model_config.max_tokens,  # output token limit, not context
         )
 
         # 从数据库恢复历史
         self._restore_history()
-
-    def _create_fallback_llm_client(self) -> LLMClient:
-        """使用 .env 全局配置創建 LLM 客戶端（向後兼容 fallback）"""
-        if settings.llm_provider.lower() == "openai":
-            provider = LLMProvider.OPENAI
-        else:
-            provider = LLMProvider.ANTHROPIC
-
-        logger.info(
-            "创建 LLM 客户端 (fallback): api_base=%s, provider=%s, model=%s",
-            settings.llm_api_base, provider, settings.llm_model,
-        )
-        return LLMClient(
-            api_key=settings.llm_api_key,
-            api_base=settings.llm_api_base,
-            provider=provider,
-            model=settings.llm_model,
-        )
 
     @staticmethod
     def _auto_locate(setting_value: str, *relative_parts: str) -> Path:
@@ -230,7 +218,7 @@ class AgentService:
             except Exception:
                 count_tokens = lambda t: int(len(t) / 2.5)
 
-            max_memory_tokens = int(settings.agent_token_limit * 0.15)
+            max_memory_tokens = int(self._token_limit * 0.15)
 
             parts: list[str] = []
             used_tokens = 0
@@ -440,39 +428,240 @@ class AgentService:
 
         从乾淨的 conversation_messages 表中讀取消息，用於 Agent 上下文恢復。
         若該表無記錄（首次運行或舊數據），fallback 到 HistoryService.get_minimal_history()。
+
+        注意：為防止歷史消息過多導致模型 context 膨脹（特別是 tool calling 能力較弱的模型），
+        會限制最多注入 agent_max_history_messages 條消息，超出時只保留最近的消息。
         """
         if not self.agent:
             return
 
-        # 優先從 conversation_messages 表恢復
+        from src.api.config import get_settings
+
+        # 從 agui_events 重建完整消息列表（含 tool_calls 和 tool results）
+        messages = self._rebuild_messages_from_events()
+
+        if not messages:
+            # 沒有任何歷史事件，保持空
+            self._last_saved_index = len(self.agent.messages)
+            return
+
+        # 限制歷史消息數量
+        max_msgs = get_settings().agent_max_history_messages
+        if len(messages) > max_msgs:
+            trimmed = messages[-max_msgs:]
+            # 確保從真實 user 消息邊界開始（跳過 synthetic）
+            while trimmed and (trimmed[0].role != "user" or trimmed[0].is_synthetic):
+                trimmed = trimmed[1:]
+            if not trimmed:
+                logger.error(
+                    "歷史消息裁剪後為空：最近 %d 條全部非 user 開頭，"
+                    "說明 _rebuild_messages_from_events 存在 bug (session=%s)",
+                    max_msgs, self.session_id,
+                )
+                return
+            logger.warning(
+                "歷史消息 %d 條超過上限 %d，保留最近 %d 條 (session=%s)",
+                len(messages), max_msgs, len(trimmed), self.session_id,
+            )
+            messages = trimmed
+
+        self.agent.messages.extend(messages)
+
+        # 同步 conversation_messages 的 sequence 計數器
         from src.api.models.conversation_message import ConversationMessage
         db = self.history_service.db
+        last_seq = (
+            db.query(ConversationMessage.sequence)
+            .filter(ConversationMessage.session_id == self.session_id)
+            .order_by(ConversationMessage.sequence.desc())
+            .limit(1)
+            .scalar()
+        )
+        if last_seq:
+            self._next_sequence = last_seq
+
+        logger.info(
+            "從 agui_events 重建 %d 條消息 (session=%s)",
+            len(messages), self.session_id,
+        )
+        self._last_saved_index = len(self.agent.messages)
+
+    def _rebuild_messages_from_events(self) -> list[AgentMessage]:
+        """從 agui_events + conversation_messages 重建完整的 LLM messages 數組。
+
+        conversation_messages 提供 user 消息（含多模態內容），
+        agui_events 提供 assistant + tool 交互（單一事實源，無數據重複）。
+
+        Returns:
+            按時序排列的 AgentMessage 列表
+        """
+        from src.api.models.agui_event import AGUIEventLog
+        from src.api.models.conversation_message import ConversationMessage
+        from src.api.models.round import Round
+
+        db = self.history_service.db
+
+        # 1. 獲取本 session 的所有 round（按時間排序）
+        rounds = (
+            db.query(Round)
+            .filter(Round.session_id == self.session_id)
+            .order_by(Round.created_at)
+            .all()
+        )
+        if not rounds:
+            return []
+
+        # 2. 預載所有 user 消息（按 round_id 索引）
         conv_msgs = (
             db.query(ConversationMessage)
             .filter(
                 ConversationMessage.session_id == self.session_id,
+                ConversationMessage.role == "user",
                 ConversationMessage.is_summary == False,  # noqa: E712
             )
             .order_by(ConversationMessage.sequence)
             .all()
         )
+        user_msgs_by_round: dict[str, list] = {}
+        for m in conv_msgs:
+            user_msgs_by_round.setdefault(m.round_id, []).append(m)
 
-        if conv_msgs:
-            for msg in conv_msgs:
-                try:
-                    content = json.loads(msg.content)
-                except (json.JSONDecodeError, TypeError):
-                    content = msg.content
-                self.agent.messages.append(
-                    AgentMessage(role=msg.role, content=content)
+        # 3. 批量加載所有 round 的 agui_events（避免 N+1 查詢）
+        round_ids = [r.id for r in rounds]
+        all_events = (
+            db.query(AGUIEventLog)
+            .filter(AGUIEventLog.run_id.in_(round_ids))
+            .order_by(AGUIEventLog.run_id, AGUIEventLog.sequence)
+            .all()
+        )
+        events_by_round: dict[str, list] = {}
+        for evt in all_events:
+            events_by_round.setdefault(evt.run_id, []).append(evt)
+
+        # 4. 逐 round 重建
+        messages: list[AgentMessage] = []
+
+        for rnd in rounds:
+            # 4a. User 消息（從 conversation_messages 取，保留多模態塊）
+            user_records = user_msgs_by_round.get(rnd.id, [])
+            if user_records:
+                for um in user_records:
+                    try:
+                        content = json.loads(um.content)
+                    except (json.JSONDecodeError, TypeError):
+                        content = um.content
+                    messages.append(AgentMessage(role="user", content=content))
+            elif rnd.user_message:
+                # Fallback：conversation_messages 無記錄（歷史數據遷移期），用 rounds.user_message
+                logger.warning(
+                    "Round %s 無 conversation_messages user 記錄，fallback 到 rounds.user_message (session=%s)",
+                    rnd.id, self.session_id,
                 )
-            self._next_sequence = conv_msgs[-1].sequence
-            logger.info(
-                "從 conversation_messages 恢復 %d 條消息 (session=%s)",
-                len(conv_msgs), self.session_id,
-            )
+                messages.append(AgentMessage(role="user", content=rnd.user_message))
+            else:
+                # 兩邊都無 user 消息（數據損壞），跳過該 round 的 agent 輸出以避免孤立 assistant 消息
+                logger.warning(
+                    "Round %s 既無 conversation_messages 也無 user_message，跳過整個 round (session=%s)",
+                    rnd.id, self.session_id,
+                )
+                continue
 
-        self._last_saved_index = len(self.agent.messages)
+            # 4b. Agent 輸出（從預載的 agui_events 重建 assistant + tool 消息）
+            messages.extend(self._events_to_messages(events_by_round.get(rnd.id, [])))
+
+        return messages
+
+    @staticmethod
+    def _events_to_messages(events) -> list[AgentMessage]:
+        """將一個 round 的 agui_events 序列轉換為 LLM messages。
+
+        解析事件流，重建 assistant（含 tool_calls）和 tool result 消息。
+        """
+        from src.agent.schema import ToolCall, FunctionCall
+
+        messages: list[AgentMessage] = []
+        # Per-step 狀態
+        step_text = ""
+        step_tool_calls: list[ToolCall] = []
+        step_tool_results: list[dict] = []
+        tc_id_to_name: dict[str, str] = {}
+
+        for evt in events:
+            try:
+                payload = json.loads(evt.payload) if isinstance(evt.payload, str) else evt.payload
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            evt_type = payload.get("type", "")
+
+            if evt_type == "TEXT_MESSAGE_CONTENT":
+                step_text += payload.get("delta", "")
+
+            elif evt_type == "TOOL_CALL_START":
+                tc_id = payload.get("toolCallId", "")
+                tc_name = payload.get("toolCallName", "")
+                tc_id_to_name[tc_id] = tc_name
+
+            elif evt_type == "TOOL_CALL_ARGS":
+                # DB 中已是聚合後的完整 args（save_agui_event 做了流式聚合）
+                tc_id = payload.get("toolCallId", "")
+                raw_args = payload.get("delta", "")
+                try:
+                    args_dict = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    args_dict = {"_raw": raw_args}
+                tc_name = tc_id_to_name.get(tc_id, "")
+                step_tool_calls.append(ToolCall(
+                    id=tc_id,
+                    type="function",
+                    function=FunctionCall(name=tc_name, arguments=args_dict),
+                ))
+
+            elif evt_type == "TOOL_CALL_RESULT":
+                tc_id = payload.get("toolCallId", "")
+                tc_name = tc_id_to_name.get(tc_id, "")
+                content = payload.get("content", "")
+                step_tool_results.append({
+                    "tool_call_id": tc_id,
+                    "name": tc_name,
+                    "content": content,
+                })
+
+            elif evt_type == "STEP_FINISHED":
+                # Flush step：生成 assistant + tool messages
+                if step_text or step_tool_calls:
+                    messages.append(AgentMessage(
+                        role="assistant",
+                        content=step_text,
+                        tool_calls=step_tool_calls if step_tool_calls else None,
+                    ))
+                for tr in step_tool_results:
+                    messages.append(AgentMessage(
+                        role="tool",
+                        content=tr["content"],
+                        tool_call_id=tr["tool_call_id"],
+                        name=tr["name"],
+                    ))
+                step_text = ""
+                step_tool_calls = []
+                step_tool_results = []
+
+        # Flush 殘留（round 異常中斷無 STEP_FINISHED 時）
+        if step_text or step_tool_calls:
+            messages.append(AgentMessage(
+                role="assistant",
+                content=step_text,
+                tool_calls=step_tool_calls if step_tool_calls else None,
+            ))
+        for tr in step_tool_results:
+            messages.append(AgentMessage(
+                role="tool",
+                content=tr["content"],
+                tool_call_id=tr["tool_call_id"],
+                name=tr["name"],
+            ))
+
+        return messages
 
     # =========================================================================
     # 已移除廢棄方法: chat()
@@ -661,6 +850,7 @@ class AgentService:
         content: Any,
         round_id: str | None = None,
         token_count: int | None = None,
+        is_synthetic: bool = False,
     ) -> None:
         """向 conversation_messages 表持久化一條消息。
 
@@ -682,6 +872,7 @@ class AgentService:
             role=role,
             content=content_str,
             token_count=token_count,
+            is_synthetic=is_synthetic,
         )
         db.add(msg)
         try:
@@ -928,6 +1119,9 @@ class AgentService:
         _memory_write_tools = {"record_memory", "update_long_term_memory", "update_user"}
         _memory_filenames = {"USER.md", "MEMORY.md", "SOUL.md", "AGENTS.md", "HEARTBEAT.md"}
         _file_op_tracking: set[str] = set()
+        _round_finished = False  # 追蹤 round 是否已正常完成
+        _final_status: str | None = None  # except 路徑填充
+        _final_response: str | None = None
 
         try:
             async for event in self.agent.run_agui(
@@ -984,6 +1178,14 @@ class AgentService:
                         status = "failed"
                 elif event.type == EventType.RUN_ERROR:
                     status = "failed"
+                elif event.type == EventType.CUSTOM:
+                    # 合成 user message 持久化（truncation retry / empty nudge / step reminder）
+                    if getattr(event, "name", "") == "synthetic_user_message":
+                        syn_content = getattr(event, "value", {}).get("content", "")
+                        if syn_content:
+                            self._save_conversation_message(
+                                "user", syn_content, round_id=run_id, is_synthetic=True,
+                            )
 
                 yield event
 
@@ -994,6 +1196,7 @@ class AgentService:
                 status=status,
                 interrupt_payload=_interrupt_json,
             )
+            _round_finished = True
 
             task = asyncio.create_task(self._post_round_tasks(
                 sync_memory=_dirty_memory,
@@ -1004,13 +1207,25 @@ class AgentService:
             task.add_done_callback(self._on_post_round_done)
 
         except Exception as e:
-            self.history_service.complete_round(
-                round_id=run_id,
-                final_response=f"{error_label}: {str(e)}",
-                step_count=step_count,
-                status="failed",
-            )
+            _final_status = "failed"
+            _final_response = f"{error_label}: {str(e)}"
             raise
+        finally:
+            # 統一處理 round 完成：正常路徑、異常、GeneratorExit、CancelledError
+            if not _round_finished:
+                try:
+                    self.history_service.complete_round(
+                        round_id=run_id,
+                        final_response=_final_response or accumulated_content or final_response or "Cancelled",
+                        step_count=step_count,
+                        status=_final_status or "failed",
+                    )
+                    logger.warning(
+                        "Round %s 異常退出（disconnect/cancel/error），已標記為 failed (steps=%d)",
+                        run_id, step_count,
+                    )
+                except Exception:
+                    logger.error("Round %s 異常退出後無法更新 DB", run_id, exc_info=True)
 
     async def _post_round_tasks(
         self,

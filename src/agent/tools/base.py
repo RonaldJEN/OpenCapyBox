@@ -16,6 +16,10 @@ class ToolResult(BaseModel):
 class Tool:
     """Base class for all tools."""
 
+    # 工具結果的最大 token 數，超出部分會被 head+tail 截斷。
+    # 子類可覆蓋，例如 SandboxReadTool 設為 32000。
+    max_result_tokens: int = 8000
+
     @property
     def name(self) -> str:
         """Tool name."""

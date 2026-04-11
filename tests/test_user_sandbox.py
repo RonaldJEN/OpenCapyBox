@@ -183,7 +183,7 @@ class TestSandboxSessionServiceUserKey:
         import asyncio
         from src.api.services.sandbox_service import SandboxSessionService
         svc = SandboxSessionService()
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.push_skill("user-no-sandbox", "/nonexistent", "my-skill")
         )
         assert result is False

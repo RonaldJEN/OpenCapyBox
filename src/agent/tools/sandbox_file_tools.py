@@ -20,7 +20,7 @@ import posixpath
 import shlex
 from typing import Any
 
-import tiktoken
+
 from opensandbox import Sandbox
 
 from .base import Tool, ToolResult
@@ -139,34 +139,7 @@ async def _sandbox_write_text(sandbox: Sandbox, path: str, content: str) -> None
     raise AttributeError("Sandbox files API does not provide write_file/write")
 
 
-def truncate_text_by_tokens(text: str, max_tokens: int) -> str:
-    """Truncate text by token count if it exceeds the limit.
-
-    When text exceeds the specified token limit, performs intelligent truncation
-    by keeping the front and back parts while truncating the middle.
-    """
-    encoding = tiktoken.get_encoding("cl100k_base")
-    token_count = len(encoding.encode(text))
-
-    if token_count <= max_tokens:
-        return text
-
-    char_count = len(text)
-    ratio = token_count / char_count
-    chars_per_half = int((max_tokens / 2) / ratio * 0.95)
-
-    head_part = text[:chars_per_half]
-    last_newline_head = head_part.rfind("\n")
-    if last_newline_head > 0:
-        head_part = head_part[:last_newline_head]
-
-    tail_part = text[-chars_per_half:]
-    first_newline_tail = tail_part.find("\n")
-    if first_newline_tail > 0:
-        tail_part = tail_part[first_newline_tail + 1:]
-
-    truncation_note = f"\n\n... [Content truncated: {token_count} tokens -> ~{max_tokens} tokens limit] ...\n\n"
-    return head_part + truncation_note + tail_part
+from ..utils.token_utils import truncate_text_by_tokens
 
 
 # 二進位文件格式到對應 skill 的映射
@@ -189,6 +162,8 @@ class SandboxReadTool(Tool):
     2. 邊界標記：輸出同時包含 HEADER（開頭）和 FOOTER（結尾），
        讓 LLM 明確辨認「內容已完整結束」。
     """
+
+    max_result_tokens = 32000  # 保持現有 32K token 截斷行為
 
     def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
         self._sandbox = sandbox

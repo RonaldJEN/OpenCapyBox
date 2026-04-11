@@ -35,6 +35,7 @@ class Message(BaseModel):
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     name: str | None = None  # For tool role
+    is_synthetic: bool = False  # True = 系統注入的合成消息（truncation retry / empty nudge / step reminder）
 
 
 class TokenUsage(BaseModel):

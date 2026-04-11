@@ -16,7 +16,7 @@ class TestAgentTokenEstimation:
     @pytest.fixture
     def agent(self, tmp_path):
         """創建 Agent 實例"""
-        return make_agent(tmp_path, system_prompt="You are a helpful assistant.", max_steps=10, token_limit=5000)
+        return make_agent(tmp_path, system_prompt="You are a helpful assistant.", max_steps=10, context_window=20000, max_output_tokens=5000)
 
     def test_estimate_tokens_basic(self, agent):
         """測試基本 Token 估算"""
@@ -67,12 +67,12 @@ class TestAgentMessageSummarization:
         """創建有很多消息的 Agent"""
         llm = MockLLMClient()
         llm.responses = [LLMResponse(content="Summary of execution", finish_reason="stop")]
-        return make_agent(tmp_path, llm=llm, system_prompt="You are a helpful assistant.", max_steps=10, token_limit=100)
+        return make_agent(tmp_path, llm=llm, system_prompt="You are a helpful assistant.", max_steps=10, context_window=1000, max_output_tokens=500)
 
     @pytest.mark.asyncio
     async def test_summarize_messages_no_action_under_limit(self, tmp_path):
         """測試 Token 未超限時不摘要"""
-        agent = make_agent(tmp_path, system_prompt="Short prompt", token_limit=100000)
+        agent = make_agent(tmp_path, system_prompt="Short prompt", context_window=500000, max_output_tokens=10000)
         
         original_len = len(agent.messages)
         await agent._summarize_messages()
@@ -161,7 +161,7 @@ class TestAgentMessageSummarization:
     @pytest.mark.asyncio
     async def test_summarize_messages_uses_assistant_role_for_summary(self, tmp_path):
         """摘要回寫應使用 assistant 角色，避免權限升級"""
-        agent = make_agent(tmp_path, token_limit=10)
+        agent = make_agent(tmp_path, context_window=1000, max_output_tokens=500, token_limit=500)
         agent.messages = [
             Message(role="system", content="sys"),
             Message(role="user", content="u1"),

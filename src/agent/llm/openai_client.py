@@ -311,11 +311,16 @@ class OpenAIClient(LLMClientBase):
                     )
                 )
 
+        # Extract actual finish_reason from API response
+        raw_finish_reason = "stop"
+        if hasattr(response, 'choices') and response.choices:
+            raw_finish_reason = getattr(response.choices[0], 'finish_reason', 'stop') or 'stop'
+
         return LLMResponse(
             content=text_content,
             thinking=thinking_content if thinking_content else None,
             tool_calls=tool_calls if tool_calls else None,
-            finish_reason="stop",
+            finish_reason=raw_finish_reason,
             usage=usage,
         )
 

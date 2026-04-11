@@ -723,14 +723,16 @@ class TestAbortEndpoint:
         return client
 
     @patch("src.api.routes.chat.get_agent_pool")
-    def test_abort_no_agent_returns_404(self, mock_pool_fn, client):
-        """無正在執行的 Agent 返回 404"""
+    def test_abort_no_agent_no_running_round_returns_409(self, mock_pool_fn, client):
+        """無正在執行的 Agent 且無卡住的 round 返回 409"""
         # 模擬會話存在
         mock_session = MagicMock()
         mock_session.id = "session-1"
         mock_session.user_id = "testuser"
         mock_session.status = "active"
         self._mock_db_session.query.return_value.filter.return_value.first.return_value = mock_session
+        # Round 查詢返回空列表（無卡住的 running round）
+        self._mock_db_session.query.return_value.filter.return_value.all.return_value = []
 
         # AgentPool 沒有這個 session
         mock_pool = MagicMock()
@@ -738,8 +740,8 @@ class TestAbortEndpoint:
         mock_pool_fn.return_value = mock_pool
 
         response = client.post("/chat/session-1/abort")
-        assert response.status_code == 404
-        assert "沒有正在執行" in response.json()["detail"]
+        assert response.status_code == 409
+        assert "沒有正在進行" in response.json()["detail"]
 
     @patch("src.api.routes.chat.get_agent_pool")
     def test_abort_with_cancel_token_returns_200(self, mock_pool_fn, client):
@@ -773,6 +775,7 @@ class TestAbortEndpoint:
         mock_session.user_id = "testuser"
         mock_session.status = "active"
         self._mock_db_session.query.return_value.filter.return_value.first.return_value = mock_session
+        self._mock_db_session.query.return_value.filter.return_value.all.return_value = []
 
         mock_agent_service = MagicMock()
         mock_agent_service.cancel_token = None

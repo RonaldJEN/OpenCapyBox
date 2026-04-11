@@ -17,6 +17,7 @@ from .schema import Message
 from .tools.base import Tool, ToolResult
 from .tools.ask_user_tool import ASK_USER_TOOL_NAME
 from .utils import calculate_display_width
+from .utils.token_utils import truncate_text_by_tokens
 from .event_emitter import AGUIEventEmitter
 from .schema.agui_events import (
     AGUIEvent, AgentState, CustomEvent, EventType, InterruptDetails,
@@ -63,11 +64,18 @@ class Agent:
         max_steps: int = 50,
         workspace_dir: str = "./workspace",
         token_limit: int = 80000,  # Summary triggered when tokens exceed this value
+        context_window: int = 128000,  # 模型總上下文窗口大小
+        max_output_tokens: int = 16384,  # 單次輸出上限（output tokens）
     ):
         self.llm = llm_client
         self.tools = {tool.name: tool for tool in tools}
+
+        # Level 2 microcompact: tool result 超過此字符數時壓縮為摘要佔位符
+        self._MICROCOMPACT_CHAR_THRESHOLD = 4000
         self.max_steps = max_steps
         self.token_limit = token_limit
+        self.context_window = context_window
+        self.max_output_tokens = max_output_tokens
         self.workspace_dir = Path(workspace_dir)
 
         # workspace 目录由 agent_pool_service 在沙箱中远程创建，
@@ -356,24 +364,101 @@ class Agent:
         # Rough estimation: average 2.5 characters = 1 token
         return int(total_chars / 2.5)
 
-    async def _summarize_messages(self):
-        """Message history summarization: summarize conversations between user messages when tokens exceed limit
+    def _microcompact_messages(self) -> int:
+        """Level 2 壓縮：輕量清理舊輪次的 tool result 和 thinking，不調用 LLM。
 
-        Strategy (Agent mode):
-        - Keep all user messages (these are user intents)
-        - Summarize content between each user-user pair (agent execution process)
-        - If last round is still executing (has agent/tool messages but no next user), also summarize
-        - Structure: system -> user1 -> summary1 -> user2 -> summary2 -> user3 -> summary3 (if executing)
+        安全邊界：保留最近 2 個 user round 的全部內容不壓縮，
+        只清理更早的舊消息，避免模型引用近期 tool result 時「失憶」。
+
+        Returns:
+            壓縮的消息數量
         """
-        # 🔥 优化：先用缓存快速检查是否需要摘要
+        user_indices = [i for i, m in enumerate(self.messages) if m.role == "user" and i > 0 and not m.is_synthetic]
+        if len(user_indices) < 3:
+            return 0  # 不足 3 個 user round，跳過
+
+        # 安全邊界：倒數第 2 個 user 消息的 index
+        safe_boundary = user_indices[-2]
+        compacted = 0
+
+        for i in range(1, safe_boundary):  # 跳過 system prompt (index 0)
+            msg = self.messages[i]
+            if msg.role == "tool" and isinstance(msg.content, str) and len(msg.content) > self._MICROCOMPACT_CHAR_THRESHOLD:
+                original_len = len(msg.content)
+                msg.content = f"[Tool result compacted — {original_len} chars]"
+                compacted += 1
+            if msg.role == "assistant" and msg.thinking:
+                msg.thinking = None
+                compacted += 1
+
+        if compacted:
+            self._cached_token_count = 0  # 重置緩存（用 0 而非 None，與 _estimate_tokens 比較類型一致）
+            print(f"{Colors.DIM}  Level 2 microcompact: cleared {compacted} old messages{Colors.RESET}")
+        return compacted
+
+    @property
+    def _hard_ceiling(self) -> int:
+        """Level 4/5 的硬頂：context_window 減去 output 預留和 buffer，下界 8192。"""
+        return max(self.context_window - self.max_output_tokens - 3000, 8192)
+
+    def _emergency_truncate(self):
+        """Level 4 壓縮：緊急丟棄最老的 user round，最後手段。
+
+        當 Level 3 摘要後仍超過硬頂（context_window - max_output_tokens - buffer）時觸發。
+        每次丟棄最老的一個 user round（user 消息 + 後續的 assistant/tool 直到下一個 user）。
+        """
+        hard_ceiling = self._hard_ceiling
+        dropped_rounds = 0
+        max_drops = 3  # 安全閥：防止極端情況下無限循環
+
+        while dropped_rounds < max_drops and self._estimate_tokens(force_recalculate=True) > hard_ceiling:
+            user_indices = [i for i, m in enumerate(self.messages) if m.role == "user" and i > 0 and not m.is_synthetic]
+            if len(user_indices) <= 1:
+                break  # 至少保留最後一個 user round
+
+            # 確定最老 user round 的範圍：從 user_indices[0] 到 user_indices[1]
+            start = user_indices[0]
+            end = user_indices[1]
+            del self.messages[start:end]
+            self._cached_token_count = 0
+            dropped_rounds += 1
+
+        if dropped_rounds:
+            print(f"{Colors.BRIGHT_YELLOW}⚠️  Level 4 emergency truncate: dropped {dropped_rounds} oldest round(s){Colors.RESET}")
+
+    async def _summarize_messages(self):
+        """漸進式上下文管理流水線（Level 2 → Level 3 → Level 4）
+
+        Level 2: Microcompact — 清除舊 tool result 和 thinking（不調 LLM）
+        Level 3: LLM 摘要 — 將 user 之間的執行過程總結為一條消息
+        Level 4: 緊急截斷 — 丟棄最老的 user round（最後手段）
+        """
         estimated_tokens = self._estimate_tokens()
 
-        # If not exceeded, no summary needed
         if estimated_tokens <= self.token_limit:
             return
 
         print(f"\n{Colors.BRIGHT_YELLOW}📊 Token estimate: {estimated_tokens}/{self.token_limit}{Colors.RESET}")
-        print(f"{Colors.BRIGHT_YELLOW}🔄 Triggering message history summarization...{Colors.RESET}")
+
+        # Level 2: Microcompact（輕量，不調 LLM）
+        self._microcompact_messages()
+        estimated_tokens = self._estimate_tokens(force_recalculate=True)
+        if estimated_tokens <= self.token_limit:
+            print(f"{Colors.BRIGHT_GREEN}✓ Level 2 microcompact sufficient, tokens now: {estimated_tokens}{Colors.RESET}")
+            return
+
+        # Level 3: LLM 摘要（原有邏輯）
+        print(f"{Colors.BRIGHT_YELLOW}🔄 Level 3: Triggering LLM summarization...{Colors.RESET}")
+        await self._summarize_with_llm(estimated_tokens)
+
+        # Level 4: 緊急截斷（摘要後仍超硬頂時觸發）
+        hard_ceiling = self._hard_ceiling
+        if self._estimate_tokens(force_recalculate=True) > hard_ceiling:
+            print(f"{Colors.BRIGHT_YELLOW}🚨 Level 4: Post-summary tokens still exceed hard ceiling ({hard_ceiling}){Colors.RESET}")
+            self._emergency_truncate()
+
+    async def _summarize_with_llm(self, estimated_tokens: int):
+        """Level 3: LLM 驅動的消息摘要（原 _summarize_messages 核心邏輯）"""
 
         # Find all user message indices (skip system prompt)
         user_indices = [i for i, msg in enumerate(self.messages) if msg.role == "user" and i > 0]
@@ -518,6 +603,11 @@ Requirements:
         
         step = 0
         final_response: Optional[str] = None
+
+        # 多層退出檢查計數器
+        output_truncation_retries = 0
+        MAX_TRUNCATION_RETRIES = 1
+        empty_response_nudged = False
         
         try:
             # RUN_STARTED
@@ -537,17 +627,19 @@ Requirements:
                     yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
                     return
 
-                # 檢查並摘要消息歷史以防止上下文溢出
+                # 檢查並摘要消息歷史以防止上下文溢出（Level 2-4 流水線）
                 await self._summarize_messages()
-                
+
                 # 漸進式提醒（倒數第2步時提醒 LLM）
                 if step == self.max_steps - 2:
                     print(f"\n{Colors.BRIGHT_YELLOW}💡 剩餘步驟不多，建議 LLM 考慮總結...{Colors.RESET}")
                     reminder_msg = Message(
                         role="user",
                         content="💡 系統提示：還剩 2 步就達到步驟上限。如果你已經收集了足夠信息，請在接下來的回復中給出答案；如果信息不足，請優先調用最關鍵的工具。",
+                        is_synthetic=True,
                     )
                     self.messages.append(reminder_msg)
+                    yield emitter.custom_event("synthetic_user_message", {"content": reminder_msg.content})
                 
                 step_name = f"step_{step + 1}"
                 
@@ -596,8 +688,12 @@ Requirements:
                     if event:
                         await event_queue.put(event)
 
-                async def on_failover_reset(model_id: str):
-                    """Failover 前重置流式狀態，避免前端收到重複內容"""
+                # 保存主模型參數，供 failover 恢復（try/finally 確保所有退出路徑都恢復）
+                _primary_context_window = self.context_window
+                _primary_max_output_tokens = self.max_output_tokens
+
+                async def on_failover_reset(model_id: str, context_window: int = 0, max_output_tokens: int = 0):
+                    """Failover 前重置流式狀態，並臨時同步 fallback 模型參數"""
                     nonlocal thinking_started, message_started
                     if thinking_started:
                         await event_queue.put(emitter.thinking_end())
@@ -605,81 +701,94 @@ Requirements:
                     if message_started:
                         await event_queue.put(emitter.text_message_end())
                         message_started = False
+                    # 臨時使用 fallback 模型參數（本次 LLM 調用結束後恢復）
+                    if context_window > 0:
+                        self.context_window = context_window
+                    if max_output_tokens > 0:
+                        self.max_output_tokens = max_output_tokens
                     await event_queue.put(CustomEvent(
                         name="failover_reset",
                         value={"model": model_id},
                     ))
-                    logger.info("Failover reset: 已通知前端重置流式狀態 (next model: %s)", model_id)
+                    logger.info(
+                        "Failover reset: next model=%s, context_window=%d, max_output_tokens=%d",
+                        model_id, self.context_window, self.max_output_tokens,
+                    )
 
                 self.llm.failover_notify = on_failover_reset
 
-                async def producer():
-                    try:
-                        return await self.llm.generate_stream(
-                            messages=self.messages,
-                            tools=tool_list,
-                            on_content=on_content_delta,
-                            on_thinking=on_thinking_delta,
-                        )
-                    except Exception as e:
-                        return e
-                    finally:
-                        await event_queue.put(SENTINEL)
-
-                # 启动生产者任务
-                producer_task = asyncio.create_task(producer())
-
-                # 消费循环（带 cancel_token 检查，可在 LLM 调用期间响应取消）
-                cancelled_during_llm = False
-
-                # 构建 cancel 等待 future（如果有 cancel_token）
-                cancel_future: asyncio.Future | None = None
-                if cancel_token:
-                    cancel_future = asyncio.ensure_future(cancel_token.wait())
-
-                while True:
-                    get_task = asyncio.ensure_future(event_queue.get())
-                    wait_set: set[asyncio.Future] = {get_task}
-                    if cancel_future and not cancel_future.done():
-                        wait_set.add(cancel_future)
-
-                    done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
-
-                    if cancel_future in done:
-                        # 用户取消
-                        get_task.cancel()
-                        cancelled_during_llm = True
-                        producer_task.cancel()
+                try:
+                    async def producer():
                         try:
-                            await producer_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        break
+                            return await self.llm.generate_stream(
+                                messages=self.messages,
+                                tools=tool_list,
+                                on_content=on_content_delta,
+                                on_thinking=on_thinking_delta,
+                            )
+                        except Exception as e:
+                            return e
+                        finally:
+                            await event_queue.put(SENTINEL)
 
-                    # queue.get() 完成
-                    item = get_task.result()
-                    if item is SENTINEL:
-                        break
-                    if isinstance(item, AGUIEvent):
-                        yield item
+                    # 启动生产者任务
+                    producer_task = asyncio.create_task(producer())
 
-                # 清理未使用的 cancel_future
-                if cancel_future and not cancel_future.done():
-                    cancel_future.cancel()
+                    # 消费循环（带 cancel_token 检查，可在 LLM 调用期间响应取消）
+                    cancelled_during_llm = False
 
-                # 如果是 LLM 调用期间被用户取消
-                if cancelled_during_llm:
-                    logger.info("⏹️  用戶取消了執行 (LLM 調用期間)")
-                    if thinking_started:
-                        yield emitter.thinking_end()
-                    if message_started:
-                        yield emitter.text_message_end()
-                    yield emitter.step_finished(step_name)
-                    yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
-                    return
+                    # 构建 cancel 等待 future（如果有 cancel_token）
+                    cancel_future: asyncio.Future | None = None
+                    if cancel_token:
+                        cancel_future = asyncio.ensure_future(cancel_token.wait())
 
-                # 获取最终结果
-                result = await producer_task
+                    while True:
+                        get_task = asyncio.ensure_future(event_queue.get())
+                        wait_set: set[asyncio.Future] = {get_task}
+                        if cancel_future and not cancel_future.done():
+                            wait_set.add(cancel_future)
+
+                        done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+
+                        if cancel_future in done:
+                            # 用户取消
+                            get_task.cancel()
+                            cancelled_during_llm = True
+                            producer_task.cancel()
+                            try:
+                                await producer_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                            break
+
+                        # queue.get() 完成
+                        item = get_task.result()
+                        if item is SENTINEL:
+                            break
+                        if isinstance(item, AGUIEvent):
+                            yield item
+
+                    # 清理未使用的 cancel_future
+                    if cancel_future and not cancel_future.done():
+                        cancel_future.cancel()
+
+                    # 如果是 LLM 调用期间被用户取消
+                    if cancelled_during_llm:
+                        logger.info("⏹️  用戶取消了執行 (LLM 調用期間)")
+                        if thinking_started:
+                            yield emitter.thinking_end()
+                        if message_started:
+                            yield emitter.text_message_end()
+                        yield emitter.step_finished(step_name)
+                        yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
+                        return
+
+                    # 获取最终结果
+                    result = await producer_task
+                finally:
+                    # Failover 是一次性的，無論成功/失敗/取消都恢復主模型參數
+                    self.context_window = _primary_context_window
+                    self.max_output_tokens = _primary_max_output_tokens
 
                 # 错误处理
                 if isinstance(result, Exception):
@@ -724,13 +833,71 @@ Requirements:
                     print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
                     print(f"{Colors.DIM}{response.thinking}{Colors.RESET}")
 
+                # 补发 text message 事件：
+                # 如果流式 delta 触发了 message_started，正常发 END；
+                # 如果流式未产生 delta（如模型一次性返回 content），补发完整 START/CONTENT/END
                 if message_started:
                     yield emitter.text_message_end()
                     print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
                     print(f"{response.content}")
-                
-                # 檢查任務是否完成（無工具調用）
+                elif response.content:
+                    # LLM 返回了 content 但流式 delta 未触发，补发完整事件
+                    yield emitter.text_message_start(role="assistant")
+                    evt = emitter.text_message_content(response.content)
+                    if evt:
+                        yield evt
+                    yield emitter.text_message_end()
+                    print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant (non-stream):{Colors.RESET}")
+                    print(f"{response.content}")
+
+                # 多層退出檢查（借鑑 Claude Code 的 needsFollowUp 模式）
                 if not response.tool_calls:
+                    # 非空正常回覆時重置空響應標記
+                    if response.content and response.content.strip():
+                        empty_response_nudged = False
+
+                    # CHECK 1: 輸出截斷恢復
+                    # finish_reason == "length" 表示模型被 max_tokens 截斷，
+                    # 注入恢復消息讓模型從中斷點繼續（最多重試 MAX_TRUNCATION_RETRIES 次）
+                    if response.finish_reason == "length" and output_truncation_retries < MAX_TRUNCATION_RETRIES:
+                        output_truncation_retries += 1
+                        print(f"\n{Colors.BRIGHT_YELLOW}🔄 Output truncated (finish_reason=length), "
+                              f"retry {output_truncation_retries}/{MAX_TRUNCATION_RETRIES}{Colors.RESET}")
+                        truncation_content = (
+                            "Your output was truncated before you could finish or call a tool. "
+                            "Resume EXACTLY where you stopped — no repeat, no recap, no apology. "
+                            "If you have remaining work, break it into smaller tool calls."
+                        )
+                        self.messages.append(Message(role="user", content=truncation_content, is_synthetic=True))
+                        yield emitter.custom_event("synthetic_user_message", {"content": truncation_content})
+                        yield emitter.step_finished(step_name)
+                        step += 1
+                        continue  # 重新進入 while 循環
+
+                    # CHECK 2: 空響應兜底
+                    # 模型返回空 content + 無 tool_calls 是異常行為，nudge 一次
+                    if not (response.content and response.content.strip()) and not empty_response_nudged:
+                        empty_response_nudged = True
+                        print(f"\n{Colors.BRIGHT_YELLOW}⚠️  Empty response with no tool calls, nudging model...{Colors.RESET}")
+                        nudge_content = (
+                            "You returned an empty response with no tool calls. "
+                            "Please provide your answer or call a tool to continue working."
+                        )
+                        self.messages.append(Message(role="user", content=nudge_content, is_synthetic=True))
+                        yield emitter.custom_event("synthetic_user_message", {"content": nudge_content})
+                        yield emitter.step_finished(step_name)
+                        step += 1
+                        continue  # 再給一次機會
+
+                    # CHECK 3: 連續空響應，視為異常退出
+                    if not (response.content and response.content.strip()):
+                        error_msg = "Model returned empty response twice with no tool calls. Ending run."
+                        print(f"\n{Colors.BRIGHT_RED}🚫 {error_msg}{Colors.RESET}")
+                        yield emitter.step_finished(step_name)
+                        yield emitter.run_error(message=error_msg)
+                        return
+
+                    # 正常完成
                     final_response = response.content
                     yield emitter.step_finished(step_name)
                     break
@@ -933,7 +1100,12 @@ Requirements:
                             execution_time_ms = int((end_time - start_time) * 1000)
                     
                     # TOOL_CALL_RESULT
+                    # Level 1 壓縮：截斷過大的 tool result，防止 context 膨脹
                     result_content = result.content if result.success else f"Error: {result.error}"
+                    tool_obj = self.tools.get(function_name)
+                    budget = getattr(tool_obj, 'max_result_tokens', 8000) if tool_obj else 8000
+                    result_content = truncate_text_by_tokens(result_content, budget)
+
                     yield emitter.tool_call_result(
                         tool_call_id=tool_call_id,
                         content=result_content,
@@ -958,15 +1130,18 @@ Requirements:
                         result_error=result.error if not result.success else None,
                     )
                     
-                    # 添加工具消息
+                    # 添加工具消息（使用截斷後的 result_content，與前端事件一致）
                     tool_msg = Message(
                         role="tool",
-                        content=result.content if result.success else f"Error: {result.error}",
+                        content=result_content,
                         tool_call_id=tool_call_id,
                         name=function_name,
                     )
                     self.messages.append(tool_msg)
-                
+
+                # Tool call 成功執行後重置空響應標記，允許下次空回覆時再 nudge
+                empty_response_nudged = False
+
                 # STEP_FINISHED
                 yield emitter.step_finished(step_name)
                 

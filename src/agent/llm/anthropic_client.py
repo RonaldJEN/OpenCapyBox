@@ -258,7 +258,9 @@ class AnthropicClient(LLMClientBase):
             content=text_content,
             thinking=thinking_content if thinking_content else None,
             tool_calls=tool_calls if tool_calls else None,
-            finish_reason=response.stop_reason or "stop",
+            # 統一 finish_reason：Anthropic 用 "max_tokens" 表示截斷，
+            # OpenAI 用 "length"。Agent loop 按 "length" 判斷，此處做映射。
+            finish_reason="length" if response.stop_reason == "max_tokens" else (response.stop_reason or "stop"),
             usage=self._extract_usage(response),
         )
 
@@ -449,7 +451,7 @@ class AnthropicClient(LLMClientBase):
             content=text_content,
             thinking=thinking_content if thinking_content else None,
             tool_calls=parsed_tool_calls if parsed_tool_calls else None,
-            finish_reason=final_message.stop_reason or "stop",
+            finish_reason="length" if final_message.stop_reason == "max_tokens" else (final_message.stop_reason or "stop"),
             usage=self._extract_usage(final_message),
         )
 

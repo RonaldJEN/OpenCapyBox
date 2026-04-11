@@ -204,6 +204,8 @@ class SandboxBashTool(Tool):
     所有命令都在隔離的容器中執行，天然安全。
     """
 
+    max_result_tokens = 16000  # bash 輸出可能較長，給 16K token 預算
+
     def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user", tracker: '_BackgroundCommandTracker | None' = None):
         """初始化
 

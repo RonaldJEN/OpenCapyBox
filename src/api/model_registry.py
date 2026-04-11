@@ -132,7 +132,8 @@ class ModelConfig:
     api_base: str
     api_key: str  # 原始值，可能是 ${ENV_VAR}
     model_name: str
-    max_tokens: int = 16384
+    max_tokens: int = 16384          # 單次輸出上限（output tokens）
+    context_window: int = 128000     # 模型總上下文窗口大小（input + output tokens）
     reasoning_format: str = "none"
     reasoning_split: bool = False
     enable_thinking: bool = False
@@ -158,6 +159,15 @@ class ModelConfig:
         if self.max_tokens <= 0:
             raise ValueError(
                 f"模型 '{self.id}' 的 max_tokens 必須 > 0，got {self.max_tokens}"
+            )
+        if self.context_window <= 0:
+            raise ValueError(
+                f"模型 '{self.id}' 的 context_window 必須 > 0，got {self.context_window}"
+            )
+        if self.context_window <= self.max_tokens:
+            raise ValueError(
+                f"模型 '{self.id}' 的 context_window ({self.context_window}) "
+                f"必須 > max_tokens ({self.max_tokens})"
             )
         if self.max_images < 0:
             raise ValueError(
@@ -210,6 +220,7 @@ class ModelConfig:
             "supports_video": self.supports_video,
             "max_videos": self.max_videos,
             "max_tokens": self.max_tokens,
+            "context_window": self.context_window,
             "enabled": self.enabled,
             "tags": self.tags,
         }
@@ -285,6 +296,7 @@ class ModelRegistry:
                     api_key=cfg.get("api_key", "${LLM_API_KEY}"),
                     model_name=cfg.get("model_name", model_id),
                     max_tokens=cfg.get("max_tokens", 16384),
+                    context_window=cfg.get("context_window", 128000),
                     reasoning_format=cfg.get("reasoning_format", "none"),
                     reasoning_split=cfg.get("reasoning_split", False),
                     enable_thinking=cfg.get("enable_thinking", False),

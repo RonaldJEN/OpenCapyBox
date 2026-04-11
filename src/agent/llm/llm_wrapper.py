@@ -254,7 +254,13 @@ class LLMClient:
             )
             # 通知調用方重置流式狀態（避免切換後內容重複）
             if self._failover_notify:
-                await self._failover_notify(fb_config.id)
+                # fb_config.max_tokens = 單次輸出上限（非 context window）
+                # fb_config.context_window = 模型總上下文窗口（Phase 1.1 新增字段）
+                await self._failover_notify(
+                    fb_config.id,
+                    fb_config.context_window,
+                    fb_config.max_tokens,  # output token limit, not context
+                )
             try:
                 # 使用緩存的 fallback 客戶端，避免重複構建 HTTP 連接
                 if fb_config.id not in self._fallback_clients:

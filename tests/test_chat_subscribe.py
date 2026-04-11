@@ -659,6 +659,230 @@ class TestSubscribeEndToEnd:
         assert data["interrupt"]["payload"]["questions"][0]["question"] == "请确认"
 
 
+class TestActiveRunners:
+    """后台 Agent 运行任务追踪测试"""
+
+    def test_active_runners_initialization(self):
+        """_active_runners 初始化为空字典"""
+        from src.api.routes.chat import _active_runners
+
+        assert isinstance(_active_runners, dict)
+
+    @pytest.mark.asyncio
+    async def test_active_runners_registration_and_cleanup(self):
+        """producer 注册和自动清理"""
+        from src.api.routes.chat import _active_runners
+
+        session_id = "test-runner-reg"
+
+        async def fake_task():
+            await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(fake_task())
+        _active_runners[session_id] = task
+
+        assert session_id in _active_runners
+        assert _active_runners[session_id] is task
+
+        await task
+        # 手动清理模拟 producer finally 行为
+        _active_runners.pop(session_id, None)
+        assert session_id not in _active_runners
+
+    @pytest.mark.asyncio
+    async def test_active_runner_cancel_stops_task(self):
+        """取消 active runner 能停止后台任务"""
+        from src.api.routes.chat import _active_runners
+
+        session_id = "test-cancel-runner"
+        ran_to_completion = False
+
+        async def long_task():
+            nonlocal ran_to_completion
+            try:
+                await asyncio.sleep(10)
+                ran_to_completion = True
+            except asyncio.CancelledError:
+                raise
+
+        task = asyncio.create_task(long_task())
+        _active_runners[session_id] = task
+
+        # 取消
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert not ran_to_completion
+        _active_runners.pop(session_id, None)
+
+
+class TestSseDetachedProducer:
+    """SSE producer 断线后继续运行测试"""
+
+    @pytest.mark.asyncio
+    async def test_producer_broadcasts_events(self):
+        """producer 在迭代 event_source 时广播事件给订阅者"""
+        from src.api.routes.chat import (
+            _round_subscribers, _broadcast_to_subscribers,
+        )
+
+        round_id = "test-producer-broadcast"
+        subscriber_queue = asyncio.Queue()
+        _round_subscribers[round_id] = [subscriber_queue]
+
+        try:
+            test_event = {"type": "TEXT_MESSAGE_CONTENT", "delta": "hi"}
+            await _broadcast_to_subscribers(round_id, test_event)
+
+            received = await asyncio.wait_for(subscriber_queue.get(), timeout=1.0)
+            assert received["type"] == "TEXT_MESSAGE_CONTENT"
+            assert received["delta"] == "hi"
+        finally:
+            _round_subscribers.pop(round_id, None)
+
+    @pytest.mark.asyncio
+    async def test_producer_continues_after_consumer_stops(self):
+        """模拟 SSE 断开后 producer 继续执行"""
+        events_produced = []
+        consumer_active = True
+
+        async def fake_event_source():
+            for i in range(5):
+                yield {"type": "event", "seq": i}
+                await asyncio.sleep(0.01)
+
+        event_queue = asyncio.Queue()
+
+        async def producer():
+            nonlocal consumer_active
+            async for event in fake_event_source():
+                events_produced.append(event)
+                if consumer_active:
+                    event_queue.put_nowait(event)
+
+        task = asyncio.create_task(producer())
+
+        # 消费前两个事件后 "断开"
+        for _ in range(2):
+            await asyncio.wait_for(event_queue.get(), timeout=1.0)
+        consumer_active = False
+
+        # 等待 producer 完成
+        await asyncio.wait_for(task, timeout=2.0)
+
+        # producer 应该产出了所有 5 个事件
+        assert len(events_produced) == 5
+
+    @pytest.mark.asyncio
+    async def test_run_round_stream_finally_marks_round(self):
+        """_run_round_stream 的 finally 块在异常退出时标记 round 为 failed"""
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from src.api.services.agent_service import AgentService
+
+        mock_history = MagicMock()
+        mock_history.save_agui_event = AsyncMock()
+        mock_history.complete_round = MagicMock()
+
+        service = object.__new__(AgentService)
+        service.history_service = mock_history
+        service.session_id = "test-session"
+        service.cancel_token = None
+        service.agent = MagicMock()
+
+        # 模拟 agent.run_agui 只产出 RUN_STARTED 就被关闭（模拟断线）
+        from src.agent.schema.agui_events import RunStartedEvent
+
+        async def fake_run_agui(**kwargs):
+            yield RunStartedEvent(
+                threadId="test-session",
+                runId="test-run",
+            )
+            # 模拟长时间运行
+            await asyncio.sleep(10)
+
+        service.agent.run_agui = fake_run_agui
+
+        # 启动 _run_round_stream 并只消费第一个事件后关闭
+        gen = service._run_round_stream(
+            run_id="test-run",
+            user_message="test",
+        )
+        first_event = await gen.__anext__()
+        assert first_event.type.value == "RUN_STARTED"
+
+        # 关闭 generator（模拟 SSE 断开 → GeneratorExit）
+        await gen.aclose()
+
+        # finally 块应该调用了 complete_round 标记为 failed
+        mock_history.complete_round.assert_called_once()
+        call_kwargs = mock_history.complete_round.call_args
+        assert call_kwargs.kwargs.get("status") == "failed" or call_kwargs[1].get("status") == "failed"
+
+    @pytest.mark.asyncio
+    async def test_round_finished_flag_after_complete_round_exception(self):
+        """complete_round 正常路径抛异常时，finally 兜底被执行
+
+        验证 _round_finished 标志位在 complete_round 之后才置 True，
+        因此当 complete_round 抛异常时 finally 兜底分支能再试一次。
+        """
+        from unittest.mock import MagicMock, AsyncMock, call
+        from src.api.services.agent_service import AgentService
+        from src.agent.schema.agui_events import (
+            RunStartedEvent, RunFinishedEvent, StepStartedEvent, StepFinishedEvent,
+            TextMessageStartEvent, TextMessageContentEvent, TextMessageEndEvent,
+        )
+
+        mock_history = MagicMock()
+        mock_history.save_agui_event = AsyncMock()
+        # 第一次 complete_round 抛异常（正常路径），第二次成功（finally 兜底）
+        mock_history.complete_round = MagicMock(
+            side_effect=[RuntimeError("DB connection lost"), None]
+        )
+
+        service = object.__new__(AgentService)
+        service.history_service = mock_history
+        service.session_id = "test-session"
+        service.cancel_token = None
+        service.agent = MagicMock()
+        service._next_sequence = 0
+        service._last_saved_index = 0
+
+        # 模拟 agent.run_agui 正常完成一个 round
+        async def fake_run_agui(**kwargs):
+            yield RunStartedEvent(threadId="test-session", runId="test-run")
+            yield StepStartedEvent(stepName="step_1")
+            yield TextMessageStartEvent(messageId="m1", role="assistant")
+            yield TextMessageContentEvent(messageId="m1", delta="Hello")
+            yield TextMessageEndEvent(messageId="m1")
+            yield StepFinishedEvent(stepName="step_1")
+            yield RunFinishedEvent(
+                threadId="test-session", runId="test-run", outcome="success",
+            )
+
+        service.agent.run_agui = fake_run_agui
+
+        # 消费所有事件（complete_round 异常会被 except 捕获后 re-raise，
+        # 但 finally 兜底应该再调用一次 complete_round）
+        events = []
+        with pytest.raises(RuntimeError, match="DB connection lost"):
+            async for event in service._run_round_stream(
+                run_id="test-run",
+                user_message="test",
+            ):
+                events.append(event)
+
+        # complete_round 应该被调用了 2 次：
+        # 1. 正常路径（抛异常）
+        # 2. finally 兜底（成功）
+        assert mock_history.complete_round.call_count == 2
+        # 兜底调用的 status 应该是 "failed"
+        second_call = mock_history.complete_round.call_args_list[1]
+        assert second_call.kwargs.get("status") == "failed" or second_call[1].get("status") == "failed"
+
+
 class TestSubscriberAbortScenarios:
     """订阅者中止场景测试 - 测试客户端切换会话时的订阅取消"""
 
