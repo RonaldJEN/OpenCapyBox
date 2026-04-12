@@ -145,6 +145,7 @@ class AgentService:
             token_limit=self._token_limit,
             context_window=model_config.context_window,
             max_output_tokens=model_config.max_tokens,  # output token limit, not context
+            tool_timeout=settings.agent_tool_timeout,
         )
 
         # 从数据库恢复历史

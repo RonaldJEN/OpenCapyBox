@@ -573,15 +573,17 @@ class MemoryService:
     # 沙箱同步
     # ------------------------------------------------------------------
 
-    async def sync_to_sandbox(self, user_id: str, sandbox) -> int:
+    async def sync_to_sandbox(self, user_id: str, sandbox, *, force: bool = False) -> int:
         """将 DB 中的记忆文件同步到沙箱
 
         Args:
             user_id: 用户 ID
             sandbox: OpenSandbox 实例
+            force: True = 无条件 DB→沙箱推送（用户前端主动保存）;
+                   False = 沙箱优先，沙箱有内容则读回 DB 而非覆盖
 
         Returns:
-            同步的文件数量
+            写入沙箱的文件数量（不含回写 DB 的文件）
         """
         from src.api.services.sandbox_service import get_sandbox_mount_path
 
@@ -591,17 +593,42 @@ class MemoryService:
 
         mount = get_sandbox_mount_path()
         synced = 0
-        for file_type, content in records.items():
+        for file_type, db_content in records.items():
             filename = FILE_TYPE_TO_FILENAME.get(file_type)
             if not filename:
                 continue
             path = f"{mount}/{filename}"
             try:
-                write_file = getattr(sandbox.files, "write_file", None)
-                if callable(write_file):
-                    await write_file(path, content)
-                else:
-                    await sandbox.files.write(path, content.encode("utf-8"))
+                # 非 force 模式：沙箱有内容则以沙箱为准，回写 DB
+                if not force:
+                    sandbox_content = None
+                    try:
+                        sandbox_content = await sandbox.files.read_file(path)
+                    except Exception as read_err:
+                        # 只有确定是"文件不存在"时才继续用 DB 推送，其他异常一律跳过
+                        status = (
+                            getattr(read_err, 'status_code', None)
+                            or getattr(getattr(read_err, 'response', None), 'status_code', None)
+                            or getattr(read_err, 'status', None)
+                        )
+                        if status == 404:
+                            pass  # 文件不存在，继续走下方 DB→沙箱推送
+                        else:
+                            logger.warning("读取沙箱文件失败 (%s)，跳过同步: %s", filename, read_err)
+                            continue
+
+                    if sandbox_content and sandbox_content.strip():
+                        # 沙箱有实质内容 → 保留沙箱版本并回写 DB
+                        if sandbox_content != db_content:
+                            self.upsert_memory_file(user_id, file_type, sandbox_content)
+                            logger.info(
+                                "沙箱优先：%s 已从沙箱回写 DB (%d chars)",
+                                filename, len(sandbox_content),
+                            )
+                        continue
+
+                # force 模式 或 沙箱无内容：DB → 沙箱推送
+                await sandbox.files.write_file(path, db_content)
                 synced += 1
             except Exception as e:
                 logger.warning("同步记忆到沙箱失败 (%s): %s", filename, e)

@@ -111,7 +111,7 @@ async def update_agent_file(
         sandbox_service = get_sandbox_service()
         sandbox = sandbox_service.get_cached(user_id)
         if sandbox:
-            await svc.sync_to_sandbox(user_id, sandbox)
+            await svc.sync_to_sandbox(user_id, sandbox, force=True)
     except Exception as e:
         logger.warning("同步配置到沙箱失败: %s", e)
 

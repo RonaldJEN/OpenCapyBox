@@ -67,6 +67,8 @@ OpenCapyBox 是一个前后端分离的 Web 智能体平台，核心能力包括
 4. 沙箱机制：`docs/Capy-project-md/sandbox.md`
 5. AG-UI 协议：`docs/Capy-project-md/ag-ui-md/`
 6. 前端设计规范：`frontend/DESIGN_SYSTEM.md`
+7. 环境变量参考：`docs/Capy-project-md/env-reference.md`
+8. 框架设计文档：`docs/Capy-project-md/design.md`
 
 ## 仓库关键路径（速查）
 
@@ -75,9 +77,10 @@ OpenCapyBox 是一个前后端分离的 Web 智能体平台，核心能力包括
 3. 模型注册表：`models.yaml` + `src/api/model_registry.py`
 4. Agent 核心：`src/agent/agent.py`
 5. 工具注册：`src/api/services/agent_service.py`（`_create_tools()`）
-6. 前端入口：`frontend/src/App.tsx`
-7. 前端 API 客户端：`frontend/src/services/api.ts`
-8. 测试目录：`tests/`
+6. Agent 配置路由：`src/api/routes/config.py`（记忆文件、Skills 启停等）
+7. 前端入口：`frontend/src/App.tsx`
+8. 前端 API 客户端：`frontend/src/services/api.ts`
+9. 测试目录：`tests/`
 
 ## 开发工作流（简版）
 
@@ -98,13 +101,12 @@ cd frontend && npm run dev
 ### 测试
 
 ```bash
-# Python
-pytest tests/ -v
-
-# 前端
-cd frontend && npm run test
+pytest tests/ -v                    # 全量
+pytest tests/test_xxx.py -v         # 单文件
+pytest tests/ -k "test_name" -v     # 按名称匹配
 ```
 
+> `pyproject.toml` 已配置 `asyncio_mode = "auto"`，异步测试函数直接 `async def` 即可，无需手动标注。
 > 若修改了接口或调用映射，测试通过之外还必须更新 docs。
 
 ## AI 助手关键约定
@@ -168,6 +170,6 @@ SSE_SUBSCRIBE_TIMEOUT=300
 
 ---
 
-**最后更新**: 2026-04-10
+**最后更新**: 2026-04-12
 **项目版本**: 0.1.0
 **维护者**: OpenCapyBox 团队

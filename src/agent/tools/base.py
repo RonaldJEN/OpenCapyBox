@@ -20,6 +20,9 @@ class Tool:
     # 子類可覆蓋，例如 SandboxReadTool 設為 32000。
     max_result_tokens: int = 8000
 
+    # 单次 execute() 超时（秒）。0 = 使用 Agent 全局默认值，>0 = 工具级覆盖。
+    execute_timeout: int = 0
+
     @property
     def name(self) -> str:
         """Tool name."""

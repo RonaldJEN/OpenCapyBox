@@ -205,6 +205,7 @@ class SandboxBashTool(Tool):
     """
 
     max_result_tokens = 16000  # bash 輸出可能較長，給 16K token 預算
+    execute_timeout = 660  # SDK 层最大 600s，留 60s 余量
 
     def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user", tracker: '_BackgroundCommandTracker | None' = None):
         """初始化

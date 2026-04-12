@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     # Agent 配置
     agent_max_steps: int = 100
     agent_max_history_messages: int = 120  # 歷史消息注入上限（條數，含 user/assistant/tool），超出時只保留最近 N 條
+    agent_tool_timeout: int = 300  # 单次工具执行超时（秒），0 表示不限
 
     # Agent 資源路徑配置（可通過 .env 覆蓋，預設相對於 src/agent/）
     skills_dir: str = ""          # 留空則自動定位到 src/agent/skills/

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, AsyncMock
 
 from src.agent.schema import ToolCall, FunctionCall, LLMResponse
 from src.agent.schema.agui_events import EventType
+from src.agent.tools.base import ToolResult
 from tests.helpers import SlowTool, fake_stream, make_agent
 
 
@@ -153,3 +154,103 @@ async def test_cancel_token_none_runs_normally():
 
     run_finished = [e for e in events if e.type == EventType.RUN_FINISHED][0]
     assert run_finished.outcome == "success"
+
+
+# ── tool timeout tests ──────────────────────────────────────
+
+
+class TimeoutTool(SlowTool):
+    """模拟一个会超时的工具"""
+
+    @property
+    def name(self) -> str:
+        return "timeout_tool"
+
+    async def execute(self, **kwargs):
+        await asyncio.sleep(999)  # 永远不会完成
+        return ToolResult(success=True, content="done")
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_timeout():
+    """工具执行超时后返回错误结果，Agent 继续运行"""
+    timeout_tool = TimeoutTool()
+    agent, llm = _make_agent(tools=[timeout_tool])
+    agent.tool_timeout = 1  # 1 秒超时
+
+    tool_call = ToolCall(
+        id="tc-timeout",
+        type="function",
+        function=FunctionCall(name="timeout_tool", arguments={"msg": "hi"}),
+    )
+    # 第一次 LLM 调用返回工具调用，第二次返回最终回复
+    response1 = LLMResponse(content="", tool_calls=[tool_call], finish_reason="tool_calls")
+    response2 = LLMResponse(content="Done", tool_calls=[], finish_reason="stop")
+
+    call_count = 0
+
+    async def _fake_stream(messages, tools, on_content=None, on_thinking=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return response1
+        if on_content:
+            await on_content("Done")
+        return response2
+
+    llm.generate_stream = _fake_stream
+
+    events = []
+    async for event in agent.run_agui("thread-1", "run-timeout"):
+        events.append(event)
+
+    types = [e.type for e in events]
+    # 应该正常完成（工具超时不中断 Agent，只是返回错误）
+    assert EventType.RUN_FINISHED in types
+    run_finished = [e for e in events if e.type == EventType.RUN_FINISHED][0]
+    assert run_finished.outcome == "success"
+
+    # 应该有超时错误的 TOOL_CALL_RESULT
+    tool_results = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
+    assert len(tool_results) >= 1
+    assert "timed out" in tool_results[0].content.lower()
+
+
+@pytest.mark.asyncio
+async def test_tool_with_custom_execute_timeout():
+    """工具级 execute_timeout 覆盖全局 tool_timeout"""
+    timeout_tool = TimeoutTool()
+    timeout_tool.execute_timeout = 1  # 工具级覆盖：1 秒
+
+    agent, llm = _make_agent(tools=[timeout_tool])
+    agent.tool_timeout = 600  # 全局 10 分钟（不应生效）
+
+    tool_call = ToolCall(
+        id="tc-custom",
+        type="function",
+        function=FunctionCall(name="timeout_tool", arguments={"msg": "hi"}),
+    )
+    response1 = LLMResponse(content="", tool_calls=[tool_call], finish_reason="tool_calls")
+    response2 = LLMResponse(content="OK", tool_calls=[], finish_reason="stop")
+
+    call_count = 0
+
+    async def _fake_stream(messages, tools, on_content=None, on_thinking=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return response1
+        if on_content:
+            await on_content("OK")
+        return response2
+
+    llm.generate_stream = _fake_stream
+
+    events = []
+    async for event in agent.run_agui("thread-1", "run-custom-timeout"):
+        events.append(event)
+
+    # 验证 1 秒就超时了（而非等待 600 秒）
+    tool_results = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
+    assert len(tool_results) >= 1
+    assert "timed out" in tool_results[0].content.lower()

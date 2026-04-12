@@ -66,6 +66,7 @@ class Agent:
         token_limit: int = 80000,  # Summary triggered when tokens exceed this value
         context_window: int = 128000,  # 模型總上下文窗口大小
         max_output_tokens: int = 16384,  # 單次輸出上限（output tokens）
+        tool_timeout: int = 300,  # 单次工具执行超时（秒），0 表示不限
     ):
         self.llm = llm_client
         self.tools = {tool.name: tool for tool in tools}
@@ -73,6 +74,7 @@ class Agent:
         # Level 2 microcompact: tool result 超過此字符數時壓縮為摘要佔位符
         self._MICROCOMPACT_CHAR_THRESHOLD = 4000
         self.max_steps = max_steps
+        self.tool_timeout = tool_timeout
         self.token_limit = token_limit
         self.context_window = context_window
         self.max_output_tokens = max_output_tokens
@@ -1085,7 +1087,21 @@ Requirements:
                         start_time = time.time()
                         try:
                             tool = self.tools[function_name]
-                            result = await tool.execute(**arguments)
+                            timeout = tool.execute_timeout or self.tool_timeout
+                            if timeout > 0:
+                                result = await asyncio.wait_for(
+                                    tool.execute(**arguments),
+                                    timeout=timeout,
+                                )
+                            else:
+                                result = await tool.execute(**arguments)
+                        except asyncio.TimeoutError:
+                            timeout_used = tool.execute_timeout or self.tool_timeout
+                            result = ToolResult(
+                                success=False,
+                                content="",
+                                error=f"Tool execution timed out after {timeout_used}s",
+                            )
                         except Exception as e:
                             import traceback
                             error_detail = f"{type(e).__name__}: {str(e)}"
