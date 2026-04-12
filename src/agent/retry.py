@@ -26,7 +26,7 @@ class RetryConfig:
     def __init__(
         self,
         enabled: bool = True,
-        max_retries: int = 5,
+        max_retries: int = 3,
         initial_delay: float = 0.5,
         max_delay: float = 30.0,
         exponential_base: float = 2.0,
@@ -36,7 +36,7 @@ class RetryConfig:
         """
         Args:
             enabled: Whether to enable retry mechanism
-            max_retries: Maximum number of retries (default 5)
+            max_retries: Maximum number of retries (default 3)
             initial_delay: Initial delay time (seconds)
             max_delay: Maximum delay time (seconds, default 30)
             exponential_base: Exponential backoff base

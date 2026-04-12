@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # 流式响应中单个 chunk 的最大等待时间（秒）
 # 超过此时间无新 chunk 到达，视为 LLM 无响应，触发重试
-STREAM_CHUNK_TIMEOUT = 60
+STREAM_CHUNK_TIMEOUT = 100
 
 
 class OpenAIClient(LLMClientBase):
