@@ -324,6 +324,145 @@ class TestSanitizeFilename:
         assert result.endswith(".png")
 
 
+class TestEnsureSandbox:
+    """_ensure_sandbox / _upsert_user_sandbox 輔助函數測試"""
+
+    @pytest.mark.asyncio
+    async def test_ensure_sandbox_returns_cached(self):
+        """快取命中時直接返回，不調用 get_or_resume"""
+        from src.api.routes.sessions import _ensure_sandbox
+
+        mock_sandbox = AsyncMock()
+        mock_sandbox.id = "sbx-cached"
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = mock_sandbox
+
+        result = await _ensure_sandbox(sandbox_service, "user-1", MagicMock())
+
+        assert result is mock_sandbox
+        sandbox_service.get_or_resume.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_sandbox_falls_back_to_get_or_resume(self):
+        """快取未命中時走 get_or_resume 並更新 DB"""
+        from src.api.routes.sessions import _ensure_sandbox
+
+        mock_sandbox = AsyncMock()
+        mock_sandbox.id = "sbx-new"
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = None
+        sandbox_service.get_or_resume = AsyncMock(return_value=mock_sandbox)
+        sandbox_service.get_sandbox_id.return_value = "sbx-new"
+
+        mock_db = MagicMock()
+        # 模擬 UserSandbox 查詢返回 None（新用戶）
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+
+        result = await _ensure_sandbox(sandbox_service, "user-1", mock_db)
+
+        assert result is mock_sandbox
+        sandbox_service.get_or_resume.assert_awaited_once()
+        # 應持久化新 sandbox_id 到 DB
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_sandbox_force_refresh_clears_cache(self):
+        """force_refresh=True 時先清除快取"""
+        from src.api.routes.sessions import _ensure_sandbox
+
+        mock_sandbox = AsyncMock()
+        mock_sandbox.id = "sbx-fresh"
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = None
+        sandbox_service.get_or_resume = AsyncMock(return_value=mock_sandbox)
+        sandbox_service.get_sandbox_id.return_value = "sbx-fresh"
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+
+        result = await _ensure_sandbox(
+            sandbox_service, "user-1", mock_db, force_refresh=True,
+        )
+
+        sandbox_service.invalidate_cache.assert_called_once_with("user-1")
+        assert result is mock_sandbox
+
+    @pytest.mark.asyncio
+    async def test_upsert_user_sandbox_updates_existing(self):
+        """已有 DB 記錄時更新 sandbox_id"""
+        from src.api.routes.sessions import _upsert_user_sandbox
+
+        sandbox_service = MagicMock()
+        sandbox_service.get_sandbox_id.return_value = "sbx-new"
+
+        existing = MagicMock()
+        existing.sandbox_id = "sbx-old"
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = existing
+
+        _upsert_user_sandbox(mock_db, "user-1", sandbox_service)
+
+        assert existing.sandbox_id == "sbx-new"
+        mock_db.commit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_upload_retries_on_stale_sandbox(self):
+        """上傳時沙箱操作失敗應自動清除快取重試"""
+        from src.api.routes.sessions import upload_file
+        from src.api.models.session import Session
+        from src.api.models.user_sandbox import UserSandbox
+        from tests.helpers import make_mock_sandbox
+
+        stale_sandbox = make_mock_sandbox(sandbox_id="sbx-stale")
+        stale_sandbox.commands.run = AsyncMock(side_effect=Exception("404 Not Found"))
+        stale_sandbox.files.write = AsyncMock(side_effect=Exception("404 Not Found"))
+
+        fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-fresh")
+
+        sandbox_service = MagicMock()
+        # 第一次 get_cached 返回陳舊沙箱，第二次（force_refresh 後）返回 None
+        sandbox_service.get_cached.side_effect = [stale_sandbox, None]
+        sandbox_service.get_or_resume = AsyncMock(return_value=fresh_sandbox)
+        sandbox_service.get_sandbox_id.return_value = "sbx-fresh"
+        sandbox_service.get_mount_path.return_value = "/home/user"
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "user-1"
+
+        # 按模型類型返回不同的查詢結果
+        def query_side_effect(model):
+            q = MagicMock()
+            if model is Session:
+                q.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                q.filter.return_value.first.return_value = None  # 新用戶，無記錄
+            return q
+
+        mock_db = MagicMock()
+        mock_db.query.side_effect = query_side_effect
+
+        mock_file = AsyncMock()
+        mock_file.filename = "test.txt"
+        mock_file.read = AsyncMock(return_value=b"hello")
+        mock_file.content_type = "text/plain"
+
+        with patch("src.api.routes.sessions.get_sandbox_service", return_value=sandbox_service):
+            result = await upload_file(
+                chat_session_id="session-1",
+                file=mock_file,
+                user_id="user-1",
+                db=mock_db,
+            )
+
+        # 重試成功：fresh_sandbox 的 write 被調用
+        fresh_sandbox.files.write.assert_awaited_once()
+        assert result.name == "test.txt"
+        assert result.size == 5
+
+
 class TestExtractExitCode:
     """_extract_exit_code 輔助函數測試"""
 

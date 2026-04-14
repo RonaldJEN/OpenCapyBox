@@ -389,9 +389,9 @@ class TestWriteFileDirtyMemoryDetection:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("filename", ["SOUL.md", "AGENTS.md", "HEARTBEAT.md"])
+    @pytest.mark.parametrize("filename", ["SOUL.md", "AGENTS.md"])
     async def test_write_file_to_other_agent_files_sets_dirty(self, filename):
-        """write_file 写入 SOUL.md/AGENTS.md/HEARTBEAT.md 应触发同步"""
+        """write_file 写入 SOUL.md/AGENTS.md 应触发同步"""
         await self._run_dirty_test(
             args_deltas=[f'{{"path": "/home/user/{filename}", "content": "# Updated"}}'],
             expected_sync=True,

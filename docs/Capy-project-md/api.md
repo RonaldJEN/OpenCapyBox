@@ -1152,29 +1152,6 @@ GET /api/models/{model_id}
 
 ## 配置管理 API
 
-### 获取 Agent 配置文件列表
-
-```
-GET /api/config/agent-files
-Authorization: Bearer <access_token>
-```
-
-**Response**:
-```json
-{
-  "files": [
-    {
-      "name": "user",
-      "file_type": "user_md",
-      "filename": "USER.md",
-      "has_content": true,
-      "version": 3,
-      "updated_at": "2026-03-30T10:00:00"
-    }
-  ]
-}
-```
-
 ### 读取 Agent 配置文件
 
 ```
@@ -1182,7 +1159,7 @@ GET /api/config/agent-files/{name}
 Authorization: Bearer <access_token>
 ```
 
-**Path 参数**: `name` — user / soul / agents / memory / heartbeat
+**Path 参数**: `name` — user / soul / agents / memory
 
 **Response**:
 ```json
@@ -1259,25 +1236,6 @@ Authorization: Bearer <access_token>
 }
 ```
 
-### 获取 HEARTBEAT 内容（纯轮询清单）+ 任务列表
-
-```
-GET /api/cron/heartbeat
-Authorization: Bearer <access_token>
-```
-
-**说明**: HEARTBEAT.md 仅用于 Heartbeat 轮询检查清单。Cron 定时任务由 `manage_cron` 工具管理，存储在 `cron_jobs` DB 表中。
-
-**Response**:
-```json
-{
-  "content": "# 轮询检查清单\n- 检查邮件",
-  "tasks": [
-    { "name": "daily_report", "cron_expr": "0 9 * * *", "description": "每天9点生成日报", "enabled": true }
-  ]
-}
-```
-
 ### 获取执行历史
 
 ```
@@ -1309,12 +1267,36 @@ POST /api/cron/jobs/{job_name}/run
 Authorization: Bearer <access_token>
 ```
 
-**说明**: 从 `cron_jobs` 表查找任务并执行。执行完成后结果会自动注入用户最近活跃的 Session。
+**说明**: 从 `cron_jobs` 表查找任务并后台执行（立即返回 `run_id`）。执行完成后结果会自动注入用户最近活跃的 Session。前端可通过 `GET /api/cron/runs/{run_id}` 轮询执行状态。
 
 **Response**:
 ```json
-{ "job_name": "daily_report", "status": "success", "output": "日报已生成" }
+{ "job_name": "daily_report", "run_id": "uuid-string", "status": "accepted", "message": "后台任务已执行" }
 ```
+
+### 查询单条执行记录
+
+```
+GET /api/cron/runs/{run_id}
+Authorization: Bearer <access_token>
+```
+
+**说明**: 查询指定 `run_id` 的执行记录状态，用于前端轮询任务执行进度。
+
+**Response**:
+```json
+{
+  "id": "uuid-string",
+  "job_name": "daily_report",
+  "cron_expr": "0 9 * * *",
+  "started_at": "2026-04-14T09:00:00",
+  "completed_at": "2026-04-14T09:00:15",
+  "status": "success",
+  "output": "日报已生成"
+}
+```
+
+**status 枚举**: `running` | `success` | `failed`
 
 ---
 

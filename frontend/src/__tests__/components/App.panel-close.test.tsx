@@ -40,7 +40,7 @@ vi.mock('../../components/SkillManager', () => ({
   default: () => <div data-testid="skills-panel">skills</div>,
 }));
 
-vi.mock('../../components/CronHistory', () => ({
+vi.mock('../../components/CronSchedule', () => ({
   default: () => <div data-testid="cron-panel">cron</div>,
 }));
 

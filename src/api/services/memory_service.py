@@ -1,7 +1,7 @@
 """记忆服务 — 分层记忆的 CRUD、Embedding 索引与混合检索
 
 职责：
-- UserMemory 表的读写（USER.md / MEMORY.md / SOUL.md / AGENTS.md / HEARTBEAT.md）
+- UserMemory 表的读写（USER.md / MEMORY.md / SOUL.md / AGENTS.md）
 - 乐观锁版本控制（防止并发写冲突）
 - Embedding 分块 + 写入 MemoryEmbedding 表
 - 混合检索：BM25 关键词 + 向量语义 + RRF 融合 + 时间衰减
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # 有效的 file_type 枚举
-VALID_FILE_TYPES = {"user_md", "memory_md", "soul_md", "agents_md", "heartbeat_md"}
+VALID_FILE_TYPES = {"user_md", "memory_md", "soul_md", "agents_md"}
 
 # file_type → 沙箱文件名映射
 FILE_TYPE_TO_FILENAME = {
@@ -36,7 +36,6 @@ FILE_TYPE_TO_FILENAME = {
     "memory_md": "MEMORY.md",
     "soul_md": "SOUL.md",
     "agents_md": "AGENTS.md",
-    "heartbeat_md": "HEARTBEAT.md",
 }
 
 # 默认模板目录（docs/sandbox_template/ 下的同名文件）
@@ -47,7 +46,6 @@ _TEMPLATE_FILES: dict[str, str] = {
     "soul_md": "SOUL.md",
     "agents_md": "AGENTS.md",
     "memory_md": "MEMORY.md",
-    "heartbeat_md": "HEARTBEAT.md",
     "user_md": "USER.md",
 }
 
@@ -156,7 +154,7 @@ class MemoryService:
         """为新用户写入默认注入文件模板（从 docs/ 目录读取）
 
         仅在用户 DB 中无任何记忆文件时执行（幂等）。
-        写入 SOUL.md / AGENTS.md / MEMORY.md / HEARTBEAT.md / USER.md(PROFILE) 到 DB。
+        写入 SOUL.md / AGENTS.md / MEMORY.md / USER.md(PROFILE) 到 DB。
 
         Args:
             user_id: 用户 ID
@@ -545,7 +543,7 @@ class MemoryService:
         decay_lambda = 0.693147 / half_life_days  # ln(2) / half_life
         now = datetime.now()
 
-        EVERGREEN_KEYWORDS = ("MEMORY.md", "USER.md", "SOUL.md", "AGENTS.md", "HEARTBEAT.md")
+        EVERGREEN_KEYWORDS = ("MEMORY.md", "USER.md", "SOUL.md", "AGENTS.md")
 
         for r in results:
             fp = r.get("file_path", "")

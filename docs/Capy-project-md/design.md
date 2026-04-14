@@ -243,7 +243,6 @@ AgentPoolService
 | `AGENTS.md` | `agents_md` | Agent 可用工具和使用规则 |
 | `MEMORY.md` | `memory_md` | 长期记忆、经验积累 |
 | `USER.md` | `user_md` | 用户画像、偏好、授权 |
-| `HEARTBEAT.md` | `heartbeat_md` | Cron 定时任务定义 |
 
 ### 8.2 同步策略
 

@@ -278,42 +278,11 @@ BOCHA_SEARCH_APPCODE=xxxxx
 
 Skills 提供工具。需要用时查看它的 `SKILL.md`。本地笔记（摄像头名称、SSH 信息、语音偏好）记在 `MEMORY.md` 的「工具设置」section 里。用户资料记在 `USER.md` 里。Agent 身份记在 `SOUL.md` 里。
 
-<!-- heartbeat:start -->
-
-## 💓 Heartbeats - 要主动！
-
-收到 heartbeat 轮询（匹配配置的 heartbeat 提示的消息）时，要给出有意义的回复。把 heartbeat 用起来！
-
-默认 heartbeat 提示：
-`有 HEARTBEAT.md 就读（工作区上下文）。严格遵循。别推测或重复之前聊天的旧任务。`
-
-你可以随意编辑 `HEARTBEAT.md`，加上简短的清单或提醒。保持精简以节省 token。
-
-**HEARTBEAT.md 只放轮询检查清单**，例如：
-
-- 检查邮件/日历/通知
-- 定期回顾 MEMORY.md
-- 查看进行中的任务状态
-
-**不要在 HEARTBEAT.md 中写 cron 格式的定时任务！** 所有精确定时任务请用 `manage_cron` 工具。
-
-<!-- heartbeat:end -->
-
 <!-- cron:start -->
 
 ## ⏰ Cron 定时任务 — 用 `manage_cron` 工具
 
-当用户需要精确定时任务时，**必须使用 `manage_cron` 工具**，不要手动写文件。
-
-### 何时用 Heartbeat vs Cron
-
-| 场景                           | 用什么         |
-| ------------------------------ | -------------- |
-| 多个检查合并（邮件+日历+通知） | Heartbeat      |
-| 需要对话上下文                 | Heartbeat      |
-| 时间可以浮动（~30分钟）        | Heartbeat      |
-| 精确时间很重要（"每天9:00"）   | **Cron** |
-| 独立任务，不需要对话上下文     | **Cron** |
+当用户需要定时任务时，**必须使用 `manage_cron` 工具**，不要手动写文件。
 
 ### `manage_cron` 工具用法
 
@@ -338,13 +307,13 @@ description: "跟用户说晚安"    # 描述（Agent 执行时的 prompt）
 - `action: "toggle", name: "daily_greeting"` — 启用/暂停
 - `action: "history"` — 查看执行历史
 
-**重要：** Cron 任务存储在数据库中，不要用 `write_file` 或 `edit_file` 写入 HEARTBEAT.md 来创建定时任务。
+**重要：** Cron 任务存储在数据库中，不要用 `write_file` 或 `edit_file` 手动写文件来创建定时任务。
 
 <!-- cron:end -->
 
-### 🔄 记忆维护（Heartbeat 期间）
+### 🔄 记忆维护
 
-定期（每隔几天），利用 heartbeat：
+定期（每隔几天）：
 
 1. 浏览最近的 `memory/YYYY-MM-DD.md` 文件
 2. 识别值得长期保留的重要事件、教训或见解

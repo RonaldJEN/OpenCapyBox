@@ -1,9 +1,9 @@
 """用户记忆与人格相关数据模型
 
 包含：
-- UserMemory：Markdown 记忆文件持久化（USER.md / MEMORY.md / SOUL.md / AGENTS.md / HEARTBEAT.md）
+- UserMemory：Markdown 记忆文件持久化（USER.md / MEMORY.md / SOUL.md / AGENTS.md）
 - MemoryEmbedding：向量索引（SQLite JSON 列，零依赖）
-- CronJobRun：HEARTBEAT.md 定时任务执行历史
+- CronJobRun：定时任务执行历史
 - UserSkillConfig：Skill 启用/禁用状态
 """
 from sqlalchemy import Column, String, Integer, Text, Boolean, DateTime
@@ -21,14 +21,13 @@ class UserMemory(Base):
     - memory_md     → MEMORY.md（长期共识/知识）
     - soul_md       → SOUL.md（Agent 沟通风格/人格）
     - agents_md     → AGENTS.md（行为规则/任务指南）
-    - heartbeat_md  → HEARTBEAT.md（定时任务定义）
     """
 
     __tablename__ = "user_memory"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(100), nullable=False, index=True)
-    # user_md / memory_md / soul_md / agents_md / heartbeat_md
+    # user_md / memory_md / soul_md / agents_md
     file_type = Column(String(20), nullable=False)
     content = Column(Text, nullable=False)
     # 乐观锁：防止并发写冲突
@@ -57,16 +56,16 @@ class MemoryEmbedding(Base):
 
 
 class CronJobRun(Base):
-    """HEARTBEAT.md 定时任务执行历史
+    """定时任务执行历史
 
-    任务定义在 HEARTBEAT.md（Agent 可直读写），DB 仅存执行结果。
+    任务定义在 CronJob 表（Agent 通过 manage_cron 工具操作），DB 存执行结果。
     """
 
     __tablename__ = "cron_job_runs"
 
     id = Column(String(36), primary_key=True)
     user_id = Column(String(100), nullable=False, index=True)
-    # 来自 HEARTBEAT.md 的任务名
+    # 来自 CronJob 表的任务名
     job_name = Column(String(100), nullable=False)
     cron_expr = Column(String(50), nullable=False)
     started_at = Column(DateTime, default=now_naive)

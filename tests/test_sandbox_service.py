@@ -768,3 +768,24 @@ class TestExtractSkillDescription:
         text = "Just content"
         result = service._extract_skill_description_from_skill_md(text)
         assert result is None
+
+
+# ============== invalidate_cache ==============
+
+class TestInvalidateCache:
+    """快取失效測試"""
+
+    def test_invalidate_existing(self, service, mock_sandbox):
+        """測試清除已存在的快取"""
+        service._cache["user-1"] = mock_sandbox
+        service._pushed_skills["user-1"] = {"skill-a"}
+
+        service.invalidate_cache("user-1")
+
+        assert service.get_cached("user-1") is None
+        assert "user-1" not in service._pushed_skills
+
+    def test_invalidate_nonexistent(self, service):
+        """測試清除不存在的快取（不報錯）"""
+        service.invalidate_cache("nonexistent")
+        assert service.get_cached("nonexistent") is None

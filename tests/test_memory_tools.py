@@ -242,7 +242,7 @@ class TestFileTypeToFilename:
         """所有已知 file_type 都应有映射"""
         from src.api.services.memory_service import FILE_TYPE_TO_FILENAME
 
-        expected_types = {"user_md", "memory_md", "soul_md", "agents_md", "heartbeat_md"}
+        expected_types = {"user_md", "memory_md", "soul_md", "agents_md"}
         assert set(FILE_TYPE_TO_FILENAME.keys()) == expected_types
 
 

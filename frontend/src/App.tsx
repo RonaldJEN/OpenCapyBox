@@ -4,7 +4,7 @@ import { Login } from './components/Login';
 import { SessionList } from './components/SessionList';
 import { ChatV2 } from './components/ChatV2';
 import AgentConfig from './components/AgentConfig';
-import CronHistory from './components/CronHistory';
+import CronSchedule from './components/CronSchedule';
 import SkillManager from './components/SkillManager';
 import { apiService } from './services/api';
 import type { ModelInfo } from './types';
@@ -126,13 +126,15 @@ function HomePage() {
             onTransitionEnd={() => { if (!activePanel) setPanelMounted(false); }}
           />
           <div
-            className={`fixed top-0 right-0 bottom-0 w-[380px] bg-claude-bg border-l border-claude-border z-30 transition-transform duration-300 ease-out shadow-xl ${
+            className={`fixed top-0 right-0 bottom-0 bg-claude-bg border-l border-claude-border z-30 transition-transform duration-300 ease-out shadow-xl ${
+              activePanel === 'cron' ? 'w-[680px]' : 'w-[380px]'
+            } ${
               activePanel ? 'translate-x-0' : 'translate-x-full'
             }`}
           >
             {activePanel === 'config' && <AgentConfig onClose={closeConfigPanel} />}
             {activePanel === 'skills' && <SkillManager onClose={closeConfigPanel} />}
-            {activePanel === 'cron' && <CronHistory onClose={closeConfigPanel} />}
+            {activePanel === 'cron' && <CronSchedule onClose={closeConfigPanel} />}
           </div>
         </>
       )}

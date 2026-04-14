@@ -1,9 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  listAgentFiles,
   getAgentFile,
   updateAgentFile,
-  type AgentFileInfo,
 } from '../services/configApi';
 
 const FILE_LABELS: Record<string, { label: string; icon: string; desc: string }> = {
@@ -11,28 +9,21 @@ const FILE_LABELS: Record<string, { label: string; icon: string; desc: string }>
   soul: { label: 'Soul', icon: '🧠', desc: 'Agent 人格/风格 (SOUL.md)' },
   agents: { label: 'Agents', icon: '📋', desc: '行为规则/任务指南 (AGENTS.md)' },
   memory: { label: 'Memory', icon: '💾', desc: '长期记忆/共识 (MEMORY.md)' },
-  heartbeat: { label: 'Heartbeat', icon: '⏰', desc: '定时任务定义 (HEARTBEAT.md)' },
 };
 
-const TABS = ['user', 'soul', 'agents', 'memory', 'heartbeat'] as const;
+const TABS = ['user', 'soul', 'agents', 'memory'] as const;
 
 interface Props {
   onClose?: () => void;
 }
 
 const AgentConfig: React.FC<Props> = ({ onClose }) => {
-  const [_files, setFiles] = useState<AgentFileInfo[]>([]);
   const [activeTab, setActiveTab] = useState<string>('user');
   const [content, setContent] = useState('');
   const [originalContent, setOriginalContent] = useState('');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
-
-  // 加载文件列表
-  useEffect(() => {
-    listAgentFiles().then(setFiles).catch(console.error);
-  }, []);
 
   // 加载选中文件内容
   const loadFile = useCallback(async (name: string) => {
@@ -61,8 +52,6 @@ const AgentConfig: React.FC<Props> = ({ onClose }) => {
       const result = await updateAgentFile(activeTab, content);
       setOriginalContent(content);
       setMessage(`保存成功 (v${result.version})`);
-      // 刷新文件列表
-      listAgentFiles().then(setFiles).catch(console.error);
     } catch (err: any) {
       const detail = err?.response?.data?.detail || err.message;
       setMessage(`保存失败: ${detail}`);

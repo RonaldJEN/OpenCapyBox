@@ -187,7 +187,7 @@ class AgentService:
         """为新用户写入默认注入文件模板（幂等）
 
         检查 DB 中是否存在用户记忆文件，如果不存在则从 docs/ 模板写入默认值。
-        包括：SOUL.md, AGENTS.md, MEMORY.md, HEARTBEAT.md, USER.md(PROFILE)
+        包括：SOUL.md, AGENTS.md, MEMORY.md, USER.md(PROFILE)
         """
         try:
             from src.api.services.memory_service import MemoryService
@@ -1118,7 +1118,7 @@ class AgentService:
         _interrupt_json: str | None = None
         _dirty_memory = False
         _memory_write_tools = {"record_memory", "update_long_term_memory", "update_user"}
-        _memory_filenames = {"USER.md", "MEMORY.md", "SOUL.md", "AGENTS.md", "HEARTBEAT.md"}
+        _memory_filenames = {"USER.md", "MEMORY.md", "SOUL.md", "AGENTS.md"}
         _file_op_tracking: set[str] = set()
         _round_finished = False  # 追蹤 round 是否已正常完成
         _final_status: str | None = None  # except 路徑填充
@@ -1263,7 +1263,7 @@ class AgentService:
             db = SessionLocal()
             try:
                 mem_svc = MemoryService(db)
-                # 同步所有 agent 配置文件（USER/MEMORY/SOUL/AGENTS/HEARTBEAT）
+                # 同步所有 agent 配置文件（USER/MEMORY/SOUL/AGENTS）
                 for ft in FILE_TYPE_TO_FILENAME:
                     content = await mem_svc.sync_from_sandbox(
                         self.user_id, self.sandbox, ft

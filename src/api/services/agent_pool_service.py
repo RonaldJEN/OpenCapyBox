@@ -41,18 +41,18 @@ class AgentPoolService:
 
     _instance: Optional["AgentPoolService"] = None
 
-    def __new__(cls, ttl: int = 3600) -> "AgentPoolService":
+    def __new__(cls, ttl: int = 86400) -> "AgentPoolService":
         """單例模式"""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self, ttl: int = 3600):
+    def __init__(self, ttl: int = 86400):
         """初始化 Agent 池
 
         Args:
-            ttl: Agent 緩存 TTL（秒），默認 3600（1小時）
+            ttl: Agent 緩存 TTL（秒），默認 86400（24小時）
         """
         if self._initialized:
             return
@@ -432,7 +432,7 @@ class AgentPoolService:
 _agent_pool: Optional[AgentPoolService] = None
 
 
-def get_agent_pool(ttl: int = 3600) -> AgentPoolService:
+def get_agent_pool(ttl: int = 86400) -> AgentPoolService:
     """獲取全局 Agent 池實例
 
     Args:

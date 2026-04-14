@@ -4,20 +4,17 @@
 - 从 CronJob DB 表管理定时任务定义
 - 动态注册/注销 APScheduler CronTrigger 任务
 - Runner：恢复用户沙箱 → 创建临时 Agent → 执行任务 → 写 CronJobRun
-- 保留 parse_heartbeat_md() 以兼容旧测试
 """
 
 import logging
-import re
 import uuid
 from datetime import datetime
-from typing import Optional
 
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import get_settings
 from src.api.models.cron_job import CronJob
-from src.api.models.user_memory import CronJobRun, UserMemory
+from src.api.models.user_memory import CronJobRun
 from src.api.models.user_sandbox import UserSandbox
 from src.api.utils.timezone import now_naive
 
@@ -25,21 +22,8 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-# ============================================================
-# 旧格式解析（向下兼容，不再用于核心流程）
-# ============================================================
-
-# HEARTBEAT.md 任务行格式（仅用于旧数据兼容）:
-_TASK_PATTERN = re.compile(
-    r"^-\s*\[(?P<status>[xX ]?)\]\s+"
-    r"(?P<name>\S+)\s+"
-    r"(?P<cron>(?:\S+\s+){4}\S+)\s*"
-    r"(?:-\s*(?P<desc>.+))?$"
-)
-
-
 class CronTask:
-    """Cron 任务数据对象（兼容旧代码 + 新 DB 通用）"""
+    """Cron 任务数据对象"""
 
     def __init__(self, name: str, cron_expr: str, description: str, enabled: bool):
         self.name = name
@@ -54,37 +38,6 @@ class CronTask:
             "description": self.description,
             "enabled": self.enabled,
         }
-
-
-def parse_heartbeat_md(content: str) -> list[CronTask]:
-    """解析 HEARTBEAT.md 内容为任务列表（旧格式兼容）
-
-    格式规则：
-    - [ ] task_name * * * * * - 描述 (启用)
-    - [x] task_name * * * * * - 描述 (暂停)
-    """
-    tasks: list[CronTask] = []
-
-    for line in content.splitlines():
-        line = line.strip()
-        match = _TASK_PATTERN.match(line)
-        if not match:
-            continue
-
-        status = match.group("status").strip()
-        name = match.group("name")
-        cron_expr = match.group("cron").strip()
-        desc = (match.group("desc") or "").strip()
-        enabled = status != "x" and status != "X"
-
-        tasks.append(CronTask(
-            name=name,
-            cron_expr=cron_expr,
-            description=desc,
-            enabled=enabled,
-        ))
-
-    return tasks
 
 
 def parse_cron_fields(cron_expr: str) -> dict | None:
@@ -111,15 +64,6 @@ class CronService:
 
     def __init__(self, db: DBSession):
         self.db = db
-
-    def get_heartbeat_content(self, user_id: str) -> str:
-        """从 DB 获取 HEARTBEAT.md 内容（仅用于 heartbeat 轮询）"""
-        record = (
-            self.db.query(UserMemory)
-            .filter(UserMemory.user_id == user_id, UserMemory.file_type == "heartbeat_md")
-            .first()
-        )
-        return record.content if record else ""
 
     def get_jobs(self, user_id: str) -> list[CronTask]:
         """从 CronJob 表获取用户所有定时任务"""
@@ -221,7 +165,7 @@ async def _run_cron_job_wrapper(user_id: str, job_name: str):
     await run_cron_job(user_id, job_name)
 
 
-async def run_cron_job(user_id: str, job_name: str) -> str | None:
+async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -> str | None:
     """执行单个 Cron 任务（从 CronJob DB 查任务定义）
 
     流程：查 DB 任务 → 恢复沙箱 → 创建临时 Agent → 执行任务 → 记录结果 → 注入聊天
@@ -229,13 +173,15 @@ async def run_cron_job(user_id: str, job_name: str) -> str | None:
     Args:
         user_id: 用户 ID
         job_name: 任务名（CronJob.name）
+        run_id: 可选，预创建的执行记录 ID（手动触发时由路由层预写入）
 
     Returns:
         执行结果摘要
     """
     from src.api.models.database import SessionLocal
 
-    run_id = str(uuid.uuid4())
+    if not run_id:
+        run_id = str(uuid.uuid4())
 
     # 从 CronJob 表查任务定义
     with SessionLocal() as db:
@@ -246,20 +192,31 @@ async def run_cron_job(user_id: str, job_name: str) -> str | None:
         )
         if not job:
             logger.warning("Cron 任务不存在 (user=%s, job=%s)", user_id, job_name)
+            # 兜底：将预创建的 run 记录标记为 failed，避免永远停留在 running
+            with SessionLocal() as db2:
+                rec = db2.query(CronJobRun).filter(CronJobRun.id == run_id).first()
+                if rec and rec.status == "running":
+                    rec.status = "failed"
+                    rec.output = "任务不存在"
+                    rec.completed_at = now_naive()
+                    db2.commit()
             return None
         task_description = job.description or job_name
         cron_expr = job.cron_expr
 
+    # 如果 run_id 对应的记录已存在（手动触发预创建），跳过；否则新建
     with SessionLocal() as db:
-        run_record = CronJobRun(
-            id=run_id,
-            user_id=user_id,
-            job_name=job_name,
-            cron_expr=cron_expr,
-            status="running",
-        )
-        db.add(run_record)
-        db.commit()
+        existing = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
+        if not existing:
+            run_record = CronJobRun(
+                id=run_id,
+                user_id=user_id,
+                job_name=job_name,
+                cron_expr=cron_expr,
+                status="running",
+            )
+            db.add(run_record)
+            db.commit()
 
     try:
         # 恢复用户沙箱

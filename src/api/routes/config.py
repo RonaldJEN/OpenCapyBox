@@ -1,7 +1,7 @@
 """配置管理 API
 
 提供 Agent 配置文件编辑和 Skill 管理：
-- GET/PUT /api/config/agent-files/{name}: 读写 USER/SOUL/AGENTS/MEMORY/HEARTBEAT 文件
+- GET/PUT /api/config/agent-files/{name}: 读写 USER/SOUL/AGENTS/MEMORY 文件
 - GET /api/config/skills: 获取用户 Skill 配置列表
 - PUT /api/config/skills/{skill_name}: 启用/禁用 Skill
 """
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session as DBSession
 
 from src.api.models.database import get_db
 from src.api.deps import get_current_user
-from src.api.services.memory_service import MemoryService, FILE_TYPE_TO_FILENAME
+from src.api.services.memory_service import MemoryService
 from src.api.models.user_memory import UserSkillConfig
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,6 @@ _NAME_TO_FILE_TYPE = {
     "soul": "soul_md",
     "agents": "agents_md",
     "memory": "memory_md",
-    "heartbeat": "heartbeat_md",
 }
 
 _SKILL_CATEGORY_MAP = {
@@ -115,62 +114,12 @@ async def update_agent_file(
     except Exception as e:
         logger.warning("同步配置到沙箱失败: %s", e)
 
-    # HEARTBEAT.md 更新后重新注册该用户的 Cron 任务
-    if name == "heartbeat":
-        try:
-            from src.api.services.cron_service import reload_user_jobs
-            import src.api.main as _main_mod
-
-            scheduler = getattr(getattr(_main_mod.app, "state", None), "scheduler", None)
-            if scheduler:
-                count = reload_user_jobs(user_id, scheduler)
-                logger.info("已重新注册用户 %s 的 %d 个 Cron 任务", user_id, count)
-        except Exception as e:
-            logger.warning("重新注册 Cron 任务失败: %s", e)
-
     return {
         "name": name,
         "file_type": file_type,
         "version": record.version,
         "message": "ok",
     }
-
-
-@router.get("/agent-files")
-async def list_agent_files(
-    user_id: str = Depends(get_current_user),
-    db: DBSession = Depends(get_db),
-):
-    """列出所有 Agent 配置文件的元数据
-
-    新用户首次访问时自动写入默认模板（Bootstrap）。
-    """
-    svc = MemoryService(db)
-
-    # 新用户自动注入默认模板
-    try:
-        count = svc.provision_default_files(user_id)
-        if count > 0:
-            logger.info("新用户默认文件注入完成: user=%s, count=%d", user_id, count)
-    except Exception as e:
-        logger.warning("默认文件注入失败（非致命）: %s", e)
-
-    all_files = svc.get_all_memory_files(user_id)
-
-    files = []
-    for name, file_type in _NAME_TO_FILE_TYPE.items():
-        content = all_files.get(file_type, "")
-        record = svc.get_memory_file(user_id, file_type)
-        files.append({
-            "name": name,
-            "file_type": file_type,
-            "filename": FILE_TYPE_TO_FILENAME.get(file_type, ""),
-            "has_content": bool(content),
-            "version": record.version if record else 0,
-            "updated_at": record.updated_at.isoformat() if record and record.updated_at else None,
-        })
-
-    return {"files": files}
 
 
 @router.get("/skills")

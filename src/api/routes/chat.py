@@ -276,7 +276,7 @@ def _start_agent_init(
     # 定期清理過期 Agent（節流：每600秒最多一次）
     global _last_cleanup_time
     now = time.time()
-    if now - _last_cleanup_time > 600:
+    if now - _last_cleanup_time > 3600:
         _cleanup_task = asyncio.create_task(agent_pool.cleanup_expired_async())
         _cleanup_task.add_done_callback(lambda t: logger.error("Agent 清理異常: %s", t.exception()) if not t.cancelled() and t.exception() else None)
         _last_cleanup_time = now

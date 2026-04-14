@@ -50,6 +50,26 @@
 | `GET /api/metrics/{id}/recent` | ✅ | `src/services/api.ts:347` (`getRecentMetrics` 方法) |
 | `GET /api/metrics/{id}/trends` | ✅ | `src/services/api.ts:357` (`getToolPerformanceTrends` 方法) |
 
+### Agent 配置文件 API（configApi）
+
+> 以下接口由 `src/services/configApi.ts` 封装，独立于主 `api.ts`。
+
+| 接口 | 前端使用 | 调用位置 |
+|------|----------|----------|
+| `GET /api/config/agent-files/{name}` | ✅ | `configApi.ts:47` (`getAgentFile` 方法)<br>`src/components/AgentConfig.tsx` |
+| `PUT /api/config/agent-files/{name}` | ✅ | `configApi.ts:52` (`updateAgentFile` 方法)<br>`src/components/AgentConfig.tsx` |
+| `GET /api/config/skills` | ✅ | `configApi.ts:72` (`getSkills` 方法)<br>`src/components/SkillManager.tsx` |
+| `PUT /api/config/skills/{skill_name}` | ✅ | `configApi.ts:77` (`toggleSkill` 方法)<br>`src/components/SkillManager.tsx` |
+
+### Cron 任务 API（configApi）
+
+| 接口 | 前端使用 | 调用位置 |
+|------|----------|----------|
+| `GET /api/cron/jobs` | ✅ | `configApi.ts:100` (`getCronJobs` 方法)<br>`src/components/CronSchedule.tsx` |
+| `GET /api/cron/runs` | ✅ | `configApi.ts:105` (`getCronRuns` 方法)<br>`src/components/CronSchedule.tsx` |
+| `GET /api/cron/runs/{run_id}` | ✅ | `configApi.ts:126` (`getCronRunStatus` 方法)<br>`src/components/CronSchedule.tsx`（手动触发后轮询执行状态） |
+| `POST /api/cron/jobs/{job_name}/run` | ✅ | `configApi.ts:118` (`triggerCronJob` 方法，返回 `run_id` 供轮询)<br>`src/components/CronSchedule.tsx` |
+
 ---
 
 ## 未使用的后端接口（共 2 个）
@@ -66,10 +86,14 @@
 | 文件 | 说明 |
 |------|------|
 | `src/services/api.ts` | API 服务封装，所有 API 调用的主要入口 |
+| `src/services/configApi.ts` | Agent 配置 / Skill / Cron 任务 API 封装 |
 | `src/components/FilePreview.tsx` | 文件预览组件，直接调用文件下载/预览接口 |
 | `src/components/Login.tsx` | 登录页面 |
 | `src/components/SessionList.tsx` | 会话列表管理，支持自动折叠和 CSS Transition 动画 |
 | `src/components/ChatV2.tsx` | 聊天界面：配合左侧折叠与右侧覆盖式抽屉（Overlay Drawer），实现按会话记忆/恢复滚动位置，欢迎页「输入即创建会话」 |
+| `src/components/AgentConfig.tsx` | Agent 配置文件编辑面板（USER/SOUL/AGENTS/MEMORY） |
+| `src/components/CronSchedule.tsx` | 日程管理面板：日历周视图 + 任务管理列表 + 手动执行（轮询 run_id） |
+| `src/components/SkillManager.tsx` | Skill 启用/禁用管理面板 |
 | `src/components/ReasoningPanel.tsx` | 推理面板（Claude Display Blocks 风格），含 ThinkingBlock / ToolGroupBlock / DoneMarker 等子组件 |
 | `src/utils/displayBlocks.ts` | Display Blocks 转换层：将 StepData[] 聚合为 DisplayBlock[]，含工具描述、diff 统计、thinking 计时 |
 | `src/components/MetricsDashboard.tsx` | 指标仪表盘 |

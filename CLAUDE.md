@@ -53,7 +53,7 @@ OpenCapyBox 是一个前后端分离的 Web 智能体平台，核心能力包括
 1. 多模型（Anthropic/OpenAI 协议）统一注册与切换。
 2. OpenSandbox 隔离执行（命令、文件、会话资源）。
 3. AG-UI 原生事件流（SSE、重放、断线恢复）。
-4. 分层记忆（USER/MEMORY/SOUL/AGENTS/HEARTBEAT）。
+4. 分层记忆（USER/MEMORY/SOUL/AGENTS）。
 5. Skills 动态加载与用户级启停。
 6. Cron 定时任务与执行历史。
 

@@ -7,9 +7,9 @@
 - kill: 銷毀沙箱（用戶刪除時）
 - push_skill: 將 skills 資源推送到沙箱
 
-架構（一用戶一沙箱）：
+架构（一用户一沙箱）：
   user_id → sandbox（持久化工作空間 /home/user）
-    ├── USER.md / SOUL.md / AGENTS.md / MEMORY.md / HEARTBEAT.md
+    ├── USER.md / SOUL.md / AGENTS.md / MEMORY.md
     └── sessions/{session_id}/   ← 各對話隔離子目錄
 
   Agent Server (本機) ←→ OpenSandbox Server (遠端)
@@ -483,6 +483,13 @@ class SandboxSessionService:
     def get_cached(self, user_id: str) -> Sandbox | None:
         """獲取快取中的沙箱（不做健康檢查，用於工具層直接存取）"""
         return self._cache.get(user_id)
+
+    def invalidate_cache(self, user_id: str) -> None:
+        """移除用戶的沙箱快取（用於陳舊沙箱恢復場景）"""
+        removed = self._cache.pop(user_id, None)
+        self._pushed_skills.pop(user_id, None)
+        if removed:
+            logger.info("已移除陳舊沙箱快取 (user=%s, sandbox_id=%s)", user_id, getattr(removed, "id", "?"))
 
     def get_sandbox_id(self, user_id: str) -> str | None:
         """獲取沙箱 ID（用於存入 DB）"""

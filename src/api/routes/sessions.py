@@ -206,6 +206,50 @@ def _get_user_sandbox_id(db: DBSession, user_id: str) -> str | None:
     return user_sandbox.sandbox_id if user_sandbox else None
 
 
+def _upsert_user_sandbox(db: DBSession, user_id: str, sandbox_service) -> None:
+    """將當前沙箱 ID 持久化到 UserSandbox 表（get_or_resume 可能創建了新沙箱）。"""
+    new_id = sandbox_service.get_sandbox_id(user_id)
+    if not new_id:
+        return
+    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+    if user_sandbox:
+        if user_sandbox.sandbox_id != new_id:
+            user_sandbox.sandbox_id = new_id
+            user_sandbox.status = "active"
+            db.commit()
+    else:
+        user_sandbox = UserSandbox(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            sandbox_id=new_id,
+            status="active",
+        )
+        db.add(user_sandbox)
+        db.commit()
+
+
+async def _ensure_sandbox(sandbox_service, user_id: str, db: DBSession, *, force_refresh: bool = False):
+    """獲取可用沙箱，支持陳舊快取自動恢復。
+
+    Args:
+        force_refresh: 為 True 時先清除快取再獲取（用於重試場景）
+
+    Returns:
+        可用的 Sandbox 實例
+    """
+    if force_refresh:
+        sandbox_service.invalidate_cache(user_id)
+
+    sandbox = sandbox_service.get_cached(user_id)
+    if sandbox:
+        return sandbox
+
+    sandbox = await sandbox_service.get_or_resume(user_id, _get_user_sandbox_id(db, user_id))
+    # 可能創建了新沙箱，持久化到 DB
+    _upsert_user_sandbox(db, user_id, sandbox_service)
+    return sandbox
+
+
 async def _sandbox_list_dir(
     sandbox, target_dir: str, session_root: str
 ) -> list[FileInfo]:
@@ -522,7 +566,7 @@ async def get_session_files(
     if not sandbox:
         # 嘗試從 UserSandbox 表恢復沙箱
         try:
-            sandbox = await sandbox_service.get_or_resume(user_id, _get_user_sandbox_id(db, user_id))
+            sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
         except Exception as e:
             logger.warning("無法連接沙箱獲取文件列表: %s", e)
             return FileListResponse(files=[], total=0)
@@ -531,8 +575,14 @@ async def get_session_files(
         files = await _sandbox_list_dir(sandbox, target_dir, session_root)
         return FileListResponse(files=files, total=len(files))
     except Exception as e:
-        logger.warning("從沙箱獲取文件列表失敗: %s", e)
-        return FileListResponse(files=[], total=0)
+        # 沙箱可能已過期，清除快取重試一次
+        logger.warning("從沙箱獲取文件列表失敗，嘗試重新連接: %s", e)
+        try:
+            sandbox = await _ensure_sandbox(sandbox_service, user_id, db, force_refresh=True)
+            files = await _sandbox_list_dir(sandbox, target_dir, session_root)
+            return FileListResponse(files=files, total=len(files))
+        except Exception:
+            return FileListResponse(files=[], total=0)
 
 
 @router.get("/{chat_session_id}/files/{file_path:path}")
@@ -566,14 +616,12 @@ async def download_file(
     sandbox_service = get_sandbox_service()
     mount_path = sandbox_service.get_mount_path()
     session_root = f"{mount_path}/sessions/{chat_session_id}"
-    sandbox = sandbox_service.get_cached(user_id)
 
-    if not sandbox:
-        try:
-            sandbox = await sandbox_service.get_or_resume(user_id, _get_user_sandbox_id(db, user_id))
-        except Exception as e:
-            logger.warning("無法連接沙箱下載文件: %s", e)
-            raise HTTPException(status_code=503, detail="沙箱不可用")
+    try:
+        sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
+    except Exception as e:
+        logger.warning("無法連接沙箱下載文件: %s", e)
+        raise HTTPException(status_code=503, detail="沙箱不可用")
 
     # 構建並校驗沙箱中的完整路徑
     sandbox_path = resolve_sandbox_path(file_path, session_root)
@@ -721,67 +769,75 @@ async def upload_file(
     sandbox_service = get_sandbox_service()
     mount_path = sandbox_service.get_mount_path()
     session_root = f"{mount_path}/sessions/{chat_session_id}"
-    sandbox = sandbox_service.get_cached(user_id)
 
-    if not sandbox:
-        try:
-            sandbox = await sandbox_service.get_or_resume(user_id, _get_user_sandbox_id(db, user_id))
-        except Exception as e:
-            logger.warning("無法連接沙箱上傳文件: %s", e)
-            raise HTTPException(status_code=503, detail="沙箱不可用")
-
-    # 確保 session 子目錄存在
-    try:
-        await sandbox.commands.run(f"mkdir -p {shlex.quote(session_root)}")
-    except Exception:
-        pass
+    # 提前讀取文件內容（重試時不可重複讀取 UploadFile）
+    content = await file.read()
 
     # 安全的文件名處理（防止路径遍历 + 清洗特殊字符）
     raw_filename = os.path.basename(file.filename or "uploaded_file")
     safe_filename = _sanitize_filename(raw_filename)
-    sandbox_path = resolve_sandbox_path(safe_filename, session_root)
 
-    # 檢查是否已存在同名文件，若存在則加序號
-    try:
-        check_result = await sandbox.commands.run(
-            f"test -f {shlex.quote(sandbox_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
-        )
-        if _command_stdout_text(check_result) == "EXISTS":
-            base_name, ext = posixpath.splitext(safe_filename)
-            counter = 1
-            while True:
-                new_name = f"{base_name}_{counter}{ext}"
-                sandbox_path = resolve_sandbox_path(new_name, session_root)
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            sandbox = await _ensure_sandbox(
+                sandbox_service, user_id, db, force_refresh=(attempt > 0),
+            )
+        except Exception as e:
+            logger.warning("無法連接沙箱上傳文件: %s", e)
+            raise HTTPException(status_code=503, detail="沙箱不可用")
+
+        try:
+            # 確保 session 子目錄存在
+            await sandbox.commands.run(f"mkdir -p {shlex.quote(session_root)}")
+
+            # 檢查是否已存在同名文件，若存在則加序號
+            sandbox_path = resolve_sandbox_path(safe_filename, session_root)
+            final_filename = safe_filename
+            try:
                 check_result = await sandbox.commands.run(
                     f"test -f {shlex.quote(sandbox_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
                 )
-                if _command_stdout_text(check_result) != "EXISTS":
-                    safe_filename = new_name
-                    break
-                counter += 1
-    except Exception:
-        pass  # 如果檢查失敗，直接覆蓋
+                if _command_stdout_text(check_result) == "EXISTS":
+                    base_name, ext = posixpath.splitext(safe_filename)
+                    counter = 1
+                    while True:
+                        new_name = f"{base_name}_{counter}{ext}"
+                        sandbox_path = resolve_sandbox_path(new_name, session_root)
+                        check_result = await sandbox.commands.run(
+                            f"test -f {shlex.quote(sandbox_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
+                        )
+                        if _command_stdout_text(check_result) != "EXISTS":
+                            final_filename = new_name
+                            break
+                        counter += 1
+            except Exception:
+                pass  # 如果檢查失敗，直接覆蓋
 
-    # 讀取上傳文件內容並寫入沙箱
-    try:
-        content = await file.read()
-        write = getattr(sandbox.files, "write", None)
-        if callable(write):
-            await write(sandbox_path, content)
-        else:
-            await sandbox.files.write_file(sandbox_path, content)
+            # 寫入沙箱
+            write = getattr(sandbox.files, "write", None)
+            if callable(write):
+                await write(sandbox_path, content)
+            else:
+                await sandbox.files.write_file(sandbox_path, content)
 
-        file_info = FileInfo(
-            name=safe_filename,
-            path=safe_filename,  # 相對路徑
-            size=len(content),
-            modified=datetime.utcnow().isoformat(),
-            type=file.content_type or "application/octet-stream",
-        )
+            file_info = FileInfo(
+                name=final_filename,
+                path=final_filename,  # 相對路徑
+                size=len(content),
+                modified=datetime.utcnow().isoformat(),
+                type=file.content_type or "application/octet-stream",
+            )
 
-        logger.info(f"文件上傳至沙箱成功: {safe_filename} ({len(content)} bytes)")
-        return file_info
+            logger.info(f"文件上傳至沙箱成功: {final_filename} ({len(content)} bytes)")
+            return file_info
 
-    except Exception as e:
-        logger.error(f"文件上傳至沙箱失敗: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"文件保存失敗: {str(e)}")
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                logger.warning("沙箱操作失敗，將清除快取重試: %s", e)
+                continue
+    else:
+        # 所有重試均失敗
+        logger.error(f"文件上傳至沙箱失敗: {last_err}")
+        raise HTTPException(status_code=500, detail=f"文件保存失敗: {last_err}")

@@ -1,15 +1,15 @@
 """Cron 服务 (cron_service) 单元测试
 
 覆盖：
-- HEARTBEAT.md 解析
 - CronTask 数据结构
 - parse_cron_fields
 - CronService CRUD
+- Cron 路由端点（trigger_job run_id、get_run_status）
 """
 import pytest
 from unittest.mock import MagicMock, patch
 
-from tests.helpers import make_query_db
+from tests.helpers import make_query_db, make_test_client
 
 
 # ── 共享工厂 ────────────────────────────────────────────────
@@ -29,74 +29,6 @@ def _make_cron_service(*, query_return=None, first_return=None):
 def _make_cron_db(jobs):
     """构建只含 CronJob 查询链的 mock_db（用于 register_user_jobs）"""
     return make_query_db(all_results=jobs)
-
-
-class TestParseHeartbeatMd:
-    """parse_heartbeat_md 解析测试"""
-
-    def test_empty_content(self):
-        from src.api.services.cron_service import parse_heartbeat_md
-
-        tasks = parse_heartbeat_md("")
-        assert tasks == []
-
-    def test_single_enabled_task(self):
-        from src.api.services.cron_service import parse_heartbeat_md
-
-        content = "- [ ] daily_report 0 9 * * * - 每天9点生成日报"
-        tasks = parse_heartbeat_md(content)
-        assert len(tasks) == 1
-        assert tasks[0].name == "daily_report"
-        assert tasks[0].cron_expr == "0 9 * * *"
-        assert tasks[0].description == "每天9点生成日报"
-        assert tasks[0].enabled is True
-
-    def test_disabled_task(self):
-        from src.api.services.cron_service import parse_heartbeat_md
-
-        content = "- [x] cleanup 0 0 * * 0 - 每周清理"
-        tasks = parse_heartbeat_md(content)
-        assert len(tasks) == 1
-        assert tasks[0].name == "cleanup"
-        assert tasks[0].enabled is False
-
-    def test_multiple_tasks(self):
-        from src.api.services.cron_service import parse_heartbeat_md
-
-        content = """# 定时任务
-
-- [ ] daily_report 0 9 * * * - 每天9点
-- [x] weekly_clean 0 0 * * 0 - 每周清理
-- [ ] hourly_check */5 * * * * - 每5分钟检查
-"""
-        tasks = parse_heartbeat_md(content)
-        assert len(tasks) == 3
-        assert tasks[0].enabled is True
-        assert tasks[1].enabled is False
-        assert tasks[2].name == "hourly_check"
-
-    def test_task_without_description(self):
-        from src.api.services.cron_service import parse_heartbeat_md
-
-        content = "- [ ] simple_task 0 0 * * *"
-        tasks = parse_heartbeat_md(content)
-        assert len(tasks) == 1
-        assert tasks[0].description == ""
-
-    def test_ignores_non_task_lines(self):
-        from src.api.services.cron_service import parse_heartbeat_md
-
-        content = """# HEARTBEAT.md
-这是说明文字
-
-- 普通列表项
-- [ ] valid_task 0 0 * * * - 有效任务
-
-> 引用文字
-"""
-        tasks = parse_heartbeat_md(content)
-        assert len(tasks) == 1
-        assert tasks[0].name == "valid_task"
 
 
 class TestParseCronFields:
@@ -146,18 +78,6 @@ class TestCronTask:
 
 class TestCronServiceDB:
     """CronService 数据库操作测试"""
-
-    def test_get_heartbeat_content_empty(self):
-        svc, mock_db = _make_cron_service()
-        # get_heartbeat_content queries UserMemory; explicitly set first()=None
-        mock_db.query.return_value.filter.return_value.first.return_value = None
-        assert svc.get_heartbeat_content("user-1") == ""
-
-    def test_get_heartbeat_content_exists(self):
-        record = MagicMock()
-        record.content = "- [ ] test 0 0 * * *"
-        svc, _ = _make_cron_service(first_return=record)
-        assert svc.get_heartbeat_content("user-1") == "- [ ] test 0 0 * * *"
 
     def test_get_tasks_from_db(self):
         """get_tasks 现在从 CronJob 表查询"""
@@ -263,3 +183,102 @@ class TestRegisterUserJobs:
         mock_job1.remove.assert_called_once()
         mock_job2.remove.assert_not_called()
         assert count == 1
+
+
+class TestCronRoutes:
+    """Cron 路由端点测试"""
+
+    @pytest.fixture
+    def client(self):
+        from src.api.routes import cron as cron_routes
+        return make_test_client(cron_routes.router, "/cron")
+
+    def test_trigger_job_returns_run_id(self, client):
+        """POST /jobs/{name}/run 应返回 run_id"""
+        mock_job = MagicMock()
+        mock_job.name = "daily"
+        mock_job.cron_expr = "0 9 * * *"
+
+        client.mock_db.query.return_value.filter.return_value.first.return_value = mock_job
+
+        with patch("src.api.routes.cron.run_cron_job"):
+            response = client.post("/cron/jobs/daily/run")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "run_id" in data
+        assert data["status"] == "accepted"
+        assert data["job_name"] == "daily"
+        # run_id 应该是 UUID 格式
+        import uuid
+        uuid.UUID(data["run_id"])  # 不抛异常即合法
+
+    def test_trigger_job_not_found(self, client):
+        """POST /jobs/{name}/run 任务不存在返回 404"""
+        client.mock_db.query.return_value.filter.return_value.first.return_value = None
+
+        response = client.post("/cron/jobs/nonexistent/run")
+        assert response.status_code == 404
+
+    def test_get_run_status_found(self, client):
+        """GET /runs/{run_id} 返回执行记录"""
+        mock_run = MagicMock()
+        mock_run.id = "run-uuid-123"
+        mock_run.job_name = "daily"
+        mock_run.cron_expr = "0 9 * * *"
+        mock_run.started_at = None
+        mock_run.completed_at = None
+        mock_run.status = "running"
+        mock_run.output = None
+
+        client.mock_db.query.return_value.filter.return_value.first.return_value = mock_run
+
+        response = client.get("/cron/runs/run-uuid-123")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "run-uuid-123"
+        assert data["status"] == "running"
+        assert data["job_name"] == "daily"
+
+    def test_get_run_status_not_found(self, client):
+        """GET /runs/{run_id} 记录不存在返回 404"""
+        client.mock_db.query.return_value.filter.return_value.first.return_value = None
+
+        response = client.get("/cron/runs/nonexistent")
+        assert response.status_code == 404
+
+
+class TestRunCronJobFallback:
+    """run_cron_job 兜底逻辑测试"""
+
+    @pytest.mark.asyncio
+    async def test_marks_preexisting_run_as_failed_when_job_missing(self):
+        """job 被删除后，预创建的 CronJobRun 应被标记为 failed"""
+        from src.api.services.cron_service import run_cron_job
+
+        pre_run = MagicMock()
+        pre_run.id = "pre-run-id"
+        pre_run.status = "running"
+
+        call_count = {"n": 0}
+
+        def fake_first():
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # 第一次调用：CronJob 查询 → 不存在
+                return None
+            # 第二次调用：CronJobRun 查询 → 预创建记录
+            return pre_run
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.side_effect = fake_first
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+
+        with patch("src.api.models.database.SessionLocal", return_value=mock_db):
+            result = await run_cron_job("user-1", "deleted_job", run_id="pre-run-id")
+
+        assert result is None
+        assert pre_run.status == "failed"
+        assert pre_run.output == "任务不存在"
+        mock_db.commit.assert_called()

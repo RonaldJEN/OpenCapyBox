@@ -35,25 +35,11 @@ client.interceptors.response.use(
 
 // ========== Agent 配置文件 API ==========
 
-export interface AgentFileInfo {
-  name: string;
-  file_type: string;
-  filename: string;
-  has_content: boolean;
-  version: number;
-  updated_at: string | null;
-}
-
 export interface AgentFileDetail {
   name: string;
   file_type: string;
   content: string;
   version: number;
-}
-
-export async function listAgentFiles(): Promise<AgentFileInfo[]> {
-  const resp = await client.get<{ files: AgentFileInfo[] }>('/config/agent-files');
-  return resp.data.files;
 }
 
 export async function getAgentFile(name: string): Promise<AgentFileDetail> {
@@ -112,16 +98,6 @@ export interface CronJobRun {
   output: string | null;
 }
 
-export async function getHeartbeat(): Promise<{
-  content: string;
-  tasks: CronTask[];
-}> {
-  const resp = await client.get<{ content: string; tasks: CronTask[] }>(
-    '/cron/heartbeat',
-  );
-  return resp.data;
-}
-
 export async function getCronJobs(): Promise<CronTask[]> {
   const resp = await client.get<{ jobs: CronTask[] }>('/cron/jobs');
   return resp.data.jobs;
@@ -139,9 +115,14 @@ export async function getCronRuns(
 
 export async function triggerCronJob(
   jobName: string,
-): Promise<{ job_name: string; status: string; message?: string; output: string | null }> {
-  const resp = await client.post<{ job_name: string; status: string; message?: string; output: string | null }>(
+): Promise<{ job_name: string; run_id: string; status: string; message?: string }> {
+  const resp = await client.post<{ job_name: string; run_id: string; status: string; message?: string }>(
     `/cron/jobs/${jobName}/run`,
   );
+  return resp.data;
+}
+
+export async function getCronRunStatus(runId: string): Promise<CronJobRun> {
+  const resp = await client.get<CronJobRun>(`/cron/runs/${runId}`);
   return resp.data;
 }

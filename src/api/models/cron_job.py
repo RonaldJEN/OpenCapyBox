@@ -1,7 +1,6 @@
 """Cron 定时任务数据模型
 
-CronJob 表替代 HEARTBEAT.md 中的 Markdown 行存储，
-实现 Cron 任务定义的持久化管理。
+CronJob 表实现 Cron 任务定义的持久化管理。
 """
 from sqlalchemy import Column, String, Integer, Text, Boolean, DateTime, UniqueConstraint
 from .database import Base

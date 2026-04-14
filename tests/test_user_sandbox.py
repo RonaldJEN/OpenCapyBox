@@ -87,7 +87,7 @@ class TestUserMemoryModels:
 
     def test_user_memory_file_types(self):
         from src.api.models.user_memory import UserMemory
-        for file_type in ["user_md", "memory_md", "soul_md", "agents_md", "heartbeat_md"]:
+        for file_type in ["user_md", "memory_md", "soul_md", "agents_md"]:
             mem = UserMemory(
                 user_id="user-1",
                 file_type=file_type,
@@ -527,35 +527,11 @@ class TestAgentServicePostRoundTasks:
             with patch("src.api.services.memory_service.MemoryService", return_value=mock_mem_svc):
                 await svc._sync_memory_to_db()
 
-        # 应对所有 5 个 file_type 各调用一次 sync_from_sandbox
-        assert mock_mem_svc.sync_from_sandbox.call_count == 5
+        # 应对所有 4 个 file_type 各调用一次 sync_from_sandbox
+        assert mock_mem_svc.sync_from_sandbox.call_count == 4
         # 仅 user_md 和 memory_md 需要 rebuild_embeddings
         assert mock_mem_svc.rebuild_embeddings.call_count == 2
         mock_db.close.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_sync_memory_no_heartbeat_cron_reload(self):
-        """Cron 已改为 DB 驱动，HEARTBEAT.md 变化不再触发 cron reload"""
-        svc = make_agent_service()
-
-        # sync_from_sandbox 对 heartbeat_md 返回内容
-        async def _fake_sync(user_id, sandbox, ft):
-            if ft == "heartbeat_md":
-                return "# 轮询检查清单\n- 检查邮件"
-            return None
-
-        mock_mem_svc = MagicMock()
-        mock_mem_svc.sync_from_sandbox = AsyncMock(side_effect=_fake_sync)
-        mock_mem_svc.rebuild_embeddings = AsyncMock()
-
-        mock_db = MagicMock()
-
-        with patch("src.api.models.database.SessionLocal", return_value=mock_db):
-            with patch("src.api.services.memory_service.MemoryService", return_value=mock_mem_svc):
-                await svc._sync_memory_to_db()
-
-        # 确认不再调用 reload_user_jobs
-        # （Cron 现在由 manage_cron 工具直接操作 DB + APScheduler）
 
 
 class TestAgentServiceSkillFiltering:

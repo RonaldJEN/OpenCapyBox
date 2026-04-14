@@ -251,55 +251,12 @@ class TestAgentServiceProvision:
 # =========================================================================
 
 class TestConfigRouteAutoProvision:
-    """GET /agent-files 端点新用户自动注入默认模板测试"""
+    """GET/PUT /agent-files/{name} 端点新用户自动注入默认模板测试"""
 
     @pytest.fixture
     def client(self):
         from src.api.routes import config as config_routes
         return make_test_client(config_routes.router, "/config", user="new-user")
-
-    def test_list_agent_files_triggers_provision_for_new_user(self, client):
-        """GET /agent-files 对新用户会自动触发 provision_default_files"""
-        with patch("src.api.routes.config.MemoryService") as MockMemSvc:
-            mock_instance = MockMemSvc.return_value
-            mock_instance.provision_default_files.return_value = 5
-            mock_instance.get_all_memory_files.return_value = {}
-            mock_instance.get_memory_file.return_value = None
-
-            response = client.get("/config/agent-files", params={"user_id": "new-user"})
-
-        assert response.status_code == 200
-        mock_instance.provision_default_files.assert_called_once_with("new-user")
-
-    def test_list_agent_files_provision_idempotent(self, client):
-        """已有用户调用 provision_default_files 返回 0，不影响正常流程"""
-        with patch("src.api.routes.config.MemoryService") as MockMemSvc:
-            mock_instance = MockMemSvc.return_value
-            mock_instance.provision_default_files.return_value = 0  # 非新用户
-            mock_instance.get_all_memory_files.return_value = {"soul_md": "content"}
-            record = MagicMock()
-            record.content = "content"
-            record.version = 2
-            record.updated_at = None
-            mock_instance.get_memory_file.return_value = record
-
-            response = client.get("/config/agent-files", params={"user_id": "new-user"})
-
-        assert response.status_code == 200
-        data = response.json()
-        assert any(f["has_content"] for f in data["files"])
-
-    def test_list_agent_files_provision_failure_non_fatal(self, client):
-        """provision_default_files 异常不影响接口正常返回"""
-        with patch("src.api.routes.config.MemoryService") as MockMemSvc:
-            mock_instance = MockMemSvc.return_value
-            mock_instance.provision_default_files.side_effect = RuntimeError("DB error")
-            mock_instance.get_all_memory_files.return_value = {}
-            mock_instance.get_memory_file.return_value = None
-
-            response = client.get("/config/agent-files", params={"user_id": "new-user"})
-
-        assert response.status_code == 200
 
     def test_get_single_agent_file_triggers_provision(self, client):
         """GET /agent-files/{name} 对新用户也触发 provision"""

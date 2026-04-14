@@ -211,7 +211,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
           className="w-full flex items-center space-x-3 px-3 py-2 text-sm text-claude-secondary hover:bg-claude-hover rounded-lg transition-all group"
         >
           <Clock size={16} className="text-claude-muted group-hover:text-claude-secondary" />
-          <span>定时任务</span>
+          <span>日程管理</span>
         </button>
         <button
           onClick={handleLogout}

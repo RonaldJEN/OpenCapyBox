@@ -107,7 +107,7 @@ Supports **BM25 keyword + vector semantic + RRF fusion** hybrid retrieval — th
 
 ### ⏰ Scheduled Tasks
 
-Define Cron jobs via `HEARTBEAT.md`, and your AI assistant runs them autonomously:
+Define Cron jobs via the `manage_cron` tool, and your AI assistant runs them autonomously:
 
 - Visual task dashboard in the frontend
 - Manual trigger / pause support
@@ -361,8 +361,6 @@ OpenCapyBox's layered memory makes your AI assistant understand you better over 
 │               (Long-term Memory)            │
 ├─────────────────────────────────────────────┤
 │  AGENTS.md  — Team collaboration rules      │
-├─────────────────────────────────────────────┤
-│  HEARTBEAT.md — What to do on schedule?     │
 └─────────────────────────────────────────────┘
 ```
 

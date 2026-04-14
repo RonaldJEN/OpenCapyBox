@@ -311,7 +311,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
     timer = setInterval(poll, 1000);
 
-    // 监听 CronHistory 手动触发的即时刷新事件
+    // 监听 CronSchedule 手动触发的即时刷新事件
     const handleCronDone = () => {
       // 延迟 300ms 等后端落库完成
       if (cronRefreshTimeoutRef.current) {
