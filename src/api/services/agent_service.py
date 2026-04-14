@@ -118,7 +118,7 @@ class AgentService:
                 "請修復 models.yaml 或環境變數後重試。"
             ) from e
 
-        # === 新用户默认文件初始化（Bootstrap）===
+        # === 新用户默认文件初始化 ===
         self._provision_default_files_if_needed()
 
         # 加载 system prompt

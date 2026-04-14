@@ -283,23 +283,14 @@ Agent 运行时修改记忆
 
 每轮对话结束后，若 dirty flag 为 True，`_post_round_tasks()` 调用 `_sync_memory_to_db()` 将所有记忆文件从沙箱读回 DB。
 
-### 8.5 BOOTSTRAP 引导流程
-
-新用户首次使用时，系统在沙箱中写入 `BOOTSTRAP.md` 引导文件，指导 Agent 完成初始人格建立：
-
-- `provision_sandbox_templates()` 仅在用户无任何对话记录时执行
-- 沙箱中已存在该文件时跳过（幂等）
-- Agent 完成引导后自行删除 BOOTSTRAP.md
-
-### 8.6 新用户初始化时序
+### 8.5 新用户初始化时序
 
 ```
 AgentPoolService._do_create_agent()
 ├── AgentService.initialize_agent()
 │   └── _provision_default_files_if_needed()
 │       └── MemoryService.provision_default_files()   // DB: 仅 is_new_user 时写入默认模板
-├── MemoryService.sync_to_sandbox(force=False)        // 沙箱优先同步
-└── MemoryService.provision_sandbox_templates()        // 写入 BOOTSTRAP.md（仅新用户）
+└── MemoryService.sync_to_sandbox(force=False)         // 沙箱优先同步
 ```
 
 ---
@@ -325,4 +316,4 @@ AgentPoolService._do_create_agent()
 
 ---
 
-**最后更新**: 2026-04-12
+**最后更新**: 2026-04-14

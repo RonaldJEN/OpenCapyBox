@@ -6,7 +6,7 @@
 - Embedding 分块 + 写入 MemoryEmbedding 表
 - 混合检索：BM25 关键词 + 向量语义 + RRF 融合 + 时间衰减
 - 沙箱文件同步（DB → sandbox）
-- 新用户默认注入文件（Bootstrap 机制）
+- 新用户默认注入文件（SOUL.md / AGENTS.md / MEMORY.md / USER.md）
 """
 
 import json
@@ -47,11 +47,6 @@ _TEMPLATE_FILES: dict[str, str] = {
     "agents_md": "AGENTS.md",
     "memory_md": "MEMORY.md",
     "user_md": "USER.md",
-}
-
-# 额外的沙箱独有模板文件（不存 DB，仅写沙箱）
-_SANDBOX_ONLY_TEMPLATES: dict[str, str] = {
-    "BOOTSTRAP.md": "BOOTSTRAP.md",
 }
 
 
@@ -183,78 +178,6 @@ class MemoryService:
             logger.info("已为新用户写入默认模板: user=%s, file=%s", user_id, template_name)
 
         logger.info("新用户默认文件初始化完成: user=%s, count=%d", user_id, count)
-        return count
-
-    async def provision_sandbox_templates(self, user_id: str, sandbox) -> int:
-        """将额外的沙箱独有模板文件写入沙箱（如 BOOTSTRAP.md）
-
-        这些文件不存 DB，仅在沙箱中存在。Agent 完成引导后会自行删除。
-
-        仅在用户尚无任何对话记录时写入：有对话记录说明用户已经使用过，
-        不再重复上传引导文件。
-
-        Args:
-            user_id: 用户 ID
-            sandbox: OpenSandbox 实例
-
-        Returns:
-            写入的文件数量
-        """
-        # 如果用户已有对话记录（Round 表有记录），跳过 BOOTSTRAP.md
-        # 不查 Session 表：当前正在创建的 session 已 commit，会导致首次也被跳过
-        from src.api.models.round import Round
-        from src.api.models.session import Session
-        has_rounds = (
-            self.db.query(Round.id)
-            .join(Session, Round.session_id == Session.id)
-            .filter(Session.user_id == user_id)
-            .limit(1)
-            .first()
-        )
-        if has_rounds:
-            logger.debug("用户已有对话记录，跳过 BOOTSTRAP.md (user=%s)", user_id)
-            return 0
-
-        from src.api.services.sandbox_service import get_sandbox_mount_path
-
-        mount = get_sandbox_mount_path()
-        count = 0
-        for sandbox_filename, template_name in _SANDBOX_ONLY_TEMPLATES.items():
-            sandbox_path = f"{mount}/{sandbox_filename}"
-
-            # 检查沙箱中是否已存在（幂等）
-            try:
-                read_fn = getattr(sandbox.files, "read_file", None)
-                if callable(read_fn):
-                    existing = await read_fn(sandbox_path)
-                else:
-                    existing = await sandbox.files.read(sandbox_path)
-                if existing:
-                    continue  # 已存在，不覆盖
-            except Exception:
-                pass  # 文件不存在，正常继续
-
-            template_path = _TEMPLATE_DIR / template_name
-            if not template_path.exists():
-                logger.warning("沙箱模板不存在: %s", template_path)
-                continue
-
-            content = template_path.read_text(encoding="utf-8")
-            content = self._strip_frontmatter(content)
-            if not content.strip():
-                continue
-
-            try:
-                write_fn = getattr(sandbox.files, "write_file", None)
-                if callable(write_fn):
-                    await write_fn(sandbox_path, content)
-                else:
-                    await sandbox.files.write(sandbox_path, content.encode("utf-8"))
-                count += 1
-                logger.info("已写入沙箱模板: user=%s, file=%s", user_id, sandbox_filename)
-            except Exception as e:
-                logger.warning("写入沙箱模板失败 (%s): %s", sandbox_filename, e)
-
         return count
 
     @staticmethod

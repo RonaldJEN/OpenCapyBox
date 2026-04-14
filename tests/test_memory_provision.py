@@ -1,15 +1,12 @@
-"""默认注入文件 (Bootstrap) 单元测试
+"""默认注入文件（模板 Provision）单元测试
 
 覆盖：
 - MemoryService.provision_default_files: 新用户默认模板写入
 - MemoryService.is_new_user: 判断用户是否为新用户
 - MemoryService._strip_frontmatter: YAML frontmatter 去除
-- MemoryService.provision_sandbox_templates: 沙箱独有模板写入
 - AgentService._provision_default_files_if_needed: Agent 初始化时的默认文件注入
 """
-import asyncio
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -17,7 +14,7 @@ from tests.helpers import make_query_db as _make_query_db, make_test_client
 
 
 # =========================================================================
-# MemoryService Bootstrap 测试
+# MemoryService 默认模板测试
 # =========================================================================
 
 class TestStripFrontmatter:
@@ -100,15 +97,11 @@ class TestProvisionDefaultFiles:
 
     def test_template_files_exist(self):
         """验证所有配置的模板文件都存在于 docs/ 目录"""
-        from src.api.services.memory_service import _TEMPLATE_DIR, _TEMPLATE_FILES, _SANDBOX_ONLY_TEMPLATES
+        from src.api.services.memory_service import _TEMPLATE_DIR, _TEMPLATE_FILES
 
         for file_type, filename in _TEMPLATE_FILES.items():
             path = _TEMPLATE_DIR / filename
             assert path.exists(), f"模板文件缺失: {path} (file_type={file_type})"
-
-        for sandbox_name, filename in _SANDBOX_ONLY_TEMPLATES.items():
-            path = _TEMPLATE_DIR / filename
-            assert path.exists(), f"沙箱模板文件缺失: {path} (file={sandbox_name})"
 
     def test_frontmatter_stripped_in_provision(self):
         """验证写入的内容不包含 YAML frontmatter"""
@@ -127,84 +120,13 @@ class TestProvisionDefaultFiles:
                     f"内容应去除 frontmatter: {record.content[:50]}"
 
 
-class TestProvisionSandboxTemplates:
-    """provision_sandbox_templates 测试"""
+class TestSandboxTemplateMethodRemoved:
+    """确认旧的沙箱独有模板方法已移除"""
 
-    def _mock_db_no_sessions(self):
-        """模拟无对话记录的 DB（新用户）"""
-        db = MagicMock()
-        mock_query = MagicMock()
-        mock_query.join.return_value = mock_query
-        mock_query.filter.return_value = mock_query
-        mock_query.limit.return_value = mock_query
-        mock_query.first.return_value = None  # 无 round 记录
-        db.query.return_value = mock_query
-        return db
-
-    def _mock_db_has_sessions(self):
-        """模拟有对话记录的 DB（老用户）"""
-        db = MagicMock()
-        mock_query = MagicMock()
-        mock_query.join.return_value = mock_query
-        mock_query.filter.return_value = mock_query
-        mock_query.limit.return_value = mock_query
-        mock_query.first.return_value = ("some-round-id",)  # 有 round 记录
-        db.query.return_value = mock_query
-        return db
-
-    @pytest.mark.asyncio
-    async def test_write_bootstrap_to_sandbox(self):
+    def test_provision_sandbox_templates_removed(self):
         from src.api.services.memory_service import MemoryService
 
-        db = self._mock_db_no_sessions()
-        sandbox = MagicMock()
-        # 模拟文件不存在（抛异常）
-        sandbox.files.read_file = AsyncMock(side_effect=FileNotFoundError("not found"))
-        sandbox.files.write_file = AsyncMock()
-
-        svc = MemoryService(db)
-        with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
-            count = await svc.provision_sandbox_templates("new-user", sandbox)
-
-        assert count >= 1
-        # 验证 write_file 被调用且路径包含 BOOTSTRAP.md
-        write_calls = sandbox.files.write_file.call_args_list
-        paths = [call[0][0] for call in write_calls]
-        assert any("BOOTSTRAP.md" in p for p in paths)
-
-    @pytest.mark.asyncio
-    async def test_skip_existing_bootstrap(self):
-        from src.api.services.memory_service import MemoryService
-
-        db = self._mock_db_no_sessions()
-        sandbox = MagicMock()
-        # 模拟文件已存在
-        sandbox.files.read_file = AsyncMock(return_value="existing content")
-        sandbox.files.write_file = AsyncMock()
-
-        svc = MemoryService(db)
-        with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
-            count = await svc.provision_sandbox_templates("existing-user", sandbox)
-
-        assert count == 0
-        sandbox.files.write_file.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_skip_bootstrap_when_user_has_conversations(self):
-        """用户已有对话记录，不应再上传 BOOTSTRAP.md"""
-        from src.api.services.memory_service import MemoryService
-
-        db = self._mock_db_has_sessions()
-        sandbox = MagicMock()
-        sandbox.files.read_file = AsyncMock(side_effect=FileNotFoundError("not found"))
-        sandbox.files.write_file = AsyncMock()
-
-        svc = MemoryService(db)
-        with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
-            count = await svc.provision_sandbox_templates("returning-user", sandbox)
-
-        assert count == 0
-        sandbox.files.write_file.assert_not_called()
+        assert not hasattr(MemoryService, "provision_sandbox_templates")
 
 
 # =========================================================================

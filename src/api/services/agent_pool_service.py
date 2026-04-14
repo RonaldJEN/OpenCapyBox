@@ -242,14 +242,13 @@ class AgentPoolService:
         await agent_service.initialize_agent()
         logger.info("Agent 初始化成功 (session=%s)", chat_session_id)
 
-        # 新用户：将 DB 记忆同步到沙箱 + 写入沙箱独有模板（如 BOOTSTRAP.md）
+        # 将 DB 记忆同步到沙箱
         try:
             from src.api.services.memory_service import MemoryService
             mem_svc = MemoryService(db)
             await mem_svc.sync_to_sandbox(user_id, sandbox)
-            await mem_svc.provision_sandbox_templates(user_id, sandbox)
         except Exception as e:
-            logger.warning("沙箱记忆同步/模板写入失败（非致命）: %s", e)
+            logger.warning("沙箱记忆同步失败（非致命）: %s", e)
 
         # 存入緩存（session 映射已在 _create_agent_instance 提前注冊）
         self._cache[chat_session_id] = agent_service
