@@ -241,13 +241,15 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, themeIdx, latestRun, onClick 
 interface TaskDetailModalProps {
   task: CronTask;
   runs: CronJobRun[];
+  latestRun?: CronJobRun;
   onClose: () => void;
   onTrigger: (name: string) => void;
   triggering: boolean;
 }
 
-const TaskDetailModal: React.FC<TaskDetailModalProps> = ({ task, runs, onClose, onTrigger, triggering }) => {
+const TaskDetailModal: React.FC<TaskDetailModalProps> = ({ task, runs, latestRun, onClose, onTrigger, triggering }) => {
   const [expandedRun, setExpandedRun] = useState<string | null>(null);
+  const [descExpanded, setDescExpanded] = useState(false);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
@@ -260,7 +262,7 @@ const TaskDetailModal: React.FC<TaskDetailModalProps> = ({ task, runs, onClose, 
       >
         {/* Header */}
         <div className="flex items-start justify-between px-6 pt-5 pb-3">
-          <h3 className="text-lg font-semibold text-claude-text leading-tight">
+          <h3 className="text-lg font-semibold text-claude-text leading-tight line-clamp-2" title={task.description || task.name}>
             {task.description || task.name}
           </h3>
           <button
@@ -275,8 +277,14 @@ const TaskDetailModal: React.FC<TaskDetailModalProps> = ({ task, runs, onClose, 
         <div className="px-6 pb-4 space-y-3 text-sm border-b border-claude-border">
           <div className="flex">
             <span className="w-24 text-claude-secondary shrink-0">状态</span>
-            <span className={`font-medium ${task.enabled ? 'text-claude-text' : 'text-claude-muted'}`}>
-              {task.enabled ? '待执行' : '已暂停'}
+            <span className={`font-medium ${
+              !task.enabled ? 'text-claude-muted'
+                : latestRun ? statusColor(latestRun.status)
+                : 'text-claude-text'
+            }`}>
+              {!task.enabled ? '已暂停'
+                : latestRun ? `${statusIcon(latestRun.status)} ${statusLabel(latestRun.status)}`
+                : '待执行'}
             </span>
           </div>
           <div className="flex">
@@ -292,7 +300,19 @@ const TaskDetailModal: React.FC<TaskDetailModalProps> = ({ task, runs, onClose, 
           {task.description && (
             <div className="flex">
               <span className="w-24 text-claude-secondary shrink-0">描述</span>
-              <span className="text-claude-text">{task.description}</span>
+              <div className="flex-1 min-w-0">
+                <span className={`text-claude-text break-words ${!descExpanded ? 'line-clamp-3' : ''}`}>
+                  {task.description}
+                </span>
+                {task.description.length > 80 && (
+                  <button
+                    onClick={() => setDescExpanded(!descExpanded)}
+                    className="text-xs text-claude-accent hover:underline mt-0.5 block"
+                  >
+                    {descExpanded ? '收起' : '展开'}
+                  </button>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -678,6 +698,7 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
         <TaskDetailModal
           task={selectedTask}
           runs={taskRuns}
+          latestRun={latestRunMap.get(selectedTask.name)}
           onClose={() => setSelectedTask(null)}
           onTrigger={handleTrigger}
           triggering={triggeringSet.has(selectedTask.name)}

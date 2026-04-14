@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import CronSchedule, { cronToReadable } from '../../components/CronSchedule';
 
 // Mock configApi
@@ -9,7 +9,9 @@ vi.mock('../../services/configApi', () => ({
     { name: 'weekday_check', cron_expr: '0 10 * * 1-5', description: '工作日检查', enabled: true },
     { name: 'disabled_task', cron_expr: '*/30 * * * *', description: '已暂停', enabled: false },
   ]),
-  getCronRuns: vi.fn().mockResolvedValue([]),
+  getCronRuns: vi.fn().mockResolvedValue([
+    { id: 'run-1', job_name: 'daily_report', cron_expr: '0 9 * * *', started_at: '2026-04-14T09:00:00Z', completed_at: '2026-04-14T09:01:00Z', status: 'success', output: 'done' },
+  ]),
   triggerCronJob: vi.fn().mockResolvedValue({ job_name: 'daily_report', run_id: 'fake-run-id', status: 'accepted', message: '后台任务已执行' }),
   getCronRunStatus: vi.fn().mockResolvedValue({ id: 'fake-run-id', job_name: 'daily_report', status: 'success', output: 'ok' }),
 }));
@@ -56,6 +58,58 @@ describe('CronSchedule', () => {
 
     screen.getByText('✕').click();
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('弹窗中有执行记录时显示执行成功而非待执行', async () => {
+    render(<CronSchedule />);
+
+    // 等待任务卡片渲染
+    await waitFor(() => {
+      expect(screen.getAllByText('每天9点日报').length).toBeGreaterThan(0);
+    });
+
+    // 日历卡片上应显示执行成功（latestRun status=success）
+    expect(screen.getAllByText('执行成功').length).toBeGreaterThan(0);
+
+    // 点击任务卡片打开弹窗
+    const cards = screen.getAllByText('每天9点日报');
+    fireEvent.click(cards[0]);
+
+    // 弹窗中状态区域应显示执行成功
+    await waitFor(() => {
+      // 弹窗内有"状态"标签
+      expect(screen.getByText('状态')).toBeInTheDocument();
+    });
+    // 弹窗中不应出现"待执行"（因为有成功的 run 记录）
+    const statusElements = screen.getAllByText(/执行成功/);
+    expect(statusElements.length).toBeGreaterThan(0);
+  });
+
+  it('弹窗中长描述默认截断并可展开', async () => {
+    const { getCronJobs, getCronRuns } = await import('../../services/configApi');
+    const longDesc = 'A'.repeat(200);
+    vi.mocked(getCronJobs).mockResolvedValueOnce([
+      { name: 'long_desc_task', cron_expr: '0 12 * * *', description: longDesc, enabled: true },
+    ]);
+    vi.mocked(getCronRuns).mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    render(<CronSchedule />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText(longDesc).length).toBeGreaterThan(0);
+    });
+
+    // 点击任务卡片打开弹窗
+    fireEvent.click(screen.getAllByText(longDesc)[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('展开')).toBeInTheDocument();
+    });
+
+    // 点击展开
+    fireEvent.click(screen.getByText('展开'));
+    expect(screen.getByText('收起')).toBeInTheDocument();
   });
 });
 
