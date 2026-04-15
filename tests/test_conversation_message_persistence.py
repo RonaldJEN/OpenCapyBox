@@ -561,3 +561,141 @@ class TestSyntheticMessagePersistenceOnRestore:
         assert "empty response" in messages[1].content.lower()
         assert messages[2].role == "assistant"
         assert messages[2].content == "Here is my answer."
+
+
+# ============================================================
+# _save_conversation_message 原子 INSERT 測試
+# ============================================================
+
+class TestSaveConversationMessageAtomicInsert:
+    """驗證 _save_conversation_message 使用原子 INSERT…SELECT
+    正確分配 sequence，不因併發寫入產生 UNIQUE 衝突。"""
+
+    @staticmethod
+    def _make_real_db():
+        """創建真實的 SQLite 內存庫並建表。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from src.api.models.database import Base
+        # 確保 ConversationMessage model 已導入，否則 create_all 不會建表
+        import src.api.models.conversation_message  # noqa: F401
+
+        engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+        return Session, engine
+
+    def test_sequential_saves_increment_sequence(self):
+        """連續 save 產生遞增 sequence 1, 2, 3"""
+        Session, _ = self._make_real_db()
+        db = Session()
+
+        history = MagicMock()
+        history.db = db
+
+        service = make_agent_service(history_service=history, session_id="s-seq")
+
+        service._save_conversation_message("user", "msg1", round_id="r1")
+        service._save_conversation_message("assistant", "msg2", round_id="r1")
+        service._save_conversation_message("user", "msg3", round_id="r2")
+
+        from src.api.models.conversation_message import ConversationMessage as ConvMsg
+        rows = db.query(ConvMsg).filter(ConvMsg.session_id == "s-seq").order_by(ConvMsg.sequence).all()
+        assert [r.sequence for r in rows] == [1, 2, 3]
+        assert [r.role for r in rows] == ["user", "assistant", "user"]
+        db.close()
+
+    def test_interleaved_sessions_have_independent_sequences(self):
+        """不同 session_id 之間 sequence 互相獨立"""
+        Session, _ = self._make_real_db()
+        db = Session()
+
+        history = MagicMock()
+        history.db = db
+
+        svc_a = make_agent_service(history_service=history, session_id="s-a")
+        svc_b = make_agent_service(history_service=history, session_id="s-b")
+
+        svc_a._save_conversation_message("user", "a1")
+        svc_b._save_conversation_message("user", "b1")
+        svc_a._save_conversation_message("assistant", "a2")
+        svc_b._save_conversation_message("assistant", "b2")
+
+        from src.api.models.conversation_message import ConversationMessage as ConvMsg
+        rows_a = db.query(ConvMsg).filter(ConvMsg.session_id == "s-a").order_by(ConvMsg.sequence).all()
+        rows_b = db.query(ConvMsg).filter(ConvMsg.session_id == "s-b").order_by(ConvMsg.sequence).all()
+        assert [r.sequence for r in rows_a] == [1, 2]
+        assert [r.sequence for r in rows_b] == [1, 2]
+        db.close()
+
+    def test_concurrent_saves_no_unique_conflict(self):
+        """模擬併發：兩個 session 物件同時寫同一 session_id，不觸發 UNIQUE 衝突。
+
+        使用同一引擎的兩個 Session（模擬 agent 線程 + synthetic 線程），
+        交替寫入，驗證 sequence 持續遞增且無重複。
+        """
+        Session, engine = self._make_real_db()
+        db1 = Session()
+        db2 = Session()
+
+        history1 = MagicMock()
+        history1.db = db1
+        history2 = MagicMock()
+        history2.db = db2
+
+        svc1 = make_agent_service(history_service=history1, session_id="s-concurrent")
+        svc2 = make_agent_service(history_service=history2, session_id="s-concurrent")
+
+        # 交替寫入
+        svc1._save_conversation_message("user", "from-agent-1")
+        svc2._save_conversation_message("user", "from-synthetic-1", is_synthetic=True)
+        svc1._save_conversation_message("assistant", "from-agent-2")
+        svc2._save_conversation_message("user", "from-synthetic-2", is_synthetic=True)
+
+        # 用一個乾淨的 session 讀取驗證
+        db_read = Session()
+        from src.api.models.conversation_message import ConversationMessage as ConvMsg
+        rows = (
+            db_read.query(ConvMsg)
+            .filter(ConvMsg.session_id == "s-concurrent")
+            .order_by(ConvMsg.sequence)
+            .all()
+        )
+        seqs = [r.sequence for r in rows]
+        assert seqs == [1, 2, 3, 4], f"expected [1,2,3,4], got {seqs}"
+        assert len(set(seqs)) == 4, "sequence 有重複"
+
+        db1.close()
+        db2.close()
+        db_read.close()
+
+    def test_save_handles_json_content(self):
+        """content 為 dict/list 時自動序列化為 JSON 字符串"""
+        Session, _ = self._make_real_db()
+        db = Session()
+
+        history = MagicMock()
+        history.db = db
+
+        service = make_agent_service(history_service=history, session_id="s-json")
+        content = [{"type": "text", "text": "hello"}]
+        service._save_conversation_message("user", content, round_id="r1")
+
+        from src.api.models.conversation_message import ConversationMessage as ConvMsg
+        row = db.query(ConvMsg).filter(ConvMsg.session_id == "s-json").first()
+        import json as _json
+        assert _json.loads(row.content) == content
+        db.close()
+
+    def test_save_error_rolls_back(self):
+        """DB 異常時 rollback，不崩潰"""
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = RuntimeError("disk full")
+
+        history = MagicMock()
+        history.db = mock_db
+
+        service = make_agent_service(history_service=history, session_id="s-err")
+        # 不應拋異常
+        service._save_conversation_message("user", "boom")
+        mock_db.rollback.assert_called_once()

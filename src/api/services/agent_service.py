@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, AsyncIterator, Any
 
 from opensandbox import Sandbox
 
+from src.api.utils.timezone import now_naive
 from src.agent.agent import Agent
 from src.agent.llm import LLMClient
 from src.agent.schema import Message as AgentMessage
@@ -65,7 +66,6 @@ class AgentService:
         self.model_id = model_id
         self.agent: Agent | None = None
         self._last_saved_index = 0
-        self._next_sequence = 0  # in-memory counter for conversation_messages.sequence
         self.skill_loader = None  # 保存 skill_loader 引用
         self.cancel_token: asyncio.Event | None = None  # per-run 取消令牌
         self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
@@ -468,19 +468,6 @@ class AgentService:
 
         self.agent.messages.extend(messages)
 
-        # 同步 conversation_messages 的 sequence 計數器
-        from src.api.models.conversation_message import ConversationMessage
-        db = self.history_service.db
-        last_seq = (
-            db.query(ConversationMessage.sequence)
-            .filter(ConversationMessage.session_id == self.session_id)
-            .order_by(ConversationMessage.sequence.desc())
-            .limit(1)
-            .scalar()
-        )
-        if last_seq:
-            self._next_sequence = last_seq
-
         logger.info(
             "從 agui_events 重建 %d 條消息 (session=%s)",
             len(messages), self.session_id,
@@ -856,27 +843,46 @@ class AgentService:
         """向 conversation_messages 表持久化一條消息。
 
         用於 Agent 上下文恢復，與 agui_events 互相獨立。
+
+        使用原子 INSERT…SELECT 在單條 SQL 語句內完成
+        MAX(sequence) 讀取 + 行寫入，SQLite 對單條寫語句持
+        排他鎖，從結構上消除併發 UNIQUE 衝突。
         """
-        from src.api.models.conversation_message import ConversationMessage as ConvMsg
+        from sqlalchemy import text
 
         db = self.history_service.db
-        self._next_sequence += 1
         content_str = (
             json.dumps(content, ensure_ascii=False)
             if not isinstance(content, str)
             else content
         )
-        msg = ConvMsg(
-            session_id=self.session_id,
-            round_id=round_id,
-            sequence=self._next_sequence,
-            role=role,
-            content=content_str,
-            token_count=token_count,
-            is_synthetic=is_synthetic,
-        )
-        db.add(msg)
+
         try:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO conversation_messages
+                        (session_id, round_id, sequence, role,
+                         content, token_count, is_synthetic, created_at)
+                    SELECT
+                        :session_id, :round_id,
+                        COALESCE(MAX(sequence), 0) + 1,
+                        :role, :content, :token_count,
+                        :is_synthetic, :created_at
+                    FROM conversation_messages
+                    WHERE session_id = :session_id
+                    """
+                ),
+                {
+                    "session_id": self.session_id,
+                    "round_id": round_id,
+                    "role": role,
+                    "content": content_str,
+                    "token_count": token_count,
+                    "is_synthetic": is_synthetic,
+                    "created_at": now_naive(),
+                },
+            )
             db.commit()
         except Exception as e:
             db.rollback()

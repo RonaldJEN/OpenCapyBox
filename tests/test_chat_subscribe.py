@@ -847,7 +847,6 @@ class TestSseDetachedProducer:
         service.session_id = "test-session"
         service.cancel_token = None
         service.agent = MagicMock()
-        service._next_sequence = 0
         service._last_saved_index = 0
 
         # 模拟 agent.run_agui 正常完成一个 round

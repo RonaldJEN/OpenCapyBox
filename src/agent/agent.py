@@ -462,8 +462,11 @@ class Agent:
     async def _summarize_with_llm(self, estimated_tokens: int):
         """Level 3: LLM 驅動的消息摘要（原 _summarize_messages 核心邏輯）"""
 
-        # Find all user message indices (skip system prompt)
-        user_indices = [i for i, msg in enumerate(self.messages) if msg.role == "user" and i > 0]
+        # Find all real user message indices (skip system prompt and synthetic nudges)
+        user_indices = [
+            i for i, msg in enumerate(self.messages)
+            if msg.role == "user" and i > 0 and not msg.is_synthetic
+        ]
 
         # Need at least 1 user message to perform summary
         if len(user_indices) < 1:

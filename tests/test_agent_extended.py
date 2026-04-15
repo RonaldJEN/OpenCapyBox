@@ -180,6 +180,28 @@ class TestAgentMessageSummarization:
         assert summary_messages
         assert all(msg.role == "assistant" for msg in summary_messages)
 
+    @pytest.mark.asyncio
+    async def test_summarize_with_llm_ignores_synthetic_user_boundary(self, tmp_path):
+        """Level 3 摘要時 synthetic user 不應作為 round 邊界，也不應被保留"""
+        agent = make_agent(tmp_path, context_window=1000, max_output_tokens=500, token_limit=500)
+        agent.messages = [
+            Message(role="system", content="sys"),
+            Message(role="user", content="real-q1"),
+            Message(role="assistant", content="a1"),
+            Message(role="user", content="nudge", is_synthetic=True),
+            Message(role="assistant", content="a-nudge"),
+            Message(role="user", content="real-q2"),
+            Message(role="assistant", content="a2"),
+        ]
+
+        with patch.object(agent, "_create_summary", new=AsyncMock(return_value="summary text")) as create_summary:
+            await agent._summarize_with_llm(estimated_tokens=999)
+
+        users = [m for m in agent.messages if m.role == "user"]
+        assert [m.content for m in users] == ["real-q1", "real-q2"]
+        assert all(not m.is_synthetic for m in users)
+        assert create_summary.await_count == 2
+
 
 class TestAgentRun:
     """Agent 運行測試"""
