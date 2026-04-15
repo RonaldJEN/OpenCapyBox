@@ -863,11 +863,13 @@ class AgentService:
                     """
                     INSERT INTO conversation_messages
                         (session_id, round_id, sequence, role,
-                         content, token_count, is_synthetic, created_at)
+                         content, token_count, is_summary,
+                         is_synthetic, created_at)
                     SELECT
                         :session_id, :round_id,
                         COALESCE(MAX(sequence), 0) + 1,
                         :role, :content, :token_count,
+                        :is_summary,
                         :is_synthetic, :created_at
                     FROM conversation_messages
                     WHERE session_id = :session_id
@@ -879,6 +881,7 @@ class AgentService:
                     "role": role,
                     "content": content_str,
                     "token_count": token_count,
+                    "is_summary": False,
                     "is_synthetic": is_synthetic,
                     "created_at": now_naive(),
                 },

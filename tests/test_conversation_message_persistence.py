@@ -5,6 +5,7 @@
 """
 
 import json
+import threading
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -573,14 +574,43 @@ class TestSaveConversationMessageAtomicInsert:
 
     @staticmethod
     def _make_real_db():
-        """創建真實的 SQLite 內存庫並建表。"""
+        """創建真實的 SQLite 內存庫並建表。
+
+        使用 StaticPool 確保所有 Session 共享同一底層連接，
+        避免 sqlite:///:memory: 每條連接看到獨立 DB 的問題。
+        """
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
         from src.api.models.database import Base
         # 確保 ConversationMessage model 已導入，否則 create_all 不會建表
         import src.api.models.conversation_message  # noqa: F401
 
-        engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+        return Session, engine
+
+    @staticmethod
+    def _make_file_db(tmp_path):
+        """创建文件型 SQLite 库，用于多连接并发写入测试。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import NullPool
+        from src.api.models.database import Base
+        # 確保 ConversationMessage model 已導入，否則 create_all 不會建表
+        import src.api.models.conversation_message  # noqa: F401
+
+        db_file = tmp_path / "conversation_messages_concurrent.db"
+        engine = create_engine(
+            f"sqlite:///{db_file.as_posix()}",
+            connect_args={"check_same_thread": False, "timeout": 5},
+            poolclass=NullPool,
+        )
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
         return Session, engine
@@ -628,29 +658,58 @@ class TestSaveConversationMessageAtomicInsert:
         assert [r.sequence for r in rows_b] == [1, 2]
         db.close()
 
-    def test_concurrent_saves_no_unique_conflict(self):
-        """模擬併發：兩個 session 物件同時寫同一 session_id，不觸發 UNIQUE 衝突。
+    def test_save_sets_is_summary_false(self):
+        """保存消息時顯式寫入 is_summary=False，避免恢復查詢漏數。"""
+        Session, _ = self._make_real_db()
+        db = Session()
 
-        使用同一引擎的兩個 Session（模擬 agent 線程 + synthetic 線程），
-        交替寫入，驗證 sequence 持續遞增且無重複。
+        history = MagicMock()
+        history.db = db
+
+        service = make_agent_service(history_service=history, session_id="s-summary")
+        service._save_conversation_message("user", "hello")
+
+        from src.api.models.conversation_message import ConversationMessage as ConvMsg
+        row = db.query(ConvMsg).filter(ConvMsg.session_id == "s-summary").first()
+        assert row is not None
+        assert row.is_summary is False
+        db.close()
+
+    def test_concurrent_saves_no_unique_conflict(self, tmp_path):
+        """模擬併發：兩個連接同時寫同一 session_id，不觸發 UNIQUE 衝突。
+
+        使用文件型 SQLite + 多連接 + 線程屏障，
+        讓兩條寫入路徑在同一時刻競爭 sequence 分配。
         """
-        Session, engine = self._make_real_db()
-        db1 = Session()
-        db2 = Session()
+        Session, engine = self._make_file_db(tmp_path)
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
 
-        history1 = MagicMock()
-        history1.db = db1
-        history2 = MagicMock()
-        history2.db = db2
+        def _worker(name: str, synthetic_first: bool):
+            db = Session()
+            history = MagicMock()
+            history.db = db
+            svc = make_agent_service(history_service=history, session_id="s-concurrent")
+            try:
+                barrier.wait()
+                svc._save_conversation_message(
+                    "user", f"{name}-1", is_synthetic=synthetic_first
+                )
+                barrier.wait()
+                svc._save_conversation_message("assistant", f"{name}-2")
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                db.close()
 
-        svc1 = make_agent_service(history_service=history1, session_id="s-concurrent")
-        svc2 = make_agent_service(history_service=history2, session_id="s-concurrent")
+        t1 = threading.Thread(target=_worker, args=("agent", False))
+        t2 = threading.Thread(target=_worker, args=("synthetic", True))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
-        # 交替寫入
-        svc1._save_conversation_message("user", "from-agent-1")
-        svc2._save_conversation_message("user", "from-synthetic-1", is_synthetic=True)
-        svc1._save_conversation_message("assistant", "from-agent-2")
-        svc2._save_conversation_message("user", "from-synthetic-2", is_synthetic=True)
+        assert not errors, f"concurrent writes failed: {errors}"
 
         # 用一個乾淨的 session 讀取驗證
         db_read = Session()
@@ -664,10 +723,10 @@ class TestSaveConversationMessageAtomicInsert:
         seqs = [r.sequence for r in rows]
         assert seqs == [1, 2, 3, 4], f"expected [1,2,3,4], got {seqs}"
         assert len(set(seqs)) == 4, "sequence 有重複"
+        assert len(rows) == 4
 
-        db1.close()
-        db2.close()
         db_read.close()
+        engine.dispose()
 
     def test_save_handles_json_content(self):
         """content 為 dict/list 時自動序列化為 JSON 字符串"""
