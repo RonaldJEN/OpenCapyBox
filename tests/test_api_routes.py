@@ -864,14 +864,26 @@ class TestAbortEndpoint:
     @patch("src.api.routes.chat.get_agent_pool")
     def test_abort_no_agent_no_running_round_returns_409(self, mock_pool_fn, client):
         """無正在執行的 Agent 且無卡住的 round 返回 409"""
-        # 模擬會話存在
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock
+
         mock_session = MagicMock()
         mock_session.id = "session-1"
         mock_session.user_id = "testuser"
         mock_session.status = "active"
-        self._mock_db_session.query.return_value.filter.return_value.first.return_value = mock_session
-        # Round 查詢返回空列表（無卡住的 running round）
-        self._mock_db_session.query.return_value.filter.return_value.all.return_value = []
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = None
+            elif model is UserRunLock:
+                chain.filter.return_value.first.return_value = None
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
 
         # AgentPool 沒有這個 session
         mock_pool = MagicMock()
@@ -886,11 +898,35 @@ class TestAbortEndpoint:
     def test_abort_with_cancel_token_returns_200(self, mock_pool_fn, client):
         """有 cancel_token 時成功取消"""
         import asyncio
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.utils.timezone import now_naive
+
         mock_session = MagicMock()
         mock_session.id = "session-1"
         mock_session.user_id = "testuser"
         mock_session.status = "active"
-        self._mock_db_session.query.return_value.filter.return_value.first.return_value = mock_session
+
+        mock_round = MagicMock()
+        mock_round.id = "round-1"
+
+        # 心跳新鲜的锁（worker 存活）
+        mock_lock = MagicMock()
+        mock_lock.updated_at = now_naive()
+        mock_lock.lock_id = "lock-1"
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = mock_round
+            elif model is UserRunLock:
+                chain.filter.return_value.first.return_value = mock_lock
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
 
         # 模擬 AgentService + cancel_token
         cancel_token = asyncio.Event()
@@ -901,20 +937,92 @@ class TestAbortEndpoint:
         mock_pool.get.return_value = mock_agent_service
         mock_pool_fn.return_value = mock_pool
 
-        response = client.post("/chat/session-1/abort")
+        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-1"):
+            response = client.post("/chat/session-1/abort")
         assert response.status_code == 200
-        assert response.json()["status"] == "cancelled"
+        assert response.json()["status"] == "cancellation_requested"
+        assert response.json()["request_id"] == "req-1"
         assert cancel_token.is_set()
 
     @patch("src.api.routes.chat.get_agent_pool")
-    def test_abort_no_cancel_token_returns_409(self, mock_pool_fn, client):
-        """有 Agent 但沒有 cancel_token（沒有進行中的執行）返回 409"""
+    def test_abort_init_window_with_recent_lock_returns_200(self, mock_pool_fn, client):
+        """无 running round 但持有近期会话锁（init 窗口）也应允许发起取消。"""
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock as UserRunLockModel
+        from src.api.utils.timezone import now_naive
+
         mock_session = MagicMock()
         mock_session.id = "session-1"
         mock_session.user_id = "testuser"
         mock_session.status = "active"
-        self._mock_db_session.query.return_value.filter.return_value.first.return_value = mock_session
-        self._mock_db_session.query.return_value.filter.return_value.all.return_value = []
+
+        mock_lock = MagicMock()
+        mock_lock.user_id = "testuser"
+        mock_lock.session_id = "session-1"
+        mock_lock.lock_id = "lock-init-window"
+        mock_lock.updated_at = now_naive()
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = None
+            elif model is UserRunLockModel:
+                chain.filter.return_value.first.return_value = mock_lock
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
+
+        mock_pool = MagicMock()
+        mock_pool.get.return_value = None
+        mock_pool_fn.return_value = mock_pool
+
+        mock_settings = MagicMock()
+        mock_settings.sse_subscribe_timeout = 300
+
+        with patch("src.api.routes.chat.get_settings", return_value=mock_settings), patch(
+            "src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-init-window"
+        ):
+            response = client.post("/chat/session-1/abort")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancellation_requested"
+        assert response.json()["request_id"] == "req-init-window"
+
+    @patch("src.api.routes.chat.get_agent_pool")
+    def test_abort_without_local_cancel_token_still_requests_cancel(self, mock_pool_fn, client):
+        """有 running round 但本地 worker 無 cancel_token 也應返回 cancellation_requested"""
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.utils.timezone import now_naive
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.status = "active"
+
+        mock_round = MagicMock()
+        mock_round.id = "round-1"
+
+        # 心跳新鲜（worker 存活但在其他进程）
+        mock_lock = MagicMock()
+        mock_lock.updated_at = now_naive()
+        mock_lock.lock_id = "lock-2"
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = mock_round
+            elif model is UserRunLock:
+                chain.filter.return_value.first.return_value = mock_lock
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
 
         mock_agent_service = MagicMock()
         mock_agent_service.cancel_token = None
@@ -923,8 +1031,12 @@ class TestAbortEndpoint:
         mock_pool.get.return_value = mock_agent_service
         mock_pool_fn.return_value = mock_pool
 
-        response = client.post("/chat/session-1/abort")
-        assert response.status_code == 409
+        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-2"):
+            response = client.post("/chat/session-1/abort")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancellation_requested"
+        assert response.json()["request_id"] == "req-2"
 
     def test_abort_session_not_found_returns_404(self, client):
         """會話不存在返回 404"""
@@ -932,3 +1044,84 @@ class TestAbortEndpoint:
 
         response = client.post("/chat/session-1/abort")
         assert response.status_code == 404
+
+    def test_abort_status_returns_cancel_row_details(self, client):
+        """abort/status 返回取消请求明细（state/request_id/时间戳）。"""
+        from datetime import datetime
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.run_cancel_request import RunCancelRequest as RunCancelRequestModel
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+
+        mock_cancel = MagicMock()
+        mock_cancel.state = "acked"
+        mock_cancel.request_id = "req-acked-1"
+        mock_cancel.requested_at = datetime(2026, 4, 16, 10, 0, 0)
+        mock_cancel.acked_at = datetime(2026, 4, 16, 10, 0, 1)
+        mock_cancel.completed_at = None
+
+        mock_running_round = MagicMock()
+        mock_running_round.id = "round-1"
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RunCancelRequestModel:
+                chain.filter.return_value.first.return_value = mock_cancel
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = mock_running_round
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
+
+        response = client.get("/chat/session-1/abort/status")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["session_id"] == "session-1"
+        assert payload["state"] == "acked"
+        assert payload["request_id"] == "req-acked-1"
+        assert payload["requested_at"] == "2026-04-16T10:00:00"
+        assert payload["acked_at"] == "2026-04-16T10:00:01"
+        assert payload["completed_at"] is None
+        assert payload["running"] is True
+        assert payload["running_round_id"] == "round-1"
+
+    def test_abort_status_returns_none_when_no_cancel_request(self, client):
+        """abort/status 在无取消请求时返回 state=none。"""
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.run_cancel_request import RunCancelRequest as RunCancelRequestModel
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RunCancelRequestModel:
+                chain.filter.return_value.first.return_value = None
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = None
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
+
+        response = client.get("/chat/session-1/abort/status")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["session_id"] == "session-1"
+        assert payload["state"] == "none"
+        assert payload["request_id"] is None
+        assert payload["requested_at"] is None
+        assert payload["acked_at"] is None
+        assert payload["completed_at"] is None
+        assert payload["running"] is False
+        assert payload["running_round_id"] is None

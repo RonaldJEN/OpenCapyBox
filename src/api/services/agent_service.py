@@ -1178,12 +1178,23 @@ class AgentService:
                     if event.outcome == "success":
                         status = "completed"
                     elif event.outcome == "interrupt":
-                        status = "interrupted"
-                        if event.interrupt:
-                            _interrupt_json = json.dumps(
-                                event.interrupt.model_dump(exclude_none=True),
-                                ensure_ascii=False,
-                            )
+                        # 區分用戶主動取消和 ask_user 中斷：
+                        # - user_cancelled → cancelled（終態）
+                        # - ask_user 問答中斷 → interrupted（中間態，可恢復）
+                        _result = event.result
+                        _is_user_cancel = (
+                            isinstance(_result, dict)
+                            and _result.get("reason") == "user_cancelled"
+                        )
+                        if _is_user_cancel:
+                            status = "cancelled"
+                        else:
+                            status = "interrupted"
+                            if event.interrupt:
+                                _interrupt_json = json.dumps(
+                                    event.interrupt.model_dump(exclude_none=True),
+                                    ensure_ascii=False,
+                                )
                     else:
                         status = "failed"
                 elif event.type == EventType.RUN_ERROR:
@@ -1224,15 +1235,21 @@ class AgentService:
             # 統一處理 round 完成：正常路徑、異常、GeneratorExit、CancelledError
             if not _round_finished:
                 try:
+                    # 僅在可確認本地 cancel_token 已觸發時視為用戶取消。
+                    # 其餘未知異常中斷（如框架級取消、進程退出）保守標記為 failed，
+                    # 避免把系統級中斷混淆為 cancelled。
+                    _is_user_cancel = bool(self.cancel_token and self.cancel_token.is_set())
+                    _actual_status = "cancelled" if _is_user_cancel else (_final_status or "failed")
+                    _fallback_response = "Cancelled" if _actual_status == "cancelled" else "Failed"
                     self.history_service.complete_round(
                         round_id=run_id,
-                        final_response=_final_response or accumulated_content or final_response or "Cancelled",
+                        final_response=_final_response or accumulated_content or final_response or _fallback_response,
                         step_count=step_count,
-                        status=_final_status or "failed",
+                        status=_actual_status,
                     )
                     logger.warning(
-                        "Round %s 異常退出（disconnect/cancel/error），已標記為 failed (steps=%d)",
-                        run_id, step_count,
+                        "Round %s 異常退出（disconnect/cancel/error），已標記為 %s (steps=%d)",
+                        run_id, _actual_status, step_count,
                     )
                 except Exception:
                     logger.error("Round %s 異常退出後無法更新 DB", run_id, exc_info=True)

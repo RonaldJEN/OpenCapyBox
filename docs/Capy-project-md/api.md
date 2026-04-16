@@ -552,6 +552,7 @@ Content-Type: application/json
 
 ```json
 {
+  "idempotency_key": "550e8400-e29b-41d4-a716-446655440000",
   "content": [
     {
       "type": "text",
@@ -587,6 +588,11 @@ Content-Type: application/json
 - `file`: 附件块，字段 `file.path/name/mime_type`
 - `video_url`: 预留类型，当前默认不开放（由模型能力配置控制）
 
+| 字段             | 类型     | 必填 | 说明 |
+| ---------------- | -------- | ---- | ---- |
+| content          | array    | 是   | 内容块数组（见上方类型说明） |
+| idempotency_key  | string   | 否   | 幂等键（UUID），多 worker 下防止同一请求被重复处理。前端自动生成 |
+
 **模型能力限制**
 
 - 仅模型配置中 `supports_image=true` 的模型可接收 `image_url`
@@ -612,6 +618,36 @@ Connection: keep-alive
 ```
 RUN_STARTED → STATE_SNAPSHOT → THINKING_TEXT_MESSAGE_START → THINKING_TEXT_MESSAGE_CONTENT* → THINKING_TEXT_MESSAGE_END → TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT* → TEXT_MESSAGE_END → TOOL_CALL_START → TOOL_CALL_ARGS → TOOL_CALL_END → TOOL_CALL_RESULT → STATE_DELTA → RUN_FINISHED
 ```
+
+**并发限制说明**
+
+- 同一用户同一时刻只允许一个运行中的任务
+- 并发限制基于数据库行锁 `UserRunLock` 实现（跨 worker 生效），执行期间通过心跳保活
+- 心跳超过 `sse_subscribe_timeout` 未更新时，锁被视为陈旧并自动回收
+- 当存在运行中的任务时，接口返回 `429 Too Many Requests`
+
+**幂等冲突（SSE 事件）**
+
+当 `idempotency_key` 对应的 Round 已被另一个 worker 创建时，不返回 HTTP 错误，而是通过 SSE 推送 `RUN_ERROR` 事件：
+
+```json
+{
+  "type": "RUN_ERROR",
+  "code": "ROUND_IN_PROGRESS",
+  "message": "<existing_round_id>"
+}
+```
+
+前端收到后应使用 `message` 中的 `round_id` 转入 `subscribe` 恢复路径。
+
+**错误响应**
+
+| 状态码 | 说明 |
+| ------ | ---- |
+| 404    | 会话不存在 |
+| 410    | 会话已完成（不可继续发送消息） |
+| 429    | 当前用户已有运行中的任务（并发限制） |
+| 503    | 服务暂时不可用（数据库异常等系统错误） |
 
 ---
 
@@ -644,7 +680,7 @@ Connection: keep-alive
 
 **行为说明**
 
-1. **已完成/失败的轮次**：立即返回 `MESSAGES_SNAPSHOT` + `RUN_FINISHED` 事件并关闭连接
+1. **已终态轮次**（`completed` / `failed` / `interrupted` / `resumed` / `cancelled`）：立即返回补齐事件并关闭连接
 2. **运行中的轮次**：
    - 先从 `agui_events` 表重放 `last_sequence` 之后的所有已持久化事件
    - 然后注册为订阅者接收后续实时事件
@@ -693,7 +729,11 @@ abortSubscription();
 
 ### 中止 Agent 执行
 
-中止正在进行的 Agent 执行。Agent 会在下一个检查点（step 开始 / 工具执行前）退出，并通过 SSE 连接推送 `RUN_FINISHED(outcome=interrupt)`。
+中止正在进行的 Agent 执行。
+
+在多 worker 部署下，该接口会先写入跨 worker 可见的取消请求（`requested`），随后由实际执行该任务的 worker 感知并触发本地取消令牌。Agent 会在下一个检查点（step 开始 / 工具执行前）退出，并通过 SSE 连接推送 `RUN_FINISHED(outcome=interrupt)`。
+
+取消成功时，`RUN_FINISHED.result.reason` 为 `user_cancelled`，用于前端区分“用户取消”与“ask_user 中断”。
 
 **请求**
 
@@ -709,9 +749,22 @@ Authorization: Bearer <access_token>
 
 **响应** `200 OK`
 
+正常情况：
+
 ```json
 {
-  "status": "cancelled"
+  "status": "cancellation_requested",
+  "request_id": "uuid"
+}
+```
+
+执行 worker 已死（心跳过期），直接收敛：
+
+```json
+{
+  "status": "cancelled",
+  "request_id": "uuid",
+  "reason": "worker_dead"
 }
 ```
 
@@ -719,8 +772,113 @@ Authorization: Bearer <access_token>
 
 | 状态码 | 说明                           |
 | ------ | -------------------------------- |
-| 404    | 会话不存在或没有正在执行的 Agent |
-| 409    | 无活跃的运行可取消           |
+| 404    | 会话不存在 |
+| 409    | 该会话没有正在进行的执行（无 running round 且锁不存在或已过期） |
+| 503    | 取消请求写入失败（数据库繁忙等） |
+
+### 查询取消请求状态（多 worker 可观测）
+
+用于排查“取消是否已被执行 worker 感知”。接口返回取消请求状态机与当前运行态，便于控制台或运维面板展示。
+
+**请求**
+
+```
+GET /api/chat/{chat_session_id}/abort/status
+Authorization: Bearer <access_token>
+```
+
+**响应** `200 OK`
+
+```json
+{
+  "session_id": "session-uuid",
+  "state": "acked",
+  "request_id": "req-uuid",
+  "requested_at": "2026-04-16T10:00:00",
+  "acked_at": "2026-04-16T10:00:01",
+  "completed_at": null,
+  "running": true,
+  "running_round_id": "round-uuid"
+}
+```
+
+`state` 含义：
+
+| 值        | 说明 |
+| --------- | ---- |
+| `none`      | 尚未记录取消请求 |
+| `requested` | 已收到取消请求，等待执行 worker 感知 |
+| `acked`     | 执行 worker 已确认并触发本地取消 |
+| `completed` | 该次运行已结束并完成收敛 |
+
+**错误**
+
+| 状态码 | 说明     |
+| ------ | -------- |
+| 404    | 会话不存在 |
+
+---
+
+### 恢复中断执行 (Human-in-the-Loop)
+
+恢复被 `ask_user` 工具中断的 Agent 执行。返回 SSE 流。
+
+**请求**
+
+```
+POST /api/chat/{chat_session_id}/resume
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+| 参数            | 类型   | 必填 | 说明                  |
+| --------------- | ------ | ---- | --------------------- |
+| chat_session_id | string | 是   | 会话 ID（Path 参数）  |
+| user_id         | string | 是   | 用户 ID（由 Authorization Bearer Token 解析） |
+
+**请求体**
+
+```json
+{
+  "interrupt_id": "interrupt-uuid",
+  "answers": {
+    "你想用什么语言？": "Python",
+    "需要测试吗？": "是"
+  }
+}
+```
+
+| 字段         | 类型              | 必填 | 说明 |
+| ------------ | ----------------- | ---- | ---- |
+| interrupt_id | string            | 是   | 中断 ID（来自 `RUN_FINISHED.interrupt.id`） |
+| answers      | dict[string, string] | 是   | 用户回答（问题文本 → 选项值） |
+
+**响应** `200 OK`
+
+```
+Content-Type: text/event-stream
+```
+
+事件类型与 `message/stream` 完全相同（AG-UI 协议）。恢复操作会创建一个新的 Round。
+
+**恢复机制**
+
+- **热恢复**：Agent 内存中仍持有中断状态，直接替换 `ask_user` 占位 tool_result 继续执行
+- **冷恢复**：Agent 内存状态已丢失（如 AgentPool TTL 回收），退化为注入用户回答作为新消息继续对话
+- 旧的 `interrupted` 轮次会被标记为 `resumed`
+
+**并发限制**
+
+与 `message/stream` 共享同一把用户锁，同一用户同时只能有一个 send 或 resume 在执行。
+
+**错误响应**
+
+| 状态码 | 说明 |
+| ------ | ---- |
+| 404    | 会话不存在 |
+| 409    | 无待处理的中断 |
+| 429    | 当前用户已有运行中的任务 |
+| 503    | 服务暂时不可用 |
 
 ---
 
@@ -1107,7 +1265,7 @@ GET /api/models/{model_id}
 | final_response | string | 最终响应                                     |
 | steps          | Step[] | 执行步骤列表                                 |
 | step_count     | int    | 步骤数量                                     |
-| status         | string | 状态：pending / running / completed / failed |
+| status         | string | 状态：pending / running / completed / failed / cancelled / interrupted / resumed |
 | created_at     | string | 创建时间                                     |
 | completed_at   | string | 完成时间                                     |
 
@@ -1137,6 +1295,34 @@ GET /api/models/{model_id}
 | success | bool   | 是否成功         |
 | content | string | 结果内容         |
 | error   | string | 错误信息（可选） |
+
+### UserRunLock（用户运行锁）
+
+跨 worker 用户级运行互斥锁。每个用户最多一把锁（主键 `user_id`），执行 worker 通过定时刷新 `updated_at` 实现心跳保活。
+
+| 字段       | 类型     | 说明                            |
+| ---------- | -------- | ------------------------------- |
+| user_id    | string   | 用户 ID（主键）                 |
+| session_id | string   | 当前持锁的会话 ID               |
+| lock_id    | string   | 锁实例 UUID（防止 TOCTOU 误删） |
+| created_at | datetime | 锁创建时间                      |
+| updated_at | datetime | 最后心跳时间                    |
+
+**心跳与过期**：`_cancel_request_watcher` 每 15s 刷新 `updated_at`。当 `updated_at` 超过 `sse_subscribe_timeout` 秒未更新时，锁被视为陈旧，新请求可回收并清理关联的孤儿 Round。
+
+### RunCancelRequest（跨 worker 取消请求）
+
+跨 worker 可见的取消请求状态机（`requested → acked → completed`）。每个会话最多一条记录（主键 `session_id`），新 abort 会覆盖旧记录。
+
+| 字段         | 类型     | 说明                             |
+| ------------ | -------- | -------------------------------- |
+| session_id   | string   | 会话 ID（主键）                  |
+| user_id      | string   | 用户 ID                          |
+| request_id   | string   | 请求 UUID                        |
+| state        | string   | requested / acked / completed    |
+| requested_at | datetime | 请求时间                         |
+| acked_at     | datetime | 执行 worker 确认时间（可选）     |
+| completed_at | datetime | 运行结束时间（可选）             |
 
 ### FileInfo（文件信息）
 

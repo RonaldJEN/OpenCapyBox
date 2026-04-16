@@ -778,7 +778,7 @@ class TestSseDetachedProducer:
 
     @pytest.mark.asyncio
     async def test_run_round_stream_finally_marks_round(self):
-        """_run_round_stream 的 finally 块在异常退出时标记 round 为 failed"""
+        """_run_round_stream 在未知异常退出时应标记为 failed（非用户取消）。"""
         from unittest.mock import MagicMock, AsyncMock, patch
         from src.api.services.agent_service import AgentService
 
@@ -816,10 +816,51 @@ class TestSseDetachedProducer:
         # 关闭 generator（模拟 SSE 断开 → GeneratorExit）
         await gen.aclose()
 
-        # finally 块应该调用了 complete_round 标记为 failed
+        # finally 块应该调用了 complete_round，并标记为 failed（未知中断）。
         mock_history.complete_round.assert_called_once()
         call_kwargs = mock_history.complete_round.call_args
         assert call_kwargs.kwargs.get("status") == "failed" or call_kwargs[1].get("status") == "failed"
+
+    @pytest.mark.asyncio
+    async def test_run_round_stream_finally_marks_cancelled_when_cancel_token_set(self):
+        """_run_round_stream 异常退出且本地 cancel_token 已触发时标记为 cancelled。"""
+        from unittest.mock import MagicMock, AsyncMock
+        from src.api.services.agent_service import AgentService
+
+        mock_history = MagicMock()
+        mock_history.save_agui_event = AsyncMock()
+        mock_history.complete_round = MagicMock()
+
+        service = object.__new__(AgentService)
+        service.history_service = mock_history
+        service.session_id = "test-session"
+        service.cancel_token = asyncio.Event()
+        service.cancel_token.set()
+        service.agent = MagicMock()
+
+        from src.agent.schema.agui_events import RunStartedEvent
+
+        async def fake_run_agui(**kwargs):
+            yield RunStartedEvent(
+                threadId="test-session",
+                runId="test-run",
+            )
+            await asyncio.sleep(10)
+
+        service.agent.run_agui = fake_run_agui
+
+        gen = service._run_round_stream(
+            run_id="test-run",
+            user_message="test",
+        )
+        first_event = await gen.__anext__()
+        assert first_event.type.value == "RUN_STARTED"
+
+        await gen.aclose()
+
+        mock_history.complete_round.assert_called_once()
+        call_kwargs = mock_history.complete_round.call_args
+        assert call_kwargs.kwargs.get("status") == "cancelled" or call_kwargs[1].get("status") == "cancelled"
 
     @pytest.mark.asyncio
     async def test_round_finished_flag_after_complete_round_exception(self):
@@ -880,6 +921,198 @@ class TestSseDetachedProducer:
         # 兜底调用的 status 应该是 "failed"
         second_call = mock_history.complete_round.call_args_list[1]
         assert second_call.kwargs.get("status") == "failed" or second_call[1].get("status") == "failed"
+
+
+class TestCrossWorkerCancelFlow:
+    """跨 worker cancel 请求链路集成测试。"""
+
+    @pytest.mark.asyncio
+    async def test_cancel_request_requested_to_ack_to_completed_and_release_lock(self):
+        """模拟 A worker 执行、B worker 取消，最终应 ack+completed 且释放用户锁。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from src.api.models.database import Base
+        from src.api.models.run_cancel_request import RunCancelRequest
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.routes import chat as chat_routes
+        from src.agent.schema.agui_events import RunStartedEvent, RunFinishedEvent
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+
+        user_id = "user-1"
+        session_id = "session-1"
+        lock_id = "lock-1"
+        cancel_token = asyncio.Event()
+
+        try:
+            # A worker 已持有用户锁并开始执行
+            with TestingSessionLocal() as setup_db:
+                setup_db.add(
+                    UserRunLock(
+                        user_id=user_id,
+                        session_id=session_id,
+                        lock_id=lock_id,
+                    )
+                )
+                setup_db.commit()
+                # B worker 发起 abort，写入跨 worker 可见 requested
+                await chat_routes._upsert_cancel_request(
+                    setup_db,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+
+            async def fake_event_source():
+                yield RunStartedEvent(threadId=session_id, runId="run-1")
+                # 等待 watcher 读取 requested 并触发 cancel_token
+                for _ in range(120):
+                    if cancel_token.is_set():
+                        break
+                    await asyncio.sleep(0.02)
+                assert cancel_token.is_set()
+                yield RunFinishedEvent(
+                    threadId=session_id,
+                    runId="run-1",
+                    outcome="interrupt",
+                    result={"reason": "user_cancelled"},
+                )
+
+            with patch("src.api.routes.chat.SessionLocal", TestingSessionLocal):
+                chunks = []
+                async for chunk in chat_routes._sse_with_heartbeat(
+                    fake_event_source(),
+                    session_id=session_id,
+                    user_id=user_id,
+                    lock_id=lock_id,
+                    cancel_token=cancel_token,
+                ):
+                    chunks.append(chunk)
+
+            assert any("RUN_FINISHED" in chunk for chunk in chunks)
+
+            with TestingSessionLocal() as verify_db:
+                cancel_row = (
+                    verify_db.query(RunCancelRequest)
+                    .filter(
+                        RunCancelRequest.session_id == session_id,
+                        RunCancelRequest.user_id == user_id,
+                    )
+                    .first()
+                )
+                assert cancel_row is not None
+                assert cancel_row.state == "completed"
+                assert cancel_row.acked_at is not None
+                assert cancel_row.completed_at is not None
+
+                lock_row = (
+                    verify_db.query(UserRunLock)
+                    .filter(UserRunLock.user_id == user_id)
+                    .first()
+                )
+                assert lock_row is None
+        finally:
+            engine.dispose()
+
+
+class TestSubscribeCrossWorkerPolling:
+    """subscribe 端点跨 worker 持久化轮询回归测试。"""
+
+    @pytest.mark.asyncio
+    async def test_subscribe_receives_persisted_terminal_event_without_local_broadcast(self):
+        """无本地广播事件时，subscribe 应通过持久化轮询拿到 RUN_FINISHED。"""
+        from src.api.routes import chat as chat_routes
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.agui_event import AGUIEventLog as AGUIEventModel
+
+        mock_db = MagicMock()
+        mock_db.refresh = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+
+        mock_round = MagicMock()
+        mock_round.id = "round-1"
+        mock_round.session_id = "session-1"
+        mock_round.status = "running"
+
+        # 请求级 DB：初始 replay 为空，模拟“当前 worker 没有本地广播事件”。
+        def request_db_query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = mock_round
+            elif model is AGUIEventModel:
+                chain.filter.return_value.order_by.return_value.all.return_value = []
+            return chain
+
+        mock_db.query.side_effect = request_db_query_side_effect
+
+        # 轮询 DB：首次返回 RUN_FINISHED，后续为空。
+        replay_db = MagicMock()
+        replay_calls = {"count": 0}
+
+        event_row = MagicMock()
+        event_row.payload = json.dumps({
+            "type": "RUN_FINISHED",
+            "threadId": "session-1",
+            "runId": "round-1",
+            "outcome": "interrupt",
+            "result": {"reason": "user_cancelled"},
+        })
+        event_row.sequence = 1
+        event_row.id = 1
+
+        def replay_db_query_side_effect(_model):
+            chain = MagicMock()
+            rows = [event_row] if replay_calls["count"] == 0 else []
+            replay_calls["count"] += 1
+            chain.filter.return_value.order_by.return_value.all.return_value = rows
+            return chain
+
+        replay_db.query.side_effect = replay_db_query_side_effect
+
+        session_local_cm = MagicMock()
+        session_local_cm.__enter__.return_value = replay_db
+        session_local_cm.__exit__.return_value = False
+
+        mock_settings = MagicMock()
+        mock_settings.sse_heartbeat_interval = 0.01
+        mock_settings.sse_subscribe_timeout = 1
+        mock_settings.cancel_watcher_interval_seconds = 0.01
+
+        with patch("src.api.routes.chat.get_settings", return_value=mock_settings), patch(
+            "src.api.routes.chat.SessionLocal", return_value=session_local_cm
+        ):
+            response = await chat_routes.subscribe_to_round(
+                chat_session_id="session-1",
+                round_id="round-1",
+                last_step=0,
+                last_sequence=0,
+                user_id="testuser",
+                db=mock_db,
+            )
+
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+                if "RUN_FINISHED" in chunk:
+                    break
+                if len(chunks) > 50:
+                    break
+
+        assert any("RUN_FINISHED" in c for c in chunks)
+        assert replay_calls["count"] >= 1
 
 
 class TestSubscriberAbortScenarios:
@@ -1088,3 +1321,406 @@ class TestSubscribeEdgeCases:
         finally:
             if round_id in _round_subscribers:
                 del _round_subscribers[round_id]
+
+
+class TestAbortCancellation:
+    """abort_chat 取消机制回归测试
+
+    回归：触发取消后 SSE consumer 未收到 RUN_FINISHED，导致前端 UI 不刷新，
+    需要刷新浏览器才能看到 Cancelled 状态。
+    修复：producer 的 CancelledError 路径现在补发 RUN_FINISHED(outcome=interrupt)。
+    """
+
+    @pytest.mark.asyncio
+    async def test_producer_cancelled_delivers_run_finished(self):
+        """producer task 被取消时，SSE consumer 应收到 RUN_FINISHED(outcome=interrupt)
+
+        模拟 abort_chat 调用 runner.cancel() 的完整路径：
+        1. producer task 被外部取消 → CancelledError        2. except CancelledError 补发 RunFinishedEvent 到队列
+        3. SSE consumer 收到 RUN_FINISHED → 前端 UI 立即更新
+        """
+        from unittest.mock import patch, MagicMock
+        from src.api.routes.chat import _sse_with_heartbeat, _active_runners
+        from src.agent.schema.agui_events import RunStartedEvent
+
+        session_id = "abort-run-finished-regression"
+        run_id = "abort-run-id-regression"
+        _active_runners.pop(session_id, None)
+
+        async def slow_source():
+            yield RunStartedEvent(threadId=session_id, runId=run_id)
+            await asyncio.sleep(100)  # 永不结束，等待被取消
+
+        mock_settings = MagicMock()
+        mock_settings.sse_heartbeat_interval = 60
+
+        with patch("src.api.routes.chat.get_settings", return_value=mock_settings):
+            generator = _sse_with_heartbeat(
+                slow_source(),
+                session_id=session_id,
+            )
+
+            events_received = []
+
+            async def consume():
+                async for chunk in generator:
+                    for line in chunk.split("\n"):
+                        if line.startswith("data: "):
+                            try:
+                                data = json.loads(line[6:])
+                                events_received.append(data)
+                            except Exception:
+                                pass
+                    # 收到 RUN_FINISHED 可停止
+                    if any(e.get("type") == "RUN_FINISHED" for e in events_received):
+                        return
+
+            consume_task = asyncio.create_task(consume())
+
+            # 等待 producer 注册到 _active_runners（最多 500ms）
+            for _ in range(50):
+                if session_id in _active_runners:
+                    break
+                await asyncio.sleep(0.01)
+
+            producer_task = _active_runners.get(session_id)
+            assert producer_task is not None, "producer_task 应已注册到 _active_runners"
+
+            # 模拟 abort_chat runner.cancel()
+            producer_task.cancel()
+
+            await asyncio.wait_for(consume_task, timeout=3.0)
+
+        # 验证：consumer 收到了 RUN_FINISHED(outcome=interrupt, reason=user_cancelled)
+        run_finished = [e for e in events_received if e.get("type") == "RUN_FINISHED"]
+        assert len(run_finished) >= 1, (
+            f"应该有 RUN_FINISHED 事件，实际收到: {[e.get('type') for e in events_received]}"
+        )
+        assert run_finished[0]["outcome"] == "interrupt", (
+            "abort 后的 RUN_FINISHED 应为 outcome=interrupt"
+        )
+        assert run_finished[0].get("result", {}).get("reason") == "user_cancelled"
+
+        _active_runners.pop(session_id, None)
+
+    def test_cancelled_round_in_terminal_status_set(self):
+        """cancelled 状态应在 subscribe_to_round 的终态检查集合中
+
+        回归：subscribe_to_round 未处理 cancelled 状态，导致订阅者永久等待。
+        """
+        cancelled_status = "cancelled"
+        from src.api.models.round import Round
+        assert cancelled_status in Round.SUBSCRIBE_TERMINAL_STATUSES
+
+    def test_cancelled_round_emits_interrupt_outcome(self):
+        """subscribe_to_round 对 cancelled 轮次应发 RUN_FINISHED(outcome=interrupt)
+
+        cancelled 属于用户主动中止，语义上等同于 interrupt（无 interrupt 详情对象）。
+        """
+        from src.agent.schema.agui_events import RunFinishedEvent
+
+        finished = RunFinishedEvent(
+            threadId="session-cancel-sub",
+            runId="round-cancel-sub",
+            result={
+                "finalResponse": "",
+                "stepCount": 0,
+                "reason": "user_cancelled",
+            },
+            outcome="interrupt",
+        )
+        data = finished.model_dump(by_alias=True)
+
+        assert data["type"] == "RUN_FINISHED"
+        assert data["outcome"] == "interrupt", "cancelled 轮次应为 interrupt 而非 success"
+        assert data["result"]["reason"] == "user_cancelled"
+        # cancelled 不携带 interrupt 详情（区别于 ask_user 中断）
+        assert data.get("interrupt") is None
+
+    @pytest.mark.asyncio
+    async def test_producer_cancelled_broadcasts_to_subscribers(self):
+        """producer 被 cancel 时，已注册的 subscriber 队列必须收到 RUN_FINISHED
+
+        回归测试：旧实现用 asyncio.create_task(_broadcast_to_subscribers(...))
+        在 CancelledError handler 中做 fire-and-forget 广播，但 finally 中
+        _cleanup_subscribers 同步删除了订阅者列表，导致广播 task 执行时订阅者
+        已空，subscribe 客户端永远收不到 RUN_FINISHED，前端一直转圈。
+        修复：改为同步 put_nowait 直接写入订阅者队列。
+        """
+        from src.api.routes.chat import (
+            _sse_with_heartbeat,
+            _active_runners,
+            _round_subscribers,
+            _round_subscribers_lock,
+        )
+        from src.agent.schema.agui_events import RunStartedEvent
+
+        session_id = "abort-subscriber-broadcast-test"
+        run_id = "abort-subscriber-run-id"
+        _active_runners.pop(session_id, None)
+
+        # 模拟一个 subscriber（代表 subscribe 端点的客户端）
+        subscriber_queue = asyncio.Queue()
+        with _round_subscribers_lock:
+            _round_subscribers[run_id] = [subscriber_queue]
+
+        async def slow_source():
+            yield RunStartedEvent(threadId=session_id, runId=run_id)
+            await asyncio.sleep(100)
+
+        mock_settings = MagicMock()
+        mock_settings.sse_heartbeat_interval = 60
+
+        with patch("src.api.routes.chat.get_settings", return_value=mock_settings):
+            generator = _sse_with_heartbeat(
+                slow_source(),
+                session_id=session_id,
+            )
+
+            # 启动 consumer
+            async def consume():
+                async for _ in generator:
+                    pass
+
+            consume_task = asyncio.create_task(consume())
+
+            # 等待 producer 注册
+            for _ in range(50):
+                if session_id in _active_runners:
+                    break
+                await asyncio.sleep(0.01)
+
+            producer_task = _active_runners.get(session_id)
+            assert producer_task is not None
+
+            # 模拟 abort_chat: cancel producer
+            producer_task.cancel()
+
+            await asyncio.wait_for(consume_task, timeout=3.0)
+
+        # 核心断言：subscriber 队列必须收到 RUN_FINISHED
+        received_events = []
+        while not subscriber_queue.empty():
+            received_events.append(subscriber_queue.get_nowait())
+
+        run_finished_events = [
+            e for e in received_events
+            if isinstance(e, dict) and e.get("type") == "RUN_FINISHED"
+        ]
+        assert len(run_finished_events) >= 1, (
+            f"subscriber 队列应收到 RUN_FINISHED，实际收到: {received_events}"
+        )
+        assert run_finished_events[0]["outcome"] == "interrupt"
+        assert run_finished_events[0].get("result", {}).get("reason") == "user_cancelled"
+
+        # 清理
+        _active_runners.pop(session_id, None)
+        with _round_subscribers_lock:
+            _round_subscribers.pop(run_id, None)
+
+
+class TestWatcherSurvivesDisconnect:
+    """回归：SSE 断线后 cancel_watch_task 必须继续运行。"""
+
+    @pytest.mark.asyncio
+    async def test_watcher_continues_after_sse_disconnect_and_abort_still_acked(self):
+        """客户端断线 → Agent 后台继续 → 从其他 worker abort → watcher 仍能 ack。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from src.api.models.database import Base
+        from src.api.models.run_cancel_request import RunCancelRequest
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.routes import chat as chat_routes
+        from src.agent.schema.agui_events import RunStartedEvent, RunFinishedEvent
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+
+        user_id = "user-disconnect"
+        session_id = "session-disconnect"
+        lock_id = "lock-disconnect"
+        cancel_token = asyncio.Event()
+
+        try:
+            with TestSL() as setup_db:
+                setup_db.add(
+                    UserRunLock(
+                        user_id=user_id,
+                        session_id=session_id,
+                        lock_id=lock_id,
+                    )
+                )
+                setup_db.commit()
+
+            # Agent 会在 cancel_token 被设置后结束
+            agent_started = asyncio.Event()
+
+            async def slow_agent():
+                yield RunStartedEvent(threadId=session_id, runId="run-d1")
+                agent_started.set()
+                # 模拟长时间运行，等待取消
+                for _ in range(300):
+                    if cancel_token.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                yield RunFinishedEvent(
+                    threadId=session_id,
+                    runId="run-d1",
+                    outcome="interrupt",
+                    result={"reason": "user_cancelled"},
+                )
+
+            with patch("src.api.routes.chat.SessionLocal", TestSL):
+                gen = chat_routes._sse_with_heartbeat(
+                    slow_agent(),
+                    session_id=session_id,
+                    user_id=user_id,
+                    lock_id=lock_id,
+                    cancel_token=cancel_token,
+                )
+
+                # 只消费 RUN_STARTED 就 "断线"（关闭 generator）
+                first_chunk = await gen.__anext__()
+                assert "RUN_STARTED" in first_chunk
+                await gen.aclose()
+
+            # 断线后等待 agent 开始运行
+            await asyncio.wait_for(agent_started.wait(), timeout=2.0)
+            await asyncio.sleep(0.05)
+
+            # 模拟 B worker 发起 abort（写入 DB cancel request）
+            with TestSL() as abort_db:
+                await chat_routes._upsert_cancel_request(
+                    abort_db,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+
+            # 给 watcher 时间去 ack（watcher 默认 3s interval，但测试里可能更快）
+            for _ in range(200):
+                if cancel_token.is_set():
+                    break
+                await asyncio.sleep(0.05)
+
+            assert cancel_token.is_set(), "cancel_token 应该被 watcher 设置"
+
+            # 验证 cancel request 被 acked
+            with TestSL() as verify_db:
+                row = (
+                    verify_db.query(RunCancelRequest)
+                    .filter(RunCancelRequest.session_id == session_id)
+                    .first()
+                )
+                assert row is not None
+                assert row.state in ("acked", "completed"), (
+                    f"cancel request 应为 acked/completed，实际: {row.state}"
+                )
+        finally:
+            engine.dispose()
+
+
+class TestUserCancelledRoundStatus:
+    """回归：RUN_FINISHED user_cancelled 最终 round.status 为 cancelled。"""
+
+    @pytest.mark.asyncio
+    async def test_run_finished_user_cancelled_sets_status_cancelled(self):
+        """Agent yield RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled) → status=cancelled"""
+        from src.api.services.agent_service import AgentService
+        from src.agent.schema.agui_events import (
+            RunStartedEvent, RunFinishedEvent,
+            StepStartedEvent, StepFinishedEvent,
+        )
+
+        mock_history = MagicMock()
+        mock_history.save_agui_event = AsyncMock()
+        mock_history.complete_round = MagicMock()
+
+        service = object.__new__(AgentService)
+        service.history_service = mock_history
+        service.session_id = "test-session"
+        service.cancel_token = None
+        service.agent = MagicMock()
+        service._last_saved_index = 0
+
+        async def fake_run_agui(**kwargs):
+            yield RunStartedEvent(threadId="test-session", runId="run-cancel")
+            yield StepStartedEvent(stepName="step_1")
+            yield StepFinishedEvent(stepName="step_1")
+            yield RunFinishedEvent(
+                threadId="test-session",
+                runId="run-cancel",
+                outcome="interrupt",
+                result={"reason": "user_cancelled"},
+            )
+
+        service.agent.run_agui = fake_run_agui
+
+        events = []
+        async for event in service._run_round_stream(
+            run_id="run-cancel",
+            user_message="test",
+        ):
+            events.append(event)
+
+        mock_history.complete_round.assert_called_once()
+        call_kwargs = mock_history.complete_round.call_args
+        actual_status = call_kwargs.kwargs.get("status") or call_kwargs[1].get("status")
+        assert actual_status == "cancelled", (
+            f"user_cancelled 应该映射为 cancelled，实际: {actual_status}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_finished_ask_user_interrupt_sets_status_interrupted(self):
+        """Agent yield RUN_FINISHED(outcome=interrupt) 无 user_cancelled → status=interrupted"""
+        from src.api.services.agent_service import AgentService
+        from src.agent.schema.agui_events import (
+            RunStartedEvent, RunFinishedEvent,
+            StepStartedEvent, StepFinishedEvent,
+            InterruptDetails,
+        )
+
+        mock_history = MagicMock()
+        mock_history.save_agui_event = AsyncMock()
+        mock_history.complete_round = MagicMock()
+
+        service = object.__new__(AgentService)
+        service.history_service = mock_history
+        service.session_id = "test-session"
+        service.cancel_token = None
+        service.agent = MagicMock()
+        service._last_saved_index = 0
+
+        async def fake_run_agui(**kwargs):
+            yield RunStartedEvent(threadId="test-session", runId="run-ask")
+            yield StepStartedEvent(stepName="step_1")
+            yield StepFinishedEvent(stepName="step_1")
+            yield RunFinishedEvent(
+                threadId="test-session",
+                runId="run-ask",
+                outcome="interrupt",
+                result={"finalResponse": "waiting for answer"},
+                interrupt=InterruptDetails(id="int-1", payload={}),
+            )
+
+        service.agent.run_agui = fake_run_agui
+
+        events = []
+        async for event in service._run_round_stream(
+            run_id="run-ask",
+            user_message="test",
+        ):
+            events.append(event)
+
+        mock_history.complete_round.assert_called_once()
+        call_kwargs = mock_history.complete_round.call_args
+        actual_status = call_kwargs.kwargs.get("status") or call_kwargs[1].get("status")
+        assert actual_status == "interrupted", (
+            f"ask_user 中断应该映射为 interrupted，实际: {actual_status}"
+        )
