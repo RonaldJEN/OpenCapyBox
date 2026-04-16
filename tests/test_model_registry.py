@@ -171,6 +171,24 @@ class TestModelConfig:
         cfg = self._make_config(tags=["thinking", "coding"])
         assert cfg.tags == ["thinking", "coding"]
 
+    def test_compute_token_limit_normal(self):
+        """正常情況：context_window - max_tokens - 3000"""
+        cfg = self._make_config(context_window=128000, max_tokens=8192)
+        # 128000 - 8192 - 3000 = 116808
+        assert cfg.compute_token_limit() == 116808
+
+    def test_compute_token_limit_small_window_clamps_to_floor(self):
+        """窗口極小時下界鉗位到 8192"""
+        cfg = self._make_config(context_window=16000, max_tokens=8000)
+        # 16000 - 8000 - 3000 = 5000 -> clamp to 8192
+        assert cfg.compute_token_limit() == 8192
+
+    def test_compute_token_limit_large_output(self):
+        """大 output token 配額時仍正確計算"""
+        cfg = self._make_config(context_window=200000, max_tokens=65536)
+        # 200000 - 65536 - 3000 = 131464
+        assert cfg.compute_token_limit() == 131464
+
 
 # ============================================================
 # ModelRegistry YAML 載入

@@ -203,6 +203,14 @@ class ModelConfig:
             )
         return resolved
 
+    def compute_token_limit(self) -> int:
+        """推導 Agent token_limit（Level 3 摘要觸發閾值）。
+
+        預留 output tokens + 3000 buffer 給 system prompt，下界 8192。
+        """
+        usable_input = self.context_window - self.max_tokens
+        return max(usable_input - 3000, 8192)
+
     @property
     def supports_thinking(self) -> bool:
         """是否支援思考過程"""

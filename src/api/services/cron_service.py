@@ -243,18 +243,19 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
             from src.api.model_registry import get_model_registry
             model_config = get_model_registry().get_default()
             llm_client = LLMClient.from_model_config(model_config)
-        except Exception:
-            from src.agent.schema import LLMProvider
-            llm_client = LLMClient(
-                api_key=settings.llm_api_key,
-                api_base=settings.llm_api_base,
-                provider=(
-                    LLMProvider.OPENAI
-                    if settings.llm_provider.lower() == "openai"
-                    else LLMProvider.ANTHROPIC
-                ),
-                model=settings.llm_model,
-            )
+            cron_token_limit = model_config.compute_token_limit()
+            cron_context_window = model_config.context_window
+            cron_max_output_tokens = model_config.max_tokens
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"Model Registry 不可用: {e}. "
+                "請修復 models.yaml 配置後重試。"
+            ) from e
+        except ValueError as e:
+            raise RuntimeError(
+                f"Model Registry 配置異常: {e}. "
+                "請修復 models.yaml 或環境變數後重試。"
+            ) from e
 
         # 创建与聊天 Agent 相同的工具集（排除 AskUserQuestionTool，Cron 无人交互）
         from src.api.services.sandbox_service import get_sandbox_mount_path
@@ -301,9 +302,12 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                 f"所有产出文件必须保存在当前工作目录下（{run_workspace}），禁止写入其他路径。"
             ),
             tools=tools,
-            max_steps=10,
+            max_steps=settings.agent_max_steps,
             workspace_dir=run_workspace,
-            token_limit=50000,
+            token_limit=cron_token_limit,
+            context_window=cron_context_window,
+            max_output_tokens=cron_max_output_tokens,
+            tool_timeout=settings.agent_tool_timeout,
         )
 
         # 执行（不使用 run_agui，简单收集最终结果）

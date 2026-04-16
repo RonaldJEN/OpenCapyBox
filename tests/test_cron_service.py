@@ -368,3 +368,127 @@ class TestScanRunArtifacts:
         assert artifacts[0]["name"] == "news.md"
         assert artifacts[0]["path"] == "news.md"
         assert artifacts[0]["size"] == 0
+
+
+class TestCronAgentConstruction:
+    """Cron Agent 构造参数测试"""
+
+    @pytest.mark.asyncio
+    async def test_registry_unavailable_fails_hard_and_skips_agent(self):
+        """model registry 不可用时应 fail-hard，且不应创建 Agent。"""
+        with (
+            patch("src.api.model_registry.get_model_registry", side_effect=FileNotFoundError("no registry")),
+            patch("src.api.models.database.SessionLocal") as mock_session_local,
+            patch("src.api.services.sandbox_service.get_sandbox_service") as mock_svc,
+            patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/mnt"),
+            patch("src.api.services.tool_factory.create_agent_tools", new_callable=AsyncMock, return_value=([], None)),
+            patch("src.api.services.cron_service._scan_run_artifacts", new_callable=AsyncMock, return_value=None),
+            patch("src.agent.agent.Agent") as MockAgent,
+        ):
+            # DB mock — 每次 SessionLocal() 返回同一个 mock context manager
+            mock_db = MagicMock()
+            mock_session_local.return_value.__enter__ = MagicMock(return_value=mock_db)
+            mock_session_local.return_value.__exit__ = MagicMock(return_value=False)
+
+            mock_job = MagicMock()
+            mock_job.name = "test-job"
+            mock_job.description = "desc"
+            mock_job.cron_expr = "0 * * * *"
+            mock_job.enabled = True
+            mock_run_record = MagicMock()
+            mock_run_record.status = "running"
+            mock_run_record.output = None
+            mock_db.query.return_value.filter.return_value.first.side_effect = [
+                mock_job,                       # 查 CronJob
+                mock_run_record,                # 查 CronJobRun (已存在)
+                MagicMock(sandbox_id="sb-1"),   # 查 UserSandbox
+                mock_run_record,                # 失败后更新 CronJobRun
+            ]
+
+            # sandbox mock
+            mock_sandbox = AsyncMock()
+            mock_sandbox.commands.run = AsyncMock(return_value=MagicMock(logs=MagicMock(stdout=[])))
+            mock_svc.return_value.get_or_resume = AsyncMock(return_value=mock_sandbox)
+
+            # Agent mock: run_agui 立即结束
+            mock_agent_instance = MagicMock()
+
+            async def _empty_gen(*a, **kw):
+                return
+                yield  # noqa: make it an async generator
+
+            mock_agent_instance.run_agui = _empty_gen
+            mock_agent_instance.add_user_message = MagicMock()
+            MockAgent.return_value = mock_agent_instance
+
+            from src.api.services.cron_service import run_cron_job
+
+            result = await run_cron_job("user-1", "test-job", run_id="run-1")
+
+            assert result is None
+            MockAgent.assert_not_called()
+            assert mock_run_record.status == "failed"
+            assert mock_run_record.output is not None
+            assert "Model Registry 不可用" in mock_run_record.output
+
+    @pytest.mark.asyncio
+    async def test_registry_agent_uses_model_config_values(self):
+        """model registry 可用时，Agent 参数来自 model_config"""
+        mock_model_config = MagicMock()
+        mock_model_config.context_window = 200000
+        mock_model_config.max_tokens = 32768
+        mock_model_config.compute_token_limit.return_value = 164232
+
+        mock_registry = MagicMock()
+        mock_registry.get_default.return_value = mock_model_config
+
+        with (
+            patch("src.api.model_registry.get_model_registry", return_value=mock_registry),
+            patch("src.agent.llm.LLMClient") as MockLLM,
+            patch("src.api.models.database.SessionLocal") as mock_session_local,
+            patch("src.api.services.sandbox_service.get_sandbox_service") as mock_svc,
+            patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/mnt"),
+            patch("src.api.services.tool_factory.create_agent_tools", new_callable=AsyncMock, return_value=([], None)),
+            patch("src.api.services.cron_service._scan_run_artifacts", new_callable=AsyncMock, return_value=None),
+            patch("src.agent.agent.Agent") as MockAgent,
+        ):
+            MockLLM.from_model_config.return_value = MagicMock()
+
+            mock_db = MagicMock()
+            mock_session_local.return_value.__enter__ = MagicMock(return_value=mock_db)
+            mock_session_local.return_value.__exit__ = MagicMock(return_value=False)
+
+            mock_job = MagicMock()
+            mock_job.name = "test-job"
+            mock_job.description = "desc"
+            mock_job.cron_expr = "0 * * * *"
+            mock_job.enabled = True
+            mock_run_record = MagicMock()
+            mock_db.query.return_value.filter.return_value.first.side_effect = [
+                mock_job, None,
+                MagicMock(sandbox_id="sb-1"),
+                mock_run_record,
+            ]
+
+            mock_sandbox = AsyncMock()
+            mock_sandbox.commands.run = AsyncMock(return_value=MagicMock(logs=MagicMock(stdout=[])))
+            mock_svc.return_value.get_or_resume = AsyncMock(return_value=mock_sandbox)
+
+            mock_agent_instance = MagicMock()
+
+            async def _empty_gen(*a, **kw):
+                return
+                yield
+
+            mock_agent_instance.run_agui = _empty_gen
+            mock_agent_instance.add_user_message = MagicMock()
+            MockAgent.return_value = mock_agent_instance
+
+            from src.api.services.cron_service import run_cron_job
+
+            await run_cron_job("user-1", "test-job")
+
+            call_kwargs = MockAgent.call_args[1]
+            assert call_kwargs["token_limit"] == 164232
+            assert call_kwargs["context_window"] == 200000
+            assert call_kwargs["max_output_tokens"] == 32768

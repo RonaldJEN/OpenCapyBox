@@ -69,10 +69,7 @@ class AgentService:
                 model_config = registry.get_default()
                 self.model_id = model_config.id
 
-            # 從模型配置推導 token_limit（Level 3 摘要觸發閾值）
-            # 預留 output tokens + 3000 buffer 給 system prompt，下界 8192
-            usable_input = model_config.context_window - model_config.max_tokens
-            self._token_limit = max(usable_input - 3000, 8192)
+            self._token_limit = model_config.compute_token_limit()
 
             logger.info(
                 "创建 LLM 客户端: model=%s, provider=%s, api_base=%s",
