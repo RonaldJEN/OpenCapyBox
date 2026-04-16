@@ -154,7 +154,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const scrollPosBySessionRef = useRef<Record<string, number>>({});
   const pendingRestoreScrollRef = useRef<number | null>(null);
   const suppressAutoScrollRef = useRef<boolean>(false); // 切会话期间抑制自动 smooth 滚动
-  const cronRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const titleRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 🆕 欢迎页「输入即创建」相关状态
@@ -233,10 +232,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         subscriptionAbortRef.current();
         subscriptionAbortRef.current = null;
       }
-      if (cronRefreshTimeoutRef.current) {
-        clearTimeout(cronRefreshTimeoutRef.current);
-        cronRefreshTimeoutRef.current = null;
-      }
       if (titleRefreshTimeoutRef.current) {
         clearTimeout(titleRefreshTimeoutRef.current);
         titleRefreshTimeoutRef.current = null;
@@ -304,7 +299,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     };
   }, [sessionId]);
 
-  // 🔄 轮询检测新消息（Cron / 系统注入的 Round）
+  // 🔄 轮询检测新消息（系统注入的 Round）
   const knownRoundCountRef = useRef<number>(0);
   useEffect(() => {
     // 同步已知 round count
@@ -331,35 +326,13 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
     timer = setInterval(poll, 1000);
 
-    // 监听 CronSchedule 手动触发的即时刷新事件
-    const handleCronDone = () => {
-      // 延迟 300ms 等后端落库完成
-      if (cronRefreshTimeoutRef.current) {
-        clearTimeout(cronRefreshTimeoutRef.current);
-      }
-      cronRefreshTimeoutRef.current = setTimeout(() => {
-        cronRefreshTimeoutRef.current = null;
-        void poll();
-      }, 300);
-    };
-    window.addEventListener('cron-job-done', handleCronDone);
-
     return () => {
       if (timer) clearInterval(timer);
-      if (cronRefreshTimeoutRef.current) {
-        clearTimeout(cronRefreshTimeoutRef.current);
-        cronRefreshTimeoutRef.current = null;
-      }
-      window.removeEventListener('cron-job-done', handleCronDone);
     };
   }, [sessionId, sending]);
 
   useEffect(() => {
     return () => {
-      if (cronRefreshTimeoutRef.current) {
-        clearTimeout(cronRefreshTimeoutRef.current);
-        cronRefreshTimeoutRef.current = null;
-      }
       if (titleRefreshTimeoutRef.current) {
         clearTimeout(titleRefreshTimeoutRef.current);
         titleRefreshTimeoutRef.current = null;

@@ -3,7 +3,6 @@ import asyncio
 import json
 import logging
 import uuid
-from pathlib import Path
 from typing import List, Dict, Optional, AsyncIterator, Any
 
 from opensandbox import Sandbox
@@ -13,24 +12,10 @@ from src.agent.agent import Agent
 from src.agent.llm import LLMClient
 from src.agent.schema import Message as AgentMessage
 from src.agent.schema.agui_events import AGUIEvent, EventType
-from src.agent.tools.sandbox_file_tools import SandboxReadTool, SandboxWriteTool, SandboxEditTool
-from src.agent.tools.sandbox_bash_tool import SandboxBashTool, SandboxBashOutputTool, SandboxBashKillTool, _BackgroundCommandTracker
-from src.agent.tools.sandbox_note_tool import SandboxSessionNoteTool, SandboxRecallNoteTool
-from src.agent.tools.skill_loader import SkillLoader
-from src.agent.tools.skill_tool import GetSkillTool
-from src.agent.tools.memory_tools import (
-    RecordDailyLogTool,
-    UpdateLongTermMemoryTool,
-    SearchMemoryTool,
-    ReadUserProfileTool,
-    UpdateUserProfileTool,
-)
-from src.agent.tools.cron_tool import ManageCronTool
-from src.agent.tools.ask_user_tool import AskUserQuestionTool
 
 from src.api.services.history_service import HistoryService
-
 from src.api.services.sandbox_service import get_sandbox_service, get_sandbox_mount_path
+from src.api.services.tool_factory import create_agent_tools
 from src.api.config import get_settings
 from src.api.model_registry import get_model_registry
 from pathlib import Path as PathlibPath
@@ -125,7 +110,13 @@ class AgentService:
         system_prompt = self._load_system_prompt()
 
         # 创建工具列表
-        tools = await self._create_tools()
+        tools, self.skill_loader = await create_agent_tools(
+            sandbox=self.sandbox,
+            workspace_dir=self._workspace_dir,
+            mount=get_sandbox_mount_path(),
+            user_id=self.user_id,
+            db_session_factory=self._get_db_session_factory(),
+        )
 
         # 注入技能元数据到系统提示符（Progressive Disclosure - Level 1）
         if self.skill_loader:
@@ -151,26 +142,10 @@ class AgentService:
         # 从数据库恢复历史
         self._restore_history()
 
-    @staticmethod
-    def _auto_locate(setting_value: str, *relative_parts: str) -> Path:
-        """若 setting_value 非空則直接使用，否則自動定位到 src/agent/ 下的相對路徑"""
-        if setting_value:
-            return Path(setting_value).resolve()
-        return (Path(__file__).parent.parent.parent / "agent" / Path(*relative_parts)).resolve()
-
     def _get_db_session_factory(self):
         """返回 DB session 工厂函数（供 memory_tools 延迟获取 DB session）"""
         from src.api.models.database import SessionLocal
         return SessionLocal
-
-    @staticmethod
-    def _get_scheduler():
-        """获取 APScheduler 实例（best-effort，避免工具层反向 import API 层）"""
-        try:
-            import src.api.main as _main_mod
-            return getattr(getattr(_main_mod.app, "state", None), "scheduler", None)
-        except Exception:
-            return None
 
     def _load_system_prompt(self) -> str:
         """从 DB 记忆文件组装 
@@ -274,155 +249,6 @@ class AgentService:
             else:
                 high = mid - 1
         return text[:low] + "\n...(truncated)"
-
-    async def _create_tools(self) -> List:
-        """创建工具列表（基於 OpenSandbox）"""
-        # 计算 skills 目录路径（位於 Agent Server 本地，用於 SkillLoader）
-        skills_dir = self._auto_locate(settings.skills_dir, "skills")
-        mount = get_sandbox_mount_path()
-
-        # 共享後台命令追蹤器（按 session 隔離）
-        bg_tracker = _BackgroundCommandTracker()
-
-        tools = [
-            # 沙箱文件工具
-            SandboxReadTool(sandbox=self.sandbox, workspace_dir=self._workspace_dir),
-            SandboxWriteTool(sandbox=self.sandbox, workspace_dir=self._workspace_dir),
-            SandboxEditTool(sandbox=self.sandbox, workspace_dir=self._workspace_dir),
-            # 沙箱 Bash 工具（共享 tracker）
-            SandboxBashTool(sandbox=self.sandbox, workspace_dir=self._workspace_dir, tracker=bg_tracker),
-            SandboxBashOutputTool(tracker=bg_tracker),
-            SandboxBashKillTool(tracker=bg_tracker),
-            # 沙箱會話筆記工具
-            SandboxSessionNoteTool(sandbox=self.sandbox),
-            SandboxRecallNoteTool(sandbox=self.sandbox),
-            # 分层记忆工具
-            RecordDailyLogTool(sandbox=self.sandbox, workspace_dir=mount),
-            UpdateLongTermMemoryTool(sandbox=self.sandbox, workspace_dir=mount),
-            SearchMemoryTool(
-                db_session_factory=self._get_db_session_factory(),
-                user_id=self.user_id,
-            ),
-            ReadUserProfileTool(sandbox=self.sandbox, workspace_dir=mount),
-            UpdateUserProfileTool(sandbox=self.sandbox, workspace_dir=mount),
-            # Cron 定时任务管理工具（通过依赖注入获取 scheduler，避免反向 import）
-            ManageCronTool(
-                db_session_factory=self._get_db_session_factory(),
-                user_id=self.user_id,
-                scheduler=self._get_scheduler(),
-            ),
-            # 用户交互工具（Human-in-the-Loop）
-            AskUserQuestionTool(),
-        ]
-
-        # 添加搜索工具（如果配置了 Bocha AppCode）
-        bocha_appcode = settings.bocha_search_appcode
-        if bocha_appcode and bocha_appcode.strip():
-            try:
-                from src.agent.tools.glm_search_tool import GLMSearchTool, GLMBatchSearchTool
-                tools.append(GLMSearchTool(api_key=bocha_appcode))
-                tools.append(GLMBatchSearchTool(api_key=bocha_appcode))
-                logger.info("已加载 Bocha 搜索工具")
-            except Exception as e:
-                logger.warning("Bocha 搜索工具加载失败: %s", e)
-        else:
-            logger.info("未配置 BOCHA_SEARCH_APPCODE，跳过搜索工具")
-
-        # 添加 Skills（复用前面计算的 skills_dir）
-        try:
-            if skills_dir.exists():
-                skill_loader = SkillLoader(str(skills_dir))
-                # 🔥 关键修复：必须先调用 discover_skills() 才能加载技能！
-                skills = skill_loader.discover_skills()
-
-                # 按用户 skill 配置过滤掉禁用的 skill
-                try:
-                    from src.api.models.user_memory import UserSkillConfig
-                    db = self.history_service.db
-                    disabled_skills = {
-                        r.skill_name for r in
-                        db.query(UserSkillConfig)
-                        .filter(
-                            UserSkillConfig.user_id == self.user_id,
-                            UserSkillConfig.enabled == False,  # noqa: E712
-                        )
-                        .all()
-                    }
-                    if disabled_skills:
-                        for name in disabled_skills:
-                            skill_loader.loaded_skills.pop(name, None)
-                        skills = [s for s in skills if s.name not in disabled_skills]
-                        logger.info("已按用户配置禁用 %d 个 Skills: %s", len(disabled_skills), disabled_skills)
-                except Exception as e:
-                    logger.warning("查询 UserSkillConfig 失败，加载全部 Skills: %s", e)
-
-                # --- 发现沙箱中用户自行安装的第三方 Skill ---
-                try:
-                    sandbox_service = get_sandbox_service()
-                    official_names = set(skill_loader.loaded_skills.keys())
-                    sandbox_skill_infos = await sandbox_service.discover_sandbox_skills(
-                        self.user_id, official_names,
-                    )
-                    from src.agent.tools.skill_loader import Skill as _Skill
-                    for info in sandbox_skill_infos:
-                        user_skill = _Skill(
-                            name=info["name"],
-                            description=info["description"],
-                            content="",  # 延迟加载
-                            source="user",
-                            sandbox_skill_dir=info["sandbox_skill_dir"],
-                        )
-                        skill_loader.register_sandbox_skill(user_skill)
-                    if sandbox_skill_infos:
-                        logger.info(
-                            "已发现 %d 个用户沙箱 Skills: %s",
-                            len(sandbox_skill_infos),
-                            [i["name"] for i in sandbox_skill_infos],
-                        )
-                except Exception as e:
-                    logger.warning("沙箱 Skill 发现失败（不影响官方 Skills）: %s", e)
-
-                async def _ensure_skill_ready(skill_name: str) -> bool:
-                    """确保 Skill 在沙箱中就绪。官方 Skill 需要推送，用户 Skill 已在沙箱中。"""
-                    skill = skill_loader.get_skill(skill_name)
-                    if skill and skill.source == "user":
-                        return True  # 用户 Skill 已在沙箱中，无需推送
-                    sandbox_service = get_sandbox_service()
-                    return await sandbox_service.push_skill(
-                        self.user_id,
-                        str(skills_dir),
-                        skill_name,
-                    )
-
-                async def _read_sandbox_skill(skill_name: str) -> str | None:
-                    """从沙箱按需读取用户 Skill 的完整内容。"""
-                    skill = skill_loader.get_skill(skill_name)
-                    if not skill or skill.source != "user" or not skill.sandbox_skill_dir:
-                        return None
-                    sandbox_service = get_sandbox_service()
-                    return await sandbox_service.read_sandbox_skill_content(
-                        self.user_id,
-                        skill.sandbox_skill_dir,
-                    )
-
-                tools.append(GetSkillTool(
-                    skill_loader,
-                    ensure_skill_ready=_ensure_skill_ready,
-                    read_sandbox_skill=_read_sandbox_skill,
-                ))
-                skill_count = len(skill_loader.list_skills())
-                # 🔥 保存 skill_loader 引用，用于后续注入元数据
-                self.skill_loader = skill_loader
-                logger.info("已加载 %d 个 Skills（官方 %d + 用户 %d）",
-                            skill_count,
-                            len(skill_loader.loaded_skills),
-                            len(skill_loader.sandbox_skills))
-            else:
-                logger.warning("Skills 目录不存在: %s", skills_dir)
-        except Exception as e:
-            logger.warning("Skills 加载失败: %s", e)
-
-        return tools
 
     def _restore_history(self):
         """从 conversation_messages 表恢复对话历史

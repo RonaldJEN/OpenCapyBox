@@ -36,9 +36,18 @@ class TestAgentServiceCreateTools:
 
     @pytest.mark.asyncio
     async def test_create_tools_basic(self, service):
-        with patch("src.api.services.agent_service.settings") as mock_settings:
+        with patch("src.api.services.tool_factory.settings") as mock_settings:
             mock_settings.bocha_search_appcode = None
-            tools = await service._create_tools()
+            mock_settings.skills_dir = ""
+            from src.api.services.tool_factory import create_agent_tools
+            from src.api.services.sandbox_service import get_sandbox_mount_path
+            tools, _ = await create_agent_tools(
+                sandbox=service.sandbox,
+                workspace_dir=service._workspace_dir,
+                mount=get_sandbox_mount_path(),
+                user_id=service.user_id,
+                db_session_factory=service._get_db_session_factory(),
+            )
 
         tool_names = [t.name for t in tools]
         assert "read_file" in tool_names

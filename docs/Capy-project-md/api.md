@@ -1422,10 +1422,10 @@ Authorization: Bearer <access_token>
 }
 ```
 
-### 获取执行历史
+### 获取执行历史（分页）
 
 ```
-GET /api/cron/runs?job_name=<optional>&limit=20
+GET /api/cron/runs?job_name=<optional>&limit=20&offset=0
 Authorization: Bearer <access_token>
 ```
 
@@ -1440,9 +1440,15 @@ Authorization: Bearer <access_token>
       "started_at": "2026-03-30T09:00:00",
       "completed_at": "2026-03-30T09:01:30",
       "status": "success",
-      "output": "日报已生成"
+      "output": "日报已生成",
+      "is_read": true,
+      "artifacts": [{"name": "report.md", "size": 1024}],
+      "run_workspace": "/mnt/user/cron/runs/uuid"
     }
-  ]
+  ],
+  "total": 42,
+  "offset": 0,
+  "limit": 20
 }
 ```
 
@@ -1453,7 +1459,7 @@ POST /api/cron/jobs/{job_name}/run
 Authorization: Bearer <access_token>
 ```
 
-**说明**: 从 `cron_jobs` 表查找任务并后台执行（立即返回 `run_id`）。执行完成后结果会自动注入用户最近活跃的 Session。前端可通过 `GET /api/cron/runs/{run_id}` 轮询执行状态。
+**说明**: 从 `cron_jobs` 表查找任务并后台执行（立即返回 `run_id`）。执行结果不会注入聊天 Session，用户通过消息中心查看。前端可通过 `GET /api/cron/runs/{run_id}` 轮询执行状态。
 
 **Response**:
 ```json
@@ -1478,11 +1484,74 @@ Authorization: Bearer <access_token>
   "started_at": "2026-04-14T09:00:00",
   "completed_at": "2026-04-14T09:00:15",
   "status": "success",
-  "output": "日报已生成"
+  "output": "日报已生成",
+  "is_read": false,
+  "artifacts": [{"name": "report.md", "size": 2048}],
+  "run_workspace": "/mnt/user/cron/runs/uuid-string"
 }
 ```
 
 **status 枚举**: `running` | `success` | `failed`
+
+### 获取未读执行记录数
+
+```
+GET /api/cron/runs/unread-count
+Authorization: Bearer <access_token>
+```
+
+**Response**:
+```json
+{ "count": 3 }
+```
+
+**说明**: 仅统计 `status = success` 且 `is_read = false` 的记录。
+
+### 标记执行记录为已读
+
+```
+POST /api/cron/runs/mark-read?run_id=<optional>
+Authorization: Bearer <access_token>
+```
+
+**说明**:
+- 不传 `run_id`：将当前用户所有 `success` 且未读记录标记为已读。
+- 传 `run_id`：仅标记指定 run（且必须属于当前用户、状态为 `success`）。
+
+**Response**:
+```json
+{ "marked": 3 }
+```
+
+### 获取执行产物文件列表
+
+```
+GET /api/cron/runs/{run_id}/files
+Authorization: Bearer <access_token>
+```
+
+**说明**: 返回该次执行在沙箱中生成的文件列表（从 DB `artifacts` 字段读取）。
+
+**Response**:
+```json
+{
+  "files": [
+    { "name": "report.md", "size": 1024 },
+    { "name": "data.csv", "size": 4096 }
+  ]
+}
+```
+
+### 下载执行产物文件
+
+```
+GET /api/cron/runs/{run_id}/files/{file_path}
+Authorization: Bearer <access_token>
+```
+
+**说明**: 从沙箱下载指定执行产物文件。包含路径遍历保护。
+
+**Response**: 文件内容流（`application/octet-stream`）
 
 ---
 

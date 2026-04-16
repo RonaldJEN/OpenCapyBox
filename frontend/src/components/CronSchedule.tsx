@@ -7,6 +7,7 @@ import {
   type CronTask,
   type CronJobRun,
 } from '../services/configApi';
+import CronMessageCenter from './CronMessageCenter';
 
 // ────────────────────────────────────────────
 // Helpers
@@ -397,9 +398,11 @@ const TaskDetailModal: React.FC<TaskDetailModalProps> = ({ task, runs, latestRun
 
 interface Props {
   onClose?: () => void;
+  unreadCount?: number;
+  onUnreadChange?: (count: number) => void;
 }
 
-const CronSchedule: React.FC<Props> = ({ onClose }) => {
+const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChange }) => {
   const [tasks, setTasks] = useState<CronTask[]>([]);
   const [allRuns, setAllRuns] = useState<CronJobRun[]>([]);
   const [weekOffset, setWeekOffset] = useState(0);
@@ -407,7 +410,7 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
   const [selectedTask, setSelectedTask] = useState<CronTask | null>(null);
   const [taskRuns, setTaskRuns] = useState<CronJobRun[]>([]);
   const [triggeringSet, setTriggeringSet] = useState<Set<string>>(new Set());
-  const [tab, setTab] = useState<'calendar' | 'manage'>('calendar');
+  const [tab, setTab] = useState<'calendar' | 'manage' | 'messages'>('calendar');
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const today = useMemo(() => {
@@ -452,9 +455,9 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [jobs, runs] = await Promise.all([getCronJobs(), getCronRuns(undefined, 100)]);
+      const [jobs, runsResp] = await Promise.all([getCronJobs(), getCronRuns(undefined, 100)]);
       setTasks(jobs);
-      setAllRuns(runs);
+      setAllRuns(runsResp.runs);
     } catch (e) {
       console.error(e);
     } finally {
@@ -480,8 +483,8 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
   const handleOpenTask = useCallback(async (task: CronTask) => {
     setSelectedTask(task);
     try {
-      const runs = await getCronRuns(task.name, 20);
-      setTaskRuns(runs);
+      const resp = await getCronRuns(task.name, 20);
+      setTaskRuns(resp.runs);
     } catch {
       setTaskRuns([]);
     }
@@ -497,7 +500,6 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
     try {
       const result = await triggerCronJob(name);
       setNotice({ type: 'success', text: result.message || `任务 ${name} 已提交后台执行` });
-      window.dispatchEvent(new CustomEvent('cron-job-done'));
 
       // 轮询执行状态，直到完成或超时
       const runId = result.run_id;
@@ -518,10 +520,10 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
                 type: run.status === 'success' ? 'success' : 'error',
                 text: run.status === 'success' ? `任务 ${name} 执行成功` : `任务 ${name} 执行失败`,
               });
-              const [runs, allR] = await Promise.all([getCronRuns(name, 20), getCronRuns(undefined, 100)]);
+              const [runsResp, allResp] = await Promise.all([getCronRuns(name, 20), getCronRuns(undefined, 100)]);
               if (!mountedRef.current) return;
-              setTaskRuns(runs);
-              setAllRuns(allR);
+              setTaskRuns(runsResp.runs);
+              setAllRuns(allResp.runs);
               return;
             }
           } catch {
@@ -530,10 +532,10 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
         }
         if (!mountedRef.current) return;
         // 超时，仍然刷新一次
-        const [runs, allR] = await Promise.all([getCronRuns(name, 20), getCronRuns(undefined, 100)]);
+        const [runsResp2, allResp2] = await Promise.all([getCronRuns(name, 20), getCronRuns(undefined, 100)]);
         if (!mountedRef.current) return;
-        setTaskRuns(runs);
-        setAllRuns(allR);
+        setTaskRuns(runsResp2.runs);
+        setAllRuns(allResp2.runs);
       };
       // 后台轮询，不阻塞 UI
       poll().finally(clearTriggering);
@@ -563,11 +565,24 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
             </button>
             <button
               onClick={() => setTab('manage')}
-              className={`px-3 py-1 rounded-r-lg border border-l-0 border-claude-border ${
+              className={`px-3 py-1 border-y border-claude-border ${
                 tab === 'manage' ? 'bg-claude-surface text-claude-text font-medium' : 'text-claude-secondary hover:bg-claude-hover'
               }`}
             >
               日程管理
+            </button>
+            <button
+              onClick={() => setTab('messages')}
+              className={`relative px-3 py-1 rounded-r-lg border border-l-0 border-claude-border ${
+                tab === 'messages' ? 'bg-claude-surface text-claude-text font-medium' : 'text-claude-secondary hover:bg-claude-hover'
+              }`}
+            >
+              消息中心
+              {unreadCount > 0 && tab !== 'messages' && (
+                <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] flex items-center justify-center px-1 text-[10px] font-bold text-white bg-red-500 rounded-full">
+                  {unreadCount > 99 ? '99+' : unreadCount}
+                </span>
+              )}
             </button>
           </div>
         </div>
@@ -647,7 +662,7 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
             })}
           </div>
         </div>
-      ) : (
+      ) : tab === 'manage' ? (
         // ──── Manage View (任务列表) ────
         <div className="flex-1 overflow-y-auto p-4 space-y-3">
           {tasks.length === 0 ? (
@@ -691,7 +706,9 @@ const CronSchedule: React.FC<Props> = ({ onClose }) => {
             })
           )}
         </div>
-      )}
+      ) : tab === 'messages' ? (
+        <CronMessageCenter onUnreadChange={onUnreadChange} />
+      ) : null}
 
       {/* Task detail modal */}
       {selectedTask && (

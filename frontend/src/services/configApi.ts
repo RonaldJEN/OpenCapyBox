@@ -96,6 +96,16 @@ export interface CronJobRun {
   completed_at: string | null;
   status: string;
   output: string | null;
+  is_read: boolean;
+  artifacts: ArtifactFile[] | null;
+  run_workspace: string | null;
+}
+
+export interface ArtifactFile {
+  name: string;
+  path: string;
+  size: number;
+  type: string;
 }
 
 export async function getCronJobs(): Promise<CronTask[]> {
@@ -106,11 +116,15 @@ export async function getCronJobs(): Promise<CronTask[]> {
 export async function getCronRuns(
   jobName?: string,
   limit: number = 20,
-): Promise<CronJobRun[]> {
-  const params: Record<string, string | number> = { limit };
+  offset: number = 0,
+): Promise<{ runs: CronJobRun[]; total: number; offset: number; limit: number }> {
+  const params: Record<string, string | number> = { limit, offset };
   if (jobName) params.job_name = jobName;
-  const resp = await client.get<{ runs: CronJobRun[] }>('/cron/runs', { params });
-  return resp.data.runs;
+  const resp = await client.get<{ runs: CronJobRun[]; total: number; offset: number; limit: number }>(
+    '/cron/runs',
+    { params },
+  );
+  return resp.data;
 }
 
 export async function triggerCronJob(
@@ -125,4 +139,51 @@ export async function triggerCronJob(
 export async function getCronRunStatus(runId: string): Promise<CronJobRun> {
   const resp = await client.get<CronJobRun>(`/cron/runs/${runId}`);
   return resp.data;
+}
+
+export async function getUnreadCount(): Promise<{ count: number }> {
+  const resp = await client.get<{ count: number }>('/cron/runs/unread-count');
+  return resp.data;
+}
+
+export async function markCronRunsRead(runId?: string): Promise<{ marked: number }> {
+  const resp = await client.post<{ marked: number }>(
+    '/cron/runs/mark-read',
+    undefined,
+    runId ? { params: { run_id: runId } } : undefined,
+  );
+  return resp.data;
+}
+
+export async function getCronRunFiles(runId: string): Promise<{ files: ArtifactFile[] }> {
+  const resp = await client.get<{ files: ArtifactFile[] }>(`/cron/runs/${runId}/files`);
+  return resp.data;
+}
+
+export async function downloadCronRunFile(
+  runId: string,
+  filePath: string,
+  fileName?: string,
+): Promise<void> {
+  const encodedPath = filePath
+    .split('/')
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
+
+  const resp = await client.get<Blob>(`/cron/runs/${runId}/files/${encodedPath}`, {
+    responseType: 'blob',
+  });
+
+  const blob = resp.data;
+  const objectUrl = window.URL.createObjectURL(blob);
+  try {
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = fileName || filePath.split('/').pop() || 'download';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  } finally {
+    window.URL.revokeObjectURL(objectUrl);
+  }
 }

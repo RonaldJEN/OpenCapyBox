@@ -6,6 +6,8 @@
 - CronJobRun：定时任务执行历史
 - UserSkillConfig：Skill 启用/禁用状态
 """
+import json
+
 from sqlalchemy import Column, String, Integer, Text, Boolean, DateTime
 from .database import Base
 from src.api.utils.timezone import now_naive
@@ -73,6 +75,33 @@ class CronJobRun(Base):
     # running / success / failed
     status = Column(String(20), default="running")
     output = Column(Text, nullable=True)
+    # 未读标记：新记录默认未读(False)，存量通过迁移 DEFAULT 1 回填为已读
+    is_read = Column(Boolean, default=False)
+    # 产物文件元数据 JSON 数组，如 [{"name":"report.md","path":"report.md","size":1234,"type":"md"}]
+    artifacts = Column(Text, nullable=True)
+    # 本次运行的沙箱工作目录绝对路径
+    run_workspace = Column(String(500), nullable=True)
+
+    def to_dict(self) -> dict:
+        """序列化为前端可用的 dict（单一事实源）。"""
+        artifacts = None
+        if self.artifacts:
+            try:
+                artifacts = json.loads(self.artifacts)
+            except (ValueError, TypeError):
+                pass
+        return {
+            "id": self.id,
+            "job_name": self.job_name,
+            "cron_expr": self.cron_expr,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "status": self.status,
+            "output": self.output,
+            "is_read": bool(self.is_read),
+            "artifacts": artifacts,
+            "run_workspace": self.run_workspace,
+        }
 
 
 class UserSkillConfig(Base):

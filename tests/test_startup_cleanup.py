@@ -9,10 +9,11 @@ from sqlalchemy.orm import sessionmaker
 
 from src.api.models.database import Base
 from src.api.models.round import Round
+from src.api.models.user_run_lock import UserRunLock
 
 
-def _cleanup_stale_rounds(db):
-    """模拟启动清理逻辑 — 将所有 running 轮次标记为 failed"""
+def _cleanup_stale_runtime_state(db):
+    """模拟启动清理逻辑：清理残留轮次 + 清空用户运行锁。"""
     from src.api.utils.timezone import now_naive
 
     stale_count = (
@@ -24,8 +25,19 @@ def _cleanup_stale_rounds(db):
             "final_response": "[系统重启，执行被中断]",
         })
     )
+    zombie_count = (
+        db.query(Round)
+        .filter(Round.status == "interrupted")
+        .update({
+            "status": "failed",
+            "completed_at": now_naive(),
+            "interrupt_payload": None,
+            "final_response": "[系统重启，中断问答已失效]",
+        })
+    )
+    stale_lock_count = db.query(UserRunLock).delete(synchronize_session=False)
     db.commit()
-    return stale_count
+    return stale_count, zombie_count, stale_lock_count
 
 
 @pytest.fixture
@@ -48,13 +60,16 @@ class TestStartupCleanup:
             r1 = Round(id=str(uuid.uuid4()), session_id="s1", user_message="hi", status="running")
             r2 = Round(id=str(uuid.uuid4()), session_id="s2", user_message="hello", status="running")
             r3 = Round(id=str(uuid.uuid4()), session_id="s1", user_message="done", status="completed")
-            db.add_all([r1, r2, r3])
+            lock = UserRunLock(user_id="u1", session_id="s1", lock_id=str(uuid.uuid4()))
+            db.add_all([r1, r2, r3, lock])
             db.commit()
 
             # 模拟启动清理逻辑
-            stale_count = _cleanup_stale_rounds(db)
+            stale_count, zombie_count, stale_lock_count = _cleanup_stale_runtime_state(db)
 
             assert stale_count == 2
+            assert zombie_count == 0
+            assert stale_lock_count == 1
 
             # 验证状态
             all_rounds = db.query(Round).all()
@@ -71,6 +86,9 @@ class TestStartupCleanup:
                 assert r.final_response == "[系统重启，执行被中断]"
                 assert r.completed_at is not None
 
+            # 验证用户运行锁已清空
+            assert db.query(UserRunLock).count() == 0
+
     def test_no_stale_rounds_noop(self, in_memory_db):
         """没有 running 轮次时，清理不影响已有数据"""
         engine, Session = in_memory_db
@@ -79,9 +97,11 @@ class TestStartupCleanup:
             db.add(r1)
             db.commit()
 
-            stale_count = _cleanup_stale_rounds(db)
+            stale_count, zombie_count, stale_lock_count = _cleanup_stale_runtime_state(db)
 
             assert stale_count == 0
+            assert zombie_count == 0
+            assert stale_lock_count == 0
 
             # completed 轮次不受影响
             r = db.query(Round).first()
@@ -97,12 +117,15 @@ class TestStartupCleanup:
             r2 = Round(id=str(uuid.uuid4()), session_id="s1", user_message="b", status="failed",
                        final_response="error")
             r3 = Round(id=str(uuid.uuid4()), session_id="s1", user_message="c", status="running")
-            db.add_all([r1, r2, r3])
+            lock = UserRunLock(user_id="u2", session_id="s1", lock_id=str(uuid.uuid4()))
+            db.add_all([r1, r2, r3, lock])
             db.commit()
 
-            stale_count = _cleanup_stale_rounds(db)
+            stale_count, zombie_count, stale_lock_count = _cleanup_stale_runtime_state(db)
 
             assert stale_count == 1
+            assert zombie_count == 0
+            assert stale_lock_count == 1
 
             # 验证原有 completed/failed 未被修改
             r1_db = db.query(Round).filter(Round.id == r1.id).first()
@@ -112,3 +135,22 @@ class TestStartupCleanup:
             r2_db = db.query(Round).filter(Round.id == r2.id).first()
             assert r2_db.final_response == "error"
             assert r2_db.status == "failed"
+
+            # 验证用户运行锁已清空
+            assert db.query(UserRunLock).count() == 0
+
+    def test_user_run_locks_cleared_on_startup(self, in_memory_db):
+        """重启清理会清空所有 user_run_locks，避免残留锁导致 429。"""
+        engine, Session = in_memory_db
+        with Session() as db:
+            lock1 = UserRunLock(user_id="u1", session_id="s1", lock_id=str(uuid.uuid4()))
+            lock2 = UserRunLock(user_id="u2", session_id="s2", lock_id=str(uuid.uuid4()))
+            db.add_all([lock1, lock2])
+            db.commit()
+
+            stale_count, zombie_count, stale_lock_count = _cleanup_stale_runtime_state(db)
+
+            assert stale_count == 0
+            assert zombie_count == 0
+            assert stale_lock_count == 2
+            assert db.query(UserRunLock).count() == 0

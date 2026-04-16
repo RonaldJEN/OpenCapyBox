@@ -14,9 +14,11 @@ interface FilePreviewProps {
   file: FileInfo | null;
   sessionId: string;
   onClose: () => void;
+  previewUrlBuilder?: (file: FileInfo) => string;
+  onDownloadFile?: (file: FileInfo) => Promise<void>;
 }
 
-export function FilePreview({ file, sessionId, onClose }: FilePreviewProps) {
+export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDownloadFile }: FilePreviewProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [textContent, setTextContent] = useState('');
@@ -67,6 +69,7 @@ export function FilePreview({ file, sessionId, onClose }: FilePreviewProps) {
 
   const getPreviewApiUrl = () => {
     if (!file) return '';
+    if (previewUrlBuilder) return previewUrlBuilder(file);
     return `/api/sessions/${sessionId}/files/${encodeURIComponent(file.path)}?preview=true`;
   };
 
@@ -190,7 +193,11 @@ export function FilePreview({ file, sessionId, onClose }: FilePreviewProps) {
   const handleDownload = async () => {
     if (!file) return;
     try {
-      await apiService.downloadFile(sessionId, file.path);
+      if (onDownloadFile) {
+        await onDownloadFile(file);
+      } else {
+        await apiService.downloadFile(sessionId, file.path);
+      }
     } catch (err) {
       console.error('Failed to download file:', err);
       setError('下载文件失败');

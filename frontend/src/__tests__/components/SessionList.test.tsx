@@ -134,4 +134,14 @@ describe('SessionList 組件', () => {
 
     expect(screen.queryByTitle('新建对话')).not.toBeInTheDocument();
   });
+
+  it('cronUnreadCount 大于 0 时显示日程未读数字徽标', async () => {
+    render(<SessionList onSessionSelect={vi.fn()} cronUnreadCount={2} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('日程管理')).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('2')).toBeInTheDocument();
+  });
 });

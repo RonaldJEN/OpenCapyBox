@@ -55,6 +55,11 @@ def parse_cron_fields(cron_expr: str) -> dict | None:
     return dict(zip(keys, parts))
 
 
+# re-export 以保持已有 import 不破坏
+from src.api.utils.sandbox_helpers import extract_command_stdout  # noqa: F401
+from src.api.utils.sandbox_helpers import extract_command_stdout as _extract_command_stdout  # noqa: F401
+
+
 # ============================================================
 # CronService — DB 驱动
 # ============================================================
@@ -88,25 +93,19 @@ class CronService:
         return self.get_jobs(user_id)
 
     def get_run_history(
-        self, user_id: str, job_name: str | None = None, limit: int = 20
-    ) -> list[dict]:
-        """获取执行历史"""
+        self, user_id: str, job_name: str | None = None, limit: int = 20, offset: int = 0,
+    ) -> tuple[list[dict], int]:
+        """获取执行历史（分页）
+
+        Returns:
+            (runs_list, total_count)
+        """
         query = self.db.query(CronJobRun).filter(CronJobRun.user_id == user_id)
         if job_name:
             query = query.filter(CronJobRun.job_name == job_name)
-        runs = query.order_by(CronJobRun.started_at.desc()).limit(limit).all()
-        return [
-            {
-                "id": r.id,
-                "job_name": r.job_name,
-                "cron_expr": r.cron_expr,
-                "started_at": r.started_at.isoformat() if r.started_at else None,
-                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-                "status": r.status,
-                "output": r.output,
-            }
-            for r in runs
-        ]
+        total = query.count()
+        runs = query.order_by(CronJobRun.started_at.desc()).offset(offset).limit(limit).all()
+        return [r.to_dict() for r in runs], total
 
 
 def register_user_jobs(db: DBSession, user_id: str, scheduler) -> int:
@@ -183,6 +182,8 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
     if not run_id:
         run_id = str(uuid.uuid4())
 
+    run_workspace: str | None = None
+
     # 从 CronJob 表查任务定义
     with SessionLocal() as db:
         job = (
@@ -214,6 +215,7 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                 job_name=job_name,
                 cron_expr=cron_expr,
                 status="running",
+                is_read=False,
             )
             db.add(run_record)
             db.commit()
@@ -254,17 +256,34 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                 model=settings.llm_model,
             )
 
-        # 简单的单次 LLM 调用（带工具）
-        from src.agent.tools.sandbox_bash_tool import SandboxBashTool
-        from src.agent.tools.sandbox_file_tools import SandboxReadTool, SandboxWriteTool
+        # 创建与聊天 Agent 相同的工具集（排除 AskUserQuestionTool，Cron 无人交互）
         from src.api.services.sandbox_service import get_sandbox_mount_path
+        from src.api.services.tool_factory import create_agent_tools
 
         mount = get_sandbox_mount_path()
-        tools = [
-            SandboxBashTool(sandbox=sandbox, workspace_dir=mount),
-            SandboxReadTool(sandbox=sandbox, workspace_dir=mount),
-            SandboxWriteTool(sandbox=sandbox, workspace_dir=mount),
-        ]
+        run_workspace = f"{mount}/cron/runs/{run_id}"
+
+        # 确保 run 工作目录存在
+        await sandbox.commands.run(f"mkdir -p {run_workspace}")
+
+        tools, _ = await create_agent_tools(
+            sandbox=sandbox,
+            workspace_dir=run_workspace,
+            mount=mount,
+            user_id=user_id,
+            db_session_factory=SessionLocal,
+            exclude={
+                "AskUserQuestionTool",
+                "SandboxSessionNoteTool",
+                "SandboxRecallNoteTool",
+                "RecordDailyLogTool",
+                "UpdateLongTermMemoryTool",
+                "SearchMemoryTool",
+                "ReadUserProfileTool",
+                "UpdateUserProfileTool",
+                "ManageCronTool",
+            },
+        )
 
         task_prompt = (
             f"你是一个定时任务执行器。请执行以下任务：\n\n"
@@ -277,10 +296,13 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
 
         agent = Agent(
             llm_client=llm_client,
-            system_prompt="You are a cron job executor. Complete the task efficiently.",
+            system_prompt=(
+                "You are a cron job executor. Complete the task efficiently.\n"
+                f"所有产出文件必须保存在当前工作目录下（{run_workspace}），禁止写入其他路径。"
+            ),
             tools=tools,
             max_steps=10,
-            workspace_dir=f"{mount}/cron",
+            workspace_dir=run_workspace,
             token_limit=50000,
         )
 
@@ -299,6 +321,9 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
 
         output = final_response or "Task completed (no output)"
 
+        # 扫描产物文件
+        artifacts_json = await _scan_run_artifacts(sandbox, run_workspace)
+
         # 更新执行记录
         with SessionLocal() as db:
             record = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
@@ -306,12 +331,11 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                 record.status = "success"
                 record.completed_at = now_naive()
                 record.output = output[:10000]  # 截断
+                record.run_workspace = run_workspace
+                record.artifacts = artifacts_json
                 db.commit()
 
         logger.info("Cron 任务完成 (user=%s, job=%s)", user_id, job_name)
-
-        # 注入结果到用户最近活跃的 Session
-        await _inject_cron_result_to_chat(user_id, job_name, output)
 
         return output
 
@@ -324,56 +348,97 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                 record.status = "failed"
                 record.completed_at = now_naive()
                 record.output = f"Error: {e}"
+                record.run_workspace = run_workspace
                 db.commit()
 
         return None
 
 
-async def _inject_cron_result_to_chat(
-    user_id: str, job_name: str, output: str
-) -> None:
-    """将 Cron 执行结果注入到用户最近活跃的 Session
+def _build_artifact(full_path: str, run_workspace: str, size: int = 0) -> dict | None:
+    """将完整路径转换为产物元数据 dict，不合法返回 None。"""
+    full_path = full_path.strip()
+    if not full_path or len(full_path) > 500:
+        return None
+    rel_path = full_path
+    if full_path.startswith(run_workspace + "/"):
+        rel_path = full_path[len(run_workspace) + 1:]
+    elif full_path.startswith(run_workspace):
+        rel_path = full_path[len(run_workspace):]
+    if not rel_path:
+        return None
+    name = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    return {"name": name, "path": rel_path, "size": size, "type": ext}
 
-    创建一个系统 Round，包含完整的 AG-UI 事件序列，
-    前端可通过轮询发现新 round 并展示。
+
+def _artifacts_to_json(artifacts: list[dict]) -> str | None:
+    """将产物列表序列化为 JSON，超过 64KB 则截断到 100 条。"""
+    import json
+    if not artifacts:
+        return None
+    json_str = json.dumps(artifacts, ensure_ascii=False)
+    if len(json_str) > 65536:
+        artifacts = artifacts[:100]
+        json_str = json.dumps(artifacts, ensure_ascii=False)
+    return json_str
+
+
+async def _scan_run_artifacts(sandbox, run_workspace: str) -> str | None:
+    """扫描 run_workspace 下的产物文件，返回 JSON 字符串。
+
+    限制：最多 200 个文件，单路径最长 500 字符，总 JSON ≤ 64KB。
+    扫描失败不阻塞主流程。
     """
     try:
-        from src.api.models.database import SessionLocal
-        from src.api.models.session import Session
-
-        with SessionLocal() as db:
-            # 查找用户最近活跃的 Session
-            session = (
-                db.query(Session)
-                .filter(Session.user_id == user_id, Session.status == "active")
-                .order_by(Session.updated_at.desc())
-                .first()
-            )
-            if not session:
-                logger.info("用户 %s 无活跃 Session，跳过 Cron 结果注入", user_id)
-                return
-
-            session_id = session.id
-
-            # 更新 Session.updated_at 以便前端轮询检测
-            session.updated_at = now_naive()
-            db.commit()
-
-        # 注入系统 Round
-        from src.api.services.history_service import HistoryService
-
-        with SessionLocal() as db:
-            history_svc = HistoryService(db)
-            history_svc.inject_system_round(
-                session_id=session_id,
-                content=f"⏰ **定时任务 `{job_name}` 执行完成**\n\n{output}",
-                source=f"cron:{job_name}",
-            )
-
-        logger.info(
-            "Cron 结果已注入 Session (user=%s, session=%s, job=%s)",
-            user_id, session_id, job_name,
+        # find -printf 是 GNU findutils 内置，不依赖外部 stat 命令
+        # %p = 完整路径, %s = 文件大小(bytes)
+        cmd = (
+            f"find {run_workspace} -maxdepth 3 -type f "
+            f"-printf '%p\\t%s\\n' 2>/dev/null | head -200"
         )
+        result = await sandbox.commands.run(cmd)
+        stdout = _extract_command_stdout(result)
+
+        # fallback: stat -c（兼容 BusyBox 等不支持 find -printf 的环境）
+        if not stdout.strip():
+            cmd = (
+                f"find {run_workspace} -maxdepth 3 -type f "
+                f"-exec stat -c '%n\\t%s' {{}} \\; 2>/dev/null | head -200"
+            )
+            result = await sandbox.commands.run(cmd)
+            stdout = _extract_command_stdout(result)
+
+        # fallback: 仅路径（最大兼容），size 置 0
+        if not stdout.strip():
+            cmd = f"find {run_workspace} -maxdepth 3 -type f 2>/dev/null | head -200"
+            result = await sandbox.commands.run(cmd)
+            path_only = _extract_command_stdout(result)
+            if path_only.strip():
+                artifacts = [
+                    a for line in path_only.strip().split("\n")
+                    if (a := _build_artifact(line, run_workspace)) is not None
+                ]
+                return _artifacts_to_json(artifacts)
+
+        if not stdout.strip():
+            return None
+
+        artifacts = []
+        for line in stdout.strip().split("\n"):
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            full_path, size_str = parts
+            try:
+                size = int(size_str)
+            except ValueError:
+                size = 0
+            a = _build_artifact(full_path, run_workspace, size)
+            if a is not None:
+                artifacts.append(a)
+
+        return _artifacts_to_json(artifacts)
 
     except Exception as e:
-        logger.warning("Cron 结果注入失败 (user=%s, job=%s): %s", user_id, job_name, e)
+        logger.warning("扫描 Cron 产物失败 (workspace=%s): %s", run_workspace, e)
+        return None

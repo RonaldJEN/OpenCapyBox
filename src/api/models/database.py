@@ -96,6 +96,10 @@ _PENDING_COLUMNS = [
     ("rounds", "idempotency_key", "VARCHAR(64)"),
     ("conversation_messages", "is_synthetic", "BOOLEAN DEFAULT 0"),
     ("user_run_locks", "lock_id", "VARCHAR(36) DEFAULT ''"),
+    # Cron 消息中心：未读标记（存量默认已读）、产物元数据、运行工作目录
+    ("cron_job_runs", "is_read", "BOOLEAN DEFAULT 1"),
+    ("cron_job_runs", "artifacts", "TEXT"),
+    ("cron_job_runs", "run_workspace", "VARCHAR(500)"),
 ]
 
 

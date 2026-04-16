@@ -65,17 +65,13 @@ def encode_filename_header(filename: str, disposition: str = "attachment") -> st
 
 
 def _command_stdout_text(execution) -> str:
-    logs = getattr(execution, "logs", None)
-    stdout_lines = getattr(logs, "stdout", None)
-    if stdout_lines:
-        chunks = []
-        for line in stdout_lines:
-            chunks.append(getattr(line, "text", str(line)))
-        return "\n".join(chunks).strip()
-    direct_stdout = getattr(execution, "stdout", None)
-    if isinstance(direct_stdout, str):
-        return direct_stdout.strip()
-    return ""
+    """兼容 OpenSandbox 命令结果的 stdout 提取。
+
+    委托给统一工具函数，保持向后兼容的本地名称。
+    """
+    from src.api.utils.sandbox_helpers import extract_command_stdout
+    text = extract_command_stdout(execution)
+    return text.strip()
 
 
 def _extract_exit_code(execution) -> int:

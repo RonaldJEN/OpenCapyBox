@@ -15,12 +15,13 @@ interface SessionListProps {
   isCollapsed?: boolean;
   onModelChange?: (modelId: string) => void;
   onNewChat?: () => void;
+  cronUnreadCount?: number;
   onOpenConfig?: () => void;
   onOpenSkills?: () => void;
   onOpenCron?: () => void;
 }
 
-export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionId, onRunningSessionDetected, isCollapsed = false, onModelChange, onNewChat, onOpenConfig, onOpenSkills, onOpenCron }: SessionListProps) {
+export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionId, onRunningSessionDetected, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenSkills, onOpenCron }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
@@ -30,7 +31,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     loadSessions();
   }, [refreshTrigger, currentSessionId]);
 
-  // 30s 自动刷新（检测 Cron 注入等后台更新）
+  // 30s 自动刷新会话列表
   useEffect(() => {
     const timer = setInterval(() => {
       loadSessions();
@@ -208,10 +209,15 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
         </button>
         <button
           onClick={onOpenCron}
-          className="w-full flex items-center space-x-3 px-3 py-2 text-sm text-claude-secondary hover:bg-claude-hover rounded-lg transition-all group"
+          className="w-full flex items-center gap-3 px-3 py-2 text-sm text-claude-secondary hover:bg-claude-hover rounded-lg transition-all group"
         >
           <Clock size={16} className="text-claude-muted group-hover:text-claude-secondary" />
-          <span>日程管理</span>
+          <span className="flex-1 text-left">日程管理</span>
+          {cronUnreadCount > 0 && (
+            <span className="ml-auto inline-flex min-w-[18px] h-[18px] items-center justify-center px-1 text-[10px] font-bold leading-none text-white bg-red-500 rounded-full">
+              {cronUnreadCount > 99 ? '99+' : cronUnreadCount}
+            </span>
+          )}
         </button>
         <button
           onClick={handleLogout}

@@ -7,6 +7,7 @@ import AgentConfig from './components/AgentConfig';
 import CronSchedule from './components/CronSchedule';
 import SkillManager from './components/SkillManager';
 import { apiService } from './services/api';
+import { getUnreadCount } from './services/configApi';
 import type { ModelInfo } from './types';
 
 type ConfigPanel = 'config' | 'skills' | 'cron' | null;
@@ -21,6 +22,7 @@ function HomePage() {
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [activePanel, setActivePanel] = useState<ConfigPanel>(null);
   const [panelMounted, setPanelMounted] = useState(false);
+  const [cronUnreadCount, setCronUnreadCount] = useState(0);
 
   const closeConfigPanel = useCallback(() => {
     setActivePanel(null);
@@ -44,6 +46,16 @@ function HomePage() {
       console.error('Failed to load models:', err);
     });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 加载 Cron 未读计数 + 60s 轮询
+  useEffect(() => {
+    const fetchUnread = () => {
+      getUnreadCount().then((r) => setCronUnreadCount(r.count)).catch(() => {});
+    };
+    fetchUnread();
+    const timer = setInterval(fetchUnread, 60000);
+    return () => clearInterval(timer);
+  }, []);
 
   // 刷新会话列表的回调
   const handleTitleUpdated = () => {
@@ -93,6 +105,7 @@ function HomePage() {
         isCollapsed={isSidebarCollapsed}
         onModelChange={setSelectedModelId}
         onNewChat={() => setCurrentSessionId('')}
+        cronUnreadCount={cronUnreadCount}
         onOpenConfig={() => {
           const next = activePanel === 'config' ? null : 'config';
           setActivePanel(next);
@@ -139,7 +152,7 @@ function HomePage() {
           >
             {activePanel === 'config' && <AgentConfig onClose={closeConfigPanel} />}
             {activePanel === 'skills' && <SkillManager onClose={closeConfigPanel} />}
-            {activePanel === 'cron' && <CronSchedule onClose={closeConfigPanel} />}
+            {activePanel === 'cron' && <CronSchedule onClose={closeConfigPanel} unreadCount={cronUnreadCount} onUnreadChange={setCronUnreadCount} />}
           </div>
         </>
       )}

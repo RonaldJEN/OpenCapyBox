@@ -512,9 +512,9 @@ class TestCommandStdoutText:
         from src.api.routes.sessions import _command_stdout_text
 
         line1 = MagicMock()
-        line1.text = "hello"
+        line1.text = "hello\n"
         line2 = MagicMock()
-        line2.text = "world"
+        line2.text = "world\n"
         execution = MagicMock()
         execution.logs.stdout = [line1, line2]
         assert _command_stdout_text(execution) == "hello\nworld"

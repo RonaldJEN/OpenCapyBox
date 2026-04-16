@@ -9,9 +9,10 @@ vi.mock('../../services/configApi', () => ({
     { name: 'weekday_check', cron_expr: '0 10 * * 1-5', description: '工作日检查', enabled: true },
     { name: 'disabled_task', cron_expr: '*/30 * * * *', description: '已暂停', enabled: false },
   ]),
-  getCronRuns: vi.fn().mockResolvedValue([
-    { id: 'run-1', job_name: 'daily_report', cron_expr: '0 9 * * *', started_at: '2026-04-14T09:00:00Z', completed_at: '2026-04-14T09:01:00Z', status: 'success', output: 'done' },
-  ]),
+  getCronRuns: vi.fn().mockResolvedValue({
+    runs: [{ id: 'run-1', job_name: 'daily_report', cron_expr: '0 9 * * *', started_at: '2026-04-14T09:00:00Z', completed_at: '2026-04-14T09:01:00Z', status: 'success', output: 'done', is_read: true, artifacts: null, run_workspace: null }],
+    total: 1, offset: 0, limit: 20,
+  }),
   triggerCronJob: vi.fn().mockResolvedValue({ job_name: 'daily_report', run_id: 'fake-run-id', status: 'accepted', message: '后台任务已执行' }),
   getCronRunStatus: vi.fn().mockResolvedValue({ id: 'fake-run-id', job_name: 'daily_report', status: 'success', output: 'ok' }),
 }));
@@ -91,8 +92,8 @@ describe('CronSchedule', () => {
     vi.mocked(getCronJobs).mockResolvedValueOnce([
       { name: 'long_desc_task', cron_expr: '0 12 * * *', description: longDesc, enabled: true },
     ]);
-    vi.mocked(getCronRuns).mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
+    vi.mocked(getCronRuns).mockResolvedValueOnce({ runs: [], total: 0, offset: 0, limit: 20 })
+      .mockResolvedValueOnce({ runs: [], total: 0, offset: 0, limit: 20 });
 
     render(<CronSchedule />);
 

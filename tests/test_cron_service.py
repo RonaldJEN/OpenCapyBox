@@ -6,8 +6,9 @@
 - CronService CRUD
 - Cron 路由端点（trigger_job run_id、get_run_status）
 """
+import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.helpers import make_query_db, make_test_client
 
@@ -20,9 +21,10 @@ def _make_cron_service(*, query_return=None, first_return=None):
     from src.api.services.cron_service import CronService
 
     mock_db = make_query_db(first=first_return, all_results=query_return)
-    # CronService 还会用到 .order_by().limit().all()
+    # CronService 还会用到 .order_by().limit().all() 和 .order_by().offset().limit().all()
     if query_return is not None:
         mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = query_return
+        mock_db.query.return_value.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all.return_value = query_return
     return CronService(mock_db), mock_db
 
 
@@ -101,11 +103,23 @@ class TestCronServiceDB:
         run1.completed_at = None
         run1.status = "success"
         run1.output = "ok"
+        run1.is_read = True
+        run1.artifacts = None
+        run1.run_workspace = None
+        run1.to_dict.return_value = {
+            "id": "r1", "job_name": "daily", "cron_expr": "0 9 * * *",
+            "started_at": None, "completed_at": None, "status": "success",
+            "output": "ok", "is_read": True, "artifacts": None, "run_workspace": None,
+        }
 
-        svc, _ = _make_cron_service(query_return=[run1])
-        runs = svc.get_run_history("user-1")
+        svc, mock_db = _make_cron_service(query_return=[run1])
+        # get_run_history 还需要 count() 支持
+        mock_db.query.return_value.filter.return_value.count.return_value = 1
+        runs, total = svc.get_run_history("user-1")
+        assert total == 1
         assert len(runs) == 1
         assert runs[0]["job_name"] == "daily"
+        assert runs[0]["is_read"] is True
 
 
 class TestRegisterUserJobs:
@@ -230,6 +244,14 @@ class TestCronRoutes:
         mock_run.completed_at = None
         mock_run.status = "running"
         mock_run.output = None
+        mock_run.is_read = False
+        mock_run.artifacts = None
+        mock_run.run_workspace = None
+        mock_run.to_dict.return_value = {
+            "id": "run-uuid-123", "job_name": "daily", "cron_expr": "0 9 * * *",
+            "started_at": None, "completed_at": None, "status": "running",
+            "output": None, "is_read": False, "artifacts": None, "run_workspace": None,
+        }
 
         client.mock_db.query.return_value.filter.return_value.first.return_value = mock_run
 
@@ -282,3 +304,67 @@ class TestRunCronJobFallback:
         assert pre_run.status == "failed"
         assert pre_run.output == "任务不存在"
         mock_db.commit.assert_called()
+
+
+class TestScanRunArtifacts:
+    """_scan_run_artifacts 扫描兼容性测试"""
+
+    @pytest.mark.asyncio
+    async def test_extracts_files_from_logs_stdout(self):
+        """OpenSandbox 若仅在 logs.stdout 返回内容，仍应正确提取产物。"""
+        from src.api.services.cron_service import _scan_run_artifacts
+
+        run_workspace = "/home/user/cron/runs/run-1"
+        line = MagicMock()
+        line.text = f"{run_workspace}/report.md\t128\n"
+
+        cmd_result = MagicMock()
+        cmd_result.logs = MagicMock(stdout=[line])
+        cmd_result.stdout = ""
+
+        sandbox = MagicMock()
+        sandbox.commands = MagicMock()
+        sandbox.commands.run = AsyncMock(return_value=cmd_result)
+
+        artifacts_json = await _scan_run_artifacts(sandbox, run_workspace)
+        assert artifacts_json is not None
+
+        artifacts = json.loads(artifacts_json)
+        assert len(artifacts) == 1
+        assert artifacts[0]["name"] == "report.md"
+        assert artifacts[0]["path"] == "report.md"
+        assert artifacts[0]["size"] == 128
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_plain_find_when_printf_unavailable(self):
+        """当 -printf/stat 输出不可用时，仍可回退到基础 find 列表。"""
+        from src.api.services.cron_service import _scan_run_artifacts
+
+        run_workspace = "/home/user/cron/runs/run-2"
+
+        empty_result_1 = MagicMock()
+        empty_result_1.logs = MagicMock(stdout=[])
+        empty_result_1.stdout = ""
+
+        empty_result_2 = MagicMock()
+        empty_result_2.logs = MagicMock(stdout=[])
+        empty_result_2.stdout = ""
+
+        plain_line = MagicMock()
+        plain_line.text = f"{run_workspace}/news.md\n"
+        plain_result = MagicMock()
+        plain_result.logs = MagicMock(stdout=[plain_line])
+        plain_result.stdout = ""
+
+        sandbox = MagicMock()
+        sandbox.commands = MagicMock()
+        sandbox.commands.run = AsyncMock(side_effect=[empty_result_1, empty_result_2, plain_result])
+
+        artifacts_json = await _scan_run_artifacts(sandbox, run_workspace)
+        assert artifacts_json is not None
+
+        artifacts = json.loads(artifacts_json)
+        assert len(artifacts) == 1
+        assert artifacts[0]["name"] == "news.md"
+        assert artifacts[0]["path"] == "news.md"
+        assert artifacts[0]["size"] == 0

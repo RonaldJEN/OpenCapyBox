@@ -69,10 +69,14 @@
 
 | 接口 | 前端使用 | 调用位置 |
 |------|----------|----------|
-| `GET /api/cron/jobs` | ✅ | `configApi.ts:100` (`getCronJobs` 方法)<br>`src/components/CronSchedule.tsx` |
-| `GET /api/cron/runs` | ✅ | `configApi.ts:105` (`getCronRuns` 方法)<br>`src/components/CronSchedule.tsx` |
-| `GET /api/cron/runs/{run_id}` | ✅ | `configApi.ts:126` (`getCronRunStatus` 方法)<br>`src/components/CronSchedule.tsx`（手动触发后轮询执行状态） |
-| `POST /api/cron/jobs/{job_name}/run` | ✅ | `configApi.ts:118` (`triggerCronJob` 方法，返回 `run_id` 供轮询)<br>`src/components/CronSchedule.tsx` |
+| `GET /api/cron/jobs` | ✅ | `configApi.ts` (`getCronJobs` 方法)<br>`src/components/CronSchedule.tsx` |
+| `GET /api/cron/runs` | ✅ | `configApi.ts` (`getCronRuns` 方法，分页返回 `{runs, total, offset, limit}`)<br>`src/components/CronSchedule.tsx`、`src/components/CronMessageCenter.tsx` |
+| `GET /api/cron/runs/{run_id}` | ✅ | `configApi.ts` (`getCronRunStatus` 方法)<br>`src/components/CronSchedule.tsx`（手动触发后轮询执行状态） |
+| `POST /api/cron/jobs/{job_name}/run` | ✅ | `configApi.ts` (`triggerCronJob` 方法，返回 `run_id` 供轮询)<br>`src/components/CronSchedule.tsx` |
+| `GET /api/cron/runs/unread-count` | ✅ | `configApi.ts` (`getUnreadCount` 方法)<br>`src/App.tsx`（60s 轮询）、`src/components/SessionList.tsx`（红点徽标） |
+| `POST /api/cron/runs/mark-read` | ✅ | `configApi.ts` (`markCronRunsRead(runId?)` 方法)<br>`src/components/CronMessageCenter.tsx`（展开具体未读成功任务时标记） |
+| `GET /api/cron/runs/{run_id}/files` | ✅ | `configApi.ts` (`getCronRunFiles` 方法)<br>`src/components/CronMessageCenter.tsx`（展开详情时加载） |
+| `GET /api/cron/runs/{run_id}/files/{path}` | ✅ | `configApi.ts` (`downloadCronRunFile` 方法，携带 Authorization 下载 Blob)<br>`src/components/CronMessageCenter.tsx` |
 
 ---
 
@@ -96,7 +100,8 @@
 | `src/components/SessionList.tsx` | 会话列表管理，支持自动折叠和 CSS Transition 动画 |
 | `src/components/ChatV2.tsx` | 聊天界面：配合左侧折叠与右侧覆盖式抽屉（Overlay Drawer），实现按会话记忆/恢复滚动位置，欢迎页「输入即创建会话」 |
 | `src/components/AgentConfig.tsx` | Agent 配置文件编辑面板（USER/SOUL/AGENTS/MEMORY） |
-| `src/components/CronSchedule.tsx` | 日程管理面板：日历周视图 + 任务管理列表 + 手动执行（轮询 run_id） |
+| `src/components/CronSchedule.tsx` | 日程管理面板：日历周视图 + 任务管理列表 + 消息中心（三 Tab 切换），手动执行（轮询 run_id） |
+| `src/components/CronMessageCenter.tsx` | Cron 消息中心：执行历史列表（分页）、Markdown 输出渲染、产物文件预览与下载、自动标记已读 |
 | `src/components/SkillManager.tsx` | Skill 启用/禁用管理面板 |
 | `src/components/ReasoningPanel.tsx` | 推理面板（Claude Display Blocks 风格），含 ThinkingBlock / ToolGroupBlock / DoneMarker 等子组件 |
 | `src/utils/displayBlocks.ts` | Display Blocks 转换层：将 StepData[] 聚合为 DisplayBlock[]，含工具描述、diff 统计、thinking 计时 |

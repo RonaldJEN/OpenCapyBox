@@ -62,9 +62,10 @@ async def startup_event():
     init_db()
     print(f"✅ 数据库初始化完成")
 
-    # 清理上次进程残留的 running 轮次（服务器重启后 Agent 已不再运行）
+    # 清理上次进程残留的运行状态（服务器重启后 Agent 已不再运行）
     try:
         from src.api.models.round import Round
+        from src.api.models.user_run_lock import UserRunLock
         from src.api.models.database import SessionLocal
         from src.api.utils.timezone import now_naive
 
@@ -89,13 +90,17 @@ async def startup_event():
                     "final_response": "[系统重启，中断问答已失效]",
                 })
             )
+            # 重启后旧进程已退出，用户运行锁全部失效，直接清空避免启动后 429 卡住
+            stale_lock_count = db.query(UserRunLock).delete(synchronize_session=False)
             db.commit()
             if stale_count:
                 print(f"⚠️  已清理 {stale_count} 个残留的 running 轮次（标记为 failed）")
             if zombie_count:
                 print(f"⚠️  已清理 {zombie_count} 个残留的 interrupted 轮次（标记为 failed）")
+            if stale_lock_count:
+                print(f"⚠️  已清理 {stale_lock_count} 条残留的 user_run_locks")
     except Exception as e:
-        print(f"⚠️  清理残留轮次失败: {e}")
+        print(f"⚠️  清理残留运行状态失败: {e}")
 
     # 校驗 Model Registry（啟動時預檢，自動停用 key 缺失的模型）
     try:
