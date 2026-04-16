@@ -61,8 +61,9 @@ class Settings(BaseSettings):
     skills_dir: str = ""          # 留空則自動定位到 src/agent/skills/
 
     # SSE 订阅配置
-    sse_heartbeat_interval: int = 15  # 心跳间隔（秒）
-    sse_subscribe_timeout: int = 300  # 订阅超时（秒，5分钟）
+    sse_heartbeat_interval: int = 15  # 心跳间隔（秒），同时用作锁心跳写入间隔
+    sse_subscribe_timeout: int = 300  # 订阅超时（秒，5分钟），同时用作锁陈旧阈值
+    cancel_watcher_interval_seconds: float = 3.0  # 跨 worker 轮询间隔（秒）：取消请求检查 + 订阅事件补偿
 
     # Embedding 配置（不填则向量检索降级为关键词搜索）
     embedding_api_key: str = ""

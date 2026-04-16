@@ -75,6 +75,29 @@ class TestHistoryServiceRound:
         
         assert result is None
 
+    def test_complete_round_skips_terminal_status(self, history_service, mock_db):
+        """已處於終態的 round 不應被 complete_round 覆寫。
+
+        回归：跨 worker 场景下 abort 将 round 标为 cancelled，但另一
+        worker 上的 Agent 仍尝试 complete_round(status=completed)，
+        导致状态矛盾。
+        """
+        for terminal in ("completed", "failed", "cancelled"):
+            mock_round = MagicMock()
+            mock_round.status = terminal
+            mock_round.id = "round-terminal"
+            mock_db.query.return_value.filter.return_value.first.return_value = mock_round
+
+            result = history_service.complete_round(
+                round_id="round-terminal",
+                final_response="should not overwrite",
+                step_count=99,
+                status="completed",
+            )
+
+            assert result.status == terminal, f"终态 {terminal} 不应被覆写"
+            mock_db.commit.reset_mock()
+
 
 class TestHistoryServiceGetSessionRounds:
     """獲取會話輪次測試"""

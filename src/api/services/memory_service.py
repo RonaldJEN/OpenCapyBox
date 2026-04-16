@@ -532,7 +532,7 @@ class MemoryService:
                             or getattr(getattr(read_err, 'response', None), 'status_code', None)
                             or getattr(read_err, 'status', None)
                         )
-                        if status == 404:
+                        if status == 404 or isinstance(read_err, FileNotFoundError):
                             pass  # 文件不存在，继续走下方 DB→沙箱推送
                         else:
                             logger.warning("读取沙箱文件失败 (%s)，跳过同步: %s", filename, read_err)

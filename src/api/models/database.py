@@ -14,6 +14,8 @@ def _import_models():
     from src.api.models import session as _  # noqa: F401
     from src.api.models import round as _  # noqa: F401
     from src.api.models import agui_event as _  # noqa: F401
+    from src.api.models import user_run_lock as _  # noqa: F401
+    from src.api.models import run_cancel_request as _  # noqa: F401
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
     from src.api.models.conversation_message import ConversationMessage as _  # noqa: F401
     from src.api.models.user_memory import (  # noqa: F401
@@ -26,9 +28,10 @@ logger = logging.getLogger(__name__)
 # 从 Settings 读取数据库 URL（可通过 .env 的 DATABASE_URL 覆盖）
 _settings = get_settings()
 DATABASE_URL = _settings.database_url
+_IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
 # 从 URL 推断并确保数据库目录存在
-if DATABASE_URL.startswith("sqlite"):
+if _IS_SQLITE:
     # sqlite:///./data/database/open_capy_box.db → ./data/database/
     _db_path = DATABASE_URL.split("///", 1)[-1]
     db_dir = Path(_db_path).parent
@@ -37,7 +40,11 @@ if DATABASE_URL.startswith("sqlite"):
 # 创建引擎
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},  # SQLite 需要
+    connect_args=(
+        {"check_same_thread": False, "timeout": 30}
+        if _IS_SQLITE
+        else {}
+    ),
     echo=False,  # 生产环境设为 False
 )
 
@@ -61,7 +68,20 @@ def init_db():
     """初始化数据库（创建所有表 + 安全迁移新增列）"""
     _import_models()
     Base.metadata.create_all(bind=engine)
+    _configure_sqlite_pragmas()
     _migrate_add_columns()
+
+
+def _configure_sqlite_pragmas():
+    """SQLite 运行时参数（仅 SQLite 生效）。"""
+    if not _IS_SQLITE:
+        return
+    try:
+        with engine.begin() as conn:
+            mode = conn.execute(text("PRAGMA journal_mode=WAL")).scalar()
+            logger.info("SQLite PRAGMA journal_mode=%s", mode)
+    except Exception:
+        logger.warning("设置 SQLite WAL 模式失败，继续使用默认 journal_mode", exc_info=True)
 
 
 # ============================================================
@@ -75,6 +95,7 @@ _PENDING_COLUMNS = [
     ("rounds", "interrupt_payload", "TEXT"),
     ("rounds", "idempotency_key", "VARCHAR(64)"),
     ("conversation_messages", "is_synthetic", "BOOLEAN DEFAULT 0"),
+    ("user_run_locks", "lock_id", "VARCHAR(36) DEFAULT ''"),
 ]
 
 

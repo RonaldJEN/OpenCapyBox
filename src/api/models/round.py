@@ -23,6 +23,18 @@ class Round(Base):
     - outcome = RunFinishedEvent.outcome（success | interrupt）
     """
 
+    # ----- 終態常量（全局唯一事實源）-----
+    # complete_round 終態：一旦進入，不允許被覆寫（防止跨 worker 狀態矛盾）。
+    # 注意 interrupted 不在此集合——它是「暫停等待用戶輸入」的中間態，
+    # resume 後 Agent 會繼續執行並最終 complete_round 為 completed/failed。
+    COMPLETE_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+
+    # subscribe 終態：subscribe_to_round 視為「不再產生新事件」的狀態集合。
+    # 比 COMPLETE 多了 interrupted 和 resumed——這些 round 不會再有事件推送。
+    SUBSCRIBE_TERMINAL_STATUSES: frozenset[str] = frozenset(
+        {"completed", "failed", "interrupted", "resumed", "cancelled"}
+    )
+
     __tablename__ = "rounds"
     __table_args__ = (
         # 注意：依賴 SQL 標準 NULL ≠ NULL 行為（SQLite, PostgreSQL 正確）。

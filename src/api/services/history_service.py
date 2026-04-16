@@ -14,6 +14,9 @@ from typing import List, Dict, Optional, AsyncIterator
 from datetime import datetime
 from src.api.utils.timezone import now_naive
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class HistoryService:
@@ -85,13 +88,26 @@ class HistoryService:
             self.db.commit()
         return updated
 
+    # 終態集合引用 Round 模型的全局常量（唯一事實源）。
+    _TERMINAL_STATUSES = Round.COMPLETE_TERMINAL_STATUSES
+
     def complete_round(
         self, round_id: str, final_response: str, step_count: int,
         status: str = "completed", interrupt_payload: str | None = None,
     ) -> Round:
-        """完成对话轮次"""
+        """完成对话轮次
+
+        若 round 已處於終態（completed/failed/cancelled），跳過更新並返回現有狀態，
+        避免跨 worker 的 Agent 覆寫 abort 設置的 cancelled 狀態。
+        """
         round_obj = self.db.query(Round).filter(Round.id == round_id).first()
         if round_obj:
+            if round_obj.status in self._TERMINAL_STATUSES:
+                logger.info(
+                    "Round %s 已處於終態 %s，跳過 complete_round(status=%s)",
+                    round_id, round_obj.status, status,
+                )
+                return round_obj
             round_obj.final_response = final_response
             round_obj.step_count = step_count
             round_obj.status = status
