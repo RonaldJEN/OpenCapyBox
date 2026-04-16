@@ -28,6 +28,7 @@
 # ============================================================
 
 default_model: glm-5
+cron_default_model: glm-5-no-think  # Cron 任务默认模型（不配置思考）
 
 models:
 
@@ -129,6 +130,19 @@ models:
     enable_thinking: true
     enabled: true
     tags: [thinking]
+  glm-5-no-think:
+    display_name: "智谱 GLM-5 (No Thinking)"
+    provider: openai
+    api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "${LLM_API_KEY}"
+    model_name: "glm-5"
+    max_tokens: 32768
+    context_window: 128000
+    reasoning_format: reasoning_content
+    reasoning_split: false
+    enable_thinking: false
+    enabled: true
+    tags: [cron]
   # ======================== Kimi（月之暗面，阿里 DashScope 三方）========================
   # 通過阿里 DashScope 統一接入，使用 LLM_API_KEY
 

@@ -241,7 +241,7 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
 
         try:
             from src.api.model_registry import get_model_registry
-            model_config = get_model_registry().get_default()
+            model_config = get_model_registry().get_cron_default()
             llm_client = LLMClient.from_model_config(model_config)
             cron_token_limit = model_config.compute_token_limit()
             cron_context_window = model_config.context_window

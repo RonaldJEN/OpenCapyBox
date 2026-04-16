@@ -440,7 +440,7 @@ class TestCronAgentConstruction:
         mock_model_config.compute_token_limit.return_value = 164232
 
         mock_registry = MagicMock()
-        mock_registry.get_default.return_value = mock_model_config
+        mock_registry.get_cron_default.return_value = mock_model_config
 
         with (
             patch("src.api.model_registry.get_model_registry", return_value=mock_registry),

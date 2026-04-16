@@ -258,11 +258,13 @@ class ModelRegistry:
         default_model_id: str,
         embedding_models: dict[str, EmbeddingModelConfig] | None = None,
         default_embedding_model_id: str = "",
+        cron_default_model_id: str = "",
     ):
         self._models = models
         self._default_model_id = default_model_id
         self._embedding_models = embedding_models or {}
         self._default_embedding_model_id = default_embedding_model_id
+        self._cron_default_model_id = cron_default_model_id or default_model_id
 
     @classmethod
     def load(cls, yaml_path: str | Path | None = None) -> "ModelRegistry":
@@ -292,6 +294,7 @@ class ModelRegistry:
             raise ValueError(f"YAML 格式錯誤：缺少 'models' 字段 ({yaml_path})")
 
         default_model_id = raw.get("default_model", "")
+        cron_default_model_id = raw.get("cron_default_model", "") or default_model_id
         models: dict[str, ModelConfig] = {}
 
         for model_id, cfg in raw["models"].items():
@@ -326,6 +329,14 @@ class ModelRegistry:
                 f"可選: {available}"
             )
 
+        # 校驗 cron_default_model 存在（可選字段）
+        if cron_default_model_id and cron_default_model_id not in models:
+            available = list(models.keys())
+            raise ValueError(
+                f"cron_default_model '{cron_default_model_id}' 不在 models 中。"
+                f"可選: {available}"
+            )
+
         # ---- 加載 Embedding 模型 ----
         embedding_models: dict[str, EmbeddingModelConfig] = {}
         default_embedding_model_id = raw.get("default_embedding_model", "")
@@ -357,6 +368,7 @@ class ModelRegistry:
             default_model_id=default_model_id,
             embedding_models=embedding_models,
             default_embedding_model_id=default_embedding_model_id,
+            cron_default_model_id=cron_default_model_id,
         )
         registry.validate_on_startup()
         return registry
@@ -420,6 +432,15 @@ class ModelRegistry:
         if config is None:
             raise ValueError(
                 f"默認模型 '{self._default_model_id}' 在配置中不存在"
+            )
+        return config
+
+    def get_cron_default(self) -> ModelConfig:
+        """獲取 Cron 任務默認模型（加載時已確定，無運行時 fallback）"""
+        config = self._models.get(self._cron_default_model_id)
+        if config is None:
+            raise ValueError(
+                f"cron_default_model '{self._cron_default_model_id}' 在配置中不存在"
             )
         return config
 

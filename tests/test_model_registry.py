@@ -277,6 +277,22 @@ class TestModelRegistryLoad:
         with pytest.raises(ValueError, match="nonexistent"):
             ModelRegistry.load(path)
 
+    def test_invalid_cron_default_model_raises(self, tmp_path):
+        """cron_default_model 指向不存在的模型時拋出 ValueError"""
+        data = self._minimal_yaml()
+        data["cron_default_model"] = "nonexistent-cron"
+        path = self._write_yaml(tmp_path, data)
+        with pytest.raises(ValueError, match="nonexistent-cron"):
+            ModelRegistry.load(path)
+
+    def test_load_with_cron_default_model(self, tmp_path):
+        """載入包含 cron_default_model 的 YAML"""
+        data = self._minimal_yaml()
+        data["cron_default_model"] = "test-model"
+        path = self._write_yaml(tmp_path, data)
+        registry = ModelRegistry.load(path)
+        assert registry.get_cron_default().id == "test-model"
+
     def test_invalid_provider_in_yaml_raises(self, tmp_path):
         """YAML 中無效 provider 拋出 ValueError"""
         data = self._minimal_yaml(provider="bad-provider")
@@ -363,6 +379,30 @@ class TestModelRegistryQuery:
         registry = ModelRegistry(models={}, default_model_id="")
         with pytest.raises(ValueError, match="未配置"):
             registry.get_default()
+
+    def test_get_cron_default_with_dedicated_model(self, registry):
+        """cron_default_model 單獨配置時返回專屬模型"""
+        cron_model = ModelConfig(
+            id="cron-model",
+            display_name="CronModel",
+            provider="openai",
+            api_base="https://c.com",
+            api_key="key",
+            model_name="cron-v1",
+            enabled=True,
+        )
+        models = {**registry._models, "cron-model": cron_model}
+        r = ModelRegistry(
+            models=models,
+            default_model_id="enabled-model",
+            cron_default_model_id="cron-model",
+        )
+        assert r.get_cron_default().id == "cron-model"
+
+    def test_get_cron_default_inherits_default_at_load(self, registry):
+        """未配置 cron_default_model 时，加载阶段继承 default_model"""
+        # registry fixture 未设 cron_default_model_id，应与 default 一致
+        assert registry.get_cron_default().id == "enabled-model"
 
     def test_list_models_enabled_only(self, registry):
         """僅列出啟用的模型"""
