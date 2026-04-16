@@ -43,7 +43,7 @@ interface ChatV2Props {
   sessionId: string;
   onTitleUpdated?: () => void;
   onExecutionStart?: (sessionId: string) => void;
-  onExecutionEnd?: () => void;
+  onExecutionEnd?: (sessionId?: string) => void;
   onPanelToggle?: (isOpen: boolean) => void;
   selectedModelId: string;
   onModelChange: (modelId: string) => void;
@@ -62,10 +62,25 @@ interface StreamCallbacksFactoryOptions {
   setBusyFalse: () => void;
   onStreamSuccess: () => void;
   onStreamError: (errorMsg: string, code?: string) => void;
+  /** 后端确认运行后（RUN_STARTED）才通知父组件，避免被拒请求（如 429）污染执行标记 */
+  notifyExecutionStart?: () => void;
+  /** 绑定的会话 ID，用于防止旧 SSE 回调在用户切换会话后污染新会话状态 */
+  boundSessionId?: string;
   shouldRefreshTitleOnFirstRound?: boolean;
   mirrorTextToFinalResponse?: boolean;
   setRoundRunningOnStart?: boolean;
 }
+
+/** 判断 RUN_FINISHED 事件是否表示用户主动取消（cancel_token 生效时后端发 outcome=interrupt + result.reason=user_cancelled） */
+const isUserCancelledOutcome = (outcome: string, interrupt: any, result?: any): boolean => {
+  if (outcome !== 'interrupt') return false;
+  if (result?.reason === 'user_cancelled') return true;
+  // fallback: outcome=interrupt 但无 interrupt 对象且无 reason，保守返回 false 以暴露问题
+  if (!interrupt) {
+    console.warn('RUN_FINISHED outcome=interrupt without interrupt details or user_cancelled reason, not treating as cancelled');
+  }
+  return false;
+};
 
 export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutionEnd, onPanelToggle, selectedModelId, onModelChange, availableModels = [], onCreateSession }: ChatV2Props) {
   const [rounds, setRounds] = useState<RoundData[]>([]);
@@ -134,6 +149,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const prevRoundsLengthRef = useRef<number>(0);
   const isInitialLoadRef = useRef<boolean>(true); // 🆕 标记是否是首次加载
   const subscriptionAbortRef = useRef<(() => void) | null>(null); // 🆕 保存订阅取消函数
+  const stoppingRef = useRef(false); // handleStop 正在执行，防止 SSE 回调竞态覆盖
+  const sessionIdRef = useRef(sessionId); // 追踪当前会话，防止旧 SSE 回调污染新会话状态
   const scrollPosBySessionRef = useRef<Record<string, number>>({});
   const pendingRestoreScrollRef = useRef<number | null>(null);
   const suppressAutoScrollRef = useRef<boolean>(false); // 切会话期间抑制自动 smooth 滚动
@@ -261,11 +278,14 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       subscriptionAbortRef.current = null;
     }
 
+    sessionIdRef.current = sessionId; // 立即更新，后续所有旧回调通过 ref 感知到会话已切换
     isInitialLoadRef.current = true; // 🆕 切换会话时重置为首次加载
     suppressAutoScrollRef.current = true; // 切会话期间抑制自动 smooth 滚动
     setIsAtBottom(false); // 避免会话切换瞬间误触发 smooth scroll
     historyLoadedRef.current = false; // 重置历史加载标记
     prevRoundsLengthRef.current = 0;
+    setSending(false); // 重置发送状态，loadHistory 会根据新会话是否有运行中轮次重新设置
+    setError('');
     setPendingInterrupt(null); // 切换会话时清除旧的中断状态
     setResuming(false);
     loadHistory();
@@ -430,6 +450,9 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
       // 🆕 检查是否有中断的轮次，恢复 QuestionCard
       if (!runningRound) {
+        // 当前会话没有运行中轮次，通知父组件清除该会话的执行标记（如有）
+        onExecutionEnd?.(sessionId);
+
         const interruptedRound = [...response.rounds].reverse().find(
           r => r.status === 'interrupted' && r.interrupt
         );
@@ -654,6 +677,12 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
           // 运行完成
           onRunFinished: (_threadId, runId, result, outcome, interrupt) => {
+            // 用户已切换到其他会话，释放旧会话的执行标记但跳过状态更新
+            if (sessionIdRef.current !== sessionId) {
+              onExecutionEnd?.(sessionId);
+              return;
+            }
+            const isUserCancelled = isUserCancelledOutcome(outcome, interrupt, result);
             setRounds((prev) =>
               prev.map((round) =>
                 round.round_id === runId
@@ -661,7 +690,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
                       ...round,
                       final_response: result?.finalResponse || round.final_response,
                       status: outcome === 'interrupt' ? 'interrupted' : (outcome === 'success' ? 'completed' : outcome),
-                      completed_at: outcome === 'interrupt' ? undefined : new Date().toISOString(),
+                      completed_at: (outcome === 'interrupt') ? undefined : new Date().toISOString(),
                     }
                   : round
               )
@@ -675,14 +704,24 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
               console.log(`⏸️ 轮次 ${runId} 中断，等待用户输入`);
               return;
             }
+            // 用户取消时清理残留的中断状态（如取消了一个 ask_user 中断的轮次）
+            if (isUserCancelled) {
+              setPendingInterrupt(null);
+            }
+            // handleStop 已接管 UI 状态更新，此处跳过避免竞态覆盖
+            if (stoppingRef.current) return;
             setSending(false);
-            onExecutionEnd?.();
+            onExecutionEnd?.(sessionId);
             subscriptionAbortRef.current = null;
             console.log(`✅ 轮次 ${runId} 订阅完成`);
           },
 
           // 错误处理
           onRunError: (errorMsg) => {
+            if (sessionIdRef.current !== sessionId) {
+              onExecutionEnd?.(sessionId);
+              return;
+            }
             setError(errorMsg);
             setRounds((prev) =>
               prev.map((round) =>
@@ -696,8 +735,9 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
                   : round
               )
             );
+            if (stoppingRef.current) return;
             setSending(false);
-            onExecutionEnd?.();
+            onExecutionEnd?.(sessionId);
             subscriptionAbortRef.current = null;
             console.error(`❌ 订阅错误: ${errorMsg}`);
           },
@@ -716,8 +756,13 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
         subscription.promise.catch((err) => {
           console.error('订阅失败:', err);
+          if (sessionIdRef.current !== sessionId) {
+            onExecutionEnd?.(sessionId);
+            return;
+          }
+          if (stoppingRef.current) return;
           setSending(false);
-          onExecutionEnd?.();
+          onExecutionEnd?.(sessionId);
           subscriptionAbortRef.current = null;
         });
       }
@@ -937,12 +982,21 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     setBusyFalse,
     onStreamSuccess,
     onStreamError,
+    notifyExecutionStart,
+    boundSessionId,
     shouldRefreshTitleOnFirstRound = false,
     mirrorTextToFinalResponse = false,
     setRoundRunningOnStart = false,
-  }: StreamCallbacksFactoryOptions): StreamCallbacks => ({
+  }: StreamCallbacksFactoryOptions): StreamCallbacks => {
+    /** 旧会话的回调是否已过期（用户切走） */
+    const isStale = () => boundSessionId !== undefined && sessionIdRef.current !== boundSessionId;
+
+    return {
     onRunStarted: (_threadId, runId) => {
+      if (isStale()) return;
       setCurrentRunId(runId);
+      // 后端已确认运行，此时才通知父组件设置执行标记
+      notifyExecutionStart?.();
 
       setRounds((prev) =>
         prev.map((r) =>
@@ -965,6 +1019,11 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     },
 
     onRunFinished: (_threadId, runId, result, outcome, interrupt) => {
+      if (isStale()) {
+        // 旧会话的执行已结束，通知父组件清除该会话的执行标记（避免侧栏残留）
+        if (boundSessionId) onStreamSuccess();
+        return;
+      }
       const finalContent = streamingContentRef.current.textContent;
       const targetRunId = runId || getCurrentRunId();
       setCurrentRunId(targetRunId);
@@ -983,7 +1042,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
               steps: completedSteps,
               final_response: result?.finalResponse || finalContent || round.final_response,
               status: outcome === 'interrupt' ? 'interrupted' : (outcome === 'success' ? 'completed' : outcome),
-              completed_at: outcome === 'interrupt' ? undefined : new Date().toISOString(),
+              completed_at: (outcome === 'interrupt') ? undefined : new Date().toISOString(),
             };
           }
           return round;
@@ -1007,6 +1066,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         }, 3000);
       }
 
+      const isUserCancelled = isUserCancelledOutcome(outcome, interrupt, result);
+
       if (outcome === 'interrupt' && interrupt) {
         setPendingInterrupt(interrupt);
         setAgentState((prev) => ({
@@ -1016,6 +1077,11 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         }));
         setBusyFalse();
         return;
+      }
+
+      // 用户取消时清理残留的中断状态（如取消了一个 ask_user 中断的轮次）
+      if (isUserCancelled) {
+        setPendingInterrupt(null);
       }
 
       setAgentState((prev) => ({
@@ -1029,6 +1095,28 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     },
 
     onRunError: (errorMsg, code) => {
+      if (isStale()) {
+        // 旧会话出错也视为执行结束，通知父组件清除该会话的执行标记
+        if (boundSessionId) onStreamError(errorMsg, code);
+        return;
+      }
+      // 用户主动取消不显示错误
+      if (code === 'USER_ABORT') {
+        setBusyFalse();
+        return;
+      }
+      // 并发限制：有其他会话在运行，只弹提示不标记 round 失败
+      if (code === 'USER_BUSY') {
+        setError(errorMsg);
+        // 移除这次未发出的临时 round
+        const runId = getCurrentRunId();
+        if (runId) {
+          setRounds((prev) => prev.filter((r) => r.round_id !== runId));
+        }
+        setBusyFalse();
+        onStreamError(errorMsg, code);
+        return;
+      }
       setError(`${errorMsg}${code ? ` (${code})` : ''}`);
       markRoundFailed(getCurrentRunId(), errorMsg);
       setBusyFalse();
@@ -1241,7 +1329,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         console.log(`⚡ Failover: 切换到备用模型 ${value?.model || ''}`);
       }
     },
-  });
+  };
+  };
 
   const handleSend = async () => {
     if ((!input.trim() && attachedFiles.length === 0) || sending || creatingSession) return;
@@ -1318,9 +1407,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       toolArgs: {},
     };
 
-    // 通知父组件开始执行
-    onExecutionStart?.(targetSessionId);
-
     // 立即创建并显示用户消息的round（使用临时ID）
     const tempRoundId = `temp-${Date.now()}`;
     const pendingRound: RoundData = {
@@ -1345,9 +1431,11 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         currentRunId = runId;
       },
       updateLastStep,
-      setBusyFalse: () => setSending(false),
-      onStreamSuccess: () => onExecutionEnd?.(),
-      onStreamError: () => onExecutionEnd?.(),
+      setBusyFalse: () => { if (!stoppingRef.current) setSending(false); },
+      onStreamSuccess: () => { if (!stoppingRef.current) onExecutionEnd?.(sessionId); },
+      onStreamError: () => { if (!stoppingRef.current) onExecutionEnd?.(sessionId); },
+      notifyExecutionStart: () => onExecutionStart?.(targetSessionId),
+      boundSessionId: targetSessionId,
       shouldRefreshTitleOnFirstRound: true,
       mirrorTextToFinalResponse: false,
       setRoundRunningOnStart: false,
@@ -1366,7 +1454,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       setError(errorMessage);
       setSending(false);
       setAgentState((prev) => ({ ...prev, status: 'error', lastUpdated: Date.now() }));
-      onExecutionEnd?.();
+      onExecutionEnd?.(sessionId);
     }
   };
 
@@ -1377,13 +1465,59 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   /** 当前发送按钮的 loading 文案（空 = 非 loading） */
   const sendingLabel = creatingSession ? '创建中' : resuming ? 'Resuming' : sending ? 'Running' : '';
 
-  /** 停止生成：调用后端 abort API，SSE 不断开，等后端推 RUN_FINISHED(interrupt) */
+  /** 停止生成：调用后端 abort API，立即更新 UI 状态（不等 SSE 推送 RUN_FINISHED） */
   const handleStop = async () => {
     if (!sessionId || !(sending || resuming)) return;
+    stoppingRef.current = true;
     try {
-      await apiService.abortChat(sessionId);
-    } catch (err) {
-      console.warn('Abort request failed (Agent may have already finished):', err);
+      try {
+        await apiService.abortChat(sessionId);
+      } catch (err) {
+        // abort 请求失败（网络错误/服务端异常），后端任务可能仍在运行
+        // 保持当前 sending/resuming 状态，等待 SSE 推送终态
+        console.warn('Abort request failed, keeping running state:', err);
+        return;
+      }
+
+      // 先取消 SSE 订阅，确保后续不会有事件回调覆盖状态
+      if (subscriptionAbortRef.current) {
+        subscriptionAbortRef.current();
+        subscriptionAbortRef.current = null;
+      }
+
+      // 再更新 UI 状态
+      // 1. 标记当前运行中的 round 为 interrupted（与后端 cancel_token 路径一致）
+      setRounds((prev) =>
+        prev.map((round) =>
+          round.status === 'running'
+            ? {
+                ...round,
+                status: 'interrupted',
+                steps: round.steps.map((s) =>
+                  s.status === 'streaming' || s.status === 'running'
+                    ? { ...s, status: 'completed' as const }
+                    : s
+                ),
+              }
+            : round
+        )
+      );
+
+      // 2. 重置 agent 状态
+      setAgentState((prev) => ({ ...prev, status: 'completed', lastUpdated: Date.now() }));
+
+      // 3. 停止 sending / resuming，清理中断状态
+      setSending(false);
+      setResuming(false);
+      setPendingInterrupt(null);
+
+      // 4. 通知父组件执行结束
+      onExecutionEnd?.(sessionId);
+    } finally {
+      // 利用宏任务（macrotask）延迟释放 stopping 标记：
+      // 当前调用栈中的同步 setState 全部 enqueue 后，React 在微任务中 batch commit，
+      // setTimeout(fn, 0) 作为宏任务在微任务之后执行，确保 commit 完成后再放行 SSE 回调。
+      setTimeout(() => { stoppingRef.current = false; }, 0);
     }
   };
 
@@ -1436,8 +1570,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       toolArgs: {},
     };
 
-    onExecutionStart?.(sessionId);
-
     const resumeCallbacks = createStreamCallbacks({
       tempRoundId: resumeTempRoundId,
       getCurrentRunId: () => currentResumeRunId,
@@ -1445,12 +1577,15 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         currentResumeRunId = runId;
       },
       updateLastStep,
-      setBusyFalse: () => setResuming(false),
-      onStreamSuccess: () => onExecutionEnd?.(),
+      setBusyFalse: () => { if (!stoppingRef.current) setResuming(false); },
+      onStreamSuccess: () => { if (!stoppingRef.current) onExecutionEnd?.(sessionId); },
       onStreamError: () => {
+        if (stoppingRef.current) return;
         setPendingInterrupt(interruptSnapshot);
-        onExecutionEnd?.();
+        onExecutionEnd?.(sessionId);
       },
+      notifyExecutionStart: () => onExecutionStart?.(sessionId),
+      boundSessionId: sessionId,
       shouldRefreshTitleOnFirstRound: false,
       mirrorTextToFinalResponse: true,
       setRoundRunningOnStart: true,
@@ -1465,7 +1600,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       markRoundFailed(currentResumeRunId, message);
       setPendingInterrupt(interruptSnapshot);
       setResuming(false);
-      onExecutionEnd?.();
+      onExecutionEnd?.(sessionId);
     }
   };
 

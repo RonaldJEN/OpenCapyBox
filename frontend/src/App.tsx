@@ -55,8 +55,13 @@ function HomePage() {
     setExecutingSessionId(sessionId);
   };
 
-  const handleExecutionEnd = () => {
-    setExecutingSessionId(null);
+  const handleExecutionEnd = (sessionId?: string) => {
+    // 如果传了 sessionId，只在匹配时清除（避免切换会话时误清其他正在运行的会话）
+    if (sessionId) {
+      setExecutingSessionId((prev) => (prev === sessionId ? null : prev));
+    } else {
+      setExecutingSessionId(null);
+    }
   };
 
   // 🆕 处理检测到运行中会话的回调

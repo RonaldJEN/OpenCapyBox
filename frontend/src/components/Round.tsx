@@ -23,7 +23,8 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
   // 解析用户消息，提取附件信息
   const { attachments, cleanContent } = parseMessageContent(round.user_message);
 
-  const isCompleted = round.status === 'completed' || round.status === 'failed' || round.status === 'max_steps_reached' || round.status === 'interrupted' || round.status === 'resumed';
+  const TERMINAL_STATUSES = new Set(['completed', 'failed', 'max_steps_reached', 'interrupted', 'resumed', 'cancelled']);
+  const isCompleted = TERMINAL_STATUSES.has(round.status);
 
   return (
     <div className={`space-y-6 ${disableMotion ? '' : 'animate-fade-in'}`}>

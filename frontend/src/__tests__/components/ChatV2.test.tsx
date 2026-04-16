@@ -17,6 +17,8 @@ vi.mock('../../services/api', () => ({
     createSession: vi.fn(),
     abortChat: vi.fn(),
     getUserId: vi.fn(() => 'demo-session'),
+    subscribeToRound: vi.fn(() => ({ abort: vi.fn(), promise: Promise.resolve() })),
+    pollSession: vi.fn().mockResolvedValue({ round_count: 0 }),
   },
 }));
 
@@ -570,5 +572,539 @@ describe('ChatV2 组件', () => {
 
     fireEvent.change(textarea, { target: { value: '直接发新消息跳过中断' } });
     expect(textarea.value).toBe('直接发新消息跳过中断');
+  });
+
+  it('切换 session 时 sending 状态应重置，输入框不应被锁死', async () => {
+    // session-1 有一个运行中的轮次 → loadHistory 会设置 sending=true
+    const runningRounds: RoundData[] = [
+      {
+        round_id: 'round-running-1',
+        user_message: '运行中任务',
+        final_response: '',
+        steps: [],
+        step_count: 0,
+        status: 'running',
+        created_at: new Date().toISOString(),
+      },
+    ];
+
+    const idleRounds: RoundData[] = [
+      {
+        round_id: 'round-idle-1',
+        user_message: '已完成任务',
+        final_response: '完成',
+        steps: [],
+        step_count: 0,
+        status: 'completed',
+        created_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      },
+    ];
+
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sid: string) => {
+      if (sid === 'session-running') {
+        return { rounds: runningRounds, session_id: sid, total: runningRounds.length };
+      }
+      return { rounds: idleRounds, session_id: sid, total: idleRounds.length };
+    });
+
+    // 渲染 session-running（会自动调 loadHistory → sending=true）
+    const { rerender } = render(
+      <ChatV2
+        sessionId="session-running"
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledWith('session-running');
+    });
+
+    // 切换到 session-idle
+    rerender(
+      <ChatV2
+        sessionId="session-idle"
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledWith('session-idle');
+    });
+
+    // 切换后输入框不应被禁用
+    await waitFor(() => {
+      const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+      expect(textarea).not.toBeDisabled();
+    });
+
+    // onExecutionEnd 应被调用以清除 session-idle 的执行标记
+    expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('session-idle');
+  });
+
+  it('从运行中 session 切换后，onExecutionEnd 应带 sessionId 参数', async () => {
+    const runningRounds: RoundData[] = [
+      {
+        round_id: 'round-r1',
+        user_message: '测试',
+        final_response: '',
+        steps: [],
+        step_count: 0,
+        status: 'running',
+        created_at: new Date().toISOString(),
+      },
+    ];
+
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sid: string) => {
+      if (sid === 'sess-a') {
+        return { rounds: runningRounds, session_id: sid, total: 1 };
+      }
+      return { rounds: [], session_id: sid, total: 0 };
+    });
+
+    const { rerender } = render(
+      <ChatV2
+        sessionId="sess-a"
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(defaultProps.onExecutionStart).toHaveBeenCalledWith('sess-a');
+    });
+
+    // 切换到空闲 session
+    rerender(
+      <ChatV2
+        sessionId="sess-b"
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      // onExecutionEnd 带有 sessionId，App 层只在匹配时清除
+      expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('sess-b');
+    });
+  });
+
+  it('handleStop 应该立即更新 UI 状态而不等待 SSE', async () => {
+    // 模拟一个运行中的轮次
+    const runningRounds: RoundData[] = [
+      {
+        round_id: 'round-running-stop',
+        user_message: '运行中',
+        final_response: '',
+        steps: [
+          {
+            step_number: 1,
+            thinking: '',
+            assistant_content: '正在处理...',
+            tool_calls: [],
+            tool_results: [],
+            status: 'running',
+          },
+        ],
+        step_count: 1,
+        status: 'running',
+        created_at: new Date().toISOString(),
+      },
+    ];
+
+    // subscribeToRound 不会推送 RUN_FINISHED，模拟 SSE 永远不结束
+    const mockAbort = vi.fn();
+    vi.mocked(apiService.subscribeToRound).mockReturnValue({
+      abort: mockAbort,
+      promise: new Promise(() => {}), // 永不 resolve
+    } as any);
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: runningRounds,
+      session_id: 'test-session',
+      total: runningRounds.length,
+    });
+
+    vi.mocked(apiService.abortChat).mockResolvedValue(undefined);
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    // 等待 loadHistory 完成并进入 sending 状态
+    await waitFor(() => {
+      expect(apiService.subscribeToRound).toHaveBeenCalled();
+    });
+
+    // 应该看到停止按钮
+    await waitFor(() => {
+      expect(screen.getByTitle('停止生成')).toBeInTheDocument();
+    });
+
+    // 点击停止按钮
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('停止生成'));
+    });
+
+    // abort API 应该被调用
+    expect(apiService.abortChat).toHaveBeenCalledWith('test-session');
+
+    // UI 应该立即更新 — 不再显示停止按钮，输入框可用
+    await waitFor(() => {
+      expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
+    });
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+    expect(textarea).not.toBeDisabled();
+
+    // onExecutionEnd 应该被调用
+    expect(defaultProps.onExecutionEnd).toHaveBeenCalled();
+  });
+
+  it('user_cancelled 终态也应触发 onExecutionEnd，避免侧栏执行态残留', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'test-session',
+      total: 0,
+    });
+
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
+      callbacks.onRunStarted?.('test-session', 'cancel-run-1');
+      callbacks.onRunFinished?.(
+        'test-session',
+        'cancel-run-1',
+        { finalResponse: '已取消', reason: 'user_cancelled' },
+        'interrupt',
+        undefined
+      );
+    });
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: '触发取消态' } });
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    await waitFor(() => {
+      expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('test-session');
+    });
+  });
+
+  it('abort 时应清理残留的 pendingInterrupt（QuestionCard 不应残留）', async () => {
+    // 模拟一个处于 interrupted 状态的轮次（有 ask_user 中断）
+    const interruptedRounds: RoundData[] = [
+      {
+        round_id: 'round-int-1',
+        user_message: '分析一下',
+        final_response: '',
+        steps: [],
+        step_count: 1,
+        status: 'interrupted',
+        created_at: new Date().toISOString(),
+        interrupt: {
+          id: 'int-001',
+          reason: 'input_required',
+          payload: {
+            questions: [{ question: '你想深入了解哪个方面？', options: [{ label: '选项A' }] }],
+          },
+        },
+      },
+    ];
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: interruptedRounds,
+      session_id: 'test-session',
+      total: 1,
+    });
+
+    // 模拟 subscribeToRound 立即完成（不需要真正订阅）
+    vi.mocked(apiService.subscribeToRound).mockReturnValue({
+      abort: vi.fn(),
+      promise: Promise.resolve(),
+    } as any);
+
+    vi.mocked(apiService.abortChat).mockResolvedValue(undefined);
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    // 等待历史加载并渲染 QuestionCard
+    await waitFor(() => {
+      expect(screen.getByTestId('question-card')).toBeInTheDocument();
+    });
+
+    // QuestionCard 应该可见
+    expect(screen.getByTestId('question-card')).toBeInTheDocument();
+
+    // 模拟：用户开始了新的执行（发送新消息），此时 sending=true
+    // 然后触发了一个带 outcome=interrupt 但无 interrupt 的 RUN_FINISHED（用户取消）
+    // 这会触发 sendMessageForSession 中的 setPendingInterrupt(null)    // 直接验证：发送新消息会清除 pendingInterrupt
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+
+    // sendMessageStreamV2 模拟立即完成
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
+      callbacks.onRunStarted?.('test-session', 'new-round-1');
+      callbacks.onRunFinished?.('test-session', 'new-round-1', { finalResponse: '完成' }, 'success', undefined);
+    });
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: '新消息' } });
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    // 发送新消息后 QuestionCard 应该消失
+    await waitFor(() => {
+      expect(screen.queryByTestId('question-card')).not.toBeInTheDocument();
+    });
+  });
+
+  it('abort 请求失败时应保持运行状态，不做本地终止', async () => {
+    const runningRounds: RoundData[] = [
+      {
+        round_id: 'round-abort-fail',
+        user_message: '运行中',
+        final_response: '',
+        steps: [
+          {
+            step_number: 1,
+            thinking: '',
+            assistant_content: '处理中...',
+            tool_calls: [],
+            tool_results: [],
+            status: 'running',
+          },
+        ],
+        step_count: 1,
+        status: 'running',
+        created_at: new Date().toISOString(),
+      },
+    ];
+
+    const mockAbort = vi.fn();
+    vi.mocked(apiService.subscribeToRound).mockReturnValue({
+      abort: mockAbort,
+      promise: new Promise(() => {}), // 永不 resolve
+    } as any);
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: runningRounds,
+      session_id: 'test-session',
+      total: runningRounds.length,
+    });
+
+    // abort API 抛出网络错误
+    vi.mocked(apiService.abortChat).mockRejectedValue(new Error('Network Error'));
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    // 等待进入 sending 状态
+    await waitFor(() => {
+      expect(apiService.subscribeToRound).toHaveBeenCalled();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTitle('停止生成')).toBeInTheDocument();
+    });
+
+    // 点击停止按钮
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('停止生成'));
+    });
+
+    // abort API 被调用
+    expect(apiService.abortChat).toHaveBeenCalledWith('test-session');
+
+    // 关键断言：abort 失败后，UI 应保持运行状态
+    // 停止按钮仍然可见（仍在 sending 状态）
+    await waitFor(() => {
+      expect(screen.getByTitle('停止生成')).toBeInTheDocument();
+    });
+
+    // 输入框仍被禁用
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+    expect(textarea).toBeDisabled();
+
+    // onExecutionEnd 不应被调用
+    expect(defaultProps.onExecutionEnd).not.toHaveBeenCalled();
+  });
+
+  it('USER_BUSY (429) 不应触发 onExecutionStart，不污染侧栏执行标记', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'test-session',
+      total: 0,
+    });
+
+    // sendMessageStreamV2：直接调用 onRunError(USER_BUSY)，不调用 onRunStarted
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
+      callbacks.onRunError?.('当前有正在运行的任务', 'USER_BUSY');
+    });
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: '测试并发被拒' } });
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    // 关键断言：onExecutionStart 不应被调用（因为 onRunStarted 未触发）
+    expect(defaultProps.onExecutionStart).not.toHaveBeenCalled();
+
+    // 错误信息应该展示
+    await waitFor(() => {
+      expect(screen.getByText(/正在运行/)).toBeInTheDocument();
+    });
+
+    // 输入框应恢复可用
+    await waitFor(() => {
+      expect(textarea).not.toBeDisabled();
+    });
+  });
+
+  it('ask_user 中断事件不应泄漏到用户已切换到的新会话', async () => {
+    // 模拟 session-a 空历史（将通过 sendMessageStreamV2 触发 interrupt）
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sid: string) => {
+      return { rounds: [], session_id: sid, total: 0 };
+    });
+
+    // sendMessageStreamV2 会在一段延迟后推送 interrupt，模拟 ask_user 延迟到达
+    let capturedCallbacks: any = null;
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
+      capturedCallbacks = callbacks;
+      callbacks.onRunStarted?.('session-a', 'round-ask-1');
+      // 不立即推送 interrupt，等用户切换 session 后再推
+    });
+
+    const { rerender } = render(
+      <ChatV2 sessionId="session-a" {...defaultProps} />
+    );
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledWith('session-a');
+    });
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+
+    // 在 session-a 发送消息触发 ask_user
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: '问我个问题' } });
+    });
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    // 用户立即切换到 session-b（在 interrupt 到达之前）
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledWith('session-b');
+    });
+
+    // 此时旧 session-a 的 SSE 推送 interrupt 到达
+    await act(async () => {
+      capturedCallbacks?.onRunFinished?.(
+        'session-a',
+        'round-ask-1',
+        { finalResponse: '' },
+        'interrupt',
+        { id: 'int-leak', reason: 'input_required', payload: { questions: [{ question: '泄漏测试' }] } }
+      );
+    });
+
+    // 关键断言：QuestionCard 不应出现（interrupt 属于 session-a，不应污染 session-b）
+    expect(screen.queryByTestId('question-card')).not.toBeInTheDocument();
+  });
+
+  it('stale RUN_FINISHED 应触发 onExecutionEnd(旧 sessionId) 释放侧栏执行标记', async () => {
+    // session-a 空历史，通过 sendMessageStreamV2 开始执行
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sid: string) => {
+      return { rounds: [], session_id: sid, total: 0 };
+    });
+
+    let capturedCallbacks: any = null;
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
+      capturedCallbacks = callbacks;
+      callbacks.onRunStarted?.('session-a', 'round-stale-1');
+      // 不立即完成，等用户切走后再推送 RUN_FINISHED
+    });
+
+    const { rerender } = render(
+      <ChatV2 sessionId="session-a" {...defaultProps} />
+    );
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledWith('session-a');
+    });
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+
+    // 在 session-a 发送消息
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: '开始执行' } });
+    });
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    // 确认 onExecutionStart 被调用
+    expect(defaultProps.onExecutionStart).toHaveBeenCalledWith('session-a');
+
+    // 重置 mock 计数
+    vi.mocked(defaultProps.onExecutionEnd).mockClear();
+
+    // 切换到 session-b
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledWith('session-b');
+    });
+
+    // 旧 session-a 的 RUN_FINISHED 迟到
+    await act(async () => {
+      capturedCallbacks?.onRunFinished?.(
+        'session-a',
+        'round-stale-1',
+        { finalResponse: '完成了' },
+        'success',
+        undefined
+      );
+    });
+
+    // 关键断言：stale 回调应触发 onExecutionEnd 释放 session-a 的执行标记
+    expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('session-a');
   });
 });

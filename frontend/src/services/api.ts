@@ -24,6 +24,46 @@ class RoundExistsError extends Error {
   }
 }
 
+/**
+ * HTTP 错误：携带状态码，用于 4xx 判断不重试
+ */
+class HttpError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = 'HttpError';
+  }
+}
+
+/**
+ * 后端 round 终态集合（与后端 Round.SUBSCRIBE_TERMINAL_STATUSES 保持一致）。
+ * SSE 断连恢复时，检查 round 是否已结束。
+ */
+const _ROUND_TERMINAL_STATUSES = new Set(['completed', 'failed', 'interrupted', 'resumed', 'cancelled']);
+
+/**
+ * 从 history API 恢复 round 终态并触发回调。
+ * @returns true 表示已触发回调（调用方应 return），false 表示 round 仍在运行。
+ */
+function _tryRecoverRoundFinished(
+  round: any,
+  threadId: string,
+  runId: string,
+  callbacks: StreamCallbacks,
+): boolean {
+  if (!round || !_ROUND_TERMINAL_STATUSES.has(round.status)) return false;
+  const outcome = round.status === 'completed'
+    ? 'success'
+    : (round.status === 'interrupted' || round.status === 'cancelled' || round.status === 'resumed')
+      ? 'interrupt'
+      : 'error';
+  callbacks.onRunFinished?.(threadId, runId, {
+    finalResponse: round.final_response || '',
+    stepCount: round.step_count || 0,
+    ...(round.status === 'cancelled' ? { reason: 'user_cancelled' } : {}),
+  }, outcome, round.interrupt);
+  return true;
+}
+
 class APIService {
   private client: AxiosInstance;
   private userId: string | null = null;
@@ -249,7 +289,15 @@ class APIService {
           .then(async (response) => {
             if (!response.ok) {
               const errorText = await response.text();
-              throw new Error(`HTTP ${response.status}: ${errorText}`);
+              // 尝试从 JSON 响应中提取 detail 字段
+              let friendlyMsg = `HTTP ${response.status}: ${errorText}`;
+              try {
+                const parsed = JSON.parse(errorText);
+                if (parsed.detail) {
+                  friendlyMsg = parsed.detail;
+                }
+              } catch { /* not JSON, use raw text */ }
+              throw new HttpError(response.status, friendlyMsg);
             }
 
             const reader = response.body?.getReader();
@@ -320,10 +368,18 @@ class APIService {
     try {
       await doRequest();
     } catch (error: any) {
-      // 4xx 确定性错误不重试（参数错误、鉴权失败等）
-      const is4xx = /^HTTP 4\d{2}:/.test(error?.message || '');
+      // 4xx 确定性错误不重试（参数错误、鉴权失败、并发限制等）
+      const is4xx = error instanceof HttpError && error.status >= 400 && error.status < 500;
       if (is4xx) {
-        callbacks.onRunError?.(error.message, 'HTTP_CLIENT_ERROR');
+        // 429 并发限制：使用专用 code 让前端区分处理
+        const code = error.status === 429 ? 'USER_BUSY' : 'HTTP_CLIENT_ERROR';
+        callbacks.onRunError?.(error.message, code);
+        return;
+      }
+      // 5xx 服务端错误：不伪装为并发限制，使用通用错误码
+      const is5xx = error instanceof HttpError && error.status >= 500;
+      if (is5xx) {
+        callbacks.onRunError?.(error.message, 'SERVER_ERROR');
         return;
       }
 
@@ -372,9 +428,8 @@ class APIService {
             } catch (checkError) {
               console.error('检查后端轮次失败:', checkError);
             }
-            // 后端无 running 轮次 → 安全重试 POST
-            await doRequest();
-            console.log('✅ 重试请求成功');
+            // 后端从未受理请求（无 running round），不重试 POST（避免锁释放后请求被重放）
+            callbacks.onRunError?.('网络中断，请检查连接后重试', 'REQUEST_FAILED');
             return;
           }
         } catch (retryError: any) {
@@ -390,17 +445,8 @@ class APIService {
             const history = await this.getSessionHistoryV2(chatSessionId);
             const round = history.rounds.find((r: any) => r.round_id === currentRunId);
 
-            if (round?.status === 'completed' || round?.status === 'failed' || round?.status === 'interrupted') {
-              const outcome = round.status === 'completed'
-                ? 'success'
-                : round.status === 'interrupted'
-                  ? 'interrupt'
-                  : 'error';
-              console.log(`✅ 轮次 ${currentRunId} 实际状态: ${round.status}，恢复 UI`);
-              callbacks.onRunFinished?.(currentThreadId || chatSessionId, currentRunId, {
-                finalResponse: round.final_response || '',
-                stepCount: round.step_count || 0,
-              }, outcome, round.interrupt);
+            if (_tryRecoverRoundFinished(round, currentThreadId || chatSessionId, currentRunId, callbacks)) {
+              console.log(`✅ 轮次 ${currentRunId} 实际状态: ${round?.status}，恢复 UI`);
               return;
             }
           } catch (checkError) {
@@ -732,17 +778,8 @@ class APIService {
               const history = await this.getSessionHistoryV2(chatSessionId);
               const round = history.rounds.find((r: any) => r.round_id === runId);
               
-              if (round?.status === 'completed' || round?.status === 'failed' || round?.status === 'interrupted') {
-                console.log(`✅ 检测到轮次 ${runId} 已完成 (status=${round.status})，恢复状态`);
-                const outcome = round.status === 'completed'
-                  ? 'success'
-                  : round.status === 'interrupted'
-                    ? 'interrupt'
-                    : 'error';
-                callbacks.onRunFinished?.(chatSessionId, runId, {
-                  finalResponse: round.final_response || '',
-                  stepCount: round.step_count || 0,
-                }, outcome, round.interrupt);
+              if (_tryRecoverRoundFinished(round, chatSessionId, runId, callbacks)) {
+                console.log(`✅ 检测到轮次 ${runId} 已完成 (status=${round?.status})，恢复状态`);
                 resolve();
                 return;
               }
@@ -760,18 +797,8 @@ class APIService {
             const history = await this.getSessionHistoryV2(chatSessionId);
             const round = history.rounds.find((r: any) => r.round_id === runId);
             
-            if (round?.status === 'completed' || round?.status === 'failed' || round?.status === 'interrupted') {
-              // 輪次已完成，補發 onRunFinished 回調
-              console.log(`✅ 检测到轮次 ${runId} 已完成 (status=${round.status})，恢复状态`);
-              const outcome = round.status === 'completed'
-                ? 'success'
-                : round.status === 'interrupted'
-                  ? 'interrupt'
-                  : 'error';
-              callbacks.onRunFinished?.(chatSessionId, runId, {
-                finalResponse: round.final_response || '',
-                stepCount: round.step_count || 0,
-              }, outcome, round.interrupt);
+            if (_tryRecoverRoundFinished(round, chatSessionId, runId, callbacks)) {
+              console.log(`✅ 检测到轮次 ${runId} 已完成 (status=${round?.status})，恢复状态`);
               resolve();
               return;
             }

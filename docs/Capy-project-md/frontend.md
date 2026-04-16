@@ -39,8 +39,12 @@
 |------|----------|----------|
 | `POST /api/chat/{id}/message` | ✅ | `src/services/api.ts:137` (`sendMessage` 方法) |
 | `POST /api/chat/{id}/message/v2` | ✅ | `src/services/api.ts:152` (`sendMessageV2` 方法) |
-| `POST /api/chat/{id}/message/stream` | ✅ | `src/services/api.ts:173-338` (`sendMessageStreamV2` 方法) |
-| `GET /api/chat/{id}/round/{round_id}/subscribe` | ✅ | `src/services/api.ts:345-454` (`subscribeToRound` 方法，支持 AbortController 取消)<br>`src/components/ChatV2.tsx:126-232` (断线恢复，支持切换会话时自动取消订阅) |
+| `POST /api/chat/{id}/message/stream` | ✅ | `src/services/api.ts` (`sendMessageStreamV2` 方法) |
+| `GET /api/chat/{id}/round/{round_id}/subscribe` | ✅ | `src/services/api.ts` (`subscribeToRound` 方法) |
+| `POST /api/chat/{id}/abort` | ✅ | `src/services/api.ts` (`abortChat` 方法)，`src/components/ChatV2.tsx` (`handleStop`) |
+| `GET /api/chat/{id}/abort/status` | ✅ | `src/services/api.ts` (`getAbortStatus` 方法，用于调试/可观测性) |
+| `POST /api/chat/{id}/resume` | ✅ | `src/services/api.ts` (`resumeStream` 方法)，`src/components/ChatV2.tsx` (`handleResume`) |
+| `GET /api/sessions/{id}/poll` | ✅ | `src/services/api.ts` (`pollSession` 方法)，用于轻量级状态检测 |
 
 ### 工具指标 API
 
@@ -77,7 +81,7 @@
 以下接口在后端已实现但前端未调用：
 
 1. **`GET /api/auth/me`** - 获取当前用户信息
-2. **`PATCH /api/sessions/{id}/title`** - 更新会话标题
+2. **`PATCH /api/sessions/{id}/title`** - 更新会话标题（后端自动生成标题，通过 CUSTOM 事件通知前端）
 
 ---
 
@@ -179,8 +183,8 @@
 - `ChatV2.tsx` 在 `useEffect` 的 cleanup 函数中调用 `abort()` 取消订阅
 
 **相关代码**：
-- `src/services/api.ts:345-454` - subscribeToRound 实现
-- `src/components/ChatV2.tsx:41-65` - 订阅管理和清理
+- `src/services/api.ts` - subscribeToRound 实现
+- `src/components/ChatV2.tsx` - 订阅管理和清理
 
 ### 刷新后运行中会话恢复
 
@@ -207,8 +211,8 @@
 
 **相关代码**：
 - `src/api/routes/chat.py` - `emit()` 函数实现广播
-- `src/services/api.ts:459-540` - subscribeToRound 流式事件处理
-- `src/components/ChatV2.tsx:248-440` - 订阅回调中的流式事件处理
+- `src/services/api.ts` - subscribeToRound 流式事件处理
+- `src/components/ChatV2.tsx` - 订阅回调中的流式事件处理
 
 ### TypeScript 类型定义
 
@@ -216,7 +220,13 @@
 - `RunningSessionResponse` - 运行中会话响应
 - `StreamCallbacks` - SSE 流式回调类型
 - `SubscribeCallbacks` - 订阅回调类型（含流式事件回调）
-- `SubscriptionResult` - 订阅结果类型（包含 promise 和 abort）
+- `SubscriptionResult` - 订阅结果类型（包含 promise、abort 和 getLatestSequence）
+
+**多 Worker 适配新增类型**：
+- `HttpError` - 带 `status` 的 HTTP 错误类，用于 4xx 不重试判断
+- `RoundExistsError` - 幂等冲突错误，携带 `roundId`，触发前端转入 subscribe 恢复路径
+- `_ROUND_TERMINAL_STATUSES` - Round 终态集合 `{completed, failed, interrupted, resumed, cancelled}`，与后端 `Round.SUBSCRIBE_TERMINAL_STATUSES` 保持一致
+- `_tryRecoverRoundFinished()` - 从 history API 恢复 round 终态并触发回调的辅助函数，替代了原来 3 处重复的恢复逻辑
 
 **类型使用**：
 - `sendMessageStreamV2` 使用 `StreamCallbacks` 替代内联类型
@@ -229,3 +239,35 @@
 - `onThinkingStart(messageId, timestamp?)/Content/End(messageId, timestamp?)` - 思维链流式事件（含时间戳）
 - `onToolCallStart(toolCallId, toolName, parentMessageId?, timestamp?)/Args/End(toolCallId, timestamp?)/Result(messageId, toolCallId, content, timestamp?, executionTimeMs?)` - 工具调用流式事件（含时间戳和执行耗时）
 - `onStepStarted(stepName, timestamp?)/Finished(stepName, timestamp?)` - 步骤开始/完成事件（含时间戳）
+
+### 5. 多 Worker 适配（Multi-Worker Adaptation）
+
+以下记录多 worker 部署下前端的关键行为变更。
+
+#### sendMessageStreamV2 增强
+
+- **幂等键**：自动生成 `idempotency_key`（UUID）附加到请求体，防止多 worker 重复处理
+- **4xx/5xx 错误分类**：`HttpError` 封装状态码，4xx 不重试，429 映射为 `USER_BUSY` code，5xx 映射为 `SERVER_ERROR`
+- **RoundExistsError 处理**：SSE 收到 `ROUND_IN_PROGRESS` 时抛出此错误，触发 subscribe 重连
+- **重试策略**：已有 runId 时用 subscribe 断点续传；无 runId 时先查后端是否有 running round，无则不重试 POST
+- **重试耗尽恢复**：调用 `_tryRecoverRoundFinished` 检查 round 实际终态
+- **Staleness 超时**：45s（3x heartbeat）无数据时主动断开 fetch
+
+#### subscribeToRound 增强
+
+- **Staleness 超时恢复**：超时后调用 `_tryRecoverRoundFinished` 检查轮次实际状态
+- **异常断开恢复**：非 AbortError 异常时同样检查 round 状态进行恢复
+- **`getLatestSequence()`**：`SubscriptionResult` 新增返回最新序列号，供重连时传入 `last_sequence`
+
+#### ChatV2 组件新行为
+
+- **`onExecutionEnd(sessionId?)`**：回调现在传递 `sessionId` 参数，`App.tsx` 中通过 `setExecutingSessionId(prev => prev === sessionId ? null : prev)` 精确清除，避免旧 SSE 回调污染新会话
+- **`sessionIdRef` + `isStale()` 闭包**：回调工厂绑定 `boundSessionId`，若会话已切换则跳过状态更新（仅释放执行标记）
+- **`stoppingRef`**：`useRef(false)` 防止 `handleStop` 期间 SSE 回调竞态覆盖 UI 状态。handleStop 流程：设 `stoppingRef=true` → 调用 `abortChat()` → 立即更新 round 状态为 cancelled → 微任务后重置 `stoppingRef`
+- **USER_BUSY 处理**：429 并发限制使用专用 `USER_BUSY` code，前端移除临时 round、显示错误、不触发 executionStart
+- **`isUserCancelledOutcome()`**：区分“用户主动取消”与“ask_user 中断”，取消时清理残留的 pendingInterrupt
+
+**相关代码**：
+- `src/services/api.ts` - `HttpError`、`RoundExistsError`、`_tryRecoverRoundFinished`、`_ROUND_TERMINAL_STATUSES`
+- `src/components/ChatV2.tsx` - `stoppingRef`、`sessionIdRef`、`isStale()`、`isUserCancelledOutcome()`
+- `src/App.tsx` - `handleExecutionEnd(sessionId?)` 精确清除
