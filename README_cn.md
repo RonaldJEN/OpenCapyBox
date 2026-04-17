@@ -317,7 +317,7 @@ OpenCapyBox/
 │   │   ├── services/             # API 客户端
 │   │   ├── utils/                # 消息解析/内容分块/文件处理
 │   │   └── types/                # TypeScript 类型
-│   └── DESIGN_SYSTEM.md          # 设计体系文档
+│   └── (设计体系已迁移至 docs/specs/frontend-spec.md)
 │
 ├── tests/                        # Python 测试（30+ 测试文件）
 ├── docs/                         # 项目文档
@@ -440,9 +440,26 @@ EMBEDDING_MODEL=text-embedding-v4
 
 ## 📖 开发指南
 
-### API 文档
+### Spec 驱动文档
 
-完整的后端 API 文档见 [docs/Capy-project-md/api.md](docs/Capy-project-md/api.md)，涵盖所有路由的请求/响应格式、AG-UI 事件类型定义和数据模型。前端 API 对照表见 [docs/Capy-project-md/frontend.md](docs/Capy-project-md/frontend.md)。
+各模块均有独立的 spec 文件，覆盖数据模型、API 契约、行为语义、失败模式与可观测性：
+
+| Spec | 范围 |
+|---|---|
+| [auth-spec.md](docs/specs/auth-spec.md) | 认证鉴权 |
+| [sessions-spec.md](docs/specs/sessions-spec.md) | 会话管理 |
+| [chat-spec.md](docs/specs/chat-spec.md) | 聊天 / Agent 执行 / SSE 流 |
+| [cron-spec.md](docs/specs/cron-spec.md) | 定时任务 |
+| [memory-spec.md](docs/specs/memory-spec.md) | 分层记忆 |
+| [sandbox-spec.md](docs/specs/sandbox-spec.md) | 沙箱交互 |
+| [models-spec.md](docs/specs/models-spec.md) | 模型注册与切换 |
+| [config-spec.md](docs/specs/config-spec.md) | Agent 配置与技能 |
+| [frontend-spec.md](docs/specs/frontend-spec.md) | 前端总规范与设计体系 |
+| [frontend-chat-spec.md](docs/specs/frontend-chat-spec.md) | 前端聊天 / SSE / 推理面板 |
+| [frontend-session-spec.md](docs/specs/frontend-session-spec.md) | 前端会话列表与切换 |
+| [frontend-panel-spec.md](docs/specs/frontend-panel-spec.md) | 前端抽屉类面板 |
+
+AG-UI 协议详见 [docs/Capy-project-md/ag-ui-md/](docs/Capy-project-md/ag-ui-md/)。
 
 ### 运行测试
 
@@ -460,8 +477,9 @@ cd frontend && npm run test
 ### 添加新工具
 
 1. 在 `src/agent/tools/` 创建工具类，继承 `Tool` 基类
-2. 在 `src/api/services/agent_service.py` 的 `_create_tools()` 中注册
+2. 在 `src/api/services/tool_factory.py` 的 `create_agent_tools()` 中注册
 3. 编写 `tests/` 测试
+4. 同步更新 `docs/specs/` 下对应的 spec
 
 ```python
 from src.agent.tools.base import Tool, ToolResult

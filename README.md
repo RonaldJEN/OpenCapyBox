@@ -317,7 +317,7 @@ OpenCapyBox/
 │   │   ├── services/             # API clients
 │   │   ├── utils/                # Message parsing/content chunking/file handling
 │   │   └── types/                # TypeScript types
-│   └── DESIGN_SYSTEM.md          # Design system documentation
+│   └── (design system moved to docs/specs/frontend-spec.md)
 │
 ├── tests/                        # Python tests (30+ test files)
 ├── docs/                         # Project documentation
@@ -441,9 +441,26 @@ EMBEDDING_MODEL=text-embedding-v4
 
 ## 📖 Development Guide
 
-### API Documentation
+### Spec-Driven Documentation
 
-Full backend API docs at [docs/Capy-project-md/api.md](docs/Capy-project-md/api.md), covering all route request/response formats, AG-UI event type definitions, and data models. Frontend API reference at [docs/Capy-project-md/frontend.md](docs/Capy-project-md/frontend.md).
+Each module has a standalone spec covering data models, API contracts, behavior semantics, failure modes, and observability:
+
+| Spec | Scope |
+|---|---|
+| [auth-spec.md](docs/specs/auth-spec.md) | Authentication |
+| [sessions-spec.md](docs/specs/sessions-spec.md) | Session management |
+| [chat-spec.md](docs/specs/chat-spec.md) | Chat / Agent execution / SSE streaming |
+| [cron-spec.md](docs/specs/cron-spec.md) | Cron scheduled tasks |
+| [memory-spec.md](docs/specs/memory-spec.md) | Layered memory system |
+| [sandbox-spec.md](docs/specs/sandbox-spec.md) | Sandbox interaction |
+| [models-spec.md](docs/specs/models-spec.md) | Model registry & switching |
+| [config-spec.md](docs/specs/config-spec.md) | Agent config & skills |
+| [frontend-spec.md](docs/specs/frontend-spec.md) | Frontend overview & design system |
+| [frontend-chat-spec.md](docs/specs/frontend-chat-spec.md) | Frontend chat / SSE / reasoning panel |
+| [frontend-session-spec.md](docs/specs/frontend-session-spec.md) | Frontend session list & switching |
+| [frontend-panel-spec.md](docs/specs/frontend-panel-spec.md) | Frontend drawer panels |
+
+AG-UI protocol details at [docs/Capy-project-md/ag-ui-md/](docs/Capy-project-md/ag-ui-md/).
 
 ### Running Tests
 
@@ -461,8 +478,9 @@ cd frontend && npm run test
 ### Adding New Tools
 
 1. Create a tool class in `src/agent/tools/`, inheriting from the `Tool` base class
-2. Register it in `_create_tools()` in `src/api/services/agent_service.py`
+2. Register it in `create_agent_tools()` in `src/api/services/tool_factory.py`
 3. Write tests in `tests/`
+4. Update the relevant spec in `docs/specs/`
 
 ```python
 from src.agent.tools.base import Tool, ToolResult

@@ -104,8 +104,12 @@ start_backend() {
 
     success "后端启动于 http://localhost:8000"
     success "API 文档: http://localhost:8000/api/v1/docs"
-    $PYTHON_CMD -m uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000 --reload-dir src
-}
+    $PYTHON_CMD -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 4
+}    
+#$PYTHON_CMD -m uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000 --reload-dir src
+
+#$PYTHON_CMD -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 4
+
 
 # 启动前端
 start_frontend() {

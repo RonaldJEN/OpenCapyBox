@@ -23,20 +23,21 @@
 4. 测试位置：统一放在 `tests/` 目录。
 5. CI/CD：PR 会自动运行测试，禁止带失败测试提交。
 
-### API 文档维护要求
+### Spec 文档维护要求
 
-**只要改了接口，就必须同步 docs。**
+**只要改了接口或行为，就必须同步对应 spec。**
 
-1. 后端 API 修改：修改 `src/api/routes/` 后，必须更新 `docs/Capy-project-md/api.md`。
-2. 前端 API 调用修改：修改 `frontend/src/services/api.ts` 或相关组件调用后，必须更新 `docs/Capy-project-md/frontend.md`。
-3. 提交前校验：若改动涉及前后端接口，PR 必须同时包含 docs 变更。
+1. 后端 API / 服务层修改：必须更新 `docs/specs/` 下对应模块的 spec 文件。
+2. 前端 API 调用修改：若涉及契约变更，同步更新对应 spec。
+3. 提交前校验：若改动涉及接口或行为语义，PR 必须同时包含 spec 变更。
 
 ### 文档单一事实源（SSOT）
 
 1. **CLAUDE.md 只保留摘要与导航**，不再重复维护大段接口细节。
-2. 后端接口细节以 `docs/Capy-project-md/api.md` 为准。
-3. 前端接口映射以 `docs/Capy-project-md/frontend.md` 为准。
-4. 架构与协议说明统一以 `docs/Capy-project-md/` 下文档为准。
+2. **`docs/specs/` 下的 spec 文件是各模块的权威源**（数据模型、API 契约、行为语义、失败模式）。
+3. AG-UI 协议说明以 `docs/Capy-project-md/ag-ui-md/` 为准。
+4. 前端规范与设计体系以 `docs/specs/frontend-spec.md` 为准（及 chat/session/panel 子 spec）。
+5. 环境变量参考以 `docs/Capy-project-md/env-reference.md` 为准。
 
 ### 前端交互与性能约定
 
@@ -44,7 +45,7 @@
 2. 抽屉动效优先 `transform/opacity`，避免布局属性动画。
 3. 会话切换按 `sessionId` 记忆并恢复 `scrollTop`，仅底部时自动跟随。
 4. 历史内容首次渲染禁用逐条动画，使用 `disableMotion` 控制。
-5. 涉及交互策略改动前，先阅读 `frontend/DESIGN_SYSTEM.md` 并同步更新。
+5. 涉及交互策略改动前，先阅读 `docs/specs/frontend-spec.md` 与对应子 spec，并同步更新。
 
 ## 项目概述（摘要）
 
@@ -61,14 +62,28 @@ OpenCapyBox 是一个前后端分离的 Web 智能体平台，核心能力包括
 
 ## 文档导航（权威来源）
 
-1. 后端 API：`docs/Capy-project-md/api.md`
-2. 前端 API 对照：`docs/Capy-project-md/frontend.md`
-3. 系统架构：`docs/Capy-project-md/architecture.md`
-4. 沙箱机制：`docs/Capy-project-md/sandbox.md`
-5. AG-UI 协议：`docs/Capy-project-md/ag-ui-md/`
-6. 前端设计规范：`frontend/DESIGN_SYSTEM.md`
-7. 环境变量参考：`docs/Capy-project-md/env-reference.md`
-8. 框架设计文档：`docs/Capy-project-md/design.md`
+### Spec 文件（各模块权威源）
+
+| Spec | 覆盖范围 |
+|---|---|
+| `docs/specs/auth-spec.md` | 认证鉴权 |
+| `docs/specs/sessions-spec.md` | 会话管理 |
+| `docs/specs/chat-spec.md` | 聊天 / Agent 执行 / SSE 流 |
+| `docs/specs/cron-spec.md` | 定时任务 |
+| `docs/specs/memory-spec.md` | 分层记忆 |
+| `docs/specs/sandbox-spec.md` | 沙箱交互 |
+| `docs/specs/models-spec.md` | 模型注册与切换 |
+| `docs/specs/config-spec.md` | Agent 配置与技能 |
+| `docs/specs/frontend-spec.md` | 前端总规范与设计体系 |
+| `docs/specs/frontend-chat-spec.md` | 前端聊天 / SSE / 推理面板 |
+| `docs/specs/frontend-session-spec.md` | 前端会话列表与切换 |
+| `docs/specs/frontend-panel-spec.md` | 前端抽屉类面板 |
+
+### 其他文档
+
+1. AG-UI 协议：`docs/Capy-project-md/ag-ui-md/`
+2. 前端规范与设计体系：`docs/specs/frontend-spec.md`（及 frontend-chat-spec / frontend-session-spec / frontend-panel-spec）
+3. 环境变量参考：`docs/Capy-project-md/env-reference.md`
 
 ## 仓库关键路径（速查）
 
@@ -76,7 +91,7 @@ OpenCapyBox 是一个前后端分离的 Web 智能体平台，核心能力包括
 2. 后端配置：`src/api/config.py`
 3. 模型注册表：`models.yaml` + `src/api/model_registry.py`
 4. Agent 核心：`src/agent/agent.py`
-5. 工具注册：`src/api/services/agent_service.py`（`_create_tools()`）
+5. 工具注册：`src/api/services/tool_factory.py`（`create_agent_tools()`）
 6. Agent 配置路由：`src/api/routes/config.py`（记忆文件、Skills 启停等）
 7. 前端入口：`frontend/src/App.tsx`
 8. 前端 API 客户端：`frontend/src/services/api.ts`
@@ -124,9 +139,8 @@ pytest tests/ -k "test_name" -v     # 按名称匹配
 
 1. 代码变更完成。
 2. 单元测试补齐并通过。
-3. 若涉及接口：同步更新 `docs/Capy-project-md/api.md`。
-4. 若涉及前端调用：同步更新 `docs/Capy-project-md/frontend.md`。
-5. 变更说明可追溯（PR 中写清楚代码与文档同步关系）。
+3. 若涉及接口或行为语义：同步更新 `docs/specs/` 下对应 spec 文件。
+4. 变更说明可追溯（PR 中写清楚代码与 spec 同步关系）。
 
 ### 常见坑位
 
@@ -170,6 +184,6 @@ SSE_SUBSCRIBE_TIMEOUT=300
 
 ---
 
-**最后更新**: 2026-04-12
+**最后更新**: 2026-04-17
 **项目版本**: 0.1.0
 **维护者**: OpenCapyBox 团队
