@@ -1,0 +1,907 @@
+# 聊天与 Agent 执行 (Chat) — Spec
+
+> **模块归属**: `src/api/routes/chat.py`, `src/api/services/agent_service.py`, `src/agent/agent.py`
+> **最后更新**: 2026-04-17
+> **状态**: Draft
+
+---
+
+## 目录
+
+1. [模块职责边界](#1-模块职责边界)
+2. [数据模型](#2-数据模型)
+3. [API 契约](#3-api-契约)
+4. [行为语义与不变量](#4-行为语义与不变量)
+5. [失败模式与错误处理](#5-失败模式与错误处理)
+6. [可观测性](#6-可观测性)
+7. [非目标](#7-非目标)
+
+---
+
+## 1. 模块职责边界
+
+### 本模块负责
+
+| 职责 | 说明 |
+|------|------|
+| 消息发送与 SSE 流式响应 | 接收用户消息，启动 Agent 执行，通过 SSE 实时推送事件流 |
+| Agent 执行生命周期 | 管理从启动到终态的完整流程：启动 → 工具调用 → 完成/中断/取消/错误 |
+| SSE 订阅与断线重连 | 支持客户端重连后从指定 sequence 恢复事件流 |
+| 执行中断与恢复 | Human-in-the-Loop：Agent 调用 `ask_user` 工具时暂停执行，等待用户输入后恢复 |
+| 执行取消 | 支持主动取消正在运行的 Agent（含跨 worker 场景） |
+| 幂等性保证 | 前端重复提交相同 `idempotency_key` 不会产生多次执行 |
+| AG-UI 事件生成与持久化 | 生成标准 AG-UI 事件并写入数据库，支持事后重放 |
+| 上下文压缩 | 多级压缩策略，确保对话历史不超出模型上下文窗口 |
+
+### 本模块不负责
+
+- 会话 CRUD（由 Session 模块处理）
+- 文件操作（由 OpenSandbox 文件服务处理）
+- 模型管理（由 Model Registry 处理）
+- Cron 定时任务执行
+- 技能（Skills）的注册与管理
+
+---
+
+## 2. 数据模型
+
+### 2.1 `rounds` 表（别名：Run）
+
+一条 Round 对应一次完整的 Agent 执行周期。用户每发送一条消息（或恢复一次中断）都会创建一条 Round。
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | String(36) | PK | UUID，全局唯一 |
+| `thread_id` | String(36) | FK → `sessions.id` (CASCADE), indexed | 所属线程（当前等同于 session） |
+| `session_id` | String(36) | FK → `sessions.id` (CASCADE, `use_alter`), indexed | 所属会话 |
+| `parent_run_id` | String(36) | nullable, indexed | 链接 interrupt → resume，指向被中断的 Round |
+| `outcome` | String(20) | nullable | 执行结果：`success` / `interrupt` |
+| `user_message` | Text | NOT NULL | 用户原始消息内容 |
+| `user_attachments` | Text | nullable | JSON 序列化的附件列表 |
+| `final_response` | Text | nullable | Agent 最终文本响应 |
+| `step_count` | Integer | default=0 | Agent 执行步数 |
+| `status` | String(20) | default=`"running"` | 当前状态（见下方状态机） |
+| `interrupt_payload` | Text | nullable | JSON：`{id, reason, payload}` |
+| `idempotency_key` | String(64) | nullable | 前端生成的幂等键 |
+| `created_at` | DateTime | default=now, indexed | 创建时间 |
+| `completed_at` | DateTime | nullable | 终态达成时间 |
+
+**唯一约束**: `UniqueConstraint(session_id, idempotency_key)`
+
+**Round 状态机**:
+
+```
+                    ┌─────────────┐
+                    │   running   │ ← 初始状态
+                    └──────┬──────┘
+                           │
+            ┌──────────────┼──────────────┬───────────────┐
+            ▼              ▼              ▼               ▼
+      ┌───────────┐ ┌───────────┐ ┌────────────┐ ┌────────────┐
+      │ completed │ │  failed   │ │ interrupted│ │ cancelled  │
+      └───────────┘ └───────────┘ └─────┬──────┘ └────────────┘
+                                        │
+                                        ▼
+                                  ┌───────────┐
+                                  │  resumed  │
+                                  └───────────┘
+```
+
+**终态集合**:
+
+| 集合名称 | 包含状态 | 用途 |
+|----------|----------|------|
+| `COMPLETE_TERMINAL` | `completed`, `failed`, `cancelled` | 判断 Round 是否已彻底结束（不可恢复） |
+| `SUBSCRIBE_TERMINAL` | `completed`, `failed`, `interrupted`, `resumed`, `cancelled` | 判断 SSE 订阅是否应关闭连接 |
+
+> **设计决策**: `interrupted` 和 `resumed` 被纳入 `SUBSCRIBE_TERMINAL` 但不在 `COMPLETE_TERMINAL` 中——中断态的 Round 虽然暂停了 SSE 推送，但仍可通过 resume 恢复执行。`resumed` 表示该 Round 已由后续 Round 接替，其 SSE 订阅也应关闭。
+
+### 2.2 `agui_events` 表
+
+持久化所有 AG-UI 事件，用于 SSE 重放（断线重连、订阅历史 Round）。
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | Integer | PK, autoincrement | 自增主键 |
+| `run_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL | 所属 Round |
+| `event_type` | String(50) | NOT NULL | 事件类型（22 种之一） |
+| `timestamp` | Integer | nullable | 事件时间戳（毫秒） |
+| `message_id` | String(36) | nullable | 关联的消息 ID |
+| `tool_call_id` | String(36) | nullable | 关联的工具调用 ID |
+| `payload` | Text | NOT NULL | 完整 JSON 事件体 |
+| `sequence` | Integer | NOT NULL | 事件序号（Round 内递增） |
+| `created_at` | DateTime | default=now | 写入时间 |
+
+**索引**（共 5 个）:
+
+1. `run_id` — 按 Round 查询所有事件
+2. `event_type` — 按事件类型过滤
+3. `(run_id, sequence)` — 断线重连时按序号范围查询
+4. `message_id` — 按消息定位事件
+5. `tool_call_id` — 按工具调用定位事件
+
+### 2.3 `conversation_messages` 表
+
+Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 上下文构建，而非前端事件回放。
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | Integer | PK | 自增主键 |
+| `session_id` | String(36) | FK → `sessions.id`, indexed | 所属会话 |
+| `round_id` | String(36) | nullable, indexed | 所属 Round |
+| `sequence` | Integer | NOT NULL | 会话内全局序号 |
+| `role` | String(20) | NOT NULL | `user` / `assistant` / `tool` |
+| `content` | Text | NOT NULL | JSON 序列化的消息内容 |
+| `is_summary` | Boolean | default=False | 是否为上下文压缩产生的摘要 |
+| `is_synthetic` | Boolean | default=False | 是否为系统合成消息（如 max_steps 提醒） |
+| `token_count` | Integer | nullable | 消息的预估 Token 数 |
+| `created_at` | DateTime | default=now | 创建时间 |
+
+**唯一约束**: `UniqueConstraint(session_id, sequence)`
+
+### 2.4 `user_run_locks` 表
+
+用户级执行互斥锁。确保每个用户同一时刻只有一个 Agent 在执行。
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `user_id` | String(100) | PK | 每个用户最多持有一把锁 |
+| `session_id` | String(36) | NOT NULL, indexed | 锁定的会话 |
+| `lock_id` | String(36) | NOT NULL | UUID，用于标识锁的持有者 |
+| `created_at` | DateTime | NOT NULL | 锁创建时间 |
+| `updated_at` | DateTime | NOT NULL, onupdate=now | 心跳刷新时间 |
+
+**并发语义**: 使用 PK 冲突（INSERT conflict）实现无等待互斥。若 INSERT 失败，说明用户已有正在运行的任务。
+
+### 2.5 `run_cancel_requests` 表
+
+跨 worker 取消请求的协调表。Worker 通过轮询此表检测取消信号。
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `session_id` | String(36) | PK | 一个会话最多一个活跃取消请求 |
+| `user_id` | String(100) | NOT NULL, indexed | 请求取消的用户 |
+| `state` | String(20) | NOT NULL, default=`"requested"` | 取消状态（见下方状态机） |
+| `request_id` | String(36) | NOT NULL | UUID，用于跟踪取消请求 |
+| `requested_at` | DateTime | NOT NULL | 请求时间 |
+| `acked_at` | DateTime | nullable | Worker 确认时间 |
+| `completed_at` | DateTime | nullable | 取消完成时间 |
+| `updated_at` | DateTime | NOT NULL | 最后更新时间 |
+
+**取消状态机**:
+
+```
+requested  ──→  acked  ──→  completed
+    │                           ▲
+    └───────────────────────────┘
+          (worker 死亡时直接跳到 completed)
+```
+
+---
+
+## 3. API 契约
+
+所有接口均需要 Bearer Token 认证。
+
+### 3.1 `POST /api/chat/{session_id}/message/stream`
+
+发送用户消息并启动 Agent 执行，返回 SSE 事件流。
+
+#### 请求
+
+```
+POST /api/chat/{session_id}/message/stream
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "content": ContentBlock[],
+  "idempotency_key": "uuid-string"     // 可选
+}
+```
+
+**ContentBlock 类型**:
+
+| 类型 | 结构 | 说明 |
+|------|------|------|
+| `text` | `{type: "text", text: string}` | 纯文本消息 |
+| `image_url` | `{type: "image_url", image_url: {url: string}}` | 图片（base64 data URI 或 URL） |
+| `video_url` | `{type: "video_url", video_url: {url: string}}` | 视频 |
+| `file` | `{type: "file", ...}` | 文件附件 |
+
+**图片约束**:
+
+- 模型必须支持图片（`supports_image=true`），否则拒绝
+- 单张图片大小上限：20MB
+- 总图片大小上限：50MB
+- 单次消息图片数量上限：由模型配置 `max_images` 决定
+
+#### 响应
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+X-Accel-Buffering: no
+```
+
+SSE 事件流格式遵循 AG-UI 协议（详见 [第 4.6 节](#46-ag-ui-事件体系)）。
+
+#### 错误码
+
+| HTTP 状态码 | 含义 | 场景 |
+|-------------|------|------|
+| 404 | 会话不存在 | `session_id` 无效或不属于当前用户 |
+| 410 | 会话已完成 | 会话处于终态，不再接受新消息 |
+| 429 | 当前有正在运行的任务 | 用户已有活跃的 Agent 执行（UserRunLock 冲突） |
+| 503 | 服务不可用 | DB 锁冲突等内部错误 |
+
+#### 流内错误事件
+
+当 Agent 执行过程中发生错误，不会返回 HTTP 错误码，而是通过 SSE 事件流推送错误事件：
+
+| 错误事件 | 触发条件 |
+|----------|----------|
+| `AGENT_INIT_FAILED` | Agent 初始化失败（沙箱连接、历史加载、技能初始化等） |
+| `ROUND_IN_PROGRESS` | 幂等键冲突：相同 `idempotency_key` 的 Round 已在执行中 |
+| `INTERNAL_ERROR` | 其他内部错误 |
+
+#### 并发控制机制
+
+```
+用户发送消息
+    │
+    ▼
+INSERT INTO user_run_locks (user_id, ...)
+    │
+    ├── 成功 → 获取锁，启动 Agent
+    │              │
+    │              ├── 每 15s 心跳: UPDATE updated_at
+    │              │
+    │              └── Agent 终态 → DELETE FROM user_run_locks
+    │
+    └── PK 冲突 → 返回 429 "当前有正在运行的任务"
+```
+
+### 3.2 `POST /api/chat/{session_id}/resume`
+
+恢复被中断的 Agent 执行（Human-in-the-Loop 应答）。
+
+#### 请求
+
+```
+POST /api/chat/{session_id}/resume
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "interrupt_id": "string",
+  "answers": {
+    "question_key": "user_answer"
+  }
+}
+```
+
+#### 响应
+
+SSE 事件流，格式与 `message/stream` 相同。
+
+#### 恢复路径
+
+| 路径 | 条件 | 行为 |
+|------|------|------|
+| **热路径** (Hot Path) | Agent 仍在内存中（未被 Pool 回收） | 将用户答案作为 `tool_result` 注入 → Agent 继续执行循环 |
+| **冷路径** (Cold Path) | Agent 已被 Pool 回收 | 将用户答案作为新 `user` 消息注入 → 启动新 Agent 执行 |
+
+两种路径都会创建新的 Round，其 `parent_run_id` 指向被中断的 Round。
+
+#### 错误码
+
+| HTTP 状态码 | 含义 | 场景 |
+|-------------|------|------|
+| 404 | 会话不存在 | `session_id` 无效 |
+| 409 | 没有待处理的中断 | 会话没有处于 `interrupted` 状态的 Round |
+| 429 | 当前有正在运行的任务 | UserRunLock 冲突 |
+| 500 | Agent 获取失败 | Agent 恢复过程出错 |
+| 503 | 服务不可用 | 内部错误 |
+
+### 3.3 `GET /api/chat/{session_id}/round/{round_id}/subscribe`
+
+订阅指定 Round 的 AG-UI 事件流。用于断线重连或查看历史 Round 的事件回放。
+
+#### 请求
+
+```
+GET /api/chat/{session_id}/round/{round_id}/subscribe?last_sequence=0
+Authorization: Bearer <token>
+```
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `last_sequence` | int | 0 | 客户端已接收的最大事件序号，服务端从此序号之后开始推送 |
+
+#### 响应
+
+SSE 事件流。
+
+#### 行为分支
+
+| Round 状态 | 行为 |
+|------------|------|
+| 已在终态 (`SUBSCRIBE_TERMINAL`) | 回放 `sequence > last_sequence` 的所有事件 → 关闭连接 |
+| 仍在运行 (`running`) | 回放历史事件 → 切换到实时模式，从 subscriber queue 推送新事件 |
+
+- 心跳间隔：15 秒
+- 订阅超时：5 分钟（可通过 `SSE_SUBSCRIBE_TIMEOUT=300` 配置）
+- 超时后推送 `RUN_ERROR(TIMEOUT)` 事件
+
+#### 错误码
+
+| HTTP 状态码 | 含义 |
+|-------------|------|
+| 404 | Round 不存在 |
+
+流内错误：`TIMEOUT`（订阅超时）
+
+### 3.4 `POST /api/chat/{session_id}/abort`
+
+请求取消当前正在运行的 Agent 执行。
+
+#### 响应
+
+```json
+// 正常取消请求
+{
+  "status": "cancellation_requested",
+  "request_id": "uuid"
+}
+
+// Worker 已死亡，直接清理
+{
+  "status": "cancelled",
+  "request_id": "uuid",
+  "reason": "worker_dead"
+}
+```
+
+| `status` 值 | 含义 |
+|--------------|------|
+| `cancellation_requested` | 取消请求已写入 DB，等待 Worker 检测并执行 |
+| `cancelled` + `reason: "worker_dead"` | 锁已超时（> 3 倍心跳间隔），判定 Worker 死亡，直接强制清理锁和 Round 状态 |
+
+#### 错误码
+
+| HTTP 状态码 | 含义 |
+|-------------|------|
+| 404 | 会话不存在 |
+| 409 | 没有正在进行的执行 |
+| 503 | 服务不可用 |
+
+### 3.5 `GET /api/chat/{session_id}/abort/status`
+
+查询当前取消请求的状态。
+
+#### 响应
+
+```json
+{
+  "session_id": "uuid",
+  "state": "none" | "requested" | "acked" | "completed",
+  "request_id": "uuid",
+  "requested_at": "datetime",
+  "acked_at": "datetime | null",
+  "completed_at": "datetime | null",
+  "running": true,
+  "running_round_id": "uuid"
+}
+```
+
+| `state` 值 | 含义 |
+|-------------|------|
+| `none` | 没有活跃的取消请求 |
+| `requested` | 取消已请求，Worker 尚未确认 |
+| `acked` | Worker 已确认取消，正在清理中 |
+| `completed` | 取消已完成 |
+
+#### 错误码
+
+| HTTP 状态码 | 含义 |
+|-------------|------|
+| 404 | 会话不存在 |
+
+---
+
+## 4. 行为语义与不变量
+
+### 4.1 Agent 执行循环
+
+#### 基本流程
+
+```
+用户消息到达
+    │
+    ▼
+创建 Round (status=running)
+    │
+    ▼
+获取 UserRunLock
+    │
+    ▼
+初始化 Agent (Lazy Init)
+    │  ├── 连接/恢复沙箱
+    │  ├── 加载对话历史
+    │  └── 初始化技能 (Skills)
+    │
+    ▼
+┌─── Agent 主循环 (step 1..max_steps) ──────────────┐
+│                                                     │
+│  ① 取消检查 ──── 检测 run_cancel_requests 表       │
+│      │                                              │
+│      ▼                                              │
+│  ② LLM 调用（流式）                                │
+│      │  └── Producer-Consumer: LLM stream → Queue   │
+│      ▼                                              │
+│  ③ 取消检查                                         │
+│      │                                              │
+│      ▼                                              │
+│  ④ 解析 LLM 响应                                   │
+│      │                                              │
+│      ├── 纯文本 → 发射 TEXT_MESSAGE 事件 → 结束循环 │
+│      │                                              │
+│      └── 工具调用 → 逐个执行:                       │
+│           ⑤ 取消检查                                │
+│           ⑥ 执行工具                                │
+│           ⑦ 发射 TOOL_CALL/RESULT 事件              │
+│           └── 回到循环顶部                          │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+完成 Round (status → 终态)
+    │
+    ▼
+释放 UserRunLock
+```
+
+#### 关键参数
+
+| 参数 | 默认值 | 可配置 | 说明 |
+|------|--------|--------|------|
+| `AGENT_MAX_STEPS` | 50 | 是（最大 100） | 单次 Round 最大步数 |
+| 心跳间隔 | 15s | 是 (`SSE_HEARTBEAT_INTERVAL`) | SSE 心跳与锁刷新间隔 |
+| 工具超时 | 300s | 是 (`tool_timeout`) | 单个工具执行超时 |
+| 流式块超时 | 100s | — | LLM 流式响应相邻 chunk 的最大间隔 |
+
+#### Producer-Consumer 模式
+
+LLM 流式响应采用 `asyncio.Queue` 解耦：
+
+- **Producer**: 消费 LLM 流式 chunk，写入 Queue
+- **Consumer** (主循环): 从 Queue 读取 chunk，生成 AG-UI 事件，推送 SSE
+
+这一设计使 LLM 流式输出不会阻塞事件处理，且 Producer 在 SSE 断开时仍可继续运行。
+
+#### 取消检查点
+
+Agent 执行循环中有 **3 个取消检查点**:
+
+1. **Step 开始前**: 每步循环入口
+2. **LLM 完成后、工具执行前**: LLM 响应解析完成时
+3. **每个工具执行前**: 多工具调用时，每个工具执行前单独检查
+
+检查逻辑：查询 `run_cancel_requests` 表，若存在 `state=requested` 的记录，将其更新为 `acked`，然后抛出取消异常。
+
+#### Max Steps 处理
+
+- 倒数第 2 步（step == max_steps - 1）时，注入一条**合成提醒消息**（`is_synthetic=True`），告知 Agent 即将达到步数上限
+- max_steps 耗尽时，发射 `RUN_FINISHED` 事件，`outcome="interrupt"`，附带 `max_steps_reached` 标记
+
+### 4.2 幂等性保证
+
+#### 机制
+
+```
+前端生成 UUID → idempotency_key
+    │
+    ▼
+INSERT INTO rounds (..., idempotency_key)
+    │
+    ├── 成功 → 正常执行
+    │
+    └── IntegrityError (唯一约束冲突)
+         │
+         ▼
+    查询已有 Round
+         │
+         ├── 已在终态 → 返回已有 Round（前端可 subscribe 重放）
+         │
+         └── 仍在运行 → 重定向到 subscribe 模式
+              └── 推送 ROUND_IN_PROGRESS 错误事件
+```
+
+#### 要求
+
+- `idempotency_key` 由前端生成（UUID v4）
+- 唯一约束作用域：`(session_id, idempotency_key)`
+- 前端在网络重试时必须携带相同的 `idempotency_key`
+
+### 4.3 并发控制
+
+#### UserRunLock 生命周期
+
+```
+                   获取锁
+                     │
+        ┌────────────┼────────────┐
+        │            │            │
+        ▼            ▼            ▼
+   正常完成      中断暂停      取消/失败
+   DELETE lock   DELETE lock   DELETE lock
+```
+
+#### Worker 死亡检测
+
+- 每 15s 心跳刷新 `user_run_locks.updated_at`
+- 超过 **3 倍心跳间隔**（默认 45s）未刷新 → 判定 Worker 死亡
+- `abort` 接口检测到 Worker 死亡时，直接：
+  1. 删除 `user_run_locks` 记录
+  2. 将 Round 状态设为 `cancelled`
+  3. 将取消请求状态设为 `completed`
+  4. 返回 `{status: "cancelled", reason: "worker_dead"}`
+
+#### Per-User 串行
+
+整个系统保证 **每用户同一时刻只有一个 Agent 执行**。这意味着：
+
+- 同一用户的不同会话也互斥
+- `user_run_locks` 表以 `user_id` 为 PK，而非 `session_id`
+
+### 4.4 SSE 事件持久化策略
+
+不同类型的事件采用不同的持久化策略，以平衡实时性和写入性能：
+
+#### 流式 Delta 事件 — 内存缓冲
+
+以下事件在内存中缓冲，不逐条写入 DB：
+
+- `TEXT_MESSAGE_CONTENT` — 文本 delta
+- `THINKING_TEXT_MESSAGE_CONTENT` — 思考过程 delta
+- `TOOL_CALL_ARGS` — 工具参数 delta
+
+当对应的 `*_END` 事件到达时，触发**聚合写入**：将所有缓冲的 delta 合并为一条完整内容，与 END 事件一起写入 DB。
+
+> **设计决策**: 流式 delta 可能有数十到数百条，逐条持久化会产生大量小写入。聚合后只写 2 条记录（合并的 CONTENT + END），大幅减少 DB 压力。
+
+#### 关键生命周期事件 — 立即提交
+
+以下事件在生成时立即写入 DB 并提交事务：
+
+- `RUN_STARTED` / `RUN_FINISHED`
+- `RUN_ERROR`
+- `STEP_STARTED` / `STEP_FINISHED`
+
+#### 其他事件 — 批量提交
+
+除上述两类以外的事件，每累积 **10 条**时批量提交一次。
+
+### 4.5 上下文压缩
+
+当对话历史的 Token 数超出模型上下文窗口时，触发多级压缩。压缩从低级开始逐级升级。
+
+#### Token 限制参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `token_limit` | 80,000 | 压缩触发阈值 |
+| `context_window` | 128,000 | 模型上下文窗口大小 |
+| `max_output_tokens` | 16,384 | 模型最大输出长度 |
+| `hard_ceiling` | `context_window - max_output_tokens - 3000`（最小 8,192） | 绝对不可超越的上限 |
+
+#### 压缩级别
+
+| 级别 | 名称 | 策略 | 是否需要 LLM | 说明 |
+|------|------|------|-------------|------|
+| Level 2 | Microcompact | 替换 + 清理 | 否 | 替换超过 4000 字符的 `tool_result` 为摘要占位符；清理旧的 `thinking` 内容；保留最近 2 轮完整内容 |
+| Level 3 | LLM Summary | LLM 摘要 | **是** | 使用 LLM 对历史轮次逐轮生成摘要，替换原始内容 |
+| Level 4 | Emergency Truncate | 强制丢弃 | 否 | 从最老的 user round 开始丢弃，最多丢弃 3 轮，**至少保留 1 轮** |
+
+#### 压缩流程
+
+```
+计算当前上下文 Token 数
+    │
+    ├── ≤ token_limit → 不压缩
+    │
+    └── > token_limit
+         │
+         ▼
+    Level 2: Microcompact
+         │
+         ├── 压缩后 ≤ token_limit → 完成
+         │
+         └── 仍超出
+              │
+              ▼
+         Level 3: LLM Summary
+              │
+              ├── 压缩后 ≤ token_limit → 完成
+              │
+              └── 仍超出
+                   │
+                   ▼
+              Level 4: Emergency Truncate
+                   │
+                   └── 强制满足 hard_ceiling
+```
+
+### 4.6 AG-UI 事件体系
+
+系统生成 22 类标准 AG-UI 事件，分为 7 个分类：
+
+#### 事件分类
+
+| 分类 | 事件类型 | 说明 |
+|------|----------|------|
+| **Lifecycle** | `RUN_STARTED` | Agent 执行开始 |
+| | `RUN_FINISHED` | Agent 执行完成（含 outcome） |
+| | `RUN_ERROR` | Agent 执行出错 |
+| | `STEP_STARTED` | 单步执行开始 |
+| | `STEP_FINISHED` | 单步执行完成 |
+| **Text** | `TEXT_MESSAGE_START` | 文本消息开始 |
+| | `TEXT_MESSAGE_CONTENT` | 文本消息 delta（流式） |
+| | `TEXT_MESSAGE_END` | 文本消息结束 |
+| **Thinking** | `THINKING_TEXT_MESSAGE_START` | 思考过程开始 |
+| | `THINKING_TEXT_MESSAGE_CONTENT` | 思考过程 delta（流式） |
+| | `THINKING_TEXT_MESSAGE_END` | 思考过程结束 |
+| **Tool** | `TOOL_CALL_START` | 工具调用开始 |
+| | `TOOL_CALL_ARGS` | 工具参数 delta（流式） |
+| | `TOOL_CALL_END` | 工具调用结束 |
+| | `TOOL_CALL_RESULT` | 工具执行结果 |
+| **State** | `STATE_SNAPSHOT` | 完整状态快照 |
+| | `STATE_DELTA` | 状态增量更新（JSON Patch, RFC 6902） |
+| | `MESSAGES_SNAPSHOT` | 消息列表快照 |
+| **Custom** | `heartbeat` | 心跳保活 |
+| | `title_updated` | 会话标题更新 |
+| | 其他自定义事件 | 按需扩展 |
+
+#### ID 生成规则
+
+| ID 类型 | 格式 | 示例 |
+|---------|------|------|
+| `threadId` | Session UUID | `a1b2c3d4-...` |
+| `runId` | Round UUID | `e5f6g7h8-...` |
+| `messageId` | `msg_{runId}_{step}` | `msg_e5f6g7h8_3` |
+| `toolCallId` | `tc_{runId}_{step}` | `tc_e5f6g7h8_3` |
+
+### 4.7 Ask-User 中断与恢复
+
+Human-in-the-Loop 机制允许 Agent 在执行过程中向用户提问并等待答复。
+
+#### 中断流程
+
+```
+Agent 调用 ask_user 工具
+    │
+    ▼
+保存中断状态到 Round:
+  - interrupt_payload = {id, reason, payload}
+  - status = "interrupted"
+    │
+    ▼
+填充占位 tool_result（标记为待替换）
+    │
+    ▼
+发射 TOOL_CALL_RESULT (ask_user 结果，含占位内容)
+    │
+    ▼
+发射 RUN_FINISHED (outcome="interrupt")
+    │
+    ▼
+释放 UserRunLock
+```
+
+#### 恢复流程
+
+```
+用户提交答案 → POST /resume
+    │
+    ▼
+获取 asyncio.Lock (_resume_lock) ── 防止并发 resume
+    │
+    ▼
+创建新 Round (parent_run_id = 被中断的 Round)
+    │
+    ▼
+将原 Round 状态设为 "resumed"
+    │
+    ▼
+判断恢复路径:
+    │
+    ├── 热路径: Agent 仍在内存
+    │     │
+    │     ▼
+    │   替换占位 tool_result 为用户答案
+    │     │
+    │     ▼
+    │   Agent 继续执行循环
+    │
+    └── 冷路径: Agent 已被回收
+          │
+          ▼
+        将用户答案作为新 user 消息注入
+          │
+          ▼
+        启动新 Agent 执行
+```
+
+**并发保护**: `_resume_lock` 使用 `asyncio.Lock`，确保同一会话的 resume 请求不会并发执行。
+
+### 4.8 LLM Failover
+
+#### Fallback 链
+
+`models.yaml` 中可为模型配置 fallback 列表：
+
+```yaml
+models:
+  - name: primary-model
+    fallback:
+      - fallback-model-1
+      - fallback-model-2
+```
+
+#### Failover 流程
+
+```
+调用 Primary 模型
+    │
+    ├── 成功 → 返回
+    │
+    └── 失败 → 重试（指数退避）
+         │
+         ├── 重试成功 → 返回
+         │
+         └── 重试耗尽
+              │
+              ▼
+         Callback: 重置流式状态，调整上下文窗口
+              │
+              ▼
+         调用 Fallback 模型 1
+              │
+              ├── 成功 → 返回
+              │
+              └── 失败 → 调用 Fallback 模型 2
+                   │
+                   ├── 成功 → 返回
+                   │
+                   └── 所有 Fallback 失败
+                        │
+                        ▼
+                   抛出 RetryExhaustedError
+```
+
+#### 重试参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `max_retries` | 3 | 每个模型最大重试次数 |
+| `initial_delay` | 0.5s | 初始重试延迟 |
+| `max_delay` | 30s | 最大重试延迟 |
+| `max_increment` | 1.0s | 每次退避最大增量 |
+
+#### Failover 策略
+
+- **One-shot Failover**: 当 Fallback 模型成功后，下一次 LLM 调用仍优先尝试 Primary 模型
+- 不会永久切换到 Fallback 模型
+
+### 4.9 Lazy Agent Init
+
+Agent 初始化采用延迟模式，确保 SSE 连接不会因初始化耗时而超时。
+
+```
+SSE 连接建立
+    │
+    ▼
+立即开始发送心跳（每 15s）
+    │
+    ▼
+异步并行初始化:
+    ├── 连接/恢复沙箱
+    ├── 加载对话历史
+    └── 初始化技能 (Skills)
+    │
+    ├── 全部成功 → 发射 RUN_STARTED → 进入 Agent 循环
+    │
+    └── 任一失败 → 发射 AGENT_INIT_FAILED 事件 → 关闭连接
+```
+
+> **设计决策**: SSE 连接先建立再初始化，避免浏览器/网关因等待过久而断开连接。心跳在初始化期间就已开始发送。
+
+### 4.10 Round 状态不变量
+
+**核心不变量**: 每个 Round 最终都必须达到终态。
+
+#### 实现保证
+
+1. **Finally Block**: Agent 执行的 finally 块确保无论正常完成、异常、断开还是取消，Round 都会被设置为终态
+2. **防止跨 Worker 覆写**: `complete_round` 在更新前检查 Round 当前状态——若已处于终态（`completed`/`failed`/`cancelled`），则跳过更新。这防止了以下场景：
+   - Worker A 执行 Round，被 abort 设为 `cancelled`
+   - Worker A 的 finally 块随后执行，尝试将 Round 设为 `completed`
+   - 检查发现 Round 已在终态，跳过更新
+
+---
+
+## 5. 失败模式与错误处理
+
+| 失败场景 | 检测方式 | 处理策略 | 用户感知 |
+|----------|----------|----------|----------|
+| **LLM 调用失败** | 异常捕获 + 重试耗尽 (`RetryExhaustedError`) | 发射 `RUN_ERROR` 事件，Round 标记 `failed` | SSE 收到错误事件，前端展示错误提示 |
+| **Agent 初始化失败** | 初始化异常捕获 | 发射 `AGENT_INIT_FAILED` 事件，Round 标记 `failed` | 同上 |
+| **工具执行超时** | `tool_timeout=300s` | 工具返回超时错误信息，Agent 继续执行（可选择重试或放弃该工具） | Agent 可能告知用户工具超时，或尝试替代方案 |
+| **LLM 返回空响应** | 检测空内容 | 给予一次 nudge 机会（注入提示重新生成）；连续空响应 → `RUN_ERROR` | 首次空响应用户无感知；连续空响应收到错误 |
+| **输出截断** | `finish_reason=length` | 自动重试一次（调整 prompt 或 context） | 用户无感知（自动恢复） |
+| **SSE 断开** | 连接关闭检测 | Producer 继续运行在 `_active_runners` 中，等待客户端重连通过 subscribe 恢复 | 前端检测断开，自动重连并通过 subscribe 恢复事件流 |
+| **Subscribe 超时** | 5 分钟定时器 | 发射 `RUN_ERROR(TIMEOUT)` 事件，关闭连接 | 前端收到超时事件，提示用户 |
+| **DB 锁冲突** | 数据库异常捕获 | 返回 HTTP 503 | 前端提示稍后重试 |
+| **Worker 死亡** | 锁超时检测（> 3 倍心跳） | abort 接口直接清理锁和 Round 状态 | 用户调用 abort 时得到即时响应 |
+
+### SSE 断线重连详细流程
+
+```
+SSE 连接断开
+    │
+    ▼ (前端)
+记录最后收到的 event sequence
+    │
+    ▼
+GET /subscribe?last_sequence={last_seq}
+    │
+    ▼ (后端)
+    ├── Round 仍在运行
+    │     │
+    │     ▼
+    │   从 DB 回放 sequence > last_seq 的事件
+    │     │
+    │     ▼
+    │   切换到实时模式（从 subscriber queue 推送）
+    │
+    └── Round 已结束
+          │
+          ▼
+        从 DB 回放所有剩余事件 → 关闭连接
+```
+
+---
+
+## 6. 可观测性
+
+### 日志事件
+
+| 日志事件 | 级别 | 包含信息 | 触发时机 |
+|----------|------|----------|----------|
+| Agent 执行开始 | INFO | `session_id`, `round_id`, `user_id`, 模型名称 | Round 创建时 |
+| Agent 执行结束 | INFO | `session_id`, `round_id`, `status`, `step_count`, 耗时 | Round 到达终态时 |
+| 上下文压缩触发 | INFO | 压缩级别, 压缩前/后 Token 数 | 每次压缩执行时 |
+| LLM 重试 | WARNING | 模型名称, 错误信息, 重试次数, 延迟时间 | 每次重试时 |
+| LLM Failover | WARNING | Primary 模型, Fallback 模型, 原始错误 | 切换 Fallback 时 |
+| 取消请求状态变化 | INFO | `session_id`, `request_id`, 新状态 | 每次状态流转时 |
+| 工具执行耗时 | DEBUG | 工具名称, `session_id`, 耗时 | 每次工具执行完成时 |
+| 心跳发送 | DEBUG | `session_id`, `round_id` | 每次心跳时 |
+| Worker 死亡检测 | WARNING | `user_id`, `session_id`, 锁龄 | abort 检测到死锁时 |
+
+---
+
+## 7. 非目标
+
+以下功能明确不在本模块范围内，不应在本模块中实现：
+
+| 非目标 | 说明 |
+|--------|------|
+| 消息编辑/撤回 | 已发送的消息不支持修改或删除 |
+| 多轮并行执行 | 每用户严格串行（per-user 锁），不支持同一用户同时运行多个 Agent |
+| Token 用量计费 | 不跟踪 Token 消耗用于计费目的 |
+| 对话分支/分叉 | 不支持从历史消息分叉出新的对话线路 |
+| Agent 间通信 | Sub-Agent 共享沙箱但拥有独立历史，不支持 Agent 间直接消息传递 |
+| 客户端工具执行 | 所有工具均在服务端执行，不支持将工具调用下发到客户端 |

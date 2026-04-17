@@ -1,0 +1,208 @@
+# 分层记忆 (Memory) — Spec
+
+## 1. 模块职责边界
+
+- 4 层记忆文件管理（SOUL / USER / AGENTS / MEMORY）
+- 记忆文件 CRUD（DB 为权威源）
+- 双写同步（DB <-> 沙箱）
+- 嵌入向量生成与混合检索（BM25 + 向量 + RRF）
+- 对话轮索引
+- 新用户模板初始化
+- **不负责**：记忆文件内容解析、Agent 行为控制
+
+---
+
+## 2. 数据模型
+
+### user_memory 表
+
+| 字段 | 类型 | 约束 |
+|---|---|---|
+| id | Integer | PK, autoincrement |
+| user_id | String(100) | NOT NULL, indexed |
+| file_type | String(20) | NOT NULL. 取值: `user_md`, `memory_md`, `soul_md`, `agents_md` |
+| content | Text | NOT NULL |
+| version | Integer | default=1, NOT NULL（乐观锁） |
+| updated_at | DateTime | default=now, onupdate=now |
+
+### memory_embeddings 表
+
+| 字段 | 类型 | 约束 |
+|---|---|---|
+| id | Integer | PK, autoincrement |
+| user_id | String(100) | NOT NULL, indexed |
+| file_path | String(255) | nullable |
+| chunk_index | Integer | nullable |
+| chunk_text | Text | NOT NULL |
+| embedding | Text | nullable（JSON float 数组） |
+| created_at | DateTime | default=now |
+
+### user_skill_configs 表
+
+| 字段 | 类型 | 约束 |
+|---|---|---|
+| id | Integer | PK, autoincrement |
+| user_id | String(100) | NOT NULL, indexed |
+| skill_name | String(100) | NOT NULL |
+| enabled | Boolean | default=True |
+| updated_at | DateTime | default=now, onupdate=now |
+
+---
+
+## 3. API 契约
+
+所有接口均需 Bearer Token 鉴权。
+
+### GET /api/config/agent-files/{name}
+
+- `name` 取值范围：`user` | `soul` | `agents` | `memory`
+- 成功响应 200：
+
+```json
+{
+  "name": "user",
+  "file_type": "user_md",
+  "content": "...",
+  "version": 3
+}
+```
+
+- 错误 400：`"无效的文件名"`
+
+### PUT /api/config/agent-files/{name}
+
+- 请求体：
+
+```json
+{ "content": "新的记忆内容" }
+```
+
+- 成功响应 200：
+
+```json
+{
+  "name": "user",
+  "file_type": "user_md",
+  "version": 4,
+  "message": "ok"
+}
+```
+
+- 错误 400（无效文件名）、409（版本冲突，来源 RuntimeError）
+- 副作用：更新 DB -> 强制推送到沙箱 -> 失效 AgentPool 缓存
+
+### GET /api/config/skills
+
+- 成功响应 200：
+
+```json
+{
+  "skills": [
+    {
+      "name": "web_search",
+      "description": "搜索互联网",
+      "category": "builtin",
+      "enabled": true
+    }
+  ]
+}
+```
+
+- 合并 SkillLoader 发现结果 + UserSkillConfig 数据库状态
+
+### PUT /api/config/skills/{skill_name}
+
+- 请求体：
+
+```json
+{ "enabled": true }
+```
+
+- 成功响应 200：
+
+```json
+{
+  "skill_name": "web_search",
+  "enabled": true,
+  "message": "ok"
+}
+```
+
+---
+
+## 4. 行为语义与不变量
+
+### 双写同步规则
+
+| 场景 | 方向 | 行为 |
+|---|---|---|
+| 新用户 | template -> DB -> sandbox | `provision_default_files` 幂等 |
+| Agent 运行时修改 | sandbox -> DB | dirty flag 检测后同步 |
+| 前端编辑 | DB -> sandbox (force) | 覆写沙箱内容 |
+| 新 Session Agent 创建 | sandbox-first | 沙箱有内容 -> 写回 DB；空则 DB -> sandbox |
+
+### Dirty Flag 检测
+
+- **工具名匹配**：`record_memory`、`update_long_term_memory`、`update_user`
+- **文件操作嗅探**：`write_file` / `edit_file` 目标为记忆文件
+- **盲区**：bash 修改记忆文件不可检测（AGENTS.md 中禁止此行为）
+- 每 round 结束后若 dirty -> 触发 sandbox -> DB 同步
+
+### 乐观锁
+
+- `upsert_memory_file` 支持 `expected_version` 参数
+- 版本不匹配 -> 抛出 `RuntimeError` -> 前端收到 HTTP 409
+
+### 混合检索
+
+- **BM25 分词**：中文逐字，英文逐词（零外部依赖）
+- **向量检索**：外部 embedding API（支持 model_registry + settings fallback）
+- **RRF 融合**：k=60，取 3x top_k 候选
+- **时间衰减**：half_life=30 天，指数衰减；常驻文件（MEMORY / USER / SOUL / AGENTS.md）豁免
+- **降级策略**：无 embedding API 时降级为纯 BM25
+
+### 文本分块
+
+- `chunk_size` = 512 tokens
+- 双换行分段，小段合并
+
+### 记忆文件模板
+
+- 来源：`docs/sandbox_template/` 目录
+- 初始化时剥离 YAML frontmatter
+
+### System Prompt 构建
+
+- 从 SOUL / USER / AGENTS / MEMORY 文件拼接
+- Token 预算：`token_limit` 的 15%
+- 低优先级记忆使用二分查找截断
+
+---
+
+## 5. 失败模式与错误处理
+
+| 失败场景 | 处理方式 |
+|---|---|
+| Embedding API 失败 | 返回 None embeddings，降级为纯 BM25 |
+| 沙箱同步失败 | warning 日志，不阻塞主流程 |
+| 版本冲突 | `RuntimeError` -> HTTP 409 |
+| 无效 file_type | `ValueError` / HTTP 400 |
+
+---
+
+## 6. 可观测性
+
+- 新用户初始化日志
+- 同步方向与结果日志
+- Embedding API 调用失败 warning
+- 检索结果数量日志
+
+---
+
+## 7. 非目标
+
+- 不做记忆文件的版本历史（只有当前版本 + version 数字）
+- 不做跨用户记忆共享
+- 不做自动遗忘 / 过期
+- 不做结构化知识图谱
+- 不做记忆文件导入 / 导出
