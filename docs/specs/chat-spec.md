@@ -557,6 +557,20 @@ INSERT INTO rounds (..., idempotency_key)
 - 同一用户的不同会话也互斥
 - `user_run_locks` 表以 `user_id` 为 PK，而非 `session_id`
 
+#### DB 连接生命周期约束（强约束）
+
+后端为 FastAPI + SQLAlchemy 同步 ORM + asyncio 混合模型，DB 连接必须**短持有**，否则会在单 worker 部署下耗尽连接池并阻塞整个 event loop。
+
+规则：
+
+1. **后台长轮询协程不得跨 `await asyncio.sleep` 持有 DB Session**。典型场景：
+   - `_cancel_request_watcher`：每轮单独 `with SessionLocal() as check_db` / `hb_db`，`sleep` 前必须释放。
+   - `subscribe_to_round.heartbeat_and_poll`：每次增量回放查询单独 `with SessionLocal() as replay_db`，查完立即释放。
+2. **SQLite 必须使用 `NullPool`**：文件型 DB 连接开销极低，NullPool 彻底规避 QueuePool 超时阻塞 event loop 的风险。其它数据库（MySQL/Postgres）保留默认 `QueuePool`。
+3. **请求级 `db: Depends(get_db)` 在 SSE 流路径上只能用于入口校验**；进入 event_generator / producer 后，必须使用独立短生命周期 Session 做持久化。
+
+不遵守上述规则会表现为：多并发会话切换/拉取时，`get_db` 从连接池获取连接超时，抛 `sqlalchemy.exc.TimeoutError: QueuePool limit ... connection timed out`。
+
 ### 4.4 SSE 事件持久化策略
 
 不同类型的事件采用不同的持久化策略，以平衡实时性和写入性能：

@@ -1591,37 +1591,120 @@ class TestWatcherSurvivesDisconnect:
                 assert "RUN_STARTED" in first_chunk
                 await gen.aclose()
 
-            # 断线后等待 agent 开始运行
-            await asyncio.wait_for(agent_started.wait(), timeout=2.0)
-            await asyncio.sleep(0.05)
-
-            # 模拟 B worker 发起 abort（写入 DB cancel request）
-            with TestSL() as abort_db:
-                await chat_routes._upsert_cancel_request(
-                    abort_db,
-                    user_id=user_id,
-                    session_id=session_id,
-                )
-
-            # 给 watcher 时间去 ack（watcher 默认 3s interval，但测试里可能更快）
-            for _ in range(200):
-                if cancel_token.is_set():
-                    break
+                # 断线后等待 agent 开始运行
+                await asyncio.wait_for(agent_started.wait(), timeout=2.0)
                 await asyncio.sleep(0.05)
 
-            assert cancel_token.is_set(), "cancel_token 应该被 watcher 设置"
+                # 模拟 B worker 发起 abort（写入 DB cancel request）
+                with TestSL() as abort_db:
+                    await chat_routes._upsert_cancel_request(
+                        abort_db,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
 
-            # 验证 cancel request 被 acked
-            with TestSL() as verify_db:
-                row = (
-                    verify_db.query(RunCancelRequest)
-                    .filter(RunCancelRequest.session_id == session_id)
-                    .first()
+                # 给 watcher 时间去 ack（watcher 默认 3s interval，但测试里可能更快）
+                # 注意：watcher 每轮独立创建 Session，patch 必须覆盖到 ack 完成
+                for _ in range(200):
+                    if cancel_token.is_set():
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert cancel_token.is_set(), "cancel_token 应该被 watcher 设置"
+
+                # 验证 cancel request 被 acked
+                with TestSL() as verify_db:
+                    row = (
+                        verify_db.query(RunCancelRequest)
+                        .filter(RunCancelRequest.session_id == session_id)
+                        .first()
+                    )
+                    assert row is not None
+                    assert row.state in ("acked", "completed"), (
+                        f"cancel request 应为 acked/completed，实际: {row.state}"
+                    )
+        finally:
+            engine.dispose()
+
+
+class TestWatcherConnectionLifecycle:
+    """回归：cancel watcher 每轮使用独立短生命周期 Session，
+    不会长期独占 DB 连接（防止 QueuePool 耗尽导致整体死锁）。"""
+
+    @pytest.mark.asyncio
+    async def test_watcher_opens_new_session_each_iteration(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from src.api.models.database import Base
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.routes import chat as chat_routes
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+
+        user_id = "user-conn"
+        session_id = "session-conn"
+        lock_id = "lock-conn"
+        cancel_token = asyncio.Event()
+
+        try:
+            with TestSL() as setup_db:
+                setup_db.add(
+                    UserRunLock(
+                        user_id=user_id,
+                        session_id=session_id,
+                        lock_id=lock_id,
+                    )
                 )
-                assert row is not None
-                assert row.state in ("acked", "completed"), (
-                    f"cancel request 应为 acked/completed，实际: {row.state}"
+                setup_db.commit()
+
+            # 统计 SessionLocal() 被调用次数 —— 若仍是旧实现只会调一次
+            call_count = {"n": 0}
+            real_sessionmaker = TestSL
+
+            def counting_sessionlocal(*args, **kwargs):
+                call_count["n"] += 1
+                return real_sessionmaker(*args, **kwargs)
+
+            with patch("src.api.routes.chat.SessionLocal", counting_sessionlocal), \
+                 patch("src.api.routes.chat.get_settings") as mock_settings:
+                # check_interval / heartbeat 内部会被 clamp 到 >= 0.5s
+                mock_settings.return_value.cancel_watcher_interval_seconds = 0.5
+                mock_settings.return_value.sse_heartbeat_interval = 0.5
+
+                watcher_task = asyncio.create_task(
+                    chat_routes._cancel_request_watcher(
+                        user_id=user_id,
+                        session_id=session_id,
+                        cancel_token=cancel_token,
+                        lock_id=lock_id,
+                    )
                 )
+
+                # 跑 ~2s，应完成多轮循环（每轮至少一次 check session + 偶尔 heartbeat session）
+                await asyncio.sleep(2.0)
+
+                # 触发 watcher 退出
+                cancel_token.set()
+                try:
+                    await asyncio.wait_for(watcher_task, timeout=1.0)
+                except asyncio.TimeoutError:
+                    watcher_task.cancel()
+                    with pytest.raises((asyncio.CancelledError, Exception)):
+                        await watcher_task
+
+            # 旧实现整个生命周期只会调一次 SessionLocal()。
+            # 新实现每轮独立创建：2s / 0.5s ≈ 4 轮 → check session + heartbeat session ≥ 4 次。
+            assert call_count["n"] >= 4, (
+                f"watcher 应每轮独立创建 Session，实际调用次数: {call_count['n']}"
+            )
         finally:
             engine.dispose()
 

@@ -3,6 +3,7 @@ import logging
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 from pathlib import Path
 
 from src.api.config import get_settings
@@ -22,6 +23,7 @@ def _import_models():
         UserMemory, MemoryEmbedding, CronJobRun, UserSkillConfig
     )
     from src.api.models.cron_job import CronJob as _  # noqa: F401
+    from src.api.models.cron_fire import CronFire as _  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +40,10 @@ if _IS_SQLITE:
     db_dir.mkdir(parents=True, exist_ok=True)
 
 # 创建引擎
-engine = create_engine(
-    DATABASE_URL,
+# SQLite: 使用 NullPool（文件型 DB 连接开销极低，按需创建/立即释放），
+# 彻底避免 asyncio 环境下 QueuePool 耗尽导致的 30s 阻塞死锁。
+# 其它数据库（MySQL/Postgres）保留默认 QueuePool。
+_engine_kwargs = dict(
     connect_args=(
         {"check_same_thread": False, "timeout": 30}
         if _IS_SQLITE
@@ -47,6 +51,10 @@ engine = create_engine(
     ),
     echo=False,  # 生产环境设为 False
 )
+if _IS_SQLITE:
+    _engine_kwargs["poolclass"] = NullPool
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
 
 # 会话工厂
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -79,6 +87,7 @@ def _configure_sqlite_pragmas():
     try:
         with engine.begin() as conn:
             mode = conn.execute(text("PRAGMA journal_mode=WAL")).scalar()
+            conn.execute(text("PRAGMA busy_timeout=5000"))
             logger.info("SQLite PRAGMA journal_mode=%s", mode)
     except Exception:
         logger.warning("设置 SQLite WAL 模式失败，继续使用默认 journal_mode", exc_info=True)

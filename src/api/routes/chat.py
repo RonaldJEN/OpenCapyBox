@@ -242,10 +242,16 @@ async def _cancel_request_watcher(
     """轮询 DB 取消请求并触发本地 cancel_token（跨 worker cancel）。
 
     同时定期刷新 UserRunLock.updated_at 作为心跳。
-    使用单个 SessionLocal 共用连接，减少 DB 连接开销。
+    每轮检查使用独立短生命周期 Session，在 asyncio.sleep 期间将连接归还连接池，
+    避免长时间独占 DB 连接导致 QueuePool 耗尽（FIFO 阻塞 event loop 死锁）。
     cancel check 频率由 cancel_watcher_interval_seconds 控制（默认 3s），
     心跳频率复用 sse_heartbeat_interval（默认 15s）。
     连续心跳失败 N 次后自杀，避免被其他 worker 误判存活。
+
+    心跳失败语义：OperationalError/Exception 分支不刷新 `_last_heartbeat`，
+    下一轮 `check_interval`（默认 3s）后立即重试；连续 `max_heartbeat_failures`
+    次失败则触发自杀。与旧实现（无条件刷新、每 `heartbeat_interval` 重试一次）
+    相比，最坏自杀时间由 ~45s 缩短到 ~9s，更快收敛到 "worker 死亡" 判定。
     """
     settings = get_settings()
     check_interval = max(settings.cancel_watcher_interval_seconds, 0.5)
@@ -255,12 +261,12 @@ async def _cancel_request_watcher(
     _last_heartbeat = time.monotonic()
 
     try:
-        with SessionLocal() as watcher_db:
-            while not cancel_token.is_set():
-                # 1. 检查取消请求
-                try:
+        while not cancel_token.is_set():
+            # 1. 检查取消请求 —— 独立短生命周期 Session
+            try:
+                with SessionLocal() as check_db:
                     row = (
-                        watcher_db.query(RunCancelRequest)
+                        check_db.query(RunCancelRequest)
                         .filter(
                             RunCancelRequest.session_id == session_id,
                             RunCancelRequest.user_id == user_id,
@@ -270,66 +276,64 @@ async def _cancel_request_watcher(
                     if row and row.state == _CANCEL_STATE_REQUESTED:
                         row.state = _CANCEL_STATE_ACKED
                         row.acked_at = now_naive()
-                        watcher_db.commit()
+                        check_db.commit()
                         cancel_token.set()
                         logger.info(
                             "检测到跨 worker cancel 请求，已触发本地取消: user=%s session=%s request_id=%s",
                             user_id, session_id, row.request_id,
                         )
                         return
-                except OperationalError as exc:
-                    watcher_db.rollback()
-                    if not _is_sqlite_locked_error(exc):
-                        raise
-                    # SQLite 瞬时锁冲突，下次再试
+            except OperationalError as exc:
+                if not _is_sqlite_locked_error(exc):
+                    raise
+                # SQLite 瞬时锁冲突，下次再试
 
-                # 2. 定期刷新锁心跳（频率低于 cancel check）
-                if lock_id and (time.monotonic() - _last_heartbeat) >= heartbeat_interval:
-                    try:
-                        updated = watcher_db.query(UserRunLock).filter(
+            # 2. 定期刷新锁心跳（频率低于 cancel check）—— 独立短生命周期 Session
+            if lock_id and (time.monotonic() - _last_heartbeat) >= heartbeat_interval:
+                try:
+                    with SessionLocal() as hb_db:
+                        updated = hb_db.query(UserRunLock).filter(
                             UserRunLock.user_id == user_id,
                             UserRunLock.lock_id == lock_id,
                         ).update({UserRunLock.updated_at: now_naive()}, synchronize_session=False)
-                        watcher_db.commit()
-                        if updated:
-                            _heartbeat_fail_count = 0
-                        else:
-                            # 锁已不存在（被其他 worker 回收），自杀
-                            logger.warning(
-                                "心跳发现锁已被回收，触发取消: user=%s session=%s",
-                                user_id, session_id,
-                            )
-                            cancel_token.set()
-                            return
+                        hb_db.commit()
+                    if updated:
+                        _heartbeat_fail_count = 0
                         _last_heartbeat = time.monotonic()
-                    except OperationalError as exc:
-                        watcher_db.rollback()
-                        if _is_sqlite_locked_error(exc):
-                            _heartbeat_fail_count += 1
-                            logger.warning(
-                                "心跳写入失败（SQLite 锁冲突）: user=%s fail_count=%d/%d",
-                                user_id, _heartbeat_fail_count, max_heartbeat_failures,
-                            )
-                        else:
-                            raise
-                    except Exception:
-                        watcher_db.rollback()
-                        _heartbeat_fail_count += 1
+                    else:
+                        # 锁已不存在（被其他 worker 回收），自杀
                         logger.warning(
-                            "心跳写入异常: user=%s fail_count=%d/%d",
-                            user_id, _heartbeat_fail_count, max_heartbeat_failures,
-                            exc_info=True,
-                        )
-
-                    if _heartbeat_fail_count >= max_heartbeat_failures:
-                        logger.error(
-                            "心跳连续失败 %d 次，触发取消防止假活: user=%s session=%s",
-                            _heartbeat_fail_count, user_id, session_id,
+                            "心跳发现锁已被回收，触发取消: user=%s session=%s",
+                            user_id, session_id,
                         )
                         cancel_token.set()
                         return
+                except OperationalError as exc:
+                    if _is_sqlite_locked_error(exc):
+                        _heartbeat_fail_count += 1
+                        logger.warning(
+                            "心跳写入失败（SQLite 锁冲突）: user=%s fail_count=%d/%d",
+                            user_id, _heartbeat_fail_count, max_heartbeat_failures,
+                        )
+                    else:
+                        raise
+                except Exception:
+                    _heartbeat_fail_count += 1
+                    logger.warning(
+                        "心跳写入异常: user=%s fail_count=%d/%d",
+                        user_id, _heartbeat_fail_count, max_heartbeat_failures,
+                        exc_info=True,
+                    )
 
-                await asyncio.sleep(check_interval)
+                if _heartbeat_fail_count >= max_heartbeat_failures:
+                    logger.error(
+                        "心跳连续失败 %d 次，触发取消防止假活: user=%s session=%s",
+                        _heartbeat_fail_count, user_id, session_id,
+                    )
+                    cancel_token.set()
+                    return
+
+            await asyncio.sleep(check_interval)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -1443,31 +1447,38 @@ async def subscribe_to_round(
                 poll_interval = max(settings.cancel_watcher_interval_seconds, 0.5)
                 last_heartbeat_sent = time.monotonic()
                 try:
-                    with SessionLocal() as replay_db:
-                        while True:
-                            await asyncio.sleep(poll_interval)
+                    while True:
+                        await asyncio.sleep(poll_interval)
 
-                            # 没有本地实时事件时，回放持久化增量，兜住跨 worker 订阅
-                            if time.monotonic() - last_realtime_event_at >= poll_interval:
-                                replayed_events, replay_latest = _load_persisted_run_events_after_sequence(
-                                    replay_db,
-                                    run_id=round_id,
-                                    last_sequence=latest_sequence,
+                        # 没有本地实时事件时，回放持久化增量，兜住跨 worker 订阅
+                        # 每次查询使用独立短生命周期 Session，避免长期独占 DB 连接
+                        if time.monotonic() - last_realtime_event_at >= poll_interval:
+                            try:
+                                with SessionLocal() as replay_db:
+                                    replayed_events, replay_latest = _load_persisted_run_events_after_sequence(
+                                        replay_db,
+                                        run_id=round_id,
+                                        last_sequence=latest_sequence,
+                                    )
+                            except Exception:
+                                logger.warning(
+                                    "订阅增量回放查询失败: round=%s", round_id, exc_info=True,
                                 )
-                                latest_sequence = max(latest_sequence, replay_latest)
-                                for event_data in replayed_events:
-                                    await subscriber_queue.put(event_data)
-                                    if event_data.get("type") in terminal_types:
-                                        return
+                                replayed_events, replay_latest = [], latest_sequence
+                            latest_sequence = max(latest_sequence, replay_latest)
+                            for event_data in replayed_events:
+                                await subscriber_queue.put(event_data)
+                                if event_data.get("type") in terminal_types:
+                                    return
 
-                            # SSE 心跳按 sse_heartbeat_interval 频率发送
-                            if time.monotonic() - last_heartbeat_sent >= settings.sse_heartbeat_interval:
-                                heartbeat_event = CustomEvent(
-                                    name="heartbeat",
-                                    value={"timestamp": now_ms()},
-                                )
-                                await subscriber_queue.put(heartbeat_event.model_dump(by_alias=True))
-                                last_heartbeat_sent = time.monotonic()
+                        # SSE 心跳按 sse_heartbeat_interval 频率发送
+                        if time.monotonic() - last_heartbeat_sent >= settings.sse_heartbeat_interval:
+                            heartbeat_event = CustomEvent(
+                                name="heartbeat",
+                                value={"timestamp": now_ms()},
+                            )
+                            await subscriber_queue.put(heartbeat_event.model_dump(by_alias=True))
+                            last_heartbeat_sent = time.monotonic()
                 except asyncio.CancelledError:
                     pass
                 except Exception:
