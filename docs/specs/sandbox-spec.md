@@ -56,6 +56,15 @@ get_or_resume 的恢复链：
 2. 查询沙箱状态 -> Running: connect / Paused: resume / 其他: create
 3. 所有路径失败 -> fallback create（新沙箱）
 
+### sandbox_id 持久化（fallback create 路径）
+
+- `get_or_resume` 走到 fallback create 后会自动调用 `_persist_sandbox_id_if_exists(user_id, new_id, previous_id=...)`：
+  - 仅 `update` 已存在的 `user_sandbox` 行（同时把 `status` 重置为 `active`）
+  - 不主动 `INSERT`（首次创建路径由 `sessions` / `agent_pool_service` 显式写入）
+  - `new_id == previous_id` 时短路返回，不触发任何 DB 操作
+- 目的：避免调用方持有失效旧 id → 反复 fallback create → 沙箱泄漏。
+- 调用方（cron / sessions / agent_pool）无需再各自手动回写 `user_sandbox.sandbox_id`。
+
 ### 暂停策略
 
 - 仅当用户所有 session 都从 AgentPool TTL 过期时才触发 pause

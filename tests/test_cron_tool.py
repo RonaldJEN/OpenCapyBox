@@ -9,7 +9,7 @@
 - cron 表达式校验
 """
 import pytest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock
 
 
 # ============== 模块级 Fixtures ==============
@@ -68,13 +68,12 @@ class TestManageCronToolAdd:
         # 模拟不存在同名任务
         mock_db.query.return_value.filter.return_value.first.return_value = None
 
-        with patch.object(tool, "_register_to_scheduler"):
-            result = await tool.execute(
-                action="add",
-                name="daily_greeting",
-                cron="0 21 * * *",
-                description="跟用户说晚安",
-            )
+        result = await tool.execute(
+            action="add",
+            name="daily_greeting",
+            cron="0 21 * * *",
+            description="跟用户说晚安",
+        )
 
         assert result.success is True
         assert "daily_greeting" in result.content
@@ -127,27 +126,6 @@ class TestManageCronToolAdd:
         assert result.success is False
         assert "5" in result.error
 
-    @pytest.mark.asyncio
-    async def test_add_scheduler_failure_disables_job(self, tool_and_db):
-        """Scheduler 注册失败时，任务应标记为 disabled 并在返回中告警"""
-        tool, mock_db = tool_and_db
-        mock_db.query.return_value.filter.return_value.first.return_value = None
-
-        # 让 _register_to_scheduler 抛出异常
-        with patch.object(tool, "_register_to_scheduler", side_effect=RuntimeError("scheduler down")):
-            result = await tool.execute(
-                action="add",
-                name="failing_job",
-                cron="0 9 * * *",
-                description="test",
-            )
-
-        assert result.success is True
-        assert "Scheduler 注册失败" in result.content
-        # db.commit 应被调用两次：一次创建，一次标记 disabled
-        assert mock_db.commit.call_count == 2
-
-
 class TestManageCronToolRemove:
     """remove action 测试"""
 
@@ -157,8 +135,7 @@ class TestManageCronToolRemove:
         mock_job = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_job
 
-        with patch.object(tool, "_unregister_from_scheduler"):
-            result = await tool.execute(action="remove", name="daily_greeting")
+        result = await tool.execute(action="remove", name="daily_greeting")
 
         assert result.success is True
         mock_db.delete.assert_called_once_with(mock_job)
@@ -230,8 +207,7 @@ class TestManageCronToolToggle:
         mock_job.cron_expr = "0 9 * * *"
         mock_db.query.return_value.filter.return_value.first.return_value = mock_job
 
-        with patch.object(tool, "_register_to_scheduler"):
-            result = await tool.execute(action="toggle", name="test_job")
+        result = await tool.execute(action="toggle", name="test_job")
 
         assert result.success is True
         assert mock_job.enabled is True
@@ -245,8 +221,7 @@ class TestManageCronToolToggle:
         mock_job.cron_expr = "0 9 * * *"
         mock_db.query.return_value.filter.return_value.first.return_value = mock_job
 
-        with patch.object(tool, "_unregister_from_scheduler"):
-            result = await tool.execute(action="toggle", name="test_job")
+        result = await tool.execute(action="toggle", name="test_job")
 
         assert result.success is True
         assert mock_job.enabled is False

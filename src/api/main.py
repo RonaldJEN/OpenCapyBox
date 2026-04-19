@@ -66,8 +66,11 @@ async def startup_event():
     try:
         from src.api.models.round import Round
         from src.api.models.user_run_lock import UserRunLock
+        from src.api.models.user_memory import CronJobRun
         from src.api.models.database import SessionLocal
         from src.api.utils.timezone import now_naive
+        from src.api.services.cron_worker import start_cron_worker
+        from datetime import timedelta
 
         with SessionLocal() as db:
             stale_count = (
@@ -92,6 +95,23 @@ async def startup_event():
             )
             # 重启后旧进程已退出，用户运行锁全部失效，直接清空避免启动后 429 卡住
             stale_lock_count = db.query(UserRunLock).delete(synchronize_session=False)
+
+            # 清理历史遗留的 cron 运行记录，避免前端永久显示 running
+            threshold = now_naive() - timedelta(hours=1)
+            stale_cron_runs = (
+                db.query(CronJobRun)
+                .filter(
+                    CronJobRun.status == "running",
+                    CronJobRun.started_at < threshold,
+                )
+                .all()
+            )
+            stale_cron_count = len(stale_cron_runs)
+            for rec in stale_cron_runs:
+                rec.status = "failed"
+                rec.output = "worker crashed during execution"
+                rec.completed_at = now_naive()
+
             db.commit()
             if stale_count:
                 print(f"⚠️  已清理 {stale_count} 个残留的 running 轮次（标记为 failed）")
@@ -99,6 +119,8 @@ async def startup_event():
                 print(f"⚠️  已清理 {zombie_count} 个残留的 interrupted 轮次（标记为 failed）")
             if stale_lock_count:
                 print(f"⚠️  已清理 {stale_lock_count} 条残留的 user_run_locks")
+            if stale_cron_count:
+                print(f"⚠️  已清理 {stale_cron_count} 条残留的 cron running 记录")
     except Exception as e:
         print(f"⚠️  清理残留运行状态失败: {e}")
 
@@ -116,66 +138,24 @@ async def startup_event():
 
     print(f"✅ {settings.app_name} v{settings.app_version} 启动成功")
 
-    # 启动 APScheduler 并注册用户 Cron 任务
-    # 多 worker 模式下，使用文件锁确保只有一个 worker 运行 scheduler
+    # 启动去中心化 cron worker（每个 worker 独立运行）
     try:
-        import tempfile
-        from filelock import FileLock, Timeout as LockTimeout
-        from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from src.api.services.cron_service import register_user_jobs
-        from src.api.models.user_sandbox import UserSandbox
-        from src.api.models.database import SessionLocal
-
-        lock_path = os.path.join(tempfile.gettempdir(), "opencapybox_scheduler.lock")
-        scheduler_lock = FileLock(lock_path, timeout=0)
-
-        try:
-            scheduler_lock.acquire(timeout=0)  # 非阻塞，抢不到立即放弃
-        except LockTimeout:
-            app.state.scheduler = None
-            print("ℹ️  另一个 worker 已持有 scheduler 锁，本 worker 跳过调度")
-        else:
-            # 本 worker 成为调度主节点
-            app.state._scheduler_lock = scheduler_lock  # 保持引用防止 GC 释放锁
-
-            scheduler = AsyncIOScheduler()
-            with SessionLocal() as db:
-                active_users = (
-                    db.query(UserSandbox.user_id)
-                    .filter(UserSandbox.status == "active")
-                    .all()
-                )
-                total_jobs = 0
-                for (uid,) in active_users:
-                    total_jobs += register_user_jobs(db, uid, scheduler)
-
-            scheduler.start()
-            app.state.scheduler = scheduler
-            if total_jobs > 0:
-                print(f"✅ APScheduler 已启动: {total_jobs} 个 Cron 任务 (调度主节点)")
-            else:
-                print("ℹ️  无活跃 Cron 任务，APScheduler 已就绪 (调度主节点)")
-    except ImportError as e:
-        print(f"⚠️  依赖缺失，Cron 自动调度不可用: {e}")
+        await start_cron_worker(app)
+        print("✅ Cron worker 已启动（无主去中心化模式）")
     except Exception as e:
-        # 若本 worker 已获取锁但启动失败，释放锁让其他 worker 有机会接管
-        lock = getattr(app.state, "_scheduler_lock", None)
-        if lock:
-            lock.release(force=True)
-            app.state._scheduler_lock = None
-        print(f"⚠️  Cron 调度注册失败: {e}")
+        print(f"⚠️  Cron worker 启动失败: {e}")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """应用关闭时清理 scheduler 和文件锁"""
-    scheduler = getattr(app.state, "scheduler", None)
-    if scheduler:
-        scheduler.shutdown(wait=False)
-        print("✅ APScheduler 已关闭")
-    lock = getattr(app.state, "_scheduler_lock", None)
-    if lock:
-        lock.release(force=True)
+    """应用关闭时停止 cron worker。"""
+    try:
+        from src.api.services.cron_worker import stop_cron_worker
+
+        await stop_cron_worker(app)
+        print("✅ Cron worker 已关闭")
+    except Exception as e:
+        print(f"⚠️  Cron worker 关闭失败: {e}")
 
 
 # 路由

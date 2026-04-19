@@ -1,14 +1,16 @@
-"""Cron 服务 — DB 驱动 + APScheduler 动态注册 + 执行
+"""Cron 服务 — DB 驱动 + 任务执行
 
 职责：
 - 从 CronJob DB 表管理定时任务定义
-- 动态注册/注销 APScheduler CronTrigger 任务
 - Runner：恢复用户沙箱 → 创建临时 Agent → 执行任务 → 写 CronJobRun
+
+注：调度由 `cron_worker` 去中心化执行（不再依赖 APScheduler 持久注册），
+本模块仅暴露 `parse_cron_fields` 与 `run_cron_job` 供 worker 调用。
 """
 
 import logging
+import shlex
 import uuid
-from datetime import datetime
 
 from sqlalchemy.orm import Session as DBSession
 
@@ -41,7 +43,10 @@ class CronTask:
 
 
 def parse_cron_fields(cron_expr: str) -> dict | None:
-    """将 5 字段 cron 表达式解析为 APScheduler CronTrigger 参数
+    """将 5 字段 cron 表达式解析为 CronTrigger 字段（用于单分钟匹配，非持久注册）。
+
+    返回值仅供 `cron_worker` 在每分钟唤醒时构造一次性 CronTrigger 做匹配，
+    不喂给任何 scheduler 主进程或 jobstore。
 
     Returns:
         {"minute": ..., "hour": ..., "day": ..., "month": ..., "day_of_week": ...}
@@ -55,9 +60,13 @@ def parse_cron_fields(cron_expr: str) -> dict | None:
     return dict(zip(keys, parts))
 
 
-# re-export 以保持已有 import 不破坏
-from src.api.utils.sandbox_helpers import extract_command_stdout  # noqa: F401
-from src.api.utils.sandbox_helpers import extract_command_stdout as _extract_command_stdout  # noqa: F401
+def _extract_command_stdout(result: object) -> str:
+    """兼容 OpenSandbox 命令结果的两种 stdout 结构（薄封装，向后兼容）。
+
+    实际实现统一在 ``src.api.utils.sandbox_helpers.extract_command_stdout``。
+    """
+    from src.api.utils.sandbox_helpers import extract_command_stdout
+    return extract_command_stdout(result)
 
 
 # ============================================================
@@ -100,68 +109,34 @@ class CronService:
         Returns:
             (runs_list, total_count)
         """
+        import json as _json
+
         query = self.db.query(CronJobRun).filter(CronJobRun.user_id == user_id)
         if job_name:
             query = query.filter(CronJobRun.job_name == job_name)
         total = query.count()
         runs = query.order_by(CronJobRun.started_at.desc()).offset(offset).limit(limit).all()
-        return [r.to_dict() for r in runs], total
-
-
-def register_user_jobs(db: DBSession, user_id: str, scheduler) -> int:
-    """将用户 CronJob 表中的启用任务注册到 APScheduler
-
-    Returns:
-        注册的任务数
-    """
-    from apscheduler.triggers.cron import CronTrigger
-
-    svc = CronService(db)
-    tasks = svc.get_jobs(user_id)
-    registered = 0
-
-    for task in tasks:
-        if not task.enabled:
-            continue
-        fields = parse_cron_fields(task.cron_expr)
-        if not fields:
-            logger.warning("Cron 表达式无效 (user=%s, job=%s): %s", user_id, task.name, task.cron_expr)
-            continue
-
-        job_id = f"cron-{user_id}-{task.name}"
-        scheduler.add_job(
-            _run_cron_job_wrapper,
-            CronTrigger(**fields),
-            id=job_id,
-            name=f"{user_id}/{task.name}",
-            replace_existing=True,
-            kwargs={"user_id": user_id, "job_name": task.name},
-        )
-        registered += 1
-
-    return registered
-
-
-def reload_user_jobs(user_id: str, scheduler) -> int:
-    """移除该用户的旧 job 并重新注册
-
-    Returns:
-        重新注册的任务数
-    """
-    # 先移除旧的
-    prefix = f"cron-{user_id}-"
-    for job in scheduler.get_jobs():
-        if job.id.startswith(prefix):
-            job.remove()
-
-    from src.api.models.database import SessionLocal
-    with SessionLocal() as db:
-        return register_user_jobs(db, user_id, scheduler)
-
-
-async def _run_cron_job_wrapper(user_id: str, job_name: str):
-    """APScheduler AsyncIOScheduler 回调（直接 async，在主事件循环中执行）"""
-    await run_cron_job(user_id, job_name)
+        result = []
+        for r in runs:
+            artifacts = None
+            if r.artifacts:
+                try:
+                    artifacts = _json.loads(r.artifacts)
+                except (ValueError, TypeError):
+                    artifacts = None
+            result.append({
+                "id": r.id,
+                "job_name": r.job_name,
+                "cron_expr": r.cron_expr,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "status": r.status,
+                "output": r.output,
+                "is_read": bool(getattr(r, 'is_read', True)),
+                "artifacts": artifacts,
+                "run_workspace": getattr(r, 'run_workspace', None),
+            })
+        return result, total
 
 
 async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -> str | None:
@@ -263,9 +238,12 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
 
         mount = get_sandbox_mount_path()
         run_workspace = f"{mount}/cron/runs/{run_id}"
+        # mount 均来自配置、run_id 为 UUID，但这里一律走 shlex.quote，
+        # 避免未来 mount 含空格/特殊字符时静默断裂，与 cron-spec.md 明令保持一致。
+        run_workspace_q = shlex.quote(run_workspace)
 
         # 确保 run 工作目录存在
-        await sandbox.commands.run(f"mkdir -p {run_workspace}")
+        await sandbox.commands.run(f"mkdir -p {run_workspace_q}")
 
         tools, _ = await create_agent_tools(
             sandbox=sandbox,
@@ -358,46 +336,21 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
         return None
 
 
-def _build_artifact(full_path: str, run_workspace: str, size: int = 0) -> dict | None:
-    """将完整路径转换为产物元数据 dict，不合法返回 None。"""
-    full_path = full_path.strip()
-    if not full_path or len(full_path) > 500:
-        return None
-    rel_path = full_path
-    if full_path.startswith(run_workspace + "/"):
-        rel_path = full_path[len(run_workspace) + 1:]
-    elif full_path.startswith(run_workspace):
-        rel_path = full_path[len(run_workspace):]
-    if not rel_path:
-        return None
-    name = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
-    ext = name.rsplit(".", 1)[-1] if "." in name else ""
-    return {"name": name, "path": rel_path, "size": size, "type": ext}
-
-
-def _artifacts_to_json(artifacts: list[dict]) -> str | None:
-    """将产物列表序列化为 JSON，超过 64KB 则截断到 100 条。"""
-    import json
-    if not artifacts:
-        return None
-    json_str = json.dumps(artifacts, ensure_ascii=False)
-    if len(json_str) > 65536:
-        artifacts = artifacts[:100]
-        json_str = json.dumps(artifacts, ensure_ascii=False)
-    return json_str
-
-
 async def _scan_run_artifacts(sandbox, run_workspace: str) -> str | None:
     """扫描 run_workspace 下的产物文件，返回 JSON 字符串。
 
     限制：最多 200 个文件，单路径最长 500 字符，总 JSON ≤ 64KB。
     扫描失败不阻塞主流程。
     """
+    import json
+
+    workspace_q = shlex.quote(run_workspace)
+
     try:
         # find -printf 是 GNU findutils 内置，不依赖外部 stat 命令
         # %p = 完整路径, %s = 文件大小(bytes)
         cmd = (
-            f"find {run_workspace} -maxdepth 3 -type f "
+            f"find {workspace_q} -maxdepth 3 -type f "
             f"-printf '%p\\t%s\\n' 2>/dev/null | head -200"
         )
         result = await sandbox.commands.run(cmd)
@@ -406,42 +359,64 @@ async def _scan_run_artifacts(sandbox, run_workspace: str) -> str | None:
         # fallback: stat -c（兼容 BusyBox 等不支持 find -printf 的环境）
         if not stdout.strip():
             cmd = (
-                f"find {run_workspace} -maxdepth 3 -type f "
+                f"find {workspace_q} -maxdepth 3 -type f "
                 f"-exec stat -c '%n\\t%s' {{}} \\; 2>/dev/null | head -200"
             )
             result = await sandbox.commands.run(cmd)
             stdout = _extract_command_stdout(result)
 
         # fallback: 仅路径（最大兼容），size 置 0
+        path_only_mode = False
         if not stdout.strip():
-            cmd = f"find {run_workspace} -maxdepth 3 -type f 2>/dev/null | head -200"
+            cmd = f"find {workspace_q} -maxdepth 3 -type f 2>/dev/null | head -200"
             result = await sandbox.commands.run(cmd)
-            path_only = _extract_command_stdout(result)
-            if path_only.strip():
-                artifacts = [
-                    a for line in path_only.strip().split("\n")
-                    if (a := _build_artifact(line, run_workspace)) is not None
-                ]
-                return _artifacts_to_json(artifacts)
+            stdout = _extract_command_stdout(result)
+            path_only_mode = True
 
         if not stdout.strip():
             return None
 
         artifacts = []
         for line in stdout.strip().split("\n"):
-            parts = line.split("\t", 1)
-            if len(parts) != 2:
+            if path_only_mode:
+                full_path = line
+                size_str = "0"
+            else:
+                parts = line.split("\t", 1)
+                if len(parts) != 2:
+                    continue
+                full_path, size_str = parts
+            full_path = full_path.strip()
+            if not full_path or len(full_path) > 500:
                 continue
-            full_path, size_str = parts
+            # 相对路径
+            rel_path = full_path
+            if full_path.startswith(run_workspace + "/"):
+                rel_path = full_path[len(run_workspace) + 1:]
+            elif full_path.startswith(run_workspace):
+                rel_path = full_path[len(run_workspace):]
+            name = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
+            ext = name.rsplit(".", 1)[-1] if "." in name else ""
             try:
                 size = int(size_str)
             except ValueError:
                 size = 0
-            a = _build_artifact(full_path, run_workspace, size)
-            if a is not None:
-                artifacts.append(a)
+            artifacts.append({
+                "name": name,
+                "path": rel_path,
+                "size": size,
+                "type": ext,
+            })
 
-        return _artifacts_to_json(artifacts)
+        if not artifacts:
+            return None
+
+        json_str = json.dumps(artifacts, ensure_ascii=False)
+        if len(json_str) > 65536:
+            # 截断到 64KB 限制内
+            artifacts = artifacts[:100]
+            json_str = json.dumps(artifacts, ensure_ascii=False)
+        return json_str
 
     except Exception as e:
         logger.warning("扫描 Cron 产物失败 (workspace=%s): %s", run_workspace, e)

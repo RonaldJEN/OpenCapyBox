@@ -1,7 +1,5 @@
 """测试服务器启动时清理残留 running 轮次的逻辑"""
 import uuid
-from datetime import datetime
-from unittest.mock import patch, MagicMock
 
 import pytest
 from sqlalchemy import create_engine
@@ -10,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from src.api.models.database import Base
 from src.api.models.round import Round
 from src.api.models.user_run_lock import UserRunLock
+from src.api.models.user_memory import CronJobRun
 
 
 def _cleanup_stale_runtime_state(db):
@@ -38,6 +37,28 @@ def _cleanup_stale_runtime_state(db):
     stale_lock_count = db.query(UserRunLock).delete(synchronize_session=False)
     db.commit()
     return stale_count, zombie_count, stale_lock_count
+
+
+def _cleanup_stuck_cron_runs(db, *, hours: int = 1):
+    """模拟启动时清理卡住的 CronJobRun.running 记录。"""
+    from datetime import timedelta
+    from src.api.utils.timezone import now_naive
+
+    threshold = now_naive() - timedelta(hours=hours)
+    stale_runs = (
+        db.query(CronJobRun)
+        .filter(
+            CronJobRun.status == "running",
+            CronJobRun.started_at < threshold,
+        )
+        .all()
+    )
+    for rec in stale_runs:
+        rec.status = "failed"
+        rec.output = "worker crashed during execution"
+        rec.completed_at = now_naive()
+    db.commit()
+    return len(stale_runs)
 
 
 @pytest.fixture
@@ -154,3 +175,45 @@ class TestStartupCleanup:
             assert zombie_count == 0
             assert stale_lock_count == 2
             assert db.query(UserRunLock).count() == 0
+
+    def test_startup_cleans_stuck_running(self, in_memory_db):
+        """启动时应清理超时 running 的 CronJobRun。"""
+        from datetime import timedelta
+        from src.api.utils.timezone import now_naive
+
+        engine, Session = in_memory_db
+        with Session() as db:
+            now = now_naive()
+            old_run = CronJobRun(
+                id=str(uuid.uuid4()),
+                user_id="u1",
+                job_name="old",
+                cron_expr="* * * * *",
+                status="running",
+                output=None,
+                is_read=False,
+                started_at=now - timedelta(hours=2),
+            )
+            recent_run = CronJobRun(
+                id=str(uuid.uuid4()),
+                user_id="u1",
+                job_name="recent",
+                cron_expr="* * * * *",
+                status="running",
+                output=None,
+                is_read=False,
+                started_at=now - timedelta(minutes=30),
+            )
+            db.add_all([old_run, recent_run])
+            db.commit()
+
+            cleaned = _cleanup_stuck_cron_runs(db, hours=1)
+            assert cleaned == 1
+
+            old_run_db = db.query(CronJobRun).filter(CronJobRun.id == old_run.id).first()
+            recent_run_db = db.query(CronJobRun).filter(CronJobRun.id == recent_run.id).first()
+
+            assert old_run_db.status == "failed"
+            assert old_run_db.output == "worker crashed during execution"
+            assert old_run_db.completed_at is not None
+            assert recent_run_db.status == "running"

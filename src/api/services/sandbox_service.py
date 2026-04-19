@@ -333,7 +333,36 @@ class SandboxSessionService:
                 )
 
         # 3. 所有嘗試均失敗 → 創建新沙箱
-        return await self.create(user_id)
+        sandbox = await self.create(user_id)
+        # fallback 路徑：把新 sandbox_id 同步回 user_sandbox 表，避免下次調用方仍拿著
+        # 失效的舊 id 走 connect/resume 失敗 → 再次 fallback create → 持續泄漏的問題。
+        # 僅 update 既有行，不主動 INSERT（首次創建由 sessions/agent_pool 路徑顯式寫入）。
+        try:
+            self._persist_sandbox_id_if_exists(user_id, sandbox.id, previous_id=sandbox_id)
+        except Exception:
+            logger.exception("回寫 user_sandbox 失敗 (user=%s, new_id=%s)", user_id, sandbox.id)
+        return sandbox
+
+    @staticmethod
+    def _persist_sandbox_id_if_exists(user_id: str, new_sandbox_id: str, *, previous_id: str | None) -> None:
+        """get_or_resume fallback create 後，將新 sandbox_id 回寫已存在的 user_sandbox 行。"""
+        if not new_sandbox_id or new_sandbox_id == previous_id:
+            return
+        from src.api.models.database import SessionLocal
+        from src.api.models.user_sandbox import UserSandbox
+
+        with SessionLocal() as db:
+            us = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+            if us is None:
+                return
+            if us.sandbox_id != new_sandbox_id:
+                us.sandbox_id = new_sandbox_id
+                us.status = "active"
+                db.commit()
+                logger.info(
+                    "已回寫 user_sandbox.sandbox_id (user=%s, old=%s, new=%s)",
+                    user_id, previous_id, new_sandbox_id,
+                )
 
     async def pause(self, user_id: str) -> bool:
         """暫停沙箱（用戶所有 session TTL 均過期時調用）

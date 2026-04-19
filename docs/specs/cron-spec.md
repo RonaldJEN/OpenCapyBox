@@ -69,11 +69,13 @@ All require Bearer auth.
 
 ### GET /api/cron/runs/unread-count
 
-- Response 200: `{count: int}` — 统计 status=success AND is_read=False
+- Response 200: `{count: int}` — 统计 is_read=False（包含 success / failed，失败记录也需让用户看到）
 
 ### POST /api/cron/runs/mark-read
 
-- Query: run_id?: str (省略则标记全部未读)
+- Query: run_id?: str
+  - 不传：当前用户所有未读记录全部标记为已读。
+  - 传：仅标记归属于当前用户、且未读的该条记录（不存在/跨用户/已读 → marked=0）。
 - Response 200: `{marked: int}`
 
 ### GET /api/cron/runs/{run_id}
@@ -89,7 +91,10 @@ All require Bearer auth.
 ### GET /api/cron/runs/{run_id}/files/{path:path}
 
 - Response: 文件字节流, Content-Disposition: attachment
-- Error 404, 403 ("路径越界"), 503
+- 鉴权双通道：
+  - `Authorization: Bearer <token>`（标准方式，优先生效）
+  - `?token=<access_token>`（兜底，用于浏览器 `<a>` 直链下载，access log / Referer 会记录 token，仅在受控环境使用；缺失任何一种均返回 401）
+- Error 401（未提供 token）, 404, 403 ("路径越界"), 503
 
 ### POST /api/cron/jobs/{job_name}/run
 
@@ -109,8 +114,9 @@ All require Bearer auth.
 
 ### 调度机制
 
+- 仅借用 `apscheduler.triggers.cron.CronTrigger` 做单分钟语义匹配，**未使用任何 scheduler 主进程或 jobstore**（无 `AsyncIOScheduler` / 文件锁主节点）；持久化与去重全部走 DB。
 - Worker 每分钟唤醒一次（对齐到本地分钟边界 + 0-2s 随机 jitter）
-- 查询所有 enabled CronJob，通过 APScheduler CronTrigger 匹配当前分钟（本地时区）
+- 查询所有 enabled CronJob，通过一次性 `CronTrigger` 匹配当前分钟（本地时区）
 - 匹配成功后 INSERT OR IGNORE 到 cron_fires 表
   - 插入成功 = 本 worker 赢得执行权
   - 插入失败 (UNIQUE 冲突) = 其他 worker 已认领
@@ -126,22 +132,71 @@ All require Bearer auth.
 
 ### 执行流程
 
-1. 获取 per-user lock（同一用户的作业串行执行）
+1. 获取 per-user lock（同一 worker 进程内同用户作业串行执行；跨 worker 不串行，详见下方「多 worker 并发模型」）
 2. Resume 用户沙箱
 3. 创建临时 Agent（排除 AskUserQuestionTool 和 memory tools）
-4. Workspace = `{mount}/cron/runs/{run_id}`，通过 `mkdir -p {shlex.quote(...)}` 创建（防 mount 路径含空格时注入）
+4. Workspace = `{mount}/cron/runs/{run_id}`，通过 `mkdir -p {shlex.quote(...)}` 创建（防 mount 路径含空格时注入）；后续所有针对 workspace 的 shell 命令（artifact 扫描的 `find` 链）同样使用 `shlex.quote` 保护
 5. `Agent.run_agui` 执行
-6. 扫描 artifacts（3 种 fallback: GNU `find -printf` → `stat -c` → path-only）
+6. 扫描 artifacts（fallback 链：GNU `find -printf '%p\t%s'` → `find -exec stat -c '%n\t%s'` → 仅路径 `find -type f`；最后一档 size 置 0）
 7. 更新 run record（output 截断 10000 字符, artifacts JSON ≤ 64KB / 100 entries）
+
+### 未读语义（is_read × status）
+
+`is_read` 与 `status` 是**两个正交字段**，组合规则如下：
+
+- `is_read` 默认 `False`，**所有终态记录都进入未读队列**，无论 `status=success` 还是 `status=failed`。
+  - 失败也必须让用户感知：cron 静默失败是用户最难察觉的问题，强制计入未读是产品决策，不是实现细节。
+- `running` 中的记录也是 `is_read=False`，但前端不应把它当成"待用户处理的消息"展示，仅作为执行进度。
+- 未读 → 已读的转换路径**仅有一条**：用户主动调用 `POST /api/cron/runs/mark-read`（带或不带 `run_id`）。
+  - 系统不做任何自动已读：不因查看详情、不因下载 artifact、不因 TTL 过期。
+- 未读计数（`GET /api/cron/runs/unread-count`）严格等价于 `WHERE user_id=? AND is_read=False`，**不再过滤 status**。
+  - 历史上曾过滤 `status=success`，会导致失败任务永远不进入未读、用户毫无感知；该行为已废弃，不允许回退。
+
+不变量：
+1. 一条 run 记录被标记 `is_read=True` 后，不存在任何路径会把它改回 `False`。
+2. 未读计数 = 详情列表中 `is_read=False` 的条目数（前后端口径一致）。
+3. 失败记录的可见性等价于成功记录的可见性，二者在未读体系内对等。
 
 ### 手动触发与调度并发
 
 - 手动触发不写 `cron_fires`，允许与同分钟的自动调度并存。
-- 两者竞争同一个 per-user lock，实际表现为**串行执行**（先拿到锁的先跑）。
+- 两者竞争同一个 per-user lock（同一 worker 进程内），实际表现为**串行执行**（先拿到锁的先跑）。
+- 跨 worker 触发的并发约束见下方「多 worker 并发模型」。
+
+### 多 worker 并发模型
+
+- `cron_fires` UNIQUE 约束保证：**同一 (job_id, scheduled_at) 在所有 worker 中只会被执行一次**。
+- per-user 内存锁（`app.state.cron_user_locks`）只在**单个 worker 进程**内生效；多 uvicorn worker 部署下，每个进程持有独立 dict。
+- 因此**不变量边界**：
+  - 单 worker：同一用户的所有作业（自动调度 + 手动触发）严格串行。
+  - 多 worker：同一用户的不同作业可能被不同 worker 抢到，**会并行执行**。
+  - 同一作业（同 job_id 同分钟）在任何部署模式下都不会被并行触发（由 `cron_fires` 兜底）。
+- 影响范围与缓解：
+  - 用户沙箱：`get_or_resume` 是幂等的；并发 resume 同一沙箱由 OpenSandbox 层处理。
+  - `cron_job_runs` 写入：每条记录有独立 `run_id`，不会互相覆盖。
+  - 手动触发：`POST /jobs/{name}/run` 与同分钟自动调度可能在不同 worker 并行执行同一作业；调用方需自行接受这种语义。
+- 如需严格全局串行：未来可在 `_run` 入口增加 DB 级 user lock（如 `INSERT INTO user_run_locks` 抢占），不在本期实现范围。
+
+### 手动触发失败兜底
+
+- `POST /api/cron/jobs/{name}/run` 在 `trigger_manual_run` 抛出**任意异常**（HTTPException 503、RuntimeError 等）时，必须把已预创建的 `running` 记录立刻标记为 `failed`，并写入失败原因（HTTPException 取 `detail`，其余取 `repr`）。
+- 否则记录会一直挂着等 startup 1 小时清理 → 前端永久转圈。
+
+### Dispatch 异常隔离
+
+- `_dispatch_and_run` 的 per-job 循环必须 try/except 包裹整段（cron 解析、匹配、`_try_insert_fire`）。
+- 单个 job 的异常仅记录 `logger.exception`，不能影响同分钟其他 job 的调度。
 
 ### 启动清理
 
 - `main.py` startup：标记运行超过 1 小时的 cron run 为 `failed`，防止前端永久 running。
+
+### 周期性清理
+
+- Worker loop 内每日（当 `minute.hour == 0` 且日期与上次清理不同）触发 `_cleanup_old_fires()`。
+- 删除 `cron_fires` 表中 `scheduled_at < now - cron_fire_max_age_days` 的记录（默认 7 天，通过 `settings.cron_fire_max_age_days` 配置；≤0 时禁用清理）。
+- 删除操作幂等，多 worker 并发下由 SQLite 写锁串行化，不会产生冲突。
+- worker 启动当天若已过 00:xx，本日不补清，最早次日 00:xx 触发。
 
 ### Worker 生命周期
 
@@ -174,3 +229,17 @@ All require Bearer auth.
 - 不做执行重试（失败即终态）
 - 不做分布式锁（依赖 SQLite UNIQUE 约束）
 - 不做执行日志实时流式输出
+
+## 8. 未来演进
+
+### `cron_fires` → Redis（可选）
+
+`cron_fires` 表语义上等价于一个带 TTL 的分布式锁，仅在 SQLite 单机部署下作为执行权仲裁凭证。若未来切多机部署或引入 Redis，可按以下路径迁移：
+
+- 抽象 `FireArbiter` 接口：`try_acquire(job_id, minute) -> bool`
+- 保留当前实现为 `SqliteFireArbiter`（`INSERT OR IGNORE`）
+- 新增 `RedisFireArbiter`：`SET cron:fire:{job_id}:{minute} 1 NX PX <ttl_ms>`
+  - TTL 按 cron 最小粒度设（如 120s），自动回收，无需历史行清理
+- 按部署模式（单机 vs 多机）在启动时选择具体实现
+
+迁移后 `cron_fires` 表与对应 Model 整体下线；`cron_jobs` / `cron_job_runs` 不受影响。

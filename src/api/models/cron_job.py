@@ -11,7 +11,7 @@ class CronJob(Base):
     """Cron 定时任务定义
 
     由 Agent 通过 manage_cron 工具直接操作（增删改查），
-    CronService 从此表读取任务并注册到 APScheduler。
+    cron worker 每分钟扫描本表派发任务（去中心化，无主进程注册）。
     """
 
     __tablename__ = "cron_jobs"

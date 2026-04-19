@@ -28,11 +28,6 @@ def _make_cron_service(*, query_return=None, first_return=None):
     return CronService(mock_db), mock_db
 
 
-def _make_cron_db(jobs):
-    """构建只含 CronJob 查询链的 mock_db（用于 register_user_jobs）"""
-    return make_query_db(all_results=jobs)
-
-
 class TestParseCronFields:
     """parse_cron_fields 测试"""
 
@@ -106,11 +101,6 @@ class TestCronServiceDB:
         run1.is_read = True
         run1.artifacts = None
         run1.run_workspace = None
-        run1.to_dict.return_value = {
-            "id": "r1", "job_name": "daily", "cron_expr": "0 9 * * *",
-            "started_at": None, "completed_at": None, "status": "success",
-            "output": "ok", "is_read": True, "artifacts": None, "run_workspace": None,
-        }
 
         svc, mock_db = _make_cron_service(query_return=[run1])
         # get_run_history 还需要 count() 支持
@@ -120,83 +110,6 @@ class TestCronServiceDB:
         assert len(runs) == 1
         assert runs[0]["job_name"] == "daily"
         assert runs[0]["is_read"] is True
-
-
-class TestRegisterUserJobs:
-    """register_user_jobs / reload_user_jobs 测试（DB 驱动）"""
-
-    def test_register_enabled_tasks(self):
-        from src.api.services.cron_service import register_user_jobs
-
-        job1 = MagicMock(); job1.name = "daily"; job1.cron_expr = "0 9 * * *"
-        job1.description = "every day"; job1.enabled = True
-
-        job2 = MagicMock(); job2.name = "disabled_task"; job2.cron_expr = "0 0 * * *"
-        job2.description = "paused"; job2.enabled = False
-
-        job3 = MagicMock(); job3.name = "hourly"; job3.cron_expr = "*/5 * * * *"
-        job3.description = "every 5 min"; job3.enabled = True
-
-        mock_db = _make_cron_db([job1, job2, job3])
-
-        mock_scheduler = MagicMock()
-        count = register_user_jobs(mock_db, "user-1", mock_scheduler)
-
-        # 2 enabled tasks, 1 disabled → 2 registered
-        assert count == 2
-        assert mock_scheduler.add_job.call_count == 2
-
-        # 检查 job id 格式
-        call_args_list = mock_scheduler.add_job.call_args_list
-        job_ids = [call.kwargs.get("id") or call[1].get("id") for call in call_args_list]
-        assert "cron-user-1-daily" in job_ids
-        assert "cron-user-1-hourly" in job_ids
-
-        # 确认传递 job_name 而非 task_dict
-        for call in call_args_list:
-            kwargs_passed = call.kwargs.get("kwargs") or call[1].get("kwargs")
-            assert "job_name" in kwargs_passed
-            assert "task_dict" not in kwargs_passed
-
-    def test_register_no_tasks(self):
-        from src.api.services.cron_service import register_user_jobs
-
-        mock_db = _make_cron_db([])
-        mock_scheduler = MagicMock()
-        count = register_user_jobs(mock_db, "user-1", mock_scheduler)
-        assert count == 0
-        mock_scheduler.add_job.assert_not_called()
-
-    def test_register_invalid_cron_skipped(self):
-        from src.api.services.cron_service import register_user_jobs
-
-        job = MagicMock()
-        job.name = "bad_cron"; job.cron_expr = "invalid"
-        job.description = "bad"; job.enabled = True
-
-        mock_db = _make_cron_db([job])
-        mock_scheduler = MagicMock()
-        count = register_user_jobs(mock_db, "user-1", mock_scheduler)
-        assert count == 0
-
-    def test_reload_removes_old_jobs(self):
-        from src.api.services.cron_service import reload_user_jobs
-
-        mock_job1 = MagicMock()
-        mock_job1.id = "cron-user-1-old_task"
-        mock_job2 = MagicMock()
-        mock_job2.id = "cron-user-2-other"  # different user, should NOT be removed
-
-        mock_scheduler = MagicMock()
-        mock_scheduler.get_jobs.return_value = [mock_job1, mock_job2]
-
-        with patch("src.api.services.cron_service.register_user_jobs", return_value=1) as mock_reg:
-            count = reload_user_jobs("user-1", mock_scheduler)
-
-        # only user-1's job removed
-        mock_job1.remove.assert_called_once()
-        mock_job2.remove.assert_not_called()
-        assert count == 1
 
 
 class TestCronRoutes:
@@ -214,8 +127,10 @@ class TestCronRoutes:
         mock_job.cron_expr = "0 9 * * *"
 
         client.mock_db.query.return_value.filter.return_value.first.return_value = mock_job
+        client.app.state.cron_user_locks = {}
+        client.app.state.cron_worker_id = "worker-test"
 
-        with patch("src.api.routes.cron.run_cron_job"):
+        with patch("src.api.routes.cron.trigger_manual_run", new_callable=AsyncMock):
             response = client.post("/cron/jobs/daily/run")
 
         assert response.status_code == 200
@@ -244,14 +159,6 @@ class TestCronRoutes:
         mock_run.completed_at = None
         mock_run.status = "running"
         mock_run.output = None
-        mock_run.is_read = False
-        mock_run.artifacts = None
-        mock_run.run_workspace = None
-        mock_run.to_dict.return_value = {
-            "id": "run-uuid-123", "job_name": "daily", "cron_expr": "0 9 * * *",
-            "started_at": None, "completed_at": None, "status": "running",
-            "output": None, "is_read": False, "artifacts": None, "run_workspace": None,
-        }
 
         client.mock_db.query.return_value.filter.return_value.first.return_value = mock_run
 
@@ -310,6 +217,30 @@ class TestScanRunArtifacts:
     """_scan_run_artifacts 扫描兼容性测试"""
 
     @pytest.mark.asyncio
+    async def test_quotes_workspace_path_with_spaces(self):
+        """workspace 含空格时所有 find 命令必须 shlex.quote，否则会拆词失败。"""
+        from src.api.services.cron_service import _scan_run_artifacts
+
+        run_workspace = "/mnt/with space/cron/runs/run-x"
+
+        empty = MagicMock()
+        empty.logs = MagicMock(stdout=[])
+        empty.stdout = ""
+
+        sandbox = MagicMock()
+        sandbox.commands = MagicMock()
+        sandbox.commands.run = AsyncMock(return_value=empty)
+
+        await _scan_run_artifacts(sandbox, run_workspace)
+
+        assert sandbox.commands.run.await_count >= 1
+        for call in sandbox.commands.run.await_args_list:
+            cmd = call.args[0]
+            # quoted 形式应出现，裸路径不应直接出现在命令里
+            assert "'/mnt/with space/cron/runs/run-x'" in cmd
+            assert " /mnt/with space/" not in cmd
+
+    @pytest.mark.asyncio
     async def test_extracts_files_from_logs_stdout(self):
         """OpenSandbox 若仅在 logs.stdout 返回内容，仍应正确提取产物。"""
         from src.api.services.cron_service import _scan_run_artifacts
@@ -337,7 +268,7 @@ class TestScanRunArtifacts:
 
     @pytest.mark.asyncio
     async def test_fallback_to_plain_find_when_printf_unavailable(self):
-        """当 -printf/stat 输出不可用时，仍可回退到基础 find 列表。"""
+        """当 -printf/stat 输出均为空时，仍可回退到基础 find 列表（size=0）。"""
         from src.api.services.cron_service import _scan_run_artifacts
 
         run_workspace = "/home/user/cron/runs/run-2"
@@ -371,7 +302,7 @@ class TestScanRunArtifacts:
 
 
 class TestCronAgentConstruction:
-    """Cron Agent 构造参数测试"""
+    """Cron Agent 构造参数测试 — 强约束 fail-hard，不允许悄悄回退到 .env。"""
 
     @pytest.mark.asyncio
     async def test_registry_unavailable_fails_hard_and_skips_agent(self):
@@ -385,7 +316,6 @@ class TestCronAgentConstruction:
             patch("src.api.services.cron_service._scan_run_artifacts", new_callable=AsyncMock, return_value=None),
             patch("src.agent.agent.Agent") as MockAgent,
         ):
-            # DB mock — 每次 SessionLocal() 返回同一个 mock context manager
             mock_db = MagicMock()
             mock_session_local.return_value.__enter__ = MagicMock(return_value=mock_db)
             mock_session_local.return_value.__exit__ = MagicMock(return_value=False)
@@ -399,18 +329,16 @@ class TestCronAgentConstruction:
             mock_run_record.status = "running"
             mock_run_record.output = None
             mock_db.query.return_value.filter.return_value.first.side_effect = [
-                mock_job,                       # 查 CronJob
-                mock_run_record,                # 查 CronJobRun (已存在)
-                MagicMock(sandbox_id="sb-1"),   # 查 UserSandbox
-                mock_run_record,                # 失败后更新 CronJobRun
+                mock_job,
+                mock_run_record,
+                MagicMock(sandbox_id="sb-1"),
+                mock_run_record,
             ]
 
-            # sandbox mock
             mock_sandbox = AsyncMock()
             mock_sandbox.commands.run = AsyncMock(return_value=MagicMock(logs=MagicMock(stdout=[])))
             mock_svc.return_value.get_or_resume = AsyncMock(return_value=mock_sandbox)
 
-            # Agent mock: run_agui 立即结束
             mock_agent_instance = MagicMock()
 
             async def _empty_gen(*a, **kw):
@@ -433,7 +361,7 @@ class TestCronAgentConstruction:
 
     @pytest.mark.asyncio
     async def test_registry_agent_uses_model_config_values(self):
-        """model registry 可用时，Agent 参数来自 model_config"""
+        """model registry 可用时，Agent 参数来自 model_config（不允许硬编码）。"""
         mock_model_config = MagicMock()
         mock_model_config.context_window = 200000
         mock_model_config.max_tokens = 32768

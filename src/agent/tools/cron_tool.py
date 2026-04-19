@@ -1,6 +1,6 @@
-"""manage_cron 工具 — 供 Agent 管理 Cron 定时任务
+"""manage_cron 工具 — 供 Agent 管理 Cron 定时任务。
 
-通过 DB 直接增删改查 CronJob，并实时同步 APScheduler。
+通过 DB 直接增删改查 CronJob，调度由 cron worker 每分钟扫描 DB 生效。
 """
 
 import logging
@@ -22,10 +22,9 @@ def _validate_cron_expr(cron_expr: str) -> str | None:
 class ManageCronTool(Tool):
     """管理 Cron 定时任务（增删改查 + 执行历史）"""
 
-    def __init__(self, db_session_factory, user_id: str, scheduler=None):
+    def __init__(self, db_session_factory, user_id: str):
         self._db_factory = db_session_factory
         self._user_id = user_id
-        self._scheduler = scheduler
 
     @property
     def name(self) -> str:
@@ -136,19 +135,9 @@ class ManageCronTool(Tool):
             db.add(job)
             db.commit()
 
-            # 实时注册到 APScheduler — 注册失败则标记为 disabled 并告警
-            warning = ""
-            try:
-                self._register_to_scheduler(name, cron_expr)
-            except Exception as e:
-                logger.warning("任务 '%s' 已写入 DB 但 Scheduler 注册失败: %s", name, e)
-                job.enabled = False
-                db.commit()
-                warning = f"（⚠️ Scheduler 注册失败，任务已暂停: {e}）"
-
             return ToolResult(
                 success=True,
-                content=f"已创建定时任务 '{name}' (cron: {cron_expr}): {description}{warning}",
+                content=f"已创建定时任务 '{name}' (cron: {cron_expr}): {description}",
             )
         finally:
             db.close()
@@ -172,9 +161,6 @@ class ManageCronTool(Tool):
 
             db.delete(job)
             db.commit()
-
-            # 从 APScheduler 注销
-            self._unregister_from_scheduler(name)
 
             return ToolResult(success=True, content=f"已删除定时任务 '{name}'")
         finally:
@@ -222,12 +208,6 @@ class ManageCronTool(Tool):
             job.enabled = not job.enabled
             db.commit()
 
-            # 同步 APScheduler
-            if job.enabled:
-                self._register_to_scheduler(name, job.cron_expr)
-            else:
-                self._unregister_from_scheduler(name)
-
             new_status = "启用" if job.enabled else "暂停"
             return ToolResult(
                 success=True,
@@ -258,46 +238,3 @@ class ManageCronTool(Tool):
         finally:
             db.close()
 
-    def _register_to_scheduler(self, job_name: str, cron_expr: str) -> None:
-        """将任务注册到 APScheduler。
-
-        Raises:
-            Exception: 注册失败时向上传播，调用方决定如何处理。
-        """
-        if not self._scheduler:
-            logger.debug("APScheduler 不可用，跳过注册")
-            return
-
-        from src.api.services.cron_service import parse_cron_fields, _run_cron_job_wrapper
-
-        fields = parse_cron_fields(cron_expr)
-        if not fields:
-            raise ValueError(f"无法解析 cron 表达式: {cron_expr}")
-
-        from apscheduler.triggers.cron import CronTrigger
-
-        job_id = f"cron-{self._user_id}-{job_name}"
-        self._scheduler.add_job(
-            _run_cron_job_wrapper,
-            CronTrigger(**fields),
-            id=job_id,
-            name=f"{self._user_id}/{job_name}",
-            replace_existing=True,
-            kwargs={
-                "user_id": self._user_id,
-                "job_name": job_name,
-            },
-        )
-
-    def _unregister_from_scheduler(self, job_name: str) -> None:
-        """从 APScheduler 注销任务（best-effort）"""
-        try:
-            if not self._scheduler:
-                return
-
-            job_id = f"cron-{self._user_id}-{job_name}"
-            existing = self._scheduler.get_job(job_id)
-            if existing:
-                existing.remove()
-        except Exception as e:
-            logger.warning("注销 APScheduler 任务失败 (job=%s): %s", job_name, e)

@@ -10,7 +10,7 @@
 """
 import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 
 from tests.helpers import make_test_client
 
@@ -99,9 +99,9 @@ class TestUnreadCount:
         resp = client.get("/cron/runs/unread-count")
         assert resp.status_code == 200
         assert resp.json() == {"count": 3}
-        # user_id + status=success + is_read=false
+        # user_id + is_read=false（失败记录也需要计入未读）
         filter_args = mock_db.query.return_value.filter.call_args[0]
-        assert len(filter_args) == 3
+        assert len(filter_args) == 2
 
 
 class TestMarkRead:
@@ -115,9 +115,9 @@ class TestMarkRead:
         assert resp.status_code == 200
         assert resp.json() == {"marked": 5}
         mock_db.commit.assert_called_once()
-        # user_id + status=success + is_read=false
+        # user_id + is_read=false（全量标记不区分 status）
         filter_args = mock_db.query.return_value.filter.call_args[0]
-        assert len(filter_args) == 3
+        assert len(filter_args) == 2
 
     def test_marks_specific_run(self):
         client, mock_db = _make_client()
@@ -191,14 +191,22 @@ class TestDownloadRunFile:
         mock_db.query.return_value.filter.return_value.first.return_value = run
 
         # 使用 %2e%2e 避免 HTTP 客户端预处理路径
-        resp = client.get("/cron/runs/run-1/files/sub/%2e%2e/%2e%2e/%2e%2e/etc/passwd")
+        with patch("src.api.routes.cron.verify_access_token", return_value="testuser"):
+            resp = client.get(
+                "/cron/runs/run-1/files/sub/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+                params={"token": "fake"},
+            )
         assert resp.status_code == 403
 
     def test_404_when_no_run(self):
         client, mock_db = _make_client()
         mock_db.query.return_value.filter.return_value.first.return_value = None
 
-        resp = client.get("/cron/runs/nonexistent/files/test.txt")
+        with patch("src.api.routes.cron.verify_access_token", return_value="testuser"):
+            resp = client.get(
+                "/cron/runs/nonexistent/files/test.txt",
+                params={"token": "fake"},
+            )
         assert resp.status_code == 404
 
     def test_404_when_no_workspace(self):
@@ -206,5 +214,123 @@ class TestDownloadRunFile:
         run = _make_run_record(run_workspace=None)
         mock_db.query.return_value.filter.return_value.first.return_value = run
 
-        resp = client.get("/cron/runs/run-1/files/test.txt")
+        with patch("src.api.routes.cron.verify_access_token", return_value="testuser"):
+            resp = client.get(
+                "/cron/runs/run-1/files/test.txt",
+                params={"token": "fake"},
+            )
         assert resp.status_code == 404
+
+    def test_401_when_no_token(self):
+        """未提供 token 必须 401。"""
+        client, _mock_db = _make_client()
+        resp = client.get("/cron/runs/run-1/files/test.txt")
+        assert resp.status_code == 401
+
+
+class TestTriggerJob:
+    """POST /cron/jobs/{job_name}/run"""
+
+    def test_trigger_uses_spawn_and_shared_user_lock(self):
+        client, mock_db = _make_client()
+
+        mock_job = MagicMock()
+        mock_job.user_id = "testuser"
+        mock_job.name = "daily"
+        mock_job.cron_expr = "0 9 * * *"
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_job
+
+        client.app.state.cron_user_locks = {}
+        client.app.state.cron_worker_id = "worker-test"
+
+        with patch(
+            "src.api.routes.cron.trigger_manual_run",
+            new_callable=AsyncMock,
+        ) as mock_trigger:
+            resp = client.post("/cron/jobs/daily/run")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "accepted"
+        assert body["job_name"] == "daily"
+        assert "run_id" in body
+
+        mock_trigger.assert_awaited_once()
+        call_args, call_kwargs = mock_trigger.call_args
+        # 回归：路由必须只通过公开 API 与 worker 交互，
+        # 仅传纯数据（user_id / job_name / run_id），不传 ORM 实例。
+        assert call_args[0] is client.app
+        assert call_args[1] == "testuser"
+        assert call_args[2] == "daily"
+        assert call_args[3] == body["run_id"]
+
+    def test_marks_run_failed_when_worker_unavailable(self):
+        """worker 未启动时，trigger_manual_run 抛 503 → run 记录必须被标记为 failed。
+
+        否则已落库的 running 记录要等 startup 1 小时清理才会变 failed，
+        前端会一直转圈。
+        """
+        from fastapi import HTTPException
+
+        client, mock_db = _make_client()
+
+        mock_job = MagicMock()
+        mock_job.user_id = "testuser"
+        mock_job.name = "daily"
+        mock_job.cron_expr = "0 9 * * *"
+
+        mock_run_record = MagicMock()
+        mock_run_record.status = "running"
+
+        # 路由内查询顺序：CronJob → CronJobRun（失败兜底路径）
+        mock_db.query.return_value.filter.return_value.first.side_effect = [
+            mock_job,
+            mock_run_record,
+        ]
+
+        with patch(
+            "src.api.routes.cron.trigger_manual_run",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=503, detail="cron worker 未启动"),
+        ):
+            resp = client.post("/cron/jobs/daily/run")
+
+        assert resp.status_code == 503
+        assert mock_run_record.status == "failed"
+        assert "cron worker" in (mock_run_record.output or "")
+        assert mock_run_record.completed_at is not None
+
+    def test_marks_run_failed_when_trigger_raises_runtime_error(self):
+        """非 HTTPException（如 RuntimeError）也必须收拢 running 记录为 failed。
+
+        spec：trigger_manual_run 抛出"任意异常"时都要兜底，
+        否则失败信号被 500 吞掉，run 记录残留 running → 前端转圈。
+        """
+        client, mock_db = _make_client()
+
+        mock_job = MagicMock()
+        mock_job.user_id = "testuser"
+        mock_job.name = "daily"
+        mock_job.cron_expr = "0 9 * * *"
+
+        mock_run_record = MagicMock()
+        mock_run_record.status = "running"
+
+        mock_db.query.return_value.filter.return_value.first.side_effect = [
+            mock_job,
+            mock_run_record,
+        ]
+
+        with patch(
+            "src.api.routes.cron.trigger_manual_run",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("event loop is closed"),
+        ):
+            with pytest.raises(RuntimeError, match="event loop"):
+                client.post("/cron/jobs/daily/run")
+
+        # 即使异常向上抛，路由也必须先把 run 记录收拢为 failed
+        assert mock_run_record.status == "failed"
+        assert "RuntimeError" in (mock_run_record.output or "")
+        assert "event loop" in (mock_run_record.output or "")
+        assert mock_run_record.completed_at is not None

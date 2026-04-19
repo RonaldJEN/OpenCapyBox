@@ -122,7 +122,7 @@ Define Cron jobs via the `manage_cron` tool, and your AI assistant runs them aut
 | 🔍 Web Search | GLMSearch / BatchSearch | Bocha search engine, parallel batch search |
 | 🧠 Memory | RecordDailyLog / SearchMemory | Layered persistent memory + hybrid retrieval |
 | 📝 Session Notes | SessionNote / RecallNote | Cross-turn context preservation |
-| ⏰ Cron | ManageCron | APScheduler-powered cron management |
+| ⏰ Cron | ManageCron | DB-driven decentralized cron worker |
 | 🎒 Skills | GetSkill | 40+ dynamically loadable professional skills |
 | 🔌 MCP | MCP Tools | Model Context Protocol tool integration |
 

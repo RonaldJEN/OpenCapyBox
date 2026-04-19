@@ -122,7 +122,7 @@
 | 🔍 Web 搜索 | GLMSearch / BatchSearch | 博查搜索引擎，支持批量并行 |
 | 🧠 记忆系统 | RecordDailyLog / SearchMemory | 分层持久化记忆 + 混合检索 |
 | 📝 会话笔记 | SessionNote / RecallNote | 跨轮次上下文保持 |
-| ⏰ 定时任务 | ManageCron | APScheduler 驱动的 Cron 管理 |
+| ⏰ 定时任务 | ManageCron | DB 驱动的去中心化 cron worker |
 | 🎒 技能加载 | GetSkill | 40+ 可动态加载的专业技能 |
 | 🔌 MCP 协议 | MCP Tools | 模型上下文协议工具集成 |
 

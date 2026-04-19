@@ -11,29 +11,30 @@
 - POST /api/cron/jobs/{name}/run: 手动触发任务
 """
 
-import asyncio
 import json
 import logging
 import posixpath
 import shlex
 import uuid
-from typing import Set
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from sqlalchemy.orm import Session as DBSession
 
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
 from src.api.models.database import get_db
-from src.api.deps import get_current_user
-from src.api.services.cron_service import CronService, run_cron_job
+from src.api.deps import get_current_user, verify_access_token
+from src.api.services.cron_service import CronService
+from src.api.services.cron_worker import trigger_manual_run
 from src.api.utils.sandbox_helpers import extract_command_stdout
 from src.api.models.user_memory import CronJobRun
+from src.api.utils.timezone import now_naive
+
+_bearer_optional = HTTPBearer(auto_error=False)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-# 防止 asyncio.create_task 返回值被 GC 回收导致后台任务静默丢失
-_background_tasks: Set[asyncio.Task] = set()
 
 
 @router.get("/jobs")
@@ -70,14 +71,10 @@ async def get_unread_count(
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    """获取未读运行记录数（仅统计 success 且未读）。"""
+    """获取未读运行记录数"""
     count = (
         db.query(CronJobRun)
-        .filter(
-            CronJobRun.user_id == user_id,
-            CronJobRun.status == "success",
-            CronJobRun.is_read == False,  # noqa: E712
-        )
+        .filter(CronJobRun.user_id == user_id, CronJobRun.is_read == False)  # noqa: E712
         .count()
     )
     return {"count": count}
@@ -85,21 +82,20 @@ async def get_unread_count(
 
 @router.post("/runs/mark-read")
 async def mark_runs_read(
-    run_id: str | None = Query(None, description="仅标记指定 run_id 为已读"),
+    run_id: str | None = Query(None, description="指定后仅标记该条；省略则批量标记当前用户所有未读记录为已读"),
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    """标记已读。
+    """标记运行记录为已读。
 
-    - 未传 run_id: 标记当前用户全部未读记录
-    - 传 run_id: 仅标记该条记录（若属于当前用户且未读）
+    - 不传 run_id：当前用户所有未读记录全部标记。
+    - 传 run_id：仅标记归属于当前用户、且未读的该条记录。
     """
     query = db.query(CronJobRun).filter(
         CronJobRun.user_id == user_id,
-        CronJobRun.status == "success",
         CronJobRun.is_read == False,  # noqa: E712
     )
-    if run_id:
+    if run_id is not None:
         query = query.filter(CronJobRun.id == run_id)
     marked = query.update({"is_read": True})
     db.commit()
@@ -121,7 +117,25 @@ async def get_run_status(
     if not run:
         raise HTTPException(status_code=404, detail="执行记录不存在")
 
-    return run.to_dict()
+    artifacts = None
+    if run.artifacts:
+        try:
+            artifacts = json.loads(run.artifacts)
+        except (ValueError, TypeError):
+            artifacts = None
+
+    return {
+        "id": run.id,
+        "job_name": run.job_name,
+        "cron_expr": run.cron_expr,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "status": run.status,
+        "output": run.output,
+        "is_read": bool(getattr(run, 'is_read', True)),
+        "artifacts": artifacts,
+        "run_workspace": getattr(run, 'run_workspace', None),
+    }
 
 
 @router.get("/runs/{run_id}/files")
@@ -139,10 +153,13 @@ async def list_run_files(
     if not run:
         raise HTTPException(status_code=404, detail="执行记录不存在")
 
-    # 优先从 DB artifacts 字段读取（通过 to_dict 统一解析）
-    parsed = run.to_dict()
-    if parsed["artifacts"]:
-        return {"files": parsed["artifacts"]}
+    # 优先从 DB artifacts 字段读取
+    if run.artifacts:
+        try:
+            files = json.loads(run.artifacts)
+            return {"files": files}
+        except (ValueError, TypeError):
+            pass
 
     # 兼容老数据：实时扫描沙箱目录
     if not run.run_workspace:
@@ -177,10 +194,21 @@ async def list_run_files(
 async def download_run_file(
     run_id: str,
     file_path: str,
-    user_id: str = Depends(get_current_user),
+    token: str | None = Query(None, description="Bearer token (用于浏览器直接下载)"),
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_optional),
     db: DBSession = Depends(get_db),
 ):
-    """下载/预览某次执行的产物文件"""
+    """下载/预览某次执行的产物文件
+
+    支持两种鉴权方式（浏览器 <a> 链接无法带 header）：
+    1. Authorization: Bearer <token>（标准方式）
+    2. ?token=<token>（URL 直接下载）
+    """
+    # 鉴权：header 优先，query param 兜底
+    raw_token = (credentials.credentials if credentials and credentials.scheme.lower() == "bearer" else None) or token
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="未提供访问令牌")
+    user_id = verify_access_token(raw_token)
     run = (
         db.query(CronJobRun)
         .filter(CronJobRun.id == run_id, CronJobRun.user_id == user_id)
@@ -250,10 +278,15 @@ async def download_run_file(
 @router.post("/jobs/{job_name}/run")
 async def trigger_job(
     job_name: str,
+    request: Request,
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    """手动触发指定的 Cron 任务（后台执行，立即返回 run_id 供轮询）"""
+    """手动触发指定的 Cron 任务。
+
+    所有执行必须走 cron_worker.trigger_manual_run，以共享 worker 的
+    per-user 串行锁，避免与同分钟自动调度并发运行同一作业。
+    """
     from src.api.models.cron_job import CronJob
 
     job = (
@@ -277,15 +310,22 @@ async def trigger_job(
     db.add(run_record)
     db.commit()
 
-    async def _run_in_background():
-        try:
-            await run_cron_job(user_id, job_name, run_id=run_id)
-        except Exception:
-            logger.exception("后台执行 Cron 任务失败 (user=%s, job=%s)", user_id, job_name)
-
-    task = asyncio.create_task(_run_in_background())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    try:
+        await trigger_manual_run(request.app, user_id, job_name, run_id)
+    except Exception as exc:
+        # 任何异常（HTTPException / RuntimeError / 其他）都必须把预创建的 running
+        # 记录立刻收拢为 failed，否则会一直挂到 startup 1 小时清理 → 前端永久转圈。
+        rec = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
+        if rec and rec.status == "running":
+            if isinstance(exc, HTTPException):
+                reason = str(exc.detail) or "cron worker 未启动，无法手动触发任务"
+            else:
+                reason = f"手动触发失败: {exc.__class__.__name__}: {exc}"
+            rec.status = "failed"
+            rec.output = reason
+            rec.completed_at = now_naive()
+            db.commit()
+        raise
 
     logger.info("Cron 手动触发已提交后台执行 (user=%s, job=%s, run_id=%s)", user_id, job_name, run_id)
     return {

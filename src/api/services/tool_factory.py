@@ -43,14 +43,6 @@ def _auto_locate_skills_dir(setting_value: str) -> Path:
     return (Path(__file__).parent.parent.parent / "agent" / "skills").resolve()
 
 
-def _get_scheduler():
-    try:
-        import src.api.main as _main_mod
-        return getattr(getattr(_main_mod.app, "state", None), "scheduler", None)
-    except Exception:
-        return None
-
-
 async def create_agent_tools(
     *,
     sandbox: Sandbox,
@@ -98,7 +90,6 @@ async def create_agent_tools(
         ("ManageCronTool", lambda: ManageCronTool(
             db_session_factory=db_session_factory,
             user_id=user_id,
-            scheduler=_get_scheduler(),
         )),
         # 用户交互工具（Human-in-the-Loop）
         ("AskUserQuestionTool", lambda: AskUserQuestionTool()),
