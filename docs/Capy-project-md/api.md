@@ -459,32 +459,6 @@ Authorization: Bearer <access_token>
 
 ---
 
-### 轮询会话状态
-
-轻量级轮询，返回会话的轮次数量，供前端检测新消息。
-
-**请求**
-
-```
-GET /api/sessions/{chat_session_id}/poll
-Authorization: Bearer <access_token>
-```
-
-| 参数            | 类型   | 必填 | 说明                  |
-| --------------- | ------ | ---- | --------------------- |
-| chat_session_id | string | 是   | 会话 ID（Path 参数）  |
-| user_id         | string | 是   | 用户 ID（由 Authorization Bearer Token 解析） |
-
-**响应** `200 OK`
-
-```json
-{
-  "round_count": 5
-}
-```
-
----
-
 ### 上传文件
 
 上传文件到会话沙箱目录（默认 `/home/user`，可由后端配置调整，且为持久化挂载）。
@@ -1505,7 +1479,7 @@ Authorization: Bearer <access_token>
 { "count": 3 }
 ```
 
-**说明**: 仅统计 `status = success` 且 `is_read = false` 的记录。
+**说明**: 统计当前用户所有 `is_read = false` 的记录（不按 `status` 过滤，包含 `running` / `success` / `failed`）。
 
 ### 标记执行记录为已读
 
@@ -1515,8 +1489,8 @@ Authorization: Bearer <access_token>
 ```
 
 **说明**:
-- 不传 `run_id`：将当前用户所有 `success` 且未读记录标记为已读。
-- 传 `run_id`：仅标记指定 run（且必须属于当前用户、状态为 `success`）。
+- 不传 `run_id`：将当前用户所有未读记录标记为已读（不按 `status` 过滤）。
+- 传 `run_id`：仅标记指定 run（必须属于当前用户，不根据 `status` 过滤）。
 
 **Response**:
 ```json

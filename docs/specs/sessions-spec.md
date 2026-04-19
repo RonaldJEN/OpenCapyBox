@@ -7,7 +7,7 @@
 - 会话 CRUD（创建、列表、删除、标题更新）
 - 文件浏览与下载（代理沙箱文件操作）
 - 文件上传
-- 运行状态查询（running-session、poll）
+- 运行状态查询（running-session）
 - 历史记录查询（Round/Step 结构化）
 
 **不负责：**
@@ -44,11 +44,6 @@
 
 - Response 200: `{sessions: [{id, user_id, status, created_at, updated_at, title, model_id}]}`
 - 按 `created_at` 降序
-
-### GET /api/sessions/{id}/poll
-
-- Response 200: `{round_count: int}`
-- Error 404: "会话不存在"
 
 ### GET /api/sessions/{id}/history/v2
 

@@ -127,56 +127,6 @@ class TestSessionsRouter:
         assert exc.value.status_code == 400
         assert "未选择文件" in exc.value.detail
 
-    @pytest.mark.asyncio
-    async def test_poll_session_returns_round_count(self):
-        """测试 poll 端点返回正确的 round_count"""
-        mock_db = MagicMock()
-        # 模拟 Session 查询（会话存在）
-        mock_session = MagicMock()
-        mock_session.id = "s1"
-        mock_session.user_id = "user1"
-        # .filter().first() 链
-        session_query = MagicMock()
-        session_query.filter.return_value.first.return_value = mock_session
-        # .filter().count() 链 for Round
-        round_query = MagicMock()
-        round_query.filter.return_value.count.return_value = 5
-
-        from src.api.models.session import Session
-        from src.api.models.round import Round
-
-        def side_effect(model):
-            if model is Session:
-                return session_query
-            if model is Round:
-                return round_query
-            return MagicMock()
-
-        mock_db.query.side_effect = side_effect
-
-        result = await sessions.poll_session(
-            chat_session_id="s1",
-            user_id="user1",
-            db=mock_db,
-        )
-        assert result.round_count == 5
-
-    @pytest.mark.asyncio
-    async def test_poll_session_not_found(self):
-        """测试 poll 端点会话不存在时返回 404"""
-        from fastapi import HTTPException
-
-        mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.first.return_value = None
-
-        with pytest.raises(HTTPException) as exc:
-            await sessions.poll_session(
-                chat_session_id="nonexistent",
-                user_id="user1",
-                db=mock_db,
-            )
-        assert exc.value.status_code == 404
-
 
 class TestConfigRouter:
     """配置管理路由测试"""

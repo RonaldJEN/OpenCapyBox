@@ -128,13 +128,7 @@ catch (SSE error)
 
 ## 6. 轮询契约
 
-| 轮询 | 间隔 | 触发 | 目的 |
-|---|---|---|---|
-| `pollSession(sid)` | 1s | `sessionId && !sending` | 检测系统注入的新 Round（如 Cron 执行结果） |
-
-发现 `round_count > knownRoundCountRef.current` → `loadHistory()`。
-
-**禁止**：SSE 订阅期间并行 `pollSession`。
+ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session，由用户在「Cron 消息中心」面板查看（见 frontend-panel-spec §6）。
 
 ## 7. 推理面板（ReasoningPanel）
 

@@ -56,12 +56,6 @@ class UpdateSessionTitleRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=255, description="新标题")
 
 
-class SessionPollResponse(BaseModel):
-    """会话轮询响应（轻量级）"""
-
-    round_count: int = Field(..., description="轮次总数")
-
-
 class FileListResponse(BaseModel):
     """文件列表响应"""
 

@@ -219,16 +219,6 @@ class APIService {
   }
 
   /**
-   * 轻量级轮询：获取会话的轮次数量，用于检测新消息
-   */
-  async pollSession(chatSessionId: string): Promise<{ round_count: number }> {
-    const response = await this.client.get<{ round_count: number }>(
-      `/sessions/${chatSessionId}/poll`
-    );
-    return response.data;
-  }
-
-  /**
    * 中止正在进行的 Agent 执行
    * 后端会设置 cancel_token，Agent 通过 SSE 正常推送 RUN_FINISHED(interrupt)
    */

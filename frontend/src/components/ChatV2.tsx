@@ -299,38 +299,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     };
   }, [sessionId]);
 
-  // 🔄 轮询检测新消息（系统注入的 Round）
-  const knownRoundCountRef = useRef<number>(0);
-  useEffect(() => {
-    // 同步已知 round count
-    knownRoundCountRef.current = rounds.length;
-  }, [rounds.length]);
-
-  useEffect(() => {
-    if (!sessionId || sending) return;
-
-    let timer: ReturnType<typeof setInterval> | null = null;
-
-    const poll = async () => {
-      try {
-        const { round_count } = await apiService.pollSession(sessionId);
-        if (round_count > knownRoundCountRef.current) {
-          console.log(`🔔 检测到新 Round (${knownRoundCountRef.current} → ${round_count})，刷新历史`);
-          knownRoundCountRef.current = round_count;
-          loadHistory();
-        }
-      } catch {
-        // 静默忽略轮询错误
-      }
-    };
-
-    timer = setInterval(poll, 1000);
-
-    return () => {
-      if (timer) clearInterval(timer);
-    };
-  }, [sessionId, sending]);
-
   useEffect(() => {
     return () => {
       if (titleRefreshTimeoutRef.current) {

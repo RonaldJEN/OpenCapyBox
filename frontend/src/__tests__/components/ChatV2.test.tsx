@@ -18,7 +18,6 @@ vi.mock('../../services/api', () => ({
     abortChat: vi.fn(),
     getUserId: vi.fn(() => 'demo-session'),
     subscribeToRound: vi.fn(() => ({ abort: vi.fn(), promise: Promise.resolve() })),
-    pollSession: vi.fn().mockResolvedValue({ round_count: 0 }),
   },
 }));
 

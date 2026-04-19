@@ -15,7 +15,7 @@ from src.api.deps import get_current_user
 from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.agui_event import AGUIEventLog
-from src.api.schemas.session import CreateSessionResponse, SessionResponse, SessionListResponse, SessionPollResponse, FileListResponse, FileInfo, UpdateSessionTitleRequest
+from src.api.schemas.session import CreateSessionResponse, SessionResponse, SessionListResponse, FileListResponse, FileInfo, UpdateSessionTitleRequest
 from src.api.schemas.chat import HistoryResponseV2
 from src.api.services.sandbox_service import (
     get_sandbox_service,
@@ -394,25 +394,6 @@ async def list_sessions(
     )
 
     return SessionListResponse(sessions=sessions)
-
-
-@router.get("/{chat_session_id}/poll", response_model=SessionPollResponse)
-async def poll_session(
-    chat_session_id: str,
-    user_id: str = Depends(get_current_user),
-    db: DBSession = Depends(get_db),
-):
-    """轻量级轮询：返回会话的轮次数量，供前端检测新消息"""
-    session = (
-        db.query(Session)
-        .filter(Session.id == chat_session_id, Session.user_id == user_id)
-        .first()
-    )
-    if not session:
-        raise HTTPException(status_code=404, detail="会话不存在")
-
-    round_count = db.query(Round).filter(Round.session_id == chat_session_id).count()
-    return SessionPollResponse(round_count=round_count)
 
 
 @router.get("/{chat_session_id}/history/v2", response_model=HistoryResponseV2)

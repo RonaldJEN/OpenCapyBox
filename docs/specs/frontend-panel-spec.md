@@ -169,9 +169,9 @@ useEffect(() => {
 
 ### 6.3 关键不变量
 
-- **打开 CronMessageCenter 时标记已读**：`POST /api/cron/messages/mark_read`，未读计数归零。
+- **打开 CronMessageCenter 时标记已读**：`POST /api/cron/runs/mark-read`（不传 `run_id` 则全量），未读计数归零。
 - **Cron 任务新增/编辑**走表单（不允许直接写 cron 表达式原文，必须经前端校验）。
-- **手动触发**：`POST /api/cron/{id}/trigger`，返回的新 round 会通过 `pollSession` 被 ChatV2 检测到（见 frontend-chat-spec §6）。
+- **手动触发**：`POST /api/cron/jobs/{job_name}/run`，立即返回 `run_id`；执行结果不注入聊天 Session，由「Cron 消息中心」展示。
 
 ## 7. FilePreview（模态弹窗，非抽屉）
 
