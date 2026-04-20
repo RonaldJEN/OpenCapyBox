@@ -1,10 +1,11 @@
 import { useState, useCallback } from 'react';
-import { MessageCircle, Check, Send, ChevronLeft, ChevronRight } from 'lucide-react';
+import { MessageCircle, Check, Send, ChevronLeft, ChevronRight, X } from 'lucide-react';
 import type { AskUserQuestion } from '../types';
 
 interface QuestionCardProps {
   questions: AskUserQuestion[];
   onSubmit: (answers: Record<string, string>) => void;
+  onDismiss?: () => void;
   disabled?: boolean;
 }
 
@@ -31,7 +32,7 @@ function isAnswerFromOptions(question: AskUserQuestion, answer: string): boolean
   return question.options.some((opt) => opt.label === answer);
 }
 
-export function QuestionCard({ questions, onSubmit, disabled = false }: QuestionCardProps) {
+export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false }: QuestionCardProps) {
   // answers: question index -> selected label(s) or freeform text
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -117,11 +118,24 @@ export function QuestionCard({ questions, onSubmit, disabled = false }: Question
           <MessageCircle size={16} className="text-claude-accent flex-shrink-0" />
           <span className="text-sm font-medium text-claude-text truncate">Agent 需要你的输入</span>
         </div>
-        {totalQuestions > 1 && (
-          <span className="text-xs text-claude-secondary font-medium flex-shrink-0">
-            {`<${safeIndex + 1}/${totalQuestions}>`}
-          </span>
-        )}
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {totalQuestions > 1 && (
+            <span className="text-xs text-claude-secondary font-medium">
+              {`<${safeIndex + 1}/${totalQuestions}>`}
+            </span>
+          )}
+          {onDismiss && (
+            <button
+              type="button"
+              onClick={onDismiss}
+              disabled={disabled}
+              className="p-0.5 rounded-md hover:bg-claude-hover transition-colors text-claude-muted hover:text-claude-secondary disabled:opacity-50"
+              aria-label="关闭问题"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Questions */}

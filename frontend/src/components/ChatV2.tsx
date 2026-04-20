@@ -1690,6 +1690,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
             <QuestionCard
               questions={pendingInterrupt.payload.questions as AskUserQuestion[]}
               onSubmit={handleResumeSubmit}
+              onDismiss={() => setPendingInterrupt(null)}
               disabled={resuming}
             />
           </div>

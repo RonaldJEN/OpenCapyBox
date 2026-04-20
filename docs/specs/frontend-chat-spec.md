@@ -103,10 +103,24 @@ catch (SSE error)
   - `setPendingInterrupt(interrupt)` + `agentState.status = 'waiting'`
   - 渲染 `QuestionCard` 供用户回答
 - 用户回答 → 继续调用后端 `resume` 接口（携带答案）。
+- **放弃路径**：`QuestionCard` 提供关闭按钮（X），点击仅本地 `setPendingInterrupt(null)` 隐藏卡片，不调用任何后端接口。Round 保持 `interrupted` 终态，用户可直接发新消息开启新 round。
 
 ### 3.7 多 RUN 同一 Round
 
-一个 round 可能包含多个 RUN（ask_user resume 后新增 RUN）。前端按 `runId` 区分，但 UI 内聚合在同一个 `RoundData.steps` 下。
+一个 round 可能包含多个 RUN（断线重连同一 round 时新增 RUN）。前端按 `runId` 区分，但 UI 内聚合在同一个 `RoundData.steps` 下。
+
+### 3.8 Resume 后的 Round 关系
+
+`ask_user` 中断恢复后，**不**复用旧 round。后端语义（见 `chat-spec.md` §Resume 流程，对应实现 `history_service.resolve_interrupted_rounds()` 与 `agent_service` 的 resume 入口）：
+
+- 旧 `interrupted` round 的状态会被后端迁移为 `resumed`，并清除 `interrupt_payload`，以阻止刷新后重复弹出 `QuestionCard`。
+- 同时新建一个 round（`parent_run_id` 指向旧 round）承载 resume 之后的步骤。
+
+前端实现与之一致：
+
+- `handleResumeSubmit` 在调用 `resumeStream` 前向 `rounds` 数组追加一个新的 `running` 占位 round（`user_message` 用 `Q:/A:` 拼接的回答摘要）。
+- 旧 round 仍展示在历史中作为可读记录，但其状态在拉取历史时会是 `resumed`（不再是 `interrupted`）。前端断言、测试 fixture 与 UI 渲染分支需基于 `resumed` 而非 `interrupted`。
+- 这样保证刷新页面后，从后端拉到的多 round 结构与本地实时状态一致。
 
 ## 4. 滚动策略
 

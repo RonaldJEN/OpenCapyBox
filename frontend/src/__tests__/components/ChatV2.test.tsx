@@ -53,7 +53,7 @@ vi.mock('../../components/FilePreview', () => ({
 }));
 
 vi.mock('../../components/QuestionCard', () => ({
-  QuestionCard: ({ onSubmit, disabled }: any) => (
+  QuestionCard: ({ onSubmit, onDismiss, disabled }: any) => (
     <div data-testid="question-card">
       <button
         type="button"
@@ -62,6 +62,11 @@ vi.mock('../../components/QuestionCard', () => ({
       >
         Submit Question
       </button>
+      {onDismiss && (
+        <button type="button" data-testid="question-card-dismiss" onClick={onDismiss}>
+          Dismiss
+        </button>
+      )}
     </div>
   ),
 }));
@@ -874,6 +879,52 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('question-card')).not.toBeInTheDocument();
     });
+  });
+
+  it('点击 QuestionCard dismiss 按钮应本地隐藏卡片，不调后端接口', async () => {
+    const interruptedRounds: RoundData[] = [
+      {
+        round_id: 'round-dismiss-1',
+        user_message: '分析一下',
+        final_response: '',
+        steps: [],
+        step_count: 1,
+        status: 'interrupted',
+        created_at: new Date().toISOString(),
+        interrupt: {
+          id: 'int-dismiss-001',
+          reason: 'input_required',
+          payload: {
+            questions: [{ question: '选择方案', options: [{ label: 'A' }] }],
+          },
+        },
+      },
+    ];
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: interruptedRounds,
+      session_id: 'test-session',
+      total: 1,
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    // 等待 QuestionCard 出现
+    await waitFor(() => {
+      expect(screen.getByTestId('question-card')).toBeInTheDocument();
+    });
+
+    // 点击 dismiss 按钮
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('question-card-dismiss'));
+    });
+
+    // QuestionCard 应该消失
+    expect(screen.queryByTestId('question-card')).not.toBeInTheDocument();
+
+    // 不应调用 resume 或 cancel 接口
+    expect(apiService.resumeStream).not.toHaveBeenCalled();
+    expect(apiService.abortChat).not.toHaveBeenCalled();
   });
 
   it('abort 请求失败时应保持运行状态，不做本地终止', async () => {
