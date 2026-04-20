@@ -3,17 +3,17 @@
 本文档为使用 OpenCapyBox 项目的 AI 助手（如 Claude）提供核心约束与导航。
 **始终使用中文回复用户。不要随便写操作手册。**
 
-## ⚠️ 强制约束
+## ⚠️ 强制约束-编码规范-第一原则:禁止防御性编程
 
-### OpenSandbox 全量迁移（无本地 fallback）
+### 第一原则:禁止防御性编程
 
-1. **命令执行必须走 OpenSandbox**：使用 `sandbox.commands.run()`，不再依赖本地 subprocess/shared_env。
-2. **文件操作必须走 OpenSandbox**：使用 `sandbox.files.*`（`read_file` / `write_file` / `search` / `read_bytes_stream`）。
-3. **会话资源以 sandbox_id 为准**：DB 中 `user_sandbox` 表为恢复依据（connect/resume）。
-4. **`shared_env` / `init_env` 属于历史机制**：新增代码禁止继续依赖这些逻辑。
-5. **Agent Server 角色**：仅负责 LLM 推理、AG-UI 事件、鉴权与数据库持久化。
-
-### 单元测试要求
+1.严禁一切非必要的防御性编程。这是本项目最高优先级的编码规范，违反即为严重缺陷。
+具体要求:
+2.禁止写try-except吞掉异常。如果代码出错，必须让它暴露出来，而不是静默失败让人反复排查禁止对参数做多余的3.None/空值检查。调用方有责任传正确的参数，不要在被调用方做无意义的保护
+4.禁止ifxis not None/or""/or0等兜底写法，除非业务逻辑明确要求
+5.禁止写“以防万一"的代码。每一行代码必须有明确的、当下就需要的理由
+6.出错就让它崩。崩溃信息比静默失败有价值一万倍
+7.先让功能跑通，再考虑边界情况。不要在功能都没验证的时候就开始“防御”单元测试要求
 
 **修改代码后必须补足单元测试。**
 
@@ -64,20 +64,20 @@ OpenCapyBox 是一个前后端分离的 Web 智能体平台，核心能力包括
 
 ### Spec 文件（各模块权威源）
 
-| Spec | 覆盖范围 |
-|---|---|
-| `docs/specs/auth-spec.md` | 认证鉴权 |
-| `docs/specs/sessions-spec.md` | 会话管理 |
-| `docs/specs/chat-spec.md` | 聊天 / Agent 执行 / SSE 流 |
-| `docs/specs/cron-spec.md` | 定时任务 |
-| `docs/specs/memory-spec.md` | 分层记忆 |
-| `docs/specs/sandbox-spec.md` | 沙箱交互 |
-| `docs/specs/models-spec.md` | 模型注册与切换 |
-| `docs/specs/config-spec.md` | Agent 配置与技能 |
-| `docs/specs/frontend-spec.md` | 前端总规范与设计体系 |
-| `docs/specs/frontend-chat-spec.md` | 前端聊天 / SSE / 推理面板 |
-| `docs/specs/frontend-session-spec.md` | 前端会话列表与切换 |
-| `docs/specs/frontend-panel-spec.md` | 前端抽屉类面板 |
+| Spec                                    | 覆盖范围                   |
+| --------------------------------------- | -------------------------- |
+| `docs/specs/auth-spec.md`             | 认证鉴权                   |
+| `docs/specs/sessions-spec.md`         | 会话管理                   |
+| `docs/specs/chat-spec.md`             | 聊天 / Agent 执行 / SSE 流 |
+| `docs/specs/cron-spec.md`             | 定时任务                   |
+| `docs/specs/memory-spec.md`           | 分层记忆                   |
+| `docs/specs/sandbox-spec.md`          | 沙箱交互                   |
+| `docs/specs/models-spec.md`           | 模型注册与切换             |
+| `docs/specs/config-spec.md`           | Agent 配置与技能           |
+| `docs/specs/frontend-spec.md`         | 前端总规范与设计体系       |
+| `docs/specs/frontend-chat-spec.md`    | 前端聊天 / SSE / 推理面板  |
+| `docs/specs/frontend-session-spec.md` | 前端会话列表与切换         |
+| `docs/specs/frontend-panel-spec.md`   | 前端抽屉类面板             |
 
 ### 其他文档
 
