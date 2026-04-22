@@ -109,6 +109,9 @@ _PENDING_COLUMNS = [
     ("cron_job_runs", "is_read", "BOOLEAN DEFAULT 1"),
     ("cron_job_runs", "artifacts", "TEXT"),
     ("cron_job_runs", "run_workspace", "VARCHAR(500)"),
+    # Cron 任务表单：结构化时间配置（前端编辑回显）+ 执行内容（Agent prompt）
+    ("cron_jobs", "schedule", "TEXT"),
+    ("cron_jobs", "content", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 

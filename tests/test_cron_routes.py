@@ -334,3 +334,257 @@ class TestTriggerJob:
         assert "RuntimeError" in (mock_run_record.output or "")
         assert "event loop" in (mock_run_record.output or "")
         assert mock_run_record.completed_at is not None
+
+
+# ════════════════════════════════════════════════════════════════
+# CRUD 路由（POST/PUT/DELETE/preview）—— 给前端表单调用
+# ════════════════════════════════════════════════════════════════
+
+
+def _job_with_to_dict(**fields):
+    """构造一个带 to_dict() 的 mock CronJob ORM 对象。"""
+    job = MagicMock()
+    defaults = {
+        "id": 1,
+        "name": "daily",
+        "cron_expr": "30 9 * * *",
+        "schedule": {"kind": "daily", "time": "09:30"},
+        "description": "晨报",
+        "content": "",
+        "enabled": True,
+    }
+    defaults.update(fields)
+    for k, v in defaults.items():
+        setattr(job, k, v)
+    job.to_dict.return_value = defaults
+    return job
+
+
+class TestCreateCronJob:
+    def test_201_with_schedule(self):
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.create_job.return_value = _job_with_to_dict()
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.post("/cron/jobs", json={
+                "name": "daily",
+                "description": "晨报",
+                "content": "汇总今天日程",
+                "schedule": {"kind": "daily", "time": "09:30"},
+                "enabled": True,
+            })
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["job"]["name"] == "daily"
+        assert set(body["job"].keys()) == {
+            "id", "name", "cron_expr", "schedule", "description", "content", "enabled",
+        }
+        assert "user_id" not in body["job"]
+        assert "created_at" not in body["job"]
+        assert "updated_at" not in body["job"]
+        # 服务层收到 schedule 而非 cron_expr
+        kwargs = svc.create_job.call_args.kwargs
+        assert kwargs["schedule"] == {"kind": "daily", "time": "09:30"}
+        assert kwargs["cron_expr"] is None
+        assert kwargs["content"] == "汇总今天日程"
+
+    def test_201_with_cron_expr(self):
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.create_job.return_value = _job_with_to_dict(schedule=None, cron_expr="0 8 * * *")
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.post("/cron/jobs", json={
+                "name": "morning",
+                "cron_expr": "0 8 * * *",
+            })
+        assert resp.status_code == 201
+
+    def test_400_when_validation_error(self):
+        from src.api.services.cron_service import CronJobValidationError
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.create_job.side_effect = CronJobValidationError("任务名非法")
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.post("/cron/jobs", json={
+                "name": "bad name!",
+                "schedule": {"kind": "daily", "time": "09:30"},
+            })
+        assert resp.status_code == 400
+        assert "任务名" in resp.json()["detail"]
+
+    def test_503_when_db_busy(self):
+        from src.api.services.cron_service import CronJobBusyError
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.create_job.side_effect = CronJobBusyError("数据库繁忙，请稍后重试")
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.post("/cron/jobs", json={
+                "name": "daily",
+                "schedule": {"kind": "daily", "time": "09:30"},
+            })
+        assert resp.status_code == 503
+        assert "数据库繁忙" in resp.json()["detail"]
+
+    def test_422_when_name_missing(self):
+        client, _ = _make_client()
+        # Pydantic 校验：name 缺失
+        resp = client.post("/cron/jobs", json={"schedule": {"kind": "daily", "time": "09:30"}})
+        assert resp.status_code == 422
+
+    def test_201_when_content_len_is_8000(self):
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.create_job.return_value = _job_with_to_dict(content="x" * 8000)
+        long_content = "x" * 8000
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.post("/cron/jobs", json={
+                "name": "daily",
+                "content": long_content,
+                "schedule": {"kind": "daily", "time": "09:30"},
+            })
+        assert resp.status_code == 201
+        kwargs = svc.create_job.call_args.kwargs
+        assert len(kwargs["content"]) == 8000
+
+    def test_422_when_content_len_exceeds_8000(self):
+        client, _ = _make_client()
+        resp = client.post("/cron/jobs", json={
+            "name": "daily",
+            "content": "x" * 8001,
+            "schedule": {"kind": "daily", "time": "09:30"},
+        })
+        assert resp.status_code == 422
+
+
+class TestUpdateCronJob:
+    def test_200_partial_update(self):
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.update_job.return_value = _job_with_to_dict(enabled=False)
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.put("/cron/jobs/daily", json={"enabled": False})
+        assert resp.status_code == 200
+        assert resp.json()["job"]["enabled"] is False
+        kwargs = svc.update_job.call_args.kwargs
+        # 未传字段必须是 None（表示"不变"）
+        assert kwargs["enabled"] is False
+        assert kwargs["description"] is None
+        assert kwargs["schedule"] is None
+
+    def test_404_when_not_found(self):
+        from src.api.services.cron_service import CronJobNotFoundError
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.update_job.side_effect = CronJobNotFoundError("任务 'x' 不存在")
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.put("/cron/jobs/x", json={"enabled": False})
+        assert resp.status_code == 404
+
+    def test_400_when_other_validation(self):
+        from src.api.services.cron_service import CronJobValidationError
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.update_job.side_effect = CronJobValidationError("schedule 格式错误")
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.put("/cron/jobs/daily", json={
+                "schedule": {"kind": "daily", "time": "bad"},
+            })
+        assert resp.status_code == 400
+
+    def test_503_when_db_busy(self):
+        from src.api.services.cron_service import CronJobBusyError
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.update_job.side_effect = CronJobBusyError("数据库繁忙，请稍后重试")
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.put("/cron/jobs/daily", json={"enabled": False})
+        assert resp.status_code == 503
+        assert "数据库繁忙" in resp.json()["detail"]
+
+    def test_422_when_update_content_len_exceeds_8000(self):
+        client, _ = _make_client()
+        resp = client.put("/cron/jobs/daily", json={"content": "x" * 8001})
+        assert resp.status_code == 422
+
+
+class TestDeleteCronJob:
+    def test_204_on_success(self):
+        client, _ = _make_client()
+        svc = MagicMock()
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.delete("/cron/jobs/daily")
+        assert resp.status_code == 204
+        assert resp.content == b""
+        svc.delete_job.assert_called_once_with("testuser", "daily")
+
+    def test_404_when_not_found(self):
+        from src.api.services.cron_service import CronJobNotFoundError
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.delete_job.side_effect = CronJobNotFoundError("任务 'x' 不存在")
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.delete("/cron/jobs/x")
+        assert resp.status_code == 404
+
+    def test_503_when_db_busy(self):
+        from src.api.services.cron_service import CronJobBusyError
+        client, _ = _make_client()
+        svc = MagicMock()
+        svc.delete_job.side_effect = CronJobBusyError("数据库繁忙，请稍后重试")
+        with patch("src.api.routes.cron.CronService", return_value=svc):
+            resp = client.delete("/cron/jobs/daily")
+        assert resp.status_code == 503
+        assert "数据库繁忙" in resp.json()["detail"]
+
+
+class TestSchedulePreview:
+    def test_preview_with_schedule(self):
+        client, _ = _make_client()
+        resp = client.post("/cron/jobs/preview", json={
+            "schedule": {"kind": "daily", "time": "09:00"},
+            "n": 3,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cron_expr"] == "0 9 * * *"
+        assert len(data["next_fires"]) == 3
+        # ISO 字符串格式
+        assert "T" in data["next_fires"][0]
+
+    def test_preview_with_cron_expr(self):
+        client, _ = _make_client()
+        resp = client.post("/cron/jobs/preview", json={
+            "cron_expr": "0 8 * * *",
+            "n": 2,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cron_expr"] == "0 8 * * *"
+        assert len(data["next_fires"]) == 2
+
+    def test_400_when_neither_provided(self):
+        client, _ = _make_client()
+        resp = client.post("/cron/jobs/preview", json={"n": 5})
+        assert resp.status_code == 400
+
+    def test_400_when_both_schedule_and_cron_expr_provided(self):
+        client, _ = _make_client()
+        resp = client.post("/cron/jobs/preview", json={
+            "schedule": {"kind": "daily", "time": "09:00"},
+            "cron_expr": "0 8 * * *",
+            "n": 5,
+        })
+        assert resp.status_code == 400
+        assert "不能同时" in resp.json()["detail"]
+
+    def test_400_when_schedule_invalid(self):
+        client, _ = _make_client()
+        resp = client.post("/cron/jobs/preview", json={
+            "schedule": {"kind": "daily", "time": "25:99"},
+        })
+        assert resp.status_code == 400
+
+    def test_400_when_cron_expr_invalid(self):
+        client, _ = _make_client()
+        resp = client.post("/cron/jobs/preview", json={"cron_expr": "* * *"})
+        assert resp.status_code == 400

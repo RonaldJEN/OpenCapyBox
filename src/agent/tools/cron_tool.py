@@ -39,8 +39,8 @@ class ManageCronTool(Tool):
             "- list: List all cron jobs for this user\n"
             "- toggle: Enable/disable a cron job by name\n"
             "- history: View recent execution history\n\n"
-            "Cron expression uses 5 fields: minute hour day month day_of_week\n"
-            "Examples: '0 9 * * *' (daily 9am), '0 9 * * 1' (Monday 9am), "
+            "Cron expression uses 5 fields: minute hour day month day_of_week (0=Mon..6=Sun)\n"
+            "Examples: '0 9 * * *' (daily 9am), '0 9 * * 0' (Monday 9am), "
             "'*/30 * * * *' (every 30 min)"
         )
 
@@ -102,42 +102,29 @@ class ManageCronTool(Tool):
         if not description or not description.strip():
             return ToolResult(success=False, error="任务描述 description 不能为空")
 
-        name = name.strip()
-        cron_expr = cron_expr.strip()
-        description = description.strip()
-
-        err = _validate_cron_expr(cron_expr)
-        if err:
-            return ToolResult(success=False, error=err)
-
-        from src.api.models.cron_job import CronJob
+        from src.api.services.cron_service import CronJobValidationError, CronService
 
         db = self._db_factory()
         try:
-            existing = (
-                db.query(CronJob)
-                .filter(CronJob.user_id == self._user_id, CronJob.name == name)
-                .first()
-            )
-            if existing:
-                return ToolResult(
-                    success=False,
-                    error=f"任务 '{name}' 已存在。如需修改，请先 remove 再 add。",
+            svc = CronService(db)
+            try:
+                job = svc.create_job(
+                    self._user_id,
+                    name=name.strip(),
+                    description=description.strip(),
+                    # Agent 沿用 description 作为 prompt（与历史行为一致），
+                    # content 留空让 run_cron_job 回退到 description。
+                    content="",
+                    schedule=None,
+                    cron_expr=cron_expr.strip(),
+                    enabled=True,
                 )
-
-            job = CronJob(
-                user_id=self._user_id,
-                name=name,
-                cron_expr=cron_expr,
-                description=description,
-                enabled=True,
-            )
-            db.add(job)
-            db.commit()
+            except CronJobValidationError as e:
+                return ToolResult(success=False, error=str(e))
 
             return ToolResult(
                 success=True,
-                content=f"已创建定时任务 '{name}' (cron: {cron_expr}): {description}",
+                content=f"已创建定时任务 '{job.name}' (cron: {job.cron_expr}): {job.description}",
             )
         finally:
             db.close()
@@ -147,20 +134,15 @@ class ManageCronTool(Tool):
             return ToolResult(success=False, error="任务名 name 不能为空")
 
         name = name.strip()
-        from src.api.models.cron_job import CronJob
+        from src.api.services.cron_service import CronJobNotFoundError, CronService
 
         db = self._db_factory()
         try:
-            job = (
-                db.query(CronJob)
-                .filter(CronJob.user_id == self._user_id, CronJob.name == name)
-                .first()
-            )
-            if not job:
-                return ToolResult(success=False, error=f"任务 '{name}' 不存在")
-
-            db.delete(job)
-            db.commit()
+            svc = CronService(db)
+            try:
+                svc.delete_job(self._user_id, name)
+            except CronJobNotFoundError as e:
+                return ToolResult(success=False, error=str(e))
 
             return ToolResult(success=True, content=f"已删除定时任务 '{name}'")
         finally:
@@ -193,22 +175,25 @@ class ManageCronTool(Tool):
             return ToolResult(success=False, error="任务名 name 不能为空")
 
         name = name.strip()
-        from src.api.models.cron_job import CronJob
+        from src.api.services.cron_service import (
+            CronJobBusyError,
+            CronJobNotFoundError,
+            CronService,
+        )
 
         db = self._db_factory()
         try:
-            job = (
-                db.query(CronJob)
-                .filter(CronJob.user_id == self._user_id, CronJob.name == name)
-                .first()
-            )
-            if not job:
+            svc = CronService(db)
+            task = next((t for t in svc.get_jobs(self._user_id) if t.name == name), None)
+            if not task:
                 return ToolResult(success=False, error=f"任务 '{name}' 不存在")
 
-            job.enabled = not job.enabled
-            db.commit()
+            try:
+                updated = svc.update_job(self._user_id, name, enabled=not task.enabled)
+            except (CronJobNotFoundError, CronJobBusyError) as e:
+                return ToolResult(success=False, error=str(e))
 
-            new_status = "启用" if job.enabled else "暂停"
+            new_status = "启用" if updated.enabled else "暂停"
             return ToolResult(
                 success=True,
                 content=f"任务 '{name}' 已切换为: {new_status}",

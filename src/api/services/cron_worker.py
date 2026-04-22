@@ -220,13 +220,30 @@ async def _run(
     user_locks: dict[str, asyncio.Lock],
     worker_id: str,
     run_id: str | None = None,
+    scheduled_job_id: int | None = None,
 ) -> None:
-    """执行单个任务，cron 与手动触发共用。"""
+    """执行单个任务，cron 与手动触发共用。
+
+    当 scheduled_job_id 不为空（自动调度路径）时，拿到 per-user 锁后
+    再按 job_id 做一次 enabled 校验，避免“快照已启用 -> 排队等待锁 ->
+    用户在等待期间禁用任务”导致的空跑。
+    """
     lock = _get_or_create_user_lock(user_locks, user_id)
     actual_run_id = run_id or str(uuid.uuid4())
     source = "manual" if run_id else "scheduled"
 
     async with lock:
+        if scheduled_job_id is not None:
+            # 自动调度路径：在真正执行前（已拿锁）做二次校验，收敛竞态窗口。
+            latest = await asyncio.to_thread(_load_job_snapshot_if_enabled, scheduled_job_id)
+            if latest is None:
+                logger.info(
+                    "cron skip stale job before execute job_id=%s worker=%s (deleted or disabled)",
+                    scheduled_job_id,
+                    worker_id,
+                )
+                return
+
         logger.info(
             "cron start worker=%s user=%s job=%s run=%s source=%s",
             worker_id,
@@ -265,7 +282,7 @@ async def _run_by_id(
         return
 
     user_id, name = snapshot
-    await _run(user_id, name, user_locks, worker_id)
+    await _run(user_id, name, user_locks, worker_id, scheduled_job_id=job_id)
 
 
 def _load_job_snapshot_if_enabled(job_id: int) -> tuple[str, str] | None:

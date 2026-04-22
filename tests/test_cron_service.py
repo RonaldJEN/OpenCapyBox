@@ -54,6 +54,23 @@ class TestParseCronFields:
         assert parse_cron_fields("0 9 * * * *") is None
 
 
+class TestResolveCronExpr:
+    """_resolve_cron_expr 语义校验测试"""
+
+    def test_accepts_valid_5_field_cron(self):
+        from src.api.services.cron_service import _resolve_cron_expr
+
+        expr, schedule_json = _resolve_cron_expr(None, "0 9 * * *")
+        assert expr == "0 9 * * *"
+        assert schedule_json is None
+
+    def test_rejects_invalid_value_even_with_5_fields(self):
+        from src.api.services.cron_service import CronJobValidationError, _resolve_cron_expr
+
+        with pytest.raises(CronJobValidationError, match="cron 表达式解析失败"):
+            _resolve_cron_expr(None, "70 25 * * *")
+
+
 class TestCronTask:
     """CronTask 数据结构测试"""
 
@@ -79,10 +96,13 @@ class TestCronServiceDB:
     def test_get_tasks_from_db(self):
         """get_tasks 现在从 CronJob 表查询"""
         job1 = MagicMock()
+        job1.id = 1
         job1.name = "daily"
         job1.cron_expr = "0 9 * * *"
         job1.description = "every day"
         job1.enabled = True
+        job1.schedule = None
+        job1.content = ""
 
         svc, _ = _make_cron_service(query_return=[job1])
         tasks = svc.get_tasks("user-1")
@@ -110,6 +130,152 @@ class TestCronServiceDB:
         assert len(runs) == 1
         assert runs[0]["job_name"] == "daily"
         assert runs[0]["is_read"] is True
+
+    def test_update_job_not_found_raises_specific_error(self):
+        from src.api.services.cron_service import CronJobNotFoundError
+
+        svc, _ = _make_cron_service(first_return=None)
+
+        with pytest.raises(CronJobNotFoundError, match="不存在"):
+            svc.update_job("user-1", "missing", enabled=False)
+
+    def test_delete_job_cleans_related_cron_fires(self):
+        from src.api.models.cron_fire import CronFire
+
+        job = MagicMock()
+        job.id = 42
+        job.name = "daily"
+
+        svc, mock_db = _make_cron_service(first_return=job)
+
+        svc.delete_job("user-1", "daily")
+
+        mock_db.query.assert_any_call(CronFire)
+        mock_db.query.return_value.filter.return_value.delete.assert_called_once_with(
+            synchronize_session=False,
+        )
+        mock_db.delete.assert_called_once_with(job)
+        mock_db.commit.assert_called_once()
+
+    def test_create_job_duplicate_race_maps_integrity_error_to_validation(self):
+        from sqlalchemy.exc import IntegrityError
+        from src.api.services.cron_service import CronJobValidationError
+
+        svc, mock_db = _make_cron_service(first_return=None)
+        mock_db.commit.side_effect = IntegrityError("stmt", {}, Exception("UNIQUE constraint failed"))
+
+        with pytest.raises(CronJobValidationError, match="已存在"):
+            svc.create_job("user-1", name="daily", cron_expr="0 9 * * *")
+
+        mock_db.rollback.assert_called_once()
+
+    def test_create_job_sqlite_busy_maps_to_busy_error(self):
+        from sqlalchemy.exc import OperationalError
+        from src.api.services.cron_service import CronJobBusyError
+
+        svc, mock_db = _make_cron_service(first_return=None)
+        mock_db.commit.side_effect = OperationalError("stmt", {}, Exception("database is locked"))
+
+        with pytest.raises(CronJobBusyError, match="数据库繁忙"):
+            svc.create_job("user-1", name="daily", cron_expr="0 9 * * *")
+
+        mock_db.rollback.assert_called_once()
+
+    def test_create_job_busy_during_lookup_maps_to_busy_error(self):
+        from sqlalchemy.exc import OperationalError
+        from src.api.services.cron_service import CronJobBusyError
+
+        svc, mock_db = _make_cron_service(first_return=None)
+        mock_db.query.return_value.filter.return_value.first.side_effect = (
+            OperationalError("stmt", {}, Exception("database is locked"))
+        )
+
+        with pytest.raises(CronJobBusyError, match="数据库繁忙"):
+            svc.create_job("user-1", name="daily", cron_expr="0 9 * * *")
+
+        mock_db.rollback.assert_called_once()
+
+    def test_update_job_sqlite_busy_maps_to_busy_error(self):
+        from sqlalchemy.exc import OperationalError
+        from src.api.services.cron_service import CronJobBusyError
+
+        job = MagicMock()
+        job.name = "daily"
+        job.cron_expr = "0 9 * * *"
+        job.description = "d"
+        job.enabled = True
+
+        svc, mock_db = _make_cron_service(first_return=job)
+        mock_db.commit.side_effect = OperationalError("stmt", {}, Exception("database is locked"))
+
+        with pytest.raises(CronJobBusyError, match="数据库繁忙"):
+            svc.update_job("user-1", "daily", enabled=False)
+
+        mock_db.rollback.assert_called_once()
+
+    def test_update_job_busy_during_lookup_maps_to_busy_error(self):
+        from sqlalchemy.exc import OperationalError
+        from src.api.services.cron_service import CronJobBusyError
+
+        svc, mock_db = _make_cron_service(first_return=None)
+        mock_db.query.return_value.filter.return_value.first.side_effect = (
+            OperationalError("stmt", {}, Exception("database is locked"))
+        )
+
+        with pytest.raises(CronJobBusyError, match="数据库繁忙"):
+            svc.update_job("user-1", "daily", enabled=False)
+
+        mock_db.rollback.assert_called_once()
+
+    def test_delete_job_sqlite_busy_maps_to_busy_error(self):
+        from sqlalchemy.exc import OperationalError
+        from src.api.services.cron_service import CronJobBusyError
+
+        job = MagicMock()
+        job.id = 42
+        job.name = "daily"
+
+        svc, mock_db = _make_cron_service(first_return=job)
+        mock_db.commit.side_effect = OperationalError("stmt", {}, Exception("database is locked"))
+
+        with pytest.raises(CronJobBusyError, match="数据库繁忙"):
+            svc.delete_job("user-1", "daily")
+
+        mock_db.rollback.assert_called_once()
+
+    def test_delete_job_busy_during_lookup_maps_to_busy_error(self):
+        from sqlalchemy.exc import OperationalError
+        from src.api.services.cron_service import CronJobBusyError
+
+        svc, mock_db = _make_cron_service(first_return=None)
+        mock_db.query.return_value.filter.return_value.first.side_effect = (
+            OperationalError("stmt", {}, Exception("database is locked"))
+        )
+
+        with pytest.raises(CronJobBusyError, match="数据库繁忙"):
+            svc.delete_job("user-1", "daily")
+
+        mock_db.rollback.assert_called_once()
+
+    def test_delete_job_busy_during_fire_cleanup(self):
+        """cron_fires DELETE 阶段（commit 之前）锁冲突也应映射为 CronJobBusyError。"""
+        from sqlalchemy.exc import OperationalError
+        from src.api.services.cron_service import CronJobBusyError
+
+        job = MagicMock()
+        job.id = 42
+        job.name = "daily"
+
+        svc, mock_db = _make_cron_service(first_return=job)
+        # 模拟 query(CronFire).filter(...).delete() 抛出锁冲突
+        mock_db.query.return_value.filter.return_value.delete.side_effect = (
+            OperationalError("stmt", {}, Exception("database is locked"))
+        )
+
+        with pytest.raises(CronJobBusyError, match="数据库繁忙"):
+            svc.delete_job("user-1", "daily")
+
+        mock_db.rollback.assert_called_once()
 
 
 class TestCronRoutes:

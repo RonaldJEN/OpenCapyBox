@@ -81,10 +81,21 @@ export async function toggleSkill(
 
 // ========== Cron 任务 API ==========
 
+/** 结构化时间配置 — 由 SchedulePicker 产出，后端转 cron_expr。 */
+export type Schedule =
+  | { kind: 'daily'; time: string }                                    // HH:MM
+  | { kind: 'weekdays'; time: string }                                  // 周一-五
+  | { kind: 'weekly'; time: string; days: number[] }                   // 0=Mon..6=Sun
+  | { kind: 'monthly'; time: string; dayOfMonth: number }              // 1-31
+  | { kind: 'interval'; everyMinutes?: number; everyHours?: number };
+
 export interface CronTask {
+  id?: number | null;
   name: string;
   cron_expr: string;
+  schedule: Schedule | null;
   description: string;
+  content: string;
   enabled: boolean;
 }
 
@@ -111,6 +122,49 @@ export interface ArtifactFile {
 export async function getCronJobs(): Promise<CronTask[]> {
   const resp = await client.get<{ jobs: CronTask[] }>('/cron/jobs');
   return resp.data.jobs;
+}
+
+export interface CronJobInput {
+  name: string;
+  description?: string;
+  content?: string;
+  schedule?: Schedule | null;
+  cron_expr?: string | null;
+  enabled?: boolean;
+}
+
+export async function createCronJob(payload: CronJobInput): Promise<CronTask> {
+  const resp = await client.post<{ job: CronTask }>('/cron/jobs', payload);
+  return resp.data.job;
+}
+
+export interface CronJobUpdateInput {
+  description?: string;
+  content?: string;
+  schedule?: Schedule | null;
+  cron_expr?: string | null;
+  enabled?: boolean;
+}
+
+export async function updateCronJob(name: string, payload: CronJobUpdateInput): Promise<CronTask> {
+  const resp = await client.put<{ job: CronTask }>(`/cron/jobs/${encodeURIComponent(name)}`, payload);
+  return resp.data.job;
+}
+
+export async function deleteCronJob(name: string): Promise<void> {
+  await client.delete(`/cron/jobs/${encodeURIComponent(name)}`);
+}
+
+export interface SchedulePreviewResult {
+  cron_expr: string;
+  next_fires: string[];  // ISO datetime strings (本地 naive)
+}
+
+export async function previewSchedule(
+  payload: { schedule?: Schedule | null; cron_expr?: string | null; n?: number },
+): Promise<SchedulePreviewResult> {
+  const resp = await client.post<SchedulePreviewResult>('/cron/jobs/preview', payload);
+  return resp.data;
 }
 
 export async function getCronRuns(

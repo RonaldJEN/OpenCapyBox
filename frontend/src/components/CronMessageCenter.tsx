@@ -71,6 +71,31 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function localDateKey(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * 把 started_at 转成分组 key（YYYY-MM-DD，本地时区）。
+ *
+ * 统一 key 口径，避免：
+ * - 分组用原始字符串日期
+ * - 今天/昨天用 UTC 日期
+ * 两者混用导致的跨时区错标。
+ */
+export function runDateGroupKey(startedAt: string | null): string {
+  if (!startedAt) return '未知日期';
+  const dt = new Date(startedAt);
+  if (!Number.isNaN(dt.getTime())) {
+    return localDateKey(dt);
+  }
+  const m = startedAt.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : '未知日期';
+}
+
 // ────────────────────────────────────────────
 // Sub-component: 产物文件列表（支持 lazy fetch）
 // ────────────────────────────────────────────
@@ -165,6 +190,7 @@ const PAGE_SIZE = 20;
 
 const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
   const [runs, setRuns] = useState<CronJobRun[]>([]);
+  const [unreadCount, setUnreadCount] = useState(0);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -205,6 +231,7 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
         setRuns(resp.runs);
         setTotal(resp.total);
         offsetRef.current = resp.runs.length;
+        setUnreadCount(unreadResp.count);
         onUnreadChange?.(unreadResp.count);
       } catch (e) {
         console.error('加载消息中心失败', e);
@@ -232,19 +259,89 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
   const handleToggleRun = useCallback(async (run: CronJobRun, isExpanded: boolean) => {
     setExpandedRun(isExpanded ? null : run.id);
 
-    // 仅在用户首次展开 success 且未读任务时，标记该条为已读
-    if (isExpanded || run.is_read || run.status !== 'success') return;
+    // 仅在首次展开「终态且未读」记录时做单条已读标记。
+    // running 记录不自动标记，避免把进行中的失败风险提前“读掉”。
+    if (isExpanded || run.is_read || run.status === 'running') return;
 
-    setRuns((prev) => prev.map((r) => (r.id === run.id ? { ...r, is_read: true } : r)));
+    setRuns((prev) => {
+      const next = prev.map((r) => (r.id === run.id ? { ...r, is_read: true } : r));
+      return next;
+    });
+    setUnreadCount((prev) => {
+      const next = Math.max(0, prev - 1);
+      onUnreadChange?.(next);
+      return next;
+    });
+
     try {
       await markCronRunsRead(run.id);
       const unreadResp = await getUnreadCount();
+      setUnreadCount(unreadResp.count);
       onUnreadChange?.(unreadResp.count);
     } catch (e) {
-      console.error('标记已读失败', e);
-      setRuns((prev) => prev.map((r) => (r.id === run.id ? { ...r, is_read: false } : r)));
+      console.error('标记单条已读失败', e);
+      setRuns((prev) => {
+        const next = prev.map((r) => (r.id === run.id ? { ...r, is_read: false } : r));
+        return next;
+      });
+      const unreadResp = await getUnreadCount();
+      setUnreadCount(unreadResp.count);
+      onUnreadChange?.(unreadResp.count);
     }
   }, [onUnreadChange]);
+
+  const handleMarkAllRead = useCallback(async () => {
+    try {
+      const resp = await markCronRunsRead();
+      const unreadResp = await getUnreadCount();
+      // 并发场景下可能出现 marked=0 但服务端未读已归零（例如其他端已先标记），
+      // 此时也需要把当前列表的红点同步清掉，避免本地状态残留。
+      if (resp.marked > 0 || unreadResp.count === 0) {
+        setRuns((prev) => prev.map((r) => (r.is_read ? r : { ...r, is_read: true })));
+      }
+      setUnreadCount(unreadResp.count);
+      onUnreadChange?.(unreadResp.count);
+    } catch (e) {
+      console.error('全部标已读失败', e);
+    }
+  }, [onUnreadChange]);
+
+  /** 按日期分组（YYYY-MM-DD），组内：失败优先 → 时间倒序 */
+  const groupedRuns = useMemo(() => {
+    const groups = new Map<string, CronJobRun[]>();
+    for (const r of runs) {
+      const key = runDateGroupKey(r.started_at);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(r);
+    }
+    for (const arr of groups.values()) {
+      arr.sort((a, b) => {
+        // 仅 failed && unread 置顶；其余全部按时间倒序。
+        const aTop = a.status === 'failed' && !a.is_read;
+        const bTop = b.status === 'failed' && !b.is_read;
+        if (aTop !== bTop) return aTop ? -1 : 1;
+        const at = a.started_at ? new Date(a.started_at).getTime() : 0;
+        const bt = b.started_at ? new Date(b.started_at).getTime() : 0;
+        return bt - at;
+      });
+    }
+    // 日期倒序
+    return [...groups.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1));
+  }, [runs]);
+
+  const formatGroupDate = (key: string): string => {
+    if (key === '未知日期') return key;
+    const today = localDateKey(new Date());
+    const yesterday = localDateKey(new Date(Date.now() - 86400000));
+    if (key === today) return '今天';
+    if (key === yesterday) return '昨天';
+    const parts = key.split('-').map(Number);
+    if (parts.length === 3 && parts.every((n) => Number.isInteger(n))) {
+      const [, month, day] = parts;
+      return `${month}月${day}日`;
+    }
+    return key;
+  };
 
   const hasMore = runs.length < total;
 
@@ -262,8 +359,28 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto p-4 space-y-2">
-      {runs.map((run) => {
+    <div className="flex-1 flex flex-col overflow-hidden">
+      {/* Sticky 顶栏：未读计数 + 全部标已读 */}
+      <div className="flex items-center justify-between px-4 py-2 border-b border-claude-border bg-claude-bg">
+        <span className="text-xs text-claude-secondary">
+          共 {total} 条 · {unreadCount > 0 ? <span className="text-red-500">{unreadCount} 条未读</span> : '全部已读'}
+        </span>
+        <button
+          onClick={() => { void handleMarkAllRead(); }}
+          disabled={unreadCount === 0}
+          className="px-2.5 py-1 text-xs rounded border border-claude-border bg-claude-surface text-claude-text hover:bg-claude-hover disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          全部标已读
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      {groupedRuns.map(([dateKey, dayRuns]) => (
+        <div key={dateKey} className="space-y-2">
+          <div className="text-xs font-medium text-claude-secondary px-1 py-1">
+            {formatGroupDate(dateKey)} · {dayRuns.length} 条
+          </div>
+          {dayRuns.map((run) => {
         const isExpanded = expandedRun === run.id;
         return (
           <div key={run.id} className="rounded-lg border border-claude-border overflow-hidden">
@@ -298,7 +415,7 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
                 </div>
               </div>
               <div className="flex items-center gap-2">
-                {run.status === 'success' && !run.is_read && (
+                {!run.is_read && (
                   <span className="inline-block w-2 h-2 rounded-full bg-red-500" title="未读" />
                 )}
                 {run.artifacts && run.artifacts.length > 0 && (
@@ -335,6 +452,8 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
           </div>
         );
       })}
+        </div>
+      ))}
 
       {/* Load more */}
       {hasMore && (
@@ -362,6 +481,7 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
           await downloadCronRunFile(previewTarget.runId, file.path, file.name);
         }}
       />
+      </div>
     </div>
   );
 };

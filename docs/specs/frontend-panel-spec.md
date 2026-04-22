@@ -156,22 +156,61 @@ useEffect(() => {
 
 ## 6. CronSchedule / CronMessageCenter
 
-### 6.1 两个组件分工
+### 6.1 组件分工
 
 | 组件 | 职责 |
 |---|---|
-| `CronSchedule` | Cron 任务列表 CRUD |
-| `CronMessageCenter` | Cron 执行历史 + 未读消息 |
+| `CronSchedule` | Cron 面板根容器：顶栏 + 子视图 + 各种 overlay |
+| `cron/WeekAgenda` | 周视图时间轴日历（8 列：00:00–23:00 左轴 + 7 天列，事件 absolute 按时间点位）|
+| `cron/ScheduleList` | 列表视图：任务数 < 10 卡片、≥ 10 表格密排 |
+| `cron/TaskFormDrawer` + `cron/SchedulePicker` | 新建/编辑表单（输出 `schedule` JSON）|
+| `CronMessageCenter` | 执行记录 overlay（按日期分组、全部标已读）|
 
-### 6.2 未读消息轮询
+### 6.2 顶栏与导航
 
-`App.tsx` 每 60s 调 `getUnreadCount()` → 更新 `cronUnreadCount` → `SessionList` 上的入口按钮显示红点。
+`CronSchedule` 顶栏由三段组成：
+- 左：标题「日程」+ segmented switcher：`日历` / `列表`（不再有「消息中心」tab）
+- 右：`+ 新建任务`（primary）+ `执行记录`（带未读红点 badge）+ 关闭按钮
+- 「执行记录」点击 → 在 `CronSchedule` 内部以 `absolute inset-0 z-40` overlay 形式打开 `CronMessageCenter`，header 提供「← 返回日程」返回上一视图
 
-### 6.3 关键不变量
+### 6.3 未读消息轮询与红点
 
-- **打开 CronMessageCenter 时标记已读**：`POST /api/cron/runs/mark-read`（不传 `run_id` 则全量），未读计数归零。
-- **Cron 任务新增/编辑**走表单（不允许直接写 cron 表达式原文，必须经前端校验）。
-- **手动触发**：`POST /api/cron/jobs/{job_name}/run`，立即返回 `run_id`；执行结果不注入聊天 Session，由「Cron 消息中心」展示。
+- `App.tsx` 每 60s 调 `getUnreadCount()` → `cronUnreadCount` → `SessionList` 入口按钮 + `CronSchedule` 顶栏「执行记录」按钮均显示同源红点
+- `CronMessageCenter` 内部维护本地 `unreadCount`（从 `runs` 派生）；进入面板**不**自动 mark-read
+
+### 6.4 关键不变量
+
+- **进入「执行记录」不做全量隐式标已读**：仅打开面板时不触发 mark-read
+- **仅终态未读 run 展开即标记该条已读（running 除外）**：点击未读终态 run 卡片展开时调用 `POST /api/cron/runs/mark-read?run_id=...`，红点即时消失并刷新未读计数；running 记录不触发标记
+- **保留显式全量入口**：`CronMessageCenter` 顶部「全部标已读」按钮 → `POST /api/cron/runs/mark-read`（不传 `run_id` = 全量）；按钮在 `unreadCount === 0` 时 disabled
+- **未读红点判定**：`!run.is_read`（含 success/failed/cancelled 等所有终态），不再排除 failed
+- **执行记录排序**：按日期分组（`今天`/`昨天`/`M月D日`），组内 `failed && unread` 优先，其次 `started_at desc`
+- **日期分组时区口径一致**：分组 key 与 `今天/昨天` 判断都按浏览器本地时区计算，避免 UTC 基准导致错标
+- **日期分组标题不吸顶**：日期行作为普通分组标题展示，随列表自然滚动
+- **WeekAgenda 是时间轴日历**：左侧固定 56px 时间轴（00:00–23:00，每小时 40px）；任务按 `HH:MM` absolute 定位到对应小时格
+- **WeekAgenda 任务色统一**：启用态 = 柔和米橘色块（`bg-amber-100/70` + `border-amber-400`）；disabled = `bg-claude-surface` 灰调；不再用 6 色区分任务
+- **WeekAgenda 全周仅一个选中**：点击任意事件块则选中，不同事件互斥；hover 事件块也会临时浮出工具条
+- **WeekAgenda 点击外部自动收起**：选中后，点击事件块/浮出工具条以外任意区域会自动取消选中
+- **WeekAgenda 事件条信息结构**：每条固定展示「时间 + 标题」两行，状态反馈由运行按钮与执行记录承载
+- **WeekAgenda 展示与管理分层**：周视图展示启用任务，暂停任务在列表视图提供启用/编辑/删除管理入口
+- **WeekAgenda 浮出工具条仅一个图标**：只保留 `运行任务`；暂停/启用统一在列表视图管理，事件块保持安静
+- **ScheduleList 密排阈值**：按当前筛选/搜索结果数判定；`filteredTasks.length >= 10` 切表格，< 10 保持卡片
+- **ScheduleList 默认排序**：按 `cronTime(HH:MM)` 升序；无法提取固定时间（如 interval）的任务排在最后，再按任务名升序兜底
+- **ScheduleList 顶栏能力**：提供 `全部/启用中/已暂停/最近失败` 筛选、任务名/cron 搜索与总览统计（总数/启用/暂停/失败）
+- **ScheduleList 空态语义**：仅在 `tasks.length === 0` 时显示「暂无日程」；筛选/搜索无匹配时显示「未找到匹配任务」并提供「清空筛选与搜索」
+- **ScheduleList 仅就地操作**：卡片与表格行不支持点击进入详情页；操作统一在行内按钮与菜单完成
+- **ScheduleList 主次操作分离**：主操作为 `执行` + `启用/暂停 Switch`；次操作仅保留（编辑/删除）并收纳至 `更多操作` 菜单
+- **ScheduleList 菜单收起规则**：点击菜单外任意区域时，`更多操作` 菜单自动收起
+- **ScheduleList 信息层级压缩**：meta 行只展示频率与状态，不展示上次/下次执行时间（避免预览时间抖动）
+- **启停切换必须可点击**：仅 `ScheduleList` 状态按钮可触发 `PUT /api/cron/jobs/{name}`（仅传 `enabled`），成功后本地状态即时更新；`WeekAgenda` 不提供启停入口
+- **启停切换默认静默成功**：不弹成功提示条（避免频繁操作噪音）；失败时才展示错误提示
+- **手动执行反馈策略**：点击执行后通过行内按钮状态反馈进度与结果，失败时展示错误提示
+- **WeekAgenda 运行反馈需动态可见**：点击「运行任务」后，运行按钮进入 `aria-busy=true` 状态并显示旋转加载图标；该动画不依赖 hover，鼠标移开后仍持续，直至任务退出 running
+- **Cron 任务新增/编辑**走 `TaskFormDrawer`：表单产出 `schedule` JSON，后端 `schedule_to_cron()` 双写 `cron_expr`；前端**不展示 cron 表达式原文**给用户编辑
+- **TaskFormDrawer 字段最小化**：仅保留「任务名 / 任务内容 / 执行时间 / 启用」；不再区分显示名与执行内容，不显示摘要与未来执行预览
+- **TaskFormDrawer 编辑回填**：编辑时「任务内容」优先回填 `content`；若 `content` 为空（兼容老数据）则回填 `description`，确保用户可直接在原内容上修改
+- **编辑老数据**（`schedule == null` 而 `cron_expr != null`）：表单中时间区域只读展示 `cron_expr`，需要点「重新选择」才能进入 `SchedulePicker`
+- **手动触发**：`POST /api/cron/jobs/{job_name}/run`，立即返回 `run_id`；执行结果不注入聊天 Session，由「执行记录」展示
 
 ## 7. FilePreview（模态弹窗，非抽屉）
 
@@ -200,7 +239,26 @@ useEffect(() => {
 - [ ] 抽屉打开时聊天区宽度不变（不触发 reflow）
 - [ ] session 切换后 ArtifactsPanel 回到根目录
 - [ ] AgentConfig 未保存修改时关闭面板有确认提示
-- [ ] CronMessageCenter 打开后未读红点消失
+- [ ] CronSchedule 顶栏显示日历/列表 segmented switcher，无「消息中心」tab
+- [ ] WeekAgenda 呈现为时间轴日历：左侧 00–23 时间轴 + 7 列，任务按时间 absolute 定位；任务色块统一柔和米橘色，disabled 灰调
+- [ ] WeekAgenda 点击事件块或 hover 才浮出工具条（仅运行图标）
+- [ ] WeekAgenda 事件条固定展示时间与标题两行，状态反馈由运行按钮/执行记录承载
+- [ ] WeekAgenda 选中后点击事件块/工具条外区域会自动取消选中
+- [ ] WeekAgenda 浮出工具条仅保留运行图标，aria-label 语义正确
+- [ ] 暂停任务不出现在周视图日历列；切到列表视图仍可看到并执行启用/编辑/删除
+- [ ] ScheduleList 当前筛选结果数 < 10 为卡片、≥ 10 为表格（`data-testid=schedule-list-table` 可检测）
+- [ ] ScheduleList 顶栏包含筛选、搜索、统计，筛选与搜索可叠加生效
+- [ ] ScheduleList 筛选/搜索无匹配时显示「未找到匹配任务」+「清空筛选与搜索」；仅真正无任务时显示「暂无日程」
+- [ ] ScheduleList 行点击不会进入详情页；点击按钮区仅触发行内操作
+- [ ] ScheduleList 主操作为「执行 + Switch」，次操作在「更多操作」菜单可访问（编辑/删除）且点击菜单外区域会自动收起
+- [ ] ScheduleList meta 行不展示上次/下次执行时间，仅保留频率与状态信息
+- [ ] 在列表视图点击「暂停/启用」会触发 `PUT /api/cron/jobs/{name}`，并立即反映新状态（周视图无启停入口）
+- [ ] 点击执行后通过行内按钮状态反馈执行进度与结果；失败时展示提示
+- [ ] 周视图点击「运行任务」后，按钮进入 `aria-busy=true` 且图标旋转；鼠标移开后动画持续直到任务结束
+- [ ] TaskFormDrawer 仅展示「任务名 / 任务内容 / 执行时间 / 启用」，不展示「显示名 / 摘要 / 未来 5 次执行」
+- [ ] 进入「执行记录」面板不自动清未读；展开未读终态 run 卡片触发单条标已读，running 记录不触发
+- [ ] 「全部标已读」按钮在有未读时可点击、点击后红点归零；无未读时 disabled
+- [ ] failed 状态的未读 run 卡片显示红点
 - [ ] 面板打开左侧栏自动折叠（AgentConfig/Skills/Cron），ArtifactsPanel 打开不折叠
 
 ## 9. 已知易错点

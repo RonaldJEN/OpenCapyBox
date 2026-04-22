@@ -35,4 +35,48 @@ describe('ChatInput drag/drop behavior', () => {
     expect(onInputDropHandled).toHaveBeenCalledTimes(1);
     expect(onParentDrop).not.toHaveBeenCalled();
   });
+
+  it('clearing long text should hide textarea scrollbar and reset scrollTop', () => {
+    const { rerender } = render(
+      <ChatInput
+        value=""
+        onChange={() => {}}
+        onSend={() => {}}
+      />
+    );
+
+    const textarea = screen.getByPlaceholderText('输入消息...') as HTMLTextAreaElement;
+    let mockScrollHeight = 360;
+
+    Object.defineProperty(textarea, 'scrollHeight', {
+      configurable: true,
+      get: () => mockScrollHeight,
+    });
+
+    rerender(
+      <ChatInput
+        value={'x'.repeat(600)}
+        onChange={() => {}}
+        onSend={() => {}}
+      />
+    );
+
+    expect(textarea.style.height).toBe('200px');
+    expect(textarea.style.overflowY).toBe('auto');
+
+    textarea.scrollTop = 140;
+    mockScrollHeight = 42;
+
+    rerender(
+      <ChatInput
+        value=""
+        onChange={() => {}}
+        onSend={() => {}}
+      />
+    );
+
+    expect(textarea.style.height).toBe('42px');
+    expect(textarea.style.overflowY).toBe('hidden');
+    expect(textarea.scrollTop).toBe(0);
+  });
 });

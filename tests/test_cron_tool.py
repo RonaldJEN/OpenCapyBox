@@ -9,7 +9,7 @@
 - cron 表达式校验
 """
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 # ============== 模块级 Fixtures ==============
@@ -131,21 +131,25 @@ class TestManageCronToolRemove:
 
     @pytest.mark.asyncio
     async def test_remove_success(self, tool_and_db):
-        tool, mock_db = tool_and_db
-        mock_job = MagicMock()
-        mock_db.query.return_value.filter.return_value.first.return_value = mock_job
+        tool, _ = tool_and_db
 
-        result = await tool.execute(action="remove", name="daily_greeting")
+        with patch("src.api.services.cron_service.CronService") as svc_cls:
+            svc = svc_cls.return_value
+            result = await tool.execute(action="remove", name="daily_greeting")
 
         assert result.success is True
-        mock_db.delete.assert_called_once_with(mock_job)
+        svc.delete_job.assert_called_once_with("test-user", "daily_greeting")
 
     @pytest.mark.asyncio
     async def test_remove_not_found(self, tool_and_db):
-        tool, mock_db = tool_and_db
-        mock_db.query.return_value.filter.return_value.first.return_value = None
+        tool, _ = tool_and_db
+        from src.api.services.cron_service import CronJobNotFoundError
 
-        result = await tool.execute(action="remove", name="nonexistent")
+        with patch("src.api.services.cron_service.CronService") as svc_cls:
+            svc = svc_cls.return_value
+            svc.delete_job.side_effect = CronJobNotFoundError("任务 'nonexistent' 不存在")
+            result = await tool.execute(action="remove", name="nonexistent")
+
         assert result.success is False
         assert "不存在" in result.error
 
@@ -201,40 +205,73 @@ class TestManageCronToolToggle:
 
     @pytest.mark.asyncio
     async def test_toggle_enable(self, tool_and_db):
-        tool, mock_db = tool_and_db
-        mock_job = MagicMock()
-        mock_job.enabled = False
-        mock_job.cron_expr = "0 9 * * *"
-        mock_db.query.return_value.filter.return_value.first.return_value = mock_job
+        tool, _ = tool_and_db
 
-        result = await tool.execute(action="toggle", name="test_job")
+        task = MagicMock()
+        task.name = "test_job"
+        task.enabled = False
+        updated = MagicMock()
+        updated.enabled = True
+
+        with patch("src.api.services.cron_service.CronService") as svc_cls:
+            svc = svc_cls.return_value
+            svc.get_jobs.return_value = [task]
+            svc.update_job.return_value = updated
+            result = await tool.execute(action="toggle", name="test_job")
 
         assert result.success is True
-        assert mock_job.enabled is True
+        svc.update_job.assert_called_once_with("test-user", "test_job", enabled=True)
         assert "启用" in result.content
 
     @pytest.mark.asyncio
     async def test_toggle_disable(self, tool_and_db):
-        tool, mock_db = tool_and_db
-        mock_job = MagicMock()
-        mock_job.enabled = True
-        mock_job.cron_expr = "0 9 * * *"
-        mock_db.query.return_value.filter.return_value.first.return_value = mock_job
+        tool, _ = tool_and_db
 
-        result = await tool.execute(action="toggle", name="test_job")
+        task = MagicMock()
+        task.name = "test_job"
+        task.enabled = True
+        updated = MagicMock()
+        updated.enabled = False
+
+        with patch("src.api.services.cron_service.CronService") as svc_cls:
+            svc = svc_cls.return_value
+            svc.get_jobs.return_value = [task]
+            svc.update_job.return_value = updated
+            result = await tool.execute(action="toggle", name="test_job")
 
         assert result.success is True
-        assert mock_job.enabled is False
+        svc.update_job.assert_called_once_with("test-user", "test_job", enabled=False)
         assert "暂停" in result.content
 
     @pytest.mark.asyncio
     async def test_toggle_not_found(self, tool_and_db):
-        tool, mock_db = tool_and_db
-        mock_db.query.return_value.filter.return_value.first.return_value = None
+        tool, _ = tool_and_db
 
-        result = await tool.execute(action="toggle", name="nonexistent")
+        with patch("src.api.services.cron_service.CronService") as svc_cls:
+            svc = svc_cls.return_value
+            svc.get_jobs.return_value = []
+            result = await tool.execute(action="toggle", name="nonexistent")
+
         assert result.success is False
         assert "不存在" in result.error
+
+    @pytest.mark.asyncio
+    async def test_toggle_busy_error(self, tool_and_db):
+        tool, _ = tool_and_db
+        from src.api.services.cron_service import CronJobBusyError
+
+        task = MagicMock()
+        task.name = "test_job"
+        task.enabled = True
+
+        with patch("src.api.services.cron_service.CronService") as svc_cls:
+            svc = svc_cls.return_value
+            svc.get_jobs.return_value = [task]
+            svc.update_job.side_effect = CronJobBusyError("数据库繁忙，请稍后重试")
+            result = await tool.execute(action="toggle", name="test_job")
+
+        assert result.success is False
+        assert "数据库繁忙" in result.error
 
 
 class TestManageCronToolHistory:
@@ -301,6 +338,14 @@ class TestManageCronToolSchema:
         schema = tool.to_openai_schema()
         assert schema["type"] == "function"
         assert schema["function"]["name"] == "manage_cron"
+
+    def test_description_uses_monday_first_day_of_week(self):
+        from src.agent.tools.cron_tool import ManageCronTool
+
+        tool = ManageCronTool(db_session_factory=MagicMock(), user_id="test")
+        desc = tool.description
+        assert "0=Mon..6=Sun" in desc
+        assert "'0 9 * * 0' (Monday 9am)" in desc
 
     @pytest.mark.asyncio
     async def test_unknown_action(self):

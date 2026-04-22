@@ -2,13 +2,14 @@
 
 ## 1. 模块职责边界
 
-- Cron 作业定义与管理
+- Cron 作业定义与管理（CRUD：HTTP 表单与 Agent 工具共用）
+- 结构化时间配置（`schedule`）↔ cron 表达式（`cron_expr`）转换
 - 定时调度与执行（去中心化 worker）
 - 执行历史查询与分页
 - 手动触发
-- 未读计数与已读标记（消息中心）
+- 未读计数与显式已读标记（消息中心）
 - 执行产物（artifacts）查看与下载
-- 不负责：作业编辑 UI、复杂调度策略（仅 5-field cron）
+- 不负责：复杂调度策略（仅 5-field cron）
 
 ## 2. 数据模型
 
@@ -19,13 +20,27 @@
 | id | Integer | PK, autoincrement |
 | user_id | String(100) | NOT NULL, indexed |
 | name | String(100) | NOT NULL |
-| cron_expr | String(50) | NOT NULL |
-| description | Text | default="" |
+| cron_expr | String(50) | NOT NULL。所有调度/匹配以此字段为准 |
+| schedule | Text | nullable。结构化时间配置的 JSON 源事实（仅用于表单回显）。老数据/Agent 工具创建的作业可为 NULL |
+| description | Text | default=""（列表显示名） |
+| content | Text | NOT NULL default=""（传给 Agent 的执行提示词）。老数据为空时 runner 回退到 description |
 | enabled | Boolean | default=True, NOT NULL |
 | created_at | DateTime | default=now |
 | updated_at | DateTime | default=now, onupdate=now |
 
 UniqueConstraint: (user_id, name)
+
+**`schedule` 字段语义**：后端不反解析 `cron_expr` 来推导 `schedule`。存在以下三种状态：
+- `schedule != null`：表单创建/修改 → 后端 `schedule_to_cron()` 双写 `cron_expr`。编辑时前端读 `schedule` 回显 SchedulePicker。
+- `schedule == null` 且 `cron_expr != null`：Agent 工具 / 老数据 创建的作业。前端编辑时只读展示 `cron_expr`，需明示点“重新选择”才能进入 SchedulePicker。
+- 两者均为 null：非法状态，创建/修改必须被后端拒绝（400）。
+
+**`schedule` JSON 结构列5 种 kind**（完整定义见 `src/api/services/cron_schedule.py`）：
+- `{kind: "daily", time: "HH:MM"}`
+- `{kind: "weekdays", time: "HH:MM"}` —— 映射到 `day_of_week=0-4`（周一到周五）
+- `{kind: "weekly", time: "HH:MM", days: number[]}` —— 0=周一 .. 6=周日（与 APScheduler `day_of_week` 一致）
+- `{kind: "monthly", time: "HH:MM", dayOfMonth: 1–31}`
+- `{kind: "interval", everyMinutes?: 1–59} 或 {everyHours?: 1–23}`（二选一）
 
 ### cron_fires 表 (去重表)
 
@@ -60,7 +75,36 @@ All require Bearer auth.
 
 ### GET /api/cron/jobs
 
-- Response 200: `{jobs: [{id, user_id, name, cron_expr, description, enabled, created_at, updated_at}]}`
+- Response 200: `{jobs: [{id, name, cron_expr, schedule, description, content, enabled}]}`
+  - `schedule` 为老数据时为 `null`；后端不反解析 `cron_expr`。
+
+### POST /api/cron/jobs
+
+- Body: `{name (1-100, [A-Za-z0-9_-]), description? (<=500), content? (<=8000), schedule?, cron_expr?, enabled?: bool=true}`
+  - `schedule` 与 `cron_expr` 二选一（`schedule` 优先）；两者都未提供 → 400。
+  - `cron_expr` 必须是 5 字段标准 cron；不是 → 400。
+  - 重名 → 400。
+- Response 201: `{job: <同上表项>}`
+- Error 400 (校验失败), 503 (SQLite 写锁冲突，建议重试)
+
+### PUT /api/cron/jobs/{name}
+
+- Body: `{description? (<=500), content? (<=8000), schedule?, cron_expr?, enabled?}` —— 所有字段可选，省略则保持原值；`name` 不可改。
+- `schedule` / `cron_expr` 同斶传入 → 以 `schedule` 为准；两者均不传 → 时间不变。
+- Response 200: `{job: ...}`
+- Error 404 (任务不存在), 400 (其他校验失败), 503 (SQLite 写锁冲突，建议重试)
+
+### DELETE /api/cron/jobs/{name}
+
+- Response 204 (空 body)。历史 `cron_job_runs` 保留；`cron_fires` 允许级联清理（按 `job_id` 删除），以保证删除可用。
+- Error 404, 503 (SQLite 写锁冲突，建议重试)
+
+### POST /api/cron/jobs/preview
+
+- Body: `{schedule?, cron_expr?, n?: 1-20=5}` —— 二选一。
+- Response 200: `{cron_expr: str, next_fires: ISO datetime[]}` —— 本地时区 naive datetime。
+- 仅鉴权，不读/写任何以 user_id 为维度的数据。
+- Error 400 (未提供 / 同时提供 / schedule 非法 / cron 表达式非法)
 
 ### GET /api/cron/runs
 
@@ -163,6 +207,13 @@ All require Bearer auth.
 - 两者竞争同一个 per-user lock（同一 worker 进程内），实际表现为**串行执行**（先拿到锁的先跑）。
 - 跨 worker 触发的并发约束见下方「多 worker 并发模型」。
 
+### 作业删除语义
+
+- `DELETE /api/cron/jobs/{name}` 的目标是确保任务可删除：
+  - `cron_job_runs` 历史保留（消息中心仍可展示过往执行）
+  - `cron_fires` 允许按 `job_id` 级联清理（不影响历史展示）
+- 级联清理仅影响去重键历史，不改变 `cron_job_runs` 的可见性与统计。
+
 ### 多 worker 并发模型
 
 - `cron_fires` UNIQUE 约束保证：**同一 (job_id, scheduled_at) 在所有 worker 中只会被执行一次**。
@@ -212,6 +263,7 @@ All require Bearer auth.
 - Agent 执行异常 → run failed, output 记录错误信息
 - Artifact 扫描失败 → 降级（最终只返回路径）
 - SQLite busy → 本分钟调度丢失（不重试同分钟，cron_fires 键不变时无法重新抢占）；下一次 cron 命中恢复正常
+- CRUD 写接口遇到 SQLite `database is locked|busy` → 返回 503（瞬时冲突，调用方重试）
 - 调度快照期间 job 被删除/禁用 → `_run_by_id` 二次校验 skip
 
 ## 6. 可观测性
@@ -223,12 +275,12 @@ All require Bearer auth.
 
 ## 7. 非目标
 
-- 不做作业定义的 CRUD API（作业通过 Agent 工具管理，存 DB）
 - 不做秒级调度（最小粒度 = 1 分钟）
 - 不做作业依赖编排
 - 不做执行重试（失败即终态）
 - 不做分布式锁（依赖 SQLite UNIQUE 约束）
 - 不做执行日志实时流式输出
+- 不做 `cron_expr` 反解析 → `schedule`；老数据/工具创建的作业 `schedule=null`，前端只能读 `cron_expr` 只读展示。
 
 ## 8. 未来演进
 

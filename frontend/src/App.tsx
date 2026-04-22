@@ -145,7 +145,7 @@ function HomePage() {
           />
           <div
             className={`fixed top-0 right-0 bottom-0 bg-claude-bg border-l border-claude-border z-30 transition-transform duration-300 ease-out shadow-xl ${
-              activePanel === 'cron' ? 'w-[680px]' : 'w-[380px]'
+              activePanel === 'cron' ? 'w-[760px]' : 'w-[380px]'
             } ${
               activePanel ? 'translate-x-0' : 'translate-x-full'
             }`}

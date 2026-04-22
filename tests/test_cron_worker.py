@@ -355,6 +355,31 @@ class TestRunByIdRevalidation:
 
         assert calls == [("u1", "live-job")]
 
+    @pytest.mark.asyncio
+    async def test_run_by_id_rechecks_enabled_after_lock(self, monkeypatch):
+        """首次快照命中后，若等待锁期间任务被禁用，执行前应再次跳过。"""
+        calls = []
+
+        async def fake_run_cron_job(user_id, job_name, run_id):
+            calls.append((user_id, job_name, run_id))
+
+        monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
+
+        snapshots = [("u1", "race-job"), None]
+
+        def fake_load_snapshot_if_enabled(job_id):
+            return snapshots.pop(0)
+
+        monkeypatch.setattr(
+            cron_worker,
+            "_load_job_snapshot_if_enabled",
+            fake_load_snapshot_if_enabled,
+        )
+
+        await cron_worker._run_by_id(42, {}, "w1")
+
+        assert calls == []
+
 
 class TestCleanupOldFires:
     """_cleanup_old_fires 应按 max_age_days 清理 cron_fires 历史行。"""

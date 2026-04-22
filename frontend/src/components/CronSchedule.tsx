@@ -4,10 +4,15 @@ import {
   getCronRuns,
   triggerCronJob,
   getCronRunStatus,
+  deleteCronJob,
+  updateCronJob,
   type CronTask,
   type CronJobRun,
 } from '../services/configApi';
 import CronMessageCenter from './CronMessageCenter';
+import TaskFormDrawer from './cron/TaskFormDrawer';
+import WeekAgenda from './cron/WeekAgenda';
+import ScheduleList from './cron/ScheduleList';
 
 // ────────────────────────────────────────────
 // Helpers
@@ -60,17 +65,17 @@ export function cronToReadable(expr: string): string {
     if (hasDom && !hasMon && !hasDow) {
       return `每月${dom}日 ${timeStr}`;
     }
-    // M H * * 1-5 → 工作日
-    if (!hasDom && !hasMon && dow === '1-5') {
+    // M H * * 0-4 → 工作日（与 APScheduler: 0=周一..6=周日 对齐）
+    if (!hasDom && !hasMon && dow === '0-4') {
       return `工作日 ${timeStr}`;
     }
-    // M H * * 0,6 or 6,0 → 周末
-    if (!hasDom && !hasMon && (dow === '0,6' || dow === '6,0')) {
+    // M H * * 5,6 or 6,5 → 周末（周六/周日）
+    if (!hasDom && !hasMon && (dow === '5,6' || dow === '6,5')) {
       return `周末 ${timeStr}`;
     }
     // M H * * N,N,... → 每周多天
     if (!hasDom && !hasMon && hasDow) {
-      const dayNames = ['日', '一', '二', '三', '四', '五', '六'];
+      const dayNames = ['一', '二', '三', '四', '五', '六', '日'];
       if (!dow.includes('-') && !dow.includes('/')) {
         const dayList = dow.split(',').map((d) => dayNames[Number(d)] ?? d).join('、');
         return `每周${dayList} ${timeStr}`;
@@ -104,7 +109,11 @@ function taskVisibleOnDate(expr: string, date: Date): boolean {
   if (monSet && !monSet.has(date.getMonth() + 1)) return false;
   // day-of-week 检查
   const dowSet = parseCronField(dow);
-  if (dowSet && !dowSet.has(date.getDay())) return false;
+  if (dowSet) {
+    // 与 APScheduler 对齐：0=周一..6=周日
+    const dowMonFirst = (date.getDay() + 6) % 7;
+    if (!dowSet.has(dowMonFirst)) return false;
+  }
   return true;
 }
 
@@ -133,10 +142,6 @@ function getWeekDays(baseDate: Date): Date[] {
   return days;
 }
 
-function isSameDay(a: Date, b: Date): boolean {
-  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-}
-
 function formatDateRange(days: Date[]): string {
   if (days.length === 0) return '';
   const first = days[0];
@@ -149,248 +154,11 @@ function formatDateRange(days: Date[]): string {
   return `${y}年${m1}月${d1}日 - ${m2 !== m1 ? `${m2}月` : ''}${d2}日`;
 }
 
-const DAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
-const DAY_EN = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
-
 // ────────────────────────────────────────────
-// Task card colors (循环分配)
+// Legacy TaskCard / TaskDetailModal removed —
+// 使用 WeekAgenda / ScheduleList 替代。
+// status helpers / 主题色 / DAY_LABELS / isSameDay 已迁入对应子组件。
 // ────────────────────────────────────────────
-
-const CARD_THEMES = [
-  { bg: 'bg-amber-800/60', border: 'border-amber-700/40', text: 'text-amber-100' },
-  { bg: 'bg-emerald-800/50', border: 'border-emerald-700/40', text: 'text-emerald-100' },
-  { bg: 'bg-slate-600/50', border: 'border-slate-500/40', text: 'text-slate-100' },
-  { bg: 'bg-rose-800/50', border: 'border-rose-700/40', text: 'text-rose-100' },
-  { bg: 'bg-violet-800/50', border: 'border-violet-700/40', text: 'text-violet-100' },
-  { bg: 'bg-cyan-800/50', border: 'border-cyan-700/40', text: 'text-cyan-100' },
-];
-
-// ────────────────────────────────────────────
-// Status helpers
-// ────────────────────────────────────────────
-
-function statusLabel(s: string) {
-  switch (s) {
-    case 'success': return '执行成功';
-    case 'failed': return '执行失败';
-    case 'running': return '执行中';
-    default: return s;
-  }
-}
-
-function statusIcon(s: string) {
-  switch (s) {
-    case 'success': return '✓';
-    case 'failed': return '✕';
-    case 'running': return '⟳';
-    default: return '○';
-  }
-}
-
-function statusColor(s: string) {
-  switch (s) {
-    case 'success': return 'text-green-600';
-    case 'failed': return 'text-red-500';
-    case 'running': return 'text-yellow-500';
-    default: return 'text-claude-muted';
-  }
-}
-
-// ────────────────────────────────────────────
-// Sub-components
-// ────────────────────────────────────────────
-
-interface TaskCardProps {
-  task: CronTask;
-  themeIdx: number;
-  latestRun?: CronJobRun;
-  onClick: () => void;
-}
-
-const TaskCard: React.FC<TaskCardProps> = ({ task, themeIdx, latestRun, onClick }) => {
-  const theme = CARD_THEMES[themeIdx % CARD_THEMES.length];
-  const time = cronTime(task.cron_expr);
-  const runStatus = latestRun?.status;
-
-  return (
-    <button
-      onClick={onClick}
-      className={`w-full text-left px-2.5 py-2 rounded-lg border ${theme.bg} ${theme.border} ${theme.text} hover:opacity-90 transition-opacity cursor-pointer mb-1.5`}
-    >
-      <div className="font-medium text-xs truncate leading-tight">
-        {task.description || task.name}
-      </div>
-      <div className="flex items-center gap-1.5 mt-1 text-[10px] opacity-80">
-        {runStatus ? (
-          <span className="flex items-center gap-0.5">
-            <span className={statusColor(runStatus)}>{statusIcon(runStatus)}</span>
-            {statusLabel(runStatus)}
-          </span>
-        ) : (
-          <span className="flex items-center gap-0.5">
-            <span>⏳</span> 待执行
-          </span>
-        )}
-      </div>
-      <div className="flex items-center gap-1 mt-0.5 text-[10px] opacity-70">
-        <span>{time ? '⏰' : '🔄'}</span> {cronToReadable(task.cron_expr)}
-      </div>
-    </button>
-  );
-};
-
-interface TaskDetailModalProps {
-  task: CronTask;
-  runs: CronJobRun[];
-  latestRun?: CronJobRun;
-  onClose: () => void;
-  onTrigger: (name: string) => void;
-  triggering: boolean;
-}
-
-const TaskDetailModal: React.FC<TaskDetailModalProps> = ({ task, runs, latestRun, onClose, onTrigger, triggering }) => {
-  const [expandedRun, setExpandedRun] = useState<string | null>(null);
-  const [descExpanded, setDescExpanded] = useState(false);
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
-      {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/30" />
-      {/* Modal */}
-      <div
-        className="relative bg-claude-bg rounded-2xl shadow-2xl border border-claude-border w-[480px] max-h-[80vh] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-start justify-between px-6 pt-5 pb-3">
-          <h3 className="text-lg font-semibold text-claude-text leading-tight line-clamp-2" title={task.description || task.name}>
-            {task.description || task.name}
-          </h3>
-          <button
-            onClick={onClose}
-            className="p-1 rounded-lg hover:bg-claude-hover text-claude-muted ml-4 shrink-0"
-          >
-            ✕
-          </button>
-        </div>
-
-        {/* Info grid */}
-        <div className="px-6 pb-4 space-y-3 text-sm border-b border-claude-border">
-          <div className="flex">
-            <span className="w-24 text-claude-secondary shrink-0">状态</span>
-            <span className={`font-medium ${
-              !task.enabled ? 'text-claude-muted'
-                : latestRun ? statusColor(latestRun.status)
-                : 'text-claude-text'
-            }`}>
-              {!task.enabled ? '已暂停'
-                : latestRun ? `${statusIcon(latestRun.status)} ${statusLabel(latestRun.status)}`
-                : '待执行'}
-            </span>
-          </div>
-          <div className="flex">
-            <span className="w-24 text-claude-secondary shrink-0">频率</span>
-            <span className="text-claude-text">{cronToReadable(task.cron_expr)}</span>
-          </div>
-          <div className="flex">
-            <span className="w-24 text-claude-secondary shrink-0">Cron 表达式</span>
-            <code className="text-claude-text bg-claude-surface px-1.5 py-0.5 rounded text-xs">
-              {task.cron_expr}
-            </code>
-          </div>
-          {task.description && (
-            <div className="flex">
-              <span className="w-24 text-claude-secondary shrink-0">描述</span>
-              <div className="flex-1 min-w-0">
-                <span className={`text-claude-text break-words ${!descExpanded ? 'line-clamp-3' : ''}`}>
-                  {task.description}
-                </span>
-                {task.description.length > 80 && (
-                  <button
-                    onClick={() => setDescExpanded(!descExpanded)}
-                    className="text-xs text-claude-accent hover:underline mt-0.5 block"
-                  >
-                    {descExpanded ? '收起' : '展开'}
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Run history */}
-        <div className="flex-1 overflow-y-auto px-6 py-4">
-          <div className="flex items-center justify-between mb-3">
-            <h4 className="text-sm font-medium text-claude-text">执行历史</h4>
-            <button
-              onClick={() => onTrigger(task.name)}
-              disabled={triggering}
-              className="px-3 py-1 text-xs font-medium rounded-lg bg-claude-surface text-claude-accent hover:bg-claude-hover disabled:opacity-50 border border-claude-border"
-            >
-              {triggering ? '执行中...' : '手动执行'}
-            </button>
-          </div>
-
-          {runs.length === 0 ? (
-            <div className="text-center text-claude-muted py-6 text-sm">暂无执行记录</div>
-          ) : (
-            <div className="space-y-2">
-              {runs.map((run) => (
-                <div
-                  key={run.id}
-                  className="rounded-lg border border-claude-border overflow-hidden"
-                >
-                  <button
-                    onClick={() => setExpandedRun(expandedRun === run.id ? null : run.id)}
-                    className="w-full flex items-center justify-between px-3 py-2.5 hover:bg-claude-hover/50 transition-colors"
-                  >
-                    <div className="flex items-center gap-2 text-sm">
-                      <span className={`font-medium ${statusColor(run.status)}`}>
-                        {statusIcon(run.status)}
-                      </span>
-                      <span className="text-claude-text">{statusLabel(run.status)}</span>
-                    </div>
-                    <div className="flex items-center gap-2 text-xs text-claude-secondary">
-                      {run.started_at && (
-                        <span>{new Date(run.started_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
-                      )}
-                      <span className={`transition-transform ${expandedRun === run.id ? 'rotate-180' : ''}`}>▾</span>
-                    </div>
-                  </button>
-
-                  {expandedRun === run.id && (
-                    <div className="border-t border-claude-border px-3 py-2.5 bg-claude-surface/50">
-                      <div className="text-xs text-claude-secondary space-y-1">
-                        {run.started_at && <div>开始: {new Date(run.started_at).toLocaleString('zh-CN')}</div>}
-                        {run.completed_at && <div>结束: {new Date(run.completed_at).toLocaleString('zh-CN')}</div>}
-                        {run.cron_expr && <div>表达式: <code className="bg-claude-surface px-1 rounded">{run.cron_expr}</code></div>}
-                      </div>
-                      {run.output && (
-                        <pre className="mt-2 text-xs text-claude-text bg-claude-bg p-2.5 rounded-lg overflow-x-auto max-h-48 whitespace-pre-wrap break-words border border-claude-border">
-                          {run.output}
-                        </pre>
-                      )}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="px-6 py-3 border-t border-claude-border flex justify-end">
-          <button
-            onClick={onClose}
-            className="px-5 py-1.5 text-sm rounded-lg bg-claude-surface text-claude-text hover:bg-claude-hover border border-claude-border"
-          >
-            我知道了
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-};
 
 // ────────────────────────────────────────────
 // Main component
@@ -407,11 +175,12 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
   const [allRuns, setAllRuns] = useState<CronJobRun[]>([]);
   const [weekOffset, setWeekOffset] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [selectedTask, setSelectedTask] = useState<CronTask | null>(null);
-  const [taskRuns, setTaskRuns] = useState<CronJobRun[]>([]);
   const [triggeringSet, setTriggeringSet] = useState<Set<string>>(new Set());
-  const [tab, setTab] = useState<'calendar' | 'manage' | 'messages'>('calendar');
+  const [tab, setTab] = useState<'calendar' | 'manage'>('calendar');
+  const [showMessages, setShowMessages] = useState(false);
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  // 表单抽屉：null = 关闭；'new' = 新建；CronTask = 编辑
+  const [formMode, setFormMode] = useState<'new' | CronTask | null>(null);
 
   const today = useMemo(() => {
     const d = new Date();
@@ -436,7 +205,8 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
 
   // 每天应显示的任务
   const dayTasks = useMemo(() => {
-    return weekDays.map((day) => tasks.filter((t) => taskVisibleOnDate(t.cron_expr, day)));
+    // 日历视图只展示已启用任务；已暂停任务仍在列表视图中可见、可编辑、可启用。
+    return weekDays.map((day) => tasks.filter((t) => t.enabled && taskVisibleOnDate(t.cron_expr, day)));
   }, [weekDays, tasks]);
 
   // 每个任务最近一次运行
@@ -467,7 +237,14 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
 
   // 卸载守卫：轮询中检查，避免 setState on unmounted
   const mountedRef = useRef(true);
-  useEffect(() => () => { mountedRef.current = false; }, []);
+  useEffect(() => {
+    // React StrictMode(dev) 会额外执行一次 setup->cleanup->setup，
+    // 这里在 setup 里显式置 true，避免 cleanup 把 ref 留在 false 导致 finally 不清理。
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     loadData();
@@ -479,17 +256,6 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
     return () => clearTimeout(timer);
   }, [notice]);
 
-  // 点击任务卡片 → 加载该任务执行历史并打开弹窗
-  const handleOpenTask = useCallback(async (task: CronTask) => {
-    setSelectedTask(task);
-    try {
-      const resp = await getCronRuns(task.name, 20);
-      setTaskRuns(resp.runs);
-    } catch {
-      setTaskRuns([]);
-    }
-  }, []);
-
   const handleTrigger = useCallback(async (name: string) => {
     setTriggeringSet((prev) => new Set(prev).add(name));
     const clearTriggering = () => {
@@ -499,30 +265,24 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
     };
     try {
       const result = await triggerCronJob(name);
-      setNotice({ type: 'success', text: result.message || `任务 ${name} 已提交后台执行` });
 
-      // 轮询执行状态，直到完成或超时
+      // 轮询执行状态，直到退出 running。
       const runId = result.run_id;
-      const maxAttempts = 60; // 最多 60 次，约 2 分钟
-      let attempts = 0;
       const poll = async () => {
-        while (attempts < maxAttempts) {
+        while (true) {
           if (!mountedRef.current) return;
-          attempts++;
           await new Promise((r) => setTimeout(r, 2000));
           if (!mountedRef.current) return;
           try {
             const run = await getCronRunStatus(runId);
             if (run.status !== 'running') {
               if (!mountedRef.current) return;
-              // 执行完成，刷新数据
-              setNotice({
-                type: run.status === 'success' ? 'success' : 'error',
-                text: run.status === 'success' ? `任务 ${name} 执行成功` : `任务 ${name} 执行失败`,
-              });
-              const [runsResp, allResp] = await Promise.all([getCronRuns(name, 20), getCronRuns(undefined, 100)]);
+              // 执行完成后：成功静默，失败才提示。
+              if (run.status !== 'success') {
+                setNotice({ type: 'error', text: `任务 ${name} 执行失败` });
+              }
+              const allResp = await getCronRuns(undefined, 100);
               if (!mountedRef.current) return;
-              setTaskRuns(runsResp.runs);
               setAllRuns(allResp.runs);
               return;
             }
@@ -530,12 +290,6 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
             // 轮询失败不中断，继续重试
           }
         }
-        if (!mountedRef.current) return;
-        // 超时，仍然刷新一次
-        const [runsResp2, allResp2] = await Promise.all([getCronRuns(name, 20), getCronRuns(undefined, 100)]);
-        if (!mountedRef.current) return;
-        setTaskRuns(runsResp2.runs);
-        setAllRuns(allResp2.runs);
       };
       // 后台轮询，不阻塞 UI
       poll().finally(clearTriggering);
@@ -547,13 +301,47 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
     }
   }, []);
 
+  const handleDelete = useCallback(async (name: string) => {
+    if (!window.confirm(`确认删除任务「${name}」？历史执行记录会保留。`)) return;
+    try {
+      await deleteCronJob(name);
+      setNotice({ type: 'success', text: `已删除任务 ${name}` });
+      await loadData();
+    } catch (e) {
+      setNotice({ type: 'error', text: e instanceof Error ? e.message : '删除失败' });
+    }
+  }, [loadData]);
+
+  const [togglingSet, setTogglingSet] = useState<Set<string>>(new Set());
+  const handleToggleEnabled = useCallback(async (task: CronTask) => {
+    setTogglingSet((prev) => new Set(prev).add(task.name));
+    try {
+      const next = !task.enabled;
+      const updated = await updateCronJob(task.name, { enabled: next });
+      // 局部更新，避免全量重拉闪烁
+      setTasks((prev) => prev.map((t) => (t.name === task.name ? { ...t, enabled: updated.enabled } : t)));
+    } catch (e) {
+      setNotice({ type: 'error', text: e instanceof Error ? e.message : '状态切换失败' });
+    } finally {
+      if (mountedRef.current) {
+        setTogglingSet((prev) => { const n = new Set(prev); n.delete(task.name); return n; });
+      }
+    }
+  }, []);
+
+  const handleFormSaved = useCallback(async (saved: CronTask) => {
+    setFormMode(null);
+    setNotice({ type: 'success', text: `已保存任务 ${saved.name}` });
+    await loadData();
+  }, [loadData]);
+
   return (
-    <div className="flex flex-col h-full bg-claude-bg">
+    <div className="relative flex flex-col h-full bg-claude-bg">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-claude-border">
         <div className="flex items-center gap-3">
           <h2 className="text-lg font-semibold text-claude-text">日程</h2>
-          {/* Tab switch */}
+          {/* View switcher（去 messages tab，messages 改为顶栏按钮覆盖式弹出） */}
           <div className="flex text-sm">
             <button
               onClick={() => setTab('calendar')}
@@ -565,30 +353,36 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
             </button>
             <button
               onClick={() => setTab('manage')}
-              className={`px-3 py-1 border-y border-claude-border ${
+              className={`px-3 py-1 rounded-r-lg border border-l-0 border-claude-border ${
                 tab === 'manage' ? 'bg-claude-surface text-claude-text font-medium' : 'text-claude-secondary hover:bg-claude-hover'
               }`}
             >
-              日程管理
-            </button>
-            <button
-              onClick={() => setTab('messages')}
-              className={`relative px-3 py-1 rounded-r-lg border border-l-0 border-claude-border ${
-                tab === 'messages' ? 'bg-claude-surface text-claude-text font-medium' : 'text-claude-secondary hover:bg-claude-hover'
-              }`}
-            >
-              消息中心
-              {unreadCount > 0 && tab !== 'messages' && (
-                <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] flex items-center justify-center px-1 text-[10px] font-bold text-white bg-red-500 rounded-full">
-                  {unreadCount > 99 ? '99+' : unreadCount}
-                </span>
-              )}
+              列表
             </button>
           </div>
         </div>
-        {onClose && (
-          <button onClick={onClose} className="p-1 rounded hover:bg-claude-hover text-claude-muted">✕</button>
-        )}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setFormMode('new')}
+            className="px-2.5 py-1 text-xs rounded bg-claude-accent text-white hover:opacity-90"
+          >
+            + 新建任务
+          </button>
+          <button
+            onClick={() => setShowMessages(true)}
+            className="relative px-2.5 py-1 text-xs rounded border border-claude-border bg-claude-surface text-claude-text hover:bg-claude-hover"
+          >
+            执行记录
+            {unreadCount > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] flex items-center justify-center px-1 text-[10px] font-bold text-white bg-red-500 rounded-full">
+                {unreadCount > 99 ? '99+' : unreadCount}
+              </span>
+            )}
+          </button>
+          {onClose && (
+            <button onClick={onClose} className="p-1 rounded hover:bg-claude-hover text-claude-muted">✕</button>
+          )}
+        </div>
       </div>
 
       {notice && (
@@ -627,98 +421,57 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
             )}
           </div>
 
-          {/* Day columns */}
-          <div className="flex-1 grid grid-cols-7 divide-x divide-claude-border overflow-y-auto">
-            {weekDays.map((day, idx) => {
-              const isToday = isSameDay(day, today);
-              const tasksForDay = dayTasks[idx];
-              return (
-                <div key={idx} className={`flex flex-col min-h-0 ${isToday ? 'bg-claude-hover/30' : ''}`}>
-                  {/* Day header */}
-                  <div className={`px-2 py-2 text-center border-b border-claude-border ${isToday ? 'bg-claude-accent/10' : ''}`}>
-                    <div className="text-[10px] text-claude-muted leading-tight">
-                      {DAY_LABELS[idx]} / {DAY_EN[idx]}
-                    </div>
-                    <div className={`text-lg font-semibold leading-tight mt-0.5 ${
-                      isToday ? 'text-claude-accent' : 'text-claude-text'
-                    }`}>
-                      {day.getDate()}
-                    </div>
-                  </div>
-                  {/* Task cards */}
-                  <div className="flex-1 p-1.5 space-y-0 overflow-y-auto">
-                    {tasksForDay.map((task) => (
-                      <TaskCard
-                        key={task.name}
-                        task={task}
-                        themeIdx={taskThemeMap.get(task.name) ?? 0}
-                        latestRun={latestRunMap.get(task.name)}
-                        onClick={() => handleOpenTask(task)}
-                      />
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+          {/* Day columns (Agenda) */}
+          <WeekAgenda
+            weekDays={weekDays}
+            today={today}
+            dayTasks={dayTasks.map((tasksForDay) =>
+              tasksForDay.map((task) => ({ task, time: cronTime(task.cron_expr) })),
+            )}
+            taskThemeMap={taskThemeMap}
+            cronToReadable={cronToReadable}
+            onTrigger={handleTrigger}
+            triggeringSet={triggeringSet}
+          />
         </div>
       ) : tab === 'manage' ? (
         // ──── Manage View (任务列表) ────
-        <div className="flex-1 overflow-y-auto p-4 space-y-3">
-          {tasks.length === 0 ? (
-            <div className="text-center text-claude-muted py-8">
-              <p className="mb-2">暂无日程</p>
-              <p className="text-xs">让 Agent 使用 manage_cron 工具创建日程</p>
-            </div>
-          ) : (
-            tasks.map((task) => {
-              const latest = latestRunMap.get(task.name);
-              return (
-                <button
-                  key={task.name}
-                  onClick={() => handleOpenTask(task)}
-                  className="w-full text-left p-3 rounded-lg border border-claude-border hover:bg-claude-hover/50 transition-colors"
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium text-sm text-claude-text">{task.description || task.name}</span>
-                      <span className={`px-1.5 py-0.5 text-xs rounded ${
-                        task.enabled ? 'bg-green-100 text-green-700' : 'bg-claude-surface text-claude-muted'
-                      }`}>
-                        {task.enabled ? '启用' : '暂停'}
-                      </span>
-                    </div>
-                    {latest && (
-                      <span className={`text-xs ${statusColor(latest.status)}`}>
-                        {statusIcon(latest.status)} {statusLabel(latest.status)}
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-xs text-claude-secondary mt-1.5 flex items-center gap-3">
-                    <span>🔄 {cronToReadable(task.cron_expr)}</span>
-                    <code className="bg-claude-surface px-1 rounded">{task.cron_expr}</code>
-                    {task.name !== task.description && (
-                      <span className="text-claude-muted">{task.name}</span>
-                    )}
-                  </div>
-                </button>
-              );
-            })
-          )}
-        </div>
-      ) : tab === 'messages' ? (
-        <CronMessageCenter onUnreadChange={onUnreadChange} />
+        <ScheduleList
+          tasks={tasks}
+          latestRunMap={latestRunMap}
+          cronToReadable={cronToReadable}
+          cronTime={cronTime}
+          onEdit={(task) => setFormMode(task)}
+          onDelete={handleDelete}
+          onTrigger={handleTrigger}
+          onToggleEnabled={handleToggleEnabled}
+          triggeringSet={triggeringSet}
+          togglingSet={togglingSet}
+        />
       ) : null}
 
-      {/* Task detail modal */}
-      {selectedTask && (
-        <TaskDetailModal
-          task={selectedTask}
-          runs={taskRuns}
-          latestRun={latestRunMap.get(selectedTask.name)}
-          onClose={() => setSelectedTask(null)}
-          onTrigger={handleTrigger}
-          triggering={triggeringSet.has(selectedTask.name)}
+      {/* 执行记录覆盖式抽屉（顶栏按钮触发） */}
+      {showMessages && (
+        <div className="absolute inset-0 z-40 flex flex-col bg-claude-bg">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-claude-border">
+            <h3 className="text-base font-semibold text-claude-text">执行记录</h3>
+            <button
+              onClick={() => setShowMessages(false)}
+              className="px-2 py-1 text-xs rounded border border-claude-border bg-claude-surface text-claude-text hover:bg-claude-hover"
+            >
+              ← 返回日程
+            </button>
+          </div>
+          <CronMessageCenter onUnreadChange={onUnreadChange} />
+        </div>
+      )}
+
+      {/* Task form drawer (新建 / 编辑) */}
+      {formMode !== null && (
+        <TaskFormDrawer
+          task={formMode === 'new' ? null : formMode}
+          onClose={() => setFormMode(null)}
+          onSaved={handleFormSaved}
         />
       )}
     </div>

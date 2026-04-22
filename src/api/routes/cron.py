@@ -2,6 +2,10 @@
 
 提供 Cron 任务管理和执行历史查询：
 - GET /api/cron/jobs: 获取 CronJob 任务列表
+- POST /api/cron/jobs: 新建任务（schedule 优先于 cron_expr）
+- PUT /api/cron/jobs/{name}: 更新任务
+- DELETE /api/cron/jobs/{name}: 删除任务（保留历史 run）
+- POST /api/cron/jobs/preview: 预览未来 5 次执行时间
 - GET /api/cron/runs: 获取执行历史（分页）
 - GET /api/cron/runs/unread-count: 未读运行记录数
 - POST /api/cron/runs/mark-read: 批量标记已读
@@ -19,13 +23,20 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session as DBSession
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.api.models.database import get_db
 from src.api.deps import get_current_user, verify_access_token
-from src.api.services.cron_service import CronService
+from src.api.services.cron_schedule import ScheduleError, next_fire_at
+from src.api.services.cron_service import (
+    CronJobBusyError,
+    CronJobNotFoundError,
+    CronJobValidationError,
+    CronService,
+)
 from src.api.services.cron_worker import trigger_manual_run
 from src.api.utils.sandbox_helpers import extract_command_stdout
 from src.api.models.user_memory import CronJobRun
@@ -35,6 +46,55 @@ _bearer_optional = HTTPBearer(auto_error=False)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ────────────────────────── Pydantic schemas ──────────────────────────
+
+
+class CronJobCreate(BaseModel):
+    """新建 Cron 任务请求体。schedule 与 cron_expr 二选一（schedule 优先）。"""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field("", max_length=500)
+    content: str = Field("", max_length=8000)
+    schedule: dict | None = None
+    cron_expr: str | None = None
+    enabled: bool = True
+
+
+class CronJobUpdate(BaseModel):
+    """更新 Cron 任务请求体。所有字段可选，省略则不变；name 不可改。"""
+
+    description: str | None = Field(None, max_length=500)
+    content: str | None = Field(None, max_length=8000)
+    schedule: dict | None = None
+    cron_expr: str | None = None
+    enabled: bool | None = None
+
+
+class SchedulePreviewRequest(BaseModel):
+    """表单底部"未来 N 次执行预览"请求体。schedule / cron_expr 二选一。"""
+
+    schedule: dict | None = None
+    cron_expr: str | None = None
+    n: int = Field(5, ge=1, le=20)
+
+
+def _job_response(job: object) -> dict:
+    raw_schedule = getattr(job, "schedule", None)
+    if isinstance(raw_schedule, str):
+        schedule = json.loads(raw_schedule) if raw_schedule else None
+    else:
+        schedule = raw_schedule
+    return {
+        "id": getattr(job, "id", None),
+        "name": getattr(job, "name"),
+        "cron_expr": getattr(job, "cron_expr"),
+        "schedule": schedule,
+        "description": getattr(job, "description", "") or "",
+        "content": getattr(job, "content", "") or "",
+        "enabled": bool(getattr(job, "enabled", False)),
+    }
 
 
 @router.get("/jobs")
@@ -47,6 +107,104 @@ async def get_cron_jobs(
     tasks = svc.get_jobs(user_id)
     return {
         "jobs": [t.to_dict() for t in tasks],
+    }
+
+
+@router.post("/jobs", status_code=201)
+async def create_cron_job(
+    payload: CronJobCreate,
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """新建 Cron 任务。schedule 与 cron_expr 二选一（schedule 优先）。"""
+    svc = CronService(db)
+    try:
+        job = svc.create_job(
+            user_id,
+            name=payload.name,
+            description=payload.description,
+            content=payload.content,
+            schedule=payload.schedule,
+            cron_expr=payload.cron_expr,
+            enabled=payload.enabled,
+        )
+    except CronJobValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except CronJobBusyError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"job": _job_response(job)}
+
+
+@router.put("/jobs/{name}")
+async def update_cron_job(
+    name: str,
+    payload: CronJobUpdate,
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """更新 Cron 任务。任意字段可选；schedule/cron_expr 二选一。"""
+    svc = CronService(db)
+    try:
+        job = svc.update_job(
+            user_id,
+            name,
+            description=payload.description,
+            content=payload.content,
+            schedule=payload.schedule,
+            cron_expr=payload.cron_expr,
+            enabled=payload.enabled,
+        )
+    except CronJobNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except CronJobValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except CronJobBusyError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"job": _job_response(job)}
+
+
+@router.delete("/jobs/{name}", status_code=204)
+async def delete_cron_job(
+    name: str,
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """删除 Cron 任务。保留 CronJobRun 历史；CronFire 去重记录按 job_id 清理。"""
+    svc = CronService(db)
+    try:
+        svc.delete_job(user_id, name)
+    except CronJobNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except CronJobBusyError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return Response(status_code=204)
+
+
+@router.post("/jobs/preview")
+async def preview_schedule(
+    payload: SchedulePreviewRequest,
+    user_id: str = Depends(get_current_user),  # 仅鉴权，不读 user 数据
+):
+    """计算 schedule / cron_expr 接下来 N 次触发时间（本地时区 ISO 字符串）。"""
+    from src.api.services.cron_schedule import schedule_to_cron
+
+    try:
+        has_schedule = payload.schedule is not None
+        has_cron_expr = bool(payload.cron_expr and payload.cron_expr.strip())
+        if has_schedule and has_cron_expr:
+            raise HTTPException(status_code=400, detail="schedule 与 cron_expr 不能同时提供")
+        if has_schedule:
+            expr = schedule_to_cron(payload.schedule)
+        elif has_cron_expr:
+            expr = payload.cron_expr.strip()
+        else:
+            raise HTTPException(status_code=400, detail="必须提供 schedule 或 cron_expr")
+        fires = next_fire_at(expr, n=payload.n)
+    except ScheduleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "cron_expr": expr,
+        "next_fires": [t.isoformat() for t in fires],
     }
 
 
@@ -284,8 +442,9 @@ async def trigger_job(
 ):
     """手动触发指定的 Cron 任务。
 
-    所有执行必须走 cron_worker.trigger_manual_run，以共享 worker 的
-    per-user 串行锁，避免与同分钟自动调度并发运行同一作业。
+    所有执行必须走 cron_worker.trigger_manual_run，以共享 worker 内部的
+    per-user 串行锁。注意该串行锁是进程内语义：单 worker 严格串行，
+    多 worker 部署下同一用户任务仍可能并行（与 cron spec 一致）。
     """
     from src.api.models.cron_job import CronJob
 

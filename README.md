@@ -175,6 +175,8 @@ Task list + execution history, manual trigger and status tracking support.
 
 ![Cron Dashboard](docs/Capy-project-md/screenshots/定时任务看板.png)
 
+![Cron Dashboard](docs/Capy-project-md/screenshots/定时任务列表.png)
+
 ### File Panel
 
 Browse sandbox files, preview and download Agent-generated artifacts.

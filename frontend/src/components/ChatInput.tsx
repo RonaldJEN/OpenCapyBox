@@ -3,6 +3,8 @@ import { ArrowUp, Loader2, Paperclip, Square, X } from 'lucide-react';
 import { FileInfo } from '../types';
 import { getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, isImageFile } from '../utils/fileUtils';
 
+const MAX_TEXTAREA_HEIGHT = 200;
+
 interface ChatInputProps {
   /** 当前输入文本 */
   value: string;
@@ -57,9 +59,17 @@ export function ChatInput({
 
   // 自动调整 textarea 高度
   useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-      textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = 'auto';
+    const scrollHeight = textarea.scrollHeight;
+    const hasOverflow = scrollHeight > MAX_TEXTAREA_HEIGHT;
+    textarea.style.height = `${Math.min(scrollHeight, MAX_TEXTAREA_HEIGHT)}px`;
+    textarea.style.overflowY = hasOverflow ? 'auto' : 'hidden';
+
+    if (!hasOverflow) {
+      textarea.scrollTop = 0;
     }
   }, [value]);
 

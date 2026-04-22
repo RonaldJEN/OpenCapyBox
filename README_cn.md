@@ -175,6 +175,8 @@ OpenCapyBox 支持通过 [MCP（Model Context Protocol）](https://modelcontextp
 
 ![定时任务看板](docs/Capy-project-md/screenshots/定时任务看板.png)
 
+![Cron Dashboard](docs/Capy-project-md/screenshots/定时任务列表.png)
+
 ### 文件面板
 
 沙箱内文件一览，支持预览和下载 Agent 生成的产出物。

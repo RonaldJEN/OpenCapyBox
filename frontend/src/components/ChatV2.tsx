@@ -149,7 +149,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const prevRoundsLengthRef = useRef<number>(0);
   const isInitialLoadRef = useRef<boolean>(true); // 🆕 标记是否是首次加载
   const subscriptionAbortRef = useRef<(() => void) | null>(null); // 🆕 保存订阅取消函数
-  const stoppingRef = useRef(false); // handleStop 正在执行，防止 SSE 回调竞态覆盖
+  const stopRequestPendingRef = useRef(false); // 防止重复点击导致并发 abort 请求
   const sessionIdRef = useRef(sessionId); // 追踪当前会话，防止旧 SSE 回调污染新会话状态
   const scrollPosBySessionRef = useRef<Record<string, number>>({});
   const pendingRestoreScrollRef = useRef<number | null>(null);
@@ -649,8 +649,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
             if (isUserCancelled) {
               setPendingInterrupt(null);
             }
-            // handleStop 已接管 UI 状态更新，此处跳过避免竞态覆盖
-            if (stoppingRef.current) return;
             setSending(false);
             onExecutionEnd?.(sessionId);
             subscriptionAbortRef.current = null;
@@ -676,7 +674,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
                   : round
               )
             );
-            if (stoppingRef.current) return;
             setSending(false);
             onExecutionEnd?.(sessionId);
             subscriptionAbortRef.current = null;
@@ -701,7 +698,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
             onExecutionEnd?.(sessionId);
             return;
           }
-          if (stoppingRef.current) return;
           setSending(false);
           onExecutionEnd?.(sessionId);
           subscriptionAbortRef.current = null;
@@ -1372,9 +1368,9 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         currentRunId = runId;
       },
       updateLastStep,
-      setBusyFalse: () => { if (!stoppingRef.current) setSending(false); },
-      onStreamSuccess: () => { if (!stoppingRef.current) onExecutionEnd?.(sessionId); },
-      onStreamError: () => { if (!stoppingRef.current) onExecutionEnd?.(sessionId); },
+      setBusyFalse: () => { setSending(false); },
+      onStreamSuccess: () => { onExecutionEnd?.(sessionId); },
+      onStreamError: () => { onExecutionEnd?.(sessionId); },
       notifyExecutionStart: () => onExecutionStart?.(targetSessionId),
       boundSessionId: targetSessionId,
       shouldRefreshTitleOnFirstRound: true,
@@ -1406,59 +1402,18 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   /** 当前发送按钮的 loading 文案（空 = 非 loading） */
   const sendingLabel = creatingSession ? '创建中' : resuming ? 'Resuming' : sending ? 'Running' : '';
 
-  /** 停止生成：调用后端 abort API，立即更新 UI 状态（不等 SSE 推送 RUN_FINISHED） */
+  /** 停止生成：仅发送后端 abort 请求，等待后端终态事件再收敛 UI。 */
   const handleStop = async () => {
-    if (!sessionId || !(sending || resuming)) return;
-    stoppingRef.current = true;
+    if (!sessionId || !(sending || resuming) || stopRequestPendingRef.current) return;
+    stopRequestPendingRef.current = true;
     try {
-      try {
-        await apiService.abortChat(sessionId);
-      } catch (err) {
-        // abort 请求失败（网络错误/服务端异常），后端任务可能仍在运行
-        // 保持当前 sending/resuming 状态，等待 SSE 推送终态
-        console.warn('Abort request failed, keeping running state:', err);
-        return;
-      }
-
-      // 先取消 SSE 订阅，确保后续不会有事件回调覆盖状态
-      if (subscriptionAbortRef.current) {
-        subscriptionAbortRef.current();
-        subscriptionAbortRef.current = null;
-      }
-
-      // 再更新 UI 状态
-      // 1. 标记当前运行中的 round 为 interrupted（与后端 cancel_token 路径一致）
-      setRounds((prev) =>
-        prev.map((round) =>
-          round.status === 'running'
-            ? {
-                ...round,
-                status: 'interrupted',
-                steps: round.steps.map((s) =>
-                  s.status === 'streaming' || s.status === 'running'
-                    ? { ...s, status: 'completed' as const }
-                    : s
-                ),
-              }
-            : round
-        )
-      );
-
-      // 2. 重置 agent 状态
-      setAgentState((prev) => ({ ...prev, status: 'completed', lastUpdated: Date.now() }));
-
-      // 3. 停止 sending / resuming，清理中断状态
-      setSending(false);
-      setResuming(false);
-      setPendingInterrupt(null);
-
-      // 4. 通知父组件执行结束
-      onExecutionEnd?.(sessionId);
+      await apiService.abortChat(sessionId);
+    } catch (err) {
+      // abort 请求失败（网络错误/服务端异常），后端任务可能仍在运行
+      // 保持当前 sending/resuming 状态，等待 SSE 推送终态
+      console.warn('Abort request failed, keeping running state:', err);
     } finally {
-      // 利用宏任务（macrotask）延迟释放 stopping 标记：
-      // 当前调用栈中的同步 setState 全部 enqueue 后，React 在微任务中 batch commit，
-      // setTimeout(fn, 0) 作为宏任务在微任务之后执行，确保 commit 完成后再放行 SSE 回调。
-      setTimeout(() => { stoppingRef.current = false; }, 0);
+      stopRequestPendingRef.current = false;
     }
   };
 
@@ -1518,10 +1473,9 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         currentResumeRunId = runId;
       },
       updateLastStep,
-      setBusyFalse: () => { if (!stoppingRef.current) setResuming(false); },
-      onStreamSuccess: () => { if (!stoppingRef.current) onExecutionEnd?.(sessionId); },
+      setBusyFalse: () => { setResuming(false); },
+      onStreamSuccess: () => { onExecutionEnd?.(sessionId); },
       onStreamError: () => {
-        if (stoppingRef.current) return;
         setPendingInterrupt(interruptSnapshot);
         onExecutionEnd?.(sessionId);
       },

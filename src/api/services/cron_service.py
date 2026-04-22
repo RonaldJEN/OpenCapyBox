@@ -1,43 +1,133 @@
 """Cron 服务 — DB 驱动 + 任务执行
 
 职责：
-- 从 CronJob DB 表管理定时任务定义
+- 从 CronJob DB 表管理定时任务定义（CRUD：HTTP 路由与 Agent 工具共用）
 - Runner：恢复用户沙箱 → 创建临时 Agent → 执行任务 → 写 CronJobRun
 
 注：调度由 `cron_worker` 去中心化执行（不再依赖 APScheduler 持久注册），
 本模块仅暴露 `parse_cron_fields` 与 `run_cron_job` 供 worker 调用。
 """
 
+import json
 import logging
+import re
 import shlex
 import uuid
+from contextlib import contextmanager
 
+from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import get_settings
+from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.user_memory import CronJobRun
 from src.api.models.user_sandbox import UserSandbox
-from src.api.utils.timezone import now_naive
+from src.api.services.cron_schedule import schedule_to_cron, ScheduleError
+from src.api.utils.timezone import get_timezone, now_naive
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# 任务名格式：字母数字 _ -，1-100 字符
+_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+
+
+class CronJobValidationError(ValueError):
+    """CronJob CRUD 校验错误（用于路由层映射 400）"""
+
+
+class CronJobNotFoundError(CronJobValidationError):
+    """CronJob 不存在（用于路由层映射 404）"""
+
+
+class CronJobBusyError(RuntimeError):
+    """SQLite 写冲突（database is locked/busy）。"""
+
+
+def _is_sqlite_busy_error(error: OperationalError) -> bool:
+    msg = str(error).lower()
+    return (
+        "database is locked" in msg
+        or "database table is locked" in msg
+        or "database is busy" in msg
+    )
+
+
+def _validate_name(name: str) -> str:
+    name = (name or "").strip()
+    if not _NAME_RE.match(name):
+        raise CronJobValidationError(
+            "任务名必须为 1-100 字符的字母/数字/下划线/连字符"
+        )
+    return name
+
+
+def _resolve_cron_expr(schedule: dict | None, cron_expr: str | None) -> tuple[str, str | None]:
+    """根据 schedule / cron_expr 输入决定最终存储值。
+
+    优先级：schedule 提供 → 由 schedule 派生 cron_expr，schedule_json 入库；
+    否则使用直传 cron_expr，schedule_json 为 None（Agent 工具走该路径）。
+    """
+    if schedule is not None:
+        try:
+            expr = schedule_to_cron(schedule)
+        except ScheduleError as e:
+            raise CronJobValidationError(str(e)) from e
+        return expr, json.dumps(schedule, ensure_ascii=False)
+    if not cron_expr or not cron_expr.strip():
+        raise CronJobValidationError("必须提供 schedule 或 cron_expr")
+    expr = cron_expr.strip()
+    parts = expr.split()
+    if len(parts) != 5:
+        raise CronJobValidationError(
+            f"cron 表达式必须是 5 个字段（分 时 日 月 周），当前 {len(parts)} 个: {cron_expr!r}"
+        )
+    try:
+        CronTrigger(
+            minute=parts[0],
+            hour=parts[1],
+            day=parts[2],
+            month=parts[3],
+            day_of_week=parts[4],
+            timezone=get_timezone(),
+        )
+    except Exception as e:
+        raise CronJobValidationError(f"cron 表达式解析失败: {expr!r}: {e}") from e
+    return expr, None
+
 
 class CronTask:
-    """Cron 任务数据对象"""
+    """Cron 任务数据对象（路由层序列化用）"""
 
-    def __init__(self, name: str, cron_expr: str, description: str, enabled: bool):
+    def __init__(
+        self,
+        name: str,
+        cron_expr: str,
+        description: str,
+        enabled: bool,
+        *,
+        schedule: dict | None = None,
+        content: str = "",
+        job_id: int | None = None,
+    ):
+        self.id = job_id
         self.name = name
         self.cron_expr = cron_expr
         self.description = description
         self.enabled = enabled
+        self.schedule = schedule
+        self.content = content
 
     def to_dict(self) -> dict:
         return {
+            "id": self.id,
             "name": self.name,
             "cron_expr": self.cron_expr,
+            "schedule": self.schedule,
             "description": self.description,
+            "content": self.content,
             "enabled": self.enabled,
         }
 
@@ -79,6 +169,17 @@ class CronService:
     def __init__(self, db: DBSession):
         self.db = db
 
+    @contextmanager
+    def _busy_guard(self):
+        """包裹写操作段：任何 OperationalError(locked/busy) 统一映射为 503。"""
+        try:
+            yield
+        except OperationalError as e:
+            self.db.rollback()
+            if _is_sqlite_busy_error(e):
+                raise CronJobBusyError("数据库繁忙，请稍后重试") from e
+            raise
+
     def get_jobs(self, user_id: str) -> list[CronTask]:
         """从 CronJob 表获取用户所有定时任务"""
         jobs = (
@@ -87,19 +188,130 @@ class CronService:
             .order_by(CronJob.created_at)
             .all()
         )
-        return [
-            CronTask(
-                name=j.name,
-                cron_expr=j.cron_expr,
-                description=j.description or "",
-                enabled=j.enabled,
+        result: list[CronTask] = []
+        for j in jobs:
+            schedule_obj: dict | None = None
+            raw_schedule = getattr(j, "schedule", None)
+            if raw_schedule:
+                # JSON 解析失败让它崩；schedule 由后端写入，结构损坏属于数据事故。
+                schedule_obj = json.loads(raw_schedule)
+            result.append(
+                CronTask(
+                    name=j.name,
+                    cron_expr=j.cron_expr,
+                    description=j.description or "",
+                    enabled=j.enabled,
+                    schedule=schedule_obj,
+                    content=getattr(j, "content", "") or "",
+                    job_id=j.id,
+                )
             )
-            for j in jobs
-        ]
+        return result
 
     def get_tasks(self, user_id: str) -> list[CronTask]:
         """获取用户的所有定时任务（get_jobs 别名，保持向下兼容）"""
         return self.get_jobs(user_id)
+
+    # ────────────────────────── CRUD（HTTP + Agent 工具共用） ──────────────────────────
+
+    def create_job(
+        self,
+        user_id: str,
+        *,
+        name: str,
+        description: str = "",
+        content: str = "",
+        schedule: dict | None = None,
+        cron_expr: str | None = None,
+        enabled: bool = True,
+    ) -> CronJob:
+        """新建 CronJob，schedule 与 cron_expr 二选一（schedule 优先）。"""
+        name = _validate_name(name)
+        expr, schedule_json = _resolve_cron_expr(schedule, cron_expr)
+
+        with self._busy_guard():
+            existing = (
+                self.db.query(CronJob)
+                .filter(CronJob.user_id == user_id, CronJob.name == name)
+                .first()
+            )
+        if existing:
+            raise CronJobValidationError(f"任务 '{name}' 已存在")
+
+        job = CronJob(
+            user_id=user_id,
+            name=name,
+            cron_expr=expr,
+            schedule=schedule_json,
+            description=description or "",
+            content=content or "",
+            enabled=bool(enabled),
+        )
+        self.db.add(job)
+        try:
+            with self._busy_guard():
+                self.db.commit()
+                self.db.refresh(job)
+        except IntegrityError as e:
+            self.db.rollback()
+            raise CronJobValidationError(f"任务 '{name}' 已存在") from e
+        return job
+
+    def update_job(
+        self,
+        user_id: str,
+        name: str,
+        *,
+        description: str | None = None,
+        content: str | None = None,
+        schedule: dict | None = None,
+        cron_expr: str | None = None,
+        enabled: bool | None = None,
+    ) -> CronJob:
+        """更新 CronJob。任意字段省略则不动；schedule/cron_expr 至少传一个时才会改时间。"""
+        with self._busy_guard():
+            job = (
+                self.db.query(CronJob)
+                .filter(CronJob.user_id == user_id, CronJob.name == name)
+                .first()
+            )
+        if not job:
+            raise CronJobNotFoundError(f"任务 '{name}' 不存在")
+
+        if schedule is not None or cron_expr is not None:
+            expr, schedule_json = _resolve_cron_expr(schedule, cron_expr)
+            job.cron_expr = expr
+            job.schedule = schedule_json
+
+        if description is not None:
+            job.description = description
+        if content is not None:
+            job.content = content
+        if enabled is not None:
+            job.enabled = bool(enabled)
+
+        with self._busy_guard():
+            self.db.commit()
+            self.db.refresh(job)
+        return job
+
+    def delete_job(self, user_id: str, name: str) -> None:
+        with self._busy_guard():
+            job = (
+                self.db.query(CronJob)
+                .filter(CronJob.user_id == user_id, CronJob.name == name)
+                .first()
+            )
+        if not job:
+            raise CronJobNotFoundError(f"任务 '{name}' 不存在")
+
+        with self._busy_guard():
+            # 允许清理去重键历史，确保删除在有外键约束时依然可用。
+            self.db.query(CronFire).filter(CronFire.job_id == job.id).delete(synchronize_session=False)
+
+            # CronJobRun 历史保留：用户仍可在执行记录中看到过往运行。
+            self.db.delete(job)
+            self.db.commit()
 
     def get_run_history(
         self, user_id: str, job_name: str | None = None, limit: int = 20, offset: int = 0,
@@ -177,7 +389,9 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                     rec.completed_at = now_naive()
                     db2.commit()
             return None
-        task_description = job.description or job_name
+        # content 是新表单的"执行内容"字段，优先作为 prompt；
+        # 老数据 content 为空时回退到 description（与之前行为一致）。
+        task_description = (job.content or "").strip() or (job.description or job_name)
         cron_expr = job.cron_expr
 
     # 如果 run_id 对应的记录已存在（手动触发预创建），跳过；否则新建
