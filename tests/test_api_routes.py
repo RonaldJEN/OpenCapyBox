@@ -890,9 +890,299 @@ class TestAbortEndpoint:
         with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-1"):
             response = client.post("/chat/session-1/abort")
         assert response.status_code == 200
-        assert response.json()["status"] == "cancellation_requested"
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["reason"] == "force_aborted"
         assert response.json()["request_id"] == "req-1"
         assert cancel_token.is_set()
+
+    @patch("src.api.routes.chat.get_agent_pool")
+    def test_abort_returns_503_when_lock_release_failed(self, mock_pool_fn, client):
+        """abort 已收敛 round 但释放锁失败时，不得返回 cancelled 假成功。"""
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.models.agui_event import AGUIEventLog
+        from src.api.utils.timezone import now_naive
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.status = "active"
+
+        mock_round = MagicMock()
+        mock_round.id = "round-1"
+        mock_round.step_count = 1
+        mock_round.final_response = ""
+
+        mock_lock = MagicMock()
+        mock_lock.updated_at = now_naive()
+        mock_lock.lock_id = "lock-release-failed"
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = mock_round
+            elif model is UserRunLock:
+                chain.filter.return_value.first.return_value = mock_lock
+            elif model is AGUIEventLog:
+                chain.filter.return_value.count.return_value = 0
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
+
+        mock_pool = MagicMock()
+        mock_pool.get.return_value = None
+        mock_pool_fn.return_value = mock_pool
+
+        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-lock-failed"), patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session",
+            new_callable=AsyncMock,
+            return_value=False,
+        ), patch(
+            "src.api.routes.chat._complete_cancel_request_in_new_session",
+            new_callable=AsyncMock,
+        ) as complete_cancel:
+            response = client.post("/chat/session-1/abort")
+
+        assert response.status_code == 503
+        assert "暂时不可用" in response.json()["detail"]
+        complete_cancel.assert_not_awaited()
+
+    @patch("src.api.routes.chat.get_agent_pool")
+    def test_abort_with_local_runner_force_stops_immediately(self, mock_pool_fn, client):
+        """命中本地 active runner 时，abort 应强制停止并立即返回 cancelled。"""
+        import asyncio
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.routes import chat as chat_mod
+        from src.api.utils.timezone import now_naive
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.status = "active"
+
+        mock_round = MagicMock()
+        mock_round.id = "round-1"
+
+        mock_lock = MagicMock()
+        mock_lock.updated_at = now_naive()
+        mock_lock.lock_id = "lock-1"
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = mock_round
+            elif model is UserRunLock:
+                chain.filter.return_value.first.return_value = mock_lock
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
+
+        mock_agent_service = MagicMock()
+        mock_agent_service.cancel_token = asyncio.Event()
+        mock_pool = MagicMock()
+        mock_pool.get.return_value = mock_agent_service
+        mock_pool_fn.return_value = mock_pool
+
+        class DummyRunner:
+            def __init__(self):
+                self._done = False
+                self.cancel_count = 0
+
+            def done(self):
+                return self._done
+
+            def cancel(self):
+                self.cancel_count += 1
+                self._done = True
+
+            def __await__(self):
+                async def _noop():
+                    return None
+                return _noop().__await__()
+
+        mock_runner = DummyRunner()
+
+        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-force"), patch.dict(
+            chat_mod._active_runners,
+            {"session-1": mock_runner},
+            clear=True,
+        ):
+            response = client.post("/chat/session-1/abort")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["reason"] == "force_stopped"
+        assert response.json()["request_id"] == "req-force"
+        assert mock_runner.cancel_count == 1
+        assert mock_agent_service.cancel_token.is_set()
+
+    @patch("src.api.routes.chat.get_agent_pool")
+    def test_abort_with_local_runner_uses_short_wait_budget(self, mock_pool_fn, client):
+        """本地 runner 的同步等待预算应保持短窗口，避免暂停响应变慢。"""
+        import asyncio
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.routes import chat as chat_mod
+        from src.api.utils.timezone import now_naive
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.status = "active"
+
+        mock_round = MagicMock()
+        mock_round.id = "round-1"
+
+        mock_lock = MagicMock()
+        mock_lock.updated_at = now_naive()
+        mock_lock.lock_id = "lock-1"
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = mock_round
+            elif model is UserRunLock:
+                chain.filter.return_value.first.return_value = mock_lock
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
+
+        mock_agent_service = MagicMock()
+        mock_agent_service.cancel_token = asyncio.Event()
+        mock_pool = MagicMock()
+        mock_pool.get.return_value = mock_agent_service
+        mock_pool_fn.return_value = mock_pool
+
+        class DummyRunner:
+            def __init__(self):
+                self._done = False
+
+            def done(self):
+                return self._done
+
+            def cancel(self):
+                self._done = False
+
+            def __await__(self):
+                async def _noop():
+                    return None
+                return _noop().__await__()
+
+        observed_timeout = {}
+
+        async def fake_wait_for(awaitable, timeout):
+            observed_timeout["value"] = timeout
+            raise asyncio.TimeoutError()
+
+        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-short"), patch(
+            "src.api.routes.chat.asyncio.wait_for",
+            new=AsyncMock(side_effect=fake_wait_for),
+        ), patch.dict(
+            chat_mod._active_runners,
+            {"session-1": DummyRunner()},
+            clear=True,
+        ):
+            response = client.post("/chat/session-1/abort")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["reason"] == "force_aborted"
+        assert observed_timeout["value"] == chat_mod._LOCAL_RUNNER_ABORT_WAIT_SECONDS
+        assert observed_timeout["value"] == 0.2
+
+    @patch("src.api.routes.chat.get_agent_pool")
+    def test_abort_uses_id_snapshots_after_commit_to_avoid_deleted_object_crash(self, mock_pool_fn, client):
+        """提交后对象被标记删除时，abort 仍应使用快照 ID 完成收敛，不得 500。"""
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.models.agui_event import AGUIEventLog
+        from src.api.utils.timezone import now_naive
+
+        class ExpiringRound:
+            def __init__(self):
+                self._id = "round-1"
+                self._expired = False
+                self.status = "running"
+                self.final_response = ""
+                self.step_count = 10
+                self.completed_at = None
+
+            @property
+            def id(self):
+                if self._expired:
+                    raise RuntimeError("round id expired")
+                return self._id
+
+        class ExpiringLock:
+            def __init__(self):
+                self._lock_id = "lock-1"
+                self._expired = False
+                self.updated_at = now_naive()
+
+            @property
+            def lock_id(self):
+                if self._expired:
+                    raise RuntimeError("lock id expired")
+                return self._lock_id
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.status = "active"
+
+        expiring_round = ExpiringRound()
+        expiring_lock = ExpiringLock()
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = expiring_round
+            elif model is UserRunLock:
+                chain.filter.return_value.first.return_value = expiring_lock
+            elif model is AGUIEventLog:
+                chain.filter.return_value.count.return_value = 0
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
+
+        def commit_side_effect():
+            expiring_round._expired = True
+            expiring_lock._expired = True
+
+        self._mock_db_session.commit.side_effect = commit_side_effect
+
+        mock_pool = MagicMock()
+        mock_pool.get.return_value = None
+        mock_pool_fn.return_value = mock_pool
+
+        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-snapshot"), patch(
+            "src.api.routes.chat._broadcast_to_subscribers", new_callable=AsyncMock
+        ) as mock_broadcast, patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock
+        ) as mock_release, patch(
+            "src.api.routes.chat._complete_cancel_request_in_new_session", new_callable=AsyncMock
+        ):
+            response = client.post("/chat/session-1/abort")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["reason"] == "force_aborted"
+        mock_broadcast.assert_awaited_once()
+        assert mock_broadcast.await_args.args[0] == "round-1"
+        mock_release.assert_awaited_once_with(user_id="testuser", lock_id="lock-1")
 
     @patch("src.api.routes.chat.get_agent_pool")
     def test_abort_init_window_with_recent_lock_returns_200(self, mock_pool_fn, client):
@@ -930,6 +1220,7 @@ class TestAbortEndpoint:
         mock_pool_fn.return_value = mock_pool
 
         mock_settings = MagicMock()
+        mock_settings.sse_heartbeat_interval = 15
         mock_settings.sse_subscribe_timeout = 300
 
         with patch("src.api.routes.chat.get_settings", return_value=mock_settings), patch(
@@ -938,12 +1229,69 @@ class TestAbortEndpoint:
             response = client.post("/chat/session-1/abort")
 
         assert response.status_code == 200
-        assert response.json()["status"] == "cancellation_requested"
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["reason"] == "force_unlocked"
         assert response.json()["request_id"] == "req-init-window"
 
     @patch("src.api.routes.chat.get_agent_pool")
-    def test_abort_without_local_cancel_token_still_requests_cancel(self, mock_pool_fn, client):
-        """有 running round 但本地 worker 無 cancel_token 也應返回 cancellation_requested"""
+    def test_abort_worker_dead_uses_three_times_heartbeat_threshold(self, mock_pool_fn, client):
+        """worker_dead 判定应基于 3x heartbeat，而非 sse_subscribe_timeout。"""
+        from datetime import timedelta
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.models.agui_event import AGUIEventLog
+        from src.api.utils.timezone import now_naive
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.status = "active"
+
+        mock_round = MagicMock()
+        mock_round.id = "round-1"
+
+        # 120s > 3 * 15s(heartbeat)，但 < 300s(subscribe_timeout)
+        # 若误用 subscribe_timeout 判定则不会进入 worker_dead。
+        mock_lock = MagicMock()
+        mock_lock.updated_at = now_naive() - timedelta(seconds=120)
+        mock_lock.lock_id = "lock-stale-by-heartbeat"
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is RoundModel:
+                chain.filter.return_value.first.return_value = mock_round
+            elif model is UserRunLock:
+                chain.filter.return_value.first.return_value = mock_lock
+            elif model is AGUIEventLog:
+                chain.filter.return_value.count.return_value = 0
+            return chain
+
+        self._mock_db_session.query.side_effect = query_side_effect
+
+        mock_pool = MagicMock()
+        mock_pool.get.return_value = None
+        mock_pool_fn.return_value = mock_pool
+
+        mock_settings = MagicMock()
+        mock_settings.sse_heartbeat_interval = 15
+        mock_settings.sse_subscribe_timeout = 300
+
+        with patch("src.api.routes.chat.get_settings", return_value=mock_settings), patch(
+            "src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-worker-dead"
+        ):
+            response = client.post("/chat/session-1/abort")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["reason"] == "worker_dead"
+        assert response.json()["request_id"] == "req-worker-dead"
+
+    @patch("src.api.routes.chat.get_agent_pool")
+    def test_abort_without_local_cancel_token_still_cancels_round(self, mock_pool_fn, client):
+        """有 running round 且本地 worker 無 cancel_token 時，也應立即收斂為 cancelled。"""
         from src.api.models.session import Session as SessionModel
         from src.api.models.round import Round as RoundModel
         from src.api.models.user_run_lock import UserRunLock
@@ -985,7 +1333,8 @@ class TestAbortEndpoint:
             response = client.post("/chat/session-1/abort")
 
         assert response.status_code == 200
-        assert response.json()["status"] == "cancellation_requested"
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["reason"] == "force_aborted"
         assert response.json()["request_id"] == "req-2"
 
     def test_abort_session_not_found_returns_404(self, client):
@@ -1075,3 +1424,36 @@ class TestAbortEndpoint:
         assert payload["completed_at"] is None
         assert payload["running"] is False
         assert payload["running_round_id"] is None
+
+
+class TestAbortEpochHelpers:
+    """abort-epoch 判定辅助函数测试。"""
+
+    def test_cancel_row_touched_after_detects_newer_completed_at(self):
+        """completed_at 晚于 run 启动时间时，应视为发生过较新 cancel 活动。"""
+        from datetime import timedelta
+        from src.api.routes.chat import _cancel_row_touched_after
+        from src.api.utils.timezone import now_naive
+
+        started_at = now_naive()
+        row = MagicMock()
+        row.requested_at = None
+        row.acked_at = None
+        row.completed_at = started_at + timedelta(seconds=1)
+
+        assert _cancel_row_touched_after(row=row, started_at=started_at) is True
+
+    def test_cancel_row_touched_after_ignores_older_timestamps(self):
+        """所有时间戳早于 run 启动时间时，不应误判为较新 cancel 活动。"""
+        from datetime import timedelta
+        from src.api.routes.chat import _cancel_row_touched_after
+        from src.api.utils.timezone import now_naive
+
+        started_at = now_naive()
+        older = started_at - timedelta(seconds=1)
+        row = MagicMock()
+        row.requested_at = older
+        row.acked_at = older
+        row.completed_at = older
+
+        assert _cancel_row_touched_after(row=row, started_at=started_at) is False

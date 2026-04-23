@@ -27,6 +27,19 @@ class HistoryService:
         # per-instance 状态，避免类级别共享导致跨会话数据混乱
         self._event_sequences: Dict[str, int] = {}
         self._stream_buffers: Dict[str, Dict[str, str]] = {}
+        self._terminal_runs: set[str] = set()
+
+    def get_round_status(self, round_id: str) -> str | None:
+        """查询 round 当前状态。"""
+        row = self.db.query(Round.status).filter(Round.id == round_id).first()
+        if not row:
+            return None
+        return row[0]
+
+    def is_round_terminal(self, round_id: str) -> bool:
+        """判断 round 是否已进入 subscribe 终态。"""
+        status = self.get_round_status(round_id)
+        return bool(status and status in Round.SUBSCRIBE_TERMINAL_STATUSES)
 
     # 🆕 Round 相关方法
 
@@ -310,6 +323,18 @@ class HistoryService:
         Returns:
             AGUIEventLog: 存儲的事件日誌記錄（流式 delta 事件返回 None）
         """
+        # round 已終態時，丟棄所有遲到事件，避免 abort 後舊 run 汙染回放。
+        # 常見場景：abort 接口已將 round 標記 cancelled 並補發 RUN_FINISHED，
+        # 舊 worker 遲到事件（TEXT/TOOL/RUN_FINISHED）不應再入庫。
+        if run_id in self._terminal_runs or self.is_round_terminal(run_id):
+            self._terminal_runs.add(run_id)
+            logger.info(
+                "Run %s 已終態，丟棄遲到事件: %s",
+                run_id,
+                event.type.value if hasattr(event.type, "value") else str(event.type),
+            )
+            return None
+
         # 初始化緩衝區
         if run_id not in self._stream_buffers:
             self._stream_buffers[run_id] = {}

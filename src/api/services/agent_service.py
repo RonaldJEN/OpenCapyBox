@@ -955,13 +955,32 @@ class AgentService:
         _round_finished = False  # 追蹤 round 是否已正常完成
         _final_status: str | None = None  # except 路徑填充
         _final_response: str | None = None
+        _externally_terminated = False
+        # 固化本輪 cancel_token，避免後續新 run 覆蓋 self.cancel_token 導致判定串擾。
+        run_cancel_token = self.cancel_token
 
         try:
             async for event in self.agent.run_agui(
                 thread_id=self.session_id,
                 run_id=run_id,
-                cancel_token=self.cancel_token,
+                cancel_token=run_cancel_token,
             ):
+                # 本輪已被外部收斂為終態（常見於 abort 立即 cancelled）時，
+                # 停止處理遲到事件，避免污染 conversation_messages 與 round 狀態。
+                if self.history_service.is_round_terminal(run_id) is True:
+                    current_status = self.history_service.get_round_status(run_id) or "cancelled"
+                    logger.info(
+                        "Round %s 已被外部收斂為 %s，停止處理遲到事件",
+                        run_id,
+                        current_status,
+                    )
+                    status = current_status
+                    _round_finished = True
+                    _externally_terminated = True
+                    if run_cancel_token and not run_cancel_token.is_set():
+                        run_cancel_token.set()
+                    break
+
                 await self.history_service.save_agui_event(run_id, event)
 
                 if event.type == EventType.TEXT_MESSAGE_CONTENT:
@@ -1033,6 +1052,9 @@ class AgentService:
 
                 yield event
 
+            if _externally_terminated:
+                return
+
             self.history_service.complete_round(
                 round_id=run_id,
                 final_response=final_response,
@@ -1061,7 +1083,7 @@ class AgentService:
                     # 僅在可確認本地 cancel_token 已觸發時視為用戶取消。
                     # 其餘未知異常中斷（如框架級取消、進程退出）保守標記為 failed，
                     # 避免把系統級中斷混淆為 cancelled。
-                    _is_user_cancel = bool(self.cancel_token and self.cancel_token.is_set())
+                    _is_user_cancel = bool(run_cancel_token and run_cancel_token.is_set())
                     _actual_status = "cancelled" if _is_user_cancel else (_final_status or "failed")
                     _fallback_response = "Cancelled" if _actual_status == "cancelled" else "Failed"
                     self.history_service.complete_round(

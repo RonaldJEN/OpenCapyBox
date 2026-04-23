@@ -10,6 +10,7 @@ import uuid
 
 from src.api.services.history_service import HistoryService
 from src.api.models.round import Round
+from src.agent.schema.agui_events import RunFinishedEvent
 from tests.helpers import make_query_db
 
 
@@ -288,3 +289,24 @@ class TestHistoryServiceIntegration:
         # 驗證操作執行
         assert mock_db.add.call_count >= 1  # round
         assert mock_db.commit.call_count >= 1
+
+
+class TestHistoryServiceLateEventDrop:
+    """終態 round 的遲到事件隔離測試。"""
+
+    @pytest.mark.asyncio
+    async def test_save_agui_event_drops_late_event_when_round_terminal(self, history_service, mock_db):
+        """round 已是終態時，save_agui_event 應直接丟棄事件且不入庫。"""
+        mock_db.query.return_value.filter.return_value.first.return_value = ("cancelled",)
+
+        event = RunFinishedEvent(
+            threadId="session-1",
+            runId="run-1",
+            outcome="interrupt",
+            result={"reason": "user_cancelled"},
+        )
+
+        result = await history_service.save_agui_event("run-1", event)
+
+        assert result is None
+        mock_db.add.assert_not_called()

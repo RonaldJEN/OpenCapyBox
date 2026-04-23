@@ -337,11 +337,14 @@ class TestSendMessageConcurrencyBlock:
         def query_side_effect(model):
             from src.api.models.session import Session as SessionModel
             from src.api.models.user_sandbox import UserSandbox
+            from src.api.models.run_cancel_request import RunCancelRequest as RunCancelRequestModel
 
             chain = MagicMock()
             if model is SessionModel:
                 chain.filter.return_value.first.return_value = mock_session
             elif model is UserSandbox:
+                chain.filter.return_value.first.return_value = None
+            elif model is RunCancelRequestModel:
                 chain.filter.return_value.first.return_value = None
             return chain
 
@@ -583,8 +586,8 @@ class TestResumeConcurrencyBlock:
 class TestAbortCleansUpUserLock:
     """abort 端点跨 worker 取消请求测试。"""
 
-    def test_abort_with_cancel_token_does_not_release_lock(self):
-        """abort 时 worker 存活（cancel_token 可设置），只写入 requested，不释放锁。"""
+    def test_abort_with_cancel_token_releases_lock_immediately(self):
+        """abort 时 worker 存活（cancel_token 可设置），也应立即释放锁。"""
         from tests.helpers import make_test_client
         from src.api.routes import chat as chat_routes
 
@@ -626,18 +629,24 @@ class TestAbortCleansUpUserLock:
 
         with patch("src.api.routes.chat.get_agent_pool") as mock_pool, patch(
             "src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-1"
-        ) as upsert_cancel:
+        ) as upsert_cancel, patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock, return_value=True
+        ) as release_lock, patch(
+            "src.api.routes.chat._complete_cancel_request_in_new_session", new_callable=AsyncMock, return_value=True
+        ):
             mock_pool.return_value.get.return_value = mock_agent_service
             response = client.post("/chat/session-1/abort")
 
         assert response.status_code == 200
-        assert response.json()["status"] == "cancellation_requested"
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["reason"] == "force_aborted"
         assert response.json()["request_id"] == "req-1"
         upsert_cancel.assert_called_once()
+        release_lock.assert_called_once_with(user_id="testuser", lock_id="lock-1")
         assert mock_agent_service.cancel_token.is_set()
 
-    def test_abort_live_worker_does_not_mutate_round(self):
-        """abort 时 worker 存活，不应直接改写 round 状态。"""
+    def test_abort_live_worker_mutates_round_to_cancelled(self):
+        """abort 时 worker 存活，应立即将 round 收敛为 cancelled。"""
         from tests.helpers import make_test_client
         from src.api.routes import chat as chat_routes
 
@@ -676,15 +685,19 @@ class TestAbortCleansUpUserLock:
 
         with patch("src.api.routes.chat.get_agent_pool") as mock_pool, patch(
             "src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-2"
-        ) as upsert_cancel:
+        ) as upsert_cancel, patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock, return_value=True
+        ), patch(
+            "src.api.routes.chat._complete_cancel_request_in_new_session", new_callable=AsyncMock, return_value=True
+        ):
             mock_pool.return_value.get.return_value = None
             response = client.post("/chat/session-1/abort")
 
         assert response.status_code == 200
-        assert response.json()["status"] == "cancellation_requested"
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["reason"] == "force_aborted"
         upsert_cancel.assert_called_once()
-        # worker 存活时不应直接改写 round 状态
-        assert mock_round.status == "running"
+        assert mock_round.status == "cancelled"
 
     def test_abort_dead_worker_directly_cancels_round(self):
         """abort 检测到 worker 已死（心跳过期），直接标记 round 为 cancelled 并释放锁。"""

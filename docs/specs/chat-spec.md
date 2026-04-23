@@ -351,10 +351,18 @@ SSE 事件流。
 #### 响应
 
 ```json
-// 正常取消请求
+// 常规即时取消（live worker / 跨 worker）
 {
-  "status": "cancellation_requested",
-  "request_id": "uuid"
+    "status": "cancelled",
+    "request_id": "uuid",
+    "reason": "force_aborted"
+}
+
+// 命中本地 active runner，立即强制停止
+{
+    "status": "cancelled",
+    "request_id": "uuid",
+    "reason": "force_stopped"
 }
 
 // Worker 已死亡，直接清理
@@ -363,12 +371,23 @@ SSE 事件流。
   "request_id": "uuid",
   "reason": "worker_dead"
 }
+
+// init-window（有会话锁但尚未创建 round）即时解锁
+{
+    "status": "cancelled",
+    "request_id": "uuid",
+    "reason": "force_unlocked"
+}
 ```
 
 | `status` 值 | 含义 |
 |--------------|------|
-| `cancellation_requested` | 取消请求已写入 DB，等待 Worker 检测并执行 |
+| `cancelled` + `reason: "force_aborted"` | 已将 running round 直接收敛为 cancelled，并立即释放会话锁 |
+| `cancelled` + `reason: "force_stopped"` | 命中本地 active runner，已执行 task cancel 并等待收敛完成（锁已释放） |
 | `cancelled` + `reason: "worker_dead"` | 锁已超时（> 3 倍心跳间隔），判定 Worker 死亡，直接强制清理锁和 Round 状态 |
+| `cancelled` + `reason: "force_unlocked"` | init-window（无 running round）也立即释放会话锁，允许用户立刻重发 |
+
+> 约束：`cancelled(*)` 仅在目标会话锁确认已释放时返回；若释放失败（例如数据库锁冲突），接口返回 `HTTP 503`，不会返回“假成功”。
 
 #### 错误码
 
@@ -544,18 +563,28 @@ INSERT INTO rounds (..., idempotency_key)
 
 - 每 15s 心跳刷新 `user_run_locks.updated_at`
 - 超过 **3 倍心跳间隔**（默认 45s）未刷新 → 判定 Worker 死亡
-- `abort` 接口检测到 Worker 死亡时，直接：
-  1. 删除 `user_run_locks` 记录
-  2. 将 Round 状态设为 `cancelled`
-  3. 将取消请求状态设为 `completed`
-  4. 返回 `{status: "cancelled", reason: "worker_dead"}`
+- `abort` 统一采用“接口即时收敛”策略：
+    1. 写入取消请求（用于跨 worker 可观测）
+    2. 若存在 running round，直接标记 `cancelled` 并补发 `RUN_FINISHED(outcome=interrupt)`
+    3. 立即释放 `user_run_locks`（不等待执行 worker 自行结束）
+    4. 完成取消请求状态（`completed`）
+- `abort` 若命中本地 active runner，会额外执行 `runner.cancel()` 缩短后台残留窗口
+- `abort` 检测到 Worker 死亡时返回 `reason=worker_dead`，其余即时收敛路径返回 `force_aborted/force_unlocked`
+- 执行侧引入 abort-epoch 守卫：若 run 启动后检测到较新 cancel 活动（`requested/acked/completed` 时间戳晚于 run 启动点），旧请求会被短路，避免 init-window 穿透创建新 round
 
-#### Per-User 串行
+> 说明：即时释放锁后，旧 worker 可能在极短时间内仍在退出过程。系统通过“终态后丢弃迟到事件”避免 UI/回放被旧 run 污染。
 
-整个系统保证 **每用户同一时刻只有一个 Agent 执行**。这意味着：
+#### Per-User 串行（更新）
 
-- 同一用户的不同会话也互斥
-- `user_run_locks` 表以 `user_id` 为 PK，而非 `session_id`
+系统保证 **同一用户同一时刻最多持有一个活动锁**（`UserRunLock`）。
+
+在“abort 即时释放锁”语义下，存在短时窗口：旧 run 正在退出而新 run 已启动（无锁重叠执行）。为避免状态污染，后端执行以下约束：
+
+1. round 一旦进入终态（尤其 `cancelled`），后续迟到 AG-UI 事件一律丢弃
+2. `complete_round` 不允许覆写终态 round
+3. 订阅端以终态事件为准，不再回跳 `running`
+
+- `user_run_locks` 表仍以 `user_id` 为 PK，而非 `session_id`
 
 #### DB 连接生命周期约束（强约束）
 
@@ -858,6 +887,9 @@ SSE 连接建立
 | **输出截断** | `finish_reason=length` | 自动重试一次（调整 prompt 或 context） | 用户无感知（自动恢复） |
 | **SSE 断开** | 连接关闭检测 | Producer 继续运行在 `_active_runners` 中，等待客户端重连通过 subscribe 恢复 | 前端检测断开，自动重连并通过 subscribe 恢复事件流 |
 | **Subscribe 超时** | 5 分钟定时器 | 发射 `RUN_ERROR(TIMEOUT)` 事件，关闭连接 | 前端收到超时事件，提示用户 |
+| **用户主动 abort（任意 worker）** | `POST /abort` 被调用且会话处于 running / init-window | 接口直接收敛 round 并尝试释放锁；释放成功返回 `cancelled(force_aborted/force_unlocked)`；本地命中 runner 时额外 `cancel()` | 释放成功后用户可立即重发 |
+| **abort 收敛后释放锁失败** | `POST /abort` 执行到锁释放阶段但 DB 冲突/异常 | 返回 `HTTP 503`，不返回 `cancelled` 假成功 | 前端保持运行态或提示重试，避免误判“已可重发” |
+| **abort 后旧 run 迟到输出** | round 已终态但仍收到后续 AG-UI 事件 | 丢弃迟到事件，不再入库，不污染 replay/UI | 前端状态保持 cancelled，不再回跳 running |
 | **DB 锁冲突** | 数据库异常捕获 | 返回 HTTP 503 | 前端提示稍后重试 |
 | **Worker 死亡** | 锁超时检测（> 3 倍心跳） | abort 接口直接清理锁和 Round 状态 | 用户调用 abort 时得到即时响应 |
 
