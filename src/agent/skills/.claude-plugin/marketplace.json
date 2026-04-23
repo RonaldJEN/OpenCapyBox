@@ -33,7 +33,9 @@
         "./self-improving",
         "./skill-creator",
         "./skill-vetter",
-        "./oracle"
+        "./oracle",
+        "./arxiv-watcher",
+        "./browser-use"
       ]
     },
     {
@@ -44,7 +46,7 @@
       "skills": [
         "./frontend-design",
         "./ui-ux-pro-max",
-        "./tailwind-design-system"
+        "./huashu-design"
       ]
     }
   ]

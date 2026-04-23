@@ -27,8 +27,8 @@
 #
 # ============================================================
 
-default_model: glm-5.1
-cron_default_model: glm-5-no-think  # Cron 任务默认模型（不配置思考）
+default_model: glm
+cron_default_model: glm  # Cron 任务默认模型（不配置思考）
 
 models:
 
@@ -117,7 +117,7 @@ models:
     enabled: true
     tags: [thinking]
 
-  glm-5.1:
+  glm:
     display_name: "智谱 GLM-5"
     provider: openai
     api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
