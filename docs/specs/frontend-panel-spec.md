@@ -113,7 +113,7 @@ useEffect(() => {
 ### 3.4 文件操作
 
 - **下载**：`GET /api/sessions/{sid}/files/download?path={p}`，使用 blob 触发浏览器下载。
-- **预览**：走 FilePreview，文本/Markdown/图片内联渲染，其他类型提示"不支持预览"。
+- **预览**：走 FilePreview，文本/Markdown/图片/PDF/HTML 内联渲染；HTML 使用 `Blob URL + <iframe sandbox="allow-scripts">`，支持渲染/源码切换，不提供外部浏览器打开入口。
 - **上传**：当前版本**不支持**通过面板上传，文件通过聊天附件上传到沙箱。
 
 ## 4. AgentConfig（记忆文件编辑）
@@ -212,26 +212,35 @@ useEffect(() => {
 - **编辑老数据**（`schedule == null` 而 `cron_expr != null`）：表单中时间区域只读展示 `cron_expr`，需要点「重新选择」才能进入 `SchedulePicker`
 - **手动触发**：`POST /api/cron/jobs/{job_name}/run`，立即返回 `run_id`；执行结果不注入聊天 Session，由「执行记录」展示
 
-## 7. FilePreview（模态弹窗，非抽屉）
+## 7. FilePreview（ArtifactsPanel 内联预览 + 附件弹窗预览）
 
 ### 7.1 触发源
 
 - `ArtifactsPanel` 点击文件
 - `ChatInput` 附件点击（预览已上传的图片/文档）
 
+> 交互约定：
+> - `ArtifactsPanel` 中点击文件时，切换到面板内全幅预览视图（不再弹窗，隐藏文件列表）
+> - `ChatInput` 附件点击仍使用 FilePreview 弹窗
+
 ### 7.2 类型分发
 
 | 类型 | 渲染 |
 |---|---|
 | `image/*` | `<img>` |
-| `text/*` / `.md` | Markdown 渲染（同 Round 内的 markdown 组件）|
+| `.html` / `.htm` | `Blob URL` + `<iframe sandbox="allow-scripts">`（不含 `allow-same-origin`），支持 rendered/source 双视图 |
+| `text/*` / `.md` | Markdown/文本渲染（`.md`/`.html` 支持源码视图） |
 | `application/pdf` | `<iframe>` |
 | 其他 | 占位图 + 下载按钮 |
 
 ### 7.3 关键不变量
 
 - **内容懒加载**：打开时才请求；大文件（> 5MB）默认仅显示下载按钮。
-- **session 隔离**：弹窗属于当前 session，切 session 时自动关闭。
+- **session 隔离**：切 session 时，ArtifactsPanel 路径与选中文件重置到根目录；附件弹窗预览自动关闭。
+- **HTML 沙箱约束**：HTML 预览 iframe 仅允许 `allow-scripts`，严禁与 `allow-same-origin` 同时启用。
+- **禁止外部打开**：HTML 预览仅允许在沙箱 iframe 内查看，不提供“在浏览器中打开”入口，避免离开受限上下文。
+- **全幅预览优先**：ArtifactsPanel 文件点击进入全幅预览模式，返回列表后可继续浏览其他文件。
+- **内联缓存复用**：ArtifactsPanel 预览优先复用缓存结果，减少重复点击同一文件时的等待。
 
 ## 8. 测试清单
 

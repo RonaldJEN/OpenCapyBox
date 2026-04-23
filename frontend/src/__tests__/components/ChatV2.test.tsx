@@ -33,12 +33,9 @@ vi.mock('../../components/Round', () => ({
 }));
 
 vi.mock('../../components/ArtifactsPanel', () => ({
-  ArtifactsPanel: ({ isOpen, onClose, onFilePreview }: any) => (
+  ArtifactsPanel: ({ isOpen, onClose }: any) => (
     <div data-testid="artifacts-panel" data-open={String(isOpen)}>
       <button onClick={onClose}>Close Panel</button>
-      <button onClick={() => onFilePreview({ name: 'test.pdf', path: '/test.pdf' })}>
-        Preview File
-      </button>
     </div>
   ),
 }));
@@ -223,7 +220,7 @@ describe('ChatV2 组件', () => {
     });
   });
 
-  it('点击面板中的文件应该打开预览', async () => {
+  it('打开面板不应该弹出全屏文件预览', async () => {
     render(
       <ChatV2
         sessionId="test-session"
@@ -235,42 +232,8 @@ describe('ChatV2 组件', () => {
     const folderButton = screen.getByTitle('会话资源');
     fireEvent.click(folderButton);
 
-    // 点击预览文件按钮
     await waitFor(() => {
-      fireEvent.click(screen.getByText('Preview File'));
-    });
-
-    // 应该显示文件预览
-    await waitFor(() => {
-      expect(screen.getByTestId('file-preview')).toBeInTheDocument();
-      expect(screen.getByText('Preview: test.pdf')).toBeInTheDocument();
-    });
-  });
-
-  it('应该能关闭文件预览', async () => {
-    render(
-      <ChatV2
-        sessionId="test-session"
-        {...defaultProps}
-      />
-    );
-
-    // 打开 Artifacts 面板
-    const folderButton = screen.getByTitle('会话资源');
-    fireEvent.click(folderButton);
-
-    // 打开预览
-    await waitFor(() => {
-      fireEvent.click(screen.getByText('Preview File'));
-    });
-
-    // 关闭预览
-    await waitFor(() => {
-      fireEvent.click(screen.getByText('Close Preview'));
-    });
-
-    // 预览应该关闭
-    await waitFor(() => {
+      expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'true');
       expect(screen.queryByTestId('file-preview')).not.toBeInTheDocument();
     });
   });
@@ -1000,6 +963,147 @@ describe('ChatV2 组件', () => {
 
     // onExecutionEnd 不应被调用
     expect(defaultProps.onExecutionEnd).not.toHaveBeenCalled();
+  });
+
+  it('abort 失败但终态事件已到达时，不应丢失收敛回调', async () => {
+    const runningRounds: RoundData[] = [
+      {
+        round_id: 'round-abort-race',
+        user_message: '运行中',
+        final_response: '',
+        steps: [
+          {
+            step_number: 1,
+            thinking: '',
+            assistant_content: '处理中...',
+            tool_calls: [],
+            tool_results: [],
+            status: 'running',
+          },
+        ],
+        step_count: 1,
+        status: 'running',
+        created_at: new Date().toISOString(),
+      },
+    ];
+
+    let subscribeCallbacks: any = null;
+    vi.mocked(apiService.subscribeToRound).mockImplementation((_sid, _rid, callbacks: any) => {
+      subscribeCallbacks = callbacks;
+      return {
+        abort: vi.fn(),
+        promise: new Promise(() => {}),
+      } as any;
+    });
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: runningRounds,
+      session_id: 'test-session',
+      total: runningRounds.length,
+    });
+
+    vi.mocked(apiService.abortChat).mockImplementation(async () => {
+      // 模拟：点击停止后 abort 请求失败，但几乎同时收到了后端终态事件。
+      subscribeCallbacks?.onRunFinished?.(
+        'test-session',
+        'round-abort-race',
+        { finalResponse: '已完成' },
+        'success',
+        undefined
+      );
+      throw new Error('Network Error');
+    });
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(apiService.subscribeToRound).toHaveBeenCalled();
+      expect(screen.getByTitle('停止生成')).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('停止生成'));
+    });
+
+    // 终态已到达后，UI 应完成收敛，不能卡在 running。
+    await waitFor(() => {
+      expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
+    });
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+    expect(textarea).not.toBeDisabled();
+    expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('test-session');
+  });
+
+  it('abort 返回 409 时应按已停止处理，立即恢复 UI', async () => {
+    const runningRounds: RoundData[] = [
+      {
+        round_id: 'round-abort-409',
+        user_message: '运行中',
+        final_response: '',
+        steps: [
+          {
+            step_number: 1,
+            thinking: '',
+            assistant_content: '处理中...',
+            tool_calls: [],
+            tool_results: [],
+            status: 'running',
+          },
+        ],
+        step_count: 1,
+        status: 'running',
+        created_at: new Date().toISOString(),
+      },
+    ];
+
+    const mockAbort = vi.fn();
+    vi.mocked(apiService.subscribeToRound).mockReturnValue({
+      abort: mockAbort,
+      promise: new Promise(() => {}), // 永不 resolve
+    } as any);
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: runningRounds,
+      session_id: 'test-session',
+      total: runningRounds.length,
+    });
+
+    const conflictError = Object.assign(new Error('Conflict'), {
+      response: { status: 409 },
+    });
+    vi.mocked(apiService.abortChat).mockRejectedValue(conflictError);
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(apiService.subscribeToRound).toHaveBeenCalled();
+      expect(screen.getByTitle('停止生成')).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('停止生成'));
+    });
+
+    expect(apiService.abortChat).toHaveBeenCalledWith('test-session');
+
+    await waitFor(() => {
+      expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
+    });
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+    expect(textarea).not.toBeDisabled();
+    expect(defaultProps.onExecutionEnd).toHaveBeenCalled();
   });
 
   it('USER_BUSY (429) 不应触发 onExecutionStart，不污染侧栏执行标记', async () => {

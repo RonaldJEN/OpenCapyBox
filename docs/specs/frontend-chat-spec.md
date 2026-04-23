@@ -90,10 +90,15 @@ catch (SSE error)
 ### 3.5 取消语义
 
 用户点击取消：
-1. 前端立即 `abortController.abort()`（断开 SSE）。
-2. POST `/api/sessions/{sid}/cancel`。
-3. 后端发送 `RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled)`。
-4. `isUserCancelledOutcome()` 识别后，UI 显示"已取消"，**不是错误**。
+1. POST `/api/chat/{sid}/abort`。
+2. 若请求成功：
+  - 前端立即取消当前订阅（`subscription.abort()`），防止后续迟到回调覆盖状态；
+  - 本地将当前 `running` round 先收敛为中断态（用于即时反馈），并结束 `sending/resuming`；
+  - 立即恢复输入可用（不等待 SSE 终态事件）。
+3. 若请求返回 409（会话已无运行任务）：按“已停止”处理并立即收敛本地 UI，避免重复点击无反馈。
+4. 其他请求失败：保持当前运行态，等待 SSE 后端终态事件收敛。
+5. 后端规范终态为 `RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled)`，
+  前端按 `isUserCancelledOutcome()` 识别为"已取消"，**不是错误**。
 
 **判定**：`outcome === 'interrupt' && result?.reason === 'user_cancelled'`。outcome=interrupt 但无 reason 的保守处理为非取消。
 
@@ -199,6 +204,7 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 
 - [ ] 切换会话时旧 SSE 事件不污染新会话（mock 迟到事件）
 - [ ] 取消后 UI 显示"已取消"而非"错误"
+- [ ] 取消成功后无需等待 SSE，即刻恢复输入并允许重发
 - [ ] ask_user 中断恢复：刷新页面后 QuestionCard 正常显示
 - [ ] SSE 断连后自动恢复（history API 查询终态/续订）
 - [ ] 幂等冲突自动切 subscribe

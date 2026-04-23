@@ -4,6 +4,15 @@ import { ArtifactsPanel } from '../../components/ArtifactsPanel';
 import { apiService } from '../../services/api';
 import { FileInfo } from '../../types';
 
+vi.mock('../../components/FilePreview', () => ({
+  FilePreview: ({ file, inline, onClose }: any) => (
+    <div data-testid="file-preview-inline-mock" data-inline={String(inline)}>
+      <span>Inline Preview: {file?.name}</span>
+      <button onClick={onClose}>Close Inline Preview</button>
+    </div>
+  ),
+}));
+
 // Mock apiService
 vi.mock('../../services/api', () => ({
   apiService: {
@@ -17,23 +26,26 @@ describe('ArtifactsPanel 组件', () => {
     {
       name: 'report.pdf',
       path: '/workspace/report.pdf',
-      size: 1024 * 100, // 100KB
+      size: 1024 * 100,
       type: 'application/pdf',
       modified: new Date().toISOString(),
+      is_directory: false,
     },
     {
       name: 'data.xlsx',
       path: '/workspace/data.xlsx',
-      size: 1024 * 50, // 50KB
+      size: 1024 * 50,
       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       modified: new Date().toISOString(),
+      is_directory: false,
     },
     {
       name: 'script.py',
       path: '/workspace/script.py',
-      size: 1024 * 5, // 5KB
+      size: 1024 * 5,
       type: 'text/x-python',
       modified: new Date().toISOString(),
+      is_directory: false,
     },
   ];
 
@@ -51,8 +63,7 @@ describe('ArtifactsPanel 组件', () => {
         sessionId="test-session"
         isOpen={false}
         onClose={vi.fn()}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
     expect(apiService.getSessionFiles).not.toHaveBeenCalled();
@@ -62,14 +73,13 @@ describe('ArtifactsPanel 组件', () => {
     render(
       <ArtifactsPanel
         sessionId="test-session"
-        isOpen={true}
+        isOpen
         onClose={vi.fn()}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
     await waitFor(() => {
-      expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session');
+      expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session', undefined);
     });
   });
 
@@ -77,10 +87,9 @@ describe('ArtifactsPanel 组件', () => {
     render(
       <ArtifactsPanel
         sessionId="test-session"
-        isOpen={true}
+        isOpen
         onClose={vi.fn()}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
     await waitFor(() => {
@@ -90,48 +99,43 @@ describe('ArtifactsPanel 组件', () => {
     });
   });
 
-  it('应该显示面板标题', async () => {
+  it('应该隐藏顶部标题并显示路径导航', () => {
     render(
       <ArtifactsPanel
         sessionId="test-session"
-        isOpen={true}
+        isOpen
         onClose={vi.fn()}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
-    expect(screen.getByText('会话资源管理')).toBeInTheDocument();
+    expect(screen.queryByText('会话资源管理')).not.toBeInTheDocument();
+    expect(screen.queryByText('文件预览')).not.toBeInTheDocument();
+    expect(screen.getAllByTitle('~/sessions/test-session').length).toBeGreaterThan(0);
   });
 
-  it('点击关闭按钮应该调用 onClose', async () => {
+  it('点击关闭按钮应该调用 onClose', () => {
     const mockOnClose = vi.fn();
 
     render(
       <ArtifactsPanel
         sessionId="test-session"
-        isOpen={true}
+        isOpen
         onClose={mockOnClose}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
-    // 找到关闭按钮并点击
-    const closeButton = screen.getByRole('button', { name: '' }); // X 按钮没有文字
-    fireEvent.click(closeButton);
+    fireEvent.click(screen.getByRole('button', { name: '关闭面板' }));
 
     expect(mockOnClose).toHaveBeenCalled();
   });
 
-  it('点击文件应该调用 onFilePreview', async () => {
-    const mockOnFilePreview = vi.fn();
-
+  it('点击文件应该在面板内直接预览', async () => {
     render(
       <ArtifactsPanel
         sessionId="test-session"
-        isOpen={true}
+        isOpen
         onClose={vi.fn()}
-        onFilePreview={mockOnFilePreview}
-      />
+      />,
     );
 
     await waitFor(() => {
@@ -140,10 +144,14 @@ describe('ArtifactsPanel 组件', () => {
 
     fireEvent.click(screen.getByText('report.pdf'));
 
-    expect(mockOnFilePreview).toHaveBeenCalledWith(mockFiles[0]);
+    await waitFor(() => {
+      expect(screen.getByTestId('file-preview-inline-mock')).toBeInTheDocument();
+      expect(screen.getByText('Inline Preview: report.pdf')).toBeInTheDocument();
+      expect(screen.getByTestId('file-preview-inline-mock')).toHaveAttribute('data-inline', 'true');
+    });
   });
 
-  it('空文件列表应该显示提示信息', async () => {
+  it('空文件列表应该显示空目录提示', async () => {
     vi.mocked(apiService.getSessionFiles).mockResolvedValue({
       files: [],
       total: 0,
@@ -152,32 +160,29 @@ describe('ArtifactsPanel 组件', () => {
     render(
       <ArtifactsPanel
         sessionId="test-session"
-        isOpen={true}
+        isOpen
         onClose={vi.fn()}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
     await waitFor(() => {
-      expect(screen.getByText('暂无文件')).toBeInTheDocument();
+      expect(screen.getByText('空目录')).toBeInTheDocument();
     });
   });
 
   it('加载中应该显示加载动画', () => {
     vi.mocked(apiService.getSessionFiles).mockImplementation(
-      () => new Promise(() => {}) // 永不 resolve
+      () => new Promise(() => {}),
     );
 
     render(
       <ArtifactsPanel
         sessionId="test-session"
-        isOpen={true}
+        isOpen
         onClose={vi.fn()}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
-    // 检查是否有加载动画
     expect(document.querySelector('.animate-spin')).toBeInTheDocument();
   });
 
@@ -185,45 +190,47 @@ describe('ArtifactsPanel 组件', () => {
     render(
       <ArtifactsPanel
         sessionId="test-session"
-        isOpen={true}
+        isOpen
         onClose={vi.fn()}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
     await waitFor(() => {
-      // 100KB 文件
       expect(screen.getByText(/100.*KB/)).toBeInTheDocument();
     });
   });
 
-  it('面板应该有滑入动画类', () => {
-    const { container } = render(
+  it('面板打开时应该有滑入动画类', () => {
+    render(
       <ArtifactsPanel
         sessionId="test-session"
-        isOpen={true}
+        isOpen
         onClose={vi.fn()}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
-    // 检查面板是否有 translate-x-0 类（打开状态）
-    const panel = container.firstChild as HTMLElement;
+    const panel = screen.getByTestId('artifacts-panel-drawer');
     expect(panel.className).toContain('translate-x-0');
   });
 
   it('面板关闭时应该有滑出动画类', () => {
-    const { container } = render(
+    const { rerender } = render(
+      <ArtifactsPanel
+        sessionId="test-session"
+        isOpen
+        onClose={vi.fn()}
+      />,
+    );
+
+    rerender(
       <ArtifactsPanel
         sessionId="test-session"
         isOpen={false}
         onClose={vi.fn()}
-        onFilePreview={vi.fn()}
-      />
+      />,
     );
 
-    // 检查面板是否有 translate-x-full 类（关闭状态）
-    const panel = container.firstChild as HTMLElement;
+    const panel = screen.getByTestId('artifacts-panel-drawer');
     expect(panel.className).toContain('translate-x-full');
   });
 });
