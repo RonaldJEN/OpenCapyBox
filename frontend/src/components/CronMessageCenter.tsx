@@ -96,29 +96,74 @@ export function runDateGroupKey(startedAt: string | null): string {
   return m ? m[1] : '未知日期';
 }
 
+const RUN_ARTIFACTS_CACHE_LIMIT = 80;
+const runArtifactsCache = new Map<string, ArtifactFile[]>();
+
+function readRunArtifactsCache(runId: string): ArtifactFile[] | null {
+  const cached = runArtifactsCache.get(runId) || null;
+  if (!cached) {
+    return null;
+  }
+  runArtifactsCache.delete(runId);
+  runArtifactsCache.set(runId, cached);
+  return cached;
+}
+
+function writeRunArtifactsCache(runId: string, files: ArtifactFile[]) {
+  runArtifactsCache.delete(runId);
+  runArtifactsCache.set(runId, files);
+  if (runArtifactsCache.size > RUN_ARTIFACTS_CACHE_LIMIT) {
+    const oldestKey = runArtifactsCache.keys().next().value;
+    if (oldestKey) {
+      runArtifactsCache.delete(oldestKey);
+    }
+  }
+}
+
+function initialRunArtifacts(run: CronJobRun): ArtifactFile[] {
+  if (run.artifacts && run.artifacts.length > 0) {
+    writeRunArtifactsCache(run.id, run.artifacts);
+    return run.artifacts;
+  }
+  return readRunArtifactsCache(run.id) ?? [];
+}
+
 // ────────────────────────────────────────────
 // Sub-component: 产物文件列表（支持 lazy fetch）
 // ────────────────────────────────────────────
 
 const RunArtifacts: React.FC<{ run: CronJobRun; onPreview: (runId: string, file: ArtifactFile) => void }> = ({ run, onPreview }) => {
-  const [files, setFiles] = useState<ArtifactFile[]>(run.artifacts ?? []);
+  const [files, setFiles] = useState<ArtifactFile[]>(() => initialRunArtifacts(run));
   const [fetching, setFetching] = useState(false);
-  const fetched = useRef(false);
+  const fetched = useRef(files.length > 0);
 
   // 如果 run 自带 artifacts 直接用；否则 lazy fetch
   useEffect(() => {
     if (run.artifacts && run.artifacts.length > 0) {
       setFiles(run.artifacts);
+      writeRunArtifactsCache(run.id, run.artifacts);
+      fetched.current = true;
       return;
     }
+
+    const cached = readRunArtifactsCache(run.id);
+    if (cached && cached.length > 0) {
+      setFiles(cached);
+      fetched.current = true;
+      return;
+    }
+
     if (fetched.current || !run.run_workspace) return;
     fetched.current = true;
     setFetching(true);
     getCronRunFiles(run.id)
       .then((resp) => {
         setFiles((prev) => {
-          if (resp.files.length === 0 && prev.length > 0) return prev;
-          return resp.files;
+          const next = resp.files.length === 0 && prev.length > 0 ? prev : resp.files;
+          if (next.length > 0) {
+            writeRunArtifactsCache(run.id, next);
+          }
+          return next;
         });
       })
       .catch(() => {})
@@ -205,7 +250,7 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
       name: f.name,
       path: f.path,
       size: f.size,
-      modified: '',
+      modified: previewTarget.runId,
       type: f.type,
       is_directory: false,
     };

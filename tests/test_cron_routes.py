@@ -180,6 +180,35 @@ class TestListRunFiles:
         assert resp.status_code == 200
         assert resp.json()["files"] == []
 
+    def test_scan_prefers_cached_sandbox(self):
+        client, mock_db = _make_client()
+        run = _make_run_record(artifacts=None, run_workspace="/home/user/cron/runs/run-1")
+        user_sandbox = MagicMock()
+        user_sandbox.sandbox_id = "sandbox-1"
+        mock_db.query.return_value.filter.return_value.first.side_effect = [run, user_sandbox]
+
+        sandbox = MagicMock()
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = sandbox
+        sandbox_service.get_or_resume = AsyncMock()
+        sandbox_service.get_sandbox_id.return_value = "sandbox-1"
+
+        artifacts_json = json.dumps([
+            {"name": "cached.md", "path": "cached.md", "size": 123, "type": "md"},
+        ])
+
+        with patch("src.api.services.sandbox_service.get_sandbox_service", return_value=sandbox_service), patch(
+            "src.api.services.cron_service._scan_run_artifacts",
+            new_callable=AsyncMock,
+            return_value=artifacts_json,
+        ):
+            resp = client.get("/cron/runs/run-1/files")
+
+        assert resp.status_code == 200
+        assert resp.json()["files"][0]["name"] == "cached.md"
+        sandbox_service.get_cached.assert_called_once_with("testuser")
+        sandbox_service.get_or_resume.assert_not_called()
+
 
 class TestDownloadRunFile:
     """GET /cron/runs/{run_id}/files/{path} 安全校验"""
@@ -226,6 +255,33 @@ class TestDownloadRunFile:
         client, _mock_db = _make_client()
         resp = client.get("/cron/runs/run-1/files/test.txt")
         assert resp.status_code == 401
+
+    def test_download_prefers_cached_sandbox(self):
+        client, mock_db = _make_client()
+        run = _make_run_record()
+        user_sandbox = MagicMock()
+        user_sandbox.sandbox_id = "sandbox-1"
+        mock_db.query.return_value.filter.return_value.first.side_effect = [run, user_sandbox]
+
+        sandbox = MagicMock()
+        sandbox.files.read_bytes = AsyncMock(return_value=b"hello")
+
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = sandbox
+        sandbox_service.get_or_resume = AsyncMock()
+        sandbox_service.get_sandbox_id.return_value = "sandbox-1"
+
+        with patch("src.api.routes.cron.verify_access_token", return_value="testuser"), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ):
+            resp = client.get("/cron/runs/run-1/files/test.txt", params={"token": "fake"})
+
+        assert resp.status_code == 200
+        assert resp.content == b"hello"
+        sandbox_service.get_cached.assert_called_once_with("testuser")
+        sandbox_service.get_or_resume.assert_not_called()
+        sandbox.files.read_bytes.assert_awaited_once()
 
 
 class TestTriggerJob:

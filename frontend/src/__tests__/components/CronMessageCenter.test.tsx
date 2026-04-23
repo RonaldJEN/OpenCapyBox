@@ -238,6 +238,37 @@ describe('CronMessageCenter unread behavior', () => {
     });
   });
 
+  it('同一条记录重复展开时复用产物缓存，不重复请求文件列表', async () => {
+    vi.mocked(configApi.getCronRuns).mockResolvedValue({
+      runs: [{ ...baseRun, is_read: true, run_workspace: '/home/user/cron/runs/run-1', artifacts: null }],
+      total: 1,
+      offset: 0,
+      limit: 20,
+    });
+    vi.mocked(configApi.getUnreadCount).mockResolvedValue({ count: 0 });
+    vi.mocked(configApi.getCronRunFiles).mockResolvedValue({
+      files: [{ name: 'daily-summary.md', path: 'daily-summary.md', size: 120, type: 'md' }],
+    });
+
+    render(<CronMessageCenter />);
+
+    const card = await screen.findByRole('button', { name: /daily_iraq_news/i });
+
+    fireEvent.click(card);
+    await waitFor(() => {
+      expect(configApi.getCronRunFiles).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.findByRole('button', { name: 'daily-summary.md' })).toBeInTheDocument();
+
+    fireEvent.click(card);
+    fireEvent.click(card);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'daily-summary.md' })).toBeInTheDocument();
+    });
+    expect(configApi.getCronRunFiles).toHaveBeenCalledTimes(1);
+  });
+
   it('same instant with different timezone offsets uses same date group key', () => {
     const isoUtc = '2026-04-16T01:00:00Z';
     const isoOffset = '2026-04-15T20:00:00-05:00';
