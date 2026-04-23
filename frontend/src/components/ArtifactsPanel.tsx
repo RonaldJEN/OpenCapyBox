@@ -145,6 +145,8 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose }: ArtifactsPanelPro
     }
   };
 
+  const selectedFilePath = selectedFile?.path;
+
   if (!isMounted) return null;
 
   return (
@@ -254,7 +256,7 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose }: ArtifactsPanelPro
                   </div>
                 ) : (
                   items.map((item) => {
-                    const isSelected = !item.is_directory && selectedFile?.path === item.path;
+                    const isSelected = !item.is_directory && selectedFilePath === item.path;
                     return (
                       <div
                         key={item.path}

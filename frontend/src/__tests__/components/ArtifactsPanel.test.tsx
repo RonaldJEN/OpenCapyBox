@@ -151,6 +151,34 @@ describe('ArtifactsPanel 组件', () => {
     });
   });
 
+  it('关闭内联预览后应该返回文件列表', async () => {
+    render(
+      <ArtifactsPanel
+        sessionId="test-session"
+        isOpen
+        onClose={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('report.pdf')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('report.pdf'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('file-preview-inline-mock')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close Inline Preview' }));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('file-preview-inline-mock')).not.toBeInTheDocument();
+      expect(screen.getByText('data.xlsx')).toBeInTheDocument();
+      expect(screen.getByText('script.py')).toBeInTheDocument();
+    });
+  });
+
   it('空文件列表应该显示空目录提示', async () => {
     vi.mocked(apiService.getSessionFiles).mockResolvedValue({
       files: [],

@@ -8,8 +8,8 @@ const mockQuestions: AskUserQuestion[] = [
     header: 'DB',
     question: '选哪个数据库？',
     options: [
-      { label: 'PostgreSQL' },
-      { label: 'MySQL' },
+      { label: 'PostgreSQL', description: '功能强、生态完整' },
+      { label: 'MySQL', description: '易用且部署广泛' },
     ],
   },
 ];
