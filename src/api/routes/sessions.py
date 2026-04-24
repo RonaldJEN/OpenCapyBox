@@ -15,6 +15,7 @@ from src.api.deps import get_current_user
 from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.agui_event import AGUIEventLog
+from src.api.models.llm_call_record import LLMCallRecord
 from src.api.schemas.session import CreateSessionResponse, SessionResponse, SessionListResponse, FileListResponse, FileInfo, UpdateSessionTitleRequest
 from src.api.schemas.chat import HistoryResponseV2
 from src.api.services.sandbox_service import (
@@ -495,6 +496,7 @@ async def delete_session(
     round_ids = [r.id for r in db.query(Round.id).filter(Round.session_id == chat_session_id).all()]
     if round_ids:
         db.query(AGUIEventLog).filter(AGUIEventLog.run_id.in_(round_ids)).delete(synchronize_session=False)
+        db.query(LLMCallRecord).filter(LLMCallRecord.round_id.in_(round_ids)).delete(synchronize_session=False)
     db.query(Round).filter(Round.session_id == chat_session_id).delete(synchronize_session=False)
     db.query(ConversationMessage).filter(ConversationMessage.session_id == chat_session_id).delete(synchronize_session=False)
 

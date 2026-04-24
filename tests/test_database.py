@@ -73,6 +73,7 @@ class TestDatabaseConfig:
         tables = inspector.get_table_names()
         # 至少应该有 sessions 表
         assert len(tables) > 0
+        assert "llm_call_records" in tables
 
 
 class TestDatabaseMigration:

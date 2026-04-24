@@ -154,11 +154,17 @@ class TestLLMClientFailover:
     async def test_primary_success_no_failover(self):
         """主模型成功時不觸發 failover"""
         expected = LLMResponse(content="hello", thinking=None, tool_calls=[], finish_reason="stop")
+        expected_snapshot = {
+            "provider": "openai",
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
 
         with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
             mock_client = AsyncMock()
             mock_client.generate_stream = AsyncMock(return_value=expected)
             mock_client.retry_callback = None
+            mock_client.last_request_snapshot = expected_snapshot
             MockOAI.return_value = mock_client
 
             primary = _make_model_config("model-a")
@@ -169,21 +175,34 @@ class TestLLMClientFailover:
 
             assert result.content == "hello"
             assert mock_client.generate_stream.call_count == 1
+            assert client.last_request_snapshot == expected_snapshot
 
     @pytest.mark.asyncio
     async def test_failover_to_second_model(self):
         """主模型失敗後切換到 fallback 模型"""
         primary_err = RetryExhaustedError(TimeoutError("stream stalled"), 2)
         expected = LLMResponse(content="from fallback", thinking=None, tool_calls=[], finish_reason="stop")
+        primary_snapshot = {
+            "provider": "openai",
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "primary"}],
+        }
+        fallback_snapshot = {
+            "provider": "openai",
+            "model": "model-b",
+            "messages": [{"role": "user", "content": "fallback"}],
+        }
 
         with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
             primary_client = AsyncMock()
             primary_client.generate_stream = AsyncMock(side_effect=primary_err)
             primary_client.retry_callback = None
+            primary_client.last_request_snapshot = primary_snapshot
 
             fb_client = AsyncMock()
             fb_client.generate_stream = AsyncMock(return_value=expected)
             fb_client.retry_callback = None
+            fb_client.last_request_snapshot = fallback_snapshot
 
             MockOAI.side_effect = [primary_client, fb_client]
 
@@ -196,6 +215,7 @@ class TestLLMClientFailover:
             assert result.content == "from fallback"
             # failover 是 one-shot 的，不會永久切換 client
             assert client.model == "model-a"
+            assert client.last_request_snapshot == fallback_snapshot
 
     @pytest.mark.asyncio
     async def test_all_models_fail(self):

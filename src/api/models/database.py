@@ -19,6 +19,7 @@ def _import_models():
     from src.api.models import run_cancel_request as _  # noqa: F401
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
     from src.api.models.conversation_message import ConversationMessage as _  # noqa: F401
+    from src.api.models.llm_call_record import LLMCallRecord as _  # noqa: F401
     from src.api.models.user_memory import (  # noqa: F401
         UserMemory, MemoryEmbedding, CronJobRun, UserSkillConfig
     )

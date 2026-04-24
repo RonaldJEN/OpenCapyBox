@@ -96,8 +96,14 @@ class AnthropicClient(LLMClientBase):
         if system_message:
             params["system"] = system_message
 
-        if tools:
-            params["tools"] = self._convert_tools(tools)
+        converted_tools = self._convert_tools(tools) if tools else None
+        if converted_tools:
+            params["tools"] = converted_tools
+
+        self.last_request_snapshot = {
+            "provider": "anthropic",
+            **params,
+        }
 
         # Use Anthropic async SDK's messages.create
         response = await self.client.messages.create(**params)
@@ -487,8 +493,14 @@ class AnthropicClient(LLMClientBase):
         if request_params["system_message"]:
             params["system"] = request_params["system_message"]
 
-        if request_params["tools"]:
-            params["tools"] = self._convert_tools(request_params["tools"])
+        converted_tools = self._convert_tools(request_params["tools"]) if request_params["tools"] else None
+        if converted_tools:
+            params["tools"] = converted_tools
+
+        self.last_request_snapshot = {
+            "provider": "anthropic",
+            **params,
+        }
 
         # Make streaming API request with retry logic
         if self.retry_config.enabled:

@@ -140,6 +140,37 @@ class TestAgentMessageSummarization:
         assert len(result) > 0
 
     @pytest.mark.asyncio
+    async def test_create_summary_prompt_uses_structured_sections_and_user_anchor(self, tmp_path):
+        """摘要 prompt 應包含 9-section 結構，且保留用戶意圖錨點"""
+        llm = MockLLMClient()
+        captured: dict[str, list[Message]] = {}
+
+        async def capture_generate(messages, tools=None, **kwargs):
+            captured["messages"] = messages
+            return LLMResponse(content="Structured summary", finish_reason="stop")
+
+        llm.generate = capture_generate
+        agent = make_agent(tmp_path, llm=llm)
+
+        messages = [
+            Message(role="assistant", content="I inspected src/api/services/agent_service.py"),
+            Message(role="tool", content="Tool result here", tool_call_id="123"),
+        ]
+
+        result = await agent._create_summary(
+            messages,
+            1,
+            round_user_message="帮我回邮件并附上链接和PDF",
+        )
+
+        assert result == "Structured summary"
+        prompt = captured["messages"][1].content
+        assert "1. Primary Request and Intent" in prompt
+        assert "6. All user messages (exclude tool results)" in prompt
+        assert "8. Current Work" in prompt
+        assert "帮我回邮件并附上链接和PDF" in prompt
+
+    @pytest.mark.asyncio
     async def test_create_summary_llm_failure(self, tmp_path):
         """測試 LLM 摘要失敗時的處理"""
         llm = MockLLMClient()
@@ -223,6 +254,42 @@ class TestAgentRun:
         # 檢查基本事件流
         assert "RUN_STARTED" in event_types
         assert "RUN_FINISHED" in event_types or "RUN_ERROR" in event_types
+
+    @pytest.mark.asyncio
+    async def test_run_agui_llm_call_record_uses_provider_request_snapshot(self, tmp_path):
+        """LLM 调用记录应优先落 provider 转换后的请求快照"""
+        llm = MockLLMClient()
+
+        async def fake_generate_stream(messages, tools=None, on_content=None, on_thinking=None, on_tool_call=None):
+            llm.last_request_snapshot = {
+                "provider": "openai",
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": [{"type": "function", "function": {"name": "mock_tool"}}],
+                "max_tokens": 1024,
+                "stream": True,
+            }
+            if on_content:
+                await on_content("answer")
+            return LLMResponse(content="answer", finish_reason="stop")
+
+        llm.generate_stream = fake_generate_stream
+        agent = make_agent(tmp_path, llm=llm, max_steps=2)
+        agent.add_user_message("Hello")
+
+        payloads = []
+
+        async def capture_payload(payload):
+            payloads.append(payload)
+
+        agent.set_llm_call_hook(capture_payload)
+        await collect_agui_events(agent)
+
+        assert payloads
+        first_call = payloads[0]
+        assert first_call["request_messages"] == [llm.last_request_snapshot]
+        assert first_call["request_messages"][0]["messages"][0]["content"] == "Hello"
+        assert first_call["request_tools"] == ["mock_tool"]
 
     @pytest.mark.asyncio
     async def test_run_agui_with_tool_calls(self, tmp_path):

@@ -317,6 +317,30 @@ class TestAnthropicClientMakeRequest:
 
         assert result == mock_response
 
+    @pytest.mark.asyncio
+    async def test_make_api_request_records_last_request_snapshot(self, anthropic_client_with_mock):
+        """同步調用應記錄最終 provider 請求快照"""
+        client = anthropic_client_with_mock
+        mock_response = MockAnthropicResponse(content=[MockContentBlock("text", text="ok")])
+        client.client.messages.create = AsyncMock(return_value=mock_response)
+
+        api_messages = [{"role": "user", "content": "Hello"}]
+        tools = [{"name": "test", "description": "Test", "input_schema": {}}]
+        await client._make_api_request(
+            system_message="System",
+            api_messages=api_messages,
+            tools=tools,
+        )
+
+        snapshot = client.last_request_snapshot
+        assert snapshot is not None
+        assert snapshot["provider"] == "anthropic"
+        assert snapshot["messages"] == api_messages
+        assert snapshot["system"] == "System"
+        assert snapshot["model"] == client.model
+        assert snapshot["max_tokens"] == client.max_tokens
+        assert snapshot["tools"][0]["name"] == "test"
+
 
 class TestAnthropicClientParseResponse:
     """響應解析測試"""
@@ -463,3 +487,23 @@ class TestAnthropicClientGenerate:
 
         assert result.tool_calls is not None
         assert len(result.tool_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_generate_stream_records_last_request_snapshot(self, anthropic_client):
+        """流式調用應記錄最終 provider 請求快照"""
+        anthropic_client._make_stream_request = AsyncMock(
+            return_value=LLMResponse(content="ok", finish_reason="stop")
+        )
+        tools = [{"name": "test_tool", "description": "Test", "input_schema": {}}]
+
+        await anthropic_client.generate_stream(
+            messages=[Message(role="user", content="hello")],
+            tools=tools,
+        )
+
+        snapshot = anthropic_client.last_request_snapshot
+        assert snapshot is not None
+        assert snapshot["provider"] == "anthropic"
+        assert snapshot["messages"][0]["role"] == "user"
+        assert snapshot["messages"][0]["content"] == "hello"
+        assert snapshot["tools"][0]["name"] == "test_tool"

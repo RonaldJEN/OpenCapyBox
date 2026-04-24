@@ -272,17 +272,39 @@ class AgentService:
         # 限制歷史消息數量
         max_msgs = get_settings().agent_max_history_messages
         if len(messages) > max_msgs:
-            trimmed = messages[-max_msgs:]
+            start_idx = len(messages) - max_msgs
+            trimmed = messages[start_idx:]
             # 確保從真實 user 消息邊界開始（跳過 synthetic）
             while trimmed and (trimmed[0].role != "user" or trimmed[0].is_synthetic):
                 trimmed = trimmed[1:]
             if not trimmed:
-                logger.error(
-                    "歷史消息裁剪後為空：最近 %d 條全部非 user 開頭，"
-                    "說明 _rebuild_messages_from_events 存在 bug (session=%s)",
-                    max_msgs, self.session_id,
+                # 回退策略：從窗口起點向前回溯到最近真實 user 邊界，避免整段失憶
+                fallback_idx = next(
+                    (
+                        i
+                        for i in range(start_idx - 1, -1, -1)
+                        if messages[i].role == "user" and not messages[i].is_synthetic
+                    ),
+                    None,
                 )
-                return
+                if fallback_idx is not None:
+                    trimmed = messages[fallback_idx:]
+                    logger.warning(
+                        "歷史消息尾窗最近 %d 條無真實 user 邊界，已回退到最近真實 user@index=%d，"
+                        "實際注入 %d 條 (session=%s)",
+                        max_msgs,
+                        fallback_idx,
+                        len(trimmed),
+                        self.session_id,
+                    )
+                else:
+                    # 極端兜底：整體歷史不存在真實 user，保留尾窗避免全空。
+                    logger.error(
+                        "歷史消息中不存在真實 user 邊界，保留最近 %d 條作為兜底 (session=%s)",
+                        max_msgs,
+                        self.session_id,
+                    )
+                    trimmed = messages[start_idx:]
             logger.warning(
                 "歷史消息 %d 條超過上限 %d，保留最近 %d 條 (session=%s)",
                 len(messages), max_msgs, len(trimmed), self.session_id,
@@ -361,7 +383,13 @@ class AgentService:
                         content = json.loads(um.content)
                     except (json.JSONDecodeError, TypeError):
                         content = um.content
-                    messages.append(AgentMessage(role="user", content=content))
+                    messages.append(
+                        AgentMessage(
+                            role="user",
+                            content=content,
+                            is_synthetic=bool(getattr(um, "is_synthetic", False)),
+                        )
+                    )
             elif rnd.user_message:
                 # Fallback：conversation_messages 無記錄（歷史數據遷移期），用 rounds.user_message
                 logger.warning(
@@ -378,7 +406,15 @@ class AgentService:
                 continue
 
             # 4b. Agent 輸出（從預載的 agui_events 重建 assistant + tool 消息）
-            messages.extend(self._events_to_messages(events_by_round.get(rnd.id, [])))
+            round_messages = self._events_to_messages(events_by_round.get(rnd.id, []))
+
+            # interrupted round 被後續輪次解決後，避免冷恢復時仍看到過期占位內容
+            if getattr(rnd, "status", None) == "resumed":
+                for msg in round_messages:
+                    if msg.role == "tool" and msg.content == "[Awaiting user response]":
+                        msg.content = "[Interrupt resolved in subsequent round]"
+
+            messages.extend(round_messages)
 
         return messages
 
@@ -647,7 +683,7 @@ class AgentService:
                 agent_blocks.append(
                     {
                         "type": "text",
-                        "text": f"[附件文件] name={file_name} path={file_path}。如需读取，请使用 read_file 工具。",
+                        "text": f"[附件文件] name={file_name} path={file_path}。文件已就绪，请根据当前任务上下文决定是否需要读取其内容。",
                     }
                 )
             else:
@@ -959,6 +995,25 @@ class AgentService:
         # 固化本輪 cancel_token，避免後續新 run 覆蓋 self.cancel_token 導致判定串擾。
         run_cancel_token = self.cancel_token
 
+        async def _record_llm_call(payload: dict[str, Any]) -> None:
+            await self.history_service.save_llm_call_record(
+                session_id=self.session_id,
+                round_id=run_id,
+                step_index=payload["step_index"],
+                request_messages=payload["request_messages"],
+                request_tools=payload["request_tools"],
+                response_content=payload["response_content"],
+                response_thinking=payload["response_thinking"],
+                response_tool_calls=payload["response_tool_calls"],
+                response_error=payload["response_error"],
+                finish_reason=payload["finish_reason"],
+                usage_prompt_tokens=payload["usage_prompt_tokens"],
+                usage_completion_tokens=payload["usage_completion_tokens"],
+                usage_total_tokens=payload["usage_total_tokens"],
+            )
+
+        self.agent.set_llm_call_hook(_record_llm_call)
+
         try:
             async for event in self.agent.run_agui(
                 thread_id=self.session_id,
@@ -1098,6 +1153,7 @@ class AgentService:
                     )
                 except Exception:
                     logger.error("Round %s 異常退出後無法更新 DB", run_id, exc_info=True)
+            self.agent.set_llm_call_hook(None)
 
     async def _post_round_tasks(
         self,

@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 import os
-from typing import AsyncIterator, Optional, Any
+from typing import AsyncIterator, Optional, Any, Callable, Awaitable
 
 import tiktoken
 
@@ -168,6 +168,9 @@ class Agent:
         # Human-in-the-Loop: ask_user 中断状态
         self._pending_interrupt: dict[str, Any] | None = None
 
+        # 单次 LLM 调用快照回调（由 AgentService 在 run 级别绑定）
+        self._llm_call_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+
     def add_user_message(self, content: str | list[dict[str, Any]]):
         """Add a user message to history with current timestamp."""
         # 在用户消息中附加当前时间（保持轻量级，避免冗余）
@@ -242,6 +245,19 @@ class Agent:
                 msg.content = replacement_content
                 break
         self._pending_interrupt = None
+
+    def set_llm_call_hook(
+        self,
+        hook: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> None:
+        """设置/清空 step 级 LLM 调用快照回调。"""
+        self._llm_call_hook = hook
+
+    async def _emit_llm_call_record(self, payload: dict[str, Any]) -> None:
+        """向上层发射 LLM 调用快照。"""
+        if self._llm_call_hook is None:
+            return
+        await self._llm_call_hook(payload)
 
     def _required_tool_fields(self, tool: Tool) -> set[str]:
         """Extract required argument fields from tool schema."""
@@ -494,7 +510,11 @@ class Agent:
 
             # If there are execution messages in this round, summarize them
             if execution_messages:
-                summary_text = await self._create_summary(execution_messages, i + 1)
+                summary_text = await self._create_summary(
+                    execution_messages,
+                    i + 1,
+                    round_user_message=self.messages[user_idx].content,
+                )
                 if summary_text:
                     summary_message = Message(
                         role="assistant",
@@ -513,12 +533,18 @@ class Agent:
         # 重置静默记忆刷新标记，允许下次压缩前再次刷新
         self._memory_flushed_this_compaction = False
 
-    async def _create_summary(self, messages: list[Message], round_num: int) -> str:
+    async def _create_summary(
+        self,
+        messages: list[Message],
+        round_num: int,
+        round_user_message: str | list[dict[str, Any]] | None = None,
+    ) -> str:
         """Create summary for one execution round
 
         Args:
             messages: List of messages to summarize
             round_num: Round number
+            round_user_message: 原始轮次用户消息（用于保持意图锚点）
 
         Returns:
             Summary text
@@ -526,8 +552,29 @@ class Agent:
         if not messages:
             return ""
 
+        def _content_to_text(content: Any) -> str:
+            if isinstance(content, str):
+                return content
+            return str(content)
+
+        user_messages: list[str] = []
+        if round_user_message is not None:
+            user_messages.append(_content_to_text(round_user_message))
+
+        for msg in messages:
+            if msg.role == "user" and not msg.is_synthetic:
+                user_messages.append(_content_to_text(msg.content))
+
         # Build summary content
         summary_content = f"Round {round_num} execution process:\n\n"
+        summary_content += "All user messages in this scope (non-tool-result):\n"
+        if user_messages:
+            for idx, text in enumerate(user_messages, 1):
+                summary_content += f"{idx}. {text}\n"
+        else:
+            summary_content += "None\n"
+        summary_content += "\nExecution transcript:\n"
+
         for msg in messages:
             if msg.role == "assistant":
                 content_text = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -535,29 +582,44 @@ class Agent:
                 if msg.tool_calls:
                     tool_names = [tc.function.name for tc in msg.tool_calls]
                     summary_content += f"  → Called tools: {', '.join(tool_names)}\n"
+            elif msg.role == "user" and not msg.is_synthetic:
+                content_text = msg.content if isinstance(msg.content, str) else str(msg.content)
+                summary_content += f"User: {content_text}\n"
             elif msg.role == "tool":
                 result_preview = msg.content if isinstance(msg.content, str) else str(msg.content)
                 summary_content += f"  ← Tool returned: {result_preview}...\n"
 
         # Call LLM to generate concise summary
         try:
-            summary_prompt = f"""Please provide a concise summary of the following Agent execution process:
+            summary_prompt = f"""You are summarizing one historical agent execution slice for context compaction.
 
 {summary_content}
 
+Write a structured summary in English using the following 9 sections:
+1. Primary Request and Intent
+2. Key Technical Concepts
+3. Files and Code Sections
+4. Errors and fixes
+5. Problem Solving
+6. All user messages (exclude tool results)
+7. Pending Tasks
+8. Current Work
+9. Optional Next Step
+
 Requirements:
-1. Focus on what tasks were completed and which tools were called
-2. Keep key execution results and important findings
-3. Be concise and clear, within 1000 words
-4. Use English
-5. Do not include "user" related content, only summarize the Agent's execution process"""
+1. Keep facts grounded in the provided content only.
+2. "All user messages" must include every user message in this slice.
+3. "Current Work" must describe exactly what the agent was doing at the end of this slice.
+4. If a section has no information, write "None".
+5. Keep the response concise and scannable.
+6. Output plain text only."""
 
             summary_msg = Message(role="user", content=summary_prompt)
             response = await self.llm.generate(
                 messages=[
                     Message(
                         role="system",
-                        content="You are an assistant skilled at summarizing Agent execution processes.",
+                        content="You are an assistant skilled at structured summaries for Agent context compaction.",
                     ),
                     summary_msg,
                 ]
@@ -663,6 +725,11 @@ Requirements:
                 # 獲取工具列表
                 tool_list = list(self.tools.values())
                 self.logger.log_request(messages=self.messages, tools=tool_list)
+                request_messages_snapshot = [msg.model_dump(exclude_none=True) for msg in self.messages]
+                request_tools_snapshot = [tool.name for tool in tool_list]
+                step_index = step + 1
+                if hasattr(self.llm, "last_request_snapshot"):
+                    self.llm.last_request_snapshot = None
                 
                 # 調用 LLM 並處理流式響應
                 # 真正流式 Streaming 实现 (Producer-Consumer 模式)
@@ -795,6 +862,10 @@ Requirements:
                     self.context_window = _primary_context_window
                     self.max_output_tokens = _primary_max_output_tokens
 
+                llm_request_snapshot = getattr(self.llm, "last_request_snapshot", None)
+                if isinstance(llm_request_snapshot, dict):
+                    request_messages_snapshot = [llm_request_snapshot]
+
                 # 错误处理
                 if isinstance(result, Exception):
                     e = result
@@ -804,6 +875,22 @@ Requirements:
                     else:
                         error_msg = f"LLM call failed: {str(e)}"
 
+                    await self._emit_llm_call_record(
+                        {
+                            "step_index": step_index,
+                            "request_messages": request_messages_snapshot,
+                            "request_tools": request_tools_snapshot,
+                            "response_content": None,
+                            "response_thinking": None,
+                            "response_tool_calls": None,
+                            "response_error": error_msg,
+                            "finish_reason": None,
+                            "usage_prompt_tokens": None,
+                            "usage_completion_tokens": None,
+                            "usage_total_tokens": None,
+                        }
+                    )
+
                     print(f"\n{Colors.BRIGHT_RED}❌ Error:{Colors.RESET} {error_msg}")
 
                     yield emitter.step_finished(step_name)
@@ -811,6 +898,28 @@ Requirements:
                     return
 
                 response = result
+
+                response_tool_calls_payload = (
+                    [tc.model_dump() for tc in response.tool_calls]
+                    if response.tool_calls
+                    else None
+                )
+                usage = response.usage
+                await self._emit_llm_call_record(
+                    {
+                        "step_index": step_index,
+                        "request_messages": request_messages_snapshot,
+                        "request_tools": request_tools_snapshot,
+                        "response_content": response.content,
+                        "response_thinking": response.thinking,
+                        "response_tool_calls": response_tool_calls_payload,
+                        "response_error": None,
+                        "finish_reason": response.finish_reason,
+                        "usage_prompt_tokens": usage.prompt_tokens if usage else None,
+                        "usage_completion_tokens": usage.completion_tokens if usage else None,
+                        "usage_total_tokens": usage.total_tokens if usage else None,
+                    }
+                )
 
                 # 记录 LLM 返回的 token 用量
                 self.last_llm_usage = response.usage

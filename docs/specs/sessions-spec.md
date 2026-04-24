@@ -101,7 +101,7 @@
 
 - Response 200: `{message: "会话已删除"}`
 - Error 404
-- 级联删除：Round (CASCADE) → AGUIEventLog (CASCADE)、ConversationMessage、AgentPoolService 缓存移除
+- 级联删除：Round (CASCADE) → AGUIEventLog (CASCADE)、ConversationMessage、LLMCallRecord、AgentPoolService 缓存移除
 - 沙箱清理：尝试删除 workspace 目录，沙箱过期时仅删 DB 记录
 
 ### GET /api/sessions/{id}/files
@@ -133,7 +133,7 @@
 ## 4. 行为语义与不变量
 
 - 一个 Session = 一个 AG-UI Thread
-- Session 删除是级联的：rounds → agui_events → conversation_messages 全部删除
+- Session 删除是级联的：rounds → agui_events → conversation_messages → llm_call_records 全部删除
 - 文件路径校验：必须在沙箱 mount 路径内（`is_within_sandbox_root`），否则 403
 - running-session 查询通过 JOIN `UserRunLock` + `Round` 实现单次查询
 - 历史 v2 通过 AGUI 事件动态重建 Step 结构，而非直接查表

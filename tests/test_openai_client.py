@@ -403,6 +403,49 @@ class TestAPIRequest:
         call_kwargs = openai_client_with_reasoning.client.chat.completions.create.call_args.kwargs
         assert "tools" in call_kwargs
 
+    @pytest.mark.asyncio
+    async def test_api_request_records_last_request_snapshot(self, openai_client_with_reasoning):
+        """同步調用應記錄最終 provider 請求快照"""
+        mock_message = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock(message=mock_message)]
+        openai_client_with_reasoning.client.chat.completions.create = AsyncMock(return_value=mock_response)
+
+        api_messages = [{"role": "user", "content": "hello"}]
+        tools = [{"type": "function", "function": {"name": "tool1"}}]
+        await openai_client_with_reasoning._make_api_request(api_messages, tools=tools)
+
+        snapshot = openai_client_with_reasoning.last_request_snapshot
+        assert snapshot is not None
+        assert snapshot["provider"] == "openai"
+        assert snapshot["messages"] == api_messages
+        assert snapshot["model"] == openai_client_with_reasoning.model
+        assert snapshot["max_tokens"] == openai_client_with_reasoning.max_tokens
+        assert snapshot["tools"][0]["function"]["name"] == "tool1"
+
+
+class TestGenerateStream:
+    @pytest.mark.asyncio
+    async def test_generate_stream_records_last_request_snapshot(self, openai_client):
+        """流式調用應記錄最終 provider 請求快照"""
+        openai_client._make_stream_request = AsyncMock(
+            return_value=LLMResponse(content="ok", finish_reason="stop")
+        )
+        tools = [{"type": "function", "function": {"name": "tool1"}}]
+
+        await openai_client.generate_stream(
+            messages=[Message(role="user", content="hello")],
+            tools=tools,
+        )
+
+        snapshot = openai_client.last_request_snapshot
+        assert snapshot is not None
+        assert snapshot["provider"] == "openai"
+        assert snapshot["stream"] is True
+        assert snapshot["messages"][0]["role"] == "user"
+        assert snapshot["messages"][0]["content"] == "hello"
+        assert snapshot["tools"][0]["function"]["name"] == "tool1"
+
 
 class TestEdgeCases:
     """測試邊界情況"""

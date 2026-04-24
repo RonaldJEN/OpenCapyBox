@@ -11,7 +11,7 @@ Supports two initialization modes:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..retry import RetryConfig, RetryExhaustedError
 from ..schema import LLMProvider, LLMResponse, Message
@@ -130,6 +130,9 @@ class LLMClient:
 
         logger.info("Initialized LLM client: provider=%s, api_base=%s", provider, full_api_base)
 
+        # 最近一次实际发送给 provider 的请求快照
+        self._last_request_snapshot: dict[str, Any] | None = None
+
         # Failover: 備用模型配置列表（僅 from_model_config 路徑使用）
         self._fallback_configs: list[ModelConfig] = []
         # 緩存已構建的 fallback 客戶端，避免每次 failover 都重建
@@ -195,6 +198,16 @@ class LLMClient:
         self._client.retry_callback = value
 
     @property
+    def last_request_snapshot(self) -> dict[str, Any] | None:
+        """Get last provider request snapshot for auditing."""
+        return self._last_request_snapshot
+
+    @last_request_snapshot.setter
+    def last_request_snapshot(self, value: dict[str, Any] | None):
+        """Set last provider request snapshot."""
+        self._last_request_snapshot = value
+
+    @property
     def failover_notify(self):
         """Get failover notify callback (async callable or None)."""
         return self._failover_notify
@@ -209,6 +222,10 @@ class LLMClient:
         self._failover_notify = value
 
     # ---- Failover helpers ----
+
+    def _sync_last_request_snapshot(self, client: LLMClientBase) -> None:
+        snapshot = getattr(client, "last_request_snapshot", None)
+        self._last_request_snapshot = snapshot if isinstance(snapshot, dict) else None
 
     @classmethod
     def _build_client(cls, config: "ModelConfig", retry_config: RetryConfig) -> LLMClientBase:
@@ -235,8 +252,11 @@ class LLMClient:
         # 1) 嘗試主模型
         last_error: Exception | None = None
         try:
-            return await getattr(self._client, call_method)(**kwargs)
+            result = await getattr(self._client, call_method)(**kwargs)
+            self._sync_last_request_snapshot(self._client)
+            return result
         except RetryExhaustedError as primary_err:
+            self._sync_last_request_snapshot(self._client)
             last_error = primary_err
             if not self._fallback_configs:
                 raise
@@ -268,11 +288,13 @@ class LLMClient:
                 fb_client = self._fallback_clients[fb_config.id]
                 fb_client.retry_callback = self._client.retry_callback
                 result = await getattr(fb_client, call_method)(**kwargs)
+                self._sync_last_request_snapshot(fb_client)
                 # 僅本次調用使用 fallback，不修改 self._client，
                 # 下次調用仍優先嘗試主模型（主模型可能已恢復）。
                 logger.info("Failover succeeded (one-shot): model '%s'", fb_config.id)
                 return result
             except RetryExhaustedError as fb_err:
+                self._sync_last_request_snapshot(fb_client)
                 logger.warning(
                     "Failover model '%s' also failed: %s",
                     fb_config.id, fb_err,

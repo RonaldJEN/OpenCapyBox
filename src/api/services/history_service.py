@@ -9,8 +9,9 @@ from sqlalchemy.exc import IntegrityError
 from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.agui_event import AGUIEventLog
+from src.api.models.llm_call_record import LLMCallRecord
 from src.agent.schema.agui_events import AGUIEvent, EventType
-from typing import List, Dict, Optional, AsyncIterator
+from typing import List, Dict, Optional, AsyncIterator, Any
 from datetime import datetime
 from src.api.utils.timezone import now_naive
 import json
@@ -641,3 +642,45 @@ class HistoryService:
                     })
         
         return messages
+
+    async def save_llm_call_record(
+        self,
+        *,
+        session_id: str,
+        round_id: str,
+        step_index: int,
+        request_messages: list[dict[str, Any]],
+        request_tools: list[str],
+        response_content: str | None,
+        response_thinking: str | None,
+        response_tool_calls: list[dict[str, Any]] | None,
+        response_error: str | None,
+        finish_reason: str | None,
+        usage_prompt_tokens: int | None,
+        usage_completion_tokens: int | None,
+        usage_total_tokens: int | None,
+    ) -> LLMCallRecord:
+        """持久化单次 LLM 调用快照。"""
+        row = LLMCallRecord(
+            session_id=session_id,
+            round_id=round_id,
+            step_index=step_index,
+            request_messages=json.dumps(request_messages, ensure_ascii=False),
+            request_tools=json.dumps(request_tools, ensure_ascii=False),
+            response_content=response_content,
+            response_thinking=response_thinking,
+            response_tool_calls=(
+                json.dumps(response_tool_calls, ensure_ascii=False)
+                if response_tool_calls is not None
+                else None
+            ),
+            response_error=response_error,
+            finish_reason=finish_reason,
+            usage_prompt_tokens=usage_prompt_tokens,
+            usage_completion_tokens=usage_completion_tokens,
+            usage_total_tokens=usage_total_tokens,
+        )
+        self.db.add(row)
+        self.db.commit()
+        self.db.refresh(row)
+        return row

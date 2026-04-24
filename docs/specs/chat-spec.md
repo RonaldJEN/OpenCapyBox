@@ -1,7 +1,7 @@
 # 聊天与 Agent 执行 (Chat) — Spec
 
 > **模块归属**: `src/api/routes/chat.py`, `src/api/services/agent_service.py`, `src/agent/agent.py`
-> **最后更新**: 2026-04-17
+> **最后更新**: 2026-04-24
 > **状态**: Draft
 
 ---
@@ -139,7 +139,31 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 
 **唯一约束**: `UniqueConstraint(session_id, sequence)`
 
-### 2.4 `user_run_locks` 表
+### 2.4 `llm_call_records` 表
+
+持久化每次 LLM 调用（step 级）的输入输出快照，用于运行后审计与问题排查。
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | Integer | PK, autoincrement | 自增主键 |
+| `session_id` | String(36) | FK → `sessions.id`, NOT NULL, indexed | 所属会话 |
+| `round_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL, indexed | 所属 Round |
+| `step_index` | Integer | NOT NULL | 第几次 LLM 调用（从 1 开始） |
+| `request_messages` | Text | NOT NULL | 实际发送给 provider 的请求快照（JSON，包含 provider/model/messages，必要时包含 system/tools/stream 等参数） |
+| `request_tools` | Text | NOT NULL | 本次可用工具名称列表（JSON，用于快速检索；真实工具请求体以 `request_messages` 为准） |
+| `response_content` | Text | nullable | LLM 返回文本 |
+| `response_thinking` | Text | nullable | LLM 思考内容（若模型支持） |
+| `response_tool_calls` | Text | nullable | LLM 返回的 tool_calls（JSON） |
+| `response_error` | Text | nullable | LLM 调用失败时的错误文本 |
+| `finish_reason` | String(50) | nullable | 结束原因 |
+| `usage_prompt_tokens` | Integer | nullable | prompt token 数 |
+| `usage_completion_tokens` | Integer | nullable | completion token 数 |
+| `usage_total_tokens` | Integer | nullable | 总 token 数 |
+| `created_at` | DateTime | default=now, indexed | 写入时间 |
+
+**唯一约束**: `UniqueConstraint(round_id, step_index)`
+
+### 2.5 `user_run_locks` 表
 
 用户级执行互斥锁。确保每个用户同一时刻只有一个 Agent 在执行。
 
@@ -153,7 +177,7 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 
 **并发语义**: 使用 PK 冲突（INSERT conflict）实现无等待互斥。若 INSERT 失败，说明用户已有正在运行的任务。
 
-### 2.5 `run_cancel_requests` 表
+### 2.6 `run_cancel_requests` 表
 
 跨 worker 取消请求的协调表。Worker 通过轮询此表检测取消信号。
 
@@ -208,6 +232,11 @@ Content-Type: application/json
 | `image_url` | `{type: "image_url", image_url: {url: string}}` | 图片（base64 data URI 或 URL） |
 | `video_url` | `{type: "video_url", video_url: {url: string}}` | 视频 |
 | `file` | `{type: "file", ...}` | 文件附件 |
+
+**file block 注入语义**:
+
+- `file` block 在进入 Agent 上下文前会映射为文本提示：`[附件文件] name=<name> path=<path>。文件已就绪，请根据当前任务上下文决定是否需要读取其内容。`
+- 该提示是中性提示，不强制触发 `read_file` 调用；是否读取由当前任务意图决定。
 
 **图片约束**:
 
@@ -646,7 +675,7 @@ INSERT INTO rounds (..., idempotency_key)
 | 级别 | 名称 | 策略 | 是否需要 LLM | 说明 |
 |------|------|------|-------------|------|
 | Level 2 | Microcompact | 替换 + 清理 | 否 | 替换超过 4000 字符的 `tool_result` 为摘要占位符；清理旧的 `thinking` 内容；保留最近 2 轮完整内容 |
-| Level 3 | LLM Summary | LLM 摘要 | **是** | 使用 LLM 对历史轮次逐轮生成摘要，替换原始内容 |
+| Level 3 | LLM Summary | LLM 摘要 | **是** | 使用 LLM 对历史轮次逐轮生成结构化摘要（9 sections），必须包含 `All user messages`（非 tool result）与 `Current Work`，替换原始内容 |
 | Level 4 | Emergency Truncate | 强制丢弃 | 否 | 从最老的 user round 开始丢弃，最多丢弃 3 轮，**至少保留 1 轮** |
 
 #### 压缩流程
@@ -677,6 +706,15 @@ INSERT INTO rounds (..., idempotency_key)
                    │
                    └── 强制满足 hard_ceiling
 ```
+
+#### 历史恢复裁剪边界（_restore_history）
+
+`agent_max_history_messages` 仅用于历史恢复阶段的注入上限控制，且遵循 user 边界对齐：
+
+1. 先取最近 `N` 条消息作为尾窗。
+2. 若尾窗首条不是“真实 user”（`role=user 且 is_synthetic=False`），向后跳过直到命中真实 user。
+3. 若尾窗内不存在真实 user，回退到全量历史中“离尾窗最近的真实 user 边界”，从该处注入到末尾（可超过 `N`）。
+4. 若全量历史都不存在真实 user（数据异常），保留尾窗作为兜底，避免注入全空导致整段失忆。
 
 ### 4.6 AG-UI 事件体系
 
@@ -780,7 +818,25 @@ Agent 调用 ask_user 工具
 
 **并发保护**: `_resume_lock` 使用 `asyncio.Lock`，确保同一会话的 resume 请求不会并发执行。
 
-### 4.8 LLM Failover
+**冷恢复占位归一化**:
+
+- 当原中断轮次状态已为 `resumed` 时，历史重建阶段会将旧的 ask_user 占位 `tool_result`（`[Awaiting user response]`）归一化为 `[Interrupt resolved in subsequent round]`，避免刷新后继续暴露过期等待状态。
+
+### 4.8 LLM 调用快照持久化
+
+每个 step 的 LLM 调用都会额外持久化到 `llm_call_records`：
+
+1. 调用前：记录 provider 转换后的最终请求快照（与实际发包口径一致）以及可用工具名称列表。
+2. 调用后成功：记录 `content` / `thinking` / `tool_calls` / `finish_reason` / `usage`。
+3. 调用后失败：记录 `response_error`。
+
+约束与边界：
+
+- 该表仅用于后端审计与排查，不参与 SSE 回放协议。
+- 会话删除时与 Round/Events 一并清理。
+- `step_index` 在同一 `round_id` 内唯一。
+
+### 4.9 LLM Failover
 
 #### Fallback 链
 

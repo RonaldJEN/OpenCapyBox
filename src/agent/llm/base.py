@@ -33,6 +33,8 @@ class LLMClientBase(ABC):
         self.api_base = api_base
         self.model = model
         self.retry_config = retry_config or RetryConfig()
+        # 最近一次实际发送给 provider 的请求快照（用于审计落库）
+        self.last_request_snapshot: dict[str, Any] | None = None
 
         # Callback for tracking retry count
         self.retry_callback = None

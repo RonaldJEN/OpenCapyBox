@@ -18,7 +18,7 @@ src/agent/config/mcp.json
 *.pfx
 credentials.json
 secrets.yaml
-
+claude-code-sourcemap
 # ========================================
 # 数据库和运行时数据
 # ========================================

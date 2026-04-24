@@ -42,6 +42,7 @@ class MockLLMClient:
         self.responses: list = []
         self.stream_responses: list = []
         self.call_count = 0
+        self.last_request_snapshot = None
 
     def _next_response(self, *, stream: bool = False):
         self.call_count += 1

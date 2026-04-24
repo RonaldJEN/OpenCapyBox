@@ -193,12 +193,13 @@ class TestEventsToMessages:
 class TestRebuildMessagesFromEvents:
     """测试从 DB 读取 rounds + agui_events + conversation_messages 重建完整消息"""
 
-    def _make_round(self, round_id, session_id, user_message, created_at_order=0):
+    def _make_round(self, round_id, session_id, user_message, created_at_order=0, status="completed"):
         rnd = MagicMock()
         rnd.id = round_id
         rnd.session_id = session_id
         rnd.user_message = user_message
         rnd.created_at = created_at_order
+        rnd.status = status
         return rnd
 
     def _make_conv_msg(self, role, content, round_id, sequence):
@@ -327,6 +328,31 @@ class TestRebuildMessagesFromEvents:
 
         assert messages == []
 
+    def test_resumed_round_rewrites_awaiting_placeholder(self):
+        """resumed 轮次在冷恢复时应改写 ask_user 旧占位内容"""
+        rounds = [self._make_round("r1", "s1", "please choose", status="resumed")]
+        user_msgs = [self._make_conv_msg("user", "please choose", "r1", 1)]
+        events = {
+            "r1": [
+                self._make_evt("TOOL_CALL_START", {"toolCallId": "tc1", "toolCallName": "ask_user"}, 1),
+                self._make_evt("TOOL_CALL_ARGS", {"toolCallId": "tc1", "delta": '{"questions": [{"question": "Q?"}]}'}, 2),
+                self._make_evt("TOOL_CALL_END", {"toolCallId": "tc1"}, 3),
+                self._make_evt("TOOL_CALL_RESULT", {"toolCallId": "tc1", "content": "[Awaiting user response]", "messageId": "m1"}, 4),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 5),
+            ],
+        }
+
+        mock_db = self._setup_db(rounds, user_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        tool_msgs = [m for m in messages if m.role == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0].content == "[Interrupt resolved in subsequent round]"
+
 
 # ============================================================
 # _restore_history 集成测试
@@ -381,8 +407,8 @@ class TestRestoreHistory:
         assert service.agent.messages[0].role == "user"
         assert service.agent.messages[0].content == "q2"
 
-    def test_restore_history_trim_logs_error_when_no_user_boundary(self, caplog):
-        """裁剪對齊到 user 邊界時全部被跳過，應記錄 error 並跳過注入"""
+    def test_restore_history_trim_fallbacks_to_nearest_real_user_boundary(self, caplog):
+        """尾窗無 user 邊界時，應回退到最近真實 user，避免整段失憶"""
         service = make_agent_service()
         service.agent = MagicMock()
         service.agent.messages = []
@@ -402,14 +428,43 @@ class TestRestoreHistory:
         mock_settings.agent_max_history_messages = 3  # 尾部 3 條都是 assistant/tool
 
         import logging
+        with caplog.at_level(logging.WARNING):
+            with patch.object(service, "_rebuild_messages_from_events", return_value=fake_messages):
+                with patch("src.api.config.get_settings", return_value=mock_settings):
+                    service._restore_history()
+
+        # 應回退到最近真實 user(q1) 而非整段丟棄
+        assert len(service.agent.messages) == len(fake_messages)
+        assert service.agent.messages[0].role == "user"
+        assert service.agent.messages[0].content == "q1"
+        assert any("回退到最近真實 user" in r.message for r in caplog.records)
+
+    def test_restore_history_trim_keeps_tail_when_no_real_user_anywhere(self, caplog):
+        """極端情況：全歷史無真實 user，至少保留尾窗避免全空"""
+        service = make_agent_service()
+        service.agent = MagicMock()
+        service.agent.messages = []
+
+        fake_messages = [
+            AgentMessage(role="assistant", content="a1"),
+            AgentMessage(role="tool", content="r1", tool_call_id="tc1", name="bash"),
+            AgentMessage(role="assistant", content="a2"),
+            AgentMessage(role="tool", content="r2", tool_call_id="tc2", name="bash"),
+        ]
+
+        mock_settings = MagicMock()
+        mock_settings.agent_max_history_messages = 2
+
+        import logging
         with caplog.at_level(logging.ERROR):
             with patch.object(service, "_rebuild_messages_from_events", return_value=fake_messages):
                 with patch("src.api.config.get_settings", return_value=mock_settings):
                     service._restore_history()
 
-        # 應記錄 error 日誌並且不注入任何消息
-        assert len(service.agent.messages) == 0
-        assert any("_rebuild_messages_from_events" in r.message for r in caplog.records)
+        assert len(service.agent.messages) == 2
+        assert service.agent.messages[0].content == "a2"
+        assert service.agent.messages[1].content == "r2"
+        assert any("不存在真實 user 邊界" in r.message for r in caplog.records)
 
     def test_restore_history_no_agent(self):
         service = make_agent_service()
@@ -558,8 +613,10 @@ class TestSyntheticMessagePersistenceOnRestore:
         assert len(messages) == 3
         assert messages[0].role == "user"
         assert messages[0].content == "hello"
+        assert messages[0].is_synthetic is False
         assert messages[1].role == "user"
         assert "empty response" in messages[1].content.lower()
+        assert messages[1].is_synthetic is True
         assert messages[2].role == "assistant"
         assert messages[2].content == "Here is my answer."
 

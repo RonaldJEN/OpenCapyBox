@@ -96,6 +96,7 @@ class TestAgentServiceChatAgui:
         history_service.create_round = MagicMock()
         history_service.complete_round = MagicMock()
         history_service.save_agui_event = AsyncMock()
+        history_service.save_llm_call_record = AsyncMock()
         history_service.resolve_interrupted_rounds = MagicMock(return_value=1)
 
         service = make_agent_service(history_service=history_service)
@@ -140,6 +141,63 @@ class TestAgentServiceChatAgui:
         assert service.history_service.save_agui_event.await_count == 4
 
     @pytest.mark.asyncio
+    async def test_chat_agui_persists_llm_call_record(self, service):
+        class HookAwareAgent:
+            def __init__(self):
+                self.messages = []
+                self._pending_interrupt = None
+                self._llm_call_hook = None
+                self.last_llm_usage = None
+
+            def has_pending_interrupt(self):
+                return False
+
+            def clear_pending_interrupt(self):
+                return None
+
+            def add_user_message(self, content):
+                self.messages.append(content)
+
+            def set_llm_call_hook(self, hook):
+                self._llm_call_hook = hook
+
+            async def run_agui(self, **kwargs):
+                await self._llm_call_hook(
+                    {
+                        "step_index": 1,
+                        "request_messages": [{"role": "system", "content": "s"}],
+                        "request_tools": ["read_file"],
+                        "response_content": "Hello",
+                        "response_thinking": None,
+                        "response_tool_calls": None,
+                        "response_error": None,
+                        "finish_reason": "stop",
+                        "usage_prompt_tokens": 10,
+                        "usage_completion_tokens": 3,
+                        "usage_total_tokens": 13,
+                    }
+                )
+                yield TextMessageContentEvent(messageId="m1", delta="Hello")
+                yield TextMessageEndEvent(messageId="m1")
+                yield StepFinishedEvent(stepName="step-1")
+                yield RunFinishedEvent(threadId="session-123", runId=kwargs["run_id"], outcome="success")
+
+        service.agent = HookAwareAgent()
+
+        async for _ in service.chat_agui([
+            {"type": "text", "text": "hello"},
+        ]):
+            pass
+
+        created_round_id = service.history_service.create_round.call_args.kwargs["round_id"]
+        save_kwargs = service.history_service.save_llm_call_record.await_args.kwargs
+        assert save_kwargs["session_id"] == "session-123"
+        assert save_kwargs["round_id"] == created_round_id
+        assert save_kwargs["step_index"] == 1
+        assert save_kwargs["response_content"] == "Hello"
+        assert save_kwargs["usage_total_tokens"] == 13
+
+    @pytest.mark.asyncio
     async def test_chat_agui_with_attachments(self, service):
         events = []
         async for event in service.chat_agui([
@@ -155,6 +213,13 @@ class TestAgentServiceChatAgui:
         assert isinstance(sent_content, list)
         assert any("path=a.txt" in block.get("text", "") for block in sent_content)
         assert any("path=b.pdf" in block.get("text", "") for block in sent_content)
+        file_text_blocks = [
+            block.get("text", "")
+            for block in sent_content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        assert any("文件已就绪" in text for text in file_text_blocks)
+        assert all("如需读取，请使用 read_file 工具" not in text for text in file_text_blocks)
         create_kwargs = service.history_service.create_round.call_args.kwargs
         assert create_kwargs["user_message"] == "read this"
         assert len(create_kwargs["user_attachments"]) == 2

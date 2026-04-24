@@ -102,8 +102,14 @@ class OpenAIClient(LLMClientBase):
             if self.enable_thinking:
                 params["extra_body"]["enable_thinking"] = True
 
-        if tools:
-            params["tools"] = self._convert_tools(tools)
+        converted_tools = self._convert_tools(tools) if tools else None
+        if converted_tools:
+            params["tools"] = converted_tools
+
+        self.last_request_snapshot = {
+            "provider": "openai",
+            **params,
+        }
 
         # Use OpenAI SDK's chat.completions.create
         response = await self.client.chat.completions.create(**params)
@@ -594,9 +600,14 @@ class OpenAIClient(LLMClientBase):
             if self.enable_thinking:
                 params["extra_body"]["enable_thinking"] = True
 
-        if request_params["tools"]:
-            # params["tools"] = request_params["tools"]
-            params["tools"] = self._convert_tools(request_params["tools"])
+        converted_tools = self._convert_tools(request_params["tools"]) if request_params["tools"] else None
+        if converted_tools:
+            params["tools"] = converted_tools
+
+        self.last_request_snapshot = {
+            "provider": "openai",
+            **params,
+        }
 
         # Make streaming API request with retry logic
         if self.retry_config.enabled:

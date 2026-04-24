@@ -13,6 +13,7 @@ from .database import Base, get_db, init_db
 from .session import Session, Thread  # Thread 是 Session 的別名
 from .round import Round, Run  # Run 是 Round 的別名
 from .agui_event import AGUIEventLog, Event  # Event 是 AGUIEventLog 的別名
+from .llm_call_record import LLMCallRecord
 from .user_run_lock import UserRunLock
 from .run_cancel_request import RunCancelRequest
 
@@ -26,6 +27,7 @@ __all__ = [
     "Session",
     "Round",
     "AGUIEventLog",
+    "LLMCallRecord",
     "UserRunLock",
     "RunCancelRequest",
     
