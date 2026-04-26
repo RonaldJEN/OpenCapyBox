@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 import os
+from time import perf_counter
 from typing import AsyncIterator, Optional, Any, Callable, Awaitable
 
 import tiktoken
@@ -730,6 +731,14 @@ Requirements:
                 step_index = step + 1
                 if hasattr(self.llm, "last_request_snapshot"):
                     self.llm.last_request_snapshot = None
+                request_started_at = perf_counter()
+                first_token_latency_s: float | None = None
+                completion_latency_s: float | None = None
+
+                def _mark_first_token() -> None:
+                    nonlocal first_token_latency_s
+                    if first_token_latency_s is None:
+                        first_token_latency_s = round(perf_counter() - request_started_at, 3)
                 
                 # 調用 LLM 並處理流式響應
                 # 真正流式 Streaming 实现 (Producer-Consumer 模式)
@@ -743,6 +752,7 @@ Requirements:
                 message_started = False
 
                 async def on_content_delta(delta: str):
+                    _mark_first_token()
                     nonlocal message_started
                     if not message_started:
                         await event_queue.put(emitter.text_message_start(role="assistant"))
@@ -752,6 +762,7 @@ Requirements:
                         await event_queue.put(event)
 
                 async def on_thinking_delta(delta: str):
+                    _mark_first_token()
                     nonlocal thinking_started
                     if not thinking_started:
                         await event_queue.put(emitter.thinking_start())
@@ -759,6 +770,9 @@ Requirements:
                     event = emitter.thinking_content(delta)
                     if event:
                         await event_queue.put(event)
+
+                async def on_tool_call_delta(*_: Any):
+                    _mark_first_token()
 
                 # 保存主模型參數，供 failover 恢復（try/finally 確保所有退出路徑都恢復）
                 _primary_context_window = self.context_window
@@ -797,6 +811,7 @@ Requirements:
                                 tools=tool_list,
                                 on_content=on_content_delta,
                                 on_thinking=on_thinking_delta,
+                                on_tool_call=on_tool_call_delta,
                             )
                         except Exception as e:
                             return e
@@ -857,6 +872,7 @@ Requirements:
 
                     # 获取最终结果
                     result = await producer_task
+                    completion_latency_s = round(perf_counter() - request_started_at, 3)
                 finally:
                     # Failover 是一次性的，無論成功/失敗/取消都恢復主模型參數
                     self.context_window = _primary_context_window
@@ -888,6 +904,8 @@ Requirements:
                             "usage_prompt_tokens": None,
                             "usage_completion_tokens": None,
                             "usage_total_tokens": None,
+                            "first_token_latency_s": first_token_latency_s,
+                            "completion_latency_s": completion_latency_s,
                         }
                     )
 
@@ -918,6 +936,8 @@ Requirements:
                         "usage_prompt_tokens": usage.prompt_tokens if usage else None,
                         "usage_completion_tokens": usage.completion_tokens if usage else None,
                         "usage_total_tokens": usage.total_tokens if usage else None,
+                        "first_token_latency_s": first_token_latency_s,
+                        "completion_latency_s": completion_latency_s,
                     }
                 )
 

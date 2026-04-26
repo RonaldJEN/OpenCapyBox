@@ -310,6 +310,8 @@ class TestHistoryServiceLLMCallRecord:
             usage_prompt_tokens=10,
             usage_completion_tokens=3,
             usage_total_tokens=13,
+            first_token_latency_s=0.12,
+            completion_latency_s=0.86,
         )
 
         mock_db.add.assert_called_once()
@@ -317,13 +319,54 @@ class TestHistoryServiceLLMCallRecord:
         assert row.session_id == "session-123"
         assert row.round_id == "round-456"
         assert row.step_index == 2
+        assert row.request_message_count == 1
+        assert row.manual_review_status == "没问题"
         assert json.loads(row.request_messages) == [{"role": "user", "content": "hi"}]
         assert json.loads(row.request_tools) == ["read_file"]
         assert row.response_content == "hello"
         assert row.finish_reason == "stop"
         assert row.usage_total_tokens == 13
+        assert row.first_token_latency_s == 0.12
+        assert row.completion_latency_s == 0.86
         mock_db.commit.assert_called_once()
         mock_db.refresh.assert_called_once_with(row)
+
+    @pytest.mark.asyncio
+    async def test_save_llm_call_record_counts_provider_snapshot_messages(self, history_service, mock_db):
+        await history_service.save_llm_call_record(
+            session_id="session-123",
+            round_id="round-456",
+            step_index=3,
+            request_messages=[
+                {
+                    "provider": "openai",
+                    "model": "glm-5.1",
+                    "messages": [
+                        {"role": "system", "content": "s"},
+                        {"role": "user", "content": "u"},
+                        {"role": "assistant", "content": "a"},
+                    ],
+                }
+            ],
+            request_tools=["read_file"],
+            response_content="hello",
+            response_thinking=None,
+            response_tool_calls=None,
+            response_error=None,
+            finish_reason="stop",
+            usage_prompt_tokens=10,
+            usage_completion_tokens=3,
+            usage_total_tokens=13,
+            first_token_latency_s=0.055,
+            completion_latency_s=0.4,
+        )
+
+        mock_db.add.assert_called_once()
+        row = mock_db.add.call_args.args[0]
+        assert row.request_message_count == 3
+        assert row.manual_review_status == "没问题"
+        assert row.first_token_latency_s == 0.055
+        assert row.completion_latency_s == 0.4
 
 
 class TestHistoryServiceLateEventDrop:

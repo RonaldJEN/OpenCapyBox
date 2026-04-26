@@ -290,6 +290,9 @@ class TestAgentRun:
         assert first_call["request_messages"] == [llm.last_request_snapshot]
         assert first_call["request_messages"][0]["messages"][0]["content"] == "Hello"
         assert first_call["request_tools"] == ["mock_tool"]
+        assert first_call["first_token_latency_s"] is not None
+        assert first_call["completion_latency_s"] is not None
+        assert first_call["completion_latency_s"] >= first_call["first_token_latency_s"]
 
     @pytest.mark.asyncio
     async def test_run_agui_with_tool_calls(self, tmp_path):

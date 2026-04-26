@@ -175,6 +175,8 @@ class TestAgentServiceChatAgui:
                         "usage_prompt_tokens": 10,
                         "usage_completion_tokens": 3,
                         "usage_total_tokens": 13,
+                        "first_token_latency_s": 0.077,
+                        "completion_latency_s": 0.333,
                     }
                 )
                 yield TextMessageContentEvent(messageId="m1", delta="Hello")
@@ -196,6 +198,8 @@ class TestAgentServiceChatAgui:
         assert save_kwargs["step_index"] == 1
         assert save_kwargs["response_content"] == "Hello"
         assert save_kwargs["usage_total_tokens"] == 13
+        assert save_kwargs["first_token_latency_s"] == 0.077
+        assert save_kwargs["completion_latency_s"] == 0.333
 
     @pytest.mark.asyncio
     async def test_chat_agui_with_attachments(self, service):

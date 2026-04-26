@@ -1010,6 +1010,8 @@ class AgentService:
                 usage_prompt_tokens=payload["usage_prompt_tokens"],
                 usage_completion_tokens=payload["usage_completion_tokens"],
                 usage_total_tokens=payload["usage_total_tokens"],
+                first_token_latency_s=payload["first_token_latency_s"],
+                completion_latency_s=payload["completion_latency_s"],
             )
 
         self.agent.set_llm_call_hook(_record_llm_call)

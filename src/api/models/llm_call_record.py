@@ -4,7 +4,7 @@
 便于排查多轮上下文注入与模型输出偏差问题。
 """
 
-from sqlalchemy import Column, String, Integer, Text, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, String, Integer, Float, Text, DateTime, ForeignKey, UniqueConstraint, text
 
 from .database import Base
 from src.api.utils.timezone import now_naive
@@ -22,6 +22,13 @@ class LLMCallRecord(Base):
     session_id = Column(String(36), ForeignKey("sessions.id"), nullable=False, index=True)
     round_id = Column(String(36), ForeignKey("rounds.id", ondelete="CASCADE"), nullable=False, index=True)
     step_index = Column(Integer, nullable=False)
+    request_message_count = Column(Integer, nullable=True)
+    manual_review_status = Column(
+        String(20),
+        nullable=False,
+        default="没问题",
+        server_default=text("'没问题'"),
+    )
 
     request_messages = Column(Text, nullable=False)
     request_tools = Column(Text, nullable=False)
@@ -35,5 +42,7 @@ class LLMCallRecord(Base):
     usage_prompt_tokens = Column(Integer, nullable=True)
     usage_completion_tokens = Column(Integer, nullable=True)
     usage_total_tokens = Column(Integer, nullable=True)
+    first_token_latency_s = Column(Float, nullable=True)
+    completion_latency_s = Column(Float, nullable=True)
 
     created_at = Column(DateTime, default=now_naive, nullable=False, index=True)

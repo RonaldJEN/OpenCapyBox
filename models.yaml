@@ -165,15 +165,27 @@ models:
     tags: [thinking]
   # ======================== DeepSeek（阿里 DashScope 三方）========================
   # 通過阿里 DashScope 統一接入，使用 LLM_API_KEY
-
-  deepseek-v3.2:
-    display_name: "DeepSeek V3.2"
+  deepseek-pro:
+    display_name: "DeepSeek V4 pro"
     provider: openai
     api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: "${LLM_API_KEY}"
-    model_name: "deepseek-v3.2"
-    max_tokens: 65536
-    context_window: 163840
+    model_name: "deepseek-v4-pro"
+    max_tokens: 384000
+    context_window: 1024000
+    reasoning_format: reasoning_content
+    reasoning_split: true
+    enable_thinking: true
+    enabled: true
+    tags: [thinking, coding, long-context]
+  deepseek-flash:
+    display_name: "DeepSeek V4 Flash"
+    provider: openai
+    api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "${LLM_API_KEY}"
+    model_name: "deepseek-v4-flash"
+    max_tokens: 384000
+    context_window: 1024000
     reasoning_format: reasoning_content
     reasoning_split: true
     enable_thinking: true

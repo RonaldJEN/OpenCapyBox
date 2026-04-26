@@ -28,7 +28,7 @@ claude-code-sourcemap
 data/
 *.log
 logs/
-
+docs/claude-code-src/
 # ========================================
 # Python
 # ========================================

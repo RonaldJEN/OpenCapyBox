@@ -75,6 +75,12 @@ class TestDatabaseConfig:
         assert len(tables) > 0
         assert "llm_call_records" in tables
 
+        llm_columns = {col["name"] for col in inspector.get_columns("llm_call_records")}
+        assert "request_message_count" in llm_columns
+        assert "manual_review_status" in llm_columns
+        assert "first_token_latency_s" in llm_columns
+        assert "completion_latency_s" in llm_columns
+
 
 class TestDatabaseMigration:
     """测试数据库迁移逻辑"""

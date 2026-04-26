@@ -659,12 +659,24 @@ class HistoryService:
         usage_prompt_tokens: int | None,
         usage_completion_tokens: int | None,
         usage_total_tokens: int | None,
+        first_token_latency_s: float | None,
+        completion_latency_s: float | None,
     ) -> LLMCallRecord:
         """持久化单次 LLM 调用快照。"""
+        request_message_count = len(request_messages)
+        if (
+            len(request_messages) == 1
+            and isinstance(request_messages[0], dict)
+            and isinstance(request_messages[0].get("messages"), list)
+        ):
+            request_message_count = len(request_messages[0]["messages"])
+
         row = LLMCallRecord(
             session_id=session_id,
             round_id=round_id,
             step_index=step_index,
+            request_message_count=request_message_count,
+            manual_review_status="没问题",
             request_messages=json.dumps(request_messages, ensure_ascii=False),
             request_tools=json.dumps(request_tools, ensure_ascii=False),
             response_content=response_content,
@@ -679,6 +691,8 @@ class HistoryService:
             usage_prompt_tokens=usage_prompt_tokens,
             usage_completion_tokens=usage_completion_tokens,
             usage_total_tokens=usage_total_tokens,
+            first_token_latency_s=first_token_latency_s,
+            completion_latency_s=completion_latency_s,
         )
         self.db.add(row)
         self.db.commit()

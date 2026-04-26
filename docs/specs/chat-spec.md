@@ -1,7 +1,7 @@
 # 聊天与 Agent 执行 (Chat) — Spec
 
 > **模块归属**: `src/api/routes/chat.py`, `src/api/services/agent_service.py`, `src/agent/agent.py`
-> **最后更新**: 2026-04-24
+> **最后更新**: 2026-04-25
 > **状态**: Draft
 
 ---
@@ -149,6 +149,8 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 | `session_id` | String(36) | FK → `sessions.id`, NOT NULL, indexed | 所属会话 |
 | `round_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL, indexed | 所属 Round |
 | `step_index` | Integer | NOT NULL | 第几次 LLM 调用（从 1 开始） |
+| `request_message_count` | Integer | nullable | 本次实际发送给 provider 的消息条数（若为 provider 快照则取 `messages` 长度） |
+| `manual_review_status` | String(20) | NOT NULL, default=`没问题` | 人工后台标注结果，默认表示未发现问题 |
 | `request_messages` | Text | NOT NULL | 实际发送给 provider 的请求快照（JSON，包含 provider/model/messages，必要时包含 system/tools/stream 等参数） |
 | `request_tools` | Text | NOT NULL | 本次可用工具名称列表（JSON，用于快速检索；真实工具请求体以 `request_messages` 为准） |
 | `response_content` | Text | nullable | LLM 返回文本 |
@@ -159,6 +161,8 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 | `usage_prompt_tokens` | Integer | nullable | prompt token 数 |
 | `usage_completion_tokens` | Integer | nullable | completion token 数 |
 | `usage_total_tokens` | Integer | nullable | 总 token 数 |
+| `first_token_latency_s` | Float | nullable | 从发起请求到收到首个流式 token 的耗时（秒） |
+| `completion_latency_s` | Float | nullable | 从发起请求到本次 LLM 调用完成返回的总耗时（秒） |
 | `created_at` | DateTime | default=now, indexed | 写入时间 |
 
 **唯一约束**: `UniqueConstraint(round_id, step_index)`

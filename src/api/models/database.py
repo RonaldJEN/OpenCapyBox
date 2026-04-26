@@ -105,6 +105,10 @@ _PENDING_COLUMNS = [
     ("rounds", "interrupt_payload", "TEXT"),
     ("rounds", "idempotency_key", "VARCHAR(64)"),
     ("conversation_messages", "is_synthetic", "BOOLEAN DEFAULT 0"),
+    ("llm_call_records", "request_message_count", "INTEGER"),
+    ("llm_call_records", "manual_review_status", "VARCHAR(20) NOT NULL DEFAULT '没问题'"),
+    ("llm_call_records", "first_token_latency_s", "FLOAT"),
+    ("llm_call_records", "completion_latency_s", "FLOAT"),
     ("user_run_locks", "lock_id", "VARCHAR(36) DEFAULT ''"),
     # Cron 消息中心：未读标记（存量默认已读）、产物元数据、运行工作目录
     ("cron_job_runs", "is_read", "BOOLEAN DEFAULT 1"),
@@ -128,13 +132,22 @@ def _migrate_add_columns():
     """检查并添加缺失的列和约束（幂等，仅在不存在时执行）"""
     inspector = inspect(engine)
     with engine.begin() as conn:
+        table_columns_cache: dict[str, set[str] | None] = {}
+
         for table_name, column_name, column_type in _PENDING_COLUMNS:
-            if not inspector.has_table(table_name):
+            if table_name not in table_columns_cache:
+                if not inspector.has_table(table_name):
+                    table_columns_cache[table_name] = None
+                else:
+                    table_columns_cache[table_name] = {col["name"] for col in inspector.get_columns(table_name)}
+
+            existing_columns = table_columns_cache[table_name]
+            if existing_columns is None:
                 continue
-            existing_columns = {col["name"] for col in inspector.get_columns(table_name)}
             if column_name not in existing_columns:
                 stmt = f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
                 conn.execute(text(stmt))
+                existing_columns.add(column_name)
                 logger.info("DB 迁移: %s 表新增列 %s (%s)", table_name, column_name, column_type)
 
         # 补建唯一约束（仅对存量库：如果已有覆盖相同列的唯一索引/约束则跳过）
