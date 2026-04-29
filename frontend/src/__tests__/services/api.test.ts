@@ -57,6 +57,19 @@ describe('APIService', () => {
       expect(localStorage.removeItem).toHaveBeenCalledWith('userId');
       expect(apiService.getUserId()).toBeNull();
     });
+
+    it('setUserId 應該保存角色並可識別管理員', () => {
+      apiService.setUserId('admin', 'token-1', 'admin');
+
+      expect(localStorage.setItem).toHaveBeenCalledWith('userRole', 'admin');
+      expect(apiService.getUserRole()).toBe('admin');
+      expect(apiService.isAdminUser()).toBe(true);
+    });
+
+    it('非管理員角色應返回 false', () => {
+      apiService.setUserId('demo', 'token-2', 'user');
+      expect(apiService.isAdminUser()).toBe(false);
+    });
   });
 
   describe('流式连接可靠性', () => {

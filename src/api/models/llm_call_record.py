@@ -4,7 +4,7 @@
 便于排查多轮上下文注入与模型输出偏差问题。
 """
 
-from sqlalchemy import Column, String, Integer, Float, Text, DateTime, ForeignKey, UniqueConstraint, text
+from sqlalchemy import Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey, UniqueConstraint, text
 
 from .database import Base
 from src.api.utils.timezone import now_naive
@@ -44,5 +44,15 @@ class LLMCallRecord(Base):
     usage_total_tokens = Column(Integer, nullable=True)
     first_token_latency_s = Column(Float, nullable=True)
     completion_latency_s = Column(Float, nullable=True)
+
+    compaction_triggered = Column(Boolean, nullable=False, default=False, server_default=text("0"))
+    compaction_pre_tokens = Column(Integer, nullable=True)
+    compaction_post_tokens = Column(Integer, nullable=True)
+    compaction_tokens_saved = Column(Integer, nullable=True)
+    compaction_microcompact_compacted_messages = Column(Integer, nullable=True)
+    compaction_summary_generated_count = Column(Integer, nullable=True)
+    compaction_summary_reused_count = Column(Integer, nullable=True)
+    compaction_summary_quality_repair_count = Column(Integer, nullable=True)
+    compaction_emergency_truncate_dropped_rounds = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=now_naive, nullable=False, index=True)

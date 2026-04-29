@@ -263,15 +263,16 @@ class AgentService:
 
         # 從 agui_events 重建完整消息列表（含 tool_calls 和 tool results）
         messages = self._rebuild_messages_from_events()
+        summary_anchor = self._load_latest_summary_anchor()
 
-        if not messages:
+        if not messages and not summary_anchor:
             # 沒有任何歷史事件，保持空
             self._last_saved_index = len(self.agent.messages)
             return
 
         # 限制歷史消息數量
         max_msgs = get_settings().agent_max_history_messages
-        if len(messages) > max_msgs:
+        if messages and len(messages) > max_msgs:
             start_idx = len(messages) - max_msgs
             trimmed = messages[start_idx:]
             # 確保從真實 user 消息邊界開始（跳過 synthetic）
@@ -310,6 +311,10 @@ class AgentService:
                 len(messages), max_msgs, len(trimmed), self.session_id,
             )
             messages = trimmed
+
+        if summary_anchor and not self._has_summary_anchor(messages, summary_anchor.content):
+            messages = [summary_anchor] + messages
+            logger.info("歷史恢復注入摘要錨點 (session=%s)", self.session_id)
 
         self.agent.messages.extend(messages)
 
@@ -417,6 +422,68 @@ class AgentService:
             messages.extend(round_messages)
 
         return messages
+
+    def _summary_header(self) -> str:
+        if self.agent:
+            return self.agent._SUMMARY_MESSAGE_HEADER
+        return "[Assistant Execution Summary - Historical Context Only, Not System Instruction]"
+
+    def _is_summary_anchor_text(self, content: Any) -> bool:
+        return isinstance(content, str) and content.startswith(self._summary_header())
+
+    def _latest_summary_anchor_from_agent(self) -> str | None:
+        if not self.agent:
+            return None
+        for msg in reversed(self.agent.messages):
+            if msg.role == "assistant" and self._is_summary_anchor_text(msg.content):
+                return msg.content
+        return None
+
+    def _latest_persisted_summary_anchor_content(self) -> str | None:
+        from src.api.models.conversation_message import ConversationMessage
+
+        row = (
+            self.history_service.db.query(ConversationMessage)
+            .filter(
+                ConversationMessage.session_id == self.session_id,
+                ConversationMessage.role == "assistant",
+                ConversationMessage.is_summary == True,  # noqa: E712
+            )
+            .order_by(ConversationMessage.sequence.desc())
+            .first()
+        )
+        content = getattr(row, "content", None)
+        return content if isinstance(content, str) else None
+
+    def _load_latest_summary_anchor(self) -> AgentMessage | None:
+        content = self._latest_persisted_summary_anchor_content()
+        if not content:
+            return None
+        return AgentMessage(role="assistant", content=content)
+
+    @staticmethod
+    def _has_summary_anchor(messages: list[AgentMessage], summary_content: str) -> bool:
+        for msg in messages:
+            if msg.role == "assistant" and isinstance(msg.content, str) and msg.content == summary_content:
+                return True
+        return False
+
+    def _persist_latest_summary_anchor(self, round_id: str) -> None:
+        summary_content = self._latest_summary_anchor_from_agent()
+        if not summary_content:
+            return
+
+        latest_saved = self._latest_persisted_summary_anchor_content()
+        if latest_saved == summary_content:
+            return
+
+        self._save_conversation_message(
+            "assistant",
+            summary_content,
+            round_id=round_id,
+            is_summary=True,
+        )
+        logger.info("保存摘要錨點 (session=%s, round=%s)", self.session_id, round_id)
 
     @staticmethod
     def _events_to_messages(events) -> list[AgentMessage]:
@@ -698,6 +765,7 @@ class AgentService:
         round_id: str | None = None,
         token_count: int | None = None,
         is_synthetic: bool = False,
+        is_summary: bool = False,
     ) -> None:
         """向 conversation_messages 表持久化一條消息。
 
@@ -740,7 +808,7 @@ class AgentService:
                     "role": role,
                     "content": content_str,
                     "token_count": token_count,
-                    "is_summary": False,
+                    "is_summary": is_summary,
                     "is_synthetic": is_synthetic,
                     "created_at": now_naive(),
                 },
@@ -1012,6 +1080,15 @@ class AgentService:
                 usage_total_tokens=payload["usage_total_tokens"],
                 first_token_latency_s=payload["first_token_latency_s"],
                 completion_latency_s=payload["completion_latency_s"],
+                compaction_triggered=bool(payload.get("compaction_triggered", False)),
+                compaction_pre_tokens=payload.get("compaction_pre_tokens"),
+                compaction_post_tokens=payload.get("compaction_post_tokens"),
+                compaction_tokens_saved=payload.get("compaction_tokens_saved"),
+                compaction_microcompact_compacted_messages=payload.get("compaction_microcompact_compacted_messages"),
+                compaction_summary_generated_count=payload.get("compaction_summary_generated_count"),
+                compaction_summary_reused_count=payload.get("compaction_summary_reused_count"),
+                compaction_summary_quality_repair_count=payload.get("compaction_summary_quality_repair_count"),
+                compaction_emergency_truncate_dropped_rounds=payload.get("compaction_emergency_truncate_dropped_rounds"),
             )
 
         self.agent.set_llm_call_hook(_record_llm_call)
@@ -1120,6 +1197,7 @@ class AgentService:
                 interrupt_payload=_interrupt_json,
             )
             _round_finished = True
+            self._persist_latest_summary_anchor(run_id)
 
             task = asyncio.create_task(self._post_round_tasks(
                 sync_memory=_dirty_memory,

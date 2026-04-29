@@ -163,10 +163,12 @@ class TestAgentMessageSummarization:
             round_user_message="帮我回邮件并附上链接和PDF",
         )
 
-        assert result == "Structured summary"
+        assert "1. Primary Request and Intent:" in result
+        assert "6. All User Messages:" in result
+        assert "帮我回邮件并附上链接和PDF" in result
         prompt = captured["messages"][1].content
         assert "1. Primary Request and Intent" in prompt
-        assert "6. All user messages (exclude tool results)" in prompt
+        assert "6. All User Messages" in prompt
         assert "8. Current Work" in prompt
         assert "帮我回邮件并附上链接和PDF" in prompt
 
@@ -187,7 +189,7 @@ class TestAgentMessageSummarization:
         
         # 應該返回簡單文本摘要而不是拋出異常
         result = await agent._create_summary(messages, 1)
-        assert "Round 1" in result
+        assert "Primary Request" in result or "Current Work" in result
 
     @pytest.mark.asyncio
     async def test_summarize_messages_uses_assistant_role_for_summary(self, tmp_path):
@@ -293,6 +295,15 @@ class TestAgentRun:
         assert first_call["first_token_latency_s"] is not None
         assert first_call["completion_latency_s"] is not None
         assert first_call["completion_latency_s"] >= first_call["first_token_latency_s"]
+        assert first_call["compaction_triggered"] is False
+        assert first_call["compaction_pre_tokens"] is not None
+        assert first_call["compaction_post_tokens"] is not None
+        assert first_call["compaction_tokens_saved"] == 0
+        assert first_call["compaction_microcompact_compacted_messages"] == 0
+        assert first_call["compaction_summary_generated_count"] == 0
+        assert first_call["compaction_summary_reused_count"] == 0
+        assert first_call["compaction_summary_quality_repair_count"] == 0
+        assert first_call["compaction_emergency_truncate_dropped_rounds"] == 0
 
     @pytest.mark.asyncio
     async def test_run_agui_with_tool_calls(self, tmp_path):

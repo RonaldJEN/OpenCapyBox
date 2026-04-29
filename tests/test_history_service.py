@@ -312,6 +312,15 @@ class TestHistoryServiceLLMCallRecord:
             usage_total_tokens=13,
             first_token_latency_s=0.12,
             completion_latency_s=0.86,
+            compaction_triggered=True,
+            compaction_pre_tokens=81234,
+            compaction_post_tokens=52345,
+            compaction_tokens_saved=28889,
+            compaction_microcompact_compacted_messages=4,
+            compaction_summary_generated_count=2,
+            compaction_summary_reused_count=1,
+            compaction_summary_quality_repair_count=1,
+            compaction_emergency_truncate_dropped_rounds=0,
         )
 
         mock_db.add.assert_called_once()
@@ -328,6 +337,15 @@ class TestHistoryServiceLLMCallRecord:
         assert row.usage_total_tokens == 13
         assert row.first_token_latency_s == 0.12
         assert row.completion_latency_s == 0.86
+        assert row.compaction_triggered is True
+        assert row.compaction_pre_tokens == 81234
+        assert row.compaction_post_tokens == 52345
+        assert row.compaction_tokens_saved == 28889
+        assert row.compaction_microcompact_compacted_messages == 4
+        assert row.compaction_summary_generated_count == 2
+        assert row.compaction_summary_reused_count == 1
+        assert row.compaction_summary_quality_repair_count == 1
+        assert row.compaction_emergency_truncate_dropped_rounds == 0
         mock_db.commit.assert_called_once()
         mock_db.refresh.assert_called_once_with(row)
 
@@ -367,6 +385,7 @@ class TestHistoryServiceLLMCallRecord:
         assert row.manual_review_status == "没问题"
         assert row.first_token_latency_s == 0.055
         assert row.completion_latency_s == 0.4
+        assert row.compaction_triggered is False
 
 
 class TestHistoryServiceLateEventDrop:

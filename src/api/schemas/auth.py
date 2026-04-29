@@ -16,4 +16,6 @@ class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int
+    role: str
+    is_admin: bool
     message: str = "登录成功"

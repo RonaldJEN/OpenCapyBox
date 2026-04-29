@@ -11,6 +11,7 @@
 | `APP_NAME` | 否 | `OpenCapyBox Backend` | 应用名称 |
 | `DEBUG` | 否 | `false` | 调试模式 |
 | `SIMPLE_AUTH_USERS` | 是 | — | 登录账号，格式：`user:pass,user2:pass2` |
+| `AUTH_ADMIN_USERS` | 否 | `admin` | 管理员用户名列表，格式：`admin,user2` |
 | `AUTH_SECRET_KEY` | 是 | 派生密钥（启动告警） | JWT 签名密钥，建议 32+ 随机字符串 |
 | `AUTH_TOKEN_EXPIRE_MINUTES` | 否 | `720` | JWT 过期时间（分钟） |
 

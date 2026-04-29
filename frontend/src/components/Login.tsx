@@ -16,8 +16,8 @@ export function Login() {
     setLoading(true);
 
     try {
-      await apiService.login(username, password);
-      navigate('/');
+      const response = await apiService.login(username, password);
+      navigate(response.role === 'admin' || response.is_admin ? '/admin' : '/');
     } catch (err) {
       console.error('Login error:', err);
       setError('登录失败，请检查用户名和密码');

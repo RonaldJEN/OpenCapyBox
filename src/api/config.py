@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     # 简单认证（临时方案，格式：username:password,username2:password2）
     simple_auth_users: str = ""  # 必须在 .env 中配置 SIMPLE_AUTH_USERS
+    auth_admin_users: str = "admin"  # 管理员用户名列表，逗号分隔
 
     # 认证配置（Bearer Token）
     auth_secret_key: str = ""
@@ -87,6 +88,14 @@ class Settings(BaseSettings):
                 username, password = user_pair.split(":", 1)
                 users[username.strip()] = password.strip()
         return users
+
+    def get_admin_users(self) -> set[str]:
+        """解析管理员用户名列表。"""
+        return {
+            username.strip()
+            for username in self.auth_admin_users.split(",")
+            if username.strip()
+        }
 
 
 @lru_cache()

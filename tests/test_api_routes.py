@@ -41,6 +41,8 @@ class TestAuthRouter:
         assert isinstance(data["access_token"], str)
         assert data["token_type"] == "bearer"
         assert data["expires_in"] > 0
+        assert data["role"] == "user"
+        assert data["is_admin"] is False
         assert data["message"] == "登录成功"
 
     def test_login_wrong_password(self, client, mock_settings):
@@ -76,6 +78,8 @@ class TestAuthRouter:
         data = response.json()
         assert data["user_id"] == "testuser"
         assert data["username"] == "testuser"
+        assert data["role"] == "user"
+        assert data["is_admin"] is False
 
     def test_get_current_user_without_token(self, client, mock_settings):
         """未帶 token 應返回 401"""

@@ -139,6 +139,11 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 
 **唯一约束**: `UniqueConstraint(session_id, sequence)`
 
+`is_summary=True` 的消息用于“历史恢复锚点”：
+
+- round 结束后，服务层会按去重策略持久化最新压缩摘要（若内容与上一条摘要锚点相同则不重复写入）。
+- `_restore_history` 在尾窗裁剪完成后会优先注入最新摘要锚点，再拼接尾窗消息，降低长会话冷恢复语义漂移。
+
 ### 2.4 `llm_call_records` 表
 
 持久化每次 LLM 调用（step 级）的输入输出快照，用于运行后审计与问题排查。
@@ -163,6 +168,15 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 | `usage_total_tokens` | Integer | nullable | 总 token 数 |
 | `first_token_latency_s` | Float | nullable | 从发起请求到收到首个流式 token 的耗时（秒） |
 | `completion_latency_s` | Float | nullable | 从发起请求到本次 LLM 调用完成返回的总耗时（秒） |
+| `compaction_triggered` | Boolean | NOT NULL, default=`false` | 本 step 调用前是否触发了上下文压缩流水线（Level 2-4） |
+| `compaction_pre_tokens` | Integer | nullable | 压缩前估算 token 数 |
+| `compaction_post_tokens` | Integer | nullable | 压缩后估算 token 数 |
+| `compaction_tokens_saved` | Integer | nullable | 本次压缩节省 token 数（`pre - post`） |
+| `compaction_microcompact_compacted_messages` | Integer | nullable | Level 2 中被 microcompact 的消息数 |
+| `compaction_summary_generated_count` | Integer | nullable | Level 3 新生成摘要条数 |
+| `compaction_summary_reused_count` | Integer | nullable | Level 3 复用旧摘要条数 |
+| `compaction_summary_quality_repair_count` | Integer | nullable | Level 3 摘要结构规范化修复次数 |
+| `compaction_emergency_truncate_dropped_rounds` | Integer | nullable | Level 4 紧急截断丢弃的最老 round 数 |
 | `created_at` | DateTime | default=now, indexed | 写入时间 |
 
 **唯一约束**: `UniqueConstraint(round_id, step_index)`
@@ -679,7 +693,7 @@ INSERT INTO rounds (..., idempotency_key)
 | 级别 | 名称 | 策略 | 是否需要 LLM | 说明 |
 |------|------|------|-------------|------|
 | Level 2 | Microcompact | 替换 + 清理 | 否 | 替换超过 4000 字符的 `tool_result` 为摘要占位符；清理旧的 `thinking` 内容；保留最近 2 轮完整内容 |
-| Level 3 | LLM Summary | LLM 摘要 | **是** | 使用 LLM 对历史轮次逐轮生成结构化摘要（9 sections），必须包含 `All user messages`（非 tool result）与 `Current Work`，替换原始内容 |
+| Level 3 | LLM Summary | LLM 摘要 | **是** | 使用 LLM 对历史轮次逐轮生成结构化摘要（9 sections），必须包含 `All user messages`（非 tool result）与 `Current Work`，替换原始内容；服务端会对缺失 section 进行规范化补齐并强制回写用户消息锚点 |
 | Level 4 | Emergency Truncate | 强制丢弃 | 否 | 从最老的 user round 开始丢弃，最多丢弃 3 轮，**至少保留 1 轮** |
 
 #### 压缩流程
@@ -713,12 +727,14 @@ INSERT INTO rounds (..., idempotency_key)
 
 #### 历史恢复裁剪边界（_restore_history）
 
-`agent_max_history_messages` 仅用于历史恢复阶段的注入上限控制，且遵循 user 边界对齐：
+`agent_max_history_messages` 仅用于历史恢复阶段的注入上限控制，且遵循“摘要锚点优先 + user 边界对齐”：
 
-1. 先取最近 `N` 条消息作为尾窗。
-2. 若尾窗首条不是“真实 user”（`role=user 且 is_synthetic=False`），向后跳过直到命中真实 user。
-3. 若尾窗内不存在真实 user，回退到全量历史中“离尾窗最近的真实 user 边界”，从该处注入到末尾（可超过 `N`）。
-4. 若全量历史都不存在真实 user（数据异常），保留尾窗作为兜底，避免注入全空导致整段失忆。
+1. 先从 `conversation_messages` 读取最新 `is_summary=True` 的摘要锚点（若存在）。
+2. 再取最近 `N` 条事件重建消息作为尾窗。
+3. 若尾窗首条不是“真实 user”（`role=user 且 is_synthetic=False`），向后跳过直到命中真实 user。
+4. 若尾窗内不存在真实 user，回退到全量历史中“离尾窗最近的真实 user 边界”，从该处注入到末尾（可超过 `N`）。
+5. 若全量历史都不存在真实 user（数据异常），保留尾窗作为兜底，避免注入全空导致整段失忆。
+6. 最终注入顺序为：`[summary_anchor?] + tail_window`；若无尾窗但有摘要锚点，仍注入摘要锚点。
 
 ### 4.6 AG-UI 事件体系
 
@@ -833,6 +849,7 @@ Agent 调用 ask_user 工具
 1. 调用前：记录 provider 转换后的最终请求快照（与实际发包口径一致）以及可用工具名称列表。
 2. 调用后成功：记录 `content` / `thinking` / `tool_calls` / `finish_reason` / `usage`。
 3. 调用后失败：记录 `response_error`。
+4. 调用时：额外记录同一步的上下文压缩观测数据（`compaction_*`），用于排查长对话中的压缩收益与恢复稳定性问题。
 
 约束与边界：
 

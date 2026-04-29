@@ -28,6 +28,8 @@ async def login(username: str = Form(...), password: str = Form(...)):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
     token, expires_in = create_access_token(username)
+    is_admin = username in settings.get_admin_users()
+    role = "admin" if is_admin else "user"
 
     # 登录成功，返回用户信息与访问令牌
     return LoginResponse(
@@ -35,6 +37,8 @@ async def login(username: str = Form(...), password: str = Form(...)):
         access_token=token,
         token_type="bearer",
         expires_in=expires_in,
+        role=role,
+        is_admin=is_admin,
         message="登录成功",
     )
 
@@ -44,4 +48,10 @@ async def get_me(user_id: str = Depends(get_current_user)):
     """
     获取当前用户信息（Bearer Token）
     """
-    return {"user_id": user_id, "username": user_id}
+    is_admin = user_id in settings.get_admin_users()
+    return {
+        "user_id": user_id,
+        "username": user_id,
+        "role": "admin" if is_admin else "user",
+        "is_admin": is_admin,
+    }

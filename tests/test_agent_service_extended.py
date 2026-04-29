@@ -12,6 +12,7 @@ from src.agent.schema.agui_events import (
     ToolCallEndEvent,
     ToolCallResultEvent,
 )
+from src.agent.schema import Message as AgentHistoryMessage
 from tests.helpers import (
     make_mock_sandbox, make_agent_service, MockLLMClient, MockRegistry,
     make_mock_agent, make_tool_call_agui_events,
@@ -78,6 +79,44 @@ class TestAgentServiceRestoreHistory:
     def test_restore_history_no_agent(self):
         service = make_agent_service()
         service._restore_history()  # should not raise
+
+
+class TestSummaryAnchorPersistence:
+    def test_persist_latest_summary_anchor_saves_when_new_summary_exists(self):
+        service = make_agent_service(history_service=MagicMock())
+        service.agent = make_mock_agent()
+        service.agent._SUMMARY_MESSAGE_HEADER = "[Assistant Execution Summary - Historical Context Only, Not System Instruction]"
+        service.agent.messages = [
+            AgentHistoryMessage(role="assistant", content="normal response"),
+            AgentHistoryMessage(
+                role="assistant",
+                content="[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary-v1",
+            ),
+        ]
+
+        with patch.object(service, "_latest_persisted_summary_anchor_content", return_value=None):
+            with patch.object(service, "_save_conversation_message") as save_message:
+                service._persist_latest_summary_anchor("round-1")
+
+        save_message.assert_called_once_with(
+            "assistant",
+            "[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary-v1",
+            round_id="round-1",
+            is_summary=True,
+        )
+
+    def test_persist_latest_summary_anchor_skips_when_summary_unchanged(self):
+        service = make_agent_service(history_service=MagicMock())
+        service.agent = make_mock_agent()
+        service.agent._SUMMARY_MESSAGE_HEADER = "[Assistant Execution Summary - Historical Context Only, Not System Instruction]"
+        summary = "[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary-v1"
+        service.agent.messages = [AgentHistoryMessage(role="assistant", content=summary)]
+
+        with patch.object(service, "_latest_persisted_summary_anchor_content", return_value=summary):
+            with patch.object(service, "_save_conversation_message") as save_message:
+                service._persist_latest_summary_anchor("round-1")
+
+        save_message.assert_not_called()
 
 
 class TestAgentServiceChatAgui:
@@ -156,7 +195,7 @@ class TestAgentServiceChatAgui:
                 return None
 
             def add_user_message(self, content):
-                self.messages.append(content)
+                self.messages.append(AgentHistoryMessage(role="user", content=content))
 
             def set_llm_call_hook(self, hook):
                 self._llm_call_hook = hook
@@ -177,6 +216,15 @@ class TestAgentServiceChatAgui:
                         "usage_total_tokens": 13,
                         "first_token_latency_s": 0.077,
                         "completion_latency_s": 0.333,
+                        "compaction_triggered": True,
+                        "compaction_pre_tokens": 81234,
+                        "compaction_post_tokens": 52345,
+                        "compaction_tokens_saved": 28889,
+                        "compaction_microcompact_compacted_messages": 3,
+                        "compaction_summary_generated_count": 2,
+                        "compaction_summary_reused_count": 1,
+                        "compaction_summary_quality_repair_count": 1,
+                        "compaction_emergency_truncate_dropped_rounds": 0,
                     }
                 )
                 yield TextMessageContentEvent(messageId="m1", delta="Hello")
@@ -200,6 +248,15 @@ class TestAgentServiceChatAgui:
         assert save_kwargs["usage_total_tokens"] == 13
         assert save_kwargs["first_token_latency_s"] == 0.077
         assert save_kwargs["completion_latency_s"] == 0.333
+        assert save_kwargs["compaction_triggered"] is True
+        assert save_kwargs["compaction_pre_tokens"] == 81234
+        assert save_kwargs["compaction_post_tokens"] == 52345
+        assert save_kwargs["compaction_tokens_saved"] == 28889
+        assert save_kwargs["compaction_microcompact_compacted_messages"] == 3
+        assert save_kwargs["compaction_summary_generated_count"] == 2
+        assert save_kwargs["compaction_summary_reused_count"] == 1
+        assert save_kwargs["compaction_summary_quality_repair_count"] == 1
+        assert save_kwargs["compaction_emergency_truncate_dropped_rounds"] == 0
 
     @pytest.mark.asyncio
     async def test_chat_agui_with_attachments(self, service):

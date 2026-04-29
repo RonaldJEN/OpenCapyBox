@@ -80,6 +80,15 @@ class TestDatabaseConfig:
         assert "manual_review_status" in llm_columns
         assert "first_token_latency_s" in llm_columns
         assert "completion_latency_s" in llm_columns
+        assert "compaction_triggered" in llm_columns
+        assert "compaction_pre_tokens" in llm_columns
+        assert "compaction_post_tokens" in llm_columns
+        assert "compaction_tokens_saved" in llm_columns
+        assert "compaction_microcompact_compacted_messages" in llm_columns
+        assert "compaction_summary_generated_count" in llm_columns
+        assert "compaction_summary_reused_count" in llm_columns
+        assert "compaction_summary_quality_repair_count" in llm_columns
+        assert "compaction_emergency_truncate_dropped_rounds" in llm_columns
 
 
 class TestDatabaseMigration:

@@ -9,21 +9,21 @@
 
 ## 2. 数据模型
 
-无专用数据库表。认证用户通过环境变量 `SIMPLE_AUTH_USERS` 配置，格式为 `user:pass,user2:pass2`。由 `Settings.get_auth_users()` 解析。JWT payload 包含 `user_id`。Token 过期时间：43200 秒（12 小时）。密钥来源：`AUTH_SECRET_KEY` 环境变量；若为空，则通过 SHA-256(app_name) 派生确定性密钥——仅用于开发环境，启动时输出 warning 日志。
+无专用数据库表。认证用户通过环境变量 `SIMPLE_AUTH_USERS` 配置，格式为 `user:pass,user2:pass2`。由 `Settings.get_auth_users()` 解析。管理员用户通过 `AUTH_ADMIN_USERS`（逗号分隔用户名）配置。JWT payload 包含 `user_id`。Token 过期时间：43200 秒（12 小时）。密钥来源：`AUTH_SECRET_KEY` 环境变量；若为空，则通过 SHA-256(app_name) 派生确定性密钥——仅用于开发环境，启动时输出 warning 日志。
 
 ## 3. API 契约
 
 ### POST /api/auth/login
 
 - **请求**：form-urlencoded `username`, `password`
-- **响应 200**：`{user_id: str, access_token: str, token_type: "bearer", expires_in: 43200, message: str}`
+- **响应 200**：`{user_id: str, access_token: str, token_type: "bearer", expires_in: 43200, role: "admin"|"user", is_admin: bool, message: str}`
 - **错误 401**：`{"detail": "用户名或密码错误"}`
 - **鉴权要求**：无（公开端点）
 
 ### GET /api/auth/me
 
 - **请求**：Authorization header 携带 Bearer token
-- **响应 200**：`{user_id: str, username: str}`
+- **响应 200**：`{user_id: str, username: str, role: "admin"|"user", is_admin: bool}`
 - **错误 401**：token 无效或已过期
 - **鉴权要求**：Bearer token，通过 `get_current_user` 注入
 
@@ -31,6 +31,7 @@
 
 - Token 过期时间固定 12 小时，不支持刷新
 - `get_current_user` 是全局依赖，几乎所有端点（除 `/login`、`/models`、`/health`）都注入
+- `get_current_admin_user` 用于管理员路由，要求 `user_id` 出现在 `AUTH_ADMIN_USERS`
 - Settings 通过 `@lru_cache` 单例化，启动后不可变
 - 若 `AUTH_SECRET_KEY` 为空，使用 SHA-256(app_name) 派生确定性密钥（跨重启一致），仅用于开发环境
 - 若 `SIMPLE_AUTH_USERS` 为空，启动时输出 warning 日志

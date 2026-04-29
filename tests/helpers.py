@@ -452,6 +452,7 @@ def make_mock_settings(**overrides):
     """
     defaults = {
         "get_auth_users": MagicMock(return_value={"testuser": "testpass", "admin": "admin123"}),
+        "get_admin_users": MagicMock(return_value={"admin"}),
         "auth_secret_key": "unit-test-secret-key-that-is-long-enough-for-hs256",
         "auth_token_expire_minutes": 60,
     }

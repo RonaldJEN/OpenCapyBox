@@ -9,6 +9,7 @@ from src.api.config import get_settings
 from src.api.routes import auth, sessions, chat, models
 from src.api.routes import cron as cron_routes
 from src.api.routes import config as config_routes
+from src.api.routes import admin as admin_routes
 from src.api.models.database import init_db
 import os
 
@@ -167,6 +168,7 @@ app.include_router(chat.router, prefix=f"{settings.api_prefix}/chat", tags=["对
 app.include_router(models.router, prefix=f"{settings.api_prefix}/models", tags=["模型管理"])
 app.include_router(cron_routes.router, prefix=f"{settings.api_prefix}/cron", tags=["定时任务"])
 app.include_router(config_routes.router, prefix=f"{settings.api_prefix}/config", tags=["配置管理"])
+app.include_router(admin_routes.router, prefix=f"{settings.api_prefix}/admin", tags=["管理后台"])
 
 
 # 根路径

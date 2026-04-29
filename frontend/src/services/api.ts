@@ -68,6 +68,7 @@ class APIService {
   private client: AxiosInstance;
   private userId: string | null = null;
   private accessToken: string | null = null;
+  private userRole: 'admin' | 'user' | null = null;
 
   constructor() {
     this.client = axios.create({
@@ -81,6 +82,7 @@ class APIService {
     // 从 localStorage 恢复认证信息
     this.userId = localStorage.getItem('userId');
     this.accessToken = localStorage.getItem('accessToken');
+    this.userRole = localStorage.getItem('userRole') as 'admin' | 'user' | null;
 
     // 请求拦截器 - 添加 Authorization Bearer Token
     this.client.interceptors.request.use((config) => {
@@ -104,12 +106,16 @@ class APIService {
   }
 
   // 设置当前登录信息
-  setUserId(userId: string, accessToken?: string) {
+  setUserId(userId: string, accessToken?: string, role?: 'admin' | 'user') {
     this.userId = userId;
     localStorage.setItem('userId', userId);
     if (accessToken) {
       this.accessToken = accessToken;
       localStorage.setItem('accessToken', accessToken);
+    }
+    if (role) {
+      this.userRole = role;
+      localStorage.setItem('userRole', role);
     }
   }
 
@@ -120,6 +126,14 @@ class APIService {
 
   getAccessToken(): string | null {
     return this.accessToken;
+  }
+
+  getUserRole(): 'admin' | 'user' | null {
+    return this.userRole;
+  }
+
+  isAdminUser(): boolean {
+    return this.userRole === 'admin';
   }
 
   isAuthenticated(): boolean {
@@ -133,12 +147,19 @@ class APIService {
     return { Authorization: `Bearer ${this.accessToken}` };
   }
 
+  /** Expose the underlying axios instance for shared use (e.g. admin API). */
+  getAxiosClient(): AxiosInstance {
+    return this.client;
+  }
+
   // 登出
   logout() {
     this.userId = null;
     this.accessToken = null;
+    this.userRole = null;
     localStorage.removeItem('userId');
     localStorage.removeItem('accessToken');
+    localStorage.removeItem('userRole');
   }
 
   // ========== 认证 API ==========
@@ -157,7 +178,7 @@ class APIService {
       },
     });
 
-    this.setUserId(response.data.user_id, response.data.access_token);
+    this.setUserId(response.data.user_id, response.data.access_token, response.data.role);
     return response.data;
   }
 

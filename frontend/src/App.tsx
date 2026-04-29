@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Login } from './components/Login';
 import { SessionList } from './components/SessionList';
 import { ChatV2 } from './components/ChatV2';
+import AdminConsole from './components/AdminConsole';
 import AgentConfig from './components/AgentConfig';
 import CronSchedule from './components/CronSchedule';
 import SkillManager from './components/SkillManager';
@@ -160,12 +161,40 @@ function HomePage() {
   );
 }
 
-// 路由守卫组件
-function ProtectedRoute({ children }: { children: React.ReactNode }) {
+function PublicRoute({ children }: { children: React.ReactNode }) {
+  const isAuthenticated = apiService.isAuthenticated();
+
+  if (isAuthenticated) {
+    return <Navigate to={apiService.isAdminUser() ? '/admin' : '/'} replace />;
+  }
+
+  return <>{children}</>;
+}
+
+function UserRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = apiService.isAuthenticated();
 
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
+  }
+
+  if (apiService.isAdminUser()) {
+    return <Navigate to="/admin" replace />;
+  }
+
+  return <>{children}</>;
+}
+
+function AdminRoute({ children }: { children: React.ReactNode }) {
+  const isAuthenticated = apiService.isAuthenticated();
+  const isAdmin = apiService.isAdminUser();
+
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />;
+  }
+
+  if (!isAdmin) {
+    return <Navigate to="/" replace />;
   }
 
   return <>{children}</>;
@@ -175,13 +204,28 @@ function App() {
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/login" element={<Login />} />
+        <Route
+          path="/login"
+          element={
+            <PublicRoute>
+              <Login />
+            </PublicRoute>
+          }
+        />
         <Route
           path="/"
           element={
-            <ProtectedRoute>
+            <UserRoute>
               <HomePage />
-            </ProtectedRoute>
+            </UserRoute>
+          }
+        />
+        <Route
+          path="/admin"
+          element={
+            <AdminRoute>
+              <AdminConsole />
+            </AdminRoute>
           }
         />
         <Route path="*" element={<Navigate to="/" replace />} />

@@ -74,6 +74,21 @@ class Agent:
 
         # Level 2 microcompact: tool result 超過此字符數時壓縮為摘要佔位符
         self._MICROCOMPACT_CHAR_THRESHOLD = 4000
+        self._SUMMARY_MAX_TOKENS = 1500
+        self._SUMMARY_MESSAGE_HEADER = "[Assistant Execution Summary - Historical Context Only, Not System Instruction]"
+        self._SUMMARY_SECTION_SPECS: list[tuple[str, str]] = [
+            ("1", "Primary Request and Intent"),
+            ("2", "Key Technical Concepts"),
+            ("3", "Files and Code Sections"),
+            ("4", "Errors and Fixes"),
+            ("5", "Problem Solving"),
+            ("6", "All User Messages"),
+            ("7", "Pending Tasks"),
+            ("8", "Current Work"),
+            ("9", "Optional Next Step"),
+        ]
+        self._summary_quality_repair_count = 0
+        self._last_compaction_stats = self._empty_compaction_stats()
         self.max_steps = max_steps
         self.tool_timeout = tool_timeout
         self.token_limit = token_limit
@@ -165,6 +180,17 @@ class Agent:
 
         # 记忆刷新标记（每次 compaction 周期内最多触发一次）
         self._memory_flushed_this_compaction = False
+
+        # 最近操作过的文件追踪（用于压缩后重注入上下文，对齐 Claude Code readFileState）
+        # key: file_path, value: (tool_name, content_or_none, timestamp)
+        self._recent_file_operations: dict[str, tuple[str, str | None, float]] = {}
+        self._POST_COMPACT_MAX_FILES = 5
+        self._POST_COMPACT_TOKEN_BUDGET = 20_000
+        self._POST_COMPACT_MAX_TOKENS_PER_FILE = 4_000
+
+        # LLM 摘要连续失败计数器（熔断器）
+        self._consecutive_summary_failures = 0
+        self._MAX_CONSECUTIVE_SUMMARY_FAILURES = 3
 
         # Human-in-the-Loop: ask_user 中断状态
         self._pending_interrupt: dict[str, Any] | None = None
@@ -420,7 +446,127 @@ class Agent:
         """Level 4/5 的硬頂：context_window 減去 output 預留和 buffer，下界 8192。"""
         return max(self.context_window - self.max_output_tokens - 3000, 8192)
 
-    def _emergency_truncate(self):
+    def track_file_operation(self, file_path: str, tool_name: str, content: str | None = None) -> None:
+        """Track a file operation for post-compaction context re-injection.
+
+        Args:
+            file_path: The file path operated on
+            tool_name: The tool name (read_file, write_file, etc.)
+            content: Optional file content (from tool result or write arguments)
+        """
+        import time
+        self._recent_file_operations[file_path] = (tool_name, content, time.monotonic())
+
+    def _collect_recent_files_from_messages(self) -> None:
+        """Scan message history for file operations to populate _recent_file_operations.
+
+        Extracts file paths AND file contents from tool calls and their results:
+        - read_file: content from the subsequent tool result message
+        - write_file/create_file: content from arguments.content
+        - edit_file: no full file content available, tracked as path-only
+
+        This is called before compaction to ensure the tracker is up-to-date.
+        """
+        import time
+
+        FILE_TOOLS = {"read_file", "write_file", "edit_file", "create_file"}
+
+        # Build tool_call_id -> tool result content map
+        tool_result_map: dict[str, str] = {}
+        for msg in self.messages:
+            if msg.role == "tool" and msg.tool_call_id and isinstance(msg.content, str):
+                tool_result_map[msg.tool_call_id] = msg.content
+
+        base_ts = time.monotonic()
+        for msg_idx, msg in enumerate(self.messages):
+            if msg.role != "assistant" or not msg.tool_calls:
+                continue
+            for tc in msg.tool_calls:
+                if tc.function.name not in FILE_TOOLS:
+                    continue
+                path = tc.function.arguments.get("path") or tc.function.arguments.get("file_path")
+                if not path:
+                    continue
+
+                content: str | None = None
+                if tc.function.name == "read_file":
+                    content = tool_result_map.get(tc.id)
+                elif tc.function.name in ("write_file", "create_file"):
+                    content = tc.function.arguments.get("content")
+
+                # Use message index as relative timestamp for ordering
+                self._recent_file_operations[path] = (tc.function.name, content, base_ts + msg_idx)
+
+    def _reinject_recent_files(self) -> int:
+        """Re-inject recently operated file contents after compaction.
+
+        Sorts by recency, truncates each file to _POST_COMPACT_MAX_TOKENS_PER_FILE,
+        and enforces a total _POST_COMPACT_TOKEN_BUDGET. Files without content
+        (e.g. edit_file) are included as path-only references.
+
+        Returns:
+            Number of files listed in the re-injection message
+        """
+        if not self._recent_file_operations:
+            return 0
+
+        # Sort by timestamp descending (most recent first), take top N
+        sorted_files = sorted(
+            self._recent_file_operations.items(),
+            key=lambda item: item[1][2],  # timestamp
+            reverse=True,
+        )[:self._POST_COMPACT_MAX_FILES]
+
+        file_blocks: list[str] = []
+        used_tokens = 0
+
+        for path, (tool_name, content, _ts) in sorted_files:
+            if content:
+                truncated = truncate_text_by_tokens(content, self._POST_COMPACT_MAX_TOKENS_PER_FILE)
+                block = f"=== FILE: {path} (recently {tool_name}) ===\n{truncated}\n=== END FILE ==="
+            else:
+                block = f"=== FILE: {path} (recently {tool_name}, content not available) ==="
+
+            # Rough token estimate: 1 token ≈ 4 chars
+            block_tokens = len(block) // 4
+            if used_tokens + block_tokens > self._POST_COMPACT_TOKEN_BUDGET:
+                break
+            used_tokens += block_tokens
+            file_blocks.append(block)
+
+        if not file_blocks:
+            self._recent_file_operations.clear()
+            return 0
+
+        reinjection_msg = Message(
+            role="assistant",
+            content=(
+                "[Post-Compact File Context — Recently operated files]\n\n"
+                + "\n\n".join(file_blocks)
+            ),
+        )
+        self.messages.append(reinjection_msg)
+
+        # Clear tracked operations after re-injection
+        self._recent_file_operations.clear()
+
+        return len(file_blocks)
+
+    @staticmethod
+    def _empty_compaction_stats() -> dict[str, int | bool | None]:
+        return {
+            "compaction_triggered": False,
+            "compaction_pre_tokens": None,
+            "compaction_post_tokens": None,
+            "compaction_tokens_saved": None,
+            "compaction_microcompact_compacted_messages": 0,
+            "compaction_summary_generated_count": 0,
+            "compaction_summary_reused_count": 0,
+            "compaction_summary_quality_repair_count": 0,
+            "compaction_emergency_truncate_dropped_rounds": 0,
+        }
+
+    def _emergency_truncate(self) -> int:
         """Level 4 壓縮：緊急丟棄最老的 user round，最後手段。
 
         當 Level 3 摘要後仍超過硬頂（context_window - max_output_tokens - buffer）時觸發。
@@ -445,6 +591,8 @@ class Agent:
         if dropped_rounds:
             print(f"{Colors.BRIGHT_YELLOW}⚠️  Level 4 emergency truncate: dropped {dropped_rounds} oldest round(s){Colors.RESET}")
 
+        return dropped_rounds
+
     async def _summarize_messages(self):
         """漸進式上下文管理流水線（Level 2 → Level 3 → Level 4）
 
@@ -453,31 +601,72 @@ class Agent:
         Level 4: 緊急截斷 — 丟棄最老的 user round（最後手段）
         """
         estimated_tokens = self._estimate_tokens()
+        compaction_stats = self._empty_compaction_stats()
+        compaction_stats["compaction_pre_tokens"] = estimated_tokens
 
         if estimated_tokens <= self.token_limit:
+            compaction_stats["compaction_post_tokens"] = estimated_tokens
+            compaction_stats["compaction_tokens_saved"] = 0
+            self._last_compaction_stats = compaction_stats
             return
+
+        compaction_stats["compaction_triggered"] = True
 
         print(f"\n{Colors.BRIGHT_YELLOW}📊 Token estimate: {estimated_tokens}/{self.token_limit}{Colors.RESET}")
 
         # Level 2: Microcompact（輕量，不調 LLM）
-        self._microcompact_messages()
+        compacted_count = self._microcompact_messages()
+        compaction_stats["compaction_microcompact_compacted_messages"] = compacted_count
         estimated_tokens = self._estimate_tokens(force_recalculate=True)
         if estimated_tokens <= self.token_limit:
             print(f"{Colors.BRIGHT_GREEN}✓ Level 2 microcompact sufficient, tokens now: {estimated_tokens}{Colors.RESET}")
+            compaction_stats["compaction_post_tokens"] = estimated_tokens
+            pre_tokens = compaction_stats["compaction_pre_tokens"] or 0
+            compaction_stats["compaction_tokens_saved"] = max(pre_tokens - estimated_tokens, 0)
+            self._last_compaction_stats = compaction_stats
             return
 
         # Level 3: LLM 摘要（原有邏輯）
         print(f"{Colors.BRIGHT_YELLOW}🔄 Level 3: Triggering LLM summarization...{Colors.RESET}")
-        await self._summarize_with_llm(estimated_tokens)
+        summary_stats = await self._summarize_with_llm(estimated_tokens)
+        compaction_stats["compaction_summary_generated_count"] = summary_stats["generated_count"]
+        compaction_stats["compaction_summary_reused_count"] = summary_stats["reused_count"]
+        compaction_stats["compaction_summary_quality_repair_count"] = summary_stats["quality_repair_count"]
 
         # Level 4: 緊急截斷（摘要後仍超硬頂時觸發）
         hard_ceiling = self._hard_ceiling
         if self._estimate_tokens(force_recalculate=True) > hard_ceiling:
             print(f"{Colors.BRIGHT_YELLOW}🚨 Level 4: Post-summary tokens still exceed hard ceiling ({hard_ceiling}){Colors.RESET}")
-            self._emergency_truncate()
+            dropped_rounds = self._emergency_truncate()
+            compaction_stats["compaction_emergency_truncate_dropped_rounds"] = dropped_rounds
 
-    async def _summarize_with_llm(self, estimated_tokens: int):
-        """Level 3: LLM 驅動的消息摘要（原 _summarize_messages 核心邏輯）"""
+        post_tokens = self._estimate_tokens(force_recalculate=True)
+        compaction_stats["compaction_post_tokens"] = post_tokens
+        pre_tokens = compaction_stats["compaction_pre_tokens"] or 0
+        compaction_stats["compaction_tokens_saved"] = max(pre_tokens - post_tokens, 0)
+        self._last_compaction_stats = compaction_stats
+
+    async def _summarize_with_llm(self, estimated_tokens: int) -> dict[str, int]:
+        """Level 3: LLM 驅動的消息摘要（原 _summarize_messages 核心邏輯）
+
+        Includes:
+        - Circuit breaker: stops after MAX_CONSECUTIVE_SUMMARY_FAILURES
+        - Post-compact file re-injection: re-reads recently operated files
+        """
+        summary_stats = {
+            "generated_count": 0,
+            "reused_count": 0,
+            "quality_repair_count": 0,
+        }
+
+        # Circuit breaker: skip LLM summarization if too many consecutive failures
+        if self._consecutive_summary_failures >= self._MAX_CONSECUTIVE_SUMMARY_FAILURES:
+            print(f"{Colors.BRIGHT_YELLOW}⚠️  LLM summarization skipped (circuit breaker: "
+                  f"{self._consecutive_summary_failures} consecutive failures){Colors.RESET}")
+            return summary_stats
+
+        # Collect file operations from messages before they get compacted
+        self._collect_recent_files_from_messages()
 
         # Find all real user message indices (skip system prompt and synthetic nudges)
         user_indices = [
@@ -488,11 +677,15 @@ class Agent:
         # Need at least 1 user message to perform summary
         if len(user_indices) < 1:
             print(f"{Colors.BRIGHT_YELLOW}⚠️  Insufficient messages, cannot summarize{Colors.RESET}")
-            return
+            return summary_stats
 
         # Build new message list
         new_messages = [self.messages[0]]  # Keep system prompt
         summary_count = 0
+        reused_summary_count = 0
+        llm_attempted_count = 0
+        llm_failure_count = 0
+        quality_repair_count_before = self._summary_quality_repair_count
 
         # Iterate through each user message and summarize the execution process after it
         for i, user_idx in enumerate(user_indices):
@@ -511,28 +704,203 @@ class Agent:
 
             # If there are execution messages in this round, summarize them
             if execution_messages:
-                summary_text = await self._create_summary(
+                if len(execution_messages) == 1 and self._is_execution_summary_message(execution_messages[0]):
+                    reused_summary = self._extract_execution_summary_text(execution_messages[0].content)
+                    reused_summary = truncate_text_by_tokens(reused_summary, self._SUMMARY_MAX_TOKENS)
+                    if reused_summary:
+                        new_messages.append(Message(
+                            role="assistant",
+                            content=self._build_execution_summary_content(reused_summary),
+                        ))
+                        summary_count += 1
+                        reused_summary_count += 1
+                    continue
+
+                llm_attempted_count += 1
+                summary_text, used_fallback = await self._create_summary_with_meta(
                     execution_messages,
                     i + 1,
                     round_user_message=self.messages[user_idx].content,
                 )
+                if used_fallback:
+                    llm_failure_count += 1
                 if summary_text:
+                    summary_text = truncate_text_by_tokens(summary_text, self._SUMMARY_MAX_TOKENS)
                     summary_message = Message(
                         role="assistant",
-                        content=f"[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\n{summary_text}",
+                        content=self._build_execution_summary_content(summary_text),
                     )
                     new_messages.append(summary_message)
                     summary_count += 1
 
+        if summary_count == 0:
+            # All summaries failed — increment circuit breaker
+            self._consecutive_summary_failures += 1
+            print(f"{Colors.BRIGHT_YELLOW}⚠️  All summaries failed (consecutive failures: "
+                  f"{self._consecutive_summary_failures}/{self._MAX_CONSECUTIVE_SUMMARY_FAILURES}){Colors.RESET}")
+            return summary_stats
+
+        # Distinguish LLM failure from fallback success:
+        # - if all LLM attempts failed in this cycle, increment consecutive failure count
+        # - otherwise reset counter
+        if llm_attempted_count > 0 and llm_failure_count == llm_attempted_count:
+            self._consecutive_summary_failures += 1
+            print(f"{Colors.BRIGHT_YELLOW}⚠️  Summary fallback used for all LLM attempts "
+                  f"({llm_failure_count}/{llm_attempted_count}); consecutive failures: "
+                  f"{self._consecutive_summary_failures}/{self._MAX_CONSECUTIVE_SUMMARY_FAILURES}{Colors.RESET}")
+        else:
+            self._consecutive_summary_failures = 0
+
         # Replace message list
         self.messages = new_messages
 
+        # Post-compact file re-injection: append recently operated file contents
+        # so the model retains awareness of key files after compaction
+        reinjected = self._reinject_recent_files()
+
         new_tokens = self._estimate_tokens()
         print(f"{Colors.BRIGHT_GREEN}✓ Summary completed, tokens reduced from {estimated_tokens} to {new_tokens}{Colors.RESET}")
-        print(f"{Colors.DIM}  Structure: system + {len(user_indices)} user messages + {summary_count} summaries{Colors.RESET}")
+        quality_repairs = self._summary_quality_repair_count - quality_repair_count_before
+        quality_note = f", {quality_repairs} normalized" if quality_repairs else ""
+        reuse_note = f", {reused_summary_count} reused" if reused_summary_count else ""
+        fallback_note = f", {llm_failure_count} fallback" if llm_failure_count else ""
+        files_note = f", re-injected {reinjected} file(s)" if reinjected else ""
+        print(f"{Colors.DIM}  Structure: system + {len(user_indices)} user messages + {summary_count} summaries{quality_note}{reuse_note}{fallback_note}{files_note}{Colors.RESET}")
 
         # 重置静默记忆刷新标记，允许下次压缩前再次刷新
         self._memory_flushed_this_compaction = False
+
+        summary_stats["generated_count"] = summary_count - reused_summary_count
+        summary_stats["reused_count"] = reused_summary_count
+        summary_stats["quality_repair_count"] = max(quality_repairs, 0)
+        return summary_stats
+
+    def _build_execution_summary_content(self, summary_text: str) -> str:
+        return f"{self._SUMMARY_MESSAGE_HEADER}\n\n{summary_text}"
+
+    def _is_execution_summary_message(self, msg: Message) -> bool:
+        return (
+            msg.role == "assistant"
+            and isinstance(msg.content, str)
+            and msg.content.startswith(self._SUMMARY_MESSAGE_HEADER)
+        )
+
+    def _extract_execution_summary_text(self, summary_content: str) -> str:
+        summary_prefix = f"{self._SUMMARY_MESSAGE_HEADER}\n\n"
+        if summary_content.startswith(summary_prefix):
+            return summary_content[len(summary_prefix):]
+        if summary_content.startswith(self._SUMMARY_MESSAGE_HEADER):
+            return summary_content[len(self._SUMMARY_MESSAGE_HEADER):].lstrip()
+        return summary_content
+
+    def _build_summary_fallback_sections(self, user_messages: list[str], transcript: str) -> dict[str, str]:
+        all_user_messages = "\n".join(
+            f"{idx}. {text}" for idx, text in enumerate(user_messages, 1)
+        ) or "None"
+        primary_request = "\n".join(user_messages) if user_messages else "None"
+        current_work = transcript[-600:].strip() if transcript else "None"
+        if not current_work:
+            current_work = "None"
+
+        return {
+            "1": primary_request,
+            "2": "None",
+            "3": "None",
+            "4": "None",
+            "5": "None",
+            "6": all_user_messages,
+            "7": "None",
+            "8": current_work,
+            "9": "None",
+        }
+
+    @staticmethod
+    def _parse_numbered_summary_sections(summary_text: str) -> dict[str, str]:
+        import re
+
+        if not summary_text.strip():
+            return {}
+
+        section_pattern = re.compile(
+            r"(?ms)^(\d+)\.\s+[^\n:]+:?\s*(.*?)\s*(?=^\d+\.\s+|\Z)"
+        )
+        parsed: dict[str, str] = {}
+        for match in section_pattern.finditer(summary_text.strip()):
+            section_number = match.group(1).strip()
+            section_content = match.group(2).strip() or "None"
+            parsed[section_number] = section_content
+        return parsed
+
+    def _format_summary_sections(self, section_contents: dict[str, str]) -> str:
+        lines: list[str] = []
+        for section_number, section_title in self._SUMMARY_SECTION_SPECS:
+            section_text = (section_contents.get(section_number) or "None").strip() or "None"
+            lines.append(f"{section_number}. {section_title}:")
+            lines.append(section_text)
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _has_required_summary_sections(self, summary_text: str) -> bool:
+        return all(
+            f"{section_number}. {section_title}:" in summary_text
+            for section_number, section_title in self._SUMMARY_SECTION_SPECS
+        )
+
+    def _build_compact_summary_sections(self, user_messages: list[str], transcript: str) -> dict[str, str]:
+        compact = self._build_summary_fallback_sections(user_messages, transcript)
+        compact["1"] = truncate_text_by_tokens(compact["1"], 120)
+        compact["6"] = truncate_text_by_tokens(compact["6"], 320)
+        compact["8"] = truncate_text_by_tokens(compact["8"], 200)
+        return compact
+
+    def _normalize_summary_text(self, summary_text: str, user_messages: list[str], transcript: str) -> str:
+        parsed_sections = self._parse_numbered_summary_sections(summary_text)
+        fallback_sections = self._build_summary_fallback_sections(user_messages, transcript)
+
+        normalized_sections: dict[str, str] = {}
+        for section_number, _ in self._SUMMARY_SECTION_SPECS:
+            parsed_content = (parsed_sections.get(section_number) or "").strip()
+
+            if section_number == "6":
+                # 强制使用源消息重建，避免模型遗漏或改写用户意图。
+                normalized_sections[section_number] = fallback_sections[section_number]
+                continue
+
+            if section_number == "8" and (not parsed_content or parsed_content.lower() == "none"):
+                normalized_sections[section_number] = fallback_sections[section_number]
+                continue
+
+            normalized_sections[section_number] = parsed_content or fallback_sections[section_number]
+
+        normalized_text = self._format_summary_sections(normalized_sections)
+        if normalized_text.strip() != summary_text.strip():
+            self._summary_quality_repair_count += 1
+        return normalized_text
+
+    def _finalize_summary_text(self, summary_text: str, user_messages: list[str], transcript: str) -> str:
+        normalized_summary = self._normalize_summary_text(summary_text, user_messages, transcript)
+        capped_summary = truncate_text_by_tokens(normalized_summary, self._SUMMARY_MAX_TOKENS)
+        if self._has_required_summary_sections(capped_summary):
+            return capped_summary
+
+        compact_summary = self._format_summary_sections(
+            self._build_compact_summary_sections(user_messages, transcript)
+        )
+        return truncate_text_by_tokens(compact_summary, self._SUMMARY_MAX_TOKENS)
+
+    @staticmethod
+    def _extract_summary_from_response(raw: str) -> str:
+        """Extract <summary> block from compact response, stripping <analysis>.
+
+        If no <summary> tags found, return raw text as-is.
+        """
+        import re
+        match = re.search(r"<summary>(.*?)</summary>", raw, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        # Fallback: strip <analysis> block if present
+        cleaned = re.sub(r"<analysis>.*?</analysis>", "", raw, flags=re.DOTALL)
+        return cleaned.strip()
 
     async def _create_summary(
         self,
@@ -540,7 +908,25 @@ class Agent:
         round_num: int,
         round_user_message: str | list[dict[str, Any]] | None = None,
     ) -> str:
-        """Create summary for one execution round
+        """Backward-compatible wrapper that returns summary text only."""
+        summary_text, _ = await self._create_summary_with_meta(
+            messages,
+            round_num,
+            round_user_message,
+        )
+        return summary_text
+
+    async def _create_summary_with_meta(
+        self,
+        messages: list[Message],
+        round_num: int,
+        round_user_message: str | list[dict[str, Any]] | None = None,
+    ) -> tuple[str, bool]:
+        """Create summary for one execution round using structured 9-section prompt.
+
+        Inspired by Claude Code's compact prompt: produces a structured summary
+        with an <analysis> scratchpad (stripped before entering context) and a
+        <summary> block with 9 required sections.
 
         Args:
             messages: List of messages to summarize
@@ -548,10 +934,10 @@ class Agent:
             round_user_message: 原始轮次用户消息（用于保持意图锚点）
 
         Returns:
-            Summary text
+            (summary_text, used_fallback)
         """
         if not messages:
-            return ""
+            return "", False
 
         def _content_to_text(content: Any) -> str:
             if isinstance(content, str):
@@ -566,74 +952,85 @@ class Agent:
             if msg.role == "user" and not msg.is_synthetic:
                 user_messages.append(_content_to_text(msg.content))
 
-        # Build summary content
-        summary_content = f"Round {round_num} execution process:\n\n"
-        summary_content += "All user messages in this scope (non-tool-result):\n"
-        if user_messages:
-            for idx, text in enumerate(user_messages, 1):
-                summary_content += f"{idx}. {text}\n"
-        else:
-            summary_content += "None\n"
-        summary_content += "\nExecution transcript:\n"
-
+        # Build execution transcript
+        transcript_parts: list[str] = []
         for msg in messages:
             if msg.role == "assistant":
-                content_text = msg.content if isinstance(msg.content, str) else str(msg.content)
-                summary_content += f"Assistant: {content_text}\n"
+                content_text = _content_to_text(msg.content)
+                transcript_parts.append(f"Assistant: {content_text}")
                 if msg.tool_calls:
                     tool_names = [tc.function.name for tc in msg.tool_calls]
-                    summary_content += f"  → Called tools: {', '.join(tool_names)}\n"
+                    transcript_parts.append(f"  → Called tools: {', '.join(tool_names)}")
             elif msg.role == "user" and not msg.is_synthetic:
-                content_text = msg.content if isinstance(msg.content, str) else str(msg.content)
-                summary_content += f"User: {content_text}\n"
+                content_text = _content_to_text(msg.content)
+                transcript_parts.append(f"User: {content_text}")
             elif msg.role == "tool":
-                result_preview = msg.content if isinstance(msg.content, str) else str(msg.content)
-                summary_content += f"  ← Tool returned: {result_preview}...\n"
+                result_preview = _content_to_text(msg.content)
+                # Preserve file content and code snippets in tool results (up to 2000 chars)
+                if len(result_preview) > 2000:
+                    result_preview = result_preview[:1000] + "\n...[truncated]...\n" + result_preview[-1000:]
+                transcript_parts.append(f"  ← Tool[{msg.name or '?'}]: {result_preview}")
 
-        # Call LLM to generate concise summary
+        transcript = "\n".join(transcript_parts)
+
+        user_messages_block = "\n".join(f"  {idx}. {text}" for idx, text in enumerate(user_messages, 1)) or "  None"
+
+        summary_prompt = f"""You are summarizing one historical agent execution slice for context compaction.
+
+Round {round_num} — All user messages in this scope (non-tool-result):
+{user_messages_block}
+
+Execution transcript:
+{transcript}
+
+Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts. In your analysis:
+1. Chronologically trace each step in the transcript
+2. Identify the user's explicit requests and intents
+3. Note specific file names, key function signatures, and concrete file edits
+4. Note errors encountered and how they were fixed
+5. Pay special attention to user feedback
+
+Then provide your summary in <summary> tags with these 9 sections:
+
+1. Primary Request and Intent: All explicit user requests/intents in detail
+2. Key Technical Concepts: Technologies, frameworks, patterns discussed
+3. Files and Code Sections: Files examined/modified/created, key snippets/signatures when critical, and why each file matters
+4. Errors and Fixes: All errors encountered and how they were resolved, including user feedback
+5. Problem Solving: Problems solved and ongoing troubleshooting
+6. All User Messages: List EVERY user message (non-tool-result) verbatim — critical for intent tracking
+7. Pending Tasks: Explicitly requested but unfinished work
+8. Current Work: Precisely what was happening at the end of this slice, with file names and code context
+9. Optional Next Step: Only if directly in line with the user's most recent request
+
+Rules:
+- Keep facts grounded in the provided content only
+- Keep the summary concise and information-dense; avoid long verbatim code dumps
+- Keep total summary length within approximately {self._SUMMARY_MAX_TOKENS} tokens
+- If a section has no information, write "None"
+- Be concise but thorough on technical details"""
+
         try:
-            summary_prompt = f"""You are summarizing one historical agent execution slice for context compaction.
-
-{summary_content}
-
-Write a structured summary in English using the following 9 sections:
-1. Primary Request and Intent
-2. Key Technical Concepts
-3. Files and Code Sections
-4. Errors and fixes
-5. Problem Solving
-6. All user messages (exclude tool results)
-7. Pending Tasks
-8. Current Work
-9. Optional Next Step
-
-Requirements:
-1. Keep facts grounded in the provided content only.
-2. "All user messages" must include every user message in this slice.
-3. "Current Work" must describe exactly what the agent was doing at the end of this slice.
-4. If a section has no information, write "None".
-5. Keep the response concise and scannable.
-6. Output plain text only."""
-
-            summary_msg = Message(role="user", content=summary_prompt)
             response = await self.llm.generate(
                 messages=[
                     Message(
                         role="system",
-                        content="You are an assistant skilled at structured summaries for Agent context compaction.",
+                        content="You are a summarization assistant for Agent context compaction. Respond with TEXT ONLY. Do NOT call any tools.",
                     ),
-                    summary_msg,
+                    Message(role="user", content=summary_prompt),
                 ]
             )
 
-            summary_text = response.content
+            summary_text = self._extract_summary_from_response(response.content)
+            summary_text = self._finalize_summary_text(summary_text, user_messages, transcript)
             print(f"{Colors.BRIGHT_GREEN}✓ Summary for round {round_num} generated successfully{Colors.RESET}")
-            return summary_text
+            return summary_text, False
 
         except Exception as e:
             print(f"{Colors.BRIGHT_RED}✗ Summary generation failed for round {round_num}: {e}{Colors.RESET}")
-            # Use simple text summary on failure
-            return summary_content
+            fallback_summary = self._format_summary_sections(
+                self._build_summary_fallback_sections(user_messages, transcript)
+            )
+            return truncate_text_by_tokens(fallback_summary, self._SUMMARY_MAX_TOKENS), True
 
     # =========================================================================
     # 已移除廢棄方法: run() 和 run_with_steps()
@@ -697,6 +1094,7 @@ Requirements:
 
                 # 檢查並摘要消息歷史以防止上下文溢出（Level 2-4 流水線）
                 await self._summarize_messages()
+                compaction_stats_snapshot = dict(self._last_compaction_stats)
 
                 # 漸進式提醒（倒數第2步時提醒 LLM）
                 if step == self.max_steps - 2:
@@ -906,6 +1304,7 @@ Requirements:
                             "usage_total_tokens": None,
                             "first_token_latency_s": first_token_latency_s,
                             "completion_latency_s": completion_latency_s,
+                            **compaction_stats_snapshot,
                         }
                     )
 
@@ -938,6 +1337,7 @@ Requirements:
                         "usage_total_tokens": usage.total_tokens if usage else None,
                         "first_token_latency_s": first_token_latency_s,
                         "completion_latency_s": completion_latency_s,
+                        **compaction_stats_snapshot,
                     }
                 )
 

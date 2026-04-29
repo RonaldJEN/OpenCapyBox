@@ -661,6 +661,15 @@ class HistoryService:
         usage_total_tokens: int | None,
         first_token_latency_s: float | None,
         completion_latency_s: float | None,
+        compaction_triggered: bool = False,
+        compaction_pre_tokens: int | None = None,
+        compaction_post_tokens: int | None = None,
+        compaction_tokens_saved: int | None = None,
+        compaction_microcompact_compacted_messages: int | None = None,
+        compaction_summary_generated_count: int | None = None,
+        compaction_summary_reused_count: int | None = None,
+        compaction_summary_quality_repair_count: int | None = None,
+        compaction_emergency_truncate_dropped_rounds: int | None = None,
     ) -> LLMCallRecord:
         """持久化单次 LLM 调用快照。"""
         request_message_count = len(request_messages)
@@ -693,6 +702,15 @@ class HistoryService:
             usage_total_tokens=usage_total_tokens,
             first_token_latency_s=first_token_latency_s,
             completion_latency_s=completion_latency_s,
+            compaction_triggered=compaction_triggered,
+            compaction_pre_tokens=compaction_pre_tokens,
+            compaction_post_tokens=compaction_post_tokens,
+            compaction_tokens_saved=compaction_tokens_saved,
+            compaction_microcompact_compacted_messages=compaction_microcompact_compacted_messages,
+            compaction_summary_generated_count=compaction_summary_generated_count,
+            compaction_summary_reused_count=compaction_summary_reused_count,
+            compaction_summary_quality_repair_count=compaction_summary_quality_repair_count,
+            compaction_emergency_truncate_dropped_rounds=compaction_emergency_truncate_dropped_rounds,
         )
         self.db.add(row)
         self.db.commit()

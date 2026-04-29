@@ -64,3 +64,20 @@ class TestGetCurrentUser:
         assert exc_info.value.status_code == 401
         if detail_substr:
             assert detail_substr in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_get_current_admin_user_success(self):
+        from src.api.deps import get_current_admin_user
+
+        result = await get_current_admin_user(user_id="admin")
+        assert result == "admin"
+
+    @pytest.mark.asyncio
+    async def test_get_current_admin_user_forbidden_for_normal_user(self):
+        from src.api.deps import get_current_admin_user
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_admin_user(user_id="demo")
+
+        assert exc_info.value.status_code == 403
+        assert "管理员权限" in exc_info.value.detail

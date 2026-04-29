@@ -202,13 +202,13 @@ class TestRebuildMessagesFromEvents:
         rnd.status = status
         return rnd
 
-    def _make_conv_msg(self, role, content, round_id, sequence):
+    def _make_conv_msg(self, role, content, round_id, sequence, is_summary=False):
         m = MagicMock()
         m.role = role
         m.content = content if isinstance(content, str) else json.dumps(content)
         m.round_id = round_id
         m.sequence = sequence
-        m.is_summary = False
+        m.is_summary = is_summary
         return m
 
     def _make_evt(self, event_type, payload_dict, sequence):
@@ -506,6 +506,56 @@ class TestRestoreHistory:
         assert service.agent.messages[0].role == "user"
         assert service.agent.messages[0].content == "q2"
 
+    def test_restore_history_prepends_summary_anchor_before_trimmed_tail(self):
+        """恢复时应优先注入最新摘要锚点，再拼接尾窗历史"""
+        service = make_agent_service()
+        service.agent = MagicMock()
+        service.agent.messages = []
+
+        fake_messages = [
+            AgentMessage(role="user", content="q1"),
+            AgentMessage(role="assistant", content="a1"),
+            AgentMessage(role="user", content="q2"),
+            AgentMessage(role="assistant", content="a2"),
+        ]
+        summary_anchor = AgentMessage(
+            role="assistant",
+            content="[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary",
+        )
+
+        mock_settings = MagicMock()
+        mock_settings.agent_max_history_messages = 2
+
+        with patch.object(service, "_rebuild_messages_from_events", return_value=fake_messages):
+            with patch.object(service, "_load_latest_summary_anchor", return_value=summary_anchor):
+                with patch("src.api.config.get_settings", return_value=mock_settings):
+                    service._restore_history()
+
+        assert len(service.agent.messages) == 3
+        assert service.agent.messages[0].role == "assistant"
+        assert "Assistant Execution Summary" in service.agent.messages[0].content
+        assert service.agent.messages[1].role == "user"
+        assert service.agent.messages[1].content == "q2"
+
+    def test_restore_history_uses_summary_anchor_when_event_history_empty(self):
+        """当事件历史为空但存在摘要锚点时，仍应恢复摘要消息"""
+        service = make_agent_service()
+        service.agent = MagicMock()
+        service.agent.messages = []
+
+        summary_anchor = AgentMessage(
+            role="assistant",
+            content="[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary only",
+        )
+
+        with patch.object(service, "_rebuild_messages_from_events", return_value=[]):
+            with patch.object(service, "_load_latest_summary_anchor", return_value=summary_anchor):
+                service._restore_history()
+
+        assert len(service.agent.messages) == 1
+        assert service.agent.messages[0].role == "assistant"
+        assert "summary only" in service.agent.messages[0].content
+
 
 # ============================================================
 # 合成消息持久化 + 恢復測試
@@ -730,6 +780,27 @@ class TestSaveConversationMessageAtomicInsert:
         row = db.query(ConvMsg).filter(ConvMsg.session_id == "s-summary").first()
         assert row is not None
         assert row.is_summary is False
+        db.close()
+
+    def test_save_sets_is_summary_true_when_requested(self):
+        """保存摘要锚点時應寫入 is_summary=True。"""
+        Session, _ = self._make_real_db()
+        db = Session()
+
+        history = MagicMock()
+        history.db = db
+
+        service = make_agent_service(history_service=history, session_id="s-summary-true")
+        service._save_conversation_message(
+            "assistant",
+            "[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary",
+            is_summary=True,
+        )
+
+        from src.api.models.conversation_message import ConversationMessage as ConvMsg
+        row = db.query(ConvMsg).filter(ConvMsg.session_id == "s-summary-true").first()
+        assert row is not None
+        assert row.is_summary is True
         db.close()
 
     def test_concurrent_saves_no_unique_conflict(self, tmp_path):

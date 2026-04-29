@@ -21,6 +21,10 @@ def _unauthorized(detail: str) -> HTTPException:
     )
 
 
+def _forbidden(detail: str) -> HTTPException:
+    return HTTPException(status_code=403, detail=detail)
+
+
 def create_access_token(user_id: str, expires_in_seconds: int | None = None) -> tuple[str, int]:
     """创建 HS256 签名访问令牌。
 
@@ -85,3 +89,12 @@ async def get_current_user(
     if not credentials or credentials.scheme.lower() != "bearer":
         raise _unauthorized("未提供访问令牌")
     return verify_access_token(credentials.credentials)
+
+
+async def get_current_admin_user(user_id: str = Depends(get_current_user)) -> str:
+    """校验当前用户是否为管理员。"""
+    settings = get_settings()
+    admin_users = settings.get_admin_users()
+    if user_id not in admin_users:
+        raise _forbidden("需要管理员权限")
+    return user_id
