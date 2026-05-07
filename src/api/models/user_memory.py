@@ -2,15 +2,46 @@
 
 包含：
 - UserMemory：Markdown 记忆文件持久化（USER.md / MEMORY.md / SOUL.md / AGENTS.md）
-- MemoryEmbedding：向量索引（SQLite JSON 列，零依赖）
+- MemoryEmbedding：向量索引（SQLite JSON / PostgreSQL vector(2048)）
 - CronJobRun：定时任务执行历史
 - UserSkillConfig：Skill 启用/禁用状态
 """
 import json
 
-from sqlalchemy import Column, String, Integer, Text, Boolean, DateTime
+from sqlalchemy import Column, String, Integer, Text, Boolean, DateTime, JSON
+from sqlalchemy.types import UserDefinedType
 from .database import Base
 from src.api.utils.timezone import now_naive
+from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS, normalize_embedding_vector, parse_embedding_vector, serialize_pgvector
+
+
+class PGVector(UserDefinedType):
+    """PostgreSQL pgvector 类型。"""
+
+    cache_ok = True
+
+    def __init__(self, dimensions: int):
+        self.dimensions = dimensions
+
+    def get_col_spec(self, **kw):
+        return f"vector({self.dimensions})"
+
+    def bind_processor(self, dialect):
+        def process(value):
+            return serialize_pgvector(value)
+
+        return process
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if value is None:
+                return None
+            # pgvector 返回字符串形式 "[0.1,0.2,...]"，直接解析为 list（写入时已保证维度正确）
+            if isinstance(value, str):
+                return parse_embedding_vector(value)
+            return list(value)
+
+        return process
 
 
 class UserMemory(Base):
@@ -40,7 +71,8 @@ class UserMemory(Base):
 class MemoryEmbedding(Base):
     """记忆向量索引
 
-    使用 OpenAI Embedding API 生成向量，存为 JSON float array。
+    使用 OpenAI Embedding API 生成向量。
+    SQLite 存为 JSON 数组，PostgreSQL 存为 pgvector vector(2048)。
     若未配置 EMBEDDING_API_KEY，则降级为关键词检索。
     """
 
@@ -52,8 +84,8 @@ class MemoryEmbedding(Base):
     file_path = Column(String(255), nullable=True)
     chunk_index = Column(Integer, nullable=True)
     chunk_text = Column(Text, nullable=False)
-    # JSON float array，例如 "[0.12, -0.34, ...]"
-    embedding = Column(Text, nullable=True)
+    # float array，例如 [0.12, -0.34, ...]；短向量写入前补齐到 2048 维
+    embedding = Column(JSON().with_variant(PGVector(MEMORY_EMBEDDING_DIMENSIONS), "postgresql"), nullable=True)
     created_at = Column(DateTime, default=now_naive)
 
 

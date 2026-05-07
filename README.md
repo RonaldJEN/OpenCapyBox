@@ -224,15 +224,22 @@ Edit `.env` with at minimum:
 LLM_API_KEY=your-dashscope-key           # Alibaba DashScope unified key
 SIMPLE_AUTH_USERS=demo:demo123           # Login users (format: user:pass,user2:pass2)
 
+# === Database ===
+# Replace the placeholder from .env.example before starting the backend.
+# The PostgreSQL database must exist and have pgvector installed:
+#   CREATE EXTENSION IF NOT EXISTS vector;
+DATABASE_URL=postgresql://user:password@host:5432/opencapybox
+
 # === OpenSandbox (optional) ===
 SANDBOX_DOMAIN=localhost:8080
 SANDBOX_API_KEY=your-sandbox-key
 
-# === Others (all have defaults) ===
-# DATABASE_URL=sqlite:///./data/database/open_capy_box.db
+# === Others ===
 # AGENT_MAX_STEPS=100
 # AGENT_TOKEN_LIMIT=200000
 ```
+
+The PostgreSQL URL in `.env.example` is only a template. Configure a real PostgreSQL database and enable the `pgvector` extension before running `uv run uvicorn ...`; otherwise startup or database initialization will fail.
 
 ### 3. Start Services
 
@@ -422,7 +429,10 @@ SANDBOX_PERSISTENT_STORAGE_ENABLED=true
 # === Application ===
 DEBUG=false
 CORS_ORIGINS=["http://localhost:3000"]
-DATABASE_URL=sqlite:///./data/database/open_capy_box.db
+DATABASE_URL=postgresql://user:password@host:5432/opencapybox
+# PostgreSQL must have pgvector installed: CREATE EXTENSION IF NOT EXISTS vector;
+# Optional pytest integration database, never point this at production:
+TEST_DATABASE_URL=postgresql://user:password@host:5432/opencapybox_test
 AUTH_SECRET_KEY=                        # Auto-derived if not set
 AUTH_TOKEN_EXPIRE_MINUTES=720
 

@@ -413,6 +413,21 @@ class AgentService:
             # 4b. Agent 輸出（從預載的 agui_events 重建 assistant + tool 消息）
             round_messages = self._events_to_messages(events_by_round.get(rnd.id, []))
 
+            if (
+                getattr(rnd, "status", None) == "completed"
+                and rnd.final_response
+                and not any(
+                    msg.role == "assistant" and isinstance(msg.content, str) and msg.content
+                    for msg in round_messages
+                )
+            ):
+                round_messages.append(AgentMessage(role="assistant", content=rnd.final_response))
+                logger.warning(
+                    "Round %s 無可恢復 assistant 文本事件，fallback 到 rounds.final_response (session=%s)",
+                    rnd.id,
+                    self.session_id,
+                )
+
             # interrupted round 被後續輪次解決後，避免冷恢復時仍看到過期占位內容
             if getattr(rnd, "status", None) == "resumed":
                 for msg in round_messages:
@@ -1113,6 +1128,7 @@ class AgentService:
                     _externally_terminated = True
                     if run_cancel_token and not run_cancel_token.is_set():
                         run_cancel_token.set()
+                    self.history_service.reset_session()
                     break
 
                 await self.history_service.save_agui_event(run_id, event)
@@ -1221,6 +1237,7 @@ class AgentService:
                     _is_user_cancel = bool(run_cancel_token and run_cancel_token.is_set())
                     _actual_status = "cancelled" if _is_user_cancel else (_final_status or "failed")
                     _fallback_response = "Cancelled" if _actual_status == "cancelled" else "Failed"
+                    self.history_service.reset_session()
                     self.history_service.complete_round(
                         round_id=run_id,
                         final_response=_final_response or accumulated_content or final_response or _fallback_response,

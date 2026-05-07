@@ -34,7 +34,7 @@
 | file_path | String(255) | nullable |
 | chunk_index | Integer | nullable |
 | chunk_text | Text | NOT NULL |
-| embedding | Text | nullable（JSON float 数组） |
+| embedding | SQLite: JSON / PostgreSQL: pgvector `vector(2048)` | nullable（float 数组；不足 2048 维右侧补 0） |
 | created_at | DateTime | default=now |
 
 ### user_skill_configs 表
@@ -157,6 +157,8 @@
 
 - **BM25 分词**：中文逐字，英文逐词（零外部依赖）
 - **向量检索**：外部 embedding API（支持 model_registry + settings fallback）
+- **向量存储维度**：`memory_embeddings.embedding` 固定为 2048 维；Embedding API 返回短向量时右侧补 0。
+- **PostgreSQL 前置条件**：生产库必须安装 pgvector 扩展；扩展缺失时启动 / 迁移直接失败。
 - **RRF 融合**：k=60，取 3x top_k 候选
 - **时间衰减**：half_life=30 天，指数衰减；常驻文件（MEMORY / USER / SOUL / AGENTS.md）豁免
 - **降级策略**：无 embedding API 时降级为纯 BM25

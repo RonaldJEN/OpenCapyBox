@@ -14,6 +14,10 @@ import pytest
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+from tests.db_safety import configure_pytest_database_urls  # noqa: E402
+
+configure_pytest_database_urls(project_root)
+
 # 設置測試環境變量（如果未設置）
 if "LLM_API_KEY" not in os.environ:
     os.environ["LLM_API_KEY"] = "test-api-key-for-ci"

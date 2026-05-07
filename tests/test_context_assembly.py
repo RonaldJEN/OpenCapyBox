@@ -276,7 +276,7 @@ class TestTimeDecay:
         # 今天的文件衰减极小
         assert decayed[0]["score"] >= 0.95
 
-    def test_no_date_in_path_no_decay(self):
+    def test_no_date_in_path_no_created_at_no_decay(self):
         from src.api.services.memory_service import MemoryService
 
         results = [
@@ -284,6 +284,46 @@ class TestTimeDecay:
         ]
         decayed = MemoryService._apply_time_decay(results)
         assert decayed[0]["score"] == 0.7
+
+    def test_conversation_with_created_at_decays(self):
+        """对话记录 file_path 无日期时，fallback 到 created_at 进行时间衰减"""
+        from src.api.services.memory_service import MemoryService
+        from datetime import datetime, timedelta
+
+        old_date = datetime.now() - timedelta(days=60)
+        results = [
+            {"file_path": "conversation/sess1/round1", "chunk_index": 0, "text": "old chat", "score": 1.0, "created_at": old_date},
+        ]
+        decayed = MemoryService._apply_time_decay(results, half_life_days=30.0)
+        # 60 天 = 2 个半衰期，衰减到 ~0.25
+        assert decayed[0]["score"] < 0.3
+
+    def test_recent_conversation_minimal_decay(self):
+        """近期对话通过 created_at 衰减极小"""
+        from src.api.services.memory_service import MemoryService
+        from datetime import datetime, timedelta
+
+        recent = datetime.now() - timedelta(days=1)
+        results = [
+            {"file_path": "conversation/sess1/round1", "chunk_index": 0, "text": "recent", "score": 1.0, "created_at": recent},
+        ]
+        decayed = MemoryService._apply_time_decay(results, half_life_days=30.0)
+        assert decayed[0]["score"] >= 0.97
+
+    def test_created_at_reorders_old_vs_new_conversations(self):
+        """旧对话通过 created_at 衰减后排名下降，新对话上升"""
+        from src.api.services.memory_service import MemoryService
+        from datetime import datetime, timedelta
+
+        old_date = datetime.now() - timedelta(days=90)
+        recent = datetime.now() - timedelta(days=2)
+        results = [
+            {"file_path": "conversation/sess-old/round1", "chunk_index": 0, "text": "old", "score": 1.0, "created_at": old_date},
+            {"file_path": "conversation/sess-new/round2", "chunk_index": 0, "text": "new", "score": 0.5, "created_at": recent},
+        ]
+        decayed = MemoryService._apply_time_decay(results, half_life_days=30.0)
+        # 新对话 score≈0.48 应排在旧对话 score≈0.12 前面
+        assert decayed[0]["file_path"] == "conversation/sess-new/round2"
 
     def test_empty_results(self):
         from src.api.services.memory_service import MemoryService
@@ -355,6 +395,297 @@ class TestHybridSearchIntegration:
              patch.object(MemoryService, "_search_by_embedding", new_callable=AsyncMock, side_effect=Exception("API down")):
             results = await svc.search_memory("u1", "React", top_k=5)
         assert len(results) >= 1
+
+
+class TestSearchMemoryDateRange:
+    """search_memory 时间范围过滤测试"""
+
+    def test_parse_date_range_valid(self):
+        from src.api.services.memory_service import MemoryService
+
+        dt_start, dt_end = MemoryService._parse_date_range("2026-04-20", "2026-04-26")
+        assert dt_start.year == 2026 and dt_start.month == 4 and dt_start.day == 20
+        assert dt_end.hour == 23 and dt_end.minute == 59 and dt_end.second == 59
+        assert dt_end.day == 26
+
+    def test_parse_date_range_none(self):
+        from src.api.services.memory_service import MemoryService
+
+        dt_start, dt_end = MemoryService._parse_date_range(None, None)
+        assert dt_start is None
+        assert dt_end is None
+
+    def test_parse_date_range_invalid_format(self):
+        from src.api.services.memory_service import MemoryService
+
+        dt_start, dt_end = MemoryService._parse_date_range("not-a-date", "2026-04-26")
+        assert dt_start is None
+        assert dt_end is not None
+
+    def test_bm25_with_date_filter(self):
+        """BM25 搜索应传递时间过滤条件到 query filter"""
+        from src.api.services.memory_service import MemoryService
+        from datetime import datetime
+
+        chunk = MagicMock(chunk_text="Python 深度学习", file_path="a.md", chunk_index=0)
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = [chunk]
+        svc = MemoryService(mock_db)
+
+        dt_start = datetime(2026, 4, 20)
+        dt_end = datetime(2026, 4, 26, 23, 59, 59)
+        results = svc._search_by_bm25("u1", "Python", top_k=5, dt_start=dt_start, dt_end=dt_end)
+
+        # filter 应被调用（带时间条件）
+        mock_db.query.return_value.filter.assert_called()
+        assert len(results) >= 1
+
+    @pytest.mark.asyncio
+    async def test_search_memory_passes_dates_to_bm25(self):
+        """search_memory 将 start_date/end_date 传递到 BM25"""
+        from src.api.services.memory_service import MemoryService
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+        svc = MemoryService(mock_db)
+
+        with patch.object(MemoryService, "_is_embedding_available", return_value=False), \
+             patch.object(svc, "_search_by_bm25", return_value=[]) as mock_bm25:
+            await svc.search_memory("u1", "test", top_k=5, start_date="2026-04-20", end_date="2026-04-26")
+
+        _, kwargs = mock_bm25.call_args
+        assert kwargs["dt_start"].day == 20
+        assert kwargs["dt_end"].day == 26
+
+    @pytest.mark.asyncio
+    async def test_search_memory_passes_dates_to_embedding(self):
+        """search_memory 将 start_date/end_date 传递到向量检索"""
+        from src.api.services.memory_service import MemoryService
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+        svc = MemoryService(mock_db)
+
+        with patch.object(MemoryService, "_is_embedding_available", return_value=True), \
+             patch.object(svc, "_search_by_embedding", new_callable=AsyncMock, return_value=[]) as mock_emb, \
+             patch.object(svc, "_search_by_bm25", return_value=[]):
+            await svc.search_memory("u1", "test", top_k=5, start_date="2026-04-20", end_date="2026-04-26")
+
+        _, kwargs = mock_emb.call_args
+        assert kwargs["dt_start"].day == 20
+        assert kwargs["dt_end"].day == 26
+
+    def test_bm25_excludes_evergreen_files_with_date_range(self):
+        """指定日期范围时，BM25 filter 应排除 MEMORY.md/USER.md 等常青文件"""
+        from src.api.services.memory_service import MemoryService
+        from src.api.models.user_memory import MemoryEmbedding
+        from datetime import datetime
+
+        mock_db = MagicMock()
+        # 模拟两个 chunk: 一个是 MEMORY.md, 一个是对话
+        chunk_memory = MagicMock(chunk_text="记忆内容", file_path="MEMORY.md", chunk_index=0)
+        chunk_convo = MagicMock(chunk_text="对话内容讨论", file_path="conversation/s1/r1", chunk_index=0)
+        mock_db.query.return_value.filter.return_value.all.return_value = [chunk_convo]
+        svc = MemoryService(mock_db)
+
+        dt_start = datetime(2026, 4, 20)
+        dt_end = datetime(2026, 4, 26, 23, 59, 59)
+        results = svc._search_by_bm25("u1", "对话内容", top_k=5, dt_start=dt_start, dt_end=dt_end)
+
+        # 验证 filter 被调用时包含了 notlike 条件（排除常青文件）
+        filter_call = mock_db.query.return_value.filter
+        filter_args = filter_call.call_args[0]
+        # 至少有 user_id + created_at >= + created_at <= + 4 notlike = 7 个条件
+        assert len(filter_args) >= 7
+
+    def test_bm25_no_exclusion_without_date_range(self):
+        """不指定日期范围时，不排除常青文件"""
+        from src.api.services.memory_service import MemoryService
+        from datetime import datetime
+
+        mock_db = MagicMock()
+        chunk = MagicMock(chunk_text="记忆", file_path="MEMORY.md", chunk_index=0)
+        mock_db.query.return_value.filter.return_value.all.return_value = [chunk]
+        svc = MemoryService(mock_db)
+
+        svc._search_by_bm25("u1", "记忆", top_k=5)
+
+        filter_call = mock_db.query.return_value.filter
+        filter_args = filter_call.call_args[0]
+        # 只有 user_id 一个条件
+        assert len(filter_args) == 1
+
+    def test_bm25_date_filter_keeps_null_file_path_records(self):
+        """指定日期范围时，file_path 为空的对话索引仍应保留。"""
+        from datetime import datetime
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from src.api.models.user_memory import MemoryEmbedding
+        from src.api.services.memory_service import MemoryService
+
+        engine = create_engine("sqlite:///:memory:")
+        MemoryEmbedding.__table__.create(bind=engine)
+        TestingSessionLocal = sessionmaker(bind=engine)
+        db = TestingSessionLocal()
+        try:
+            db.add_all([
+                MemoryEmbedding(
+                    user_id="u1",
+                    file_path=None,
+                    chunk_index=0,
+                    chunk_text="Python 对话内容",
+                    created_at=datetime(2026, 4, 22),
+                ),
+                MemoryEmbedding(
+                    user_id="u1",
+                    file_path="MEMORY.md",
+                    chunk_index=0,
+                    chunk_text="Python 常青内容",
+                    created_at=datetime(2026, 4, 22),
+                ),
+            ])
+            db.commit()
+
+            svc = MemoryService(db)
+            results = svc._search_by_bm25(
+                "u1",
+                "Python",
+                top_k=5,
+                dt_start=datetime(2026, 4, 20),
+                dt_end=datetime(2026, 4, 26, 23, 59, 59),
+            )
+
+            assert [r["file_path"] for r in results] == [None]
+        finally:
+            db.close()
+            engine.dispose()
+
+
+class TestSearchMemoryToolDateParams:
+    """SearchMemoryTool 时间参数透传测试"""
+
+    @pytest.mark.asyncio
+    async def test_tool_passes_dates_to_service(self):
+        from src.agent.tools.memory_tools import SearchMemoryTool
+        from src.api.services.memory_service import MemoryService
+
+        mock_db = MagicMock()
+        factory = MagicMock(return_value=mock_db)
+        tool = SearchMemoryTool(db_session_factory=factory, user_id="u1")
+
+        with patch.object(MemoryService, "search_memory", new_callable=AsyncMock, return_value=[]) as mock_search:
+            await tool.execute(query="test", start_date="2026-04-20", end_date="2026-04-26")
+
+        mock_search.assert_called_once_with("u1", "test", 5, start_date="2026-04-20", end_date="2026-04-26")
+
+    def test_tool_parameters_include_dates(self):
+        from src.agent.tools.memory_tools import SearchMemoryTool
+
+        tool = SearchMemoryTool(db_session_factory=MagicMock, user_id="u1")
+        props = tool.parameters["properties"]
+        assert "start_date" in props
+        assert "end_date" in props
+        assert "start_date" not in tool.parameters.get("required", [])
+
+
+class TestEmbeddingVectorNormalization:
+    """Embedding 向量维度归一测试"""
+
+    def test_short_embedding_is_padded_to_storage_dimensions(self):
+        from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS, normalize_embedding_vector
+
+        vector = normalize_embedding_vector([0.1, -0.2, 0.3])
+
+        assert len(vector) == MEMORY_EMBEDDING_DIMENSIONS
+        assert vector[:3] == [0.1, -0.2, 0.3]
+        assert vector[3:] == [0.0] * (MEMORY_EMBEDDING_DIMENSIONS - 3)
+
+    def test_pgvector_literal_is_parsed_and_padded(self):
+        from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS, normalize_embedding_vector
+
+        vector = normalize_embedding_vector("[0.1,-0.2]")
+
+        assert len(vector) == MEMORY_EMBEDDING_DIMENSIONS
+        assert vector[:2] == [0.1, -0.2]
+
+    @pytest.mark.asyncio
+    async def test_sqlite_embedding_search_normalizes_legacy_short_vectors(self):
+        from src.api.services.memory_service import MemoryService
+
+        chunk = MagicMock()
+        chunk.embedding = [0.1, 0.2]
+        chunk.file_path = "conversation/s1/r1"
+        chunk.chunk_index = 0
+        chunk.chunk_text = "legacy short vector"
+        chunk.created_at = None
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = [chunk]
+        svc = MemoryService(mock_db)
+
+        with patch.object(svc, "_generate_embeddings", new_callable=AsyncMock, return_value=[[0.1, 0.2]]):
+            results = await svc._search_by_embedding("u1", "query", top_k=1)
+
+        assert results[0]["score"] == 1.0
+
+    def test_pgvector_search_builds_bound_vector_query(self):
+        from sqlalchemy.dialects import postgresql
+
+        from src.api.models.user_memory import MemoryEmbedding
+        from src.api.services.memory_service import MemoryService
+        from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS
+
+        item = MagicMock()
+        item.file_path = "conversation/s1/r1"
+        item.chunk_index = 0
+        item.chunk_text = "pgvector result"
+        item.created_at = None
+
+        captured = {}
+
+        class FakeQuery:
+            def __init__(self, *entities):
+                captured["entities"] = entities
+
+            def filter(self, *conditions):
+                captured["filters"] = conditions
+                return self
+
+            def order_by(self, expression):
+                captured["order_by"] = expression
+                return self
+
+            def limit(self, value):
+                captured["limit"] = value
+                return self
+
+            def all(self):
+                return [(item, 0.75)]
+
+        mock_db = MagicMock()
+        mock_db.query.side_effect = lambda *entities: FakeQuery(*entities)
+        svc = MemoryService(mock_db)
+
+        results = svc._search_by_pgvector(
+            [0.1, 0.2],
+            [MemoryEmbedding.user_id == "u1", MemoryEmbedding.embedding.isnot(None)],
+            top_k=3,
+        )
+
+        compiled_order = str(captured["order_by"].compile(dialect=postgresql.dialect()))
+        assert "<=>" in compiled_order
+        assert f"vector({MEMORY_EMBEDDING_DIMENSIONS})" in compiled_order
+        assert captured["limit"] == 3
+        assert results == [
+            {
+                "file_path": "conversation/s1/r1",
+                "chunk_index": 0,
+                "text": "pgvector result",
+                "score": 0.75,
+                "created_at": None,
+            }
+        ]
 
 
 class TestEmbeddingModelRegistry:
@@ -572,6 +903,22 @@ class TestIndexConversationRound:
             if isinstance(record, MemoryEmbedding):
                 assert record.file_path == "conversation/session-123/round-456"
                 assert record.user_id == "u1"
+
+    @pytest.mark.asyncio
+    async def test_index_stores_embedding_as_padded_float_list(self):
+        """向量字段写入 2048 维 Python list，不再 json.dumps 成字符串。"""
+        from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS
+
+        svc, mock_db = _make_memory_service(delete_return=0)
+
+        with patch.object(svc, "_generate_embeddings", new_callable=AsyncMock, return_value=[[0.1, 0.2, 0.3]]):
+            await svc.index_conversation_round("u1", "s1", "r1", "msg", "resp")
+
+        record = mock_db.add.call_args.args[0]
+        assert len(record.embedding) == MEMORY_EMBEDDING_DIMENSIONS
+        assert record.embedding[:3] == [0.1, 0.2, 0.3]
+        assert record.embedding[3:] == [0.0] * (MEMORY_EMBEDDING_DIMENSIONS - 3)
+        assert not isinstance(record.embedding, str)
 
     @pytest.mark.asyncio
     async def test_index_idempotent_deletes_old(self):

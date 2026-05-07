@@ -822,6 +822,45 @@ class TestSseDetachedProducer:
         assert call_kwargs.kwargs.get("status") == "failed" or call_kwargs[1].get("status") == "failed"
 
     @pytest.mark.asyncio
+    async def test_run_round_stream_rolls_back_before_failed_round_update_after_db_error(self):
+        """事件写库失败后，收尾更新 round 前必须先 rollback 当前 Session。"""
+        from unittest.mock import MagicMock, AsyncMock
+        from sqlalchemy.exc import OperationalError
+        from src.api.services.agent_service import AgentService
+        from src.agent.schema.agui_events import RunStartedEvent
+
+        mock_history = MagicMock()
+        mock_history.db = MagicMock()
+        mock_history.is_round_terminal = MagicMock(return_value=False)
+        mock_history.save_agui_event = AsyncMock(
+            side_effect=OperationalError("stmt", {}, Exception("SSL error: unexpected eof while reading"))
+        )
+        mock_history.complete_round = MagicMock()
+
+        service = object.__new__(AgentService)
+        service.history_service = mock_history
+        service.session_id = "test-session"
+        service.cancel_token = None
+        service.agent = MagicMock()
+
+        async def fake_run_agui(**kwargs):
+            yield RunStartedEvent(threadId="test-session", runId="test-run")
+
+        service.agent.run_agui = fake_run_agui
+
+        with pytest.raises(OperationalError):
+            async for _event in service._run_round_stream(
+                run_id="test-run",
+                user_message="test",
+            ):
+                pass
+
+        mock_history.reset_session.assert_called_once()
+        mock_history.complete_round.assert_called_once()
+        call_kwargs = mock_history.complete_round.call_args
+        assert call_kwargs.kwargs.get("status") == "failed" or call_kwargs[1].get("status") == "failed"
+
+    @pytest.mark.asyncio
     async def test_run_round_stream_finally_marks_cancelled_when_cancel_token_set(self):
         """_run_round_stream 异常退出且本地 cancel_token 已触发时标记为 cancelled。"""
         from unittest.mock import MagicMock, AsyncMock
@@ -929,6 +968,8 @@ class TestCrossWorkerCancelFlow:
     @pytest.mark.asyncio
     async def test_cancel_request_requested_to_ack_to_completed_and_release_lock(self):
         """模拟 A worker 执行、B worker 取消，最终应 ack+completed 且释放用户锁。"""
+        import os
+        from pathlib import Path
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
         from sqlalchemy.pool import StaticPool
@@ -938,14 +979,20 @@ class TestCrossWorkerCancelFlow:
         from src.api.models.user_run_lock import UserRunLock
         from src.api.routes import chat as chat_routes
         from src.agent.schema.agui_events import RunStartedEvent, RunFinishedEvent
+        from tests.db_safety import create_all_for_test_engine, ensure_safe_test_database_url, load_dotenv_database_url
 
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
+        test_db_url = os.environ.get("TEST_DATABASE_URL", "")
+        if test_db_url.startswith("postgresql"):
+            ensure_safe_test_database_url(test_db_url, load_dotenv_database_url(Path(__file__).parent.parent))
+            engine = create_engine(test_db_url)
+        else:
+            engine = create_engine(
+                "sqlite://",
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+            )
         TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        Base.metadata.create_all(bind=engine)
+        create_all_for_test_engine(engine, Base.metadata)
 
         user_id = "user-1"
         session_id = "session-1"
@@ -1019,6 +1066,13 @@ class TestCrossWorkerCancelFlow:
                 )
                 assert lock_row is None
         finally:
+            if test_db_url.startswith("postgresql"):
+                with engine.begin() as conn:
+                    table_names = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
+                    from sqlalchemy import text as _text
+                    conn.execute(_text(f"TRUNCATE TABLE {table_names} CASCADE"))
+            else:
+                Base.metadata.drop_all(bind=engine)
             engine.dispose()
 
 

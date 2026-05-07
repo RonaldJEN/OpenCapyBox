@@ -1,7 +1,7 @@
 # 聊天与 Agent 执行 (Chat) — Spec
 
 > **模块归属**: `src/api/routes/chat.py`, `src/api/services/agent_service.py`, `src/agent/agent.py`
-> **最后更新**: 2026-04-25
+> **最后更新**: 2026-05-06
 > **状态**: Draft
 
 ---
@@ -644,6 +644,7 @@ INSERT INTO rounds (..., idempotency_key)
    - `subscribe_to_round.heartbeat_and_poll`：每次增量回放查询单独 `with SessionLocal() as replay_db`，查完立即释放。
 2. **SQLite 必须使用 `NullPool`**：文件型 DB 连接开销极低，NullPool 彻底规避 QueuePool 超时阻塞 event loop 的风险。其它数据库（MySQL/Postgres）保留默认 `QueuePool`。
 3. **请求级 `db: Depends(get_db)` 在 SSE 流路径上只能用于入口校验**；进入 event_generator / producer 后，必须使用独立短生命周期 Session 做持久化。
+4. **AG-UI 事件持久化不得跨 Agent/LLM/tool 的 `await` 间隙保留未提交事务**；非 delta 事件写入后必须提交，delta 事件完成终态读取后也必须结束只读事务，避免 PostgreSQL 远端连接在 idle-in-transaction 状态被断开。
 
 不遵守上述规则会表现为：多并发会话切换/拉取时，`get_db` 从连接池获取连接超时，抛 `sqlalchemy.exc.TimeoutError: QueuePool limit ... connection timed out`。
 
@@ -671,9 +672,9 @@ INSERT INTO rounds (..., idempotency_key)
 - `RUN_ERROR`
 - `STEP_STARTED` / `STEP_FINISHED`
 
-#### 其他事件 — 批量提交
+#### 其他事件 — 逐事件提交
 
-除上述两类以外的事件，每累积 **10 条**时批量提交一次。
+除上述两类以外的非 delta 事件，在写入后立即提交。这样可以避免 SSE/Agent 的异步等待间隙持有 PostgreSQL 事务；流式高频 delta 仍通过内存聚合减少写入量。
 
 ### 4.5 上下文压缩
 
@@ -731,10 +732,11 @@ INSERT INTO rounds (..., idempotency_key)
 
 1. 先从 `conversation_messages` 读取最新 `is_summary=True` 的摘要锚点（若存在）。
 2. 再取最近 `N` 条事件重建消息作为尾窗。
-3. 若尾窗首条不是“真实 user”（`role=user 且 is_synthetic=False`），向后跳过直到命中真实 user。
-4. 若尾窗内不存在真实 user，回退到全量历史中“离尾窗最近的真实 user 边界”，从该处注入到末尾（可超过 `N`）。
-5. 若全量历史都不存在真实 user（数据异常），保留尾窗作为兜底，避免注入全空导致整段失忆。
-6. 最终注入顺序为：`[summary_anchor?] + tail_window`；若无尾窗但有摘要锚点，仍注入摘要锚点。
+3. 对 `status=completed` 且 `agui_events` 未能重建出任何 assistant 文本的 Round，使用 `rounds.final_response` 补回该轮最终 assistant 消息，避免事件流缺口导致下一轮“继续”丢失上一轮答复。
+4. 若尾窗首条不是“真实 user”（`role=user 且 is_synthetic=False`），向后跳过直到命中真实 user。
+5. 若尾窗内不存在真实 user，回退到全量历史中“离尾窗最近的真实 user 边界”，从该处注入到末尾（可超过 `N`）。
+6. 若全量历史都不存在真实 user（数据异常），保留尾窗作为兜底，避免注入全空导致整段失忆。
+7. 最终注入顺序为：`[summary_anchor?] + tail_window`；若无尾窗但有摘要锚点，仍注入摘要锚点。
 
 ### 4.6 AG-UI 事件体系
 

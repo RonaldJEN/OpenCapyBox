@@ -9,7 +9,6 @@
 - 新用户默认注入文件（SOUL.md / AGENTS.md / MEMORY.md / USER.md）
 """
 
-import json
 import logging
 import math
 import re
@@ -18,11 +17,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import get_settings
 from src.api.models.user_memory import UserMemory, MemoryEmbedding
+from src.api.models.database import _IS_SQLITE
 from src.api.utils.timezone import now_naive
+from src.api.utils.embedding_vector import normalize_embedding_vector, serialize_pgvector
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -226,7 +228,7 @@ class MemoryService:
                 file_path=file_path,
                 chunk_index=i,
                 chunk_text=chunk,
-                embedding=json.dumps(emb) if emb else None,
+                embedding=normalize_embedding_vector(emb),
             )
             self.db.add(record)
 
@@ -238,6 +240,9 @@ class MemoryService:
         user_id: str,
         query: str,
         top_k: int = 5,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
     ) -> list[dict]:
         """混合检索记忆：BM25 + 向量语义 + RRF 融合 + 时间衰减
 
@@ -251,20 +256,25 @@ class MemoryService:
             user_id: 用户 ID
             query: 查询文本
             top_k: 返回结果数
+            start_date: 时间范围下界（ISO YYYY-MM-DD），仅返回该日期及之后的记录
+            end_date: 时间范围上界（ISO YYYY-MM-DD），仅返回该日期及之前的记录
 
         Returns:
             匹配的记忆片段列表
         """
+        # 解析时间范围
+        dt_start, dt_end = self._parse_date_range(start_date, end_date)
+
         fetch_k = top_k * 3  # 多取一些用于融合
 
         # 1. BM25 始终执行
-        bm25_results = self._search_by_bm25(user_id, query, fetch_k)
+        bm25_results = self._search_by_bm25(user_id, query, fetch_k, dt_start=dt_start, dt_end=dt_end)
 
         # 2. 尝试向量检索
         vec_results: list[dict] = []
         if self._is_embedding_available():
             try:
-                vec_results = await self._search_by_embedding(user_id, query, fetch_k)
+                vec_results = await self._search_by_embedding(user_id, query, fetch_k, dt_start=dt_start, dt_end=dt_end)
             except Exception as e:
                 logger.warning("向量检索失败，降级为纯 BM25: %s", e)
 
@@ -278,6 +288,28 @@ class MemoryService:
 
         # 4. 时间衰减
         return self._apply_time_decay(merged)
+
+    @staticmethod
+    def _parse_date_range(
+        start_date: str | None, end_date: str | None
+    ) -> tuple[datetime | None, datetime | None]:
+        """解析 ISO 日期字符串为 datetime 边界"""
+        dt_start = None
+        dt_end = None
+        if start_date:
+            try:
+                dt_start = datetime.strptime(start_date, "%Y-%m-%d")
+            except ValueError:
+                logger.warning("无法解析 start_date: %s", start_date)
+        if end_date:
+            try:
+                # end_date 取当天 23:59:59
+                dt_end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59
+                )
+            except ValueError:
+                logger.warning("无法解析 end_date: %s", end_date)
+        return dt_start, dt_end
 
     @staticmethod
     def _is_embedding_available() -> bool:
@@ -294,31 +326,48 @@ class MemoryService:
         return bool(settings.embedding_api_key)
 
     async def _search_by_embedding(
-        self, user_id: str, query: str, top_k: int
+        self, user_id: str, query: str, top_k: int,
+        *, dt_start: datetime | None = None, dt_end: datetime | None = None,
     ) -> list[dict]:
-        """向量语义检索"""
+        """向量语义检索：PostgreSQL 使用 pgvector 原生距离算子，SQLite 回退 Python 计算。"""
         query_embedding = await self._generate_embeddings([query])
         if not query_embedding or not query_embedding[0]:
             return []
 
-        qvec = query_embedding[0]
+        qvec = normalize_embedding_vector(query_embedding[0])
 
+        filters = [
+            MemoryEmbedding.user_id == user_id,
+            MemoryEmbedding.embedding.isnot(None),
+        ]
+        if dt_start:
+            filters.append(MemoryEmbedding.created_at >= dt_start)
+        if dt_end:
+            filters.append(MemoryEmbedding.created_at <= dt_end)
+        # 指定时间范围时排除常青文件（用户要的是那段时间的对话/事件）
+        if dt_start or dt_end:
+            for kw in ("MEMORY.md", "USER.md", "SOUL.md", "AGENTS.md"):
+                filters.append(or_(MemoryEmbedding.file_path.is_(None), MemoryEmbedding.file_path.notlike(f"%{kw}%")))
+
+        if not _IS_SQLITE:
+            return self._search_by_pgvector(qvec, filters, top_k)
+
+        # SQLite fallback: 全量加载 + Python 余弦计算
         all_chunks = (
             self.db.query(MemoryEmbedding)
-            .filter(
-                MemoryEmbedding.user_id == user_id,
-                MemoryEmbedding.embedding.isnot(None),
-            )
+            .filter(*filters)
             .all()
         )
 
         scored = []
         for chunk in all_chunks:
             try:
-                cvec = json.loads(chunk.embedding)
+                cvec = normalize_embedding_vector(chunk.embedding)
+                if not cvec:
+                    continue
                 score = self._cosine_similarity(qvec, cvec)
                 scored.append((score, chunk))
-            except (json.JSONDecodeError, TypeError):
+            except (TypeError, ValueError):
                 continue
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -329,21 +378,66 @@ class MemoryService:
                 "chunk_index": item.chunk_index,
                 "text": item.chunk_text,
                 "score": round(score, 4),
+                "created_at": item.created_at,
             }
             for score, item in scored[:top_k]
         ]
 
+    def _search_by_pgvector(
+        self, qvec: list[float], filters: list, top_k: int
+    ) -> list[dict]:
+        """PostgreSQL pgvector 原生余弦距离检索。"""
+        from sqlalchemy import and_, bindparam, cast
+
+        qvec_literal = serialize_pgvector(qvec)
+
+        # 使用参数绑定传递向量值，避免 SQL 拼接风险
+        qvec_param = cast(bindparam("qvec", value=qvec_literal), MemoryEmbedding.embedding.type)
+        distance_expr = MemoryEmbedding.embedding.op("<=>")(qvec_param)
+        score_expr = 1 - distance_expr
+
+        query = (
+            self.db.query(MemoryEmbedding, score_expr.label("score"))
+            .filter(and_(*filters))
+            .order_by(distance_expr)
+            .limit(top_k)
+        )
+
+        results = []
+        for row in query.all():
+            item = row[0]
+            score = row[1]
+            results.append({
+                "file_path": item.file_path,
+                "chunk_index": item.chunk_index,
+                "text": item.chunk_text,
+                "score": round(float(score), 4),
+                "created_at": item.created_at,
+            })
+        return results
+
     def _search_by_bm25(
-        self, user_id: str, query: str, top_k: int
+        self, user_id: str, query: str, top_k: int,
+        *, dt_start: datetime | None = None, dt_end: datetime | None = None,
     ) -> list[dict]:
         """BM25 关键词检索"""
         query_terms = self._tokenize(query)
         if not query_terms:
             return []
 
+        filters = [MemoryEmbedding.user_id == user_id]
+        if dt_start:
+            filters.append(MemoryEmbedding.created_at >= dt_start)
+        if dt_end:
+            filters.append(MemoryEmbedding.created_at <= dt_end)
+        # 指定时间范围时排除常青文件
+        if dt_start or dt_end:
+            for kw in ("MEMORY.md", "USER.md", "SOUL.md", "AGENTS.md"):
+                filters.append(or_(MemoryEmbedding.file_path.is_(None), MemoryEmbedding.file_path.notlike(f"%{kw}%")))
+
         all_chunks = (
             self.db.query(MemoryEmbedding)
-            .filter(MemoryEmbedding.user_id == user_id)
+            .filter(*filters)
             .all()
         )
         if not all_chunks:
@@ -387,6 +481,7 @@ class MemoryService:
                 "chunk_index": item.chunk_index,
                 "text": item.chunk_text,
                 "score": round(score, 4),
+                "created_at": item.created_at,
             }
             for score, item in scored[:top_k]
         ]
@@ -453,7 +548,7 @@ class MemoryService:
     ) -> list[dict]:
         """对搜索结果应用时间衰减
 
-        根据 file_path 中的日期信息计算衰减系数。
+        根据 file_path 中的日期信息或 created_at 时间戳计算衰减系数。
         常青文件（MEMORY.md / USER.md 等）不衰减。
 
         Args:
@@ -475,16 +570,25 @@ class MemoryService:
             if any(kw in fp for kw in EVERGREEN_KEYWORDS):
                 continue
 
-            # 尝试从路径提取日期（如 memory/2026-03-26.md 或 conversation/.../...）
+            # 尝试从路径提取日期（如 memory/2026-03-26.md）
+            file_date = None
             date_match = re.search(r"(\d{4}-\d{2}-\d{2})", fp)
             if date_match:
                 try:
                     file_date = datetime.strptime(date_match.group(1), "%Y-%m-%d")
-                    age_days = max((now - file_date).days, 0)
-                    decay = math.exp(-decay_lambda * age_days)
-                    r["score"] = round(r["score"] * decay, 4)
                 except ValueError:
                     pass
+
+            # fallback: 使用记录的 created_at（对话记录的 file_path 是 UUID 无日期）
+            if file_date is None and r.get("created_at"):
+                created = r["created_at"]
+                if isinstance(created, datetime):
+                    file_date = created
+
+            if file_date is not None:
+                age_days = max((now - file_date).days, 0)
+                decay = math.exp(-decay_lambda * age_days)
+                r["score"] = round(r["score"] * decay, 4)
 
         # 重新排序
         results.sort(key=lambda x: x["score"], reverse=True)
@@ -738,7 +842,7 @@ class MemoryService:
                 file_path=file_path,
                 chunk_index=i,
                 chunk_text=chunk,
-                embedding=json.dumps(emb) if emb else None,
+                embedding=normalize_embedding_vector(emb),
             )
             self.db.add(record)
 

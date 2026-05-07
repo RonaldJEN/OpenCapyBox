@@ -30,6 +30,10 @@ class HistoryService:
         self._stream_buffers: Dict[str, Dict[str, str]] = {}
         self._terminal_runs: set[str] = set()
 
+    def reset_session(self):
+        """回滚当前事务并清除 Session 状态，确保后续操作不受前序脏状态影响。"""
+        self.db.rollback()
+
     def get_round_status(self, round_id: str) -> str | None:
         """查询 round 当前状态。"""
         row = self.db.query(Round.status).filter(Round.id == round_id).first()
@@ -327,7 +331,14 @@ class HistoryService:
         # round 已終態時，丟棄所有遲到事件，避免 abort 後舊 run 汙染回放。
         # 常見場景：abort 接口已將 round 標記 cancelled 並補發 RUN_FINISHED，
         # 舊 worker 遲到事件（TEXT/TOOL/RUN_FINISHED）不應再入庫。
-        if run_id in self._terminal_runs or self.is_round_terminal(run_id):
+        checked_db_terminal = False
+        is_terminal = run_id in self._terminal_runs
+        if not is_terminal:
+            is_terminal = self.is_round_terminal(run_id)
+            checked_db_terminal = True
+        if is_terminal:
+            if checked_db_terminal:
+                self.db.commit()
             self._terminal_runs.add(run_id)
             logger.info(
                 "Run %s 已終態，丟棄遲到事件: %s",
@@ -348,6 +359,9 @@ class HistoryService:
                 if buffer_key not in self._stream_buffers[run_id]:
                     self._stream_buffers[run_id][buffer_key] = ""
                 self._stream_buffers[run_id][buffer_key] += delta
+            # 释放可能挂起的只读事务（PG idle-in-transaction 防护）
+            if checked_db_terminal:
+                self.db.commit()
             return None  # 不寫入數據庫
         
         # === *_END 事件：先寫入合成的 CONTENT 事件，再寫入乾淨的 END 事件 ===
@@ -452,19 +466,7 @@ class HistoryService:
         
         self.db.add(event_log)
         
-        # 關鍵事件立即提交，防止崩潰時丟失
-        critical_events = {
-            EventType.RUN_STARTED,
-            EventType.RUN_FINISHED,
-            EventType.RUN_ERROR,
-            EventType.STEP_STARTED,
-            EventType.STEP_FINISHED,
-        }
-        if event.type in critical_events:
-            self.db.commit()
-        # 其他事件每10個批量提交
-        elif sequence % 10 == 0:
-            self.db.commit()
+        self.db.commit()
         
         return event_log
     

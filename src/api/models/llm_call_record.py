@@ -45,7 +45,7 @@ class LLMCallRecord(Base):
     first_token_latency_s = Column(Float, nullable=True)
     completion_latency_s = Column(Float, nullable=True)
 
-    compaction_triggered = Column(Boolean, nullable=False, default=False, server_default=text("0"))
+    compaction_triggered = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     compaction_pre_tokens = Column(Integer, nullable=True)
     compaction_post_tokens = Column(Integer, nullable=True)
     compaction_tokens_saved = Column(Integer, nullable=True)

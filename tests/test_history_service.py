@@ -10,7 +10,11 @@ import uuid
 
 from src.api.services.history_service import HistoryService
 from src.api.models.round import Round
-from src.agent.schema.agui_events import RunFinishedEvent
+from src.agent.schema.agui_events import (
+    RunFinishedEvent,
+    TextMessageContentEvent,
+    TextMessageStartEvent,
+)
 from tests.helpers import make_query_db
 
 
@@ -390,6 +394,30 @@ class TestHistoryServiceLLMCallRecord:
 
 class TestHistoryServiceLateEventDrop:
     """終態 round 的遲到事件隔離測試。"""
+
+    @pytest.mark.asyncio
+    async def test_save_agui_event_commits_non_delta_event_immediately(self, history_service, mock_db):
+        """非 delta 事件应立即提交，避免 SSE await 间隙持有 PG 事务。"""
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        event = TextMessageStartEvent(messageId="msg-1", role="assistant")
+
+        result = await history_service.save_agui_event("run-1", event)
+
+        assert result is not None
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_save_agui_event_commits_delta_status_read_transaction(self, history_service, mock_db):
+        """delta 事件不写行，但终态读取产生的事务也要立即提交释放。"""
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        event = TextMessageContentEvent(messageId="msg-1", delta="hello")
+
+        result = await history_service.save_agui_event("run-1", event)
+
+        assert result is None
+        mock_db.add.assert_not_called()
+        mock_db.commit.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_save_agui_event_drops_late_event_when_round_terminal(self, history_service, mock_db):

@@ -195,6 +195,24 @@ class TestSearchMemoryTool:
         assert "用户偏好深色" in result.content
         assert "0.92" in result.content
 
+    @pytest.mark.asyncio
+    async def test_search_output_includes_timestamp(self):
+        from datetime import datetime
+        from src.agent.tools.memory_tools import SearchMemoryTool
+        from src.api.services.memory_service import MemoryService
+
+        mock_db = MagicMock()
+        factory = MagicMock(return_value=mock_db)
+        tool = SearchMemoryTool(db_session_factory=factory, user_id="u1")
+
+        ts = datetime(2026, 4, 22, 10, 30)
+        mock_results = [
+            {"file_path": "conversation/sess/round1", "chunk_index": 0, "text": "聊天内容", "score": 0.85, "created_at": ts}
+        ]
+        with patch.object(MemoryService, "search_memory", new_callable=AsyncMock, return_value=mock_results):
+            result = await tool.execute(query="test")
+        assert "2026-04-22 10:30" in result.content
+
 
 class TestReadUserProfileTool:
     """ReadUserProfileTool 测试"""

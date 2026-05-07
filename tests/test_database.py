@@ -16,18 +16,23 @@ class TestDatabaseConfig:
         assert DATABASE_URL == settings.database_url
 
     def test_database_url_default_value(self):
-        """验证默认 DATABASE_URL 是 sqlite 路径"""
+        """验证默认 DATABASE_URL 来自 settings"""
         from src.api.models.database import DATABASE_URL
+        from src.api.config import get_settings
 
-        assert "sqlite" in DATABASE_URL
-        assert "open_capy_box.db" in DATABASE_URL
+        settings = get_settings()
+        assert DATABASE_URL == settings.database_url
 
     def test_engine_created_with_settings_url(self):
         """验证 engine 使用了 Settings 中的 URL"""
-        from src.api.models.database import engine
+        from src.api.models.database import engine, DATABASE_URL
 
-        # SQLAlchemy engine 的 URL 应该包含我们的数据库名
-        assert "open_capy_box" in str(engine.url)
+        # 只验证 engine url 中包含数据库名
+        if "sqlite" in DATABASE_URL:
+            assert "open_capy_box" in str(engine.url)
+        else:
+            # PostgreSQL: 验证 engine url 包含数据库名
+            assert engine.url.database is not None
 
     def test_session_local_bound_to_engine(self):
         """验证 SessionLocal 绑定到正确的 engine"""
@@ -101,3 +106,51 @@ class TestDatabaseMigration:
         # 调用两次不应报错
         init_db()
         init_db()
+
+    def test_sync_postgres_sequence_handles_uncalled_sequence_at_max_id(self):
+        from src.api.models import database as database_module
+
+        max_id_result = MagicMock()
+        max_id_result.scalar.return_value = 1
+        sequence_result = MagicMock()
+        sequence_result.one.return_value = (1, False)
+        setval_result = MagicMock()
+        conn = MagicMock()
+        conn.execute.side_effect = [max_id_result, sequence_result, setval_result]
+
+        database_module._sync_postgres_sequence(conn, "user_memory")
+
+        executed_sql = [str(call.args[0]) for call in conn.execute.call_args_list]
+        assert executed_sql == [
+            "SELECT COALESCE(MAX(id), 0) FROM user_memory",
+            "SELECT last_value, is_called FROM user_memory_id_seq",
+            "SELECT setval('user_memory_id_seq', 1, true)",
+        ]
+
+
+class TestMemoryEmbeddingColumnType:
+    """记忆向量列类型测试"""
+
+    def test_embedding_column_compiles_to_json_on_sqlite_and_vector_on_postgres(self):
+        from sqlalchemy.dialects import postgresql, sqlite
+
+        from src.api.models.user_memory import MemoryEmbedding
+        from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS
+
+        embedding_type = MemoryEmbedding.__table__.c.embedding.type
+
+        assert embedding_type.compile(dialect=sqlite.dialect()) == "JSON"
+        assert embedding_type.compile(dialect=postgresql.dialect()) == f"vector({MEMORY_EMBEDDING_DIMENSIONS})"
+
+    def test_missing_pgvector_extension_fails_fast(self):
+        from unittest.mock import MagicMock
+
+        import pytest
+
+        from src.api.models import database as database_module
+
+        conn = MagicMock()
+        conn.execute.return_value.scalar.return_value = False
+
+        with pytest.raises(RuntimeError, match="pgvector"):
+            database_module._ensure_postgres_vector_extension(conn)

@@ -224,15 +224,22 @@ cp .env.example .env
 LLM_API_KEY=your-dashscope-key           # 阿里 DashScope 统一密钥
 SIMPLE_AUTH_USERS=demo:demo123           # 登录用户（格式 user:pass,user2:pass2）
 
+# === 数据库 ===
+# 启动后端前必须把 .env.example 里的占位符替换成真实 PostgreSQL 连接串。
+# PostgreSQL 数据库必须已创建并安装 pgvector：
+#   CREATE EXTENSION IF NOT EXISTS vector;
+DATABASE_URL=postgresql://user:password@host:5432/opencapybox
+
 # === OpenSandbox（可选） ===
 SANDBOX_DOMAIN=localhost:8080
 SANDBOX_API_KEY=your-sandbox-key
 
-# === 其他（均有默认值） ===
-# DATABASE_URL=sqlite:///./data/database/open_capy_box.db
+# === 其他 ===
 # AGENT_MAX_STEPS=100
 # AGENT_TOKEN_LIMIT=200000
 ```
+
+`.env.example` 中的 PostgreSQL URL 只是模板。运行 `uv run uvicorn ...` 前必须配置真实 PostgreSQL，并确保目标库已启用 `pgvector` 扩展，否则启动或数据库初始化会直接失败。
 
 ### 3. 启动服务
 
@@ -421,7 +428,10 @@ SANDBOX_PERSISTENT_STORAGE_ENABLED=true
 # === 应用 ===
 DEBUG=false
 CORS_ORIGINS=["http://localhost:3000"]
-DATABASE_URL=sqlite:///./data/database/open_capy_box.db
+DATABASE_URL=postgresql://user:password@host:5432/opencapybox
+# PostgreSQL 必须安装 pgvector：CREATE EXTENSION IF NOT EXISTS vector;
+# pytest 集成测试库，禁止指向生产库：
+TEST_DATABASE_URL=postgresql://user:password@host:5432/opencapybox_test
 AUTH_SECRET_KEY=                        # 不配则自动派生
 AUTH_TOKEN_EXPIRE_MINUTES=720
 

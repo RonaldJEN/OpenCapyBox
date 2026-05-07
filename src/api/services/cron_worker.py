@@ -179,20 +179,33 @@ def _cron_matches_minute(expr: str, minute: datetime) -> bool:
 
 
 def _try_insert_fire(job_id: int, minute: datetime) -> bool:
-    """INSERT OR IGNORE：成功插入返回 True。"""
+    """尝试插入去重记录：成功插入返回 True，唯一约束冲突返回 False。
+
+    SQLite 使用 INSERT OR IGNORE，PostgreSQL 使用 ON CONFLICT DO NOTHING。
+    """
+    from src.api.models.database import _IS_SQLITE
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
     try:
         with SessionLocal() as db:
-            result = db.execute(
-                insert(CronFire)
-                .prefix_with("OR IGNORE")
-                .values(
-                    id=str(uuid.uuid4()),
-                    job_id=job_id,
-                    scheduled_at=minute,
-                )
+            values = dict(
+                id=str(uuid.uuid4()),
+                job_id=job_id,
+                scheduled_at=minute,
             )
-            db.commit()
-            return result.rowcount == 1
+            if _IS_SQLITE:
+                result = db.execute(
+                    insert(CronFire).prefix_with("OR IGNORE").values(**values)
+                )
+                db.commit()
+                return result.rowcount == 1
+            else:
+                stmt = pg_insert(CronFire).values(**values).on_conflict_do_nothing(
+                    constraint="uq_cronfire_job_time"
+                )
+                result = db.execute(stmt)
+                db.commit()
+                return result.rowcount == 1
     except OperationalError as e:
         # 只有 "database is locked / busy" 属于预期抢占失败，其余（例如 no such table）
         # 都是严重配置错误，必须响亮报错，避免静默吞掉导致 cron 看起来"没运行"

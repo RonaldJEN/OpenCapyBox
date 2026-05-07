@@ -193,13 +193,14 @@ class TestEventsToMessages:
 class TestRebuildMessagesFromEvents:
     """测试从 DB 读取 rounds + agui_events + conversation_messages 重建完整消息"""
 
-    def _make_round(self, round_id, session_id, user_message, created_at_order=0, status="completed"):
+    def _make_round(self, round_id, session_id, user_message, created_at_order=0, status="completed", final_response=None):
         rnd = MagicMock()
         rnd.id = round_id
         rnd.session_id = session_id
         rnd.user_message = user_message
         rnd.created_at = created_at_order
         rnd.status = status
+        rnd.final_response = final_response
         return rnd
 
     def _make_conv_msg(self, role, content, round_id, sequence, is_summary=False):
@@ -316,6 +317,45 @@ class TestRebuildMessagesFromEvents:
         assert messages[0].content == "hello from round"
         assert messages[1].role == "assistant"
         assert messages[1].content == "Hi!"
+
+    def test_fallback_to_final_response_when_assistant_text_events_missing(self):
+        """completed round 缺少可恢复 assistant 文本事件时，用 final_response 补回上一轮答复"""
+        rounds = [self._make_round("r1", "s1", "continue previous task", final_response="Previous final answer")]
+        user_msgs = [self._make_conv_msg("user", "continue previous task", "r1", 1)]
+        events = {
+            "r1": [
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m1"}, 1),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 2),
+            ],
+        }
+
+        mock_db = self._setup_db(rounds, user_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        assert len(messages) == 2
+        assert messages[0].role == "user"
+        assert messages[1].role == "assistant"
+        assert messages[1].content == "Previous final answer"
+
+    def test_final_response_fallback_skips_failed_round(self):
+        """failed/cancelled round 的 final_response 不作为下一轮语义上下文"""
+        rounds = [self._make_round("r1", "s1", "continue previous task", status="failed", final_response="Failed")]
+        user_msgs = [self._make_conv_msg("user", "continue previous task", "r1", 1)]
+        events = {}
+
+        mock_db = self._setup_db(rounds, user_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        assert len(messages) == 1
+        assert messages[0].role == "user"
 
     def test_no_rounds_returns_empty(self):
         """无 rounds → 空列表"""
@@ -571,6 +611,8 @@ class TestSyntheticMessagePersistenceOnRestore:
         rnd.session_id = session_id
         rnd.user_message = user_message
         rnd.created_at = created_at_order
+        rnd.status = "completed"
+        rnd.final_response = None
         return rnd
 
     @staticmethod

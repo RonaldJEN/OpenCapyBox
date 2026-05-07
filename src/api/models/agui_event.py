@@ -14,7 +14,7 @@ AG-UI 事件類型（EventType）：
 3. 消息追蹤 - 通過 message_id 關聯消息
 4. 工具調用追蹤 - 通過 tool_call_id 關聯工具調用
 """
-from sqlalchemy import Column, String, Text, DateTime, Integer, ForeignKey, Index
+from sqlalchemy import Column, String, Text, DateTime, Integer, BigInteger, ForeignKey, Index
 from .database import Base
 from src.api.utils.timezone import now_naive
 
@@ -53,7 +53,7 @@ class AGUIEventLog(Base):
     event_type = Column(String(50), nullable=False)
     
     # timestamp - 事件時間戳（毫秒）
-    timestamp = Column(Integer, nullable=True)
+    timestamp = Column(BigInteger, nullable=True)
     
     # === 索引優化字段 ===
     
@@ -61,7 +61,8 @@ class AGUIEventLog(Base):
     message_id = Column(String(36), nullable=True)
     
     # toolCallId - 關聯的工具調用 ID（用於 ToolCall* 事件）
-    tool_call_id = Column(String(36), nullable=True)
+    # 格式 "tool-" + 32hex = 37 字符，預留空間用 64
+    tool_call_id = Column(String(64), nullable=True)
     
     # === 事件數據 ===
     

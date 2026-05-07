@@ -197,10 +197,13 @@ class SearchMemoryTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Search through the user's long-term memory and daily logs using semantic "
-            "search (if embedding is configured) or keyword matching. Returns the most "
-            "relevant memory snippets. Use this when you need to recall past conversations, "
-            "decisions, or user preferences."
+            "Search through the user's long-term memory and conversation history using "
+            "semantic search (if embedding is configured) or keyword matching. Returns the "
+            "most relevant memory snippets stored in the database. "
+            "IMPORTANT: Results are retrieved from the database, NOT from sandbox files. "
+            "Do NOT attempt to use read_file on paths returned by this tool. "
+            "Use start_date/end_date to filter by time range (e.g. to find what was "
+            "discussed during a specific week)."
         )
 
     @property
@@ -217,26 +220,41 @@ class SearchMemoryTool(Tool):
                     "description": "Maximum number of results to return (default: 5)",
                     "default": 5,
                 },
+                "start_date": {
+                    "type": "string",
+                    "description": "Filter results created on or after this date (ISO format YYYY-MM-DD, e.g. 2026-04-20)",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "Filter results created on or before this date (ISO format YYYY-MM-DD, e.g. 2026-04-26)",
+                },
             },
             "required": ["query"],
         }
 
-    async def execute(self, query: str, top_k: int = 5) -> ToolResult:
+    async def execute(self, query: str, top_k: int = 5, start_date: str | None = None, end_date: str | None = None) -> ToolResult:
         try:
             from src.api.services.memory_service import MemoryService
 
             db = self._db_factory()
             try:
                 service = MemoryService(db)
-                results = await service.search_memory(self._user_id, query, top_k)
+                results = await service.search_memory(self._user_id, query, top_k, start_date=start_date, end_date=end_date)
 
                 if not results:
                     return ToolResult(success=True, content="No matching memories found.")
 
                 output_parts = []
                 for i, r in enumerate(results, 1):
+                    created = r.get("created_at")
+                    time_str = ""
+                    if created:
+                        if hasattr(created, "strftime"):
+                            time_str = f" | {created.strftime('%Y-%m-%d %H:%M')}"
+                        else:
+                            time_str = f" | {created}"
                     output_parts.append(
-                        f"### [{i}] {r['file_path']} (score: {r['score']})\n{r['text']}"
+                        f"### [{i}] {r['file_path']} (score: {r['score']}{time_str})\n{r['text']}"
                     )
                 return ToolResult(success=True, content="\n\n".join(output_parts))
             finally:

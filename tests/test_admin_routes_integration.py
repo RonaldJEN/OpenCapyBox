@@ -1,7 +1,9 @@
-"""Admin routes integration tests with real sqlite queries."""
+"""Admin routes integration tests with real database queries."""
 
 from datetime import timedelta
 import json
+import os
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -16,19 +18,32 @@ from src.api.models.round import Round
 from src.api.models.session import Session
 from src.api.routes import admin as admin_routes
 from src.api.utils.timezone import now_naive
+from tests.db_safety import create_all_for_test_engine, ensure_safe_test_database_url, load_dotenv_database_url
 
 
 @pytest.fixture
 def admin_integration_client(tmp_path):
-    db_file = tmp_path / "admin-routes-integration.db"
-    engine = create_engine(
-        f"sqlite:///{db_file}",
-        connect_args={"check_same_thread": False},
-    )
+    test_db_url = os.environ.get("TEST_DATABASE_URL", "")
+    if test_db_url.startswith("postgresql"):
+        ensure_safe_test_database_url(test_db_url, load_dotenv_database_url(Path(__file__).parent.parent))
+        engine = create_engine(test_db_url)
+    else:
+        db_file = tmp_path / "admin-routes-integration.db"
+        engine = create_engine(
+            f"sqlite:///{db_file}",
+            connect_args={"check_same_thread": False},
+        )
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
     # Ensure required tables exist for real SQL query coverage.
-    Base.metadata.create_all(bind=engine)
+    create_all_for_test_engine(engine, Base.metadata)
+
+    # PG: 清理可能遗留的脏数据（前次失败遗留）
+    if test_db_url.startswith("postgresql"):
+        from sqlalchemy import text as _text
+        with engine.begin() as conn:
+            table_names = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
+            conn.execute(_text(f"TRUNCATE TABLE {table_names} CASCADE"))
 
     app = FastAPI()
     app.include_router(admin_routes.router, prefix="/admin")
@@ -46,6 +61,14 @@ def admin_integration_client(tmp_path):
     with TestClient(app) as client:
         yield client, TestingSessionLocal
 
+    # 清理：PG 用 TRUNCATE CASCADE，SQLite 直接 drop
+    if test_db_url.startswith("postgresql"):
+        from sqlalchemy import text as _text
+        with engine.begin() as conn:
+            table_names = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
+            conn.execute(_text(f"TRUNCATE TABLE {table_names} CASCADE"))
+    else:
+        Base.metadata.drop_all(bind=engine)
     engine.dispose()
 
 
@@ -72,6 +95,7 @@ def _insert_round_with_step(
         updated_at=created_at,
     )
     db.add(session)
+    db.flush()
 
     round_row = Round(
         id=round_id,
@@ -85,6 +109,7 @@ def _insert_round_with_step(
         completed_at=created_at + timedelta(seconds=5),
     )
     db.add(round_row)
+    db.flush()
 
     llm_row = LLMCallRecord(
         session_id=session_id,
