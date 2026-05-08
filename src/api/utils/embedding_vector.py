@@ -4,7 +4,7 @@ import json
 from collections.abc import Sequence
 
 
-MEMORY_EMBEDDING_DIMENSIONS = 2048
+MEMORY_EMBEDDING_DIMENSIONS = 2560
 
 
 def normalize_embedding_vector(
