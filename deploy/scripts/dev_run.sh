@@ -22,6 +22,20 @@ success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+is_windows_shell() {
+    [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]
+}
+
+start_uvicorn_backend() {
+    local workers=$1
+    if is_windows_shell; then
+        warn "Windows 开发环境使用单 worker 启动后端，避免 uvicorn 多进程 WinError 10022"
+        $PYTHON_CMD -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+    else
+        $PYTHON_CMD -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers "$workers"
+    fi
+}
+
 # Python 运行方式检测：uv > conda(agentskill) > system python
 PYTHON_CMD=""
 USE_UV=false
@@ -104,7 +118,7 @@ start_backend() {
 
     success "后端启动于 http://localhost:8000"
     success "API 文档: http://localhost:8000/api/v1/docs"
-    $PYTHON_CMD -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 4
+    start_uvicorn_backend 4
 }    
 #$PYTHON_CMD -m uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000 --reload-dir src
 
@@ -191,7 +205,7 @@ start_all() {
     fi
 
     info "启动后端 (http://localhost:8000)..."
-    $PYTHON_CMD -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 2 &
+    start_uvicorn_backend 2 &
     BACKEND_PID=$!
     
     # 等待后端启动
