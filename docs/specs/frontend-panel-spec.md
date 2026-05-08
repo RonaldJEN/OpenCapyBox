@@ -71,6 +71,8 @@ pathHistory: string[]       // 前进/后退历史
 historyIndex: number
 ```
 
+`FileInfo.modified` 来自会话文件接口，必须按带显式时区偏移的 ISO 8601 字符串解析。
+
 ### 3.2 关键不变量
 
 **竞态防护**：`loadDir` 必须用 `latestPathRef` 丢弃过期请求。

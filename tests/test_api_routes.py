@@ -1,6 +1,7 @@
 """API 路由測試"""
 import json
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
@@ -415,6 +416,7 @@ class TestEnsureSandbox:
         fresh_sandbox.files.write.assert_awaited_once()
         assert result.name == "test.txt"
         assert result.size == 5
+        assert datetime.fromisoformat(result.modified).tzinfo == timezone.utc
 
 
 class TestExtractExitCode:
@@ -713,6 +715,7 @@ class TestSandboxListDir:
         assert items[2].name == "report.pdf"
         assert items[2].is_directory is False
         assert items[2].size == 2048
+        assert items[2].modified == datetime.fromtimestamp(1750000000.0, timezone.utc).isoformat()
 
     @pytest.mark.asyncio
     async def test_list_dir_skips_system_paths(self):

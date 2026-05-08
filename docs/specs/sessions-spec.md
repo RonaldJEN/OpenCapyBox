@@ -108,6 +108,7 @@
 
 - Query: `path: str = ""`（相对子目录）
 - Response 200: `{files: [{name, path, size, modified, type, is_directory}], total}`
+- `modified` 为带显式时区偏移的 ISO 8601 时间字符串，当前统一返回 UTC（如 `2026-05-08T02:30:00+00:00`）。
 - Error 404, 403（"路径越界"）
 - 当 `sandbox_use_server_proxy=True` 时使用 `find` 命令替代 SDK
 
@@ -127,6 +128,7 @@
 
 - Body: multipart file
 - Response 200: `{name, path, size, modified, type}`
+- `modified` 为带显式时区偏移的 ISO 8601 时间字符串，当前统一返回 UTC（如 `2026-05-08T02:30:00+00:00`）。
 - Error 400（"未选择文件"）, 404, 503, 500
 - 重复文件名自动重命名（如 `document_1.pdf`）
 

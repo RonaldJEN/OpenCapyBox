@@ -29,7 +29,7 @@ from src.api.services.agent_service import AgentService
 from src.api.model_registry import get_model_registry
 from src.api.models.user_sandbox import UserSandbox
 from src.api.models.conversation_message import ConversationMessage
-from datetime import datetime
+from datetime import datetime, timezone
 from src.api.utils.timezone import now_naive
 import shlex
 
@@ -192,7 +192,7 @@ def _build_fileinfo_from_path(path: str, root_path: str) -> FileInfo | None:
         name=name,
         path=rel_path,
         size=0,
-        modified=datetime.utcnow().isoformat(),
+        modified=datetime.now(timezone.utc).isoformat(),
         type=ext,
     )
 
@@ -298,11 +298,8 @@ PY"""
         if rel_path is None:
             continue
 
-        mtime = row.get("mtime")
-        try:
-            modified = datetime.utcfromtimestamp(float(mtime)).isoformat()
-        except Exception:
-            modified = datetime.utcnow().isoformat()
+        mtime = row["mtime"]
+        modified = datetime.fromtimestamp(float(mtime), timezone.utc).isoformat()
 
         if is_dir:
             items.append(
@@ -804,7 +801,7 @@ async def upload_file(
                 name=final_filename,
                 path=final_filename,  # 相對路徑
                 size=len(content),
-                modified=datetime.utcnow().isoformat(),
+                modified=datetime.now(timezone.utc).isoformat(),
                 type=file.content_type or "application/octet-stream",
             )
 
