@@ -200,7 +200,6 @@ export function toFileInfo(
 export function buildSandboxFileUrl(
   sessionId: string,
   filePath: string,
-  authSessionId: string,
   preview = true,
 ): string {
   const encodedPath = filePath
@@ -208,9 +207,7 @@ export function buildSandboxFileUrl(
     .map((segment) => encodeURIComponent(segment))
     .join('/');
   const base = `/api/sessions/${encodeURIComponent(sessionId)}/files/${encodedPath}`;
-  const params = new URLSearchParams({
-    user_id: authSessionId,
-  });
+  const params = new URLSearchParams();
   if (preview) {
     params.set('preview', 'true');
   }

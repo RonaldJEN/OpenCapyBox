@@ -23,6 +23,13 @@ vi.mock('../../components/FileAttachment', () => ({
   ),
 }));
 
+// Mock AuthenticatedImage 组件
+vi.mock('../../components/AuthenticatedImage', () => ({
+  AuthenticatedImage: ({ src, alt, fallback, ...rest }: any) => (
+    <img data-testid="auth-image" src={src} alt={alt} {...rest} />
+  ),
+}));
+
 describe('Round 组件', () => {
   const createMockRound = (overrides?: Partial<RoundData>): RoundData => ({
     round_id: 'round-1',
@@ -153,15 +160,15 @@ describe('Round 组件', () => {
     expect(userAvatar).toBeInTheDocument();
   });
 
-  it('助手头像应该使用黑色背景', () => {
+  it('助手头像应该使用品牌图片', () => {
     const round = createMockRound();
 
     render(<Round round={round} isStreaming={false} />);
 
-    const assistantLabel = screen.getByText('助手');
-    const botAvatar = assistantLabel.parentElement?.previousElementSibling as HTMLElement | null;
-    expect(botAvatar).toBeInTheDocument();
-    expect(botAvatar?.className).toContain('bg-claude-accent/20');
+    const avatar = screen.getByAltText('AI');
+    expect(avatar).toBeInTheDocument();
+    expect(avatar).toHaveAttribute('src', '/logo.jpg');
+    expect(avatar.className).toContain('object-cover');
   });
 
   it('默认应该有淡入动画', () => {
@@ -181,5 +188,66 @@ describe('Round 组件', () => {
 
     const animatedElement = container.querySelector('.animate-fade-in');
     expect(animatedElement).not.toBeInTheDocument();
+  });
+
+  it('图片附件使用 AuthenticatedImage 而非直接 <img src="/api/...">', () => {
+    const round = createMockRound();
+    const attachments = [
+      {
+        name: '每日复盘模板.png',
+        path: 'uploads/每日复盘模板.png',
+        size: 12345,
+        type: 'png',
+        session_id: 's1',
+      },
+    ];
+
+    const { container } = render(
+      <Round
+        round={round}
+        isStreaming={false}
+        userAttachments={attachments as any}
+        sessionId="s1"
+      />,
+    );
+
+    // AuthenticatedImage mock 渲染为 data-testid="auth-image"
+    const authImg = screen.getByTestId('auth-image');
+    expect(authImg).toBeInTheDocument();
+    expect(authImg.getAttribute('src')).toContain('/api/sessions/s1/files/');
+    expect(authImg.getAttribute('src')).toContain(encodeURIComponent('每日复盘模板.png'));
+
+    // 不应存在未经认证的直接 <img src="/api/...">
+    const allImgs = container.querySelectorAll('img:not([data-testid="auth-image"])');
+    const directApiImgs = Array.from(allImgs).filter(
+      (img) => img.getAttribute('src')?.startsWith('/api/'),
+    );
+    expect(directApiImgs).toHaveLength(0);
+  });
+
+  it('有 data_url 的图片附件直接用 data_url', () => {
+    const round = createMockRound();
+    const attachments = [
+      {
+        name: 'screenshot.png',
+        path: 'uploads/screenshot.png',
+        size: 100,
+        type: 'png',
+        data_url: 'data:image/png;base64,iVBOR',
+        session_id: 's1',
+      },
+    ];
+
+    render(
+      <Round
+        round={round}
+        isStreaming={false}
+        userAttachments={attachments as any}
+        sessionId="s1"
+      />,
+    );
+
+    const authImg = screen.getByTestId('auth-image');
+    expect(authImg.getAttribute('src')).toBe('data:image/png;base64,iVBOR');
   });
 });

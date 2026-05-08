@@ -7,6 +7,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { parseMessageContent } from '../utils/messageParser';
 import { getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, toFileInfo, buildSandboxFileUrl, isImageFile } from '../utils/fileUtils';
+import { AuthenticatedImage } from './AuthenticatedImage';
 
 interface RoundProps {
   round: RoundData;
@@ -14,12 +15,10 @@ interface RoundProps {
   disableMotion?: boolean;
   userAttachments?: AttachmentInfo[];
   sessionId?: string;
-  /** 用戶認證 session ID（用於構建沙箱文件 URL） */
-  authSessionId?: string;
   onPreviewAttachment?: (file: FileInfo) => void;
 }
 
-export function Round({ round, isStreaming = false, disableMotion = false, userAttachments = [], sessionId, authSessionId, onPreviewAttachment }: RoundProps) {
+export function Round({ round, isStreaming = false, disableMotion = false, userAttachments = [], sessionId, onPreviewAttachment }: RoundProps) {
   // 解析用户消息，提取附件信息
   const { attachments, cleanContent } = parseMessageContent(round.user_message);
 
@@ -52,11 +51,19 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
                   <div className={`absolute top-1.5 right-1.5 text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-wide z-10 ${getFileBadgeClass(file)}`}>
                     {getFileExtLabel(file)}
                   </div>
-                  {isImageFile(file) && (file.data_url || (sessionId && authSessionId)) ? (
-                    <img
-                      src={file.data_url || buildSandboxFileUrl(sessionId!, file.path, authSessionId!)}
+                  {isImageFile(file) && (file.data_url || sessionId) ? (
+                    <AuthenticatedImage
+                      src={file.data_url || buildSandboxFileUrl(sessionId!, file.path)}
                       alt={file.name}
                       className="w-full h-full object-cover transition-transform group-hover:scale-105"
+                      fallback={
+                        <div className="w-full h-full flex items-center justify-center bg-claude-surface">
+                          {(() => {
+                            const Icon = getFileIcon(file);
+                            return <Icon className={`w-6 h-6 ${getFileIconClass(file)}`} />;
+                          })()}
+                        </div>
+                      }
                     />
                   ) : (
                     <div className="w-full h-full flex items-center justify-center bg-claude-surface">
@@ -143,6 +150,19 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
                         {children}
                       </pre>
                     );
+                  },
+                  img: ({ src: imgSrc, alt: imgAlt, ...imgRest }: any) => {
+                    if (imgSrc && imgSrc.startsWith('/api/')) {
+                      return (
+                        <AuthenticatedImage
+                          src={imgSrc}
+                          alt={imgAlt || ''}
+                          className="max-w-full rounded-lg my-2"
+                          {...imgRest}
+                        />
+                      );
+                    }
+                    return <img src={imgSrc} alt={imgAlt || ''} className="max-w-full rounded-lg my-2" {...imgRest} />;
                   },
                   a: ({ children, ...props }: any) => (
                     <a

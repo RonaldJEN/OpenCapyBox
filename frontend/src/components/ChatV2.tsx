@@ -1650,7 +1650,6 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
                   round={round}
                   userAttachments={round.user_attachments || []}
                   sessionId={sessionId}
-                  authSessionId={apiService.getUserId?.() || ''}
                   onPreviewAttachment={handlePreviewAttachment}
                   isStreaming={(sending || resuming) && index === rounds.length - 1}
                   disableMotion={disableInitialMotion}
