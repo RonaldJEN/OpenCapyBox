@@ -227,7 +227,7 @@ class TestAgentMessageSummarization:
             Message(role="assistant", content="a2"),
         ]
 
-        with patch.object(agent, "_create_summary", new=AsyncMock(return_value="summary text")) as create_summary:
+        with patch.object(agent, "_create_summary_with_meta", new=AsyncMock(return_value=("summary text", False))) as create_summary:
             await agent._summarize_with_llm(estimated_tokens=999)
 
         users = [m for m in agent.messages if m.role == "user"]

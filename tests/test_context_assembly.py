@@ -624,7 +624,8 @@ class TestEmbeddingVectorNormalization:
         mock_db.query.return_value.filter.return_value.all.return_value = [chunk]
         svc = MemoryService(mock_db)
 
-        with patch.object(svc, "_generate_embeddings", new_callable=AsyncMock, return_value=[[0.1, 0.2]]):
+        with patch("src.api.services.memory_service._IS_SQLITE", True), \
+             patch.object(svc, "_generate_embeddings", new_callable=AsyncMock, return_value=[[0.1, 0.2]]):
             results = await svc._search_by_embedding("u1", "query", top_k=1)
 
         assert results[0]["score"] == 1.0

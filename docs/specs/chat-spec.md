@@ -732,7 +732,7 @@ INSERT INTO rounds (..., idempotency_key)
 
 1. 先从 `conversation_messages` 读取最新 `is_summary=True` 的摘要锚点（若存在）。
 2. 再取最近 `N` 条事件重建消息作为尾窗。
-3. 对 `status=completed` 且 `agui_events` 未能重建出任何 assistant 文本的 Round，使用 `rounds.final_response` 补回该轮最终 assistant 消息，避免事件流缺口导致下一轮“继续”丢失上一轮答复。
+3. 对 `status=completed` 且 `agui_events` 未能重建出任何 assistant 文本的 Round，按顺序补回该轮最终 assistant 消息：优先使用 `rounds.final_response`；若为空，再使用同 `round_id` 下 `conversation_messages` 中 `role=assistant 且 is_summary=False` 的记录。若两者均不存在，不注入 assistant 内容并记录告警，避免事件流缺口导致下一轮“继续”丢失上一轮答复。
 4. 若尾窗首条不是“真实 user”（`role=user 且 is_synthetic=False`），向后跳过直到命中真实 user。
 5. 若尾窗内不存在真实 user，回退到全量历史中“离尾窗最近的真实 user 边界”，从该处注入到末尾（可超过 `N`）。
 6. 若全量历史都不存在真实 user（数据异常），保留尾窗作为兜底，避免注入全空导致整段失忆。

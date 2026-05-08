@@ -189,7 +189,7 @@ async def test_tool_execution_timeout():
 
     call_count = 0
 
-    async def _fake_stream(messages, tools, on_content=None, on_thinking=None):
+    async def _fake_stream(messages, tools, on_content=None, on_thinking=None, **kwargs):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -235,7 +235,7 @@ async def test_tool_with_custom_execute_timeout():
 
     call_count = 0
 
-    async def _fake_stream(messages, tools, on_content=None, on_thinking=None):
+    async def _fake_stream(messages, tools, on_content=None, on_thinking=None, **kwargs):
         nonlocal call_count
         call_count += 1
         if call_count == 1:

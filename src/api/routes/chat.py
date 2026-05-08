@@ -637,7 +637,12 @@ async def _release_user_run_lock(
 
         lock_row = query.first()
         if not lock_row:
-            # 目标锁已不存在（常见于并发 finally 先完成），视为已释放。
+            # 带过滤条件时：锁可能存在但不匹配（属于其他 session/lock_id），应返回 False
+            if lock_id is not None or session_id is not None:
+                any_lock = db.query(UserRunLock).filter(UserRunLock.user_id == user_id).first()
+                if any_lock:
+                    return False
+            # 锁确实不存在，视为已释放
             return True
 
         db.delete(lock_row)

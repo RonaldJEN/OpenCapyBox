@@ -349,20 +349,24 @@ class AgentService:
         if not rounds:
             return []
 
-        # 2. 預載所有 user 消息（按 round_id 索引）
+        # 2. 預載所有 user + assistant 消息（按 round_id 索引）
         conv_msgs = (
             db.query(ConversationMessage)
             .filter(
                 ConversationMessage.session_id == self.session_id,
-                ConversationMessage.role == "user",
+                ConversationMessage.role.in_(["user", "assistant"]),
                 ConversationMessage.is_summary == False,  # noqa: E712
             )
             .order_by(ConversationMessage.sequence)
             .all()
         )
         user_msgs_by_round: dict[str, list] = {}
+        asst_msgs_by_round: dict[str, list] = {}
         for m in conv_msgs:
-            user_msgs_by_round.setdefault(m.round_id, []).append(m)
+            if m.role == "user":
+                user_msgs_by_round.setdefault(m.round_id, []).append(m)
+            else:
+                asst_msgs_by_round.setdefault(m.round_id, []).append(m)
 
         # 3. 批量加載所有 round 的 agui_events（避免 N+1 查詢）
         round_ids = [r.id for r in rounds]
@@ -411,22 +415,41 @@ class AgentService:
                 continue
 
             # 4b. Agent 輸出（從預載的 agui_events 重建 assistant + tool 消息）
-            round_messages = self._events_to_messages(events_by_round.get(rnd.id, []))
+            round_events = events_by_round.get(rnd.id, [])
+            round_messages = self._events_to_messages(round_events, round_id=rnd.id)
 
-            if (
-                getattr(rnd, "status", None) == "completed"
-                and rnd.final_response
-                and not any(
-                    msg.role == "assistant" and isinstance(msg.content, str) and msg.content
-                    for msg in round_messages
-                )
-            ):
-                round_messages.append(AgentMessage(role="assistant", content=rnd.final_response))
-                logger.warning(
-                    "Round %s 無可恢復 assistant 文本事件，fallback 到 rounds.final_response (session=%s)",
-                    rnd.id,
-                    self.session_id,
-                )
+            _has_asst_text = any(
+                msg.role == "assistant" and isinstance(msg.content, str) and msg.content
+                for msg in round_messages
+            )
+
+            if getattr(rnd, "status", None) == "completed" and not _has_asst_text:
+                # Level-1 fallback: Round.final_response
+                if rnd.final_response:
+                    round_messages.append(AgentMessage(role="assistant", content=rnd.final_response))
+                    logger.warning(
+                        "Round %s 事件重建無 assistant 文本 (%d 事件→%d 消息)，"
+                        "fallback-L1 到 rounds.final_response (session=%s)",
+                        rnd.id, len(round_events), len(round_messages), self.session_id,
+                    )
+                else:
+                    # Level-2 fallback: conversation_messages 表的 assistant 記錄
+                    asst_records = asst_msgs_by_round.get(rnd.id, [])
+                    if asst_records:
+                        for am in asst_records:
+                            round_messages.append(AgentMessage(role="assistant", content=am.content))
+                        logger.warning(
+                            "Round %s 事件重建無 assistant 文本且無 final_response (%d 事件→%d 消息)，"
+                            "fallback-L2 到 conversation_messages (%d 條) (session=%s)",
+                            rnd.id, len(round_events), len(round_messages),
+                            len(asst_records), self.session_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Round %s completed 但無法恢復任何 assistant 內容 "
+                            "(events=%d, final_response=None, conv_msgs=0) (session=%s)",
+                            rnd.id, len(round_events), self.session_id,
+                        )
 
             # interrupted round 被後續輪次解決後，避免冷恢復時仍看到過期占位內容
             if getattr(rnd, "status", None) == "resumed":
@@ -436,6 +459,10 @@ class AgentService:
 
             messages.extend(round_messages)
 
+        logger.info(
+            "歷史重建完成: %d rounds → %d messages (session=%s)",
+            len(rounds), len(messages), self.session_id,
+        )
         return messages
 
     def _summary_header(self) -> str:
@@ -501,7 +528,7 @@ class AgentService:
         logger.info("保存摘要錨點 (session=%s, round=%s)", self.session_id, round_id)
 
     @staticmethod
-    def _events_to_messages(events) -> list[AgentMessage]:
+    def _events_to_messages(events, round_id: str | None = None) -> list[AgentMessage]:
         """將一個 round 的 agui_events 序列轉換為 LLM messages。
 
         解析事件流，重建 assistant（含 tool_calls）和 tool result 消息。
@@ -514,11 +541,23 @@ class AgentService:
         step_tool_calls: list[ToolCall] = []
         step_tool_results: list[dict] = []
         tc_id_to_name: dict[str, str] = {}
+        _skipped = 0
 
         for evt in events:
-            try:
-                payload = json.loads(evt.payload) if isinstance(evt.payload, str) else evt.payload
-            except (json.JSONDecodeError, TypeError):
+            if isinstance(evt.payload, dict):
+                payload = evt.payload
+            elif isinstance(evt.payload, str):
+                try:
+                    payload = json.loads(evt.payload)
+                except (json.JSONDecodeError, TypeError):
+                    _skipped += 1
+                    logger.warning(
+                        "事件 payload 解析失敗 (round=%s, seq=%s, preview=%.200s)",
+                        round_id, getattr(evt, "sequence", "?"), evt.payload[:200] if evt.payload else "",
+                    )
+                    continue
+            else:
+                _skipped += 1
                 continue
 
             evt_type = payload.get("type", "")
@@ -589,6 +628,12 @@ class AgentService:
                 tool_call_id=tr["tool_call_id"],
                 name=tr["name"],
             ))
+
+        if _skipped:
+            logger.warning(
+                "事件解析：%d/%d 條事件因 payload 畸形被跳過 (round=%s)",
+                _skipped, len(events), round_id,
+            )
 
         return messages
 

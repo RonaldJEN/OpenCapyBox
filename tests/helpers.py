@@ -280,7 +280,7 @@ def make_agent(tmp_path=None, *, llm=None, tools=None, **kwargs):
 
 def fake_stream(response, on_content_text=None):
     """构建 fake generate_stream 函数，减少取消测试的样板。"""
-    async def _fake_generate_stream(messages, tools, on_content=None, on_thinking=None):
+    async def _fake_generate_stream(messages, tools, on_content=None, on_thinking=None, **kwargs):
         if on_content_text and on_content:
             await on_content(on_content_text)
         return response

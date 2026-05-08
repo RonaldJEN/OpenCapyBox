@@ -928,3 +928,281 @@ class TestSaveConversationMessageAtomicInsert:
         # 不應拋異常
         service._save_conversation_message("user", "boom")
         mock_db.rollback.assert_called_once()
+
+
+# ============================================================
+# _events_to_messages 诊断日志 + dict payload 兼容
+# ============================================================
+
+class TestEventsToMessagesDiagnostics:
+    """验证 _events_to_messages 的诊断日志与 dict payload 支持"""
+
+    @staticmethod
+    def _evt(event_type: str, payload, sequence: int = 0):
+        e = MagicMock()
+        if isinstance(payload, dict):
+            payload["type"] = event_type
+        e.payload = payload
+        e.sequence = sequence
+        return e
+
+    def test_malformed_payload_logs_warning(self, caplog):
+        """畸形 payload 应记录 warning 而非静默跳过"""
+        from src.api.services.agent_service import AgentService
+        import logging
+
+        bad_evt = MagicMock()
+        bad_evt.payload = "NOT_JSON{{{"
+        bad_evt.sequence = 1
+
+        with caplog.at_level(logging.WARNING):
+            msgs = AgentService._events_to_messages([bad_evt], round_id="r-bad")
+
+        assert msgs == []
+        assert any("payload 解析失敗" in r.message for r in caplog.records)
+
+    def test_dict_payload_accepted(self):
+        """payload 已是 dict 时应直接使用而非 json.loads"""
+        from src.api.services.agent_service import AgentService
+
+        events = [
+            self._evt("TEXT_MESSAGE_CONTENT", {"delta": "dict works"}, 1),
+            self._evt("TEXT_MESSAGE_END", {"messageId": "m1"}, 2),
+            self._evt("STEP_FINISHED", {"stepName": "step-1"}, 3),
+        ]
+        # payload is already a dict
+        for e in events:
+            assert isinstance(e.payload, dict)
+
+        msgs = AgentService._events_to_messages(events, round_id="r-dict")
+        assert len(msgs) == 1
+        assert msgs[0].content == "dict works"
+
+    def test_skipped_count_in_log(self, caplog):
+        """多条畸形事件时，summary 日志报告总跳过数"""
+        from src.api.services.agent_service import AgentService
+        import logging
+
+        events = [
+            self._evt("TEXT_MESSAGE_CONTENT", "BAD1{{{", 1),
+            self._evt("TEXT_MESSAGE_CONTENT", "BAD2{{{", 2),
+            self._evt("TEXT_MESSAGE_CONTENT", {"delta": "ok"}, 3),
+            self._evt("TEXT_MESSAGE_END", {"messageId": "m1"}, 4),
+            self._evt("STEP_FINISHED", {"stepName": "step-1"}, 5),
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            msgs = AgentService._events_to_messages(events, round_id="r-multi-bad")
+
+        assert len(msgs) == 1
+        assert msgs[0].content == "ok"
+        summary_logs = [r for r in caplog.records if "2/5" in r.message]
+        assert len(summary_logs) == 1
+
+
+# ============================================================
+# _rebuild_messages_from_events Level-2 fallback 测试
+# ============================================================
+
+class TestRebuildFallbackToConversationMessages:
+    """验证当 events 无法重建 assistant 且 final_response 为空时，
+    fallback 到 conversation_messages 表的 assistant 记录"""
+
+    @staticmethod
+    def _make_round(round_id, session_id, user_message, status="completed", final_response=None):
+        rnd = MagicMock()
+        rnd.id = round_id
+        rnd.session_id = session_id
+        rnd.user_message = user_message
+        rnd.created_at = 0
+        rnd.status = status
+        rnd.final_response = final_response
+        return rnd
+
+    @staticmethod
+    def _make_conv_msg(role, content, round_id, sequence, is_summary=False):
+        m = MagicMock()
+        m.role = role
+        m.content = content if isinstance(content, str) else json.dumps(content)
+        m.round_id = round_id
+        m.sequence = sequence
+        m.is_summary = is_summary
+        return m
+
+    @staticmethod
+    def _make_evt(event_type, payload_dict, sequence):
+        e = MagicMock()
+        payload_dict["type"] = event_type
+        e.payload = json.dumps(payload_dict)
+        e.sequence = sequence
+        return e
+
+    def _setup_db(self, rounds, conv_msgs, events_by_round):
+        """构建 mock db，conv_msgs 包含 user + assistant"""
+        from src.api.models.round import Round
+        from src.api.models.conversation_message import ConversationMessage
+        from src.api.models.agui_event import AGUIEventLog
+
+        mock_db = MagicMock()
+
+        rounds_query = MagicMock()
+        rounds_query.filter.return_value.order_by.return_value.all.return_value = rounds
+
+        conv_query = MagicMock()
+        conv_query.filter.return_value.order_by.return_value.all.return_value = conv_msgs
+
+        all_events_flat = []
+        for rnd in rounds:
+            for evt in events_by_round.get(rnd.id, []):
+                evt.run_id = rnd.id
+            all_events_flat.extend(events_by_round.get(rnd.id, []))
+
+        events_query = MagicMock()
+        events_query.filter.return_value.order_by.return_value.all.return_value = all_events_flat
+
+        def _query(model):
+            if model is Round:
+                return rounds_query
+            elif model is ConversationMessage:
+                return conv_query
+            elif model is AGUIEventLog:
+                return events_query
+            return MagicMock()
+
+        mock_db.query = MagicMock(side_effect=_query)
+        return mock_db
+
+    def test_fallback_l2_to_conversation_messages(self, caplog):
+        """events 无 assistant 文本 + final_response=None → fallback 到 conv_msgs assistant"""
+        import logging
+
+        rounds = [self._make_round("r1", "s1", "hello")]
+        conv_msgs = [
+            self._make_conv_msg("user", "hello", "r1", 1),
+            self._make_conv_msg("assistant", "world from conv_msgs", "r1", 2),
+        ]
+        # 空事件（或只有 END 事件，不产生文本）
+        events = {"r1": []}
+
+        mock_db = self._setup_db(rounds, conv_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+
+        with caplog.at_level(logging.WARNING):
+            messages = service._rebuild_messages_from_events()
+
+        assert len(messages) == 2
+        assert messages[0].role == "user"
+        assert messages[0].content == "hello"
+        assert messages[1].role == "assistant"
+        assert messages[1].content == "world from conv_msgs"
+        assert any("fallback-L2" in r.message for r in caplog.records)
+
+    def test_fallback_l1_preferred_over_l2(self, caplog):
+        """final_response 存在时优先用 L1 fallback"""
+        import logging
+
+        rounds = [self._make_round("r1", "s1", "hello", final_response="from final_response")]
+        conv_msgs = [
+            self._make_conv_msg("user", "hello", "r1", 1),
+            self._make_conv_msg("assistant", "from conv_msgs", "r1", 2),
+        ]
+        events = {"r1": []}
+
+        mock_db = self._setup_db(rounds, conv_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+
+        with caplog.at_level(logging.WARNING):
+            messages = service._rebuild_messages_from_events()
+
+        assert len(messages) == 2
+        assert messages[1].role == "assistant"
+        assert messages[1].content == "from final_response"
+        assert any("fallback-L1" in r.message for r in caplog.records)
+        assert not any("fallback-L2" in r.message for r in caplog.records)
+
+    def test_no_fallback_when_events_have_text(self):
+        """events 正常重建 assistant 文本时不触发任何 fallback"""
+        rounds = [self._make_round("r1", "s1", "hello")]
+        conv_msgs = [
+            self._make_conv_msg("user", "hello", "r1", 1),
+        ]
+        events = {
+            "r1": [
+                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "normal reply"}, 1),
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m1"}, 2),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 3),
+            ],
+        }
+
+        mock_db = self._setup_db(rounds, conv_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        assert len(messages) == 2
+        assert messages[1].content == "normal reply"
+
+    def test_multi_round_mixed_fallback(self, caplog):
+        """多 round 场景：R1 正常，R2 需 L2 fallback"""
+        import logging
+
+        rounds = [
+            self._make_round("r1", "s1", "q1"),
+            self._make_round("r2", "s1", "q2"),
+        ]
+        conv_msgs = [
+            self._make_conv_msg("user", "q1", "r1", 1),
+            self._make_conv_msg("user", "q2", "r2", 3),
+            self._make_conv_msg("assistant", "a2 from conv", "r2", 4),
+        ]
+        events = {
+            "r1": [
+                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "a1 from events"}, 1),
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m1"}, 2),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 3),
+            ],
+            "r2": [],  # 事件缺失
+        }
+
+        mock_db = self._setup_db(rounds, conv_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+
+        with caplog.at_level(logging.WARNING):
+            messages = service._rebuild_messages_from_events()
+
+        assert len(messages) == 4
+        assert messages[0].content == "q1"
+        assert messages[1].content == "a1 from events"
+        assert messages[2].content == "q2"
+        assert messages[3].content == "a2 from conv"
+        assert any("fallback-L2" in r.message for r in caplog.records)
+
+    def test_failed_round_no_fallback(self):
+        """failed round 不应触发 fallback（只有 completed round 需要）"""
+        rounds = [self._make_round("r1", "s1", "q1", status="failed", final_response="error msg")]
+        conv_msgs = [
+            self._make_conv_msg("user", "q1", "r1", 1),
+            self._make_conv_msg("assistant", "should not appear", "r1", 2),
+        ]
+        events = {"r1": []}
+
+        mock_db = self._setup_db(rounds, conv_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        assert len(messages) == 1
+        assert messages[0].role == "user"

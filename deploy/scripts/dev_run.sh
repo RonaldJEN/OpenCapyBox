@@ -191,7 +191,7 @@ start_all() {
     fi
 
     info "启动后端 (http://localhost:8000)..."
-    $PYTHON_CMD -m uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000 --reload-dir src &
+    $PYTHON_CMD -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 2 &
     BACKEND_PID=$!
     
     # 等待后端启动
