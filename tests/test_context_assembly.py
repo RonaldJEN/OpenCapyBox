@@ -597,6 +597,7 @@ class TestEmbeddingVectorNormalization:
 
         vector = normalize_embedding_vector([0.1, -0.2, 0.3])
 
+        assert MEMORY_EMBEDDING_DIMENSIONS == 2560
         assert len(vector) == MEMORY_EMBEDDING_DIMENSIONS
         assert vector[:3] == [0.1, -0.2, 0.3]
         assert vector[3:] == [0.0] * (MEMORY_EMBEDDING_DIMENSIONS - 3)
@@ -705,7 +706,7 @@ class TestEmbeddingModelRegistry:
                     "api_base": "https://example.com/v1",
                     "api_key": "test-key",
                     "model_name": "text-embedding-v4",
-                    "dimensions": 1024,
+                    "dimensions": 2560,
                     "enabled": True,
                 },
             },
@@ -722,7 +723,7 @@ class TestEmbeddingModelRegistry:
                     api_base="https://example.com/v1",
                     api_key="test-key",
                     model_name="text-embedding-v4",
-                    dimensions=1024,
+                    dimensions=2560,
                 )
             },
             default_embedding_model_id="text-embedding-v4",
@@ -731,7 +732,59 @@ class TestEmbeddingModelRegistry:
         emb = registry.get_embedding_model()
         assert emb is not None
         assert emb.id == "text-embedding-v4"
-        assert emb.dimensions == 1024
+        assert emb.dimensions == 2560
+
+    @pytest.mark.asyncio
+    async def test_generate_embeddings_passes_registry_dimensions(self):
+        from src.api.model_registry import EmbeddingModelConfig
+        from src.api.services.memory_service import MemoryService
+
+        captured = {}
+
+        class FakeRegistry:
+            def get_embedding_model(self):
+                return EmbeddingModelConfig(
+                    id="text-embedding-v4",
+                    display_name="test emb",
+                    api_base="https://example.com/v1",
+                    api_key="test-key",
+                    model_name="text-embedding-v4",
+                    dimensions=2560,
+                )
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": [{"embedding": [0.1, 0.2]}]}
+
+        class FakeAsyncClient:
+            def __init__(self, timeout):
+                captured["timeout"] = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def post(self, url, *, headers, json):
+                captured["url"] = url
+                captured["headers"] = headers
+                captured["json"] = json
+                return FakeResponse()
+
+        with patch("src.api.model_registry.get_model_registry", return_value=FakeRegistry()), \
+             patch("httpx.AsyncClient", FakeAsyncClient):
+            result = await MemoryService._generate_embeddings(["hello"])
+
+        assert result == [[0.1, 0.2]]
+        assert captured["json"] == {
+            "model": "text-embedding-v4",
+            "input": ["hello"],
+            "dimensions": 2560,
+        }
 
     def test_get_embedding_model_returns_none_when_empty(self):
         from src.api.model_registry import ModelRegistry
@@ -907,7 +960,7 @@ class TestIndexConversationRound:
 
     @pytest.mark.asyncio
     async def test_index_stores_embedding_as_padded_float_list(self):
-        """向量字段写入 2048 维 Python list，不再 json.dumps 成字符串。"""
+        """向量字段写入 2560 维 Python list，不再 json.dumps 成字符串。"""
         from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS
 
         svc, mock_db = _make_memory_service(delete_return=0)

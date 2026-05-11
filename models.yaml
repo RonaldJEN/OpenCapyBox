@@ -206,7 +206,7 @@ embedding_models:
     api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: "${LLM_API_KEY}"
     model_name: "text-embedding-v4"
-    dimensions: 1024
+    dimensions: 2560
     enabled: true
 
   # OpenAI Embedding

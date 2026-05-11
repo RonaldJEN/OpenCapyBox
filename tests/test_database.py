@@ -142,6 +142,38 @@ class TestMemoryEmbeddingColumnType:
         assert embedding_type.compile(dialect=sqlite.dialect()) == "JSON"
         assert embedding_type.compile(dialect=postgresql.dialect()) == f"vector({MEMORY_EMBEDDING_DIMENSIONS})"
 
+    def test_postgres_existing_vector_column_resizes_to_target_dimensions(self):
+        from src.api.models import database as database_module
+        from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS
+
+        inspector = MagicMock()
+        inspector.has_table.side_effect = lambda table_name: table_name == "memory_embeddings"
+
+        extension_available = MagicMock()
+        extension_available.scalar.return_value = True
+        column_type = MagicMock()
+        column_type.scalar.return_value = "vector(2048)"
+
+        conn = MagicMock()
+        conn.execute.side_effect = [extension_available, MagicMock(), column_type, MagicMock()]
+
+        context = MagicMock()
+        context.__enter__.return_value = conn
+        context.__exit__.return_value = None
+        fake_engine = MagicMock()
+        fake_engine.begin.return_value = context
+
+        with patch.object(database_module, "_IS_SQLITE", False), \
+             patch.object(database_module, "engine", fake_engine), \
+             patch.object(database_module, "inspect", return_value=inspector), \
+             patch.object(database_module, "_sync_postgres_sequence"):
+            database_module._migrate_add_columns()
+
+        executed_sql = [str(call.args[0]) for call in conn.execute.call_args_list]
+        alter_sql = next(sql for sql in executed_sql if "ALTER TABLE memory_embeddings" in sql)
+        assert f"ALTER COLUMN embedding TYPE vector({MEMORY_EMBEDDING_DIMENSIONS})" in alter_sql
+        assert "embedding::text" in alter_sql
+
     def test_missing_pgvector_extension_fails_fast(self):
         from unittest.mock import MagicMock
 

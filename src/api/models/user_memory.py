@@ -2,7 +2,7 @@
 
 包含：
 - UserMemory：Markdown 记忆文件持久化（USER.md / MEMORY.md / SOUL.md / AGENTS.md）
-- MemoryEmbedding：向量索引（SQLite JSON / PostgreSQL vector(2048)）
+- MemoryEmbedding：向量索引（SQLite JSON / PostgreSQL vector(2560)）
 - CronJobRun：定时任务执行历史
 - UserSkillConfig：Skill 启用/禁用状态
 """
@@ -72,7 +72,7 @@ class MemoryEmbedding(Base):
     """记忆向量索引
 
     使用 OpenAI Embedding API 生成向量。
-    SQLite 存为 JSON 数组，PostgreSQL 存为 pgvector vector(2048)。
+    SQLite 存为 JSON 数组，PostgreSQL 存为 pgvector vector(2560)。
     若未配置 EMBEDDING_API_KEY，则降级为关键词检索。
     """
 
@@ -84,7 +84,7 @@ class MemoryEmbedding(Base):
     file_path = Column(String(255), nullable=True)
     chunk_index = Column(Integer, nullable=True)
     chunk_text = Column(Text, nullable=False)
-    # float array，例如 [0.12, -0.34, ...]；短向量写入前补齐到 2048 维
+    # float array，例如 [0.12, -0.34, ...]；短向量写入前补齐到 2560 维
     embedding = Column(JSON().with_variant(PGVector(MEMORY_EMBEDDING_DIMENSIONS), "postgresql"), nullable=True)
     created_at = Column(DateTime, default=now_naive)
 

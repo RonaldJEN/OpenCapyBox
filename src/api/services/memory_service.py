@@ -730,6 +730,7 @@ class MemoryService:
         api_key: str = ""
         api_base: str = ""
         model_name: str = ""
+        dimensions: int | None = None
 
         # 1. 尝试 model_registry
         try:
@@ -740,6 +741,7 @@ class MemoryService:
                 api_key = emb_config.resolve_api_key()
                 api_base = emb_config.api_base
                 model_name = emb_config.model_name
+                dimensions = emb_config.dimensions
         except Exception:
             pass
 
@@ -756,13 +758,16 @@ class MemoryService:
             import httpx
 
             async with httpx.AsyncClient(timeout=30) as client:
+                payload = {
+                    "model": model_name,
+                    "input": texts,
+                }
+                if dimensions is not None:
+                    payload["dimensions"] = dimensions
                 resp = await client.post(
                     f"{api_base.rstrip('/')}/embeddings",
                     headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "model": model_name,
-                        "input": texts,
-                    },
+                    json=payload,
                 )
                 resp.raise_for_status()
                 data = resp.json()

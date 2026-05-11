@@ -244,13 +244,34 @@ def _migrate_add_columns():
                     conn.execute(text("ALTER TABLE agui_events ALTER COLUMN tool_call_id TYPE VARCHAR(64)"))
                     logger.info("DB 迁移: agui_events.tool_call_id 从 VARCHAR(%s) 升级为 VARCHAR(64)", col["type"].length)
 
-        # PostgreSQL: memory_embeddings.embedding 从 TEXT(JSON) / float8[] 升级为 pgvector vector(2048)
+        # PostgreSQL: memory_embeddings.embedding 统一为目标 pgvector 维度
         if not _IS_SQLITE and inspector.has_table("memory_embeddings"):
             has_pgvector = _ensure_postgres_vector_extension(conn)
             if has_pgvector:
                 col_type = _get_postgres_column_type(conn, "memory_embeddings", "embedding")
-                if col_type and _is_postgres_vector_type(col_type):
+                target_vector_type = f"vector({MEMORY_EMBEDDING_DIMENSIONS})"
+                if col_type == target_vector_type:
                     pass
+                elif col_type and _is_postgres_vector_type(col_type):
+                    conn.execute(text(f"""
+                        ALTER TABLE memory_embeddings
+                        ALTER COLUMN embedding TYPE vector({MEMORY_EMBEDDING_DIMENSIONS})
+                        USING CASE
+                            WHEN embedding IS NULL THEN NULL
+                            ELSE (
+                                '[' || array_to_string(
+                                    CASE
+                                        WHEN cardinality(translate(embedding::text, '[]', '{{}}')::DOUBLE PRECISION[]) < {MEMORY_EMBEDDING_DIMENSIONS}
+                                        THEN translate(embedding::text, '[]', '{{}}')::DOUBLE PRECISION[]
+                                            || array_fill(0.0::DOUBLE PRECISION, ARRAY[{MEMORY_EMBEDDING_DIMENSIONS} - cardinality(translate(embedding::text, '[]', '{{}}')::DOUBLE PRECISION[])])
+                                        ELSE translate(embedding::text, '[]', '{{}}')::DOUBLE PRECISION[]
+                                    END,
+                                    ','
+                                ) || ']'
+                            )::vector({MEMORY_EMBEDDING_DIMENSIONS})
+                        END
+                        """))
+                    logger.info("DB 迁移: memory_embeddings.embedding 从 %s 调整为 vector(%s)", col_type, MEMORY_EMBEDDING_DIMENSIONS)
                 elif col_type == "text":
                     conn.execute(text(f"""
                             ALTER TABLE memory_embeddings
