@@ -93,13 +93,12 @@ ls /home/user/skills/
 
 **经验类（流程/参数/配置）：**
 ```
-[skill:example-kb-prod] 不传 kbId 直接检索返回 500。解决路径：先 list_kb() 取 id，再传 kbId 检索
 [skill:new:ocp4-镜像推送] harbor push 需先 docker login，证书用 --insecure-registry 绕过
 ```
 
 **脚本类（需要新建或修改脚本）：**
 ```
-[skill-script:example-kb-prod/fetch_kb.py] 原脚本未处理分页导致数据截断。修复内容：
+[skill-script:kb-prod/fetch_kb.py] 原脚本未处理分页导致数据截断。修复内容：
 <script>
 while has_more:
     result = fetch(page=page)
@@ -247,7 +246,7 @@ description: "执行内容描述"
 2. 扫描 `MEMORY.md` 中 `[skill-script:xxx/yyy.py]` 条目 → 脚本已存在则 `edit_file` 更新，不存在则 `write_file` 创建到 `skills/{xxx}/scripts/yyy.py`，整合后删除该条目
 3. 若 `[skill:new:xxx]` 对应技能不存在，创建新 `SKILL.md`
 4. 扫描 `/home/user/skills/` 中 description 语义相似的技能，合并冗余文件
-
+![1778477708998](image/AGENTS/1778477708998.png)
 ---
 
 ## 让它成为你的
