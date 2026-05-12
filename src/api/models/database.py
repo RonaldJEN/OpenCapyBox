@@ -18,6 +18,7 @@ def _import_models():
     from src.api.models import agui_event as _  # noqa: F401
     from src.api.models import user_run_lock as _  # noqa: F401
     from src.api.models import run_cancel_request as _  # noqa: F401
+    from src.api.models.auth_user import AuthUser as _  # noqa: F401
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
     from src.api.models.conversation_message import ConversationMessage as _  # noqa: F401
     from src.api.models.llm_call_record import LLMCallRecord as _  # noqa: F401
@@ -181,6 +182,10 @@ _PENDING_COLUMNS = [
     # Cron 任务表单：结构化时间配置（前端编辑回显）+ 执行内容（Agent prompt）
     ("cron_jobs", "schedule", "TEXT"),
     ("cron_jobs", "content", "TEXT NOT NULL DEFAULT ''"),
+    # auth_users: JWT 失效控制（epoch 秒）+ 软删除
+    ("auth_users", "token_valid_after", "BIGINT"),
+    ("auth_users", "deleted_at", f"{'DATETIME' if _IS_SQLITE else 'TIMESTAMP'}"),
+    ("auth_users", "token_generation", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

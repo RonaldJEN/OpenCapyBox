@@ -1,0 +1,342 @@
+"""认证与用户授权服务。"""
+
+import base64
+import hashlib
+import hmac
+import secrets
+from datetime import timedelta
+from typing import Protocol
+
+from fastapi import HTTPException, Request
+from sqlalchemy import func, text
+from sqlalchemy.orm import Session as DBSession
+
+from src.api.config import get_settings
+from src.api.models.auth_user import AuthUser
+from src.api.models.llm_call_record import LLMCallRecord
+from src.api.models.session import Session
+from src.api.utils.timezone import now_naive
+
+
+_PASSWORD_ALGORITHM = "pbkdf2_sha256"
+_PASSWORD_ITERATIONS = 260000
+
+
+class EnterpriseIdentityVerifier(Protocol):
+    def resolve_user_id(self, request: Request) -> str:
+        """返回企业域账号；企业部署中替换为 Kerberos/SPNEGO 适配器。"""
+        ...
+
+
+class UnconfiguredEnterpriseIdentityVerifier:
+    def resolve_user_id(self, request: Request) -> str:
+        raise HTTPException(status_code=501, detail="企业统一登录验证器未配置")
+
+
+def get_enterprise_identity_verifier() -> EnterpriseIdentityVerifier:
+    return UnconfiguredEnterpriseIdentityVerifier()
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        _PASSWORD_ITERATIONS,
+    )
+    return "$".join(
+        [
+            _PASSWORD_ALGORITHM,
+            str(_PASSWORD_ITERATIONS),
+            base64.b64encode(salt).decode("ascii"),
+            base64.b64encode(digest).decode("ascii"),
+        ]
+    )
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    algorithm, iterations_text, salt_text, digest_text = stored_hash.split("$", 3)
+    if algorithm != _PASSWORD_ALGORITHM:
+        raise ValueError(f"unsupported password hash algorithm: {algorithm}")
+    iterations = int(iterations_text)
+    salt = base64.b64decode(salt_text.encode("ascii"))
+    expected = base64.b64decode(digest_text.encode("ascii"))
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(actual, expected)
+
+
+def normalize_domain_user(user_code: str) -> str:
+    value = user_code.strip()
+    if "\\" in value:
+        value = value.split("\\", 1)[1].strip()
+    if "@" in value:
+        value = value.split("@", 1)[0].strip()
+    return value
+
+
+def bootstrap_auth_users(db: DBSession) -> int:
+    """当 auth_users 为空时，从旧 .env 配置初始化第一批 simple 用户。
+
+    PostgreSQL 使用 pg_advisory_xact_lock 串行化多 worker 首次初始化。
+    """
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('bootstrap_auth_users'))"))
+
+    existing_count = db.query(func.count(AuthUser.id)).scalar() or 0
+    if existing_count > 0:
+        return 0
+
+    settings = get_settings()
+    auth_users = settings.get_auth_users()
+    admin_users = settings.get_admin_users()
+
+    created = 0
+    for username, password in sorted(auth_users.items()):
+        user = AuthUser(
+            user_id=username,
+            username=username,
+            auth_type="simple",
+            password_hash=hash_password(password),
+            enabled=True,
+            is_admin=username in admin_users,
+            token_limit_per_month=None,
+            token_limit_per_week=None,
+            created_by="bootstrap",
+        )
+        db.add(user)
+        created += 1
+
+    if created:
+        db.commit()
+    return created
+
+
+def get_auth_user(db: DBSession, user_id: str) -> AuthUser | None:
+    return db.query(AuthUser).filter(AuthUser.user_id == user_id, AuthUser.deleted_at.is_(None)).first()
+
+
+def get_enabled_user(db: DBSession, user_id: str) -> AuthUser:
+    user = get_auth_user(db, user_id)
+    if not user or not user.enabled:
+        raise HTTPException(status_code=401, detail="无效或已过期的访问令牌")
+    return user
+
+
+def require_admin_user(db: DBSession, user_id: str) -> AuthUser:
+    user = get_enabled_user(db, user_id)
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user
+
+
+def login_simple_user(db: DBSession, username: str, password: str) -> AuthUser:
+    user = db.query(AuthUser).filter(AuthUser.username == username, AuthUser.deleted_at.is_(None)).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    if user.auth_type != "simple":
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    if not verify_password(password, user.password_hash):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    if not user.enabled:
+        raise HTTPException(status_code=403, detail="账户已被禁用")
+
+    user.last_login_at = now_naive()
+    db.commit()
+    return user
+
+
+def login_sso_user(db: DBSession, request: Request) -> AuthUser:
+    settings = get_settings()
+    if not settings.enterprise_sso_enabled:
+        raise HTTPException(status_code=404, detail="企业统一登录未启用")
+
+    authenticated_user = get_enterprise_identity_verifier().resolve_user_id(request)
+    user_id = normalize_domain_user(authenticated_user)
+    user = get_auth_user(db, user_id)
+    if not user or not user.enabled:
+        raise HTTPException(status_code=403, detail="用户未开通或已被禁用")
+    if user.auth_type != "ldap":
+        raise HTTPException(status_code=403, detail="当前用户未配置为企业统一登录用户")
+
+    user.last_login_at = now_naive()
+    db.commit()
+    return user
+
+
+def create_simple_user(
+    db: DBSession,
+    *,
+    username: str,
+    password: str,
+    enabled: bool,
+    is_admin: bool,
+    token_limit_per_week: int | None,
+    token_limit_per_month: int | None,
+    created_by: str,
+) -> AuthUser:
+    _ensure_user_not_exists(db, username=username, user_id=username)
+    user = AuthUser(
+        user_id=username,
+        username=username,
+        auth_type="simple",
+        password_hash=hash_password(password),
+        enabled=enabled,
+        is_admin=is_admin,
+        token_limit_per_week=token_limit_per_week,
+        token_limit_per_month=token_limit_per_month,
+        created_by=created_by,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def create_ldap_user(
+    db: DBSession,
+    *,
+    user_id: str,
+    username: str | None,
+    enabled: bool,
+    is_admin: bool,
+    token_limit_per_week: int | None,
+    token_limit_per_month: int | None,
+    created_by: str,
+) -> AuthUser:
+    user_id = normalize_domain_user(user_id)
+    actual_username = username or user_id
+    _ensure_user_not_exists(db, username=actual_username, user_id=user_id)
+    user = AuthUser(
+        user_id=user_id,
+        username=actual_username,
+        auth_type="ldap",
+        password_hash=None,
+        enabled=enabled,
+        is_admin=is_admin,
+        token_limit_per_week=token_limit_per_week,
+        token_limit_per_month=token_limit_per_month,
+        created_by=created_by,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def update_user_enabled(db: DBSession, *, user_id: str, enabled: bool) -> AuthUser:
+    user = _get_existing_user(db, user_id)
+    user.enabled = enabled
+    if not enabled:
+        user.token_generation += 1
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def update_user_admin(db: DBSession, *, user_id: str, is_admin: bool) -> AuthUser:
+    user = _get_existing_user(db, user_id)
+    user.is_admin = is_admin
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def update_user_token_limits(
+    db: DBSession,
+    *,
+    user_id: str,
+    token_limit_per_week: int | None,
+    token_limit_per_month: int | None,
+) -> AuthUser:
+    user = _get_existing_user(db, user_id)
+    user.token_limit_per_week = token_limit_per_week
+    user.token_limit_per_month = token_limit_per_month
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def reset_simple_user_password(db: DBSession, *, user_id: str, password: str) -> AuthUser:
+    user = _get_existing_user(db, user_id)
+    if user.auth_type != "simple":
+        raise HTTPException(status_code=400, detail="ldap 用户不能重置本地密码")
+    user.password_hash = hash_password(password)
+    user.token_generation += 1
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def delete_auth_user(db: DBSession, *, user_id: str) -> str:
+    user = _get_existing_user(db, user_id)
+    user.deleted_at = now_naive()
+    user.enabled = False
+    user.token_generation += 1
+    db.commit()
+    return user_id
+
+
+def get_user_token_usage(db: DBSession, *, user_id: str, since) -> int:
+    value = (
+        db.query(func.coalesce(func.sum(LLMCallRecord.usage_total_tokens), 0))
+        .join(Session, Session.id == LLMCallRecord.session_id)
+        .filter(Session.user_id == user_id, LLMCallRecord.created_at >= since)
+        .scalar()
+    )
+    return int(value or 0)
+
+
+def enforce_token_limits(db: DBSession, *, user_id: str) -> None:
+    user = get_enabled_user(db, user_id)
+
+    now = now_naive()
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    if user.token_limit_per_week is not None:
+        week_used = get_user_token_usage(db, user_id=user_id, since=week_start)
+        if week_used >= user.token_limit_per_week:
+            raise HTTPException(status_code=429, detail="本周 token 使用量已达上限")
+
+    if user.token_limit_per_month is not None:
+        month_used = get_user_token_usage(db, user_id=user_id, since=month_start)
+        if month_used >= user.token_limit_per_month:
+            raise HTTPException(status_code=429, detail="本月 token 使用量已达上限")
+
+
+def auth_user_to_payload(user: AuthUser) -> dict:
+    return {
+        "user_id": user.user_id,
+        "username": user.username,
+        "auth_type": user.auth_type,
+        "enabled": bool(user.enabled),
+        "role": "admin" if user.is_admin else "user",
+        "is_admin": bool(user.is_admin),
+        "token_limit_per_week": user.token_limit_per_week,
+        "token_limit_per_month": user.token_limit_per_month,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "created_by": user.created_by,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+        "token_generation": user.token_generation,
+    }
+
+
+def _ensure_user_not_exists(db: DBSession, *, username: str, user_id: str) -> None:
+    existing = (
+        db.query(AuthUser)
+        .filter((AuthUser.username == username) | (AuthUser.user_id == user_id))
+        .first()
+    )
+    if existing:
+        if existing.deleted_at is not None:
+            raise HTTPException(status_code=409, detail="该用户 ID 已被使用过且存在历史数据，不允许复用")
+        raise HTTPException(status_code=409, detail="用户已存在")
+
+
+def _get_existing_user(db: DBSession, user_id: str) -> AuthUser:
+    user = get_auth_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return user

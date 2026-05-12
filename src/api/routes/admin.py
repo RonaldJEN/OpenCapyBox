@@ -11,18 +11,30 @@ from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import get_settings
 from src.api.deps import get_current_admin_user
+from src.api.models.auth_user import AuthUser
 from src.api.models.database import get_db
 from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.cron_job import CronJob
+from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_memory import CronJobRun
 from src.api.models.llm_call_record import LLMCallRecord
+from src.api.services.auth_service import (
+    auth_user_to_payload,
+    create_ldap_user,
+    create_simple_user,
+    delete_auth_user,
+    reset_simple_user_password,
+    update_user_admin,
+    update_user_enabled,
+    update_user_token_limits,
+)
 from src.api.utils.timezone import now_naive
 
 router = APIRouter()
@@ -30,6 +42,65 @@ router = APIRouter()
 
 class ManualReviewUpdatePayload(BaseModel):
     manual_review_status: str
+
+
+class AdminCreateSimpleUserPayload(BaseModel):
+    username: str = Field(..., min_length=1, max_length=100)
+    password: str = Field(..., min_length=1, max_length=1024)
+    enabled: bool = True
+    is_admin: bool = False
+    token_limit_per_week: int | None = Field(default=None, ge=0)
+    token_limit_per_month: int | None = Field(default=None, ge=0)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def _strip_username(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("password")
+    @classmethod
+    def _reject_blank_password(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("密码不能为空")
+        return value
+
+
+class AdminCreateLdapUserPayload(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=100)
+    username: str | None = Field(default=None, min_length=1, max_length=100)
+    enabled: bool = True
+    is_admin: bool = False
+    token_limit_per_week: int | None = Field(default=None, ge=0)
+    token_limit_per_month: int | None = Field(default=None, ge=0)
+
+    @field_validator("user_id", "username", mode="before")
+    @classmethod
+    def _strip_identifiers(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class AdminEnabledUpdatePayload(BaseModel):
+    enabled: bool
+
+
+class AdminFlagUpdatePayload(BaseModel):
+    is_admin: bool
+
+
+class AdminTokenLimitsUpdatePayload(BaseModel):
+    token_limit_per_week: int | None = Field(default=None, ge=0)
+    token_limit_per_month: int | None = Field(default=None, ge=0)
+
+
+class AdminResetPasswordPayload(BaseModel):
+    password: str = Field(..., min_length=1, max_length=1024)
+
+    @field_validator("password")
+    @classmethod
+    def _reject_blank_password(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("密码不能为空")
+        return value
 
 
 def _iso(dt) -> str | None:
@@ -50,13 +121,12 @@ def _percentile(values: list[float], p: float) -> float | None:
 
 
 def _build_overview_payload(db: DBSession, days: int) -> dict[str, Any]:
-    settings = get_settings()
     now = now_naive()
     since_24h = now - timedelta(hours=24)
     since_days = now - timedelta(days=days)
 
-    users_total = len(settings.get_auth_users())
-    admins_total = len(settings.get_admin_users())
+    users_total = db.query(func.count(AuthUser.id)).filter(AuthUser.deleted_at.is_(None)).scalar()
+    admins_total = db.query(func.count(AuthUser.id)).filter(AuthUser.is_admin.is_(True), AuthUser.deleted_at.is_(None)).scalar()
 
     sessions_total = db.query(func.count(Session.id)).scalar()
     rounds_total = db.query(func.count(Round.id)).scalar()
@@ -478,12 +548,24 @@ def _update_llm_record_review_status(
 
 
 def _build_users_payload(db: DBSession) -> dict[str, Any]:
-    settings = get_settings()
     now = now_naive()
     since_24h = now - timedelta(hours=24)
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    lock_cutoff = now - timedelta(seconds=get_settings().sse_subscribe_timeout)
 
-    auth_users = settings.get_auth_users()
-    admin_users = settings.get_admin_users()
+    auth_user_rows = db.query(AuthUser).filter(AuthUser.deleted_at.is_(None)).order_by(AuthUser.username).all()
+    user_ids = [user.user_id for user in auth_user_rows]
+    if not user_ids:
+        return {
+            "summary": {
+                "users_total": 0,
+                "admins_total": 0,
+                "active_total": 0,
+                "running_total": 0,
+            },
+            "users": [],
+        }
 
     session_rows = (
         db.query(
@@ -491,6 +573,7 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
             func.count(Session.id).label("sessions_count"),
             func.max(Session.updated_at).label("last_session_at"),
         )
+        .filter(Session.user_id.in_(user_ids))
         .group_by(Session.user_id)
         .all()
     )
@@ -513,6 +596,7 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
             func.max(Round.created_at).label("last_round_at"),
         )
         .join(Round, Round.session_id == Session.id)
+        .filter(Session.user_id.in_(user_ids))
         .group_by(Session.user_id)
         .all()
     )
@@ -529,12 +613,28 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
         db.query(
             Session.user_id,
             func.coalesce(func.sum(LLMCallRecord.usage_total_tokens), 0).label("total_tokens"),
+            func.coalesce(
+                func.sum(case((LLMCallRecord.created_at >= week_start, LLMCallRecord.usage_total_tokens), else_=0)),
+                0,
+            ).label("weekly_tokens"),
+            func.coalesce(
+                func.sum(case((LLMCallRecord.created_at >= month_start, LLMCallRecord.usage_total_tokens), else_=0)),
+                0,
+            ).label("monthly_tokens"),
         )
         .join(LLMCallRecord, LLMCallRecord.session_id == Session.id)
+        .filter(Session.user_id.in_(user_ids))
         .group_by(Session.user_id)
         .all()
     )
-    token_map = {row.user_id: int(row.total_tokens) for row in token_rows}
+    token_map = {
+        row.user_id: {
+            "total_tokens": int(row.total_tokens),
+            "weekly_tokens": int(row.weekly_tokens),
+            "monthly_tokens": int(row.monthly_tokens),
+        }
+        for row in token_rows
+    }
 
     cron_rows = (
         db.query(
@@ -545,6 +645,7 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
                 0,
             ).label("cron_jobs_enabled"),
         )
+        .filter(CronJob.user_id.in_(user_ids))
         .group_by(CronJob.user_id)
         .all()
     )
@@ -564,25 +665,54 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
         .filter(
             CronJobRun.status == "failed",
             CronJobRun.started_at >= since_24h,
+            CronJobRun.user_id.in_(user_ids),
         )
         .group_by(CronJobRun.user_id)
         .all()
     )
     cron_failed_map = {row.user_id: int(row.cron_failed_24h) for row in cron_failed_rows}
 
+    lock_rows = (
+        db.query(
+            UserRunLock.user_id,
+            func.count(UserRunLock.user_id).label("running_locks"),
+            func.max(UserRunLock.updated_at).label("last_lock_at"),
+        )
+        .filter(
+            UserRunLock.user_id.in_(user_ids),
+            UserRunLock.updated_at >= lock_cutoff,
+        )
+        .group_by(UserRunLock.user_id)
+        .all()
+    )
+    lock_map = {
+        row.user_id: {
+            "running_locks": int(row.running_locks),
+            "last_lock_at": row.last_lock_at,
+        }
+        for row in lock_rows
+    }
+
     users: list[dict[str, Any]] = []
-    for username in sorted(auth_users.keys()):
-        session_info = session_map.get(username, {})
-        round_info = round_map.get(username, {})
-        cron_info = cron_map.get(username, {})
+    for auth_user in auth_user_rows:
+        user_id = auth_user.user_id
+        session_info = session_map.get(user_id, {})
+        round_info = round_map.get(user_id, {})
+        cron_info = cron_map.get(user_id, {})
+        token_info = token_map.get(user_id, {})
+        lock_info = lock_map.get(user_id, {})
 
         last_active_candidates = [
             session_info.get("last_session_at"),
             round_info.get("last_round_at"),
+            lock_info.get("last_lock_at"),
         ]
         last_active = max((dt for dt in last_active_candidates if dt is not None), default=None)
 
-        running_rounds = int(round_info.get("running_rounds", 0))
+        running_rounds = max(
+            int(round_info.get("running_rounds", 0)),
+            int(lock_info.get("running_locks", 0)),
+        )
         if running_rounds > 0:
             status = "running"
         elif last_active and (now - last_active) <= timedelta(days=7):
@@ -590,21 +720,32 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
         else:
             status = "idle"
 
-        is_admin = username in admin_users
+        is_admin = bool(auth_user.is_admin)
         users.append(
             {
-                "user_id": username,
+                "user_id": user_id,
+                "username": auth_user.username,
+                "auth_type": auth_user.auth_type,
+                "enabled": bool(auth_user.enabled),
                 "role": "admin" if is_admin else "user",
                 "is_admin": is_admin,
                 "status": status,
                 "sessions_count": int(session_info.get("sessions_count", 0)),
                 "rounds_count": int(round_info.get("rounds_count", 0)),
                 "running_rounds": running_rounds,
-                "total_tokens": int(token_map.get(username, 0)),
+                "total_tokens": int(token_info.get("total_tokens", 0)),
+                "weekly_tokens_used": int(token_info.get("weekly_tokens", 0)),
+                "monthly_tokens_used": int(token_info.get("monthly_tokens", 0)),
+                "token_limit_per_week": auth_user.token_limit_per_week,
+                "token_limit_per_month": auth_user.token_limit_per_month,
                 "cron_jobs_total": int(cron_info.get("cron_jobs_total", 0)),
                 "cron_jobs_enabled": int(cron_info.get("cron_jobs_enabled", 0)),
-                "cron_failed_24h": int(cron_failed_map.get(username, 0)),
+                "cron_failed_24h": int(cron_failed_map.get(user_id, 0)),
                 "last_active_at": _iso(last_active),
+                "last_login_at": _iso(auth_user.last_login_at),
+                "created_by": auth_user.created_by,
+                "created_at": _iso(auth_user.created_at),
+                "updated_at": _iso(auth_user.updated_at),
             }
         )
 
@@ -781,6 +922,116 @@ async def get_admin_users(
 ):
     """管理端用户列表与角色信息。"""
     return _build_users_payload(db)
+
+
+@router.post("/users/simple")
+async def create_admin_simple_user(
+    payload: AdminCreateSimpleUserPayload,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """创建本地 simple 用户。"""
+    user = create_simple_user(
+        db,
+        username=payload.username,
+        password=payload.password,
+        enabled=payload.enabled,
+        is_admin=payload.is_admin,
+        token_limit_per_week=payload.token_limit_per_week,
+        token_limit_per_month=payload.token_limit_per_month,
+        created_by=admin_user_id,
+    )
+    return auth_user_to_payload(user)
+
+
+@router.post("/users/ldap")
+async def create_admin_ldap_user(
+    payload: AdminCreateLdapUserPayload,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """创建企业域账号用户。"""
+    user = create_ldap_user(
+        db,
+        user_id=payload.user_id,
+        username=payload.username,
+        enabled=payload.enabled,
+        is_admin=payload.is_admin,
+        token_limit_per_week=payload.token_limit_per_week,
+        token_limit_per_month=payload.token_limit_per_month,
+        created_by=admin_user_id,
+    )
+    return auth_user_to_payload(user)
+
+
+@router.patch("/users/{user_id}/enabled")
+async def update_admin_user_enabled(
+    user_id: str,
+    payload: AdminEnabledUpdatePayload,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """启用或禁用用户。"""
+    if user_id == admin_user_id and not payload.enabled:
+        raise HTTPException(status_code=400, detail="不能禁用当前管理员账号")
+    user = update_user_enabled(db, user_id=user_id, enabled=payload.enabled)
+    return auth_user_to_payload(user)
+
+
+@router.patch("/users/{user_id}/admin")
+async def update_admin_user_admin_flag(
+    user_id: str,
+    payload: AdminFlagUpdatePayload,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """设置或取消管理员权限。"""
+    if user_id == admin_user_id and not payload.is_admin:
+        raise HTTPException(status_code=400, detail="不能取消自己的管理员权限")
+    user = update_user_admin(db, user_id=user_id, is_admin=payload.is_admin)
+    return auth_user_to_payload(user)
+
+
+@router.patch("/users/{user_id}/token-limits")
+async def update_admin_user_token_limits(
+    user_id: str,
+    payload: AdminTokenLimitsUpdatePayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """更新用户 token 周/月限额。"""
+    user = update_user_token_limits(
+        db,
+        user_id=user_id,
+        token_limit_per_week=payload.token_limit_per_week,
+        token_limit_per_month=payload.token_limit_per_month,
+    )
+    return auth_user_to_payload(user)
+
+
+@router.post("/users/{user_id}/reset-password")
+async def reset_admin_simple_user_password(
+    user_id: str,
+    payload: AdminResetPasswordPayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """重置 simple 用户密码。"""
+    user = reset_simple_user_password(db, user_id=user_id, password=payload.password)
+    return auth_user_to_payload(user)
+
+
+@router.delete("/users/{user_id}")
+async def delete_admin_auth_user(
+    user_id: str,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """删除认证用户账号；历史会话与审计记录保留。"""
+    if user_id == admin_user_id:
+        raise HTTPException(status_code=400, detail="不能删除当前管理员账号")
+    deleted_user_id = delete_auth_user(db, user_id=user_id)
+    return {"user_id": deleted_user_id, "deleted": True}
 
 
 @router.get("/system")

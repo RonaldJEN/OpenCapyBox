@@ -27,6 +27,7 @@
 | `components/AgentConfig.tsx` | SOUL/USER/MEMORY 记忆文件编辑 | Skills/Cron |
 | `components/SkillManager.tsx` | Skills 启停、分类筛选 | Skill 执行（后端负责）|
 | `components/CronSchedule.tsx` / `CronMessageCenter.tsx` | Cron 列表与执行历史 | Cron 调度（后端 worker）|
+| `components/AdminConsole.tsx` | 管理后台概览、Session 监控、用户管理、系统监控 | 业务执行、用户认证判定 |
 | `services/api.ts` | 所有 HTTP/SSE 调用封装 | 业务决策 |
 | `services/configApi.ts` | 记忆文件、Skills、未读计数 API | 聊天相关 |
 | `utils/messageParser.ts` | AG-UI 事件 → RoundData/StepData | 渲染 |
@@ -47,6 +48,13 @@
 - 所有 state 更新必须经过 `boundSessionId` 校验（见 frontend-chat-spec §3）。
 
 ## 4. 全局行为契约
+
+### 4.0 登录失败处理
+
+- `/auth/login` 返回 401 时，登录页展示通用登录失败提示，不触发全局登出和 `window.location.href` 硬跳转。
+- `/auth/login` 返回 `账户已被禁用` 时，登录页展示该明确业务提示。
+- 登录页不得向普通用户展示企业统一登录内部提示；企业登录入口由后续后台/网关链路承接。
+- 非登录接口返回 401 时，`services/api.ts` 仍按会话失效处理：清理本地认证信息并跳转 `/login`。
 
 ### 4.1 会话隔离（最重要）
 
@@ -80,6 +88,23 @@
 | Cron 未读计数 | 60s | `App.tsx` 挂载期间 |
 
 **禁止**在 SSE 订阅期间轮询 history（浪费资源且易产生竞态）。
+
+### 4.6 管理后台用户管理
+
+- `AdminConsole` 的用户页必须通过 `services/adminApi.ts` 调用 `/admin/users*` 后端接口。
+- 用户页展示 `auth_type`、`enabled`、`is_admin`、周/月 token 用量与限额。
+- 用户管理页采用用户目录表格布局，顶部提供本地搜索、状态/权限/认证筛选与排序控件；这些控件只筛选当前 `/admin/users` 返回的数据，不改变后端契约。
+- 用户管理表格在常规桌面宽度下必须使用紧凑列宽与可收缩控件，避免出现横向滚动条。
+- 用户管理页不得展示没有对应批量动作的选择框或无行为按钮。
+- 用户管理页的“导出”按钮必须导出当前本地搜索/筛选/排序后的可见用户为 CSV。
+- 支持通过“新建用户”按钮打开右侧抽屉创建 `simple` 用户与 `ldap` 用户；`simple` 用户提交本地密码，`ldap` 用户不提交密码。
+- 新建用户抽屉中 `simple` 账号只展示用户名与密码；`ldap` 账号才展示可选显示名。
+- 支持启停用户、设置/取消管理员、更新周/月 token 限额、重置 simple 用户密码、删除用户账号。
+- 管理员权限变更必须使用“角色选择 + 保存”的显式交互；取消管理员权限前必须二次确认。
+- 当前登录管理员账号的禁用、取消管理员、删除入口必须禁用。
+- 任一写操作成功后重新拉取 `/admin/users`，确保列表与后端事实源一致。
+- 用户写操作成功提示必须是短暂 toast，不占用表格上方常驻空间。
+- `ldap` 用户密码入口必须显示为企业统一登录，不提供本地密码重置控件。
 
 ## 5. 设计体系（Claude 暖色调文档流）
 

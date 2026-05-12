@@ -10,7 +10,7 @@
 
 - 所有端点都要求 Bearer Token。
 - 所有端点都依赖 `get_current_admin_user`。
-- 用户是否为管理员由 `AUTH_ADMIN_USERS` 环境变量决定（逗号分隔用户名）。
+- 用户是否为管理员由 `auth_users.is_admin` 决定。`AUTH_ADMIN_USERS` 仅用于首次 bootstrap。
 
 ## 3. API 契约
 
@@ -60,7 +60,46 @@
 
 - 响应：
   - `summary`: 用户总数、管理员数、活跃用户数、运行中用户数
-  - `users`: 每个账号的角色（`admin/user`）、状态（`active/idle/running`）、会话/round/token/cron 指标
+  - `users`: 每个账号的 `user_id`、`username`、`auth_type`、`enabled`、角色（`admin/user`）、状态（`active/idle/running`）、会话/round/token/cron 指标、周/月 token 限额与用量
+- 语义：`status=running`、`running_rounds` 与 `summary.running_total` 同时参考 `rounds.status='running'` 和新鲜的 `user_run_locks.updated_at` 心跳；Agent 已持有用户运行锁但尚未写入 running round 时也必须显示为运行中。
+
+### POST /api/admin/users/simple
+
+- Body: `{username, password, enabled?, is_admin?, token_limit_per_week?, token_limit_per_month?}`
+- 响应：创建后的用户基础信息。
+- 语义：创建本地 simple 用户，密码只保存 hash。
+
+### POST /api/admin/users/ldap
+
+- Body: `{user_id, username?, enabled?, is_admin?, token_limit_per_week?, token_limit_per_month?}`
+- 响应：创建后的用户基础信息。
+- 语义：创建企业域账号用户，不保存密码；内部 SSO 通过 `user_id` 匹配。
+
+### PATCH /api/admin/users/{user_id}/enabled
+
+- Body: `{enabled: bool}`
+- 语义：启用/禁用用户。禁用后已有 token 也会在下一次鉴权时失效。
+
+### PATCH /api/admin/users/{user_id}/admin
+
+- Body: `{is_admin: bool}`
+- 语义：设置或取消管理员权限。
+
+### PATCH /api/admin/users/{user_id}/token-limits
+
+- Body: `{token_limit_per_week: int|null, token_limit_per_month: int|null}`
+- 语义：设置用户周/月 token 限额；限额必须为非负整数，`NULL` 表示不限额，`0` 表示禁止发起模型调用。
+
+### POST /api/admin/users/{user_id}/reset-password
+
+- Body: `{password: str}`
+- 语义：仅 simple 用户可重置本地密码；ldap 用户返回 400。
+
+### DELETE /api/admin/users/{user_id}
+
+- 响应：`{user_id: str, deleted: true}`
+- 语义：删除 `auth_users` 账号记录；历史 session / round / LLM 审计记录保留。
+- 约束：管理员不能删除当前登录账号。
 
 ### GET /api/admin/system
 
@@ -72,8 +111,10 @@
 
 ## 4. 行为语义与不变量
 
-- 管理端查询仅返回聚合信息，不写业务数据。
+- 除用户管理接口外，管理端查询仅返回聚合信息，不写业务数据。
 - `rounds-tree` 端点按 session 维度分页，session 内 round 仍按 `created_at` 倒序。
+- `auth_users` 是后台用户管理的事实源。
+- 管理员不能禁用当前登录账号、不能取消自己的管理员权限、不能删除当前登录账号。
 
 ## 5. 失败模式
 

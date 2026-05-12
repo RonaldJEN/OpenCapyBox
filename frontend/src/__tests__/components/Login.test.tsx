@@ -118,6 +118,50 @@ describe('Login 組件', () => {
     await waitFor(() => {
       expect(screen.getByText('登录失败，请检查用户名和密码')).toBeInTheDocument();
     });
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it('账号被禁用时应显示明确提示', async () => {
+    vi.mocked(apiService.login).mockRejectedValue({
+      response: { data: { detail: '账户已被禁用' } },
+    });
+
+    render(<Login />);
+
+    fireEvent.change(screen.getByLabelText('用户名'), {
+      target: { value: 'disabled-user' },
+    });
+    fireEvent.change(screen.getByLabelText('密码'), {
+      target: { value: 'pass123' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /登\s*录/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('账户已被禁用')).toBeInTheDocument();
+    });
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it('企业登录细节不应显示给普通登录页用户', async () => {
+    vi.mocked(apiService.login).mockRejectedValue({
+      response: { data: { detail: '请使用企业统一登录' } },
+    });
+
+    render(<Login />);
+
+    fireEvent.change(screen.getByLabelText('用户名'), {
+      target: { value: 'ldap-user' },
+    });
+    fireEvent.change(screen.getByLabelText('密码'), {
+      target: { value: 'anypass' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /登\s*录/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('登录失败，请检查用户名和密码')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('请使用企业统一登录')).not.toBeInTheDocument();
+    expect(mockNavigate).not.toHaveBeenCalled();
   });
 
   it('登錄中應該禁用按鈕並顯示載入狀態', async () => {

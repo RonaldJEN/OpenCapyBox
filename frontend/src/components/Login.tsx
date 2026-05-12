@@ -3,6 +3,14 @@ import { useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
 import { AlertCircle } from 'lucide-react';
 
+const loginSpecificErrorMessages = new Set(['账户已被禁用']);
+
+function getLoginErrorMessage(err: unknown): string {
+  const detail = (err as { response?: { data?: { detail?: unknown } } }).response?.data?.detail;
+  if (typeof detail === 'string' && loginSpecificErrorMessages.has(detail)) return detail;
+  return '登录失败，请检查用户名和密码';
+}
+
 export function Login() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -20,7 +28,7 @@ export function Login() {
       navigate(response.role === 'admin' || response.is_admin ? '/admin' : '/');
     } catch (err) {
       console.error('Login error:', err);
-      setError('登录失败，请检查用户名和密码');
+      setError(getLoginErrorMessage(err));
     } finally {
       setLoading(false);
     }

@@ -21,13 +21,16 @@ class Settings(BaseSettings):
     api_prefix: str = "/api"
     cors_origins: List[str] = ["http://localhost:3000"]
 
-    # 简单认证（临时方案，格式：username:password,username2:password2）
-    simple_auth_users: str = ""  # 必须在 .env 中配置 SIMPLE_AUTH_USERS
-    auth_admin_users: str = "admin"  # 管理员用户名列表，逗号分隔
+    # 首次 bootstrap 认证用户（格式：username:password,username2:password2）
+    simple_auth_users: str = ""
+    auth_admin_users: str = "admin"  # 首次 bootstrap 管理员用户名列表，逗号分隔
 
     # 认证配置（Bearer Token）
     auth_secret_key: str = ""
     auth_token_expire_minutes: int = 720
+    enterprise_sso_enabled: bool = False
+    enterprise_sso_gateway_url: str = ""  # 企业 SSO 网关地址，如 http://gateway-host/infra-auth
+    enterprise_sso_jwt_secret: str = ""  # 企业 SSO 网关 JWT 签名密钥
 
     # 数据库配置
     database_url: str = "sqlite:///./data/database/open_capy_box.db"
@@ -115,7 +118,7 @@ def get_settings() -> Settings:
         )
     if not settings.simple_auth_users:
         _config_logger.warning(
-            "SIMPLE_AUTH_USERS 未配置，无法登录。"
-            "请在 .env 中设置 SIMPLE_AUTH_USERS=username:password"
+            "SIMPLE_AUTH_USERS 未配置；auth_users 空表首次 bootstrap 不会创建 simple 用户。"
+            "已有 auth_users 数据时可忽略。"
         )
     return settings

@@ -70,6 +70,21 @@ describe('APIService', () => {
       apiService.setUserId('demo', 'token-2', 'user');
       expect(apiService.isAdminUser()).toBe(false);
     });
+
+    it('登录接口返回 401 时不应触发全局登出跳转', async () => {
+      const axiosModule = await import('axios');
+      const client = vi.mocked(axiosModule.default.create).mock.results[0].value as any;
+      const responseRejected = client.interceptors.response.use.mock.calls[0][1];
+      const logoutSpy = vi.spyOn(apiService, 'logout');
+      const error = {
+        config: { url: '/auth/login' },
+        response: { status: 401 },
+      };
+
+      await expect(responseRejected(error)).rejects.toBe(error);
+
+      expect(logoutSpy).not.toHaveBeenCalled();
+    });
   });
 
   describe('流式连接可靠性', () => {

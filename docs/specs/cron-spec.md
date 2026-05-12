@@ -9,7 +9,9 @@
 - 手动触发
 - 未读计数与显式已读标记（消息中心）
 - 执行产物（artifacts）查看与下载
+- 执行前遵守 `auth_users.enabled` 用户开通状态
 - 不负责：复杂调度策略（仅 5-field cron）
+- 不负责：用户周/月 token 限额扣减或门禁；Cron 执行不占用 Auth/Admin token 限额
 
 ## 2. 数据模型
 
@@ -169,10 +171,12 @@ All require Bearer auth.
 ### 执行前二次校验
 
 - dispatch 查询结果是**内存快照**。在 `_run` 实际执行前，必须按 `job_id` 重新从 DB 拉取：
-  - job 不存在 → skip（用户已删除）
-  - `enabled == False` → skip（用户已禁用）
+  - job 不存在 → skip
+  - `cron_jobs.enabled == False` → skip
+  - `auth_users` 中没有对应用户 → skip
+  - `auth_users.enabled == False` → skip
 - 实现位置：`cron_worker._run_by_id`。
-- 手动触发（`POST /api/cron/jobs/{name}/run`）路径不经此校验（路由层已在请求时校验 job 存在）。
+- 手动触发（`POST /api/cron/jobs/{name}/run`）不写 `cron_fires`，但 `run_cron_job()` 执行入口仍必须校验 `auth_users` 用户存在且启用；用户在触发后被禁用/删除时，预创建的 run 记录应转为 `failed`。
 
 ### 执行流程
 

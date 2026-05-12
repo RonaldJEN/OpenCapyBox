@@ -2,11 +2,16 @@
 import json
 import pytest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from src.api.routes import auth, sessions, config as config_routes
+from src.api.models.database import Base, get_db
 from tests.helpers import make_test_client, make_mock_settings, make_fake_execution
 
 
@@ -18,16 +23,41 @@ class TestAuthRouter:
         """模擬設置"""
         mock_s = make_mock_settings()
 
-        with patch("src.api.routes.auth.settings", mock_s):
-            with patch("src.api.deps.get_settings", return_value=mock_s):
+        with patch("src.api.deps.get_settings", return_value=mock_s):
+            with patch("src.api.services.auth_service.get_settings", return_value=mock_s):
                 yield mock_s
 
     @pytest.fixture
     def client(self, mock_settings):
         """創建測試客戶端"""
+        from src.api.services.auth_service import bootstrap_auth_users
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+
+        with TestingSessionLocal() as db:
+            bootstrap_auth_users(db)
+
         app = FastAPI()
         app.include_router(auth.router, prefix="/auth")
-        return TestClient(app)
+
+        def _override_get_db():
+            db = TestingSessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = _override_get_db
+        with TestClient(app) as test_client:
+            yield test_client
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
 
     def test_login_success(self, client, mock_settings):
         """測試登錄成功"""
@@ -87,6 +117,20 @@ class TestAuthRouter:
         response = client.get("/auth/me")
         
         assert response.status_code == 401
+
+    def test_sso_login_returns_token_for_enterprise_user(self, client, mock_settings):
+        """企业登录成功后签发本系统 JWT。"""
+        user = SimpleNamespace(user_id="zhangsan", is_admin=False, token_generation=0)
+
+        with patch("src.api.routes.auth.login_sso_user", return_value=user):
+            response = client.get("/auth/sso-login")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["user_id"] == "zhangsan"
+        assert isinstance(data["access_token"], str)
+        assert data["token_type"] == "bearer"
+        assert data["role"] == "user"
 
 
 class TestSessionsRouter:
@@ -808,6 +852,19 @@ class TestSandboxListDir:
 
 class TestAbortEndpoint:
     """Abort 端點測試"""
+
+    @pytest.fixture(autouse=True)
+    def _mock_cross_session_abort_helpers(self):
+        with patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch(
+            "src.api.routes.chat._complete_cancel_request_in_new_session",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            yield
 
     @pytest.fixture
     def client(self):

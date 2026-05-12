@@ -25,6 +25,7 @@ from src.api.models.user_run_lock import UserRunLock
 from src.api.models.run_cancel_request import RunCancelRequest
 from src.api.schemas.chat import SendMessageRequest, ResumeRequest
 from src.api.services.agent_pool_service import get_agent_pool
+from src.api.services.auth_service import enforce_token_limits
 from src.api.models.user_sandbox import UserSandbox
 from src.api.config import get_settings
 import logging
@@ -1060,6 +1061,8 @@ async def send_message_stream(
     if session.status == "completed":
         raise HTTPException(status_code=410, detail="會話已完成")
 
+    enforce_token_limits(db, user_id=user_id)
+
     # 用戶級並發限制 + 清理遺留取消請求
     lock_id = await _acquire_lock_and_clear_cancel(db, user_id=user_id, session_id=chat_session_id)
     run_guard_started_at = now_naive()
@@ -1231,6 +1234,8 @@ async def resume_interrupt(
     )
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
+
+    enforce_token_limits(db, user_id=user_id)
 
     # 获取 Agent Service
     agent_pool = get_agent_pool()

@@ -63,6 +63,14 @@ async def startup_event():
     init_db()
     print(f"✅ 数据库初始化完成")
 
+    from src.api.models.database import SessionLocal
+    from src.api.services.auth_service import bootstrap_auth_users
+
+    with SessionLocal() as db:
+        bootstrapped_users = bootstrap_auth_users(db)
+    if bootstrapped_users:
+        print(f"✅ 已从 SIMPLE_AUTH_USERS 初始化 {bootstrapped_users} 个认证用户")
+
     # 清理上次进程残留的运行状态（服务器重启后 Agent 已不再运行）
     try:
         from src.api.models.round import Round

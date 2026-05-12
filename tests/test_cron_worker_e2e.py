@@ -8,6 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import src.api.services.cron_worker as cron_worker
+from src.api.models.auth_user import AuthUser
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.database import Base
@@ -41,6 +42,18 @@ def cron_db(tmp_path, monkeypatch):
 
 def _insert_job(session_factory, user_id: str, name: str, cron_expr: str):
     with session_factory() as db:
+        if not db.query(AuthUser).filter(AuthUser.user_id == user_id).first():
+            db.add(
+                AuthUser(
+                    user_id=user_id,
+                    username=user_id,
+                    auth_type="simple",
+                    password_hash="hash",
+                    enabled=True,
+                    is_admin=False,
+                    created_by="test",
+                )
+            )
         job = CronJob(
             user_id=user_id,
             name=name,

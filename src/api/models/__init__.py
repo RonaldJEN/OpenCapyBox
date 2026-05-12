@@ -16,6 +16,7 @@ from .agui_event import AGUIEventLog, Event  # Event 是 AGUIEventLog 的別名
 from .llm_call_record import LLMCallRecord
 from .user_run_lock import UserRunLock
 from .run_cancel_request import RunCancelRequest
+from .auth_user import AuthUser
 
 __all__ = [
     # 數據庫基礎
@@ -30,6 +31,7 @@ __all__ = [
     "LLMCallRecord",
     "UserRunLock",
     "RunCancelRequest",
+    "AuthUser",
     
     # AG-UI 命名（協議兼容）
     "Thread",  # = Session

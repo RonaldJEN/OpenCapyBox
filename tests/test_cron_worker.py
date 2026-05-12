@@ -11,6 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import src.api.services.cron_worker as cron_worker
+from src.api.models.auth_user import AuthUser
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.database import Base
@@ -49,8 +50,21 @@ def _insert_job(
     name: str,
     cron_expr: str,
     enabled: bool = True,
+    user_enabled: bool = True,
 ) -> CronJob:
     with session_factory() as db:
+        if not db.query(AuthUser).filter(AuthUser.user_id == user_id).first():
+            db.add(
+                AuthUser(
+                    user_id=user_id,
+                    username=user_id,
+                    auth_type="simple",
+                    password_hash="hash",
+                    enabled=user_enabled,
+                    is_admin=False,
+                    created_by="test",
+                )
+            )
         job = CronJob(
             user_id=user_id,
             name=name,
@@ -127,6 +141,33 @@ class TestDispatchAndSpawn:
         with cron_db() as db:
             assert db.query(CronFire).count() == 1
         assert len(spawned) == 1
+
+    @pytest.mark.asyncio
+    async def test_dispatch_skips_disabled_auth_user(self, cron_db, monkeypatch):
+        _insert_job(
+            cron_db,
+            user_id="disabled-user",
+            name="should-not-run",
+            cron_expr="* * * * *",
+            enabled=True,
+            user_enabled=False,
+        )
+
+        spawned = []
+
+        def fake_spawn(coro):
+            spawned.append(coro)
+            coro.close()
+            return MagicMock()
+
+        monkeypatch.setattr(cron_worker, "_spawn", fake_spawn)
+        minute = datetime.utcnow().replace(second=0, microsecond=0)
+
+        await cron_worker._dispatch_and_run("w1", {}, minute)
+
+        with cron_db() as db:
+            assert db.query(CronFire).count() == 0
+        assert spawned == []
 
     @pytest.mark.asyncio
     async def test_dispatch_skips_non_matching_minute(self, cron_db, monkeypatch):
@@ -321,6 +362,28 @@ class TestRunByIdRevalidation:
             name="disabled-later",
             cron_expr="* * * * *",
             enabled=False,
+        )
+
+        calls = []
+
+        async def fake_run_cron_job(user_id, job_name, run_id):
+            calls.append((user_id, job_name))
+
+        monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
+
+        await cron_worker._run_by_id(job.id, {}, "w1")
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_run_by_id_skips_when_auth_user_disabled(self, cron_db, monkeypatch):
+        job = _insert_job(
+            cron_db,
+            user_id="disabled-user",
+            name="disabled-user-job",
+            cron_expr="* * * * *",
+            enabled=True,
+            user_enabled=False,
         )
 
         calls = []

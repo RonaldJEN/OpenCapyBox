@@ -19,6 +19,7 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import insert
 from sqlalchemy.exc import OperationalError
 
+from src.api.models.auth_user import AuthUser
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.database import SessionLocal
@@ -133,7 +134,12 @@ def _cleanup_old_fires() -> None:
 def _load_enabled_job_snapshots() -> list[tuple[int, str, str, str]]:
     """同步读取所有 enabled job 的轻量快照，供 dispatch 使用。"""
     with SessionLocal() as db:
-        jobs = db.query(CronJob).filter(CronJob.enabled == True).all()  # noqa: E712
+        jobs = (
+            db.query(CronJob)
+            .join(AuthUser, AuthUser.user_id == CronJob.user_id)
+            .filter(CronJob.enabled == True, AuthUser.enabled == True)  # noqa: E712
+            .all()
+        )
         return [(j.id, j.user_id, j.name, j.cron_expr) for j in jobs]
 
 
@@ -299,10 +305,19 @@ async def _run_by_id(
 
 
 def _load_job_snapshot_if_enabled(job_id: int) -> tuple[str, str] | None:
-    """同步读取单个 job 的 (user_id, name)，仅在 enabled 时返回。"""
+    """同步读取单个 job 的 (user_id, name)，仅在 job 和用户账号均启用时返回。"""
     with SessionLocal() as db:
-        job = db.query(CronJob).filter(CronJob.id == job_id).first()
-        if job is None or not job.enabled:
+        job = (
+            db.query(CronJob)
+            .join(AuthUser, AuthUser.user_id == CronJob.user_id)
+            .filter(
+                CronJob.id == job_id,
+                CronJob.enabled == True,  # noqa: E712
+                AuthUser.enabled == True,  # noqa: E712
+            )
+            .first()
+        )
+        if job is None:
             return None
         return job.user_id, job.name
 

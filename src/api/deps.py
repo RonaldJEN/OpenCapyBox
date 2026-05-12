@@ -1,11 +1,15 @@
 """全局依赖注入 — 鉴权与用户标识"""
 
+import time
 import uuid
 import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import get_settings
+from src.api.models.database import SessionLocal, get_db
+from src.api.services.auth_service import get_enabled_user, require_admin_user
 
 _ISSUER = "opencapybox"
 _ALGORITHM = "HS256"
@@ -25,14 +29,12 @@ def _forbidden(detail: str) -> HTTPException:
     return HTTPException(status_code=403, detail=detail)
 
 
-def create_access_token(user_id: str, expires_in_seconds: int | None = None) -> tuple[str, int]:
+def create_access_token(user_id: str, *, token_generation: int = 0, expires_in_seconds: int | None = None) -> tuple[str, int]:
     """创建 HS256 签名访问令牌。
 
     Returns:
         (token, expires_in_seconds)
     """
-    import time
-
     settings = get_settings()
     now = int(time.time())
     ttl = (
@@ -47,13 +49,14 @@ def create_access_token(user_id: str, expires_in_seconds: int | None = None) -> 
         "exp": now + ttl,
         "jti": str(uuid.uuid4()),
         "iss": _ISSUER,
+        "gen": token_generation,
     }
 
     token = jwt.encode(payload, settings.auth_secret_key, algorithm=_ALGORITHM)
     return token, ttl
 
 
-def verify_access_token(token: str) -> str:
+def verify_access_token(token: str, db: DBSession | None = None) -> str:
     """校验访问令牌并返回 user_id。"""
     settings = get_settings()
 
@@ -70,31 +73,46 @@ def verify_access_token(token: str) -> str:
         if not isinstance(user_id, str) or not user_id.strip():
             raise jwt.InvalidTokenError("invalid subject")
 
-        # 令牌用户必须仍在可登录用户列表中
-        auth_users = settings.get_auth_users()
-        if user_id not in auth_users:
-            raise jwt.InvalidTokenError("unknown user")
+        if db is None:
+            with SessionLocal() as token_db:
+                user = get_enabled_user(token_db, user_id)
+        else:
+            user = get_enabled_user(db, user_id)
+
+        token_gen = payload.get("gen")
+        if token_gen is None or token_gen != user.token_generation:
+            raise jwt.InvalidTokenError("token generation mismatch")
 
         return user_id
     except jwt.ExpiredSignatureError:
         raise _unauthorized("访问令牌已过期") from None
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            raise _unauthorized(exc.detail) from exc
+        raise
     except jwt.InvalidTokenError as exc:
         raise _unauthorized("无效或已过期的访问令牌") from exc
 
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+    db: DBSession = Depends(get_db),
 ) -> str:
     """从 Bearer Token 校验并返回当前用户 ID。"""
     if not credentials or credentials.scheme.lower() != "bearer":
         raise _unauthorized("未提供访问令牌")
-    return verify_access_token(credentials.credentials)
+    return verify_access_token(credentials.credentials, db)
 
 
-async def get_current_admin_user(user_id: str = Depends(get_current_user)) -> str:
+async def get_current_admin_user(
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+) -> str:
     """校验当前用户是否为管理员。"""
-    settings = get_settings()
-    admin_users = settings.get_admin_users()
-    if user_id not in admin_users:
-        raise _forbidden("需要管理员权限")
+    try:
+        require_admin_user(db, user_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise _forbidden(exc.detail) from exc
+        raise
     return user_id

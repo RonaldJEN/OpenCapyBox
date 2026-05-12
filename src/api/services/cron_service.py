@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import get_settings
+from src.api.models.auth_user import AuthUser
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.user_memory import CronJobRun
@@ -53,6 +54,19 @@ def _is_sqlite_busy_error(error: OperationalError) -> bool:
         or "database table is locked" in msg
         or "database is busy" in msg
     )
+
+
+def _mark_run_failed(run_id: str, output: str, run_workspace: str | None = None) -> None:
+    from src.api.models.database import SessionLocal
+
+    with SessionLocal() as db:
+        record = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
+        if record and record.status == "running":
+            record.status = "failed"
+            record.output = output
+            record.completed_at = now_naive()
+            record.run_workspace = run_workspace
+            db.commit()
 
 
 def _validate_name(name: str) -> str:
@@ -373,6 +387,12 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
 
     # 从 CronJob 表查任务定义
     with SessionLocal() as db:
+        auth_user = db.query(AuthUser).filter(AuthUser.user_id == user_id).first()
+        if not auth_user or not auth_user.enabled:
+            logger.warning("Cron 用户不存在或已禁用 (user=%s, job=%s)", user_id, job_name)
+            _mark_run_failed(run_id, "用户不存在或已禁用")
+            return None
+
         job = (
             db.query(CronJob)
             .filter(CronJob.user_id == user_id, CronJob.name == job_name)
@@ -380,14 +400,7 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
         )
         if not job:
             logger.warning("Cron 任务不存在 (user=%s, job=%s)", user_id, job_name)
-            # 兜底：将预创建的 run 记录标记为 failed，避免永远停留在 running
-            with SessionLocal() as db2:
-                rec = db2.query(CronJobRun).filter(CronJobRun.id == run_id).first()
-                if rec and rec.status == "running":
-                    rec.status = "failed"
-                    rec.output = "任务不存在"
-                    rec.completed_at = now_naive()
-                    db2.commit()
+            _mark_run_failed(run_id, "任务不存在")
             return None
         # content 是新表单的"执行内容"字段，优先作为 prompt；
         # 老数据 content 为空时回退到 description（与之前行为一致）。
@@ -537,15 +550,7 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
 
     except Exception as e:
         logger.error("Cron 任务失败 (user=%s, job=%s): %s", user_id, job_name, e, exc_info=True)
-
-        with SessionLocal() as db:
-            record = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
-            if record:
-                record.status = "failed"
-                record.completed_at = now_naive()
-                record.output = f"Error: {e}"
-                record.run_workspace = run_workspace
-                db.commit()
+        _mark_run_failed(run_id, f"Error: {e}", run_workspace)
 
         return None
 

@@ -165,6 +165,174 @@ class TestAdminRouter:
         assert resp.json() == payload
         assert mocked.call_count == 1
 
+    def test_create_simple_user_delegates_to_service(self):
+        client = _make_client(admin_enabled=True)
+        user_obj = object()
+        payload = {"user_id": "demo3", "auth_type": "simple", "enabled": True}
+
+        with patch("src.api.routes.admin.create_simple_user", return_value=user_obj) as create_mock:
+            with patch("src.api.routes.admin.auth_user_to_payload", return_value=payload):
+                resp = client.post(
+                    "/admin/users/simple",
+                    json={"username": "demo3", "password": "pass123", "enabled": True},
+                )
+
+        assert resp.status_code == 200
+        assert resp.json() == payload
+        assert create_mock.call_args.kwargs["username"] == "demo3"
+        assert create_mock.call_args.kwargs["created_by"] == "admin"
+
+    def test_create_simple_user_strips_username(self):
+        client = _make_client(admin_enabled=True)
+        user_obj = object()
+        payload = {"user_id": "demo3", "auth_type": "simple", "enabled": True}
+
+        with patch("src.api.routes.admin.create_simple_user", return_value=user_obj) as create_mock:
+            with patch("src.api.routes.admin.auth_user_to_payload", return_value=payload):
+                resp = client.post(
+                    "/admin/users/simple",
+                    json={"username": " demo3 ", "password": " pass123 "},
+                )
+
+        assert resp.status_code == 200
+        assert create_mock.call_args.kwargs["username"] == "demo3"
+        assert create_mock.call_args.kwargs["password"] == " pass123 "
+
+    def test_create_ldap_user_delegates_to_service(self):
+        client = _make_client(admin_enabled=True)
+        user_obj = object()
+        payload = {"user_id": "zhangsan", "auth_type": "ldap", "enabled": True}
+
+        with patch("src.api.routes.admin.create_ldap_user", return_value=user_obj) as create_mock:
+            with patch("src.api.routes.admin.auth_user_to_payload", return_value=payload):
+                resp = client.post(
+                    "/admin/users/ldap",
+                    json={"user_id": "zhangsan", "enabled": True},
+                )
+
+        assert resp.status_code == 200
+        assert resp.json() == payload
+        assert create_mock.call_args.kwargs["user_id"] == "zhangsan"
+        assert create_mock.call_args.kwargs["created_by"] == "admin"
+
+    def test_update_token_limits_delegates_to_service(self):
+        client = _make_client(admin_enabled=True)
+        user_obj = object()
+        payload = {"user_id": "demo", "token_limit_per_week": 100, "token_limit_per_month": 1000}
+
+        with patch("src.api.routes.admin.update_user_token_limits", return_value=user_obj) as update_mock:
+            with patch("src.api.routes.admin.auth_user_to_payload", return_value=payload):
+                resp = client.patch(
+                    "/admin/users/demo/token-limits",
+                    json={"token_limit_per_week": 100, "token_limit_per_month": 1000},
+                )
+
+        assert resp.status_code == 200
+        assert resp.json() == payload
+        assert update_mock.call_args.kwargs["user_id"] == "demo"
+        assert update_mock.call_args.kwargs["token_limit_per_week"] == 100
+
+    def test_update_token_limits_rejects_negative_values(self):
+        client = _make_client(admin_enabled=True)
+
+        with patch("src.api.routes.admin.update_user_token_limits") as update_mock:
+            resp = client.patch(
+                "/admin/users/demo/token-limits",
+                json={"token_limit_per_week": -1, "token_limit_per_month": 1000},
+            )
+
+        assert resp.status_code == 422
+        update_mock.assert_not_called()
+
+    def test_create_simple_user_rejects_negative_token_limit(self):
+        client = _make_client(admin_enabled=True)
+
+        with patch("src.api.routes.admin.create_simple_user") as create_mock:
+            resp = client.post(
+                "/admin/users/simple",
+                json={"username": "demo3", "password": "pass123", "token_limit_per_week": -1},
+            )
+
+        assert resp.status_code == 422
+        create_mock.assert_not_called()
+
+    def test_create_simple_user_rejects_blank_identity_or_password(self):
+        client = _make_client(admin_enabled=True)
+
+        with patch("src.api.routes.admin.create_simple_user") as create_mock:
+            blank_username = client.post(
+                "/admin/users/simple",
+                json={"username": "   ", "password": "pass123"},
+            )
+            blank_password = client.post(
+                "/admin/users/simple",
+                json={"username": "demo3", "password": "   "},
+            )
+
+        assert blank_username.status_code == 422
+        assert blank_password.status_code == 422
+        create_mock.assert_not_called()
+
+    def test_create_ldap_user_rejects_blank_or_too_long_user_id(self):
+        client = _make_client(admin_enabled=True)
+
+        with patch("src.api.routes.admin.create_ldap_user") as create_mock:
+            blank_user = client.post("/admin/users/ldap", json={"user_id": "   "})
+            long_user = client.post("/admin/users/ldap", json={"user_id": "u" * 101})
+
+        assert blank_user.status_code == 422
+        assert long_user.status_code == 422
+        create_mock.assert_not_called()
+
+    def test_reset_password_rejects_blank_password(self):
+        client = _make_client(admin_enabled=True)
+
+        with patch("src.api.routes.admin.reset_simple_user_password") as reset_mock:
+            resp = client.post("/admin/users/demo/reset-password", json={"password": "   "})
+
+        assert resp.status_code == 422
+        reset_mock.assert_not_called()
+
+    def test_admin_cannot_disable_self(self):
+        client = _make_client(admin_enabled=True)
+
+        with patch("src.api.routes.admin.update_user_enabled") as update_mock:
+            resp = client.patch("/admin/users/admin/enabled", json={"enabled": False})
+
+        assert resp.status_code == 400
+        assert "不能禁用" in resp.json()["detail"]
+        update_mock.assert_not_called()
+
+    def test_admin_cannot_demote_self(self):
+        client = _make_client(admin_enabled=True)
+
+        with patch("src.api.routes.admin.update_user_admin") as update_mock:
+            resp = client.patch("/admin/users/admin/admin", json={"is_admin": False})
+
+        assert resp.status_code == 400
+        assert "不能取消" in resp.json()["detail"]
+        update_mock.assert_not_called()
+
+    def test_delete_user_delegates_to_service(self):
+        client = _make_client(admin_enabled=True)
+
+        with patch("src.api.routes.admin.delete_auth_user", return_value="demo") as delete_mock:
+            resp = client.delete("/admin/users/demo")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"user_id": "demo", "deleted": True}
+        assert delete_mock.call_args.kwargs["user_id"] == "demo"
+
+    def test_admin_cannot_delete_self(self):
+        client = _make_client(admin_enabled=True)
+
+        with patch("src.api.routes.admin.delete_auth_user") as delete_mock:
+            resp = client.delete("/admin/users/admin")
+
+        assert resp.status_code == 400
+        assert "不能删除" in resp.json()["detail"]
+        delete_mock.assert_not_called()
+
     def test_system_delegates_to_builder(self):
         client = _make_client(admin_enabled=True)
         payload = {

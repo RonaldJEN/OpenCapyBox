@@ -351,6 +351,8 @@ class TestRunCronJobFallback:
         """job 被删除后，预创建的 CronJobRun 应被标记为 failed"""
         from src.api.services.cron_service import run_cron_job
 
+        auth_user = MagicMock()
+        auth_user.enabled = True
         pre_run = MagicMock()
         pre_run.id = "pre-run-id"
         pre_run.status = "running"
@@ -360,9 +362,11 @@ class TestRunCronJobFallback:
         def fake_first():
             call_count["n"] += 1
             if call_count["n"] == 1:
+                return auth_user
+            if call_count["n"] == 2:
                 # 第一次调用：CronJob 查询 → 不存在
                 return None
-            # 第二次调用：CronJobRun 查询 → 预创建记录
+            # 第三次调用：CronJobRun 查询 → 预创建记录
             return pre_run
 
         mock_db = MagicMock()
@@ -376,6 +380,30 @@ class TestRunCronJobFallback:
         assert result is None
         assert pre_run.status == "failed"
         assert pre_run.output == "任务不存在"
+        mock_db.commit.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_marks_preexisting_run_as_failed_when_auth_user_disabled(self):
+        """账号被禁用后，预创建的 CronJobRun 应失败且不进入执行流程。"""
+        from src.api.services.cron_service import run_cron_job
+
+        disabled_user = MagicMock()
+        disabled_user.enabled = False
+        pre_run = MagicMock()
+        pre_run.id = "pre-run-id"
+        pre_run.status = "running"
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.side_effect = [disabled_user, pre_run]
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+
+        with patch("src.api.models.database.SessionLocal", return_value=mock_db):
+            result = await run_cron_job("user-1", "daily", run_id="pre-run-id")
+
+        assert result is None
+        assert pre_run.status == "failed"
+        assert pre_run.output == "用户不存在或已禁用"
         mock_db.commit.assert_called()
 
 
@@ -494,7 +522,9 @@ class TestCronAgentConstruction:
             mock_run_record = MagicMock()
             mock_run_record.status = "running"
             mock_run_record.output = None
+            mock_auth_user = MagicMock(enabled=True)
             mock_db.query.return_value.filter.return_value.first.side_effect = [
+                mock_auth_user,
                 mock_job,
                 mock_run_record,
                 MagicMock(sandbox_id="sb-1"),
@@ -558,7 +588,9 @@ class TestCronAgentConstruction:
             mock_job.cron_expr = "0 * * * *"
             mock_job.enabled = True
             mock_run_record = MagicMock()
+            mock_auth_user = MagicMock(enabled=True)
             mock_db.query.return_value.filter.return_value.first.side_effect = [
+                mock_auth_user,
                 mock_job, None,
                 MagicMock(sandbox_id="sb-1"),
                 mock_run_record,

@@ -12,10 +12,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from src.api.deps import get_current_admin_user
+from src.api.models.auth_user import AuthUser
 from src.api.models.database import Base, get_db
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.round import Round
 from src.api.models.session import Session
+from src.api.models.user_run_lock import UserRunLock
 from src.api.routes import admin as admin_routes
 from src.api.utils.timezone import now_naive
 from tests.db_safety import create_all_for_test_engine, ensure_safe_test_database_url, load_dotenv_database_url
@@ -259,3 +261,47 @@ def test_rounds_tree_step_list_is_lightweight_and_detail_is_full(admin_integrati
     detail_data = detail.json()
     assert detail_data["request_messages"] == heavy_request
     assert detail_data["response_content"] == heavy_response
+
+
+def test_users_payload_counts_recent_user_run_lock_as_running(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    now = now_naive()
+    db = SessionLocal()
+    db.add(
+        AuthUser(
+            user_id="demo",
+            username="demo",
+            auth_type="simple",
+            password_hash="hash",
+            enabled=True,
+            is_admin=False,
+            created_by="test",
+        )
+    )
+    db.add(
+        AuthUser(
+            user_id="idle",
+            username="idle",
+            auth_type="simple",
+            password_hash="hash",
+            enabled=True,
+            is_admin=False,
+            created_by="test",
+        )
+    )
+    db.add(UserRunLock(user_id="demo", session_id="session-lock", lock_id="lock-1", created_at=now, updated_at=now))
+    db.commit()
+    db.close()
+
+    resp = client.get("/admin/users")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["summary"]["running_total"] == 1
+    demo = next(item for item in data["users"] if item["user_id"] == "demo")
+    idle = next(item for item in data["users"] if item["user_id"] == "idle")
+    assert demo["status"] == "running"
+    assert demo["running_rounds"] == 1
+    assert idle["status"] == "idle"
+    assert idle["running_rounds"] == 0

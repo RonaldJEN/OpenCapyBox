@@ -32,6 +32,7 @@
 | 幂等性保证 | 前端重复提交相同 `idempotency_key` 不会产生多次执行 |
 | AG-UI 事件生成与持久化 | 生成标准 AG-UI 事件并写入数据库，支持事后重放 |
 | 上下文压缩 | 多级压缩策略，确保对话历史不超出模型上下文窗口 |
+| 用户 token 限额门禁 | 在启动 send/resume run 前检查用户周/月 token 限额 |
 
 ### 本模块不负责
 
@@ -40,6 +41,7 @@
 - 模型管理（由 Model Registry 处理）
 - Cron 定时任务执行
 - 技能（Skills）的注册与管理
+- 用户权限配置与限额配置（由 Auth/Admin 模块处理）
 
 ---
 
@@ -180,6 +182,8 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 | `created_at` | DateTime | default=now, indexed | 写入时间 |
 
 **唯一约束**: `UniqueConstraint(round_id, step_index)`
+
+**限额语义**: Chat 模块使用 `llm_call_records.usage_total_tokens` 通过 `sessions.user_id` 聚合用户本周/本月 token 用量，并与 `auth_users.token_limit_per_week` / `auth_users.token_limit_per_month` 比较。
 
 ### 2.5 `user_run_locks` 表
 

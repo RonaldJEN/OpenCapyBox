@@ -104,6 +104,9 @@ export interface AdminRoundTreeResponse {
 
 export interface AdminUserItem {
   user_id: string;
+  username: string;
+  auth_type: 'simple' | 'ldap';
+  enabled: boolean;
   role: 'admin' | 'user';
   is_admin: boolean;
   status: string;
@@ -111,10 +114,18 @@ export interface AdminUserItem {
   rounds_count: number;
   running_rounds: number;
   total_tokens: number;
+  weekly_tokens_used: number;
+  monthly_tokens_used: number;
+  token_limit_per_week: number | null;
+  token_limit_per_month: number | null;
   cron_jobs_total: number;
   cron_jobs_enabled: number;
   cron_failed_24h: number;
   last_active_at: string | null;
+  last_login_at: string | null;
+  created_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface AdminUsersResponse {
@@ -183,6 +194,87 @@ export async function getAdminLLMCallRecordDetail(
 
 export async function getAdminUsers(): Promise<AdminUsersResponse> {
   const resp = await client.get<AdminUsersResponse>('/admin/users');
+  return resp.data;
+}
+
+export interface AdminCreateSimpleUserRequest {
+  username: string;
+  password: string;
+  enabled: boolean;
+  is_admin: boolean;
+  token_limit_per_week: number | null;
+  token_limit_per_month: number | null;
+}
+
+export interface AdminCreateLdapUserRequest {
+  user_id: string;
+  username: string | null;
+  enabled: boolean;
+  is_admin: boolean;
+  token_limit_per_week: number | null;
+  token_limit_per_month: number | null;
+}
+
+export interface AdminTokenLimitsUpdateRequest {
+  token_limit_per_week: number | null;
+  token_limit_per_month: number | null;
+}
+
+export interface AdminDeleteUserResponse {
+  user_id: string;
+  deleted: boolean;
+}
+
+export interface AdminAuthUserResponse {
+  user_id: string;
+  username: string;
+  auth_type: 'simple' | 'ldap';
+  enabled: boolean;
+  role: 'admin' | 'user';
+  is_admin: boolean;
+  token_limit_per_week: number | null;
+  token_limit_per_month: number | null;
+  last_login_at: string | null;
+  created_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export async function createAdminSimpleUser(payload: AdminCreateSimpleUserRequest): Promise<AdminAuthUserResponse> {
+  const resp = await client.post<AdminAuthUserResponse>('/admin/users/simple', payload);
+  return resp.data;
+}
+
+export async function createAdminLdapUser(payload: AdminCreateLdapUserRequest): Promise<AdminAuthUserResponse> {
+  const resp = await client.post<AdminAuthUserResponse>('/admin/users/ldap', payload);
+  return resp.data;
+}
+
+export async function updateAdminUserEnabled(userId: string, enabled: boolean): Promise<AdminAuthUserResponse> {
+  const resp = await client.patch<AdminAuthUserResponse>(`/admin/users/${encodeURIComponent(userId)}/enabled`, { enabled });
+  return resp.data;
+}
+
+export async function updateAdminUserAdmin(userId: string, isAdmin: boolean): Promise<AdminAuthUserResponse> {
+  const resp = await client.patch<AdminAuthUserResponse>(`/admin/users/${encodeURIComponent(userId)}/admin`, { is_admin: isAdmin });
+  return resp.data;
+}
+
+export async function updateAdminUserTokenLimits(
+  userId: string,
+  payload: AdminTokenLimitsUpdateRequest,
+): Promise<AdminAuthUserResponse> {
+  const resp = await client.patch<AdminAuthUserResponse>(`/admin/users/${encodeURIComponent(userId)}/token-limits`, payload);
+  return resp.data;
+}
+
+export async function resetAdminSimpleUserPassword(userId: string, password: string): Promise<AdminAuthUserResponse> {
+  const resp = await client.post<AdminAuthUserResponse>(`/admin/users/${encodeURIComponent(userId)}/reset-password`, { password });
+  return resp.data;
+}
+
+export async function deleteAdminUser(userId: string): Promise<AdminDeleteUserResponse> {
+  const resp = await client.delete<AdminDeleteUserResponse>(`/admin/users/${encodeURIComponent(userId)}`);
   return resp.data;
 }
 

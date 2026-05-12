@@ -1,35 +1,70 @@
-import { Fragment, useCallback, useEffect, useMemo, useState, type ComponentType } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState, type ComponentType, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   AlertTriangle,
   BarChart3,
   ChevronDown,
   ChevronRight,
+  Download,
   Gauge,
+  KeyRound,
   LayoutDashboard,
   LogOut,
+  MoreHorizontal,
+  Plus,
   RefreshCw,
+  Save,
+  Search,
   ShieldCheck,
+  Trash2,
   Users,
+  X,
 } from 'lucide-react';
 
 import { apiService } from '../services/api';
 import {
+  createAdminLdapUser,
+  createAdminSimpleUser,
+  deleteAdminUser,
   getAdminLLMCallRecordDetail,
   getAdminOverview,
   getAdminRoundsTree,
   getAdminSystem,
   getAdminUsers,
+  resetAdminSimpleUserPassword,
+  updateAdminUserAdmin,
+  updateAdminUserEnabled,
+  updateAdminUserTokenLimits,
   updateAdminLLMCallReview,
+  type AdminCreateLdapUserRequest,
+  type AdminCreateSimpleUserRequest,
   type AdminOverview,
   type AdminRoundStepItem,
   type AdminRoundTreeResponse,
   type AdminSystemResponse,
+  type AdminTokenLimitsUpdateRequest,
+  type AdminUserItem,
   type AdminUsersResponse,
 } from '../services/adminApi';
 import './AdminConsole.css';
 
 type AdminTab = 'overview' | 'rounds' | 'users' | 'system';
+type UserCreateMode = 'simple' | 'ldap';
+type UserStatusFilter = 'all' | 'enabled' | 'disabled';
+type UserRoleFilter = 'all' | 'admin' | 'user';
+type UserAuthFilter = 'all' | 'simple' | 'ldap';
+type UserSortKey = 'recent' | 'name' | 'tokens';
+
+interface UserCreateFormValues {
+  authType: UserCreateMode;
+  userId: string;
+  username: string;
+  password: string;
+  enabled: boolean;
+  isAdmin: boolean;
+  weeklyLimit: string;
+  monthlyLimit: string;
+}
 
 const NAV_ITEMS: Array<{ id: AdminTab; label: string; icon: ComponentType<{ size?: string | number }> }> = [
   { id: 'overview', label: '概览', icon: LayoutDashboard },
@@ -239,6 +274,91 @@ function statusClass(status: string): string {
   return 'paused';
 }
 
+function formatLimit(value: number | null): string {
+  return value === null ? '不限' : formatNumber(value);
+}
+
+function parseLimitInput(value: string): number | null {
+  return value.trim() === '' ? null : Number(value);
+}
+
+function userInitial(user: AdminUserItem): string {
+  return (user.username || user.user_id).slice(0, 1).toUpperCase();
+}
+
+function userAvatarTone(user: AdminUserItem): string {
+  const tones = ['sage', 'gold', 'clay', 'blue', 'rose'];
+  const code = Array.from(user.user_id).reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  return tones[code % tones.length];
+}
+
+function userSearchText(user: AdminUserItem): string {
+  return `${user.user_id} ${user.username} ${user.auth_type} ${user.created_by || ''}`.toLowerCase();
+}
+
+function tokenPercent(used: number, limit: number | null): number {
+  return limit === null || limit === 0 ? 0 : Math.min(100, Math.round((used / limit) * 100));
+}
+
+function escapeCsvCell(value: string | number | boolean | null): string {
+  const text = value === null ? '' : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function buildUsersCsv(users: AdminUserItem[]): string {
+  const headers = [
+    'user_id',
+    'username',
+    'auth_type',
+    'enabled',
+    'role',
+    'status',
+    'sessions_count',
+    'rounds_count',
+    'running_rounds',
+    'total_tokens',
+    'weekly_tokens_used',
+    'monthly_tokens_used',
+    'token_limit_per_week',
+    'token_limit_per_month',
+    'last_active_at',
+    'last_login_at',
+  ];
+  const rows = users.map((user) => [
+    user.user_id,
+    user.username,
+    user.auth_type,
+    user.enabled,
+    user.role,
+    user.status,
+    user.sessions_count,
+    user.rounds_count,
+    user.running_rounds,
+    user.total_tokens,
+    user.weekly_tokens_used,
+    user.monthly_tokens_used,
+    user.token_limit_per_week,
+    user.token_limit_per_month,
+    user.last_active_at,
+    user.last_login_at,
+  ]);
+  return [headers, ...rows]
+    .map((row) => row.map((cell) => escapeCsvCell(cell)).join(','))
+    .join('\r\n');
+}
+
+function downloadTextFile(filename: string, content: string) {
+  const blob = new Blob(['\ufeff', content], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 export default function AdminConsole() {
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
@@ -258,6 +378,10 @@ export default function AdminConsole() {
   const [stepLoadingIds, setStepLoadingIds] = useState<Record<number, boolean>>({});
   const [reviewError, setReviewError] = useState('');
   const [stepDetailError, setStepDetailError] = useState('');
+  const [userActionError, setUserActionError] = useState('');
+  const [userActionMessage, setUserActionMessage] = useState('');
+  const [userUpdatingKeys, setUserUpdatingKeys] = useState<Record<string, boolean>>({});
+  const currentUser = useMemo(() => apiService.getUserId() || '-', []);
 
   const handleLogout = () => {
     apiService.logout();
@@ -376,6 +500,103 @@ export default function AdminConsole() {
     }
   }, []);
 
+  const runUserAction = useCallback(async (
+    busyKey: string,
+    action: () => Promise<void>,
+    successMessage: string,
+  ): Promise<boolean> => {
+    setUserActionError('');
+    setUserActionMessage('');
+    setUserUpdatingKeys((prev) => ({ ...prev, [busyKey]: true }));
+    try {
+      await action();
+      setUsers(await getAdminUsers());
+      setUserActionMessage(successMessage);
+      return true;
+    } catch (err) {
+      console.error('Failed to update admin user:', err);
+      setUserActionError('用户操作失败，请稍后重试');
+      return false;
+    } finally {
+      setUserUpdatingKeys((prev) => {
+        const next = { ...prev };
+        delete next[busyKey];
+        return next;
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!userActionMessage) return;
+    const timer = window.setTimeout(() => {
+      setUserActionMessage('');
+    }, 2400);
+    return () => window.clearTimeout(timer);
+  }, [userActionMessage]);
+
+  const handleCreateUser = useCallback(async (values: UserCreateFormValues) => {
+    return runUserAction('create-user', async () => {
+      if (values.authType === 'simple') {
+        const payload: AdminCreateSimpleUserRequest = {
+          username: values.username,
+          password: values.password,
+          enabled: values.enabled,
+          is_admin: values.isAdmin,
+          token_limit_per_week: parseLimitInput(values.weeklyLimit),
+          token_limit_per_month: parseLimitInput(values.monthlyLimit),
+        };
+        await createAdminSimpleUser(payload);
+      } else {
+        const payload: AdminCreateLdapUserRequest = {
+          user_id: values.userId,
+          username: values.username || null,
+          enabled: values.enabled,
+          is_admin: values.isAdmin,
+          token_limit_per_week: parseLimitInput(values.weeklyLimit),
+          token_limit_per_month: parseLimitInput(values.monthlyLimit),
+        };
+        await createAdminLdapUser(payload);
+      }
+    }, '用户已创建');
+  }, [runUserAction]);
+
+  const handleToggleUserEnabled = useCallback(async (user: AdminUserItem) => {
+    await runUserAction(`enabled-${user.user_id}`, async () => {
+      await updateAdminUserEnabled(user.user_id, !user.enabled);
+    }, user.enabled ? '用户已禁用' : '用户已启用');
+  }, [runUserAction]);
+
+  const handleUpdateUserAdmin = useCallback(async (user: AdminUserItem, nextIsAdmin: boolean) => {
+    if (user.user_id === currentUser && !nextIsAdmin) return;
+    if (user.is_admin && !nextIsAdmin && !window.confirm(`确认取消 ${user.user_id} 的管理员权限？`)) return;
+    await runUserAction(`admin-${user.user_id}`, async () => {
+      await updateAdminUserAdmin(user.user_id, nextIsAdmin);
+    }, nextIsAdmin ? '管理员权限已授予' : '管理员权限已取消');
+  }, [currentUser, runUserAction]);
+
+  const handleUpdateTokenLimits = useCallback(async (
+    userId: string,
+    payload: AdminTokenLimitsUpdateRequest,
+  ) => {
+    await runUserAction(`limits-${userId}`, async () => {
+      await updateAdminUserTokenLimits(userId, payload);
+    }, 'Token 限额已更新');
+  }, [runUserAction]);
+
+  const handleResetPassword = useCallback(async (userId: string, password: string) => {
+    await runUserAction(`password-${userId}`, async () => {
+      await resetAdminSimpleUserPassword(userId, password);
+    }, '密码已重置');
+  }, [runUserAction]);
+
+  const handleDeleteUser = useCallback(async (user: AdminUserItem) => {
+    if (user.user_id === currentUser) return;
+    if (!window.confirm(`确认删除用户 ${user.user_id}？`)) return;
+    await runUserAction(`delete-${user.user_id}`, async () => {
+      await deleteAdminUser(user.user_id);
+    }, '用户已删除');
+  }, [currentUser, runUserAction]);
+
   const refreshActiveTab = useCallback(async () => {
     setLoading(true);
     setError('');
@@ -424,8 +645,6 @@ export default function AdminConsole() {
     }
     refreshActiveTab();
   }, [navigate, refreshActiveTab]);
-
-  const currentUser = useMemo(() => apiService.getUserId() || '-', []);
 
   return (
     <div className="admin-console">
@@ -514,7 +733,19 @@ export default function AdminConsole() {
           ) : null}
 
           {!loading && !error && activeTab === 'users' ? (
-            <UsersPanel data={users} />
+            <UsersPanel
+              data={users}
+              actionError={userActionError}
+              actionMessage={userActionMessage}
+              updatingKeys={userUpdatingKeys}
+              onCreateUser={handleCreateUser}
+              onToggleEnabled={handleToggleUserEnabled}
+              onUpdateAdmin={handleUpdateUserAdmin}
+              onUpdateTokenLimits={handleUpdateTokenLimits}
+              onResetPassword={handleResetPassword}
+              onDeleteUser={handleDeleteUser}
+              currentUserId={currentUser}
+            />
           ) : null}
 
           {!loading && !error && activeTab === 'system' ? (
@@ -951,58 +1182,576 @@ function RoundsPanel({
   );
 }
 
-function UsersPanel({ data }: { data: AdminUsersResponse | null }) {
+function UsersPanel({
+  data,
+  actionError,
+  actionMessage,
+  updatingKeys,
+  onCreateUser,
+  onToggleEnabled,
+  onUpdateAdmin,
+  onUpdateTokenLimits,
+  onResetPassword,
+  onDeleteUser,
+  currentUserId,
+}: {
+  data: AdminUsersResponse | null;
+  actionError: string;
+  actionMessage: string;
+  updatingKeys: Record<string, boolean>;
+  onCreateUser: (values: UserCreateFormValues) => Promise<boolean>;
+  onToggleEnabled: (user: AdminUserItem) => Promise<void>;
+  onUpdateAdmin: (user: AdminUserItem, nextIsAdmin: boolean) => Promise<void>;
+  onUpdateTokenLimits: (userId: string, payload: AdminTokenLimitsUpdateRequest) => Promise<void>;
+  onResetPassword: (userId: string, password: string) => Promise<void>;
+  onDeleteUser: (user: AdminUserItem) => Promise<void>;
+  currentUserId: string;
+}) {
+  const defaultCreateForm: UserCreateFormValues = {
+    authType: 'simple',
+    userId: '',
+    username: '',
+    password: '',
+    enabled: true,
+    isAdmin: false,
+    weeklyLimit: '',
+    monthlyLimit: '',
+  };
+  const [createForm, setCreateForm] = useState<UserCreateFormValues>({
+    ...defaultCreateForm,
+  });
+  const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [tokenDrafts, setTokenDrafts] = useState<Record<string, { weeklyLimit: string; monthlyLimit: string }>>({});
+  const [roleDrafts, setRoleDrafts] = useState<Record<string, 'admin' | 'user'>>({});
+  const [passwordDrafts, setPasswordDrafts] = useState<Record<string, string>>({});
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<UserStatusFilter>('all');
+  const [roleFilter, setRoleFilter] = useState<UserRoleFilter>('all');
+  const [authFilter, setAuthFilter] = useState<UserAuthFilter>('all');
+  const [sortKey, setSortKey] = useState<UserSortKey>('recent');
+  const [actionMenuUserId, setActionMenuUserId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const nextDrafts: Record<string, { weeklyLimit: string; monthlyLimit: string }> = {};
+    const nextRoleDrafts: Record<string, 'admin' | 'user'> = {};
+    for (const user of data?.users || []) {
+      nextDrafts[user.user_id] = {
+        weeklyLimit: user.token_limit_per_week === null ? '' : String(user.token_limit_per_week),
+        monthlyLimit: user.token_limit_per_month === null ? '' : String(user.token_limit_per_month),
+      };
+      nextRoleDrafts[user.user_id] = user.is_admin ? 'admin' : 'user';
+    }
+    setTokenDrafts(nextDrafts);
+    setRoleDrafts(nextRoleDrafts);
+  }, [data]);
+
+  const users = data?.users || [];
+  const ldapCount = users.filter((user) => user.auth_type === 'ldap').length;
+  const simpleCount = users.filter((user) => user.auth_type === 'simple').length;
+  const visibleUsers = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    return users
+      .filter((user) => !query || userSearchText(user).includes(query))
+      .filter((user) => statusFilter === 'all' || (statusFilter === 'enabled' ? user.enabled : !user.enabled))
+      .filter((user) => roleFilter === 'all' || (roleFilter === 'admin' ? user.is_admin : !user.is_admin))
+      .filter((user) => authFilter === 'all' || user.auth_type === authFilter)
+      .slice()
+      .sort((left, right) => {
+        if (sortKey === 'name') return left.username.localeCompare(right.username);
+        if (sortKey === 'tokens') return right.total_tokens - left.total_tokens;
+        return new Date(right.last_active_at || right.last_login_at || 0).getTime()
+          - new Date(left.last_active_at || left.last_login_at || 0).getTime();
+      });
+  }, [authFilter, roleFilter, searchQuery, sortKey, statusFilter, users]);
+
+  const handleExportVisibleUsers = () => {
+    const day = new Date().toISOString().slice(0, 10);
+    downloadTextFile(`opencapybox-users-${day}.csv`, buildUsersCsv(visibleUsers));
+  };
+
+  const handleCreateSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const created = await onCreateUser({
+      ...createForm,
+      userId: createForm.userId.trim(),
+      username: createForm.username.trim(),
+      password: createForm.password,
+      weeklyLimit: createForm.weeklyLimit.trim(),
+      monthlyLimit: createForm.monthlyLimit.trim(),
+    });
+    if (!created) return;
+    setCreateForm({ ...defaultCreateForm });
+    setIsCreateModalOpen(false);
+  };
+
+  const updateCreateField = <Key extends keyof UserCreateFormValues>(key: Key, value: UserCreateFormValues[Key]) => {
+    setCreateForm((prev) => ({ ...prev, [key]: value }));
+  };
+
   return (
     <>
       <div className="admin-grid-4">
-        <MetricCard label="用户总数" value={formatNumber(data?.summary.users_total || 0)} />
-        <MetricCard label="管理员" value={formatNumber(data?.summary.admins_total || 0)} />
-        <MetricCard label="活跃用户" value={formatNumber(data?.summary.active_total || 0)} />
-        <MetricCard label="运行中用户" value={formatNumber(data?.summary.running_total || 0)} />
+        <MetricCard label="用户总数" value={formatNumber(data?.summary.users_total || 0)} hint={`${ldapCount} LDAP · ${simpleCount} Simple`} />
+        <MetricCard label="管理员" value={formatNumber(data?.summary.admins_total || 0)} hint="拥有所有权限" />
+        <MetricCard label="活跃用户" value={formatNumber(data?.summary.active_total || 0)} hint="最近 7 天有活动" />
+        <MetricCard label="运行中用户" value={formatNumber(data?.summary.running_total || 0)} hint="正在执行任务" />
       </div>
+
+      {actionError ? <div className="admin-error admin-inline-message">{actionError}</div> : null}
+      {actionMessage ? <div className="admin-toast" role="status">{actionMessage}</div> : null}
 
       <div className="admin-card">
         <div className="admin-card-header">
-          <h3 className="admin-card-header-title">用户管理（管理员 / 用户）</h3>
+          <div>
+            <h3 className="admin-card-header-title">用户目录</h3>
+            <div className="admin-card-header-sub">显示 {visibleUsers.length} / {users.length} 个账号</div>
+          </div>
+          <button
+            className="admin-button admin-primary-button admin-header-action"
+            type="button"
+            onClick={() => setIsCreateModalOpen(true)}
+          >
+            <Plus size={14} />
+            新建用户
+          </button>
+        </div>
+        <div className="admin-user-toolbar">
+          <label className="admin-search-box">
+            <Search size={14} />
+            <input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="搜索用户名、账号、认证来源..."
+            />
+          </label>
+          <div className="admin-toolbar-filters">
+            <label className="admin-filter-pill">
+              状态
+              <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as UserStatusFilter)}>
+                <option value="all">全部</option>
+                <option value="enabled">已启用</option>
+                <option value="disabled">已停用</option>
+              </select>
+            </label>
+            <label className="admin-filter-pill">
+              权限
+              <select value={roleFilter} onChange={(event) => setRoleFilter(event.target.value as UserRoleFilter)}>
+                <option value="all">全部</option>
+                <option value="admin">管理员</option>
+                <option value="user">普通用户</option>
+              </select>
+            </label>
+            <label className="admin-filter-pill">
+              认证
+              <select value={authFilter} onChange={(event) => setAuthFilter(event.target.value as UserAuthFilter)}>
+                <option value="all">全部</option>
+                <option value="simple">simple</option>
+                <option value="ldap">ldap</option>
+              </select>
+            </label>
+          </div>
+          <div className="admin-toolbar-actions">
+            <label className="admin-filter-pill">
+              排序
+              <select value={sortKey} onChange={(event) => setSortKey(event.target.value as UserSortKey)}>
+                <option value="recent">最近活动</option>
+                <option value="name">用户名</option>
+                <option value="tokens">Token 用量</option>
+              </select>
+            </label>
+            <button className="admin-button admin-icon-button" type="button" onClick={handleExportVisibleUsers}>
+              <Download size={14} />
+              导出
+            </button>
+          </div>
         </div>
         <div className="admin-table-wrap">
-          <table className="admin-table">
+          <table className="admin-table admin-users-table">
+            <colgroup>
+              <col className="admin-users-col-user" />
+              <col className="admin-users-col-status" />
+              <col className="admin-users-col-role" />
+              <col className="admin-users-col-token" />
+              <col className="admin-users-col-runtime" />
+              <col className="admin-users-col-recent" />
+              <col className="admin-users-col-actions" />
+            </colgroup>
             <thead>
               <tr>
-                <th>用户ID</th>
-                <th>角色</th>
+                <th>用户</th>
                 <th>状态</th>
-                <th>Sessions</th>
-                <th>Rounds</th>
-                <th>运行中</th>
-                <th>Tokens</th>
-                <th>Cron任务</th>
-                <th>最近活跃</th>
+                <th>权限</th>
+                <th>Token 用量与限额</th>
+                <th>运行指标</th>
+                <th>最近活动</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
-              {(data?.users || []).map((item) => (
-                <tr key={item.user_id}>
-                  <td>{item.user_id}</td>
-                  <td>
-                    <span className={`admin-status ${statusClass(item.role)}`}>{item.role}</span>
-                  </td>
-                  <td>
-                    <span className={`admin-status ${statusClass(item.status)}`}>{item.status}</span>
-                  </td>
-                  <td>{item.sessions_count}</td>
-                  <td>{item.rounds_count}</td>
-                  <td>{item.running_rounds}</td>
-                  <td>{formatNumber(item.total_tokens)}</td>
-                  <td>{item.cron_jobs_enabled} / {item.cron_jobs_total}</td>
-                  <td>{formatDateTime(item.last_active_at)}</td>
-                </tr>
-              ))}
+              {visibleUsers.map((item) => {
+                const draft = tokenDrafts[item.user_id] || { weeklyLimit: '', monthlyLimit: '' };
+                const roleDraft = roleDrafts[item.user_id] || (item.is_admin ? 'admin' : 'user');
+                const currentRole = item.is_admin ? 'admin' : 'user';
+                const passwordDraft = passwordDrafts[item.user_id] || '';
+                const isCurrentUser = item.user_id === currentUserId;
+                return (
+                  <tr key={item.user_id}>
+                    <td>
+                      <div className="admin-user-identity">
+                        <div className={`admin-user-avatar ${userAvatarTone(item)}`}>{userInitial(item)}</div>
+                        <div>
+                          <div className="admin-user-name-line">
+                            <strong>{item.username}</strong>
+                            {isCurrentUser ? <span className="admin-current-badge">当前账号</span> : null}
+                          </div>
+                          <div className="admin-subline">@{item.user_id}</div>
+                        </div>
+                        <span className={`admin-status ${item.auth_type === 'ldap' ? 'running' : 'user'}`}>{item.auth_type}</span>
+                      </div>
+                      <div className="admin-subline">创建：{item.created_by || '-'}</div>
+                    </td>
+                    <td>
+                      <button
+                        className={`admin-switch-button ${item.enabled ? 'on' : ''}`}
+                        disabled={isCurrentUser || !!updatingKeys[`enabled-${item.user_id}`]}
+                        onClick={() => { void onToggleEnabled(item); }}
+                      >
+                        <span />
+                        {item.enabled ? '已启用' : '已停用'}
+                      </button>
+                    </td>
+                    <td>
+                      <div className="admin-role-editor">
+                        <select
+                          className="admin-select admin-role-select"
+                          aria-label={`${item.user_id} 管理员权限`}
+                          value={roleDraft}
+                          disabled={isCurrentUser || !!updatingKeys[`admin-${item.user_id}`]}
+                          onChange={(event) => {
+                            setRoleDrafts((prev) => ({
+                              ...prev,
+                              [item.user_id]: event.target.value as 'admin' | 'user',
+                            }));
+                          }}
+                        >
+                          <option value="user">普通用户</option>
+                          <option value="admin">管理员</option>
+                        </select>
+                        <button
+                          className="admin-button admin-icon-button admin-icon-only-button"
+                          aria-label={`保存 ${item.user_id} 权限`}
+                          title="保存权限"
+                          disabled={isCurrentUser || roleDraft === currentRole || !!updatingKeys[`admin-${item.user_id}`]}
+                          onClick={() => { void onUpdateAdmin(item, roleDraft === 'admin'); }}
+                        >
+                          <Save size={14} />
+                        </button>
+                      </div>
+                    </td>
+                    <td>
+                      <div className="admin-token-cell">
+                        <TokenUsageBar label="本周" used={item.weekly_tokens_used} limit={item.token_limit_per_week} />
+                        <TokenUsageBar label="本月" used={item.monthly_tokens_used} limit={item.token_limit_per_month} />
+                        <div className="admin-limit-editor">
+                          <input
+                            className="admin-input admin-limit-input"
+                            aria-label={`${item.user_id} 周限额`}
+                            type="number"
+                            min="0"
+                            value={draft.weeklyLimit}
+                            onChange={(event) => {
+                              setTokenDrafts((prev) => ({
+                                ...prev,
+                                [item.user_id]: { ...draft, weeklyLimit: event.target.value },
+                              }));
+                            }}
+                            placeholder={formatLimit(item.token_limit_per_week)}
+                          />
+                          <input
+                            className="admin-input admin-limit-input"
+                            aria-label={`${item.user_id} 月限额`}
+                            type="number"
+                            min="0"
+                            value={draft.monthlyLimit}
+                            onChange={(event) => {
+                              setTokenDrafts((prev) => ({
+                                ...prev,
+                                [item.user_id]: { ...draft, monthlyLimit: event.target.value },
+                              }));
+                            }}
+                            placeholder={formatLimit(item.token_limit_per_month)}
+                          />
+                          <button
+                            className="admin-button admin-icon-button admin-icon-only-button"
+                            aria-label={`保存 ${item.user_id} 限额`}
+                            title="保存限额"
+                            disabled={!!updatingKeys[`limits-${item.user_id}`]}
+                            onClick={() => {
+                              void onUpdateTokenLimits(item.user_id, {
+                                token_limit_per_week: parseLimitInput(draft.weeklyLimit),
+                                token_limit_per_month: parseLimitInput(draft.monthlyLimit),
+                              });
+                            }}
+                          >
+                            <Save size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    </td>
+                    <td>
+                      <div className="admin-runtime-grid">
+                        <span><b>{item.sessions_count}</b> Sessions</span>
+                        <span><b>{item.rounds_count}</b> Rounds</span>
+                        <span><b>{item.running_rounds}</b> 运行中</span>
+                        <span><b>{item.cron_jobs_enabled}/{item.cron_jobs_total}</b> Cron</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div className="admin-token-stack">
+                        <span>活跃 {formatDateTime(item.last_active_at)}</span>
+                        <span>登录 {formatDateTime(item.last_login_at)}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div className="admin-row-actions">
+                        <div className="admin-more-menu-wrap">
+                          <button
+                            className="admin-button admin-icon-button admin-icon-only-button"
+                            type="button"
+                            aria-label={`更多 ${item.user_id}`}
+                            onClick={() => setActionMenuUserId((prev) => (prev === item.user_id ? null : item.user_id))}
+                          >
+                            <MoreHorizontal size={15} />
+                          </button>
+                          {actionMenuUserId === item.user_id ? (
+                            <div className="admin-more-menu">
+                              {item.auth_type === 'simple' ? (
+                                <div className="admin-password-reset">
+                                  <input
+                                    className="admin-input"
+                                    aria-label={`${item.user_id} 新密码`}
+                                    type="password"
+                                    value={passwordDraft}
+                                    onChange={(event) => {
+                                      setPasswordDrafts((prev) => ({ ...prev, [item.user_id]: event.target.value }));
+                                    }}
+                                    placeholder="新密码"
+                                  />
+                                  <button
+                                    className="admin-button admin-icon-button"
+                                    aria-label={`重置 ${item.user_id} 密码`}
+                                    disabled={!passwordDraft || !!updatingKeys[`password-${item.user_id}`]}
+                                    onClick={() => { void onResetPassword(item.user_id, passwordDraft); }}
+                                  >
+                                    <KeyRound size={14} />
+                                    重置
+                                  </button>
+                                </div>
+                              ) : (
+                                <span className="admin-subline">企业统一登录</span>
+                              )}
+                              <button
+                                className="admin-button admin-icon-button admin-danger-button"
+                                aria-label={`删除 ${item.user_id}`}
+                                disabled={isCurrentUser || !!updatingKeys[`delete-${item.user_id}`]}
+                                onClick={() => { void onDeleteUser(item); }}
+                              >
+                                <Trash2 size={14} />
+                                删除
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
       </div>
+
+      {isCreateModalOpen ? (
+        <div className="admin-drawer-backdrop" role="presentation">
+          <aside className="admin-user-drawer" role="dialog" aria-modal="true" aria-labelledby="admin-create-user-title">
+            <div className="admin-drawer-header">
+              <div>
+                <h3 id="admin-create-user-title">新建用户</h3>
+                <p>创建本地或 LDAP 企业账号</p>
+              </div>
+              <button
+                className="admin-button admin-icon-button admin-icon-only-button"
+                type="button"
+                aria-label="关闭新建用户弹窗"
+                onClick={() => setIsCreateModalOpen(false)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <form className="admin-user-drawer-form" onSubmit={handleCreateSubmit}>
+              <div className="admin-drawer-section">
+                <div className="admin-drawer-section-title">认证类型</div>
+                <div className="admin-auth-card-grid" role="radiogroup" aria-label="认证类型">
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={createForm.authType === 'simple'}
+                    className={`admin-auth-card ${createForm.authType === 'simple' ? 'active' : ''}`}
+                    onClick={() => updateCreateField('authType', 'simple')}
+                  >
+                    <strong>Simple</strong>
+                    <span>本地账号 · 系统管理密码</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={createForm.authType === 'ldap'}
+                    className={`admin-auth-card ${createForm.authType === 'ldap' ? 'active' : ''}`}
+                    onClick={() => updateCreateField('authType', 'ldap')}
+                  >
+                    <strong>LDAP</strong>
+                    <span>企业目录 · 同步邮箱与部门</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className={`admin-form-row-2 ${createForm.authType === 'simple' ? 'single' : ''}`}>
+                <label className="admin-field">
+                  <span>{createForm.authType === 'ldap' ? '域账号ID' : '用户名'}</span>
+                  <input
+                    className="admin-input"
+                    aria-label={createForm.authType === 'ldap' ? '域账号ID' : '用户名'}
+                    value={createForm.authType === 'ldap' ? createForm.userId : createForm.username}
+                    onChange={(event) => {
+                      if (createForm.authType === 'ldap') updateCreateField('userId', event.target.value);
+                      else updateCreateField('username', event.target.value);
+                    }}
+                    placeholder={createForm.authType === 'ldap' ? '如 zhangsan' : '如 alex.chen'}
+                    required
+                  />
+                </label>
+                {createForm.authType === 'ldap' ? (
+                  <label className="admin-field">
+                    <span>显示名</span>
+                    <input
+                      className="admin-input"
+                      aria-label="显示名"
+                      value={createForm.username}
+                      onChange={(event) => updateCreateField('username', event.target.value)}
+                      placeholder="可选"
+                    />
+                  </label>
+                ) : null}
+              </div>
+
+              {createForm.authType === 'simple' ? (
+                <label className="admin-field">
+                  <span>密码</span>
+                  <input
+                    className="admin-input"
+                    aria-label="密码"
+                    type="password"
+                    value={createForm.password}
+                    onChange={(event) => updateCreateField('password', event.target.value)}
+                    placeholder="创建后仅展示一次"
+                    required
+                  />
+                </label>
+              ) : null}
+
+              <div className="admin-drawer-section">
+                <div className="admin-drawer-section-title">权限</div>
+                <div className="admin-role-card-grid">
+                  <button
+                    type="button"
+                    className={`admin-role-card ${!createForm.isAdmin ? 'active' : ''}`}
+                    onClick={() => updateCreateField('isAdmin', false)}
+                  >
+                    <strong>普通用户</strong>
+                    <span>仅访问自己的资源</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`admin-role-card ${createForm.isAdmin ? 'active' : ''}`}
+                    onClick={() => updateCreateField('isAdmin', true)}
+                  >
+                    <strong>管理员</strong>
+                    <span>访问全部用户与系统</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="admin-form-row-2">
+                <label className="admin-field">
+                  <span>周 Token 限额</span>
+                  <input
+                    className="admin-input"
+                    aria-label="周限额"
+                    type="number"
+                    min="0"
+                    value={createForm.weeklyLimit}
+                    onChange={(event) => updateCreateField('weeklyLimit', event.target.value)}
+                    placeholder="留空表示不限"
+                  />
+                </label>
+
+                <label className="admin-field">
+                  <span>月 Token 限额</span>
+                  <input
+                    className="admin-input"
+                    aria-label="月限额"
+                    type="number"
+                    min="0"
+                    value={createForm.monthlyLimit}
+                    onChange={(event) => updateCreateField('monthlyLimit', event.target.value)}
+                    placeholder="留空表示不限"
+                  />
+                </label>
+              </div>
+
+              <label className="admin-drawer-toggle">
+                <input
+                  type="checkbox"
+                  checked={createForm.enabled}
+                  onChange={(event) => updateCreateField('enabled', event.target.checked)}
+                />
+                <span>创建后立即启用</span>
+              </label>
+
+              <div className="admin-drawer-footer">
+                <button
+                  className="admin-button"
+                  type="button"
+                  onClick={() => setIsCreateModalOpen(false)}
+                >
+                  取消
+                </button>
+                <button className="admin-button admin-primary-button" type="submit" disabled={!!updatingKeys['create-user']}>
+                  <Plus size={14} />
+                  创建用户
+                </button>
+              </div>
+            </form>
+          </aside>
+        </div>
+      ) : null}
     </>
+  );
+}
+
+function TokenUsageBar({ label, used, limit }: { label: string; used: number; limit: number | null }) {
+  const percent = tokenPercent(used, limit);
+  return (
+    <div className="admin-token-bar-row">
+      <div className="admin-token-bar-meta">
+        <span>{label}</span>
+        <strong>{formatNumber(used)} / {formatLimit(limit)}</strong>
+      </div>
+      <div className={`admin-token-bar ${limit === null ? 'unlimited' : ''}`}>
+        <span style={{ width: `${percent}%` }} />
+      </div>
+    </div>
   );
 }
 

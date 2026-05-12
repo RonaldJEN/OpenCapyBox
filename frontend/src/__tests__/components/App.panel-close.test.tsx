@@ -4,7 +4,16 @@ import App from '../../App';
 
 vi.mock('../../services/api', () => ({
   apiService: {
+    isAuthenticated: vi.fn(() => true),
     getUserId: vi.fn(() => 'demo-user'),
+    isAdminUser: vi.fn(() => false),
+    getAxiosClient: vi.fn(() => ({
+      get: vi.fn(),
+      post: vi.fn(),
+      patch: vi.fn(),
+      put: vi.fn(),
+      delete: vi.fn(),
+    })),
     getModels: vi.fn().mockResolvedValue({
       models: [{ id: 'test-model', name: 'Test Model' }],
       default_model: 'test-model',

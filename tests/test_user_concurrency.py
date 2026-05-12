@@ -6,6 +6,7 @@ from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
@@ -160,6 +161,11 @@ class TestUserRunLockHelpers:
 class TestSendMessageConcurrencyBlock:
     """send_message_stream 端点并发限制测试。"""
 
+    @pytest.fixture(autouse=True)
+    def _default_token_limit_allows(self):
+        with patch("src.api.routes.chat.enforce_token_limits", return_value=None):
+            yield
+
     def test_rejects_when_user_has_active_run(self):
         from tests.helpers import make_test_client
         from src.api.routes import chat as chat_routes
@@ -184,6 +190,39 @@ class TestSendMessageConcurrencyBlock:
 
         assert response.status_code == 429
         assert "正在运行" in response.json()["detail"]
+
+    def test_token_limit_rejects_before_user_lock(self):
+        from tests.helpers import make_test_client
+        from src.api.routes import chat as chat_routes
+
+        mock_db = MagicMock()
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.status = "active"
+        mock_session.model_id = "model-1"
+
+        chain = mock_db.query.return_value.filter.return_value
+        chain.first.return_value = mock_session
+
+        client = make_test_client(chat_routes.router, "/chat", db=mock_db)
+
+        with patch(
+            "src.api.routes.chat.enforce_token_limits",
+            side_effect=HTTPException(status_code=429, detail="周 token 限额已用完"),
+        ) as enforce_limits, patch(
+            "src.api.routes.chat._acquire_user_run_lock",
+            new_callable=AsyncMock,
+        ) as acquire_lock:
+            response = client.post(
+                "/chat/session-1/message/stream",
+                json={"content": [{"type": "text", "text": "hello"}]},
+            )
+
+        assert response.status_code == 429
+        assert "token" in response.json()["detail"]
+        enforce_limits.assert_called_once_with(mock_db, user_id="testuser")
+        acquire_lock.assert_not_called()
 
     def test_lock_exception_returns_503(self):
         """_acquire_user_run_lock 抛异常时应返回 503（独立 session，异常直接透传）。"""
@@ -443,6 +482,11 @@ class TestSendMessageConcurrencyBlock:
 class TestResumeConcurrencyBlock:
     """resume_interrupt 端点并发限制测试。"""
 
+    @pytest.fixture(autouse=True)
+    def _default_token_limit_allows(self):
+        with patch("src.api.routes.chat.enforce_token_limits", return_value=None):
+            yield
+
     def test_resume_rejects_when_user_has_active_run(self):
         from tests.helpers import make_test_client
         from src.api.routes import chat as chat_routes
@@ -485,6 +529,35 @@ class TestResumeConcurrencyBlock:
 
         assert response.status_code == 429
         assert "正在运行" in response.json()["detail"]
+
+    def test_resume_token_limit_rejects_before_agent_init(self):
+        from tests.helpers import make_test_client
+        from src.api.routes import chat as chat_routes
+
+        mock_db = MagicMock()
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.model_id = "model-1"
+
+        chain = mock_db.query.return_value.filter.return_value
+        chain.first.return_value = mock_session
+
+        client = make_test_client(chat_routes.router, "/chat", db=mock_db)
+
+        with patch(
+            "src.api.routes.chat.enforce_token_limits",
+            side_effect=HTTPException(status_code=429, detail="月 token 限额已用完"),
+        ) as enforce_limits, patch("src.api.routes.chat.get_agent_pool") as get_pool:
+            response = client.post(
+                "/chat/session-1/resume",
+                json={"interrupt_id": "int-1", "answers": {"question": "answer"}},
+            )
+
+        assert response.status_code == 429
+        assert "token" in response.json()["detail"]
+        enforce_limits.assert_called_once_with(mock_db, user_id="testuser")
+        get_pool.assert_not_called()
 
     def test_resume_lock_exception_returns_503(self):
         """resume 时 _acquire_user_run_lock 抛异常应返回 503。"""
