@@ -14,9 +14,8 @@
 | `AUTH_ADMIN_USERS` | 首次初始化需要 | `admin` | 首次 bootstrap 管理员用户名列表，格式：`admin,user2`，需出现在 `SIMPLE_AUTH_USERS` 中。运行时管理员权限以 `auth_users.is_admin` 为准 |
 | `AUTH_SECRET_KEY` | 是 | 派生密钥（启动告警） | JWT 签名密钥，建议 32+ 随机字符串 |
 | `AUTH_TOKEN_EXPIRE_MINUTES` | 否 | `720` | JWT 过期时间（分钟） |
-| `ENTERPRISE_SSO_ENABLED` | 否 | `false` | 是否启用企业 SSO 入口。社区版默认不内置具体企业域认证实现，需部署方接入身份验证器适配器 |
-| `ENTERPRISE_SSO_GATEWAY_URL` | 企业 SSO 按需 | — | 企业统一认证网关地址，如 `http://gateway-host/infra-auth` |
-| `ENTERPRISE_SSO_JWT_SECRET` | 企业 SSO 按需 | — | 企业 SSO 网关 JWT 签名密钥，具体用途由企业部署方的适配器实现决定 |
+| `LDAP_URLS` | LDAP 用户登录需要 | — | LDAP 地址列表，逗号分隔，按顺序主备尝试；生产环境建议使用 `ldaps://`，例如 `ldaps://ldap.example.local,ldaps://ldap-backup.example.local:636` |
+| `LDAP_USER_DOMAIN` | 否 | — | LDAP 绑定域；填写 `example.local` 时使用 `username@example.local` 作为 bind 用户，不填则直接使用短账号 |
 
 认证用户、启停状态、管理员权限、周/月 token 限额运行时均以 `auth_users` 表为事实源。`SIMPLE_AUTH_USERS` / `AUTH_ADMIN_USERS` 只负责空表首次初始化，后续请通过管理后台维护用户。
 

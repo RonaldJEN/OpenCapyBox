@@ -1548,7 +1548,7 @@ function UsersPanel({
                                   </button>
                                 </div>
                               ) : (
-                                <span className="admin-subline">企业统一登录</span>
+                                <span className="admin-subline">LDAP 认证</span>
                               )}
                               <button
                                 className="admin-button admin-icon-button admin-danger-button"
@@ -1578,7 +1578,7 @@ function UsersPanel({
             <div className="admin-drawer-header">
               <div>
                 <h3 id="admin-create-user-title">新建用户</h3>
-                <p>创建本地或 LDAP 企业账号</p>
+                <p>创建本地账号或 LDAP 目录账号</p>
               </div>
               <button
                 className="admin-button admin-icon-button admin-icon-only-button"
@@ -1611,7 +1611,7 @@ function UsersPanel({
                     onClick={() => updateCreateField('authType', 'ldap')}
                   >
                     <strong>LDAP</strong>
-                    <span>企业目录 · 同步邮箱与部门</span>
+                    <span>目录账号 · 使用目录密码验证</span>
                   </button>
                 </div>
               </div>

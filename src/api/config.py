@@ -28,9 +28,10 @@ class Settings(BaseSettings):
     # 认证配置（Bearer Token）
     auth_secret_key: str = ""
     auth_token_expire_minutes: int = 720
-    enterprise_sso_enabled: bool = False
-    enterprise_sso_gateway_url: str = ""  # 企业 SSO 网关地址，如 http://gateway-host/infra-auth
-    enterprise_sso_jwt_secret: str = ""  # 企业 SSO 网关 JWT 签名密钥
+
+    # LDAP 直连认证配置。LDAP_URLS 支持逗号分隔主备地址。
+    ldap_urls: str = ""
+    ldap_user_domain: str = ""
 
     # 数据库配置
     database_url: str = "sqlite:///./data/database/open_capy_box.db"
@@ -99,6 +100,10 @@ class Settings(BaseSettings):
             for username in self.auth_admin_users.split(",")
             if username.strip()
         }
+
+    def get_ldap_urls(self) -> list[str]:
+        """解析 LDAP 主备地址列表。"""
+        return [url.strip() for url in self.ldap_urls.split(",") if url.strip()]
 
 
 @lru_cache()

@@ -2,7 +2,6 @@
 import json
 import pytest
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
@@ -95,6 +94,28 @@ class TestAuthRouter:
         
         assert response.status_code == 401
 
+    def test_login_uses_unified_auth_service(self, client, mock_settings):
+        """登录入口应统一交给认证服务按用户类型分流。"""
+        user_obj = MagicMock()
+        user_obj.user_id = "zhangsan"
+        user_obj.is_admin = False
+        user_obj.token_generation = 7
+
+        with patch("src.api.routes.auth.login_user", return_value=user_obj) as login_mock:
+            with patch("src.api.routes.auth.create_access_token", return_value=("mock-token", 3600)) as token_mock:
+                response = client.post(
+                    "/auth/login",
+                    data={"username": "zhangsan", "password": "domain-pass"},
+                )
+
+        assert response.status_code == 200
+        assert response.json()["user_id"] == "zhangsan"
+        assert response.json()["access_token"] == "mock-token"
+        assert response.json()["role"] == "user"
+        login_mock.assert_called_once()
+        assert login_mock.call_args.args[1:] == ("zhangsan", "domain-pass")
+        token_mock.assert_called_once_with("zhangsan", token_generation=7)
+
     def test_get_current_user_success(self, client, mock_settings):
         """測試獲取當前用戶"""
         login = client.post(
@@ -117,20 +138,6 @@ class TestAuthRouter:
         response = client.get("/auth/me")
         
         assert response.status_code == 401
-
-    def test_sso_login_returns_token_for_enterprise_user(self, client, mock_settings):
-        """企业登录成功后签发本系统 JWT。"""
-        user = SimpleNamespace(user_id="zhangsan", is_admin=False, token_generation=0)
-
-        with patch("src.api.routes.auth.login_sso_user", return_value=user):
-            response = client.get("/auth/sso-login")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["user_id"] == "zhangsan"
-        assert isinstance(data["access_token"], str)
-        assert data["token_type"] == "bearer"
-        assert data["role"] == "user"
 
 
 class TestSessionsRouter:

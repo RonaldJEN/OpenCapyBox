@@ -2,12 +2,11 @@
 
 ## 1. 模块职责边界
 
-- 用户身份认证（simple 本地密码、企业 SSO 域账号）
+- 用户身份认证（simple 本地密码、LDAP 直连账号密码校验）
 - JWT Token 签发与校验
 - 全局鉴权依赖注入（`get_current_user` / `get_current_admin_user`）
 - 用户开通状态、管理员标记、token 周/月限额的事实源
-- 企业统一登录身份验证器抽象与 `auth_users` 映射
-- **不负责**：OAuth、多租户、企业域认证的具体实现
+- **不负责**：OAuth、多租户、SSO 跳转、企业网关 Kerberos/NTLM 实现
 
 ## 2. 数据模型
 
@@ -47,6 +46,15 @@ PostgreSQL 部署使用事务级 advisory lock 串行化多 worker 首次初始�
 
 JWT payload 包含 `user_id` 和 `gen`（凭据代次）。Token 过期时间：默认 43200 秒（12 小时）。密钥来源：`AUTH_SECRET_KEY` 环境变量；若为空，则通过 SHA-256(app_name) 派生确定性密钥，仅用于开发环境。
 
+### 2.3 LDAP 配置
+
+LDAP 用户仍由 `auth_users` 表控制是否开通、是否启用、是否管理员。登录时 `/api/auth/login` 根据 `auth_type=ldap` 直接连接目录服务校验账号密码，不保存 LDAP 密码。
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `LDAP_URLS` | LDAP 用户登录需要 | — | LDAP 地址列表，逗号分隔，按顺序主备尝试；生产环境建议使用 `ldaps://`，例如 `ldaps://ldap.example.local,ldaps://ldap-backup.example.local:636` |
+| `LDAP_USER_DOMAIN` | 否 | — | LDAP 绑定域；填写 `example.local` 时使用 `username@example.local` 作为 bind 用户，不填则直接使用短账号 |
+
 ## 3. API 契约
 
 ### POST /api/auth/login
@@ -54,17 +62,9 @@ JWT payload 包含 `user_id` 和 `gen`（凭据代次）。Token 过期时间：
 - **请求**：form-urlencoded `username`, `password`
 - **响应 200**：`{user_id: str, access_token: str, token_type: "bearer", expires_in: 43200, role: "admin"|"user", is_admin: bool, message: str}`
 - **错误 401**：`{"detail": "用户名或密码错误"}`
-- **错误 403**：simple 用户密码正确但账号被禁用时返回 `账户已被禁用`
+- **错误 403**：账号存在但 `enabled=false` 时返回 `账户已被禁用`
+- **错误 503**：LDAP 用户登录时目录服务未配置或全部地址不可用
 - **鉴权要求**：无（公开端点）
-
-### GET /api/auth/sso-login
-
-- **请求**：由企业统一登录身份验证器解析并返回域账号；社区版默认不内置具体域认证实现
-- **响应 200**：同 `/login`
-- **错误 404**：企业 SSO 未启用
-- **错误 501**：企业 SSO 已启用，但身份验证器未配置
-- **错误 403**：用户未开通、已禁用，或不是 `auth_type=ldap`
-- **鉴权要求**：企业部署需接入可信身份验证器，不信任客户端自报用户标识
 
 ### GET /api/auth/me
 
@@ -84,25 +84,26 @@ JWT payload 包含 `user_id` 和 `gen`（凭据代次）。Token 过期时间：
 - 删除用户为软删除（设置 `deleted_at`），同时禁用并递增 `token_generation`
 - 管理端用户列表和概览统计必须过滤 `deleted_at IS NULL`，不展示已软删除用户
 - 软删除后的 `user_id` 禁止复用（防止新用户继承旧会话/Cron 数据）
-- 创建 LDAP 用户时对 `user_id` 执行 `normalize_domain_user` 规范化（去除域前缀/邮箱后缀），与 SSO 登录口径一致
+- 创建 LDAP 用户时对 `user_id` 执行 `normalize_domain_user` 规范化（去除域前缀/邮箱后缀），与 LDAP 登录口径一致
 - `get_current_admin_user` 用于管理员路由，要求 `auth_users.is_admin=true`
 - Settings 通过 `@lru_cache` 单例化，启动后不可变
 - 若 `AUTH_SECRET_KEY` 为空，使用 SHA-256(app_name) 派生确定性密钥（跨重启一致），仅用于开发环境
 - 若 `SIMPLE_AUTH_USERS` 为空，启动时输出 warning 日志
 - simple 用户密码仅保存 PBKDF2 hash；ldap 用户不保存密码
-- `/sso-login` 只接受企业身份验证器返回的域账号，规范化后匹配 `auth_users.user_id`
+- `/api/auth/login` 是唯一登录入口：先按归一化后的 `user_id` 查询 `auth_users`，再检查 `enabled`，最后按 `auth_type` 分流认证
+- ldap 登录使用 `LDAP_URLS` 顺序尝试；某个地址连接失败时尝试下一个地址，simple bind 成功即视为鉴权成功，绑定失败则视为用户名或密码错误；生产部署建议配置 `ldaps://`
 
 ## 5. 失败模式与错误处理
 
 - 密码错误 → 401，不区分"用户不存在"和"密码错误"（防枚举）
-- ldap 用户访问 simple 登录 → 401，错误文案与普通密码错误一致
-- simple 用户密码正确但账号被禁用 → 403，提示账号已禁用
+- simple 或 ldap 用户密码错误 → 401，错误文案一致
+- 账号被禁用 → 403，提示账号已禁用
+- LDAP 未配置或全部地址不可用 → 503
 - Token 过期 → 401
 - Token 签名无效 → 401
 - 用户被禁用 → 401，已有 token 同步失效（通过 `token_generation` 递增机制）
 - 用户被删除 → 软删除，已有 token 同步失效；`user_id` 不可复用
 - 无 Authorization header → 401
-- 企业统一登录验证器未配置 → 501
 
 ## 6. 可观测性
 
@@ -114,5 +115,6 @@ JWT payload 包含 `user_id` 和 `gen`（凭据代次）。Token 过期时间：
 - 不做开放注册（用户由 bootstrap 或管理员后台创建）
 - 不做 Token 刷新
 - 不做细粒度 RBAC / 权限分级
-- 社区版不内置企业域认证实现；企业部署通过身份验证器适配器接入
+- 不做 SSO 跳转或网关回调
+- 不在应用内实现 Kerberos/NTLM
 - 不做多租户隔离

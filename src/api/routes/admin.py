@@ -950,7 +950,7 @@ async def create_admin_ldap_user(
     admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
-    """创建企业域账号用户。"""
+    """创建 LDAP 目录账号用户。"""
     user = create_ldap_user(
         db,
         user_id=payload.user_id,

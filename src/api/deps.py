@@ -87,9 +87,9 @@ def verify_access_token(token: str, db: DBSession | None = None) -> str:
     except jwt.ExpiredSignatureError:
         raise _unauthorized("访问令牌已过期") from None
     except HTTPException as exc:
-        if exc.status_code == 401:
-            raise _unauthorized(exc.detail) from exc
-        raise
+        if exc.status_code != 401:
+            raise
+        raise _unauthorized(exc.detail) from exc
     except jwt.InvalidTokenError as exc:
         raise _unauthorized("无效或已过期的访问令牌") from exc
 

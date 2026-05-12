@@ -142,9 +142,9 @@ describe('Login 組件', () => {
     expect(mockNavigate).not.toHaveBeenCalled();
   });
 
-  it('企业登录细节不应显示给普通登录页用户', async () => {
+  it('LDAP 内部错误细节不应显示给普通登录页用户', async () => {
     vi.mocked(apiService.login).mockRejectedValue({
-      response: { data: { detail: '请使用企业统一登录' } },
+      response: { data: { detail: 'LDAP 服务不可用' } },
     });
 
     render(<Login />);
@@ -160,7 +160,7 @@ describe('Login 組件', () => {
     await waitFor(() => {
       expect(screen.getByText('登录失败，请检查用户名和密码')).toBeInTheDocument();
     });
-    expect(screen.queryByText('请使用企业统一登录')).not.toBeInTheDocument();
+    expect(screen.queryByText('LDAP 服务不可用')).not.toBeInTheDocument();
     expect(mockNavigate).not.toHaveBeenCalled();
   });
 

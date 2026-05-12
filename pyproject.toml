@@ -32,6 +32,7 @@ dependencies = [
     "opensandbox>=0.1.0",
     # Scheduler (Cron tasks)
     "apscheduler>=3.10.0",
+    "ldap3>=2.9.1",
 ]
 
 # CLI 入口已移除（Web 模式專用，不再支持 CLI）

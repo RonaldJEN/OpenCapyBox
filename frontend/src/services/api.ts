@@ -96,7 +96,7 @@ class APIService {
     this.client.interceptors.response.use(
       (response) => response,
       (error) => {
-        const isLoginRequest = error.config?.url === '/auth/login' || error.config?.url === '/auth/sso-login';
+        const isLoginRequest = error.config?.url === '/auth/login';
         if (error.response?.status === 401 && !isLoginRequest) {
           this.logout();
           window.location.href = '/login';

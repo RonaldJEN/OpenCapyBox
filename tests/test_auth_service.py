@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from ldap3.core.exceptions import LDAPBindError, LDAPSocketOpenError, LDAPSocketReceiveError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -14,6 +15,7 @@ from src.api.models.database import Base
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.session import Session
 from src.api.services.auth_service import (
+    authenticate_ldap_credentials,
     bootstrap_auth_users,
     create_ldap_user,
     create_simple_user,
@@ -21,8 +23,7 @@ from src.api.services.auth_service import (
     enforce_token_limits,
     get_auth_user,
     hash_password,
-    login_sso_user,
-    login_simple_user,
+    login_user,
     normalize_domain_user,
     reset_simple_user_password,
     update_user_enabled,
@@ -75,6 +76,20 @@ def test_bootstrap_creates_simple_users_from_env(db):
     assert verify_password("admin456", admin.password_hash) is True
 
 
+@pytest.mark.parametrize("username", ["demo@example.local", "EXAMPLE\\demo"])
+def test_bootstrap_rejects_domain_style_simple_usernames(db, username):
+    mock_settings = MagicMock()
+    mock_settings.get_auth_users.return_value = {username: "demo123"}
+    mock_settings.get_admin_users.return_value = set()
+
+    with patch("src.api.services.auth_service.get_settings", return_value=mock_settings):
+        with pytest.raises(HTTPException) as exc_info:
+            bootstrap_auth_users(db)
+
+    assert exc_info.value.status_code == 400
+    assert "simple 用户名不能包含域前缀或邮箱后缀" in exc_info.value.detail
+
+
 def test_bootstrap_surfaces_integrity_error_on_race(db):
     """模拟多 worker 并发：count=0 通过但 commit 时冲突。"""
     from sqlalchemy.exc import IntegrityError
@@ -84,7 +99,6 @@ def test_bootstrap_surfaces_integrity_error_on_race(db):
     mock_settings.get_admin_users.return_value = set()
 
     original_commit = db.commit
-
     call_count = [0]
 
     def exploding_commit():
@@ -128,104 +142,25 @@ def test_simple_and_ldap_user_semantics(db):
     assert ldap.is_admin is True
 
 
-def test_login_simple_rejects_ldap_user(db):
-    create_ldap_user(
-        db,
-        user_id="zhangsan",
-        username=None,
-        enabled=True,
-        is_admin=False,
-        token_limit_per_week=None,
-        token_limit_per_month=None,
-        created_by="admin",
-    )
-
+@pytest.mark.parametrize("username", ["local-user@example.local", "EXAMPLE\\local-user"])
+def test_create_simple_user_rejects_domain_style_usernames(db, username):
     with pytest.raises(HTTPException) as exc_info:
-        login_simple_user(db, "zhangsan", "any")
+        create_simple_user(
+            db,
+            username=username,
+            password="pass123",
+            enabled=True,
+            is_admin=False,
+            token_limit_per_week=None,
+            token_limit_per_month=None,
+            created_by="admin",
+        )
 
-    assert exc_info.value.status_code == 401
-    assert "用户名或密码错误" in exc_info.value.detail
-
-
-class FakeEnterpriseVerifier:
-    def __init__(self, user_id: str):
-        self.user_id = user_id
-
-    def resolve_user_id(self, request):
-        return self.user_id
-
-
-def test_sso_login_requires_enabled_setting(db):
-    mock_settings = MagicMock()
-    mock_settings.enterprise_sso_enabled = False
-
-    with patch("src.api.services.auth_service.get_settings", return_value=mock_settings):
-        with pytest.raises(HTTPException) as exc_info:
-            login_sso_user(db, MagicMock())
-
-    assert exc_info.value.status_code == 404
+    assert exc_info.value.status_code == 400
+    assert "simple 用户名不能包含域前缀或邮箱后缀" in exc_info.value.detail
 
 
-def test_sso_login_requires_configured_enterprise_verifier(db):
-    mock_settings = MagicMock()
-    mock_settings.enterprise_sso_enabled = True
-
-    with patch("src.api.services.auth_service.get_settings", return_value=mock_settings):
-        with pytest.raises(HTTPException) as exc_info:
-            login_sso_user(db, MagicMock())
-
-    assert exc_info.value.status_code == 501
-
-
-def test_sso_login_accepts_ldap_user_from_enterprise_verifier(db):
-    create_ldap_user(
-        db,
-        user_id="zhangsan",
-        username=None,
-        enabled=True,
-        is_admin=False,
-        token_limit_per_week=None,
-        token_limit_per_month=None,
-        created_by="admin",
-    )
-    mock_settings = MagicMock()
-    mock_settings.enterprise_sso_enabled = True
-
-    with patch("src.api.services.auth_service.get_settings", return_value=mock_settings), patch(
-        "src.api.services.auth_service.get_enterprise_identity_verifier",
-        return_value=FakeEnterpriseVerifier("DOMAIN\\zhangsan"),
-    ):
-        user = login_sso_user(db, MagicMock())
-
-    assert user.user_id == "zhangsan"
-    assert user.last_login_at is not None
-
-
-def test_sso_login_rejects_simple_user_from_enterprise_verifier(db):
-    create_simple_user(
-        db,
-        username="local-user",
-        password="pass123",
-        enabled=True,
-        is_admin=False,
-        token_limit_per_week=None,
-        token_limit_per_month=None,
-        created_by="admin",
-    )
-    mock_settings = MagicMock()
-    mock_settings.enterprise_sso_enabled = True
-
-    with patch("src.api.services.auth_service.get_settings", return_value=mock_settings), patch(
-        "src.api.services.auth_service.get_enterprise_identity_verifier",
-        return_value=FakeEnterpriseVerifier("local-user"),
-    ):
-        with pytest.raises(HTTPException) as exc_info:
-            login_sso_user(db, MagicMock())
-
-    assert exc_info.value.status_code == 403
-
-
-def test_login_simple_reports_disabled_user_after_valid_password(db):
+def test_login_user_reports_disabled_simple_user(db):
     create_simple_user(
         db,
         username="disabled-user",
@@ -238,10 +173,69 @@ def test_login_simple_reports_disabled_user_after_valid_password(db):
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        login_simple_user(db, "disabled-user", "pass123")
+        login_user(db, "disabled-user", "pass123")
 
     assert exc_info.value.status_code == 403
     assert "账户已被禁用" in exc_info.value.detail
+
+
+def test_login_user_authenticates_simple_user(db):
+    create_simple_user(
+        db,
+        username="local-user",
+        password="pass123",
+        enabled=True,
+        is_admin=False,
+        token_limit_per_week=None,
+        token_limit_per_month=None,
+        created_by="admin",
+    )
+
+    user = login_user(db, "local-user", "pass123")
+
+    assert user.user_id == "local-user"
+    assert user.last_login_at is not None
+
+
+def test_login_user_authenticates_ldap_user(db):
+    create_ldap_user(
+        db,
+        user_id="zhangsan",
+        username=None,
+        enabled=True,
+        is_admin=False,
+        token_limit_per_week=None,
+        token_limit_per_month=None,
+        created_by="admin",
+    )
+
+    with patch("src.api.services.auth_service.authenticate_ldap_credentials") as ldap_auth:
+        user = login_user(db, "EXAMPLE\\zhangsan", "domain-pass")
+
+    assert user.user_id == "zhangsan"
+    assert user.last_login_at is not None
+    ldap_auth.assert_called_once_with("zhangsan", "domain-pass")
+
+
+def test_login_user_rejects_disabled_ldap_user_without_binding(db):
+    create_ldap_user(
+        db,
+        user_id="zhangsan",
+        username=None,
+        enabled=False,
+        is_admin=False,
+        token_limit_per_week=None,
+        token_limit_per_month=None,
+        created_by="admin",
+    )
+
+    with patch("src.api.services.auth_service.authenticate_ldap_credentials") as ldap_auth:
+        with pytest.raises(HTTPException) as exc_info:
+            login_user(db, "zhangsan", "domain-pass")
+
+    assert exc_info.value.status_code == 403
+    assert "账户已被禁用" in exc_info.value.detail
+    ldap_auth.assert_not_called()
 
 
 def test_reset_password_only_allows_simple_user(db):
@@ -277,7 +271,6 @@ def test_delete_auth_user_removes_account(db):
     deleted_user_id = delete_auth_user(db, user_id="demo-delete")
 
     assert deleted_user_id == "demo-delete"
-    # 软删除：行仍存在但 deleted_at 已设置，get_auth_user 查不到
     row = db.query(AuthUser).filter(AuthUser.user_id == "demo-delete").first()
     assert row is not None
     assert row.deleted_at is not None
@@ -288,13 +281,93 @@ def test_delete_auth_user_removes_account(db):
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        ("BOSHI\\zhangsan", "zhangsan"),
-        ("zhangsan@BOSHI.COM.CN", "zhangsan"),
+        ("EXAMPLE\\zhangsan", "zhangsan"),
+        ("zhangsan@EXAMPLE.LOCAL", "zhangsan"),
         (" zhangsan ", "zhangsan"),
     ],
 )
 def test_normalize_domain_user(raw, expected):
     assert normalize_domain_user(raw) == expected
+
+
+def test_authenticate_ldap_credentials_uses_fallback_url():
+    settings = _make_ldap_settings(["ldap://primary.example.local", "ldap://backup.example.local:8888"])
+    fake_connection = MagicMock()
+
+    with patch("src.api.services.auth_service.get_settings", return_value=settings):
+        with patch("src.api.services.auth_service.Server") as server_mock:
+            with patch(
+                "src.api.services.auth_service.Connection",
+                side_effect=[LDAPSocketOpenError("primary down"), fake_connection],
+            ) as connection_mock:
+                authenticate_ldap_credentials("zhangsan", "domain-pass")
+
+    assert server_mock.call_count == 2
+    assert server_mock.call_args.args[0] == "ldap://backup.example.local:8888"
+    assert server_mock.call_args.kwargs["connect_timeout"] == 5
+    assert connection_mock.call_count == 2
+    assert connection_mock.call_args.kwargs["user"] == "zhangsan@example.local"
+    assert connection_mock.call_args.kwargs["password"] == "domain-pass"
+    assert connection_mock.call_args.kwargs["auto_bind"] is True
+    assert connection_mock.call_args.kwargs["receive_timeout"] == 10
+    fake_connection.search.assert_not_called()
+    fake_connection.unbind.assert_called_once()
+
+
+def test_authenticate_ldap_credentials_binds_short_username_without_domain():
+    settings = _make_ldap_settings(["ldap://directory.example.local"], user_domain="")
+    fake_connection = MagicMock()
+
+    with patch("src.api.services.auth_service.get_settings", return_value=settings):
+        with patch(
+            "src.api.services.auth_service.Connection",
+            return_value=fake_connection,
+        ) as connection_mock:
+            authenticate_ldap_credentials("zhangsan", "domain-pass")
+
+    assert connection_mock.call_args.kwargs["user"] == "zhangsan"
+    assert connection_mock.call_args.kwargs["password"] == "domain-pass"
+    fake_connection.unbind.assert_called_once()
+
+
+def test_authenticate_ldap_credentials_rejects_invalid_password():
+    settings = _make_ldap_settings(["ldap://directory.example.local"])
+
+    with patch("src.api.services.auth_service.get_settings", return_value=settings):
+        with patch("src.api.services.auth_service.Connection", side_effect=LDAPBindError("invalid")):
+            with pytest.raises(HTTPException) as exc_info:
+                authenticate_ldap_credentials("zhangsan", "wrong-pass")
+
+    assert exc_info.value.status_code == 401
+    assert "用户名或密码错误" in exc_info.value.detail
+
+
+def test_authenticate_ldap_credentials_reports_unavailable_after_all_urls_fail():
+    settings = _make_ldap_settings(["ldap://primary.example.local", "ldap://backup.example.local:8888"])
+
+    with patch("src.api.services.auth_service.get_settings", return_value=settings):
+        with patch(
+            "src.api.services.auth_service.Connection",
+            side_effect=[LDAPSocketOpenError("primary down"), LDAPSocketReceiveError("backup down")],
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                authenticate_ldap_credentials("zhangsan", "domain-pass")
+
+    assert exc_info.value.status_code == 503
+    assert "LDAP 服务不可用" in exc_info.value.detail
+
+
+def test_authenticate_ldap_credentials_rejects_empty_password_without_binding():
+    settings = _make_ldap_settings(["ldap://directory.example.local"])
+
+    with patch("src.api.services.auth_service.get_settings", return_value=settings) as get_settings_mock:
+        with patch("src.api.services.auth_service.Connection") as connection_mock:
+            with pytest.raises(HTTPException) as exc_info:
+                authenticate_ldap_credentials("zhangsan", "")
+
+    assert exc_info.value.status_code == 401
+    get_settings_mock.assert_not_called()
+    connection_mock.assert_not_called()
 
 
 def test_enforce_token_limits_blocks_when_weekly_limit_reached(db):
@@ -356,9 +429,6 @@ def test_enforce_token_limits_rejects_disabled_user(db):
     assert exc_info.value.status_code == 401
 
 
-# ── 回归：禁用用户后 token_generation 递增 ──
-
-
 def test_disable_user_increments_token_generation(db):
     create_simple_user(
         db,
@@ -370,13 +440,14 @@ def test_disable_user_increments_token_generation(db):
         token_limit_per_month=None,
         created_by="admin",
     )
+
     user = update_user_enabled(db, user_id="will-disable", enabled=False)
+
     assert user.token_generation == 1
     assert user.enabled is False
 
 
 def test_reenable_user_preserves_token_generation(db):
-    """重新启用后 token_generation 不回退，旧 token 无法复活。"""
     create_simple_user(
         db,
         username="toggle-user",
@@ -387,13 +458,12 @@ def test_reenable_user_preserves_token_generation(db):
         token_limit_per_month=None,
         created_by="admin",
     )
+
     user = update_user_enabled(db, user_id="toggle-user", enabled=False)
-    gen = user.token_generation
+    token_generation = user.token_generation
     user = update_user_enabled(db, user_id="toggle-user", enabled=True)
-    assert user.token_generation == gen
 
-
-# ── 问题2 回归：软删除后禁止复用 user_id ──
+    assert user.token_generation == token_generation
 
 
 def test_cannot_recreate_deleted_user_id(db):
@@ -420,6 +490,7 @@ def test_cannot_recreate_deleted_user_id(db):
             token_limit_per_month=None,
             created_by="admin",
         )
+
     assert exc_info.value.status_code == 409
     assert "历史数据" in exc_info.value.detail
 
@@ -435,18 +506,17 @@ def test_soft_delete_increments_token_generation(db):
         token_limit_per_month=None,
         created_by="admin",
     )
+
     delete_auth_user(db, user_id="del-tva")
     row = db.query(AuthUser).filter(AuthUser.user_id == "del-tva").first()
+
     assert row.token_generation == 1
-
-
-# ── 问题3 回归：LDAP 创建时规范化 user_id ──
 
 
 def test_create_ldap_user_normalizes_domain_prefix(db):
     user = create_ldap_user(
         db,
-        user_id="DOMAIN\\zhangsan",
+        user_id="EXAMPLE\\zhangsan",
         username=None,
         enabled=True,
         is_admin=False,
@@ -454,6 +524,7 @@ def test_create_ldap_user_normalizes_domain_prefix(db):
         token_limit_per_month=None,
         created_by="admin",
     )
+
     assert user.user_id == "zhangsan"
     assert user.username == "zhangsan"
 
@@ -461,7 +532,7 @@ def test_create_ldap_user_normalizes_domain_prefix(db):
 def test_create_ldap_user_normalizes_email_suffix(db):
     user = create_ldap_user(
         db,
-        user_id="lisi@corp.com",
+        user_id="lisi@example.local",
         username="李四",
         enabled=True,
         is_admin=False,
@@ -469,10 +540,8 @@ def test_create_ldap_user_normalizes_email_suffix(db):
         token_limit_per_month=None,
         created_by="admin",
     )
+
     assert user.user_id == "lisi"
-
-
-# ── 问题4 回归：密码重置后旧 token 失效 ──
 
 
 def test_reset_password_increments_token_generation(db):
@@ -486,15 +555,13 @@ def test_reset_password_increments_token_generation(db):
         token_limit_per_month=None,
         created_by="admin",
     )
+
     user = reset_simple_user_password(db, user_id="pwd-reset", password="new-pass")
+
     assert user.token_generation == 1
 
 
-# ── 回归：软删除用户登录表现为不存在 ──
-
-
-def test_login_simple_deleted_user_returns_401(db):
-    """软删除后的用户登录应返回 401（不区分密码正确与否），不泄露账号存在。"""
+def test_login_user_deleted_simple_user_returns_401(db):
     create_simple_user(
         db,
         username="del-login",
@@ -507,8 +574,15 @@ def test_login_simple_deleted_user_returns_401(db):
     )
     delete_auth_user(db, user_id="del-login")
 
-    # 密码正确也应返回 401
     with pytest.raises(HTTPException) as exc_info:
-        login_simple_user(db, "del-login", "pass123")
+        login_user(db, "del-login", "pass123")
+
     assert exc_info.value.status_code == 401
     assert "用户名或密码错误" in exc_info.value.detail
+
+
+def _make_ldap_settings(ldap_urls, user_domain="example.local"):
+    settings = MagicMock()
+    settings.get_ldap_urls.return_value = ldap_urls
+    settings.ldap_user_domain = user_domain
+    return settings

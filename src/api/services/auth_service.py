@@ -5,13 +5,14 @@ import hashlib
 import hmac
 import secrets
 from datetime import timedelta
-from typing import Protocol
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException
+from ldap3 import Connection, Server
+from ldap3.core.exceptions import LDAPBindError, LDAPCommunicationError
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session as DBSession
 
-from src.api.config import get_settings
+from src.api.config import Settings, get_settings
 from src.api.models.auth_user import AuthUser
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.session import Session
@@ -20,21 +21,9 @@ from src.api.utils.timezone import now_naive
 
 _PASSWORD_ALGORITHM = "pbkdf2_sha256"
 _PASSWORD_ITERATIONS = 260000
-
-
-class EnterpriseIdentityVerifier(Protocol):
-    def resolve_user_id(self, request: Request) -> str:
-        """返回企业域账号；企业部署中替换为 Kerberos/SPNEGO 适配器。"""
-        ...
-
-
-class UnconfiguredEnterpriseIdentityVerifier:
-    def resolve_user_id(self, request: Request) -> str:
-        raise HTTPException(status_code=501, detail="企业统一登录验证器未配置")
-
-
-def get_enterprise_identity_verifier() -> EnterpriseIdentityVerifier:
-    return UnconfiguredEnterpriseIdentityVerifier()
+_LDAP_CONNECT_TIMEOUT_SECONDS = 5
+_LDAP_RECEIVE_TIMEOUT_SECONDS = 10
+_SIMPLE_USERNAME_FORBIDDEN_CHARS = ("\\", "@")
 
 
 def hash_password(password: str) -> str:
@@ -93,6 +82,7 @@ def bootstrap_auth_users(db: DBSession) -> int:
 
     created = 0
     for username, password in sorted(auth_users.items()):
+        _validate_simple_username(username)
         user = AuthUser(
             user_id=username,
             username=username,
@@ -130,38 +120,67 @@ def require_admin_user(db: DBSession, user_id: str) -> AuthUser:
     return user
 
 
-def login_simple_user(db: DBSession, username: str, password: str) -> AuthUser:
-    user = db.query(AuthUser).filter(AuthUser.username == username, AuthUser.deleted_at.is_(None)).first()
+def login_user(db: DBSession, username: str, password: str) -> AuthUser:
+    user_id = normalize_domain_user(username)
+    user = get_auth_user(db, user_id)
     if not user:
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
-    if user.auth_type != "simple":
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
-    if not verify_password(password, user.password_hash):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     if not user.enabled:
         raise HTTPException(status_code=403, detail="账户已被禁用")
 
+    if user.auth_type == "simple":
+        if not verify_password(password, user.password_hash):
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+    elif user.auth_type == "ldap":
+        authenticate_ldap_credentials(user.user_id, password)
+    else:
+        raise ValueError(f"unsupported auth_type: {user.auth_type}")
+
     user.last_login_at = now_naive()
     db.commit()
     return user
 
 
-def login_sso_user(db: DBSession, request: Request) -> AuthUser:
+def authenticate_ldap_credentials(username: str, password: str) -> None:
+    if not password:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
     settings = get_settings()
-    if not settings.enterprise_sso_enabled:
-        raise HTTPException(status_code=404, detail="企业统一登录未启用")
+    ldap_urls = settings.get_ldap_urls()
+    if not ldap_urls:
+        raise HTTPException(status_code=503, detail="LDAP 未配置")
 
-    authenticated_user = get_enterprise_identity_verifier().resolve_user_id(request)
-    user_id = normalize_domain_user(authenticated_user)
-    user = get_auth_user(db, user_id)
-    if not user or not user.enabled:
-        raise HTTPException(status_code=403, detail="用户未开通或已被禁用")
-    if user.auth_type != "ldap":
-        raise HTTPException(status_code=403, detail="当前用户未配置为企业统一登录用户")
+    bind_user = _build_ldap_bind_user(settings, username)
 
-    user.last_login_at = now_naive()
-    db.commit()
-    return user
+    for url_index, ldap_url in enumerate(ldap_urls):
+        try:
+            _bind_ldap(ldap_url, bind_user, password)
+            return
+        # ldap3 的 socket open / receive 等网络异常均继承自 LDAPCommunicationError。
+        except LDAPCommunicationError:
+            if url_index == len(ldap_urls) - 1:
+                raise HTTPException(status_code=503, detail="LDAP 服务不可用")
+        except LDAPBindError:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+
+def _build_ldap_bind_user(settings: Settings, username: str) -> str:
+    domain = settings.ldap_user_domain.strip()
+    if not domain:
+        return username
+    return f"{username}@{domain}"
+
+
+def _bind_ldap(ldap_url: str, bind_user: str, password: str) -> None:
+    server = Server(ldap_url, connect_timeout=_LDAP_CONNECT_TIMEOUT_SECONDS)
+    connection = Connection(
+        server,
+        user=bind_user,
+        password=password,
+        auto_bind=True,
+        receive_timeout=_LDAP_RECEIVE_TIMEOUT_SECONDS,
+    )
+    connection.unbind()
 
 
 def create_simple_user(
@@ -175,6 +194,7 @@ def create_simple_user(
     token_limit_per_month: int | None,
     created_by: str,
 ) -> AuthUser:
+    _validate_simple_username(username)
     _ensure_user_not_exists(db, username=username, user_id=username)
     user = AuthUser(
         user_id=username,
@@ -333,6 +353,11 @@ def _ensure_user_not_exists(db: DBSession, *, username: str, user_id: str) -> No
         if existing.deleted_at is not None:
             raise HTTPException(status_code=409, detail="该用户 ID 已被使用过且存在历史数据，不允许复用")
         raise HTTPException(status_code=409, detail="用户已存在")
+
+
+def _validate_simple_username(username: str) -> None:
+    if any(char in username for char in _SIMPLE_USERNAME_FORBIDDEN_CHARS):
+        raise HTTPException(status_code=400, detail="simple 用户名不能包含域前缀或邮箱后缀")
 
 
 def _get_existing_user(db: DBSession, user_id: str) -> AuthUser:

@@ -73,7 +73,7 @@
 
 - Body: `{user_id, username?, enabled?, is_admin?, token_limit_per_week?, token_limit_per_month?}`
 - 响应：创建后的用户基础信息。
-- 语义：创建企业域账号用户，不保存密码；内部 SSO 通过 `user_id` 匹配。
+- 语义：创建 LDAP 用户，不保存密码；统一登录时通过 `user_id` 匹配并使用目录密码验证。
 
 ### PATCH /api/admin/users/{user_id}/enabled
 
