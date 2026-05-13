@@ -669,6 +669,20 @@ class TestSandboxWriteTool:
         written_path = mock_sandbox.files.write_file.call_args.args[0]
         assert written_path == "/workspace/session-root/out.txt"
 
+    @pytest.mark.asyncio
+    async def test_write_file_calls_agent_config_sync(self, mock_sandbox):
+        """write_file 寫入成功後應把完整內容交給同步回調"""
+        mock_cmd_result = MagicMock()
+        mock_cmd_result.exit_code = 0
+        mock_sandbox.commands.run = AsyncMock(return_value=mock_cmd_result)
+        sync = AsyncMock()
+
+        tool = SandboxWriteTool(mock_sandbox, agent_config_sync=sync)
+        result = await tool.execute(path="/home/user/USER.md", content="")
+
+        assert result.success is True
+        sync.assert_awaited_once_with("/home/user/USER.md", "")
+
 
 # ============== SandboxEditTool ==============
 
@@ -729,6 +743,22 @@ class TestSandboxEditTool:
         written_path = mock_sandbox.files.write_file.call_args.args[0]
         assert read_path == "/workspace/session-root/edit.txt"
         assert written_path == "/workspace/session-root/edit.txt"
+
+    @pytest.mark.asyncio
+    async def test_edit_file_calls_agent_config_sync_with_new_content(self, mock_sandbox):
+        """edit_file 寫入成功後應同步替換後的完整內容"""
+        mock_sandbox.files.read_file = AsyncMock(return_value="alpha beta")
+        sync = AsyncMock()
+
+        tool = SandboxEditTool(mock_sandbox, agent_config_sync=sync)
+        result = await tool.execute(
+            path="/home/user/AGENTS.md",
+            old_str="beta",
+            new_str="gamma",
+        )
+
+        assert result.success is True
+        sync.assert_awaited_once_with("/home/user/AGENTS.md", "alpha gamma")
 
 
 # ============== SandboxSessionNoteTool ==============

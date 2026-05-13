@@ -18,7 +18,7 @@ import difflib
 import logging
 import posixpath
 import shlex
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 
 from opensandbox import Sandbox
@@ -26,6 +26,8 @@ from opensandbox import Sandbox
 from .base import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
+
+AgentConfigSync = Callable[[str, str], Awaitable[None]]
 
 
 def _normalize_workspace_dir(workspace_dir: str) -> str:
@@ -137,6 +139,19 @@ async def _sandbox_write_text(sandbox: Sandbox, path: str, content: str) -> None
         await write(path, content.encode("utf-8"))
         return
     raise AttributeError("Sandbox files API does not provide write_file/write")
+
+
+async def _sync_agent_config_after_write(
+    sync: AgentConfigSync | None,
+    path: str,
+    content: str,
+) -> None:
+    if sync is None:
+        return
+    try:
+        await sync(path, content)
+    except Exception as exc:
+        logger.warning("同步 Agent 配置文件到 DB 失败 (%s): %s", path, exc)
 
 
 from ..utils.token_utils import truncate_text_by_tokens
@@ -288,9 +303,15 @@ class SandboxReadTool(Tool):
 class SandboxWriteTool(Tool):
     """在沙箱中寫入文件"""
 
-    def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        workspace_dir: str = "/home/user",
+        agent_config_sync: AgentConfigSync | None = None,
+    ):
         self._sandbox = sandbox
         self._workspace_dir = _normalize_workspace_dir(workspace_dir)
+        self._agent_config_sync = agent_config_sync
 
     @property
     def name(self) -> str:
@@ -337,6 +358,7 @@ class SandboxWriteTool(Tool):
 
             # 寫入文件
             await _sandbox_write_text(self._sandbox, full_path, content)
+            await _sync_agent_config_after_write(self._agent_config_sync, full_path, content)
 
             return ToolResult(success=True, content=f"Successfully wrote to {full_path}")
 
@@ -347,9 +369,15 @@ class SandboxWriteTool(Tool):
 class SandboxEditTool(Tool):
     """在沙箱中編輯文件（字串替換）"""
 
-    def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        workspace_dir: str = "/home/user",
+        agent_config_sync: AgentConfigSync | None = None,
+    ):
         self._sandbox = sandbox
         self._workspace_dir = _normalize_workspace_dir(workspace_dir)
+        self._agent_config_sync = agent_config_sync
 
     @property
     def name(self) -> str:
@@ -404,6 +432,7 @@ class SandboxEditTool(Tool):
 
             # 寫回
             await _sandbox_write_text(self._sandbox, full_path, new_content)
+            await _sync_agent_config_after_write(self._agent_config_sync, full_path, new_content)
 
             # 計算 diff 統計
             old_lines_list = old_str.splitlines(keepends=True)

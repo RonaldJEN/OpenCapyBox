@@ -1334,15 +1334,19 @@ class AgentService:
                 mem_svc = MemoryService(db)
                 # 同步所有 agent 配置文件（USER/MEMORY/SOUL/AGENTS）
                 for ft in FILE_TYPE_TO_FILENAME:
-                    content = await mem_svc.sync_from_sandbox(
+                    sync_result = await mem_svc.sync_from_sandbox(
                         self.user_id, self.sandbox, ft
                     )
-                    if content:
+                    if sync_result is not None:
+                        content, changed = sync_result
                         filename = FILE_TYPE_TO_FILENAME[ft]
                         # 仅对 USER 和 MEMORY 重建语义索引
-                        if ft in ("user_md", "memory_md"):
+                        if changed and ft in ("user_md", "memory_md"):
                             await mem_svc.rebuild_embeddings(self.user_id, filename, content)
-                        logger.info("记忆同步完成: %s (%d chars)", filename, len(content))
+                        logger.info(
+                            "记忆同步完成: %s (%d chars, changed=%s)",
+                            filename, len(content), changed,
+                        )
             finally:
                 db.close()
         except Exception as e:

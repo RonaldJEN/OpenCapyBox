@@ -137,16 +137,17 @@
 | 场景 | 方向 | 行为 |
 |---|---|---|
 | 新用户 | template -> DB -> sandbox | `provision_default_files` 幂等 |
-| Agent 运行时修改 | sandbox -> DB | dirty flag 检测后同步 |
+| Agent 运行时修改 | sandbox -> DB | 受控工具写入成功后即时同步；dirty flag 在 round 结束后兜底校验 |
 | 前端编辑 | DB -> sandbox (force) | 覆写沙箱内容 |
 | 新 Session Agent 创建 | sandbox-first | 沙箱有内容 -> 写回 DB；空则 DB -> sandbox |
 
-### Dirty Flag 检测
+### Dirty Flag 检测与兜底
 
 - **工具名匹配**：`record_memory`、`update_long_term_memory`、`update_user`
 - **文件操作嗅探**：`write_file` / `edit_file` 目标为记忆文件
+- **即时同步**：受控工具成功写入根目录 USER / MEMORY / SOUL / AGENTS 后，立即调用 DB 同步；USER / MEMORY 内容变化时同步重建 embedding
+- **兜底同步**：每 round 结束后若 dirty -> 从 sandbox 读回 DB；仅内容实际变化时更新版本并重建 USER / MEMORY embedding
 - **盲区**：bash 修改记忆文件不可检测（AGENTS.md 中禁止此行为）
-- 每 round 结束后若 dirty -> 触发 sandbox -> DB 同步
 
 ### 乐观锁
 

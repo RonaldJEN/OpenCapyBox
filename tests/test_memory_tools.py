@@ -40,6 +40,27 @@ class TestRecordDailyLogTool:
         assert "/home/user/MEMORY.md" in sandbox.files.write_file.call_args.args[0]
 
     @pytest.mark.asyncio
+    async def test_record_syncs_merged_content(self):
+        from src.agent.tools.memory_tools import RecordDailyLogTool
+
+        sandbox = make_mock_sandbox(read_return="# Existing\n")
+        sync = AsyncMock()
+        tool = RecordDailyLogTool(
+            sandbox=sandbox,
+            workspace_dir="/home/user",
+            agent_config_sync=sync,
+        )
+
+        result = await tool.execute(content="用户偏好：深色模式", category="preference")
+
+        assert result.success is True
+        sync.assert_awaited_once()
+        path, synced_content = sync.call_args.args
+        assert path == "/home/user/MEMORY.md"
+        assert "# Existing" in synced_content
+        assert "用户偏好：深色模式" in synced_content
+
+    @pytest.mark.asyncio
     async def test_record_failure(self):
         from src.agent.tools.memory_tools import RecordDailyLogTool
 
@@ -121,12 +142,31 @@ class TestUpdateMemoryTools:
 
     @pytest.mark.parametrize("cls_name,_name,_target_file", _TOOL_PARAMS)
     @pytest.mark.asyncio
-    async def test_write_mode_no_content(self, cls_name, _name, _target_file):
+    async def test_write_mode_allows_empty_content(self, cls_name, _name, _target_file):
         cls = self._get_tool_cls(cls_name)
-        tool = cls(sandbox=MagicMock())
+        sandbox = make_mock_sandbox()
+        sync = AsyncMock()
+        tool = cls(sandbox=sandbox, workspace_dir="/home/user", agent_config_sync=sync)
 
         result = await tool.execute(mode="write", content="")
+        assert result.success is True
+        sandbox.files.write_file.assert_called_once_with(f"/home/user/{_target_file}", "")
+        sync.assert_awaited_once_with(f"/home/user/{_target_file}", "")
+
+    @pytest.mark.parametrize("cls_name,_name,_target_file", _TOOL_PARAMS)
+    @pytest.mark.asyncio
+    async def test_write_mode_requires_explicit_content(self, cls_name, _name, _target_file):
+        cls = self._get_tool_cls(cls_name)
+        sandbox = make_mock_sandbox()
+        sync = AsyncMock()
+        tool = cls(sandbox=sandbox, workspace_dir="/home/user", agent_config_sync=sync)
+
+        result = await tool.execute(mode="write")
+
         assert result.success is False
+        assert result.error == "content is required for write mode"
+        sandbox.files.write_file.assert_not_called()
+        sync.assert_not_awaited()
 
     @pytest.mark.parametrize("cls_name,_name,_target_file", _TOOL_PARAMS)
     @pytest.mark.asyncio

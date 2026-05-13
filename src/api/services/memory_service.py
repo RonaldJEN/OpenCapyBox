@@ -11,6 +11,7 @@
 
 import logging
 import math
+import posixpath
 import re
 from collections import Counter
 from datetime import datetime
@@ -50,6 +51,25 @@ _TEMPLATE_FILES: dict[str, str] = {
     "memory_md": "MEMORY.md",
     "user_md": "USER.md",
 }
+
+
+def get_agent_config_file_type_for_path(path: str, mount_path: str | None = None) -> str | None:
+    """Return file_type only for root-level Agent config files in the sandbox mount."""
+    if not path:
+        return None
+
+    if mount_path is None:
+        from src.api.services.sandbox_service import get_sandbox_mount_path
+
+        mount_path = get_sandbox_mount_path()
+
+    normalized_path = posixpath.normpath(path)
+    normalized_mount = posixpath.normpath(mount_path)
+
+    for file_type, filename in FILE_TYPE_TO_FILENAME.items():
+        if normalized_path == posixpath.join(normalized_mount, filename):
+            return file_type
+    return None
 
 
 class MemoryService:
@@ -128,6 +148,34 @@ class MemoryService:
         self.db.commit()
         self.db.refresh(record)
         return record
+
+    def upsert_memory_file_if_changed(
+        self,
+        user_id: str,
+        file_type: str,
+        content: str,
+    ) -> tuple[UserMemory, bool]:
+        """Write a memory file only when content differs.
+
+        Empty strings are valid content and are persisted.
+        """
+        record = self.get_memory_file(user_id, file_type)
+        if record and record.content == content:
+            return record, False
+
+        return self.upsert_memory_file(user_id, file_type, content), True
+
+    async def sync_agent_config_content(
+        self,
+        user_id: str,
+        file_type: str,
+        content: str,
+    ) -> tuple[UserMemory, bool]:
+        """Persist Agent config content and refresh searchable indexes when needed."""
+        record, changed = self.upsert_memory_file_if_changed(user_id, file_type, content)
+        if changed and file_type in ("user_md", "memory_md"):
+            await self.rebuild_embeddings(user_id, FILE_TYPE_TO_FILENAME[file_type], content)
+        return record, changed
 
     def get_all_memory_files(self, user_id: str) -> dict[str, str]:
         """获取用户所有记忆文件的内容"""
@@ -660,11 +708,11 @@ class MemoryService:
 
         return synced
 
-    async def sync_from_sandbox(self, user_id: str, sandbox, file_type: str) -> str | None:
+    async def sync_from_sandbox(self, user_id: str, sandbox, file_type: str) -> tuple[str, bool] | None:
         """从沙箱读取指定记忆文件并更新 DB
 
         Returns:
-            读取到的内容，读取失败返回 None
+            (读取到的内容, 内容是否变更)，读取失败返回 None
         """
         from src.api.services.sandbox_service import get_sandbox_mount_path
 
@@ -680,12 +728,16 @@ class MemoryService:
                 content = await read_file(path)
             else:
                 content = await sandbox.files.read(path)
-                if isinstance(content, bytes):
-                    content = content.decode("utf-8")
 
-            if content:
-                self.upsert_memory_file(user_id, file_type, content)
-            return content
+            if isinstance(content, bytes):
+                content = content.decode("utf-8")
+            elif content is None:
+                content = ""
+            elif not isinstance(content, str):
+                content = str(content)
+
+            _record, changed = self.upsert_memory_file_if_changed(user_id, file_type, content)
+            return content, changed
         except Exception as e:
             logger.debug("从沙箱读取记忆文件失败 (%s): %s", filename, e)
             return None

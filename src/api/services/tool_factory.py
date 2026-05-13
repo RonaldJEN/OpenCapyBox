@@ -37,6 +37,34 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+def _build_agent_config_sync(
+    *,
+    user_id: str,
+    db_session_factory: Callable,
+    mount: str,
+):
+    async def _sync(path: str, content: str) -> None:
+        from src.api.services.memory_service import (
+            MemoryService,
+            get_agent_config_file_type_for_path,
+        )
+
+        file_type = get_agent_config_file_type_for_path(path, mount)
+        if not file_type:
+            return
+
+        db = db_session_factory()
+        try:
+            svc = MemoryService(db)
+            await svc.sync_agent_config_content(user_id, file_type, content)
+        finally:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
+
+    return _sync
+
+
 def _auto_locate_skills_dir(setting_value: str) -> Path:
     if setting_value:
         return Path(setting_value).resolve()
@@ -66,13 +94,26 @@ async def create_agent_tools(
     skill_loader_ref: Optional[SkillLoader] = None
 
     bg_tracker = _BackgroundCommandTracker()
+    agent_config_sync = _build_agent_config_sync(
+        user_id=user_id,
+        db_session_factory=db_session_factory,
+        mount=mount,
+    )
 
     # 全量候选工具（类名 -> 工厂函数），延迟构造：只有不在 exclude 中的才会被实例化
     _candidates: List[tuple[str, Callable[[], object]]] = [
         # 沙箱文件工具
         ("SandboxReadTool", lambda: SandboxReadTool(sandbox=sandbox, workspace_dir=workspace_dir)),
-        ("SandboxWriteTool", lambda: SandboxWriteTool(sandbox=sandbox, workspace_dir=workspace_dir)),
-        ("SandboxEditTool", lambda: SandboxEditTool(sandbox=sandbox, workspace_dir=workspace_dir)),
+        ("SandboxWriteTool", lambda: SandboxWriteTool(
+            sandbox=sandbox,
+            workspace_dir=workspace_dir,
+            agent_config_sync=agent_config_sync,
+        )),
+        ("SandboxEditTool", lambda: SandboxEditTool(
+            sandbox=sandbox,
+            workspace_dir=workspace_dir,
+            agent_config_sync=agent_config_sync,
+        )),
         # 沙箱 Bash 工具（共享 tracker）
         ("SandboxBashTool", lambda: SandboxBashTool(sandbox=sandbox, workspace_dir=workspace_dir, tracker=bg_tracker)),
         ("SandboxBashOutputTool", lambda: SandboxBashOutputTool(tracker=bg_tracker)),
@@ -81,11 +122,23 @@ async def create_agent_tools(
         ("SandboxSessionNoteTool", lambda: SandboxSessionNoteTool(sandbox=sandbox)),
         ("SandboxRecallNoteTool", lambda: SandboxRecallNoteTool(sandbox=sandbox)),
         # 分层记忆工具
-        ("RecordDailyLogTool", lambda: RecordDailyLogTool(sandbox=sandbox, workspace_dir=mount)),
-        ("UpdateLongTermMemoryTool", lambda: UpdateLongTermMemoryTool(sandbox=sandbox, workspace_dir=mount)),
+        ("RecordDailyLogTool", lambda: RecordDailyLogTool(
+            sandbox=sandbox,
+            workspace_dir=mount,
+            agent_config_sync=agent_config_sync,
+        )),
+        ("UpdateLongTermMemoryTool", lambda: UpdateLongTermMemoryTool(
+            sandbox=sandbox,
+            workspace_dir=mount,
+            agent_config_sync=agent_config_sync,
+        )),
         ("SearchMemoryTool", lambda: SearchMemoryTool(db_session_factory=db_session_factory, user_id=user_id)),
         ("ReadUserProfileTool", lambda: ReadUserProfileTool(sandbox=sandbox, workspace_dir=mount)),
-        ("UpdateUserProfileTool", lambda: UpdateUserProfileTool(sandbox=sandbox, workspace_dir=mount)),
+        ("UpdateUserProfileTool", lambda: UpdateUserProfileTool(
+            sandbox=sandbox,
+            workspace_dir=mount,
+            agent_config_sync=agent_config_sync,
+        )),
         # Cron 定时任务管理工具
         ("ManageCronTool", lambda: ManageCronTool(
             db_session_factory=db_session_factory,

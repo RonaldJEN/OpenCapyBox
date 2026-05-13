@@ -518,7 +518,7 @@ class TestAgentServicePostRoundTasks:
         svc = make_agent_service()
 
         mock_mem_svc = MagicMock()
-        mock_mem_svc.sync_from_sandbox = AsyncMock(return_value="# Memory content")
+        mock_mem_svc.sync_from_sandbox = AsyncMock(return_value=("# Memory content", True))
         mock_mem_svc.rebuild_embeddings = AsyncMock(return_value=3)
 
         mock_db = MagicMock()
@@ -531,6 +531,25 @@ class TestAgentServicePostRoundTasks:
         assert mock_mem_svc.sync_from_sandbox.call_count == 4
         # 仅 user_md 和 memory_md 需要 rebuild_embeddings
         assert mock_mem_svc.rebuild_embeddings.call_count == 2
+        mock_db.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sync_memory_to_db_skips_embedding_rebuild_when_unchanged(self):
+        """dirty flag 兜底同步读到未变化内容时不应重复重建 embedding"""
+        svc = make_agent_service()
+
+        mock_mem_svc = MagicMock()
+        mock_mem_svc.sync_from_sandbox = AsyncMock(return_value=("# Same content", False))
+        mock_mem_svc.rebuild_embeddings = AsyncMock(return_value=3)
+
+        mock_db = MagicMock()
+
+        with patch("src.api.models.database.SessionLocal", return_value=mock_db):
+            with patch("src.api.services.memory_service.MemoryService", return_value=mock_mem_svc):
+                await svc._sync_memory_to_db()
+
+        assert mock_mem_svc.sync_from_sandbox.call_count == 4
+        mock_mem_svc.rebuild_embeddings.assert_not_awaited()
         mock_db.close.assert_called_once()
 
 

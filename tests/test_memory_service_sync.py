@@ -130,3 +130,125 @@ async def test_sandbox_whitespace_only_treated_as_empty():
 
     assert count == 1
     sandbox.files.write_file.assert_called_once()
+
+
+def test_agent_config_path_matches_only_mount_root():
+    """仅沙箱根目录四个配置文件会映射为 agent 配置"""
+    from src.api.services.memory_service import get_agent_config_file_type_for_path
+
+    assert get_agent_config_file_type_for_path("/home/user/USER.md", "/home/user") == "user_md"
+    assert get_agent_config_file_type_for_path("/home/user/MEMORY.md", "/home/user") == "memory_md"
+    assert get_agent_config_file_type_for_path("/home/user/SOUL.md", "/home/user") == "soul_md"
+    assert get_agent_config_file_type_for_path("/home/user/AGENTS.md", "/home/user") == "agents_md"
+    assert get_agent_config_file_type_for_path("/home/user/sessions/run-1/AGENTS.md", "/home/user") is None
+    assert get_agent_config_file_type_for_path("/home/user/project/AGENTS.md", "/home/user") is None
+
+
+@pytest.mark.asyncio
+async def test_sync_from_sandbox_persists_empty_string():
+    """从沙箱读到空字符串也应入库"""
+    from src.api.services.memory_service import MemoryService
+
+    record = MagicMock()
+    record.content = "old content"
+    record.version = 1
+    db = make_query_db(first=record)
+    svc = MemoryService(db)
+    sandbox = _make_sandbox({"MEMORY.md": ""})
+
+    with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
+        result = await svc.sync_from_sandbox("user-1", sandbox, "memory_md")
+
+    assert result == ("", True)
+    content, changed = result
+    assert content == ""
+    assert changed is True
+    assert record.content == ""
+    assert record.version == 2
+    db.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_from_sandbox_same_content_does_not_bump_version():
+    """沙箱内容与 DB 相同则不重复 upsert"""
+    from src.api.services.memory_service import MemoryService
+
+    record = MagicMock()
+    record.content = "same content"
+    record.version = 7
+    db = make_query_db(first=record)
+    svc = MemoryService(db)
+    sandbox = _make_sandbox({"USER.md": "same content"})
+
+    with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
+        result = await svc.sync_from_sandbox("user-1", sandbox, "user_md")
+
+    assert result == ("same content", False)
+    content, changed = result
+    assert content == "same content"
+    assert changed is False
+    assert record.version == 7
+    db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sync_from_sandbox_missing_file_does_not_modify_db():
+    """文件缺失或读取失败不应改 DB"""
+    from src.api.services.memory_service import MemoryService
+
+    record = MagicMock()
+    record.content = "old content"
+    record.version = 3
+    db = make_query_db(first=record)
+    svc = MemoryService(db)
+    sandbox = _make_sandbox({"SOUL.md": FileNotFoundError("not found")})
+
+    with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
+        content = await svc.sync_from_sandbox("user-1", sandbox, "soul_md")
+
+    assert content is None
+    assert record.content == "old content"
+    assert record.version == 3
+    db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sync_agent_config_content_rebuilds_empty_memory_embeddings():
+    """USER/MEMORY 变更为空内容时也会清理旧 embedding"""
+    from src.api.services.memory_service import MemoryService
+
+    record = MagicMock()
+    svc = MemoryService(make_query_db())
+    svc.upsert_memory_file_if_changed = MagicMock(return_value=(record, True))
+    svc.rebuild_embeddings = AsyncMock(return_value=0)
+
+    returned, changed = await svc.sync_agent_config_content("user-1", "memory_md", "")
+
+    assert returned is record
+    assert changed is True
+    svc.rebuild_embeddings.assert_awaited_once_with("user-1", "MEMORY.md", "")
+
+
+@pytest.mark.asyncio
+async def test_tool_factory_agent_config_sync_filters_and_persists_root_file():
+    """工具层同步回调只处理根目录配置文件"""
+    from src.api.services.tool_factory import _build_agent_config_sync
+
+    db = MagicMock()
+    db_session_factory = MagicMock(return_value=db)
+
+    with patch("src.api.services.memory_service.MemoryService") as MockMemoryService:
+        svc = MockMemoryService.return_value
+        svc.sync_agent_config_content = AsyncMock()
+        sync = _build_agent_config_sync(
+            user_id="user-1",
+            db_session_factory=db_session_factory,
+            mount="/home/user",
+        )
+
+        await sync("/home/user/AGENTS.md", "root rules")
+        await sync("/home/user/sessions/run-1/AGENTS.md", "session rules")
+
+    svc.sync_agent_config_content.assert_awaited_once_with("user-1", "agents_md", "root rules")
+    db_session_factory.assert_called_once()
+    db.close.assert_called_once()

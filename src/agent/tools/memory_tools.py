@@ -10,13 +10,16 @@
 
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from opensandbox import Sandbox
 
 from .base import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
+
+AgentConfigSync = Callable[[str, str], Awaitable[None]]
+_CONTENT_MISSING = object()
 
 
 async def _sandbox_read_text(sandbox: Sandbox, file_path: str) -> str:
@@ -47,19 +50,39 @@ async def _sandbox_write_text(sandbox: Sandbox, file_path: str, content: str) ->
         await sandbox.files.write(file_path, content.encode("utf-8"))
 
 
-async def _sandbox_append_text(sandbox: Sandbox, file_path: str, content: str) -> None:
+async def _sandbox_append_text(sandbox: Sandbox, file_path: str, content: str) -> str:
     """Append text by read-modify-write via sandbox files API."""
     existing = await _sandbox_read_text(sandbox, file_path)
     merged = f"{existing}{content}" if existing else content
     await _sandbox_write_text(sandbox, file_path, merged)
+    return merged
+
+
+async def _sync_agent_config_after_write(
+    sync: AgentConfigSync | None,
+    file_path: str,
+    content: str,
+) -> None:
+    if sync is None:
+        return
+    try:
+        await sync(file_path, content)
+    except Exception as exc:
+        logger.warning("同步 Agent 配置文件到 DB 失败 (%s): %s", file_path, exc)
 
 
 class RecordDailyLogTool(Tool):
     """追加结构化记忆到 MEMORY.md（长期持久化）"""
 
-    def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        workspace_dir: str = "/home/user",
+        agent_config_sync: AgentConfigSync | None = None,
+    ):
         self._sandbox = sandbox
         self._workspace_dir = workspace_dir
+        self._agent_config_sync = agent_config_sync
 
     @property
     def name(self) -> str:
@@ -93,6 +116,9 @@ class RecordDailyLogTool(Tool):
 
     async def execute(self, content: str, category: str = "general") -> ToolResult:
         try:
+            if not content or not content.strip():
+                return ToolResult(success=False, content="", error="content is required")
+
             today = datetime.now().strftime("%Y-%m-%d")
             time_str = datetime.now().strftime("%H:%M:%S")
             file_path = f"{self._workspace_dir}/MEMORY.md"
@@ -104,7 +130,8 @@ class RecordDailyLogTool(Tool):
             )
 
             # 追加到长期记忆文件
-            await _sandbox_append_text(self._sandbox, file_path, entry)
+            merged = await _sandbox_append_text(self._sandbox, file_path, entry)
+            await _sync_agent_config_after_write(self._agent_config_sync, file_path, merged)
 
             return ToolResult(
                 success=True,
@@ -117,9 +144,15 @@ class RecordDailyLogTool(Tool):
 class UpdateLongTermMemoryTool(Tool):
     """更新 MEMORY.md（长期知识/共识）"""
 
-    def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        workspace_dir: str = "/home/user",
+        agent_config_sync: AgentConfigSync | None = None,
+    ):
         self._sandbox = sandbox
         self._workspace_dir = workspace_dir
+        self._agent_config_sync = agent_config_sync
 
     @property
     def name(self) -> str:
@@ -147,13 +180,13 @@ class UpdateLongTermMemoryTool(Tool):
                 },
                 "content": {
                     "type": "string",
-                    "description": "Content to write/append (required for 'write' and 'append' modes)",
+                    "description": "Content to write/append (required for write and append; pass empty string explicitly in write mode to clear the file)",
                 },
             },
             "required": ["mode"],
         }
 
-    async def execute(self, mode: str, content: str = "") -> ToolResult:
+    async def execute(self, mode: str, content: Any = _CONTENT_MISSING) -> ToolResult:
         try:
             file_path = f"{self._workspace_dir}/MEMORY.md"
 
@@ -165,15 +198,23 @@ class UpdateLongTermMemoryTool(Tool):
                     return ToolResult(success=True, content="(MEMORY.md does not exist yet)")
 
             elif mode == "write":
-                if not content:
+                if content is _CONTENT_MISSING:
                     return ToolResult(success=False, content="", error="content is required for write mode")
+                if not isinstance(content, str):
+                    return ToolResult(success=False, content="", error="content must be a string")
                 await _sandbox_write_text(self._sandbox, file_path, content)
+                await _sync_agent_config_after_write(self._agent_config_sync, file_path, content)
                 return ToolResult(success=True, content=f"MEMORY.md updated ({len(content)} chars)")
 
             elif mode == "append":
+                if content is _CONTENT_MISSING:
+                    return ToolResult(success=False, content="", error="content is required for append mode")
+                if not isinstance(content, str):
+                    return ToolResult(success=False, content="", error="content must be a string")
                 if not content:
                     return ToolResult(success=False, content="", error="content is required for append mode")
-                await _sandbox_append_text(self._sandbox, file_path, f"\n{content}\n")
+                merged = await _sandbox_append_text(self._sandbox, file_path, f"\n{content}\n")
+                await _sync_agent_config_after_write(self._agent_config_sync, file_path, merged)
                 return ToolResult(success=True, content=f"Appended to MEMORY.md ({len(content)} chars)")
 
             else:
@@ -310,9 +351,15 @@ class ReadUserProfileTool(Tool):
 class UpdateUserProfileTool(Tool):
     """读写 USER.md（用户画像）"""
 
-    def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        workspace_dir: str = "/home/user",
+        agent_config_sync: AgentConfigSync | None = None,
+    ):
         self._sandbox = sandbox
         self._workspace_dir = workspace_dir
+        self._agent_config_sync = agent_config_sync
 
     @property
     def name(self) -> str:
@@ -339,13 +386,13 @@ class UpdateUserProfileTool(Tool):
                 },
                 "content": {
                     "type": "string",
-                    "description": "Content to write/append (required for 'write' and 'append' modes)",
+                    "description": "Content to write/append (required for write and append; pass empty string explicitly in write mode to clear the file)",
                 },
             },
             "required": ["mode"],
         }
 
-    async def execute(self, mode: str, content: str = "") -> ToolResult:
+    async def execute(self, mode: str, content: Any = _CONTENT_MISSING) -> ToolResult:
         try:
             file_path = f"{self._workspace_dir}/USER.md"
 
@@ -357,15 +404,23 @@ class UpdateUserProfileTool(Tool):
                     return ToolResult(success=True, content="(USER.md does not exist yet)")
 
             elif mode == "write":
-                if not content:
+                if content is _CONTENT_MISSING:
                     return ToolResult(success=False, content="", error="content is required for write mode")
+                if not isinstance(content, str):
+                    return ToolResult(success=False, content="", error="content must be a string")
                 await _sandbox_write_text(self._sandbox, file_path, content)
+                await _sync_agent_config_after_write(self._agent_config_sync, file_path, content)
                 return ToolResult(success=True, content=f"USER.md updated ({len(content)} chars)")
 
             elif mode == "append":
+                if content is _CONTENT_MISSING:
+                    return ToolResult(success=False, content="", error="content is required for append mode")
+                if not isinstance(content, str):
+                    return ToolResult(success=False, content="", error="content must be a string")
                 if not content:
                     return ToolResult(success=False, content="", error="content is required for append mode")
-                await _sandbox_append_text(self._sandbox, file_path, f"\n{content}\n")
+                merged = await _sandbox_append_text(self._sandbox, file_path, f"\n{content}\n")
+                await _sync_agent_config_after_write(self._agent_config_sync, file_path, merged)
                 return ToolResult(success=True, content=f"Appended to USER.md ({len(content)} chars)")
 
             else:
