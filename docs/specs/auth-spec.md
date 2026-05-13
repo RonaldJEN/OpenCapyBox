@@ -27,7 +27,6 @@
 | `token_limit_per_week` | BigInteger | nullable | 单周 token 上限；非负整数，`NULL` 表示不限 |
 | `last_login_at` | DateTime | nullable | 最近登录时间 |
 | `token_generation` | Integer | NOT NULL, default 0 | 凭据代次；签发 JWT 时写入，校验时必须严格相等 |
-| `deleted_at` | DateTime | nullable | 软删除时间戳；非空表示已删除，查询默认排除 |
 | `created_by` | String(100) | nullable | 创建人 |
 | `created_at` | DateTime | NOT NULL | 创建时间 |
 | `updated_at` | DateTime | NOT NULL | 更新时间 |
@@ -79,11 +78,11 @@ LDAP 用户仍由 `auth_users` 表控制是否开通、是否启用、是否管�
 - `get_current_user` 是全局依赖，几乎所有端点（除 `/login`、`/models`、`/health`）都注入
 - `get_current_user` 解码 JWT 后必须查询 `auth_users.enabled=true`
 - `get_current_user` 解码 JWT 后必须校验 `gen == user.token_generation`（严格相等，无精度问题）
-- 禁用用户、重置密码、删除用户时递增 `token_generation`，使所有旧 token 立即失效
+- `get_current_user` 解码 JWT 后必须校验 `iat >= auth_users.created_at`（按秒比较），避免同名账号硬删除后重建时旧 token 重新生效
+- 禁用用户、重置密码时递增 `token_generation`，使所有旧 token 立即失效
 - 登录时将当前 `token_generation` 写入 JWT `gen` 字段
-- 删除用户为软删除（设置 `deleted_at`），同时禁用并递增 `token_generation`
-- 管理端用户列表和概览统计必须过滤 `deleted_at IS NULL`，不展示已软删除用户
-- 软删除后的 `user_id` 禁止复用（防止新用户继承旧会话/Cron 数据）
+- 删除用户为硬删除：删除 `auth_users` 账号记录，并清理该 `user_id` 的会话、AG-UI 事件、LLM 调用记录、Cron、记忆、Skill 配置、运行状态、沙箱绑定与沙箱文件
+- 删除后的 `user_id` 可以重新创建；新账号不得继承旧用户的会话、Cron、记忆、沙箱文件或 token 使用记录
 - 创建 LDAP 用户时对 `user_id` 执行 `normalize_domain_user` 规范化（去除域前缀/邮箱后缀），与 LDAP 登录口径一致
 - `get_current_admin_user` 用于管理员路由，要求 `auth_users.is_admin=true`
 - Settings 通过 `@lru_cache` 单例化，启动后不可变
@@ -102,7 +101,7 @@ LDAP 用户仍由 `auth_users` 表控制是否开通、是否启用、是否管�
 - Token 过期 → 401
 - Token 签名无效 → 401
 - 用户被禁用 → 401，已有 token 同步失效（通过 `token_generation` 递增机制）
-- 用户被删除 → 软删除，已有 token 同步失效；`user_id` 不可复用
+- 用户被删除 → 账号行不存在，已有 token 在下一次鉴权查询 `auth_users` 时失效；`user_id` 可重新创建且不继承旧数据
 - 无 Authorization header → 401
 
 ## 6. 可观测性

@@ -10,10 +10,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from src.api.models.agui_event import AGUIEventLog
 from src.api.models.auth_user import AuthUser
+from src.api.models.conversation_message import ConversationMessage
+from src.api.models.cron_fire import CronFire
+from src.api.models.cron_job import CronJob
 from src.api.models.database import Base
 from src.api.models.llm_call_record import LLMCallRecord
+from src.api.models.round import Round
+from src.api.models.run_cancel_request import RunCancelRequest
 from src.api.models.session import Session
+from src.api.models.user_memory import CronJobRun, MemoryEmbedding, UserMemory, UserSkillConfig
+from src.api.models.user_run_lock import UserRunLock
+from src.api.models.user_sandbox import UserSandbox
 from src.api.services.auth_service import (
     authenticate_ldap_credentials,
     bootstrap_auth_users,
@@ -272,10 +281,89 @@ def test_delete_auth_user_removes_account(db):
 
     assert deleted_user_id == "demo-delete"
     row = db.query(AuthUser).filter(AuthUser.user_id == "demo-delete").first()
-    assert row is not None
-    assert row.deleted_at is not None
-    assert row.enabled is False
+    assert row is None
     assert get_auth_user(db, "demo-delete") is None
+
+
+def test_delete_auth_user_purges_owned_data(db):
+    create_simple_user(
+        db,
+        username="purge-user",
+        password="pass123",
+        enabled=True,
+        is_admin=False,
+        token_limit_per_week=None,
+        token_limit_per_month=None,
+        created_by="admin",
+    )
+    create_simple_user(
+        db,
+        username="keep-user",
+        password="pass123",
+        enabled=True,
+        is_admin=False,
+        token_limit_per_week=None,
+        token_limit_per_month=None,
+        created_by="admin",
+    )
+
+    now = now_naive()
+    db.add(Session(id="s-purge", user_id="purge-user", title="old", status="active"))
+    db.add(Session(id="s-keep", user_id="keep-user", title="keep", status="active"))
+    db.add(Round(id="r-purge", session_id="s-purge", user_message="hello", status="completed"))
+    db.add(Round(id="r-keep", session_id="s-keep", user_message="hello", status="completed"))
+    db.add(ConversationMessage(session_id="s-purge", round_id="r-purge", sequence=1, role="user", content="hi"))
+    db.add(AGUIEventLog(run_id="r-purge", event_type="RUN_STARTED", payload="{}", sequence=1))
+    db.add(
+        LLMCallRecord(
+            session_id="s-purge",
+            round_id="r-purge",
+            step_index=1,
+            request_messages="[]",
+            request_tools="[]",
+        )
+    )
+    cron_job = CronJob(
+        user_id="purge-user",
+        name="daily",
+        cron_expr="0 9 * * *",
+        description="old job",
+        content="run",
+        enabled=True,
+    )
+    db.add(cron_job)
+    db.flush()
+    db.add(CronFire(id="fire-purge", job_id=cron_job.id, scheduled_at=now))
+    db.add(CronJobRun(id="run-purge", user_id="purge-user", job_name="daily", cron_expr="0 9 * * *", status="success"))
+    db.add(UserMemory(user_id="purge-user", file_type="user_md", content="old memory"))
+    db.add(MemoryEmbedding(user_id="purge-user", file_path="memory.md", chunk_index=0, chunk_text="old chunk"))
+    db.add(UserSkillConfig(user_id="purge-user", skill_name="docx", enabled=False))
+    db.add(RunCancelRequest(session_id="s-purge", user_id="purge-user"))
+    db.add(UserRunLock(user_id="purge-user", session_id="s-purge"))
+    db.add(UserSandbox(id="usb-purge", user_id="purge-user", sandbox_id="sbx-old", status="active"))
+    db.add(UserMemory(user_id="keep-user", file_type="user_md", content="keep memory"))
+    db.commit()
+
+    delete_auth_user(db, user_id="purge-user")
+
+    assert db.query(AuthUser).filter(AuthUser.user_id == "purge-user").first() is None
+    assert db.query(Session).filter(Session.user_id == "purge-user").count() == 0
+    assert db.query(Round).filter(Round.id == "r-purge").count() == 0
+    assert db.query(ConversationMessage).filter(ConversationMessage.session_id == "s-purge").count() == 0
+    assert db.query(AGUIEventLog).filter(AGUIEventLog.run_id == "r-purge").count() == 0
+    assert db.query(LLMCallRecord).filter(LLMCallRecord.session_id == "s-purge").count() == 0
+    assert db.query(CronJob).filter(CronJob.user_id == "purge-user").count() == 0
+    assert db.query(CronFire).filter(CronFire.id == "fire-purge").count() == 0
+    assert db.query(CronJobRun).filter(CronJobRun.user_id == "purge-user").count() == 0
+    assert db.query(UserMemory).filter(UserMemory.user_id == "purge-user").count() == 0
+    assert db.query(MemoryEmbedding).filter(MemoryEmbedding.user_id == "purge-user").count() == 0
+    assert db.query(UserSkillConfig).filter(UserSkillConfig.user_id == "purge-user").count() == 0
+    assert db.query(RunCancelRequest).filter(RunCancelRequest.user_id == "purge-user").count() == 0
+    assert db.query(UserRunLock).filter(UserRunLock.user_id == "purge-user").count() == 0
+    assert db.query(UserSandbox).filter(UserSandbox.user_id == "purge-user").count() == 0
+    assert db.query(AuthUser).filter(AuthUser.user_id == "keep-user").count() == 1
+    assert db.query(Session).filter(Session.user_id == "keep-user").count() == 1
+    assert db.query(UserMemory).filter(UserMemory.user_id == "keep-user").count() == 1
 
 
 @pytest.mark.parametrize(
@@ -466,7 +554,7 @@ def test_reenable_user_preserves_token_generation(db):
     assert user.token_generation == token_generation
 
 
-def test_cannot_recreate_deleted_user_id(db):
+def test_can_recreate_deleted_simple_user_id(db):
     create_simple_user(
         db,
         username="reuse-test",
@@ -479,26 +567,26 @@ def test_cannot_recreate_deleted_user_id(db):
     )
     delete_auth_user(db, user_id="reuse-test")
 
-    with pytest.raises(HTTPException) as exc_info:
-        create_simple_user(
-            db,
-            username="reuse-test",
-            password="pass2",
-            enabled=True,
-            is_admin=False,
-            token_limit_per_week=None,
-            token_limit_per_month=None,
-            created_by="admin",
-        )
+    user = create_simple_user(
+        db,
+        username="reuse-test",
+        password="pass2",
+        enabled=True,
+        is_admin=False,
+        token_limit_per_week=None,
+        token_limit_per_month=None,
+        created_by="admin",
+    )
 
-    assert exc_info.value.status_code == 409
-    assert "历史数据" in exc_info.value.detail
+    assert user.user_id == "reuse-test"
+    assert user.token_generation == 0
+    assert verify_password("pass2", user.password_hash) is True
 
 
-def test_soft_delete_increments_token_generation(db):
+def test_can_recreate_deleted_ldap_user_id(db):
     create_simple_user(
         db,
-        username="del-tva",
+        username="reuse-ldap",
         password="pass",
         enabled=True,
         is_admin=False,
@@ -507,10 +595,20 @@ def test_soft_delete_increments_token_generation(db):
         created_by="admin",
     )
 
-    delete_auth_user(db, user_id="del-tva")
-    row = db.query(AuthUser).filter(AuthUser.user_id == "del-tva").first()
+    delete_auth_user(db, user_id="reuse-ldap")
+    user = create_ldap_user(
+        db,
+        user_id="reuse-ldap",
+        username=None,
+        enabled=True,
+        is_admin=False,
+        token_limit_per_week=None,
+        token_limit_per_month=None,
+        created_by="admin",
+    )
 
-    assert row.token_generation == 1
+    assert user.user_id == "reuse-ldap"
+    assert user.auth_type == "ldap"
 
 
 def test_create_ldap_user_normalizes_domain_prefix(db):

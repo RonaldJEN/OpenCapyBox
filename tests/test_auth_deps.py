@@ -1,5 +1,6 @@
 """get_current_user Bearer 鉴权依赖单元测试"""
 
+from datetime import datetime
 import pytest
 from unittest.mock import patch, MagicMock
 from fastapi import HTTPException
@@ -152,6 +153,36 @@ class TestGetCurrentUser:
         # 同一秒内禁用再启用
         update_user_enabled(db, user_id="demo", enabled=False)
         update_user_enabled(db, user_id="demo", enabled=True)
+
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(credentials=credentials, db=db)
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_token_rejected_after_user_id_recreated(self, db):
+        """同名账号硬删除后重建，旧账号签发的 token 不可复用。"""
+        from src.api.deps import create_access_token, get_current_user
+        from src.api.services.auth_service import create_simple_user, delete_auth_user
+        from src.api.utils.timezone import get_timezone
+
+        issued_at = 1_700_000_000
+        with patch("src.api.deps.time.time", return_value=issued_at):
+            token, _ = create_access_token("demo", token_generation=0, expires_in_seconds=3600)
+
+        delete_auth_user(db, user_id="demo")
+        recreated = create_simple_user(
+            db,
+            username="demo",
+            password="new-pass",
+            enabled=True,
+            is_admin=False,
+            token_limit_per_week=None,
+            token_limit_per_month=None,
+            created_by="admin",
+        )
+        recreated.created_at = datetime.fromtimestamp(issued_at + 60, tz=get_timezone()).replace(tzinfo=None)
+        db.commit()
 
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
         with pytest.raises(HTTPException) as exc_info:

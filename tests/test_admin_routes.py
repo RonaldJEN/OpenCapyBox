@@ -1,6 +1,6 @@
 """管理后台路由测试。"""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -10,10 +10,11 @@ from src.api.models.database import get_db
 from src.api.routes import admin as admin_routes
 
 
-def _make_client(*, admin_enabled: bool) -> TestClient:
+def _make_client(*, admin_enabled: bool, db=None) -> TestClient:
     app = FastAPI()
     app.include_router(admin_routes.router, prefix="/admin")
-    app.dependency_overrides[get_db] = lambda: MagicMock()
+    test_db = db or MagicMock()
+    app.dependency_overrides[get_db] = lambda: test_db
 
     if admin_enabled:
         app.dependency_overrides[get_current_admin_user] = lambda: "admin"
@@ -314,14 +315,96 @@ class TestAdminRouter:
         update_mock.assert_not_called()
 
     def test_delete_user_delegates_to_service(self):
-        client = _make_client(admin_enabled=True)
+        db = MagicMock()
+        client = _make_client(admin_enabled=True, db=db)
+        user = MagicMock()
+        user.user_id = "demo"
+        db.query.return_value.filter.return_value.first.side_effect = [user, None, None, None]
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = None
 
-        with patch("src.api.routes.admin.delete_auth_user", return_value="demo") as delete_mock:
-            resp = client.delete("/admin/users/demo")
+        with patch("src.api.routes.admin.get_agent_pool") as pool_mock:
+            with patch("src.api.routes.admin.SandboxSessionService", return_value=sandbox_service):
+                with patch("src.api.routes.admin.delete_auth_user", return_value="demo") as delete_mock:
+                    resp = client.delete("/admin/users/demo")
 
         assert resp.status_code == 200
         assert resp.json() == {"user_id": "demo", "deleted": True}
+        pool_mock.return_value.invalidate_user.assert_called_once_with("demo")
+        sandbox_service.kill.assert_not_called()
         assert delete_mock.call_args.kwargs["user_id"] == "demo"
+
+    def test_delete_user_kills_sandbox_before_service(self):
+        db = MagicMock()
+        client = _make_client(admin_enabled=True, db=db)
+        user = MagicMock()
+        user.user_id = "demo"
+        user_sandbox = MagicMock()
+        user_sandbox.sandbox_id = "sbx-demo"
+        db.query.return_value.filter.return_value.first.side_effect = [user, None, None, user_sandbox]
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = None
+        sandbox_service.kill = AsyncMock(return_value=True)
+
+        with patch("src.api.routes.admin.get_agent_pool"):
+            with patch("src.api.routes.admin.SandboxSessionService", return_value=sandbox_service):
+                with patch("src.api.routes.admin.delete_auth_user", return_value="demo") as delete_mock:
+                    resp = client.delete("/admin/users/demo")
+
+        assert resp.status_code == 200
+        sandbox_service.kill.assert_awaited_once_with("demo", "sbx-demo")
+        delete_mock.assert_called_once()
+
+    def test_delete_user_rejects_sandbox_cleanup_failure(self):
+        db = MagicMock()
+        client = _make_client(admin_enabled=True, db=db)
+        user = MagicMock()
+        user.user_id = "demo"
+        user_sandbox = MagicMock()
+        user_sandbox.sandbox_id = "sbx-demo"
+        db.query.return_value.filter.return_value.first.side_effect = [user, None, None, user_sandbox]
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = None
+        sandbox_service.kill = AsyncMock(return_value=False)
+
+        with patch("src.api.routes.admin.get_agent_pool"):
+            with patch("src.api.routes.admin.SandboxSessionService", return_value=sandbox_service):
+                with patch("src.api.routes.admin.delete_auth_user") as delete_mock:
+                    resp = client.delete("/admin/users/demo")
+
+        assert resp.status_code == 409
+        assert "沙箱清理失败" in resp.json()["detail"]
+        delete_mock.assert_not_called()
+
+    def test_delete_user_rejects_active_run_lock(self):
+        db = MagicMock()
+        client = _make_client(admin_enabled=True, db=db)
+        user = MagicMock()
+        user.user_id = "demo"
+        active_lock = MagicMock()
+        db.query.return_value.filter.return_value.first.side_effect = [user, active_lock]
+
+        with patch("src.api.routes.admin.delete_auth_user") as delete_mock:
+            resp = client.delete("/admin/users/demo")
+
+        assert resp.status_code == 409
+        assert "正在运行的任务" in resp.json()["detail"]
+        delete_mock.assert_not_called()
+
+    def test_delete_user_rejects_running_cron(self):
+        db = MagicMock()
+        client = _make_client(admin_enabled=True, db=db)
+        user = MagicMock()
+        user.user_id = "demo"
+        running_cron = MagicMock()
+        db.query.return_value.filter.return_value.first.side_effect = [user, None, running_cron]
+
+        with patch("src.api.routes.admin.delete_auth_user") as delete_mock:
+            resp = client.delete("/admin/users/demo")
+
+        assert resp.status_code == 409
+        assert "正在运行的定时任务" in resp.json()["detail"]
+        delete_mock.assert_not_called()
 
     def test_admin_cannot_delete_self(self):
         client = _make_client(admin_enabled=True)

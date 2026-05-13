@@ -22,7 +22,6 @@ class AuthUser(Base):
     token_limit_per_week = Column(BigInteger, nullable=True)
     last_login_at = Column(DateTime, nullable=True)
     token_generation = Column(Integer, nullable=False, default=0, server_default=text("0"))
-    deleted_at = Column(DateTime, nullable=True)
     created_by = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=now_naive, nullable=False)
     updated_at = Column(DateTime, default=now_naive, onupdate=now_naive, nullable=False)

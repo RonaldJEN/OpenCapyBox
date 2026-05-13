@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session as DBSession
 from src.api.config import get_settings
 from src.api.models.database import SessionLocal, get_db
 from src.api.services.auth_service import get_enabled_user, require_admin_user
+from src.api.utils.timezone import get_timezone
 
 _ISSUER = "opencapybox"
 _ALGORITHM = "HS256"
@@ -66,7 +67,7 @@ def verify_access_token(token: str, db: DBSession | None = None) -> str:
             settings.auth_secret_key,
             algorithms=[_ALGORITHM],
             issuer=_ISSUER,
-            options={"require": ["exp", "iss", "sub"]},
+            options={"require": ["exp", "iat", "iss", "sub"]},
         )
 
         user_id = payload.get("sub")
@@ -82,6 +83,16 @@ def verify_access_token(token: str, db: DBSession | None = None) -> str:
         token_gen = payload.get("gen")
         if token_gen is None or token_gen != user.token_generation:
             raise jwt.InvalidTokenError("token generation mismatch")
+
+        token_iat = payload.get("iat")
+        if not isinstance(token_iat, int) or isinstance(token_iat, bool):
+            raise jwt.InvalidTokenError("invalid issued-at")
+        if user.created_at:
+            created_at = user.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=get_timezone())
+            if token_iat < int(created_at.timestamp()):
+                raise jwt.InvalidTokenError("token issued before user creation")
 
         return user_id
     except jwt.ExpiredSignatureError:

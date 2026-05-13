@@ -4,6 +4,7 @@ from datetime import timedelta
 import json
 import os
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -305,3 +306,80 @@ def test_users_payload_counts_recent_user_run_lock_as_running(admin_integration_
     assert demo["running_rounds"] == 1
     assert idle["status"] == "idle"
     assert idle["running_rounds"] == 0
+
+
+def test_delete_user_rejects_recent_run_lock(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    now = now_naive()
+    db = SessionLocal()
+    db.add(
+        AuthUser(
+            user_id="demo",
+            username="demo",
+            auth_type="simple",
+            password_hash="hash",
+            enabled=True,
+            is_admin=False,
+            created_by="test",
+        )
+    )
+    db.add(UserRunLock(user_id="demo", session_id="session-lock", lock_id="lock-1", created_at=now, updated_at=now))
+    db.commit()
+    db.close()
+
+    resp = client.delete("/admin/users/demo")
+
+    assert resp.status_code == 409
+    assert "正在运行的任务" in resp.json()["detail"]
+    verify_db = SessionLocal()
+    try:
+        assert verify_db.query(AuthUser).filter(AuthUser.user_id == "demo").count() == 1
+    finally:
+        verify_db.close()
+
+
+def test_delete_user_allows_stale_run_lock(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    stale_time = now_naive() - timedelta(seconds=admin_routes.get_settings().sse_subscribe_timeout + 1)
+    db = SessionLocal()
+    db.add(
+        AuthUser(
+            user_id="demo",
+            username="demo",
+            auth_type="simple",
+            password_hash="hash",
+            enabled=True,
+            is_admin=False,
+            created_by="test",
+        )
+    )
+    db.add(
+        UserRunLock(
+            user_id="demo",
+            session_id="session-lock",
+            lock_id="lock-1",
+            created_at=stale_time,
+            updated_at=stale_time,
+        )
+    )
+    db.commit()
+    db.close()
+
+    sandbox_service = MagicMock()
+    sandbox_service.get_cached.return_value = None
+    with patch("src.api.routes.admin.get_agent_pool") as pool_mock:
+        with patch("src.api.routes.admin.SandboxSessionService", return_value=sandbox_service):
+            resp = client.delete("/admin/users/demo")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"user_id": "demo", "deleted": True}
+    pool_mock.return_value.invalidate_user.assert_called_once_with("demo")
+    sandbox_service.kill.assert_not_called()
+    verify_db = SessionLocal()
+    try:
+        assert verify_db.query(AuthUser).filter(AuthUser.user_id == "demo").count() == 0
+        assert verify_db.query(UserRunLock).filter(UserRunLock.user_id == "demo").count() == 0
+    finally:
+        verify_db.close()

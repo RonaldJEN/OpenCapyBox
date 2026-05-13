@@ -182,9 +182,8 @@ _PENDING_COLUMNS = [
     # Cron 任务表单：结构化时间配置（前端编辑回显）+ 执行内容（Agent prompt）
     ("cron_jobs", "schedule", "TEXT"),
     ("cron_jobs", "content", "TEXT NOT NULL DEFAULT ''"),
-    # auth_users: JWT 凭据代次 + 软删除
+    # auth_users: JWT 凭据代次
     ("auth_users", "token_generation", "INTEGER NOT NULL DEFAULT 0"),
-    ("auth_users", "deleted_at", f"{'DATETIME' if _IS_SQLITE else 'TIMESTAMP'}"),
 ]
 
 

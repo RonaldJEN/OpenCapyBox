@@ -8,7 +8,10 @@
 """
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from tests.helpers import make_mock_sandbox
 
 
 # ============== Fixtures ==============
@@ -48,7 +51,10 @@ def service(mock_settings):
     return SandboxSessionService()
 
 
-# mock_sandbox 已在 conftest.py 中统一定义，此处不再重复
+@pytest.fixture
+def mock_sandbox():
+    """模擬 Sandbox 實例，命令默認成功。"""
+    return make_mock_sandbox(run_return=SimpleNamespace(exit_code=0))
 
 
 # ============== SandboxSessionService 初始化 ==============
@@ -320,6 +326,7 @@ class TestKill:
         mock_sandbox.commands.run.assert_awaited_once()
         cmd = mock_sandbox.commands.run.call_args[0][0]
         assert "rm -rf" in cmd
+        assert "|| true" not in cmd
         # 再執行 kill
         mock_sandbox.kill.assert_awaited_once()
         assert service.get_cached("session-1") is None
@@ -367,20 +374,33 @@ class TestKill:
             mock_sandbox.commands.run.assert_awaited_once()
             cmd = mock_sandbox.commands.run.call_args[0][0]
             assert "rm -rf" in cmd
+            assert "|| true" not in cmd
             # 再 kill
             mock_sandbox.kill.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_kill_cleanup_fails_still_destroys(self, service, mock_sandbox):
-        """清理命令失敗不應阻斷容器銷毀"""
+    async def test_kill_cleanup_nonzero_exit_returns_false(self, service, mock_sandbox):
+        """清理命令返回非零退出碼時不得銷毀容器。"""
+        mock_sandbox.commands.run = AsyncMock(return_value=SimpleNamespace(exit_code=23))
+        service._cache["session-1"] = mock_sandbox
+
+        result = await service.kill("session-1")
+
+        assert result is False
+        mock_sandbox.kill.assert_not_awaited()
+        mock_sandbox.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_kill_cleanup_failure_returns_false(self, service, mock_sandbox):
+        """清理命令失敗時不得報告銷毀成功。"""
         mock_sandbox.commands.run = AsyncMock(side_effect=RuntimeError("command failed"))
         service._cache["session-1"] = mock_sandbox
 
         result = await service.kill("session-1")
 
-        assert result is True
-        # 清理失敗但 kill 仍然被調用
-        mock_sandbox.kill.assert_awaited_once()
+        assert result is False
+        mock_sandbox.kill.assert_not_awaited()
+        mock_sandbox.close.assert_awaited_once()
 
 
 # ============== renew ==============

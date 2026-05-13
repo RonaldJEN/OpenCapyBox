@@ -591,7 +591,7 @@ export default function AdminConsole() {
 
   const handleDeleteUser = useCallback(async (user: AdminUserItem) => {
     if (user.user_id === currentUser) return;
-    if (!window.confirm(`确认删除用户 ${user.user_id}？`)) return;
+    if (!window.confirm(`确认永久删除用户 ${user.user_id}？该用户的会话、记忆、定时任务和沙箱文件都会被清理。`)) return;
     await runUserAction(`delete-${user.user_id}`, async () => {
       await deleteAdminUser(user.user_id);
     }, '用户已删除');

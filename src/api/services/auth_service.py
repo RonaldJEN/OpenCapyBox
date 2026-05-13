@@ -9,13 +9,22 @@ from datetime import timedelta
 from fastapi import HTTPException
 from ldap3 import Connection, Server
 from ldap3.core.exceptions import LDAPBindError, LDAPCommunicationError
-from sqlalchemy import func, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import Settings, get_settings
+from src.api.models.agui_event import AGUIEventLog
 from src.api.models.auth_user import AuthUser
+from src.api.models.conversation_message import ConversationMessage
+from src.api.models.cron_fire import CronFire
+from src.api.models.cron_job import CronJob
 from src.api.models.llm_call_record import LLMCallRecord
+from src.api.models.round import Round
+from src.api.models.run_cancel_request import RunCancelRequest
 from src.api.models.session import Session
+from src.api.models.user_memory import CronJobRun, MemoryEmbedding, UserMemory, UserSkillConfig
+from src.api.models.user_run_lock import UserRunLock
+from src.api.models.user_sandbox import UserSandbox
 from src.api.utils.timezone import now_naive
 
 
@@ -103,7 +112,7 @@ def bootstrap_auth_users(db: DBSession) -> int:
 
 
 def get_auth_user(db: DBSession, user_id: str) -> AuthUser | None:
-    return db.query(AuthUser).filter(AuthUser.user_id == user_id, AuthUser.deleted_at.is_(None)).first()
+    return db.query(AuthUser).filter(AuthUser.user_id == user_id).first()
 
 
 def get_enabled_user(db: DBSession, user_id: str) -> AuthUser:
@@ -290,9 +299,8 @@ def reset_simple_user_password(db: DBSession, *, user_id: str, password: str) ->
 
 def delete_auth_user(db: DBSession, *, user_id: str) -> str:
     user = _get_existing_user(db, user_id)
-    user.deleted_at = now_naive()
-    user.enabled = False
-    user.token_generation += 1
+    _purge_user_owned_data(db, user_id=user_id)
+    db.delete(user)
     db.commit()
     return user_id
 
@@ -350,9 +358,36 @@ def _ensure_user_not_exists(db: DBSession, *, username: str, user_id: str) -> No
         .first()
     )
     if existing:
-        if existing.deleted_at is not None:
-            raise HTTPException(status_code=409, detail="该用户 ID 已被使用过且存在历史数据，不允许复用")
         raise HTTPException(status_code=409, detail="用户已存在")
+
+
+def _purge_user_owned_data(db: DBSession, *, user_id: str) -> None:
+    job_ids = [row[0] for row in db.query(CronJob.id).filter(CronJob.user_id == user_id).all()]
+    if job_ids:
+        db.query(CronFire).filter(CronFire.job_id.in_(job_ids)).delete(synchronize_session=False)
+    db.query(CronJob).filter(CronJob.user_id == user_id).delete(synchronize_session=False)
+    db.query(CronJobRun).filter(CronJobRun.user_id == user_id).delete(synchronize_session=False)
+
+    db.query(MemoryEmbedding).filter(MemoryEmbedding.user_id == user_id).delete(synchronize_session=False)
+    db.query(UserMemory).filter(UserMemory.user_id == user_id).delete(synchronize_session=False)
+    db.query(UserSkillConfig).filter(UserSkillConfig.user_id == user_id).delete(synchronize_session=False)
+
+    db.query(RunCancelRequest).filter(RunCancelRequest.user_id == user_id).delete(synchronize_session=False)
+    db.query(UserRunLock).filter(UserRunLock.user_id == user_id).delete(synchronize_session=False)
+
+    session_ids = [row[0] for row in db.query(Session.id).filter(Session.user_id == user_id).all()]
+    if session_ids:
+        round_filter = or_(Round.session_id.in_(session_ids), Round.thread_id.in_(session_ids))
+        round_ids = [row[0] for row in db.query(Round.id).filter(round_filter).all()]
+        if round_ids:
+            db.query(AGUIEventLog).filter(AGUIEventLog.run_id.in_(round_ids)).delete(synchronize_session=False)
+            db.query(LLMCallRecord).filter(LLMCallRecord.round_id.in_(round_ids)).delete(synchronize_session=False)
+        db.query(LLMCallRecord).filter(LLMCallRecord.session_id.in_(session_ids)).delete(synchronize_session=False)
+        db.query(ConversationMessage).filter(ConversationMessage.session_id.in_(session_ids)).delete(synchronize_session=False)
+        db.query(Round).filter(round_filter).delete(synchronize_session=False)
+        db.query(Session).filter(Session.id.in_(session_ids)).delete(synchronize_session=False)
+
+    db.query(UserSandbox).filter(UserSandbox.user_id == user_id).delete(synchronize_session=False)
 
 
 def _validate_simple_username(username: str) -> None:

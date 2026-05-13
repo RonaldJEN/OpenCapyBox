@@ -542,7 +542,7 @@ describe('AdminConsole 组件', () => {
       expect(resetAdminSimpleUserPassword).toHaveBeenCalledWith('demo', 'new-pass');
     });
 
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
   vi.useFakeTimers();
     fireEvent.click(screen.getByRole('button', { name: '删除 demo' }));
 
@@ -551,6 +551,7 @@ describe('AdminConsole 组件', () => {
       await Promise.resolve();
     });
 
+  expect(confirmSpy).toHaveBeenCalledWith('确认永久删除用户 demo？该用户的会话、记忆、定时任务和沙箱文件都会被清理。');
     expect(deleteAdminUser).toHaveBeenCalledWith('demo');
     expect(screen.getByRole('status')).toHaveTextContent('用户已删除');
 

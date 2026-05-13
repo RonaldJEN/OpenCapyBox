@@ -20,6 +20,7 @@ import logging
 import re
 import hashlib
 import posixpath
+import shlex
 from datetime import timedelta
 from typing import Optional
 from pathlib import Path
@@ -71,6 +72,13 @@ def to_sandbox_relative_path(path: str, mount_path: str | None = None) -> str | 
     if not normalized_path.startswith(prefix):
         return None
     return normalized_path[len(prefix):]
+
+
+def _extract_command_exit_code(execution) -> int:
+    exit_code = getattr(execution, "exit_code", None)
+    if isinstance(exit_code, int):
+        return exit_code
+    return 1 if getattr(execution, "error", None) else 0
 
 
 def _build_connection_config() -> ConnectionConfig:
@@ -459,13 +467,30 @@ class SandboxSessionService:
 
         # 🔥 銷毀前清理掛載目錄中的用戶文件
         mount_path = get_sandbox_mount_path()
+        quoted_mount_path = shlex.quote(mount_path)
         try:
-            await sandbox.commands.run(
-                f"rm -rf {mount_path}/* {mount_path}/.[!.]* 2>/dev/null || true"
+            cleanup_result = await sandbox.commands.run(
+                f"rm -rf -- {quoted_mount_path}/.[!.]* {quoted_mount_path}/..?* {quoted_mount_path}/*"
             )
+            cleanup_exit_code = _extract_command_exit_code(cleanup_result)
+            if cleanup_exit_code != 0:
+                logger.warning(
+                    "清理沙箱文件失敗 (user=%s, path=%s, exit=%s)",
+                    user_id, mount_path, cleanup_exit_code,
+                )
+                try:
+                    await sandbox.close()
+                except Exception:
+                    pass
+                return False
             logger.info("已清理沙箱掛載目錄文件 (user=%s, path=%s)", user_id, mount_path)
         except Exception as e:
-            logger.warning("清理沙箱文件失敗 (user=%s): %s — 繼續銷毀容器", user_id, e)
+            logger.warning("清理沙箱文件失敗 (user=%s): %s", user_id, e)
+            try:
+                await sandbox.close()
+            except Exception:
+                pass
+            return False
 
         try:
             await sandbox.kill()

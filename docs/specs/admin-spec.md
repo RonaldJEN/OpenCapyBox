@@ -98,8 +98,9 @@
 ### DELETE /api/admin/users/{user_id}
 
 - 响应：`{user_id: str, deleted: true}`
-- 语义：删除 `auth_users` 账号记录；历史 session / round / LLM 审计记录保留。
-- 约束：管理员不能删除当前登录账号。
+- 语义：不可恢复地删除 `auth_users` 账号记录，并清理该 `user_id` 归属的 session、round、conversation message、AG-UI event、LLM 调用记录、cron job / fire / run、memory、embedding、skill 配置、运行锁、取消请求、user_sandboxes 绑定与 sandbox 文件。
+- 同名 `user_id` 删除后可以重新创建；新账号不得看到旧用户数据。
+- 约束：管理员不能删除当前登录账号；存在新鲜 `user_run_locks.updated_at` 心跳代表的运行中用户任务或运行中的 cron run 时返回 409；sandbox 清理失败时返回 409 且不得删除用户。
 
 ### GET /api/admin/system
 
@@ -115,11 +116,13 @@
 - `rounds-tree` 端点按 session 维度分页，session 内 round 仍按 `created_at` 倒序。
 - `auth_users` 是后台用户管理的事实源。
 - 管理员不能禁用当前登录账号、不能取消自己的管理员权限、不能删除当前登录账号。
+- 删除用户是硬删除语义；禁用用户才表示保留账号与数据但禁止登录。
 
 ## 5. 失败模式
 
 - 非管理员访问：admin 接口统一返回 403。
 - 鉴权缺失或 token 无效：返回 401。
+- 删除用户时存在运行中任务、运行中 cron run 或 sandbox 清理失败：返回 409。
 
 ## 6. 可观测性
 

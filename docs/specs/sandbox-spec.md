@@ -33,7 +33,7 @@
 - `create(user_id) -> Sandbox`
 - `get_or_resume(user_id, sandbox_id) -> Sandbox` — 级联恢复: 内存缓存 -> 查询状态 -> connect/resume -> fallback create
 - `pause(user_id) -> bool`
-- `kill(user_id, sandbox_id) -> bool` — 先清理 mount 目录（rm -rf），再 kill 容器
+- `kill(user_id, sandbox_id) -> bool` — 先清理 mount 目录（rm -rf），再 kill 容器；用户删除路径必须在硬删除账号前调用
 - `renew(user_id) -> bool`
 - `push_skills(user_id, skills_dir) -> bool` — 批量上传（排除 node_modules, __pycache__, .git, .venv）
 - `push_skill(user_id, skills_dir, skill_name) -> bool` — 单个推送，幂等（跟踪已推送集合）
@@ -75,6 +75,7 @@ get_or_resume 的恢复链：
 
 - 用户存储卷名: SHA-1(user_id) 为隔离命名
 - host_path 使用 `_user_storage_host_path` 方法安全化 user_id
+- host_path 基于 `user_id` 稳定生成；删除用户时必须先成功 `kill()` 清理挂载文件与容器，再删除 `user_sandboxes` 和账号数据。若 `kill()` 返回 False，删除用户必须失败，避免同名新用户继承旧文件。
 
 ### 路径安全
 
@@ -93,7 +94,7 @@ get_or_resume 的恢复链：
 - 沙箱创建失败 -> RuntimeError
 - 沙箱连接失败（已销毁）-> 级联到 create
 - 沙箱 resume 失败 -> 级联到 create
-- kill 时沙箱不可达 -> 返回 False，DB 记录仍清理
+- kill 时沙箱不可达或挂载目录清理失败 -> 返回 False；用户删除路径不得继续清理 DB 账号数据
 - mkdir 失败 -> get_or_resume 的重试机制
 - Skill 推送失败 -> 返回 False，warning 日志
 

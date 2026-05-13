@@ -22,9 +22,11 @@ from src.api.models.database import get_db
 from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.cron_job import CronJob
+from src.api.models.user_sandbox import UserSandbox
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_memory import CronJobRun
 from src.api.models.llm_call_record import LLMCallRecord
+from src.api.services.agent_pool_service import get_agent_pool
 from src.api.services.auth_service import (
     auth_user_to_payload,
     create_ldap_user,
@@ -35,6 +37,7 @@ from src.api.services.auth_service import (
     update_user_enabled,
     update_user_token_limits,
 )
+from src.api.services.sandbox_service import SandboxSessionService
 from src.api.utils.timezone import now_naive
 
 router = APIRouter()
@@ -125,8 +128,8 @@ def _build_overview_payload(db: DBSession, days: int) -> dict[str, Any]:
     since_24h = now - timedelta(hours=24)
     since_days = now - timedelta(days=days)
 
-    users_total = db.query(func.count(AuthUser.id)).filter(AuthUser.deleted_at.is_(None)).scalar()
-    admins_total = db.query(func.count(AuthUser.id)).filter(AuthUser.is_admin.is_(True), AuthUser.deleted_at.is_(None)).scalar()
+    users_total = db.query(func.count(AuthUser.id)).scalar()
+    admins_total = db.query(func.count(AuthUser.id)).filter(AuthUser.is_admin.is_(True)).scalar()
 
     sessions_total = db.query(func.count(Session.id)).scalar()
     rounds_total = db.query(func.count(Round.id)).scalar()
@@ -554,7 +557,7 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     lock_cutoff = now - timedelta(seconds=get_settings().sse_subscribe_timeout)
 
-    auth_user_rows = db.query(AuthUser).filter(AuthUser.deleted_at.is_(None)).order_by(AuthUser.username).all()
+    auth_user_rows = db.query(AuthUser).order_by(AuthUser.username).all()
     user_ids = [user.user_id for user in auth_user_rows]
     if not user_ids:
         return {
@@ -1027,9 +1030,41 @@ async def delete_admin_auth_user(
     admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
-    """删除认证用户账号；历史会话与审计记录保留。"""
+    """硬删除认证用户账号及其用户态数据。"""
     if user_id == admin_user_id:
         raise HTTPException(status_code=400, detail="不能删除当前管理员账号")
+
+    target_user = db.query(AuthUser).filter(AuthUser.user_id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    lock_cutoff = now_naive() - timedelta(seconds=get_settings().sse_subscribe_timeout)
+    active_lock = (
+        db.query(UserRunLock)
+        .filter(UserRunLock.user_id == user_id, UserRunLock.updated_at >= lock_cutoff)
+        .first()
+    )
+    if active_lock:
+        raise HTTPException(status_code=409, detail="用户当前有正在运行的任务，无法删除")
+
+    running_cron = (
+        db.query(CronJobRun)
+        .filter(CronJobRun.user_id == user_id, CronJobRun.status == "running")
+        .first()
+    )
+    if running_cron:
+        raise HTTPException(status_code=409, detail="用户当前有正在运行的定时任务，无法删除")
+
+    get_agent_pool().invalidate_user(user_id)
+
+    sandbox_service = SandboxSessionService()
+    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+    sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+    if sandbox_id or sandbox_service.get_cached(user_id):
+        sandbox_deleted = await sandbox_service.kill(user_id, sandbox_id)
+        if not sandbox_deleted:
+            raise HTTPException(status_code=409, detail="沙箱清理失败，用户未删除")
+
     deleted_user_id = delete_auth_user(db, user_id=user_id)
     return {"user_id": deleted_user_id, "deleted": True}
 
