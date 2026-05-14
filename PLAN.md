@@ -13,6 +13,7 @@
 - 同一 session 永远串行。
 - 同一用户不同 session 在 Phase B 后默认允许并发，`user` cap 默认 3，可配置回退到 1。
 - 外部 channel 不直接碰 Agent、Round、AG-UI 表，只走 adapter/orchestrator/projection。
+- 现有 simple/LDAP 认证与 admin 用户生命周期继续作为用户事实源；channel adapter 只能提交已解析的内部 `user_id`。
 - Cron 不在早期阶段顺手迁移；等 Web/orchestrator/lane 稳定后再 channel 化。
 
 ## Hard Invariants
@@ -20,16 +21,18 @@
 第一阶段必须守住这些不变量，除非单独开行为变更 PR 并同步前端/spec/test。
 
 - Web HTTP 路径保持兼容：send/resume/abort/subscribe/running-session 语义不变。
-- Web busy 错误码保持现有前端可理解语义；内部 `BusySessionError` 不直接改变 Web 契约。
+- Web busy 第一阶段固定保持现有 429 语义；内部 `BusySessionError` 不直接改变 Web 契约。
 - AG-UI 中 `threadId == session_id`，`runId == round_id`。
 - `sequence` 继续是 per round 单调递增；`lastSequence` replay 语义不变。
 - `RUN_STARTED` 时机与现有链路等价：只有实际受理 run 后才让前端进入 running。
 - HTTP/SSE 断开不能杀掉后台 run；Web 断线后仍依赖 subscribe/replay 恢复。
 - Web abort 成功返回前必须完成当前 Web 语义需要的同步收敛，让前端可以立即本地停止并释放发送态。
 - failed round 保持 `RUN_ERROR` terminal 语义，不为 failed 合成 `RUN_FINISHED(outcome=interrupt)`。
-- interrupted round 继续通过 `RUN_FINISHED(outcome="interrupt")` 表达；resume 后旧 round 标记为 `resumed`，新建 round 承载后续执行。
-- 终态 round 的迟到非终态事件必须被丢弃，不能污染 `agui_events` replay。
+- interrupted round 继续通过 `RUN_FINISHED(outcome="interrupt")` 表达；resume 后只有被 `interrupt_id` 命中的旧 round 标记为 `resumed`，新建 round 承载后续执行。
+- resume 新 round 必须设置 `parent_run_id` 指向被中断 round，并通过 history API / frontend `RoundData.parent_run_id` 暴露。
+- 终态 round 的迟到非终态事件必须被丢弃，不能污染 `agui_events` replay；`resumed` 也纳入这类防护。
 - Web 不消费 `RunHandle.queue_state`；它只给排队型 channel 使用。
+- disabled/deleted 用户不得提交 turn；admin hard delete 用户时，未来新增的 binding、lane、delivery/cancel 派生数据必须被清理或阻止删除。
 
 ## Core Interfaces
 
@@ -116,6 +119,24 @@ class RunHandle(BaseModel):
 - `RunHandle.queue_state` 只给排队型 channel 使用，Web 不消费。
 - Web 同 session busy 的 HTTP 映射要按现有前端契约保持兼容。
 
+### Round Data Contract
+
+现有 Web history API 与前端类型已经暴露 `parent_run_id`：
+
+```python
+class RoundData(BaseModel):
+    round_id: str
+    parent_run_id: str | None = None
+    status: Literal["running", "completed", "failed", "interrupted", "cancelled", "resumed"]
+```
+
+约束：
+
+- 普通 send 创建的 round 其 `parent_run_id` 为 `None`。
+- resume 创建的新 round 其 `parent_run_id` 必须指向被 `interrupt_id` 命中的旧 round。
+- 旧 interrupted round 被 resume 后状态变为 `resumed`，但仍保留在历史中作为可读记录。
+- `resumed` 属于 subscribe terminal 状态，订阅应关闭；它也必须阻止迟到 Agent event 覆写历史。
+
 ### Turn Orchestrator
 
 ```python
@@ -134,6 +155,7 @@ class TurnOrchestrator:
 - 设置 cancel token。
 - 进入 `RunCoordinator`。
 - 调用 `AgentService.chat_agui()` 或 `resume_agui()`。
+- resume 时必须先通过 `interrupt_id` 定位父 round；只允许标记该父 round 为 `resumed`，不得批量 resolve 整个 session 的 interrupted rounds。
 - 将事件发布到 `AguiEventBus`。
 - 返回 `RunHandle` 给 Web SSE 或外部 channel worker。
 
@@ -153,6 +175,17 @@ class TurnOrchestrator:
 - 平台消息转 `NormalizedInboundTurn`。
 - 平台能力描述，如是否支持按钮、图片、线程、typing。
 - `deliver(route, outbound_message)` 发送平台消息。
+
+## Auth And User Lifecycle
+
+现有系统已经支持 simple 用户、LDAP 用户、admin 用户管理与 hard delete。Gateway 重构不能绕过这些边界。
+
+- Web adapter 继续使用现有 FastAPI auth dependency 取得当前用户。
+- 外部 channel adapter 必须先把平台身份映射到内部 auth user，再提交 `NormalizedInboundTurn`。
+- `NormalizedInboundTurn.user_id` 是内部用户 ID，不是平台用户名、显示名或 LDAP bind 字符串。
+- disabled/deleted 用户不得创建 binding、提交 turn、resume 或 cancel。
+- 用户 hard delete 时，如果存在新鲜 running lock、running cron run、running lane 或无法清理 sandbox，应返回冲突并拒绝删除。
+- 新增 `channel_session_bindings`、delivery attempts、lane/queue/cancel 派生数据时，必须定义用户删除时的清理或阻止删除策略。
 
 ## Session Binding
 
@@ -293,7 +326,7 @@ DB 仍是事实源：
 
 - `session:<session_id>`：严格串行。
 - `user:<user_id>`：并发上限默认 3，可配置。
-- `memory:<user_id>`：长期记忆写入和 memory sync 串行。
+- `memory:<user_id>`：长期记忆写入、memory file sync、agent config 写入 memory DB、memory tools 写入串行。
 - `skill:<user_id>`：skill 安装/更新串行。
 - `sandbox_lifecycle:<user_id>`：sandbox resume/pause/renew 串行，不包住整段 Agent run。
 
@@ -357,7 +390,7 @@ AGUI_REPAIR_TERMINAL_SINCE_HOURS=24
 
 ## Migration Plan
 
-1. Phase 0：收敛 spec 和兼容性基线。新增/更新 `agui-event-bus-spec.md`、`turn-orchestrator-spec.md`、`lane-coordinator-spec.md`、`chat-spec.md`、`frontend-chat-spec.md`、`sessions-spec.md`、`cron-spec.md`。
+1. Phase 0：收敛 spec 和兼容性基线。新增/更新 `agui-event-bus-spec.md`、`turn-orchestrator-spec.md`、`lane-coordinator-spec.md`、`chat-spec.md`、`frontend-chat-spec.md`、`sessions-spec.md`、`auth-spec.md`、`admin-spec.md`、`memory-spec.md`、`cron-spec.md`。
 2. Phase 1：抽出 Redis-backed `AguiEventBus`，保持 Web SSE/replay 行为不变。DB 继续作为事实源，Redis 负责跨 worker fanout。
 3. Phase 2：抽出 `RunCancelService`。取消请求继续写 DB；新增 Redis cancel fast-path；保留 Web abort 的即时收敛语义。
 4. Phase 3：抽出 `RunCoordinator Phase A`。保持旧 user cap=1，只把锁逻辑从 route 下沉。
@@ -381,14 +414,18 @@ AGUI_REPAIR_TERMINAL_SINCE_HOURS=24
 - failed round 只补 `RUN_ERROR`，不合成错误的 `RUN_FINISHED`。
 - abort 后迟到事件不写入终态 round。
 - abort 成功后前端可立即重发的 Web 语义不回归。
+- Web busy 仍返回现有 429 语义；409 只用于现有契约中定义的冲突场景。
 - Redis cancel fast-path 能命中异 worker runner；Redis 失效时 DB cancel request 仍可兜底。
 - 非法 `ReplyRoute` 被 schema 拒绝。
 - binding 并发懒创建不会因 nullable unique 坑产生重复行。
+- disabled/deleted/simple/LDAP 用户的 channel submit、resume、cancel 权限边界不绕过现有 auth 规则。
 - Phase A 保持 user cap=1。
 - Phase B 同 session 串行、同用户不同 session 可并发、user cap 可回退为 1。
 - 不同 session 的 workspace、Round、AG-UI event 不串流。
 - memory/skill/sandbox lifecycle lane 串行保护共享资源。
+- memory lane 覆盖 agent config 写入 memory DB、memory file sync、memory tools 写入，不只覆盖聊天过程中的长期记忆写入。
 - interrupted round 刷新后可恢复，resume 后旧 round 标记 resumed。
+- resume 新 round 的 `parent_run_id` 指向被 `interrupt_id` 命中的旧 round；不会误 resolve 同 session 其他 interrupted rounds。
 - projection 默认不发送 thinking。
 - interrupt projection 能生成外部平台可表达的问题消息。
 - transient/rate-limit/permanent delivery failure 被正确分类。
@@ -402,6 +439,9 @@ AGUI_REPAIR_TERMINAL_SINCE_HOURS=24
 - `docs/specs/chat-spec.md`
 - `docs/specs/frontend-chat-spec.md`
 - `docs/specs/sessions-spec.md`
+- `docs/specs/auth-spec.md`
+- `docs/specs/admin-spec.md`
+- `docs/specs/memory-spec.md`
 - `docs/specs/cron-spec.md`
 - `docs/Capy-project-md/env-reference.md`
 
@@ -423,12 +463,15 @@ AGUI_REPAIR_TERMINAL_SINCE_HOURS=24
 - `src/api/models/agui_event.py`：保持 DB replay 事实源。
 - `src/api/services/history_service.py`：配合或承担迟到事件丢弃。
 - `src/api/models/channel_session_binding.py`：新增 binding 表。
+- `src/api/services/auth_service.py`、`src/api/deps.py`：保持 simple/LDAP/admin 用户鉴权和 deleted/disabled 用户拦截。
+- `src/api/routes/admin.py`、`src/api/models/auth_user.py`：用户 hard delete 时要纳入新增 gateway 派生数据的清理/冲突判断。
+- `src/api/services/memory_service.py`、`src/agent/tools/memory_tools.py`、`src/agent/tools/sandbox_file_tools.py`、`src/api/services/tool_factory.py`：memory lane 需要覆盖 agent config/memory 文件到 memory DB 的同步写入。
 - `src/api/config.py`、`.env.example`、`docs/Capy-project-md/env-reference.md`：新增 Redis/EventBus/RunCoordinator 配置。
 
 ## Open Decisions
 
-1. Web busy 第一阶段建议保持现有错误码；若要改为 409，应单独改 frontend/spec/test。
-2. EventBus 第一阶段使用 Redis Pub/Sub + DB replay；如果后续需要持久消费组，再评估 Redis Streams。
+1. Web busy 第一阶段固定保持现有 429；若要改为 409，应单独改 frontend/spec/test。
+2. EventBus 第一阶段固定使用 Redis Pub/Sub + DB replay；如果后续需要持久消费组，再评估 Redis Streams。
 3. Lane coordinator Phase B 使用 Redis semaphore/Lua 还是 DB 锁，需要在实现前结合 SQLite/Postgres 目标再定。
 4. 外部 channel 排队是否持久化：真实接入前可以先定义接口；接入时必须有 DB 持久队列。
 5. `capy repair-terminal-runs` 是 CLI、admin API 还是复用 cron worker 触发，需要在 Phase 9 定。

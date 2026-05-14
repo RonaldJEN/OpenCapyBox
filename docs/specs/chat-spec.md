@@ -1,7 +1,7 @@
 # 聊天与 Agent 执行 (Chat) — Spec
 
 > **模块归属**: `src/api/routes/chat.py`, `src/api/services/agent_service.py`, `src/agent/agent.py`
-> **最后更新**: 2026-05-06
+> **最后更新**: 2026-05-14
 > **状态**: Draft
 
 ---
@@ -223,6 +223,32 @@ requested  ──→  acked  ──→  completed
           (worker 死亡时直接跳到 completed)
 ```
 
+### 2.7 `interrupt_resolutions` 表
+
+`ask_user` 中断恢复的结构化事实表。它记录某个 `interrupt_id` 被哪一个 resume round 接管，以及热路径当时写入 LLM 历史的 tool result 文本，用于冷启动后还原等价上下文。
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `interrupt_id` | String(36) | PK | ask_user 中断 ID；同一个 interrupt 只能恢复一次 |
+| `session_id` | String(36) | FK → `sessions.id` (CASCADE), NOT NULL, indexed | 所属会话 |
+| `parent_round_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL, indexed | 被中断并被接管的父 Round |
+| `resume_round_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL, indexed, unique | 承载恢复后执行的新 Round |
+| `tool_call_id` | String(64) | nullable | 原 ask_user tool call ID；旧数据或异常 payload 缺失时可为空 |
+| `answers_json` | Text | NOT NULL | 用户回答的结构化 JSON |
+| `resume_user_message` | Text | NOT NULL | resume round 中保存的 Q/A user 消息文本 |
+| `tool_result_content` | Text | NOT NULL | 热路径实际注入 LLM 的 tool result 文本，例如 `User answered:\n- Q?: A` |
+| `restore_strategy` | String(40) | nullable | resume 时采用的策略：`hot_replace` / `cold_replace` / `cold_fallback_user_message` |
+| `fallback_reason` | Text | nullable | 降级原因；运行时 fallback 或后续冷启动 stitching 失败时写入/更新 |
+| `created_at` | DateTime | default=now, indexed | 写入时间 |
+
+**唯一约束**: `UniqueConstraint(resume_round_id)`
+
+**语义约束**:
+
+- 每个 `interrupt_id` 最多对应一条 resolution，防止同一中断被并发恢复成多个 child round。
+- `parent_round_id` 必须与 `rounds.parent_run_id == parent_round_id` 的 `resume_round_id` 对齐；冷启动重建时若无法对齐，该 resolution 会被忽略并记录告警。
+- 同时保存 `answers_json` 与 `tool_result_content` 是有意冗余：前者是结构化事实源，后者固定当时注入 LLM 的文本格式，避免 formatter 变更导致旧会话冷恢复 prompt 漂移。
+
 ---
 
 ## 3. API 契约
@@ -343,9 +369,10 @@ SSE 事件流，格式与 `message/stream` 相同。
 | 路径 | 条件 | 行为 |
 |------|------|------|
 | **热路径** (Hot Path) | Agent 仍在内存中（未被 Pool 回收） | 将用户答案作为 `tool_result` 注入 → Agent 继续执行循环 |
-| **冷路径** (Cold Path) | Agent 已被 Pool 回收 | 将用户答案作为新 `user` 消息注入 → 启动新 Agent 执行 |
+| **冷实时路径** (Cold Resume Path) | AgentPool 已回收 pending interrupt，但本次用户正在提交 resume | 先用 `_restore_history()` 重建旧历史，再优先将用户答案回填到恢复出的 ask_user `tool_result`；若找不到可替换占位，退化为注入新 `user` 消息并记录 `fallback_reason` |
+| **冷启动历史重建** (Cold Restore Path) | resume 已完成过，之后服务重启/AgentPool 回收再加载整个 session | 读取 `interrupt_resolutions`，把 child Q/A 回填到 parent ask_user `tool_result`，并跳过对应 child resume user 消息；若回填失败，则保留 child user 消息避免语义丢失 |
 
-两种路径都会创建新的 Round，其 `parent_run_id` 指向被中断的 Round。
+恢复请求都会创建新的 Round，其 `parent_run_id` 指向被 `interrupt_id` 命中的中断 Round，并在同一事务中写入 `interrupt_resolutions`。原 Round 只在命中该 `interrupt_id` 时迁移为 `resumed`，不得批量 resolve 同 session 的其他 interrupted rounds。
 
 #### 错误码
 
@@ -649,6 +676,7 @@ INSERT INTO rounds (..., idempotency_key)
 2. **SQLite 必须使用 `NullPool`**：文件型 DB 连接开销极低，NullPool 彻底规避 QueuePool 超时阻塞 event loop 的风险。其它数据库（MySQL/Postgres）保留默认 `QueuePool`。
 3. **请求级 `db: Depends(get_db)` 在 SSE 流路径上只能用于入口校验**；进入 event_generator / producer 后，必须使用独立短生命周期 Session 做持久化。
 4. **AG-UI 事件持久化不得跨 Agent/LLM/tool 的 `await` 间隙保留未提交事务**；非 delta 事件写入后必须提交，delta 事件完成终态读取后也必须结束只读事务，避免 PostgreSQL 远端连接在 idle-in-transaction 状态被断开。
+5. **请求清理阶段的连接断开只记录日志，不改变已完成响应**：若 `get_db` 在 `db.close()` 隐式 rollback 时发现 PostgreSQL 连接已被远端关闭，记录 warning 并丢弃该连接；业务查询/提交阶段的 DB 异常仍必须正常抛出。
 
 不遵守上述规则会表现为：多并发会话切换/拉取时，`get_db` 从连接池获取连接超时，抛 `sqlalchemy.exc.TimeoutError: QueuePool limit ... connection timed out`。
 
@@ -742,6 +770,14 @@ INSERT INTO rounds (..., idempotency_key)
 6. 若全量历史都不存在真实 user（数据异常），保留尾窗作为兜底，避免注入全空导致整段失忆。
 7. 最终注入顺序为：`[summary_anchor?] + tail_window`；若无尾窗但有摘要锚点，仍注入摘要锚点。
 
+**Resume resolution stitching**:
+
+- `_rebuild_messages_from_events()` 会预载本 session 的 `interrupt_resolutions`，构建 `resolution_by_parent_round_id` 与 `resolution_by_resume_round_id` 两个索引。
+- 遇到 `status=resumed` 的 parent round 时，按 `tool_call_id` 将 ask_user 占位 `tool_result` 替换为 `tool_result_content`。
+- 替换成功后，对应 child resume round 的第一条匹配 `resume_user_message` 的真实 user 消息会被跳过；child round 的 assistant/tool 输出继续保留。
+- 替换失败时，不跳过 child user 消息，并更新该 resolution 的 `fallback_reason`，避免冷恢复丢失用户回答。
+- 连续 ask_user 链允许同一个 round 同时是上一个 interrupt 的 child、下一个 interrupt 的 parent；parent/child 两个索引互不冲突。
+
 ### 4.6 AG-UI 事件体系
 
 系统生成 22 类标准 AG-UI 事件，分为 7 个分类：
@@ -817,10 +853,13 @@ Agent 调用 ask_user 工具
 获取 asyncio.Lock (_resume_lock) ── 防止并发 resume
     │
     ▼
+按 interrupt_id 定位被中断的 Round
+    │
+    ▼
 创建新 Round (parent_run_id = 被中断的 Round)
     │
     ▼
-将原 Round 状态设为 "resumed"
+将该 interrupted Round 状态设为 "resumed"
     │
     ▼
 判断恢复路径:
@@ -833,20 +872,38 @@ Agent 调用 ask_user 工具
     │     ▼
     │   Agent 继续执行循环
     │
-    └── 冷路径: Agent 已被回收
+        └── 冷实时路径: Agent pending interrupt 已丢失
           │
           ▼
-        将用户答案作为新 user 消息注入
+                优先替换 _restore_history 重建出的 ask_user tool_result
+                    │
+                    ├── 替换成功: 继续执行循环
+                    │
+                    └── 替换失败: 将用户答案作为新 user 消息注入，并记录 fallback_reason
           │
           ▼
         启动新 Agent 执行
 ```
 
+**Resolution 写入时机**:
+
+- `POST /resume` 创建新 Round 时，同时写入 `interrupt_resolutions`。
+- `answers_json` 保存用户回答结构；`tool_result_content` 保存热路径实际注入 LLM 的文本。
+- `restore_strategy` 记录本次 resume 采用 `hot_replace`、`cold_replace` 或 `cold_fallback_user_message`。
+- `fallback_reason` 在运行时 fallback 时写入；若后续冷启动 stitching 发现已创建的 resolution 无法回填 parent tool result，也允许更新该字段。
+
+**连续 ask_user 链规则**:
+
+- parent round 用 `resolution_by_parent_round_id[parent.id]` 回填 tool result。
+- child round 若 `resolution_by_resume_round_id[child.id]` 命中，仅跳过与 `resume_user_message` 完全匹配的 child resume Q/A user 消息。
+- child round 的 assistant/tool 输出继续保留。
+- 同一个 round 可以同时是上一段恢复链的 child、下一段恢复链的 parent，两个身份不冲突。
+
 **并发保护**: `_resume_lock` 使用 `asyncio.Lock`，确保同一会话的 resume 请求不会并发执行。
 
 **冷恢复占位归一化**:
 
-- 当原中断轮次状态已为 `resumed` 时，历史重建阶段会将旧的 ask_user 占位 `tool_result`（`[Awaiting user response]`）归一化为 `[Interrupt resolved in subsequent round]`，避免刷新后继续暴露过期等待状态。
+- 当原中断轮次状态已为 `resumed` 且没有 resolution 可回填时，历史重建阶段会将旧的 ask_user 占位 `tool_result`（`[Awaiting user response]`）归一化为 `[Interrupt resolved in subsequent round]`，避免刷新后继续暴露过期等待状态。
 
 ### 4.8 LLM 调用快照持久化
 
@@ -952,10 +1009,11 @@ SSE 连接建立
 #### 实现保证
 
 1. **Finally Block**: Agent 执行的 finally 块确保无论正常完成、异常、断开还是取消，Round 都会被设置为终态
-2. **防止跨 Worker 覆写**: `complete_round` 在更新前检查 Round 当前状态——若已处于终态（`completed`/`failed`/`cancelled`），则跳过更新。这防止了以下场景：
+2. **防止跨 Worker 覆写**: `complete_round` 在更新前检查 Round 当前状态——若已处于终态（`completed`/`failed`/`cancelled`/`resumed`），则跳过状态覆写。这防止了以下场景：
    - Worker A 执行 Round，被 abort 设为 `cancelled`
    - Worker A 的 finally 块随后执行，尝试将 Round 设为 `completed`
    - 检查发现 Round 已在终态，跳过更新
+3. **Resume 竞争窗口处理**: 若 resume 已先将 parent round 标记为 `resumed`，旧 run 的迟到 `complete_round(status="interrupted")` 只允许补写展示元数据（如 `final_response`、`step_count`），不得把状态改回 `interrupted`。
 
 ---
 
@@ -970,6 +1028,8 @@ SSE 连接建立
 | **输出截断** | `finish_reason=length` | 自动重试一次（调整 prompt 或 context） | 用户无感知（自动恢复） |
 | **SSE 断开** | 连接关闭检测 | Producer 继续运行在 `_active_runners` 中，等待客户端重连通过 subscribe 恢复 | 前端检测断开，自动重连并通过 subscribe 恢复事件流 |
 | **Subscribe 超时** | 5 分钟定时器 | 发射 `RUN_ERROR(TIMEOUT)` 事件，关闭连接 | 前端收到超时事件，提示用户 |
+| **resume 冷实时替换失败** | 未找到 ask_user `tool_call_id` 或 tool result 占位 | 写入 `interrupt_resolutions.fallback_reason`，将用户答案作为新 user 消息注入 | Agent 仍继续执行，冷恢复可通过 child user 消息保留语义 |
+| **resume 冷启动 stitching 失败** | resolution 与 parent/child 不对齐，或 parent tool result 无法替换 | 不跳过 child resume user 消息，并更新/记录 `fallback_reason` | 刷新后不会丢失用户回答，但上下文形态会退化为 user Q/A |
 | **用户主动 abort（任意 worker）** | `POST /abort` 被调用且会话处于 running / init-window | 接口直接收敛 round 并尝试释放锁；释放成功返回 `cancelled(force_aborted/force_unlocked)`；本地命中 runner 时额外 `cancel()` | 释放成功后用户可立即重发 |
 | **abort 收敛后释放锁失败** | `POST /abort` 执行到锁释放阶段但 DB 冲突/异常 | 返回 `HTTP 503`，不返回 `cancelled` 假成功 | 前端保持运行态或提示重试，避免误判“已可重发” |
 | **abort 后旧 run 迟到输出** | round 已终态但仍收到后续 AG-UI 事件 | 丢弃迟到事件，不再入库，不污染 replay/UI | 前端状态保持 cancelled，不再回跳 running |
@@ -1016,6 +1076,7 @@ GET /subscribe?last_sequence={last_seq}
 | LLM 重试 | WARNING | 模型名称, 错误信息, 重试次数, 延迟时间 | 每次重试时 |
 | LLM Failover | WARNING | Primary 模型, Fallback 模型, 原始错误 | 切换 Fallback 时 |
 | 取消请求状态变化 | INFO | `session_id`, `request_id`, 新状态 | 每次状态流转时 |
+| resume resolution fallback | WARNING | `session_id`, `interrupt_id`, `parent_round_id`, `resume_round_id`, `tool_call_id`, `fallback_reason` | 冷实时替换失败或冷启动 stitching 失败时 |
 | 工具执行耗时 | DEBUG | 工具名称, `session_id`, 耗时 | 每次工具执行完成时 |
 | 心跳发送 | DEBUG | `session_id`, `round_id` | 每次心跳时 |
 | Worker 死亡检测 | WARNING | `user_id`, `session_id`, 锁龄 | abort 检测到死锁时 |

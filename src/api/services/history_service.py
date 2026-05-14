@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.agui_event import AGUIEventLog
+from src.api.models.interrupt_resolution import InterruptResolution
 from src.api.models.llm_call_record import LLMCallRecord
 from src.agent.schema.agui_events import AGUIEvent, EventType
 from typing import List, Dict, Optional, AsyncIterator, Any
@@ -55,6 +56,7 @@ class HistoryService:
         user_message: str,
         user_attachments: Optional[List[Dict]] = None,
         idempotency_key: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
     ) -> Round:
         """创建新的对话轮次
         
@@ -68,6 +70,7 @@ class HistoryService:
             user_attachments=json.dumps(user_attachments or [], ensure_ascii=False),
             status="running",
             idempotency_key=idempotency_key,
+            parent_run_id=parent_run_id,
         )
         self.db.add(round_obj)
         try:
@@ -86,6 +89,105 @@ class HistoryService:
             raise
         self.db.refresh(round_obj)
         return round_obj
+
+    def create_resume_round(
+        self,
+        session_id: str,
+        round_id: str,
+        user_message: str,
+        parent_run_id: str,
+        user_attachments: Optional[List[Dict]] = None,
+        interrupt_id: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+        answers: Optional[Dict[str, str]] = None,
+        tool_result_content: Optional[str] = None,
+        restore_strategy: Optional[str] = None,
+        fallback_reason: Optional[str] = None,
+    ) -> Round:
+        """原子创建 resume round，并将被接管的父 round 标记为 resumed。"""
+        completed_at = now_naive()
+        updated = (
+            self.db.query(Round)
+            .filter(
+                Round.id == parent_run_id,
+                Round.session_id == session_id,
+                Round.status.in_(("running", "interrupted")),
+            )
+            .update(
+                {
+                    "status": "resumed",
+                    "interrupt_payload": None,
+                    "completed_at": completed_at,
+                },
+                synchronize_session="fetch",
+            )
+        )
+        if updated != 1:
+            self.db.rollback()
+            parent_round = (
+                self.db.query(Round)
+                .filter(Round.id == parent_run_id, Round.session_id == session_id)
+                .first()
+            )
+            if not parent_round:
+                raise ValueError(f"Interrupted round not found: {parent_run_id}")
+            raise ValueError(
+                f"Round is not resumable: {parent_run_id} status={parent_round.status}"
+            )
+
+        round_obj = Round(
+            id=round_id,
+            session_id=session_id,
+            user_message=user_message,
+            user_attachments=json.dumps(user_attachments or [], ensure_ascii=False),
+            status="running",
+            parent_run_id=parent_run_id,
+        )
+        self.db.add(round_obj)
+        if interrupt_id:
+            if tool_result_content is None:
+                self.db.rollback()
+                raise ValueError("tool_result_content is required for interrupt resolution")
+            resolution = InterruptResolution(
+                interrupt_id=interrupt_id,
+                session_id=session_id,
+                parent_round_id=parent_run_id,
+                resume_round_id=round_id,
+                tool_call_id=tool_call_id,
+                answers_json=json.dumps(answers or {}, ensure_ascii=False),
+                resume_user_message=user_message,
+                tool_result_content=tool_result_content,
+                restore_strategy=restore_strategy,
+                fallback_reason=fallback_reason,
+            )
+            self.db.add(resolution)
+        try:
+            self.db.commit()
+        except IntegrityError as e:
+            self.db.rollback()
+            if interrupt_id:
+                raise ValueError(f"Interrupt already resumed: {interrupt_id}") from e
+            raise
+        except Exception:
+            self.db.rollback()
+            raise
+        self.db.refresh(round_obj)
+        return round_obj
+
+    def update_interrupt_resolution_fallback(
+        self,
+        interrupt_id: str,
+        fallback_reason: str,
+    ) -> int:
+        """记录已创建 resolution 在冷启动 stitching 阶段的降级原因。"""
+        updated = (
+            self.db.query(InterruptResolution)
+            .filter(InterruptResolution.interrupt_id == interrupt_id)
+            .update({"fallback_reason": fallback_reason}, synchronize_session="fetch")
+        )
+        if updated:
+            self.db.commit()
+        return updated
 
     def resolve_interrupted_rounds(self, session_id: str) -> int:
         """将会话中所有 interrupted 轮次标记为已解决（清除 interrupt_payload）。
@@ -107,7 +209,7 @@ class HistoryService:
         return updated
 
     # 終態集合引用 Round 模型的全局常量（唯一事實源）。
-    _TERMINAL_STATUSES = Round.COMPLETE_TERMINAL_STATUSES
+    _TERMINAL_STATUSES = Round.COMPLETE_TERMINAL_STATUSES | {"resumed"}
 
     def complete_round(
         self, round_id: str, final_response: str, step_count: int,
@@ -115,12 +217,30 @@ class HistoryService:
     ) -> Round:
         """完成对话轮次
 
-        若 round 已處於終態（completed/failed/cancelled），跳過更新並返回現有狀態，
-        避免跨 worker 的 Agent 覆寫 abort 設置的 cancelled 狀態。
+        若 round 已處於終態（completed/failed/cancelled/resumed），跳過狀態覆寫。
+        resumed round 允許接收遲到的 interrupted 完成回填展示元數據，但狀態保持 resumed。
         """
         round_obj = self.db.query(Round).filter(Round.id == round_id).first()
         if round_obj:
             if round_obj.status in self._TERMINAL_STATUSES:
+                if round_obj.status == "resumed" and status == "interrupted":
+                    changed = False
+                    if final_response and not round_obj.final_response:
+                        round_obj.final_response = final_response
+                        changed = True
+                    if (
+                        step_count is not None
+                        and (round_obj.step_count is None or step_count > round_obj.step_count)
+                    ):
+                        round_obj.step_count = step_count
+                        changed = True
+                    if round_obj.completed_at is None:
+                        round_obj.completed_at = now_naive()
+                        changed = True
+                    if changed:
+                        self.db.commit()
+                        self.db.refresh(round_obj)
+                    return round_obj
                 logger.info(
                     "Round %s 已處於終態 %s，跳過 complete_round(status=%s)",
                     round_id, round_obj.status, status,
@@ -281,6 +401,7 @@ class HistoryService:
             result.append(
                 {
                     "round_id": round_obj.id,
+                    "parent_run_id": round_obj.parent_run_id,
                     "user_message": round_obj.user_message,
                     "user_attachments": attachments,
                     "final_response": round_obj.final_response,

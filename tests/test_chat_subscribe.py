@@ -928,6 +928,7 @@ class TestSseDetachedProducer:
         service.cancel_token = None
         service.agent = MagicMock()
         service._last_saved_index = 0
+        service._pending_interrupt_round_ids = {}
 
         # 模拟 agent.run_agui 正常完成一个 round
         async def fake_run_agui(**kwargs):
@@ -1833,6 +1834,7 @@ class TestUserCancelledRoundStatus:
         service.cancel_token = None
         service.agent = MagicMock()
         service._last_saved_index = 0
+        service._pending_interrupt_round_ids = {}
 
         async def fake_run_agui(**kwargs):
             yield RunStartedEvent(threadId="test-session", runId="run-ask")

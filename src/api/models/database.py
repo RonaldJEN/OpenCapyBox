@@ -5,6 +5,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
 from pathlib import Path
+from sqlalchemy.exc import OperationalError
 
 from src.api.config import get_settings
 from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS
@@ -21,6 +22,7 @@ def _import_models():
     from src.api.models.auth_user import AuthUser as _  # noqa: F401
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
     from src.api.models.conversation_message import ConversationMessage as _  # noqa: F401
+    from src.api.models.interrupt_resolution import InterruptResolution as _  # noqa: F401
     from src.api.models.llm_call_record import LLMCallRecord as _  # noqa: F401
     from src.api.models.user_memory import (  # noqa: F401
         UserMemory, MemoryEmbedding, CronJobRun, UserSkillConfig
@@ -72,7 +74,10 @@ def get_db():
     try:
         yield db
     finally:
-        db.close()
+        try:
+            db.close()
+        except OperationalError:
+            logger.warning("关闭数据库会话时连接已断开", exc_info=True)
 
 
 def init_db():

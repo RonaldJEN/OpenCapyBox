@@ -193,7 +193,16 @@ class TestEventsToMessages:
 class TestRebuildMessagesFromEvents:
     """测试从 DB 读取 rounds + agui_events + conversation_messages 重建完整消息"""
 
-    def _make_round(self, round_id, session_id, user_message, created_at_order=0, status="completed", final_response=None):
+    def _make_round(
+        self,
+        round_id,
+        session_id,
+        user_message,
+        created_at_order=0,
+        status="completed",
+        final_response=None,
+        parent_run_id=None,
+    ):
         rnd = MagicMock()
         rnd.id = round_id
         rnd.session_id = session_id
@@ -201,15 +210,17 @@ class TestRebuildMessagesFromEvents:
         rnd.created_at = created_at_order
         rnd.status = status
         rnd.final_response = final_response
+        rnd.parent_run_id = parent_run_id
         return rnd
 
-    def _make_conv_msg(self, role, content, round_id, sequence, is_summary=False):
+    def _make_conv_msg(self, role, content, round_id, sequence, is_summary=False, is_synthetic=False):
         m = MagicMock()
         m.role = role
         m.content = content if isinstance(content, str) else json.dumps(content)
         m.round_id = round_id
         m.sequence = sequence
         m.is_summary = is_summary
+        m.is_synthetic = is_synthetic
         return m
 
     def _make_evt(self, event_type, payload_dict, sequence):
@@ -219,11 +230,33 @@ class TestRebuildMessagesFromEvents:
         e.sequence = sequence
         return e
 
-    def _setup_db(self, rounds, user_msgs, events_by_round):
+    def _make_resolution(
+        self,
+        interrupt_id,
+        parent_round_id,
+        resume_round_id,
+        tool_call_id,
+        tool_result_content,
+        resume_user_message,
+        created_at_order=0,
+    ):
+        row = MagicMock()
+        row.interrupt_id = interrupt_id
+        row.session_id = "s1"
+        row.parent_round_id = parent_round_id
+        row.resume_round_id = resume_round_id
+        row.tool_call_id = tool_call_id
+        row.tool_result_content = tool_result_content
+        row.resume_user_message = resume_user_message
+        row.created_at = created_at_order
+        return row
+
+    def _setup_db(self, rounds, user_msgs, events_by_round, resolutions=None):
         """构建按模型分发的 mock db.query()"""
         from src.api.models.round import Round
         from src.api.models.conversation_message import ConversationMessage
         from src.api.models.agui_event import AGUIEventLog
+        from src.api.models.interrupt_resolution import InterruptResolution
 
         mock_db = MagicMock()
 
@@ -248,6 +281,9 @@ class TestRebuildMessagesFromEvents:
         events_query = MagicMock()
         events_query.filter.return_value.order_by.return_value.all.return_value = all_events_flat
 
+        resolution_query = MagicMock()
+        resolution_query.filter.return_value.order_by.return_value.all.return_value = resolutions or []
+
         def _query(model):
             if model is Round:
                 return rounds_query
@@ -255,6 +291,8 @@ class TestRebuildMessagesFromEvents:
                 return conv_query
             elif model is AGUIEventLog:
                 return events_query
+            elif model is InterruptResolution:
+                return resolution_query
             return MagicMock()
 
         mock_db.query = MagicMock(side_effect=_query)
@@ -392,6 +430,264 @@ class TestRebuildMessagesFromEvents:
         tool_msgs = [m for m in messages if m.role == "tool"]
         assert len(tool_msgs) == 1
         assert tool_msgs[0].content == "[Interrupt resolved in subsequent round]"
+
+    def test_resume_resolution_stitches_child_answer_into_parent_tool_result(self):
+        """冷启动重建时应把 child Q/A 回填到 parent ask_user tool result。"""
+        resume_user_message = "Q: Q?\nA: Yes"
+        rounds = [
+            self._make_round("r1", "s1", "please choose", created_at_order=1, status="resumed"),
+            self._make_round(
+                "r2",
+                "s1",
+                resume_user_message,
+                created_at_order=2,
+                status="completed",
+                parent_run_id="r1",
+            ),
+        ]
+        user_msgs = [
+            self._make_conv_msg("user", "please choose", "r1", 1),
+            self._make_conv_msg("user", resume_user_message, "r2", 2),
+        ]
+        events = {
+            "r1": [
+                self._make_evt("TOOL_CALL_START", {"toolCallId": "tc1", "toolCallName": "ask_user"}, 1),
+                self._make_evt("TOOL_CALL_ARGS", {"toolCallId": "tc1", "delta": '{"questions": [{"question": "Q?"}]}'}, 2),
+                self._make_evt("TOOL_CALL_END", {"toolCallId": "tc1"}, 3),
+                self._make_evt("TOOL_CALL_RESULT", {"toolCallId": "tc1", "content": "[Awaiting user response]", "messageId": "m1"}, 4),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 5),
+            ],
+            "r2": [
+                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "Continued after answer"}, 1),
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m2"}, 2),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 3),
+            ],
+        }
+        resolutions = [
+            self._make_resolution(
+                "iid-1",
+                parent_round_id="r1",
+                resume_round_id="r2",
+                tool_call_id="tc1",
+                tool_result_content="User answered:\n- Q?: Yes",
+                resume_user_message=resume_user_message,
+            )
+        ]
+
+        mock_db = self._setup_db(rounds, user_msgs, events, resolutions=resolutions)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        history_service.update_interrupt_resolution_fallback.assert_not_called()
+        assert [m.role for m in messages] == ["user", "assistant", "tool", "assistant"]
+        assert messages[2].tool_call_id == "tc1"
+        assert messages[2].content == "User answered:\n- Q?: Yes"
+        assert all(m.content != resume_user_message for m in messages)
+        assert messages[3].content == "Continued after answer"
+
+    def test_resume_resolution_keeps_child_user_when_parent_placeholder_missing(self):
+        """若 parent tool 占位无法回填，应保留 child Q/A user，避免语义丢失。"""
+        resume_user_message = "Q: Q?\nA: Yes"
+        rounds = [
+            self._make_round("r1", "s1", "please choose", created_at_order=1, status="resumed"),
+            self._make_round(
+                "r2",
+                "s1",
+                resume_user_message,
+                created_at_order=2,
+                status="completed",
+                parent_run_id="r1",
+            ),
+        ]
+        user_msgs = [
+            self._make_conv_msg("user", "please choose", "r1", 1),
+            self._make_conv_msg("user", resume_user_message, "r2", 2),
+        ]
+        events = {
+            "r1": [
+                self._make_evt("TOOL_CALL_START", {"toolCallId": "tc1", "toolCallName": "ask_user"}, 1),
+                self._make_evt("TOOL_CALL_ARGS", {"toolCallId": "tc1", "delta": '{"questions": [{"question": "Q?"}]}'}, 2),
+                self._make_evt("TOOL_CALL_END", {"toolCallId": "tc1"}, 3),
+                self._make_evt("TOOL_CALL_RESULT", {"toolCallId": "tc1", "content": "already resolved elsewhere", "messageId": "m1"}, 4),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 5),
+            ],
+            "r2": [
+                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "Continued"}, 1),
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m2"}, 2),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 3),
+            ],
+        }
+        resolutions = [
+            self._make_resolution(
+                "iid-1",
+                parent_round_id="r1",
+                resume_round_id="r2",
+                tool_call_id="tc1",
+                tool_result_content="User answered:\n- Q?: Yes",
+                resume_user_message=resume_user_message,
+            )
+        ]
+
+        mock_db = self._setup_db(rounds, user_msgs, events, resolutions=resolutions)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        history_service.update_interrupt_resolution_fallback.assert_called_once_with(
+            "iid-1",
+            "history stitch tool placeholder not found or already resolved",
+        )
+        assert any(m.role == "user" and m.content == resume_user_message for m in messages)
+        tool_msg = next(m for m in messages if m.role == "tool" and m.tool_call_id == "tc1")
+        assert tool_msg.content == "already resolved elsewhere"
+
+    def test_resume_resolution_records_fallback_when_parent_child_misaligned(self):
+        """resolution 与 child parent_run_id 不对齐时应记录 fallback 并保留 child user。"""
+        resume_user_message = "Q: Q?\nA: Yes"
+        rounds = [
+            self._make_round("r1", "s1", "please choose", created_at_order=1, status="resumed"),
+            self._make_round(
+                "r2",
+                "s1",
+                resume_user_message,
+                created_at_order=2,
+                status="completed",
+                parent_run_id="other-parent",
+            ),
+        ]
+        user_msgs = [
+            self._make_conv_msg("user", "please choose", "r1", 1),
+            self._make_conv_msg("user", resume_user_message, "r2", 2),
+        ]
+        events = {
+            "r1": [
+                self._make_evt("TOOL_CALL_START", {"toolCallId": "tc1", "toolCallName": "ask_user"}, 1),
+                self._make_evt("TOOL_CALL_ARGS", {"toolCallId": "tc1", "delta": '{"questions": [{"question": "Q?"}]}'}, 2),
+                self._make_evt("TOOL_CALL_END", {"toolCallId": "tc1"}, 3),
+                self._make_evt("TOOL_CALL_RESULT", {"toolCallId": "tc1", "content": "[Awaiting user response]", "messageId": "m1"}, 4),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 5),
+            ],
+            "r2": [
+                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "Continued"}, 1),
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m2"}, 2),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 3),
+            ],
+        }
+        resolutions = [
+            self._make_resolution(
+                "iid-1",
+                parent_round_id="r1",
+                resume_round_id="r2",
+                tool_call_id="tc1",
+                tool_result_content="User answered:\n- Q?: Yes",
+                resume_user_message=resume_user_message,
+            )
+        ]
+
+        mock_db = self._setup_db(rounds, user_msgs, events, resolutions=resolutions)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        history_service.update_interrupt_resolution_fallback.assert_called_once_with(
+            "iid-1",
+            "history stitch parent_run_id mismatch",
+        )
+        assert any(m.role == "user" and m.content == resume_user_message for m in messages)
+        tool_msg = next(m for m in messages if m.role == "tool" and m.tool_call_id == "tc1")
+        assert tool_msg.content == "[Interrupt resolved in subsequent round]"
+
+    def test_resume_resolution_stitches_continuous_ask_user_chain(self):
+        """A->B->C 连续 ask_user resume 链应逐段回填且不重复注入 Q/A user。"""
+        first_answer = "Q: First?\nA: Yes"
+        second_answer = "Q: Second?\nA: No"
+        rounds = [
+            self._make_round("r1", "s1", "start", created_at_order=1, status="resumed"),
+            self._make_round(
+                "r2",
+                "s1",
+                first_answer,
+                created_at_order=2,
+                status="resumed",
+                parent_run_id="r1",
+            ),
+            self._make_round(
+                "r3",
+                "s1",
+                second_answer,
+                created_at_order=3,
+                status="completed",
+                parent_run_id="r2",
+            ),
+        ]
+        user_msgs = [
+            self._make_conv_msg("user", "start", "r1", 1),
+            self._make_conv_msg("user", first_answer, "r2", 2),
+            self._make_conv_msg("user", second_answer, "r3", 3),
+        ]
+        events = {
+            "r1": [
+                self._make_evt("TOOL_CALL_START", {"toolCallId": "tc1", "toolCallName": "ask_user"}, 1),
+                self._make_evt("TOOL_CALL_ARGS", {"toolCallId": "tc1", "delta": '{"questions": [{"question": "First?"}]}'}, 2),
+                self._make_evt("TOOL_CALL_END", {"toolCallId": "tc1"}, 3),
+                self._make_evt("TOOL_CALL_RESULT", {"toolCallId": "tc1", "content": "[Awaiting user response]", "messageId": "m1"}, 4),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 5),
+            ],
+            "r2": [
+                self._make_evt("TOOL_CALL_START", {"toolCallId": "tc2", "toolCallName": "ask_user"}, 1),
+                self._make_evt("TOOL_CALL_ARGS", {"toolCallId": "tc2", "delta": '{"questions": [{"question": "Second?"}]}'}, 2),
+                self._make_evt("TOOL_CALL_END", {"toolCallId": "tc2"}, 3),
+                self._make_evt("TOOL_CALL_RESULT", {"toolCallId": "tc2", "content": "[Awaiting user response]", "messageId": "m2"}, 4),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 5),
+            ],
+            "r3": [
+                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "Done"}, 1),
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m3"}, 2),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 3),
+            ],
+        }
+        resolutions = [
+            self._make_resolution(
+                "iid-1",
+                parent_round_id="r1",
+                resume_round_id="r2",
+                tool_call_id="tc1",
+                tool_result_content="User answered:\n- First?: Yes",
+                resume_user_message=first_answer,
+            ),
+            self._make_resolution(
+                "iid-2",
+                parent_round_id="r2",
+                resume_round_id="r3",
+                tool_call_id="tc2",
+                tool_result_content="User answered:\n- Second?: No",
+                resume_user_message=second_answer,
+                created_at_order=1,
+            ),
+        ]
+
+        mock_db = self._setup_db(rounds, user_msgs, events, resolutions=resolutions)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        tool_contents = [m.content for m in messages if m.role == "tool"]
+        assert tool_contents == [
+            "User answered:\n- First?: Yes",
+            "User answered:\n- Second?: No",
+        ]
+        assert all(m.content not in {first_answer, second_answer} for m in messages)
+        assert messages[-1].role == "assistant"
+        assert messages[-1].content == "Done"
 
 
 # ============================================================
@@ -605,7 +901,7 @@ class TestSyntheticMessagePersistenceOnRestore:
     """驗證合成 user message 在 _rebuild_messages_from_events 中被正確包含"""
 
     @staticmethod
-    def _make_round(round_id, session_id, user_message, created_at_order=0):
+    def _make_round(round_id, session_id, user_message, created_at_order=0, parent_run_id=None):
         rnd = MagicMock()
         rnd.id = round_id
         rnd.session_id = session_id
@@ -613,6 +909,7 @@ class TestSyntheticMessagePersistenceOnRestore:
         rnd.created_at = created_at_order
         rnd.status = "completed"
         rnd.final_response = None
+        rnd.parent_run_id = parent_run_id
         return rnd
 
     @staticmethod
@@ -638,6 +935,7 @@ class TestSyntheticMessagePersistenceOnRestore:
         from src.api.models.round import Round
         from src.api.models.conversation_message import ConversationMessage
         from src.api.models.agui_event import AGUIEventLog
+        from src.api.models.interrupt_resolution import InterruptResolution
 
         mock_db = MagicMock()
 
@@ -656,6 +954,9 @@ class TestSyntheticMessagePersistenceOnRestore:
         events_query = MagicMock()
         events_query.filter.return_value.order_by.return_value.all.return_value = all_events_flat
 
+        resolution_query = MagicMock()
+        resolution_query.filter.return_value.order_by.return_value.all.return_value = []
+
         def _query(model):
             if model is Round:
                 return rounds_query
@@ -663,6 +964,8 @@ class TestSyntheticMessagePersistenceOnRestore:
                 return conv_query
             elif model is AGUIEventLog:
                 return events_query
+            elif model is InterruptResolution:
+                return resolution_query
             return MagicMock()
 
         mock_db.query = MagicMock(side_effect=_query)
@@ -1009,7 +1312,7 @@ class TestRebuildFallbackToConversationMessages:
     fallback 到 conversation_messages 表的 assistant 记录"""
 
     @staticmethod
-    def _make_round(round_id, session_id, user_message, status="completed", final_response=None):
+    def _make_round(round_id, session_id, user_message, status="completed", final_response=None, parent_run_id=None):
         rnd = MagicMock()
         rnd.id = round_id
         rnd.session_id = session_id
@@ -1017,6 +1320,7 @@ class TestRebuildFallbackToConversationMessages:
         rnd.created_at = 0
         rnd.status = status
         rnd.final_response = final_response
+        rnd.parent_run_id = parent_run_id
         return rnd
 
     @staticmethod
@@ -1042,6 +1346,7 @@ class TestRebuildFallbackToConversationMessages:
         from src.api.models.round import Round
         from src.api.models.conversation_message import ConversationMessage
         from src.api.models.agui_event import AGUIEventLog
+        from src.api.models.interrupt_resolution import InterruptResolution
 
         mock_db = MagicMock()
 
@@ -1060,6 +1365,9 @@ class TestRebuildFallbackToConversationMessages:
         events_query = MagicMock()
         events_query.filter.return_value.order_by.return_value.all.return_value = all_events_flat
 
+        resolution_query = MagicMock()
+        resolution_query.filter.return_value.order_by.return_value.all.return_value = []
+
         def _query(model):
             if model is Round:
                 return rounds_query
@@ -1067,6 +1375,8 @@ class TestRebuildFallbackToConversationMessages:
                 return conv_query
             elif model is AGUIEventLog:
                 return events_query
+            elif model is InterruptResolution:
+                return resolution_query
             return MagicMock()
 
         mock_db.query = MagicMock(side_effect=_query)

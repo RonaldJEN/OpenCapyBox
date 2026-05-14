@@ -62,6 +62,7 @@
 ```json
 {
   "round_id": "...",
+  "parent_run_id": "... | null",
   "user_message": "...",
   "user_attachments": [],
   "final_response": "...",

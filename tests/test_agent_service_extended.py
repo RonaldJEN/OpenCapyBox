@@ -259,6 +259,126 @@ class TestAgentServiceChatAgui:
         assert save_kwargs["compaction_emergency_truncate_dropped_rounds"] == 0
 
     @pytest.mark.asyncio
+    async def test_chat_agui_llm_call_record_failure_does_not_fail_run(self, service):
+        """LLM 调用快照 DB 写失败属于 telemetry，不应中断主 Agent run。"""
+        from sqlalchemy.exc import OperationalError
+
+        class HookAwareAgent:
+            def __init__(self):
+                self.messages = []
+                self._pending_interrupt = None
+                self._llm_call_hook = None
+                self.last_llm_usage = None
+
+            def has_pending_interrupt(self):
+                return False
+
+            def clear_pending_interrupt(self):
+                return None
+
+            def add_user_message(self, content):
+                self.messages.append(AgentHistoryMessage(role="user", content=content))
+
+            def set_llm_call_hook(self, hook):
+                self._llm_call_hook = hook
+
+            async def run_agui(self, **kwargs):
+                await self._llm_call_hook(
+                    {
+                        "step_index": 1,
+                        "request_messages": [{"role": "system", "content": "s"}],
+                        "request_tools": ["read_file"],
+                        "response_content": "Hello",
+                        "response_thinking": None,
+                        "response_tool_calls": None,
+                        "response_error": None,
+                        "finish_reason": "stop",
+                        "usage_prompt_tokens": 10,
+                        "usage_completion_tokens": 3,
+                        "usage_total_tokens": 13,
+                        "first_token_latency_s": 0.077,
+                        "completion_latency_s": 0.333,
+                    }
+                )
+                yield TextMessageContentEvent(messageId="m1", delta="Hello")
+                yield TextMessageEndEvent(messageId="m1")
+                yield StepFinishedEvent(stepName="step-1")
+                yield RunFinishedEvent(threadId="session-123", runId=kwargs["run_id"], outcome="success")
+
+        service.agent = HookAwareAgent()
+        service.history_service.save_llm_call_record.side_effect = OperationalError(
+            "INSERT",
+            {},
+            Exception("server closed the connection unexpectedly"),
+        )
+        service.history_service.reset_session = MagicMock()
+
+        events = []
+        async for event in service.chat_agui([
+            {"type": "text", "text": "hello"},
+        ]):
+            events.append(event)
+
+        assert events[-1].type == "RUN_FINISHED"
+        service.history_service.reset_session.assert_called_once()
+        service.history_service.complete_round.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_chat_agui_llm_call_record_non_db_error_fails_run(self, service):
+        """非 DB 错误不能被 telemetry 降级吞掉。"""
+
+        class HookAwareAgent:
+            def __init__(self):
+                self.messages = []
+                self._pending_interrupt = None
+                self._llm_call_hook = None
+
+            def has_pending_interrupt(self):
+                return False
+
+            def clear_pending_interrupt(self):
+                return None
+
+            def add_user_message(self, content):
+                self.messages.append(AgentHistoryMessage(role="user", content=content))
+
+            def set_llm_call_hook(self, hook):
+                self._llm_call_hook = hook
+
+            async def run_agui(self, **kwargs):
+                await self._llm_call_hook(
+                    {
+                        "step_index": 1,
+                        "request_messages": [{"role": "system", "content": "s"}],
+                        "request_tools": ["read_file"],
+                        "response_content": "Hello",
+                        "response_thinking": None,
+                        "response_tool_calls": None,
+                        "response_error": None,
+                        "finish_reason": "stop",
+                        "usage_prompt_tokens": 10,
+                        "usage_completion_tokens": 3,
+                        "usage_total_tokens": 13,
+                        "first_token_latency_s": 0.077,
+                        "completion_latency_s": 0.333,
+                    }
+                )
+                yield RunFinishedEvent(threadId="session-123", runId=kwargs["run_id"], outcome="success")
+
+        service.agent = HookAwareAgent()
+        service.history_service.save_llm_call_record.side_effect = RuntimeError("schema drift")
+        service.history_service.reset_session = MagicMock()
+
+        with pytest.raises(RuntimeError, match="schema drift"):
+            async for _event in service.chat_agui([
+                {"type": "text", "text": "hello"},
+            ]):
+                pass
+
+        service.history_service.reset_session.assert_called_once()
+        service.history_service.complete_round.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_chat_agui_with_attachments(self, service):
         events = []
         async for event in service.chat_agui([
@@ -538,6 +658,7 @@ class TestAgentServiceResumeAgui:
     def service(self):
         history_service = MagicMock()
         history_service.create_round = MagicMock()
+        history_service.create_resume_round = MagicMock()
         history_service.complete_round = MagicMock()
         history_service.save_agui_event = AsyncMock()
         history_service.resolve_interrupted_rounds = MagicMock(return_value=1)
@@ -559,11 +680,30 @@ class TestAgentServiceResumeAgui:
     async def test_resume_agui_persists_resume_user_message(self, service):
         answers = {"Which DB?": "PostgreSQL"}
 
-        with patch.object(service, "_save_conversation_message") as save_message:
-            async for _ in service.resume_agui("iid-1", answers):
-                pass
+        with patch.object(
+            service,
+            "_load_persisted_interrupt",
+            return_value={
+                "interrupt_id": "iid-1",
+                "round_id": "round-interrupted",
+                "tool_call_id": "tc-ask",
+            },
+        ):
+            with patch.object(service, "_save_conversation_message") as save_message:
+                async for _ in service.resume_agui("iid-1", answers):
+                    pass
 
         service.agent.resume_from_interrupt.assert_called_once_with("iid-1", answers)
+        service.history_service.create_resume_round.assert_called_once()
+        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
+        assert create_kwargs["parent_run_id"] == "round-interrupted"
+        assert create_kwargs["interrupt_id"] == "iid-1"
+        assert create_kwargs["tool_call_id"] == "tc-ask"
+        assert create_kwargs["answers"] == answers
+        assert create_kwargs["tool_result_content"] == "User answered:\n- Which DB?: PostgreSQL"
+        assert create_kwargs["restore_strategy"] == "hot_replace"
+        service.history_service.create_round.assert_not_called()
+        service.history_service.resolve_interrupted_rounds.assert_not_called()
         assert any(
             call.args and call.args[0] == "user" and "Q: Which DB?" in call.args[1]
             for call in save_message.call_args_list
@@ -584,7 +724,11 @@ class TestAgentServiceResumeAgui:
         answers = {"Which DB?": "PostgreSQL"}
         service.agent.has_pending_interrupt.return_value = False
 
-        with patch.object(service, "_load_persisted_interrupt", return_value={"interrupt_id": "iid-1"}):
+        with patch.object(
+            service,
+            "_load_persisted_interrupt",
+            return_value={"interrupt_id": "iid-1", "round_id": "round-interrupted"},
+        ):
             with patch.object(service, "_save_conversation_message") as save_message:
                 async for _ in service.resume_agui("iid-1", answers):
                     pass
@@ -594,8 +738,229 @@ class TestAgentServiceResumeAgui:
         injected_user_message = service.agent.add_user_message.call_args.args[0]
         assert "Q: Which DB?" in injected_user_message
         assert "A: PostgreSQL" in injected_user_message
-        service.history_service.resolve_interrupted_rounds.assert_called_once_with("session-123")
+        service.history_service.create_resume_round.assert_called_once()
+        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
+        assert create_kwargs["parent_run_id"] == "round-interrupted"
+        assert create_kwargs["interrupt_id"] == "iid-1"
+        assert create_kwargs["tool_call_id"] is None
+        assert create_kwargs["tool_result_content"] == "User answered:\n- Which DB?: PostgreSQL"
+        assert create_kwargs["restore_strategy"] == "cold_fallback_user_message"
+        assert create_kwargs["fallback_reason"] == "tool_call_id missing"
+        service.history_service.create_round.assert_not_called()
+        service.history_service.resolve_interrupted_rounds.assert_not_called()
         assert any(
             call.args and call.args[0] == "user" and "Q: Which DB?" in call.args[1]
             for call in save_message.call_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_resume_agui_cold_path_replaces_restored_tool_placeholder(self, service):
+        """冷 resume 有 tool_call_id 时应替换历史恢复出的 ask_user tool result。"""
+        answers = {"Which DB?": "PostgreSQL"}
+        service.agent.has_pending_interrupt.return_value = False
+        service.agent.messages = [
+            AgentHistoryMessage(
+                role="tool",
+                content="[Awaiting user response]",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
+
+        with patch.object(
+            service,
+            "_load_persisted_interrupt",
+            return_value={
+                "interrupt_id": "iid-1",
+                "round_id": "round-interrupted",
+                "tool_call_id": "tc-ask",
+            },
+        ):
+            with patch.object(service, "_save_conversation_message"):
+                async for _ in service.resume_agui("iid-1", answers):
+                    pass
+
+        service.agent.resume_from_interrupt.assert_not_called()
+        service.agent.add_user_message.assert_not_called()
+        assert service.agent.messages[0].content == "User answered:\n- Which DB?: PostgreSQL"
+        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
+        assert create_kwargs["interrupt_id"] == "iid-1"
+        assert create_kwargs["tool_call_id"] == "tc-ask"
+        assert create_kwargs["tool_result_content"] == "User answered:\n- Which DB?: PostgreSQL"
+        assert create_kwargs["restore_strategy"] == "cold_replace"
+        assert create_kwargs["fallback_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_resume_agui_cold_path_records_fallback_reason_when_replace_fails(self, service):
+        """冷 resume 替换失败时应降级 user message，并把原因写入 resolution。"""
+        answers = {"Which DB?": "PostgreSQL"}
+        service.agent.has_pending_interrupt.return_value = False
+        service.agent.messages = [
+            AgentHistoryMessage(
+                role="tool",
+                content="already resolved",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
+
+        with patch.object(
+            service,
+            "_load_persisted_interrupt",
+            return_value={
+                "interrupt_id": "iid-1",
+                "round_id": "round-interrupted",
+                "tool_call_id": "tc-ask",
+            },
+        ):
+            with patch.object(service, "_save_conversation_message"):
+                async for _ in service.resume_agui("iid-1", answers):
+                    pass
+
+        service.agent.add_user_message.assert_called_once()
+        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
+        assert create_kwargs["restore_strategy"] == "cold_fallback_user_message"
+        assert create_kwargs["fallback_reason"] == "tool placeholder not found or already resolved"
+        assert create_kwargs["interrupt_id"] == "iid-1"
+
+    @pytest.mark.asyncio
+    async def test_resume_agui_restores_hot_state_when_resume_round_create_fails(self, service):
+        """DB 创建 resume round 失败时，热路径不应留下已恢复的内存状态。"""
+        answers = {"Which DB?": "PostgreSQL"}
+        pending = {
+            "interrupt_id": "iid-1",
+            "tool_call_id": "tc-ask",
+            "questions": [{"question": "Which DB?"}],
+        }
+        service.agent._pending_interrupt = dict(pending)
+        service.agent.messages = [
+            AgentHistoryMessage(
+                role="tool",
+                content="[Awaiting user response]",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
+        service.history_service.create_resume_round.side_effect = [
+            ValueError("Round is not resumable: round-interrupted status=resumed"),
+            None,
+        ]
+
+        def _resume_from_interrupt(_interrupt_id, _answers):
+            service.agent.messages[0].content = "User answered:\n- Which DB?: PostgreSQL"
+            service.agent._pending_interrupt = None
+
+        service.agent.resume_from_interrupt.side_effect = _resume_from_interrupt
+
+        with patch.object(
+            service,
+            "_load_persisted_interrupt",
+            return_value={
+                "interrupt_id": "iid-1",
+                "round_id": "round-interrupted",
+                "tool_call_id": "tc-ask",
+            },
+        ):
+            with patch.object(service, "_save_conversation_message"):
+                with pytest.raises(ValueError, match="Round is not resumable"):
+                    async for _ in service.resume_agui("iid-1", answers):
+                        pass
+
+                assert service.agent.messages[0].content == "[Awaiting user response]"
+                assert service.agent._pending_interrupt == pending
+
+                async for _ in service.resume_agui("iid-1", answers):
+                    pass
+
+        assert service.agent.resume_from_interrupt.call_count == 2
+        assert service.agent.messages[0].content == "User answered:\n- Which DB?: PostgreSQL"
+        assert service.agent._pending_interrupt is None
+
+    @pytest.mark.asyncio
+    async def test_resume_agui_restores_cold_replace_when_resume_round_create_fails(self, service):
+        """DB 创建 resume round 失败时，冷替换路径应还原 tool 占位。"""
+        answers = {"Which DB?": "PostgreSQL"}
+        service.agent.has_pending_interrupt.return_value = False
+        service.agent.messages = [
+            AgentHistoryMessage(
+                role="tool",
+                content="[Awaiting user response]",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
+        service.history_service.create_resume_round.side_effect = ValueError(
+            "Interrupt already resumed: iid-1"
+        )
+
+        with patch.object(
+            service,
+            "_load_persisted_interrupt",
+            return_value={
+                "interrupt_id": "iid-1",
+                "round_id": "round-interrupted",
+                "tool_call_id": "tc-ask",
+            },
+        ):
+            with patch.object(service, "_save_conversation_message"):
+                with pytest.raises(ValueError, match="Interrupt already resumed"):
+                    async for _ in service.resume_agui("iid-1", answers):
+                        pass
+
+        assert service.agent.messages[0].content == "[Awaiting user response]"
+        service.agent.add_user_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resume_agui_restores_cold_fallback_when_resume_round_create_fails(self, service):
+        """DB 创建 resume round 失败时，冷 fallback 不应留下重复 Q/A user。"""
+        answers = {"Which DB?": "PostgreSQL"}
+        service.agent.has_pending_interrupt.return_value = False
+        service.agent.messages = [
+            AgentHistoryMessage(
+                role="tool",
+                content="already resolved",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
+        service.history_service.create_resume_round.side_effect = ValueError(
+            "Interrupt already resumed: iid-1"
+        )
+
+        def _add_user_message(content):
+            service.agent.messages.append(AgentHistoryMessage(role="user", content=content))
+
+        service.agent.add_user_message.side_effect = _add_user_message
+
+        with patch.object(
+            service,
+            "_load_persisted_interrupt",
+            return_value={
+                "interrupt_id": "iid-1",
+                "round_id": "round-interrupted",
+                "tool_call_id": "tc-ask",
+            },
+        ):
+            with patch.object(service, "_save_conversation_message"):
+                with pytest.raises(ValueError, match="Interrupt already resumed"):
+                    async for _ in service.resume_agui("iid-1", answers):
+                        pass
+
+        assert [msg.role for msg in service.agent.messages] == ["tool"]
+        assert service.agent.messages[0].content == "already resolved"
+
+    @pytest.mark.asyncio
+    async def test_resume_agui_uses_hot_parent_cache_before_interrupt_commit(self, service):
+        """热恢复可用内存态 parent 映射覆盖 RUN_FINISHED 刚发出但 DB 尚未标 interrupted 的窗口。"""
+        answers = {"Which DB?": "PostgreSQL"}
+        service._pending_interrupt_round_ids["iid-1"] = "round-interrupted"
+
+        with patch.object(service, "_load_persisted_interrupt", return_value=None):
+            with patch.object(service, "_save_conversation_message"):
+                async for _ in service.resume_agui("iid-1", answers):
+                    pass
+
+        service.agent.resume_from_interrupt.assert_called_once_with("iid-1", answers)
+        assert service.history_service.create_resume_round.call_args.kwargs["parent_run_id"] == "round-interrupted"
+        service.history_service.create_round.assert_not_called()
+        assert "iid-1" not in service._pending_interrupt_round_ids

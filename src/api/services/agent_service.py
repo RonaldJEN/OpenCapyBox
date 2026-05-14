@@ -1,11 +1,13 @@
 """Agent 服务 - 连接 OpenCapyBox 核心"""
 import asyncio
+import copy
 import json
 import logging
 import uuid
 from typing import List, Dict, Optional, AsyncIterator, Any
 
 from opensandbox import Sandbox
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.utils.timezone import now_naive
 from src.agent.agent import Agent
@@ -51,6 +53,7 @@ class AgentService:
         self.model_id = model_id
         self.agent: Agent | None = None
         self._last_saved_index = 0
+        self._pending_interrupt_round_ids: dict[str, str] = {}
         self.skill_loader = None  # 保存 skill_loader 引用
         self.cancel_token: asyncio.Event | None = None  # per-run 取消令牌
         self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
@@ -335,6 +338,7 @@ class AgentService:
         """
         from src.api.models.agui_event import AGUIEventLog
         from src.api.models.conversation_message import ConversationMessage
+        from src.api.models.interrupt_resolution import InterruptResolution
         from src.api.models.round import Round
 
         db = self.history_service.db
@@ -380,18 +384,65 @@ class AgentService:
         for evt in all_events:
             events_by_round.setdefault(evt.run_id, []).append(evt)
 
-        # 4. 逐 round 重建
+        # 4. 预载 ask_user resume resolution，用于让冷恢复重建出热 resume 等价结构。
+        resolution_rows = (
+            db.query(InterruptResolution)
+            .filter(InterruptResolution.session_id == self.session_id)
+            .order_by(InterruptResolution.created_at)
+            .all()
+        )
+        round_by_id = {rnd.id: rnd for rnd in rounds}
+        resolution_by_parent_round_id = {}
+        resolution_by_resume_round_id = {}
+        for row in resolution_rows:
+            child_round = round_by_id.get(row.resume_round_id)
+            if not child_round or getattr(child_round, "parent_run_id", None) != row.parent_round_id:
+                fallback_reason = (
+                    "history stitch child round not found"
+                    if not child_round
+                    else "history stitch parent_run_id mismatch"
+                )
+                self.history_service.update_interrupt_resolution_fallback(
+                    row.interrupt_id,
+                    fallback_reason,
+                )
+                logger.warning(
+                    "忽略无法按 parent_run_id 对齐的 interrupt resolution: "
+                    "session=%s parent_round=%s resume_round=%s reason=%s",
+                    self.session_id,
+                    row.parent_round_id,
+                    row.resume_round_id,
+                    fallback_reason,
+                )
+                continue
+            resolution_by_parent_round_id[row.parent_round_id] = row
+            resolution_by_resume_round_id[row.resume_round_id] = row
+        stitched_resume_round_ids: set[str] = set()
+
+        # 5. 逐 round 重建
         messages: list[AgentMessage] = []
 
         for rnd in rounds:
             # 4a. User 消息（從 conversation_messages 取，保留多模態塊）
             user_records = user_msgs_by_round.get(rnd.id, [])
+            resume_resolution = resolution_by_resume_round_id.get(rnd.id)
+            skip_resume_user = rnd.id in stitched_resume_round_ids
+            skipped_resume_user = False
             if user_records:
                 for um in user_records:
                     try:
                         content = json.loads(um.content)
                     except (json.JSONDecodeError, TypeError):
                         content = um.content
+                    if (
+                        skip_resume_user
+                        and not skipped_resume_user
+                        and not bool(getattr(um, "is_synthetic", False))
+                        and resume_resolution
+                        and content == resume_resolution.resume_user_message
+                    ):
+                        skipped_resume_user = True
+                        continue
                     messages.append(
                         AgentMessage(
                             role="user",
@@ -400,19 +451,29 @@ class AgentService:
                         )
                     )
             elif rnd.user_message:
-                # Fallback：conversation_messages 無記錄（歷史數據遷移期），用 rounds.user_message
-                logger.warning(
-                    "Round %s 無 conversation_messages user 記錄，fallback 到 rounds.user_message (session=%s)",
-                    rnd.id, self.session_id,
-                )
-                messages.append(AgentMessage(role="user", content=rnd.user_message))
+                if (
+                    skip_resume_user
+                    and resume_resolution
+                    and rnd.user_message == resume_resolution.resume_user_message
+                ):
+                    skipped_resume_user = True
+                else:
+                    # Fallback：conversation_messages 無記錄（歷史數據遷移期），用 rounds.user_message
+                    logger.warning(
+                        "Round %s 無 conversation_messages user 記錄，fallback 到 rounds.user_message (session=%s)",
+                        rnd.id, self.session_id,
+                    )
+                    messages.append(AgentMessage(role="user", content=rnd.user_message))
             else:
-                # 兩邊都無 user 消息（數據損壞），跳過該 round 的 agent 輸出以避免孤立 assistant 消息
-                logger.warning(
-                    "Round %s 既無 conversation_messages 也無 user_message，跳過整個 round (session=%s)",
-                    rnd.id, self.session_id,
-                )
-                continue
+                if skip_resume_user:
+                    skipped_resume_user = True
+                else:
+                    # 兩邊都無 user 消息（數據損壞），跳過該 round 的 agent 輸出以避免孤立 assistant 消息
+                    logger.warning(
+                        "Round %s 既無 conversation_messages 也無 user_message，跳過整個 round (session=%s)",
+                        rnd.id, self.session_id,
+                    )
+                    continue
 
             # 4b. Agent 輸出（從預載的 agui_events 重建 assistant + tool 消息）
             round_events = events_by_round.get(rnd.id, [])
@@ -453,6 +514,36 @@ class AgentService:
 
             # interrupted round 被後續輪次解決後，避免冷恢復時仍看到過期占位內容
             if getattr(rnd, "status", None) == "resumed":
+                resolution = resolution_by_parent_round_id.get(rnd.id)
+                if resolution:
+                    replaced = False
+                    if resolution.tool_call_id:
+                        replaced = self._replace_interrupt_tool_result_in_messages(
+                            round_messages,
+                            resolution.tool_call_id,
+                            resolution.tool_result_content,
+                        )
+                    if replaced:
+                        stitched_resume_round_ids.add(resolution.resume_round_id)
+                    else:
+                        fallback_reason = (
+                            "history stitch tool_call_id missing"
+                            if not resolution.tool_call_id
+                            else "history stitch tool placeholder not found or already resolved"
+                        )
+                        self.history_service.update_interrupt_resolution_fallback(
+                            resolution.interrupt_id,
+                            fallback_reason,
+                        )
+                        logger.warning(
+                            "未能按 interrupt resolution 回填 ask_user tool result: "
+                            "session=%s parent_round=%s resume_round=%s tool_call_id=%s reason=%s",
+                            self.session_id,
+                            rnd.id,
+                            resolution.resume_round_id,
+                            resolution.tool_call_id,
+                            fallback_reason,
+                        )
                 for msg in round_messages:
                     if msg.role == "tool" and msg.content == "[Awaiting user response]":
                         msg.content = "[Interrupt resolved in subsequent round]"
@@ -464,6 +555,27 @@ class AgentService:
             len(rounds), len(messages), self.session_id,
         )
         return messages
+
+    @staticmethod
+    def _replace_interrupt_tool_result_in_messages(
+        messages: list[Any],
+        tool_call_id: str,
+        content: str,
+    ) -> bool:
+        """在一组 AgentMessage 中替换 ask_user tool result 占位。"""
+        placeholders = {
+            "[Awaiting user response]",
+            "[Interrupt resolved in subsequent round]",
+        }
+        for msg in messages:
+            if (
+                getattr(msg, "role", None) == "tool"
+                and getattr(msg, "tool_call_id", None) == tool_call_id
+                and getattr(msg, "content", None) in placeholders
+            ):
+                msg.content = content
+                return True
+        return False
 
     def _summary_header(self) -> str:
         if self.agent:
@@ -1015,6 +1127,7 @@ class AgentService:
             questions = details.get("questions") if isinstance(details.get("questions"), list) else []
             return {
                 "interrupt_id": interrupt_id,
+                "round_id": round_obj.id,
                 "tool_call_id": details.get("tool_call_id"),
                 "questions": questions,
             }
@@ -1026,6 +1139,32 @@ class AgentService:
         if self.agent and self.agent.has_pending_interrupt(interrupt_id):
             return True
         return self._load_persisted_interrupt(interrupt_id) is not None
+
+    def _get_agent_pending_interrupt_snapshot(self, interrupt_id: str) -> dict[str, Any] | None:
+        """尽量从 Agent 内存态读取 pending interrupt 快照。"""
+        if not self.agent:
+            return None
+
+        pending = getattr(self.agent, "_pending_interrupt", None)
+        if isinstance(pending, dict) and pending.get("interrupt_id") == interrupt_id:
+            return dict(pending)
+
+        getter = getattr(type(self.agent), "get_pending_interrupt", None)
+        if callable(getter):
+            snapshot = self.agent.get_pending_interrupt()
+            if isinstance(snapshot, dict) and snapshot.get("interrupt_id") == interrupt_id:
+                return snapshot
+        return None
+
+    def _replace_agent_interrupt_tool_result(self, tool_call_id: str, content: str) -> bool:
+        """替换恢复出的 ask_user tool 占位，供冷 resume 路径使用。"""
+        if not self.agent:
+            return False
+        messages = getattr(self.agent, "messages", None)
+        if not isinstance(messages, list):
+            return False
+
+        return self._replace_interrupt_tool_result_in_messages(messages, tool_call_id, content)
 
     async def resume_agui(
         self,
@@ -1051,36 +1190,96 @@ class AgentService:
                 raise RuntimeError("Agent not initialized")
 
             resume_user_message = self._format_resume_user_message(answers)
+            persisted_interrupt = self._load_persisted_interrupt(interrupt_id)
+            pending_interrupt = self._get_agent_pending_interrupt_snapshot(interrupt_id)
+            parent_run_id = (
+                persisted_interrupt["round_id"]
+                if persisted_interrupt
+                else self._pending_interrupt_round_ids.get(interrupt_id)
+            )
+            if not parent_run_id:
+                raise ValueError("No pending interrupt to resume from")
 
-            if self.agent.has_pending_interrupt(interrupt_id):
-                # 热恢复：直接替换 ask_user 占位 tool_result
-                self.agent.resume_from_interrupt(interrupt_id, answers)
-            else:
-                # 冷恢复：内存中断状态已丢失，退化为注入用户回答继续对话
-                persisted_interrupt = self._load_persisted_interrupt(interrupt_id)
-                if not persisted_interrupt:
-                    raise ValueError("No pending interrupt to resume from")
-
-                logger.warning(
-                    "resume 进入冷恢复路径: session=%s, interrupt_id=%s",
-                    self.session_id,
-                    interrupt_id,
-                )
-                self.agent.add_user_message(resume_user_message)
-
-            # 将旧的 interrupted round 标记为 resumed，防止刷新后重复弹出
-            self.history_service.resolve_interrupted_rounds(self.session_id)
+            tool_call_id = (
+                (persisted_interrupt or {}).get("tool_call_id")
+                or (pending_interrupt or {}).get("tool_call_id")
+            )
+            tool_result_content = Agent.format_interrupt_tool_result(answers)
+            restore_strategy: str | None = None
+            fallback_reason: str | None = None
 
             # 创建新的 run_id（恢复是一次新运行）
             run_id = str(uuid.uuid4())
 
-            # 创建 Round（记录为 resume 操作）
-            self.history_service.create_round(
-                session_id=self.session_id,
-                round_id=run_id,
-                user_message=resume_user_message,
-                user_attachments=[],
+            messages_snapshot = (
+                copy.deepcopy(self.agent.messages)
+                if isinstance(getattr(self.agent, "messages", None), list)
+                else None
             )
+            pending_interrupt_snapshot = copy.deepcopy(
+                getattr(self.agent, "_pending_interrupt", None)
+            )
+            pending_round_ids_snapshot = dict(self._pending_interrupt_round_ids)
+
+            try:
+                if self.agent.has_pending_interrupt(interrupt_id):
+                    # 热恢复：直接替换 ask_user 占位 tool_result
+                    self.agent.resume_from_interrupt(interrupt_id, answers)
+                    restore_strategy = "hot_replace"
+                else:
+                    # 冷恢复：内存中断状态已丢失，优先替换历史恢复出的 ask_user tool 占位。
+                    logger.warning(
+                        "resume 进入冷恢复路径: session=%s, interrupt_id=%s",
+                        self.session_id,
+                        interrupt_id,
+                    )
+                    replaced = (
+                        self._replace_agent_interrupt_tool_result(tool_call_id, tool_result_content)
+                        if tool_call_id
+                        else False
+                    )
+                    if replaced:
+                        restore_strategy = "cold_replace"
+                    else:
+                        restore_strategy = "cold_fallback_user_message"
+                        fallback_reason = (
+                            "tool_call_id missing"
+                            if not tool_call_id
+                            else "tool placeholder not found or already resolved"
+                        )
+                        logger.warning(
+                            "冷 resume 未能替换 ask_user tool result，退化为 user message: "
+                            "session=%s interrupt_id=%s tool_call_id=%s reason=%s",
+                            self.session_id,
+                            interrupt_id,
+                            tool_call_id,
+                            fallback_reason,
+                        )
+                        self.agent.add_user_message(resume_user_message)
+
+                # 原子创建 resume round，并只将命中的旧 round 标记为 resumed。
+                self.history_service.create_resume_round(
+                    session_id=self.session_id,
+                    round_id=run_id,
+                    user_message=resume_user_message,
+                    parent_run_id=parent_run_id,
+                    user_attachments=[],
+                    interrupt_id=interrupt_id,
+                    tool_call_id=tool_call_id,
+                    answers=answers,
+                    tool_result_content=tool_result_content,
+                    restore_strategy=restore_strategy,
+                    fallback_reason=fallback_reason,
+                )
+            except Exception:
+                if messages_snapshot is not None:
+                    self.agent.messages = messages_snapshot
+                if hasattr(self.agent, "_pending_interrupt"):
+                    self.agent._pending_interrupt = pending_interrupt_snapshot
+                self._pending_interrupt_round_ids = pending_round_ids_snapshot
+                raise
+
+            self._pending_interrupt_round_ids.pop(interrupt_id, None)
 
             # 持久化用户 resume 消息到 conversation_messages（用于上下文恢复）
             self._save_conversation_message("user", resume_user_message, round_id=run_id)
@@ -1124,32 +1323,41 @@ class AgentService:
         run_cancel_token = self.cancel_token
 
         async def _record_llm_call(payload: dict[str, Any]) -> None:
-            await self.history_service.save_llm_call_record(
-                session_id=self.session_id,
-                round_id=run_id,
-                step_index=payload["step_index"],
-                request_messages=payload["request_messages"],
-                request_tools=payload["request_tools"],
-                response_content=payload["response_content"],
-                response_thinking=payload["response_thinking"],
-                response_tool_calls=payload["response_tool_calls"],
-                response_error=payload["response_error"],
-                finish_reason=payload["finish_reason"],
-                usage_prompt_tokens=payload["usage_prompt_tokens"],
-                usage_completion_tokens=payload["usage_completion_tokens"],
-                usage_total_tokens=payload["usage_total_tokens"],
-                first_token_latency_s=payload["first_token_latency_s"],
-                completion_latency_s=payload["completion_latency_s"],
-                compaction_triggered=bool(payload.get("compaction_triggered", False)),
-                compaction_pre_tokens=payload.get("compaction_pre_tokens"),
-                compaction_post_tokens=payload.get("compaction_post_tokens"),
-                compaction_tokens_saved=payload.get("compaction_tokens_saved"),
-                compaction_microcompact_compacted_messages=payload.get("compaction_microcompact_compacted_messages"),
-                compaction_summary_generated_count=payload.get("compaction_summary_generated_count"),
-                compaction_summary_reused_count=payload.get("compaction_summary_reused_count"),
-                compaction_summary_quality_repair_count=payload.get("compaction_summary_quality_repair_count"),
-                compaction_emergency_truncate_dropped_rounds=payload.get("compaction_emergency_truncate_dropped_rounds"),
-            )
+            try:
+                await self.history_service.save_llm_call_record(
+                    session_id=self.session_id,
+                    round_id=run_id,
+                    step_index=payload["step_index"],
+                    request_messages=payload["request_messages"],
+                    request_tools=payload["request_tools"],
+                    response_content=payload["response_content"],
+                    response_thinking=payload["response_thinking"],
+                    response_tool_calls=payload["response_tool_calls"],
+                    response_error=payload["response_error"],
+                    finish_reason=payload["finish_reason"],
+                    usage_prompt_tokens=payload["usage_prompt_tokens"],
+                    usage_completion_tokens=payload["usage_completion_tokens"],
+                    usage_total_tokens=payload["usage_total_tokens"],
+                    first_token_latency_s=payload["first_token_latency_s"],
+                    completion_latency_s=payload["completion_latency_s"],
+                    compaction_triggered=bool(payload.get("compaction_triggered", False)),
+                    compaction_pre_tokens=payload.get("compaction_pre_tokens"),
+                    compaction_post_tokens=payload.get("compaction_post_tokens"),
+                    compaction_tokens_saved=payload.get("compaction_tokens_saved"),
+                    compaction_microcompact_compacted_messages=payload.get("compaction_microcompact_compacted_messages"),
+                    compaction_summary_generated_count=payload.get("compaction_summary_generated_count"),
+                    compaction_summary_reused_count=payload.get("compaction_summary_reused_count"),
+                    compaction_summary_quality_repair_count=payload.get("compaction_summary_quality_repair_count"),
+                    compaction_emergency_truncate_dropped_rounds=payload.get("compaction_emergency_truncate_dropped_rounds"),
+                )
+            except SQLAlchemyError:
+                self.history_service.reset_session()
+                logger.warning(
+                    "保存 LLM 调用快照失败，已跳过以避免中断 Agent run: session=%s round=%s",
+                    self.session_id,
+                    run_id,
+                    exc_info=True,
+                )
 
         self.agent.set_llm_call_hook(_record_llm_call)
 
@@ -1228,6 +1436,7 @@ class AgentService:
                         else:
                             status = "interrupted"
                             if event.interrupt:
+                                self._pending_interrupt_round_ids[event.interrupt.id] = run_id
                                 _interrupt_json = json.dumps(
                                     event.interrupt.model_dump(exclude_none=True),
                                     ensure_ascii=False,

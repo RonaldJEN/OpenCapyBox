@@ -40,6 +40,7 @@
       - `compaction_summary_generated_count` / `compaction_summary_reused_count` / `compaction_summary_quality_repair_count`
       - `compaction_emergency_truncate_dropped_rounds`
     - 人工审阅字段：`manual_review_status`
+    - Token 口径：session / round 层的 `total_tokens` 均为对应范围内 `SUM(llm_call_records.usage_total_tokens)`，用于成本与用量统计；它不是会话累计上下文长度。排查上下文恢复稳定性时，应优先查看 step 层的 `usage_prompt_tokens`、`request_message_count` 与 `compaction_*` 字段。
   - 管理台展示语义（前端约定）：
     - Session 监控默认分页为每页 `5` 条 session，可在页面切换为 `5/10/15`。
     - step 详情默认先展示“管理员分析摘要”（中文），包含请求概览、响应概览、性能与压缩诊断、建议审阅结论。

@@ -27,7 +27,7 @@
 #
 # ============================================================
 
-default_model: glm
+default_model: qwen3.6-plus
 cron_default_model: glm  # Cron 任务默认模型（不配置思考）
 
 models:
@@ -82,12 +82,12 @@ models:
   # ======================== 通义千问 Qwen（阿里 DashScope）========================
   # 通過阿里 DashScope 統一接入，使用 LLM_API_KEY
 
-  qwen3.5-plus:
-    display_name: "通义千问qwen3.5-plus"
+  qwen3.6-plus:
+    display_name: "通义千问qwen3.6-plus"
     provider: openai
     api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: "${LLM_API_KEY}"
-    model_name: "qwen3.5-plus"
+    model_name: "qwen3.6-plus"
     max_tokens: 65536
     context_window: 131072
     reasoning_format: reasoning_content
@@ -206,7 +206,7 @@ embedding_models:
     api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: "${LLM_API_KEY}"
     model_name: "text-embedding-v4"
-    dimensions: 2560
+    dimensions: 1024
     enabled: true
 
   # OpenAI Embedding

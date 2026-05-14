@@ -58,6 +58,30 @@ class TestDatabaseConfig:
         except StopIteration:
             pass
 
+    def test_get_db_close_operational_error_is_logged(self, caplog):
+        """请求清理阶段连接已断开时记录日志，不再污染已完成响应。"""
+        import logging
+        from sqlalchemy.exc import OperationalError
+        from src.api.models import database as database_module
+
+        mock_session = MagicMock()
+        mock_session.close.side_effect = OperationalError(
+            "ROLLBACK",
+            {},
+            Exception("server closed the connection unexpectedly"),
+        )
+
+        with patch.object(database_module, "SessionLocal", return_value=mock_session):
+            gen = database_module.get_db()
+            assert next(gen) is mock_session
+
+            with caplog.at_level(logging.WARNING):
+                with pytest.raises(StopIteration):
+                    next(gen)
+
+        mock_session.close.assert_called_once()
+        assert "关闭数据库会话时连接已断开" in caplog.text
+
     def test_db_directory_created(self):
         """验证数据库目录被自动创建"""
         from src.api.config import get_settings

@@ -15,6 +15,8 @@ interface ChatInputProps {
 
   /** 是否禁用（发送中 / 创建会话中） */
   disabled?: boolean;
+  /** 仅禁用发送动作，输入框仍保持可编辑 */
+  sendDisabled?: boolean;
   /** 发送按钮 loading 文案，为空时显示箭头 */
   sendingLabel?: string;
 
@@ -42,6 +44,7 @@ export function ChatInput({
   onSend,
   onStop,
   disabled = false,
+  sendDisabled = false,
   sendingLabel,
   placeholder = '输入消息...',
   attachedFiles = [],
@@ -76,6 +79,7 @@ export function ChatInput({
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      if (sendDisabled) return;
       onSend();
     }
   };
@@ -139,7 +143,7 @@ export function ChatInput({
   };
 
   const hasContent = value.trim().length > 0 || attachedFiles.length > 0;
-  const canSend = hasContent && !disabled;
+  const canSend = hasContent && !disabled && !sendDisabled;
 
   return (
     <div className="px-4 pb-5 pt-3 bg-claude-bg">

@@ -7,8 +7,10 @@ from unittest.mock import MagicMock, patch
 from datetime import datetime
 import json
 import uuid
+from sqlalchemy.exc import IntegrityError
 
 from src.api.services.history_service import HistoryService
+from src.api.models.interrupt_resolution import InterruptResolution
 from src.api.models.round import Round
 from src.agent.schema.agui_events import (
     RunFinishedEvent,
@@ -51,6 +53,155 @@ class TestHistoryServiceRound:
         assert added_round.user_message == "Hello"
         assert added_round.status == "running"
 
+    def test_create_round_with_parent_run_id(self, history_service, mock_db):
+        """resume 新 Round 应记录被中断的父 Round。"""
+        history_service.create_round(
+            session_id="session-123",
+            round_id="round-resume",
+            user_message="Q: Confirm?\nA: yes",
+            parent_run_id="round-interrupted",
+        )
+
+        added_round = mock_db.add.call_args[0][0]
+        assert added_round.parent_run_id == "round-interrupted"
+
+    def test_create_resume_round_marks_parent_and_creates_child(self, history_service, mock_db):
+        """resume round 与父 round 状态更新应在同一次提交中完成。"""
+        mock_db.query.return_value.filter.return_value.update.return_value = 1
+
+        history_service.create_resume_round(
+            session_id="session-123",
+            round_id="round-resume",
+            user_message="Q: Confirm?\nA: yes",
+            parent_run_id="round-interrupted",
+        )
+
+        mock_db.query.return_value.filter.return_value.update.assert_called_once()
+        update_filter_args = mock_db.query.return_value.filter.call_args.args
+        assert len(update_filter_args) == 3
+        assert getattr(update_filter_args[1].left, "key", None) == "session_id"
+        assert getattr(update_filter_args[1].right, "value", None) == "session-123"
+        added_round = mock_db.add.call_args[0][0]
+        assert added_round.id == "round-resume"
+        assert added_round.session_id == "session-123"
+        assert added_round.parent_run_id == "round-interrupted"
+        assert added_round.status == "running"
+        mock_db.commit.assert_called_once()
+        mock_db.rollback.assert_not_called()
+        mock_db.refresh.assert_called_once_with(added_round)
+
+    def test_create_resume_round_persists_interrupt_resolution(self, history_service, mock_db):
+        """resume round 应同事务记录结构化 ask_user resolution。"""
+        mock_db.query.return_value.filter.return_value.update.return_value = 1
+
+        history_service.create_resume_round(
+            session_id="session-123",
+            round_id="round-resume",
+            user_message="Q: Confirm?\nA: yes",
+            parent_run_id="round-interrupted",
+            interrupt_id="interrupt-1",
+            tool_call_id="tc-ask",
+            answers={"Confirm?": "yes"},
+            tool_result_content="User answered:\n- Confirm?: yes",
+            restore_strategy="hot_replace",
+        )
+
+        added_objects = [call.args[0] for call in mock_db.add.call_args_list]
+        added_round = next(obj for obj in added_objects if isinstance(obj, Round))
+        added_resolution = next(obj for obj in added_objects if isinstance(obj, InterruptResolution))
+
+        assert added_round.id == "round-resume"
+        assert added_resolution.interrupt_id == "interrupt-1"
+        assert added_resolution.session_id == "session-123"
+        assert added_resolution.parent_round_id == "round-interrupted"
+        assert added_resolution.resume_round_id == "round-resume"
+        assert added_resolution.tool_call_id == "tc-ask"
+        assert json.loads(added_resolution.answers_json) == {"Confirm?": "yes"}
+        assert added_resolution.resume_user_message == "Q: Confirm?\nA: yes"
+        assert added_resolution.tool_result_content == "User answered:\n- Confirm?: yes"
+        assert added_resolution.restore_strategy == "hot_replace"
+        mock_db.commit.assert_called_once()
+        mock_db.rollback.assert_not_called()
+
+    def test_create_resume_round_persists_fallback_without_tool_call_id(self, history_service, mock_db):
+        """tool_call_id 缺失时仍应记录 resolution 与 fallback 原因。"""
+        mock_db.query.return_value.filter.return_value.update.return_value = 1
+
+        history_service.create_resume_round(
+            session_id="session-123",
+            round_id="round-resume",
+            user_message="Q: Confirm?\nA: yes",
+            parent_run_id="round-interrupted",
+            interrupt_id="interrupt-1",
+            tool_call_id=None,
+            answers={"Confirm?": "yes"},
+            tool_result_content="User answered:\n- Confirm?: yes",
+            restore_strategy="cold_fallback_user_message",
+            fallback_reason="tool_call_id missing",
+        )
+
+        added_objects = [call.args[0] for call in mock_db.add.call_args_list]
+        added_resolution = next(obj for obj in added_objects if isinstance(obj, InterruptResolution))
+
+        assert added_resolution.tool_call_id is None
+        assert added_resolution.restore_strategy == "cold_fallback_user_message"
+        assert added_resolution.fallback_reason == "tool_call_id missing"
+
+    def test_update_interrupt_resolution_fallback(self, history_service, mock_db):
+        """冷启动 stitching 失败后允许补写 fallback 原因。"""
+        mock_db.query.return_value.filter.return_value.update.return_value = 1
+
+        updated = history_service.update_interrupt_resolution_fallback(
+            interrupt_id="interrupt-1",
+            fallback_reason="history stitch tool placeholder not found or already resolved",
+        )
+
+        assert updated == 1
+        mock_db.query.return_value.filter.return_value.update.assert_called_once_with(
+            {"fallback_reason": "history stitch tool placeholder not found or already resolved"},
+            synchronize_session="fetch",
+        )
+        mock_db.commit.assert_called_once()
+
+    def test_create_resume_round_rejects_duplicate_interrupt_resolution(self, history_service, mock_db):
+        """同一 interrupt 不应被并发 resume 成多个 child round。"""
+        mock_db.query.return_value.filter.return_value.update.return_value = 1
+        mock_db.commit.side_effect = IntegrityError("INSERT", {}, Exception("UNIQUE constraint"))
+
+        with pytest.raises(ValueError, match="Interrupt already resumed: interrupt-1"):
+            history_service.create_resume_round(
+                session_id="session-123",
+                round_id="round-resume",
+                user_message="Q: Confirm?\nA: yes",
+                parent_run_id="round-interrupted",
+                interrupt_id="interrupt-1",
+                tool_call_id="tc-ask",
+                answers={"Confirm?": "yes"},
+                tool_result_content="User answered:\n- Confirm?: yes",
+            )
+
+        mock_db.rollback.assert_called_once()
+
+    def test_create_resume_round_rejects_non_resumable_parent_without_child(self, history_service, mock_db):
+        """父 round 已被处理时，不应留下新的 running resume round。"""
+        parent_round = MagicMock()
+        parent_round.status = "cancelled"
+        query_chain = mock_db.query.return_value.filter.return_value
+        query_chain.update.return_value = 0
+        query_chain.first.return_value = parent_round
+
+        with pytest.raises(ValueError, match="status=cancelled"):
+            history_service.create_resume_round(
+                session_id="session-123",
+                round_id="round-resume",
+                user_message="Q: Confirm?\nA: yes",
+                parent_run_id="round-interrupted",
+            )
+
+        mock_db.add.assert_not_called()
+        mock_db.commit.assert_not_called()
+        mock_db.rollback.assert_called_once()
+
     def test_complete_round(self, history_service, mock_db):
         """測試完成 Round"""
         mock_round = MagicMock()
@@ -87,7 +238,7 @@ class TestHistoryServiceRound:
         worker 上的 Agent 仍尝试 complete_round(status=completed)，
         导致状态矛盾。
         """
-        for terminal in ("completed", "failed", "cancelled"):
+        for terminal in ("completed", "failed", "cancelled", "resumed"):
             mock_round = MagicMock()
             mock_round.status = terminal
             mock_round.id = "round-terminal"
@@ -102,6 +253,32 @@ class TestHistoryServiceRound:
 
             assert result.status == terminal, f"终态 {terminal} 不应被覆写"
             mock_db.commit.reset_mock()
+
+    def test_complete_round_backfills_resumed_interrupt_metadata(self, history_service, mock_db):
+        """resume 抢先标记旧 round 后，迟到的 interrupted 完成仍可补写展示元数据。"""
+        mock_round = MagicMock()
+        mock_round.status = "resumed"
+        mock_round.final_response = None
+        mock_round.step_count = 0
+        mock_round.completed_at = None
+        mock_round.interrupt_payload = None
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_round
+
+        result = history_service.complete_round(
+            round_id="round-resumed",
+            final_response="partial response before interrupt",
+            step_count=2,
+            status="interrupted",
+            interrupt_payload='{"id":"iid-1"}',
+        )
+
+        assert result.status == "resumed"
+        assert result.final_response == "partial response before interrupt"
+        assert result.step_count == 2
+        assert result.interrupt_payload is None
+        assert result.completed_at is not None
+        mock_db.commit.assert_called_once()
+        mock_db.refresh.assert_called_once_with(mock_round)
 
 
 class TestHistoryServiceGetSessionRounds:
@@ -126,6 +303,7 @@ class TestHistoryServiceGetSessionRounds:
         mock_round.created_at = datetime.now()
         mock_round.completed_at = datetime.now()
         mock_round.user_attachments = None
+        mock_round.parent_run_id = "round-parent"
         
         # 模拟 AG-UI 事件（用于重建 steps）
         mock_event = MagicMock()
@@ -148,6 +326,7 @@ class TestHistoryServiceGetSessionRounds:
         
         assert len(rounds) == 1
         assert rounds[0]["round_id"] == "round-1"
+        assert rounds[0]["parent_run_id"] == "round-parent"
         assert rounds[0]["user_message"] == "Hello"
         # steps 從事件重建
         assert "steps" in rounds[0]

@@ -690,7 +690,10 @@ describe('ChatV2 组件', () => {
       total: runningRounds.length,
     });
 
-    vi.mocked(apiService.abortChat).mockResolvedValue(undefined);
+    let resolveAbort: () => void = () => {};
+    vi.mocked(apiService.abortChat).mockImplementation(() => new Promise<void>((resolve) => {
+      resolveAbort = resolve;
+    }));
 
     render(
       <ChatV2
@@ -717,16 +720,38 @@ describe('ChatV2 组件', () => {
     // abort API 应该被调用
     expect(apiService.abortChat).toHaveBeenCalledWith('test-session');
 
-    // UI 应该立即更新 — 不再显示停止按钮，输入框可用
-    await waitFor(() => {
-      expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
-    });
+    // UI 应该在 abort HTTP 返回前立即更新 — 不再显示停止按钮，输入框可用
+    expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
 
     const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
     expect(textarea).not.toBeDisabled();
 
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: '马上问新问题' } });
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
+
     // onExecutionEnd 应该被调用
     expect(defaultProps.onExecutionEnd).toHaveBeenCalled();
+
+    await act(async () => {
+      resolveAbort();
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    expect(apiService.sendMessageStreamV2).toHaveBeenCalledWith(
+      'test-session',
+      [{ type: 'text', text: '马上问新问题' }],
+      expect.any(Object)
+    );
   });
 
   it('user_cancelled 终态也应触发 onExecutionEnd，避免侧栏执行态残留', async () => {
@@ -890,7 +915,7 @@ describe('ChatV2 组件', () => {
     expect(apiService.abortChat).not.toHaveBeenCalled();
   });
 
-  it('abort 请求失败时应保持运行状态，不做本地终止', async () => {
+  it('abort 请求失败前先本地停止，失败后重新同步运行态', async () => {
     const runningRounds: RoundData[] = [
       {
         round_id: 'round-abort-fail',
@@ -924,8 +949,10 @@ describe('ChatV2 组件', () => {
       total: runningRounds.length,
     });
 
-    // abort API 抛出网络错误
-    vi.mocked(apiService.abortChat).mockRejectedValue(new Error('Network Error'));
+    let rejectAbort: (reason?: unknown) => void = () => {};
+    vi.mocked(apiService.abortChat).mockImplementation(() => new Promise<void>((_resolve, reject) => {
+      rejectAbort = reject;
+    }));
 
     render(
       <ChatV2
@@ -951,18 +978,23 @@ describe('ChatV2 组件', () => {
     // abort API 被调用
     expect(apiService.abortChat).toHaveBeenCalledWith('test-session');
 
-    // 关键断言：abort 失败后，UI 应保持运行状态
-    // 停止按钮仍然可见（仍在 sending 状态）
+    // abort HTTP 尚未返回时，UI 已经先本地停止。
+    expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+    expect(textarea).not.toBeDisabled();
+    expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('test-session');
+
+    await act(async () => {
+      rejectAbort(new Error('Network Error'));
+    });
+
+    // abort 失败后重新拉取历史；若后端仍是 running，则恢复运行态并提示错误。
     await waitFor(() => {
       expect(screen.getByTitle('停止生成')).toBeInTheDocument();
     });
-
-    // 输入框仍被禁用
-    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
     expect(textarea).toBeDisabled();
-
-    // onExecutionEnd 不应被调用
-    expect(defaultProps.onExecutionEnd).not.toHaveBeenCalled();
+    expect(screen.getByText('停止请求失败，后端任务可能仍在运行')).toBeInTheDocument();
   });
 
   it('abort 失败但终态事件已到达时，不应丢失收敛回调', async () => {

@@ -417,6 +417,7 @@ export interface AttachmentInfo {
 // 对话轮次
 export interface RoundData {
   round_id: string;
+  parent_run_id?: string | null;
   user_message: string;
   user_attachments?: AttachmentInfo[];
   final_response: string;

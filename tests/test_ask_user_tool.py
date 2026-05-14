@@ -228,11 +228,36 @@ class TestAgentResume:
         # 验证占位消息已被替换
         tool_msgs = [m for m in agent.messages if m.role == "tool" and m.tool_call_id == "tc_ask_1"]
         assert len(tool_msgs) == 1
+        assert tool_msgs[0].content.startswith("User answered:\n")
         assert "PostgreSQL" in tool_msgs[0].content
         assert "Which database" in tool_msgs[0].content
 
         # 验证中断状态已清除
         assert agent._pending_interrupt is None
+
+    def test_replace_interrupt_tool_result_accepts_cold_placeholder(self, tmp_path):
+        """冷恢复历史重建后的 resolved 占位也可被统一 helper 替换。"""
+        agent = make_agent(tmp_path)
+        agent.messages.append(
+            Message(
+                role="tool",
+                content="[Interrupt resolved in subsequent round]",
+                tool_call_id="tc_ask_1",
+                name="ask_user",
+            )
+        )
+
+        replaced = agent.replace_interrupt_tool_result("tc_ask_1", "User answered:\n- Q?: A")
+
+        assert replaced is True
+        tool_msg = next(m for m in agent.messages if m.role == "tool" and m.tool_call_id == "tc_ask_1")
+        assert tool_msg.content == "User answered:\n- Q?: A"
+
+    def test_format_interrupt_tool_result_is_shared_resume_format(self):
+        """结构化 resolution 持久化应复用热 resume 的 tool result 格式。"""
+        content = Agent.format_interrupt_tool_result({"Q1?": "A1", "Q2?": "A2"})
+
+        assert content == "User answered:\n- Q1?: A1\n- Q2?: A2"
 
     @pytest.mark.asyncio
     async def test_resume_wrong_id_raises(self, tmp_path):

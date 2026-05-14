@@ -143,6 +143,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   // 🆕 Human-in-the-Loop 中断状态
   const [pendingInterrupt, setPendingInterrupt] = useState<InterruptDetails | null>(null);
   const [resuming, setResuming] = useState(false);
+  const [stopping, setStopping] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
@@ -151,6 +152,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const subscriptionAbortRef = useRef<(() => void) | null>(null); // 🆕 保存订阅取消函数
   const stopRequestPendingRef = useRef(false); // handleStop 正在请求 abort，防止重复点击并发请求
   const suppressStopCallbacksRef = useRef(false); // 仅在本地 stop 成功后短暂屏蔽 SSE 迟到回调
+  const stopTerminalArrivedRef = useRef(false); // stop 请求期间若终态事件先到达，则不再用失败分支覆盖本地收敛
   const sessionIdRef = useRef(sessionId); // 追踪当前会话，防止旧 SSE 回调污染新会话状态
   const scrollPosBySessionRef = useRef<Record<string, number>>({});
   const pendingRestoreScrollRef = useRef<number | null>(null);
@@ -243,6 +245,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       setError('');
       setPendingInterrupt(null);
       setResuming(false);
+      setStopping(false);
       setAttachedFiles([]);
       setPreviewFile(null);
       setPreviewSessionId('');
@@ -284,6 +287,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     setError('');
     setPendingInterrupt(null); // 切换会话时清除旧的中断状态
     setResuming(false);
+    setStopping(false);
     loadHistory();
 
     // 🆕 cleanup 函数：组件卸载或 sessionId 变化时取消订阅
@@ -651,7 +655,10 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
               setPendingInterrupt(null);
             }
             // handleStop 已接管 UI 状态更新，此处跳过避免竞态覆盖
-            if (suppressStopCallbacksRef.current) return;
+            if (suppressStopCallbacksRef.current) {
+              stopTerminalArrivedRef.current = true;
+              return;
+            }
             setSending(false);
             onExecutionEnd?.(sessionId);
             subscriptionAbortRef.current = null;
@@ -1032,6 +1039,11 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         lastUpdated: Date.now(),
       }));
 
+      if (suppressStopCallbacksRef.current) {
+        stopTerminalArrivedRef.current = true;
+        return;
+      }
+
       setBusyFalse();
       onStreamSuccess();
     },
@@ -1275,7 +1287,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   };
 
   const handleSend = async () => {
-    if ((!input.trim() && attachedFiles.length === 0) || sending || creatingSession) return;
+    if ((!input.trim() && attachedFiles.length === 0) || sending || creatingSession || stopping) return;
 
     const draftInput = input;
     const draftAttachments = [...attachedFiles];
@@ -1407,65 +1419,68 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   /** 当前发送按钮的 loading 文案（空 = 非 loading） */
   const sendingLabel = creatingSession ? '创建中' : resuming ? 'Resuming' : sending ? 'Running' : '';
 
-  /** 停止生成：调用后端 abort API，立即更新 UI 状态（不等 SSE 推送 RUN_FINISHED） */
+  const applyLocalStop = (targetSessionId: string) => {
+    suppressStopCallbacksRef.current = true;
+    stopTerminalArrivedRef.current = false;
+    setStopping(true);
+
+    if (subscriptionAbortRef.current) {
+      subscriptionAbortRef.current();
+      subscriptionAbortRef.current = null;
+    }
+
+    setRounds((prev) =>
+      prev.map((round) =>
+        round.status === 'running'
+          ? {
+              ...round,
+              status: 'interrupted',
+              steps: round.steps.map((step) =>
+                step.status === 'streaming' || step.status === 'running'
+                  ? { ...step, status: 'completed' as const }
+                  : step
+              ),
+            }
+          : round
+      )
+    );
+
+    setAgentState((prev) => ({ ...prev, status: 'completed', lastUpdated: Date.now() }));
+    setSending(false);
+    setResuming(false);
+    setPendingInterrupt(null);
+    onExecutionEnd?.(targetSessionId);
+  };
+
+  /** 停止生成：点击后先本地收敛 UI，再后台调用后端 abort。 */
   const handleStop = async () => {
     if (!sessionId || !(sending || resuming) || stopRequestPendingRef.current) return;
+    const targetSessionId = sessionId;
     stopRequestPendingRef.current = true;
+    applyLocalStop(targetSessionId);
+
     try {
-      try {
-        await apiService.abortChat(sessionId);
-      } catch (err) {
-        const statusCode = (err as { response?: { status?: number } })?.response?.status;
-        if (statusCode === 409) {
-          // 会话已不在运行态（可能已被前一次 abort 收敛），按停止成功处理。
-          console.info('Abort returned 409, treating as already stopped.');
-        } else {
-          // abort 请求失败（网络错误/服务端异常），后端任务可能仍在运行。
-          // 这里不屏蔽 SSE 回调，继续等待后端终态事件正常收敛。
-          console.warn('Abort request failed, keeping running state:', err);
-          return;
+      await apiService.abortChat(targetSessionId);
+    } catch (err) {
+      const statusCode = (err as { response?: { status?: number } })?.response?.status;
+      if (statusCode === 409) {
+        // 会话已不在运行态（可能已被前一次 abort 收敛），按停止成功处理。
+        console.info('Abort returned 409, treating as already stopped.');
+      } else if (stopTerminalArrivedRef.current) {
+        console.info('Abort request failed after terminal event arrived, keeping stopped UI.');
+      } else {
+        console.warn('Abort request failed, reloading running state:', err);
+        if (sessionIdRef.current === targetSessionId) {
+          suppressStopCallbacksRef.current = false;
+          await loadHistory();
+          if (sessionIdRef.current === targetSessionId) {
+            setError('停止请求失败，后端任务可能仍在运行');
+          }
         }
       }
-
-      // 仅在 stop 成功后屏蔽迟到回调，避免本地“已停止”被旧 SSE 回调反写。
-      suppressStopCallbacksRef.current = true;
-
-      // 先取消 SSE 订阅，确保后续不会有事件回调覆盖状态
-      if (subscriptionAbortRef.current) {
-        subscriptionAbortRef.current();
-        subscriptionAbortRef.current = null;
-      }
-
-      // 再更新 UI 状态
-      // 1. 标记当前运行中的 round 为 interrupted（与后端 cancel_token 路径一致）
-      setRounds((prev) =>
-        prev.map((round) =>
-          round.status === 'running'
-            ? {
-                ...round,
-                status: 'interrupted',
-                steps: round.steps.map((s) =>
-                  s.status === 'streaming' || s.status === 'running'
-                    ? { ...s, status: 'completed' as const }
-                    : s
-                ),
-              }
-            : round
-        )
-      );
-
-      // 2. 重置 agent 状态
-      setAgentState((prev) => ({ ...prev, status: 'completed', lastUpdated: Date.now() }));
-
-      // 3. 停止 sending / resuming，清理中断状态
-      setSending(false);
-      setResuming(false);
-      setPendingInterrupt(null);
-
-      // 4. 通知父组件执行结束
-      onExecutionEnd?.(sessionId);
     } finally {
       stopRequestPendingRef.current = false;
+      setStopping(false);
       if (suppressStopCallbacksRef.current) {
         // 利用宏任务（macrotask）延迟释放回调屏蔽标记：
         // 当前调用栈中的同步 setState 全部 enqueue 后，React 在微任务中 batch commit，
@@ -1715,6 +1730,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           onSend={handleSend}
           onStop={(sending || resuming) ? handleStop : undefined}
           disabled={inputDisabled}
+          sendDisabled={stopping}
           sendingLabel={sendingLabel}
           placeholder={sessionId ? '输入指令...' : '输入你的问题，按 Enter 开始对话...'}
           attachedFiles={attachedFiles}

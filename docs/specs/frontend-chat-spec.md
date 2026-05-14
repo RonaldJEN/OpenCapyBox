@@ -22,23 +22,30 @@
 // types/index.ts
 RoundData {
   round_id: string
-  status: 'running' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'resumed'
-  user_text: string
-  user_attachments: AttachmentInfo[]
+  parent_run_id?: string | null
+  user_message: string
+  user_attachments?: AttachmentInfo[]
+  final_response: string
   steps: StepData[]
-  final_response?: string
+  step_count: number
+  status: 'running' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'resumed'
+  created_at: string
+  completed_at?: string
   interrupt?: InterruptDetails       // ask_user 中断
-  step_count?: number
 }
 
 StepData {
-  type: 'thinking' | 'tool_call' | 'text'
-  content: string
-  tool_name?: string
-  tool_args?: any
-  tool_result?: any
-  start_time?: number
-  end_time?: number
+  step_number: number
+  thinking?: string
+  assistant_content?: string
+  tool_calls: ToolCall[]
+  tool_results: ToolResult[]
+  status: string
+  created_at?: string
+  thinking_start_ts?: number
+  thinking_end_ts?: number
+  started_at_ts?: number
+  finished_at_ts?: number
 }
 
 AgentState {
@@ -90,14 +97,13 @@ catch (SSE error)
 ### 3.5 取消语义
 
 用户点击取消：
-1. POST `/api/chat/{sid}/abort`。
-2. 若请求成功：
-  - 前端立即取消当前订阅（`subscription.abort()`），防止后续迟到回调覆盖状态；
-  - 本地将当前 `running` round 先收敛为中断态（用于即时反馈），并结束 `sending/resuming`；
-  - 立即恢复输入可用（不等待 SSE 终态事件）。
-3. 若请求返回 409（会话已无运行任务）：按“已停止”处理并立即收敛本地 UI，避免重复点击无反馈。
-4. 其他请求失败：保持当前运行态，等待 SSE 后端终态事件收敛。
-5. 后端规范终态为 `RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled)`，
+1. 前端点击后必须立即取消当前订阅（`subscription.abort()`），防止后续迟到回调覆盖状态。
+2. 本地将当前 `running` round 先收敛为中断态（用于即时反馈），结束 `sending/resuming`，并立即恢复输入可用；不得等待 `/abort` HTTP 响应或 SSE 终态事件。
+3. 进入 `stopping` 状态：输入框保持可编辑，但新的发送动作必须禁用，直到 `/abort` 返回，避免用户立即发送新问题时撞到后端尚未释放的 user/session lock。
+4. 同步发起 POST `/api/chat/{sid}/abort`。
+5. 若请求返回 409（会话已无运行任务）：按“已停止”处理，保持本地已收敛 UI。
+6. 其他请求失败：重新拉取历史以恢复真实运行态，并提示停止请求失败。
+7. 后端规范终态为 `RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled)`，
   前端按 `isUserCancelledOutcome()` 识别为"已取消"，**不是错误**。
 
 **判定**：`outcome === 'interrupt' && result?.reason === 'user_cancelled'`。outcome=interrupt 但无 reason 的保守处理为非取消。
@@ -116,7 +122,7 @@ catch (SSE error)
 
 ### 3.8 Resume 后的 Round 关系
 
-`ask_user` 中断恢复后，**不**复用旧 round。后端语义（见 `chat-spec.md` §Resume 流程，对应实现 `history_service.resolve_interrupted_rounds()` 与 `agent_service` 的 resume 入口）：
+`ask_user` 中断恢复后，**不**复用旧 round。后端语义（见 `chat-spec.md` §Resume 流程，对应实现 `history_service.create_resume_round()` 与 `agent_service` 的 resume 入口）：
 
 - 旧 `interrupted` round 的状态会被后端迁移为 `resumed`，并清除 `interrupt_payload`，以阻止刷新后重复弹出 `QuestionCard`。
 - 同时新建一个 round（`parent_run_id` 指向旧 round）承载 resume 之后的步骤。

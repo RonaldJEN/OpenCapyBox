@@ -221,6 +221,34 @@ class Agent:
             return None
         return dict(self._pending_interrupt)
 
+    @staticmethod
+    def format_interrupt_tool_result(answers: dict[str, str]) -> str:
+        """格式化 ask_user 回答为热 resume 写入 tool result 的内容。"""
+        answer_lines = []
+        for question_text, answer in answers.items():
+            answer_lines.append(f"- {question_text}: {answer}")
+        return "User answered:\n" + "\n".join(answer_lines) if answer_lines else "User provided no answers."
+
+    def replace_interrupt_tool_result(self, tool_call_id: str, content: str) -> bool:
+        """替换指定 ask_user tool result 占位内容。
+
+        Returns:
+            True 表示找到并替换了目标 tool message；False 表示未找到可替换占位。
+        """
+        placeholders = {
+            "[Awaiting user response]",
+            "[Interrupt resolved in subsequent round]",
+        }
+        for msg in self.messages:
+            if (
+                msg.role == "tool"
+                and msg.tool_call_id == tool_call_id
+                and msg.content in placeholders
+            ):
+                msg.content = content
+                return True
+        return False
+
     def resume_from_interrupt(self, interrupt_id: str, answers: dict[str, str]) -> None:
         """从 ask_user 中断中恢复，将用户答案注入对话历史。
 
@@ -239,22 +267,8 @@ class Agent:
             )
 
         tool_call_id = self._pending_interrupt["tool_call_id"]
-
-        # 格式化答案为人类可读 + LLM 可理解的文本
-        answer_lines = []
-        for question_text, answer in answers.items():
-            answer_lines.append(f"- {question_text}: {answer}")
-        formatted_answers = "User answered:\n" + "\n".join(answer_lines) if answer_lines else "User provided no answers."
-
-        # 找到占位 tool_result 消息并替换 content
-        for msg in self.messages:
-            if (
-                msg.role == "tool"
-                and msg.tool_call_id == tool_call_id
-                and msg.content == "[Awaiting user response]"
-            ):
-                msg.content = formatted_answers
-                break
+        formatted_answers = self.format_interrupt_tool_result(answers)
+        self.replace_interrupt_tool_result(tool_call_id, formatted_answers)
 
         self._pending_interrupt = None
 

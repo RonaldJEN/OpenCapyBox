@@ -113,6 +113,7 @@ class StepData(BaseModel):
 class RoundData(BaseModel):
     """对话轮次数据"""
     round_id: str
+    parent_run_id: Optional[str] = None
     user_message: str
     user_attachments: List[Dict[str, Any]] = Field(default_factory=list)
     final_response: Optional[str] = None
