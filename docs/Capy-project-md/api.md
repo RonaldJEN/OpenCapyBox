@@ -162,18 +162,19 @@ Authorization: Bearer <access_token>
 
 ### 获取会话列表
 
-获取当前用户的所有会话。
+获取当前用户的所有会话，可按标题或用户消息正文搜索。
 
 **请求**
 
 ```
-GET /api/sessions/list
+GET /api/sessions/list?q=<optional_search_query>
 Authorization: Bearer <access_token>
 ```
 
 | 参数       | 类型   | 必填 | 说明                  |
 | ---------- | ------ | ---- | --------------------- |
 | user_id         | string | 是   | 用户 ID（由 Authorization Bearer Token 解析） |
+| q         | string | 否   | 搜索词；匹配会话标题和讨论内容 |
 
 **响应** `200 OK`
 
@@ -186,11 +187,26 @@ Authorization: Bearer <access_token>
       "status": "active",
       "title": "新会话",
       "created_at": "2025-01-14T10:30:00",
-      "updated_at": "2025-01-14T10:35:00"
+      "updated_at": "2025-01-14T10:35:00",
+      "model_id": "default-model",
+      "match_type": "assistant",
+      "match_excerpt": "Agent 回复里提到了 PostgreSQL 部署和索引方案",
+      "match_round_id": "round-001"
     }
   ]
 }
 ```
+
+**搜索说明**
+
+- `q` 为空或全空格时返回完整列表。
+- 搜索匹配会话标题、用户消息和 Agent 回复；用户消息以 `rounds.user_message` 的前端可见文本为准，避免匹配 Agent 内部上下文 / 附件提示 / Data URL。
+- Agent 回复搜索 `conversation_messages(role=assistant).content`，并查询 `rounds.final_response` 作为历史兜底；搜索不包含 tool / summary / synthetic 内容。
+- `match_type` 可能为 `title` / `user` / `assistant`。
+- 排序优先级为 title → user → assistant；同级内按更新时间倒序。
+- `match_excerpt` 在用户消息或 Agent 回复命中时返回短摘要。
+- `match_round_id` 在命中具体轮次时返回，前端可用于打开会话后定位。
+- 搜索使用 PostgreSQL 兼容的轻量 `ILIKE ... ESCAPE`，`%`、`_`、`\` 按普通字符处理。
 
 ---
 

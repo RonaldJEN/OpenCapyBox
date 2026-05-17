@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Login } from './components/Login';
 import { SessionList } from './components/SessionList';
@@ -12,6 +12,11 @@ import { getUnreadCount } from './services/configApi';
 import type { ModelInfo } from './types';
 
 type ConfigPanel = 'config' | 'skills' | 'cron' | null;
+type SessionScrollTarget = {
+  sessionId: string;
+  roundId: string;
+  nonce: number;
+};
 
 // 主页面组件
 function HomePage() {
@@ -24,6 +29,8 @@ function HomePage() {
   const [activePanel, setActivePanel] = useState<ConfigPanel>(null);
   const [panelMounted, setPanelMounted] = useState(false);
   const [cronUnreadCount, setCronUnreadCount] = useState(0);
+  const [sessionScrollTarget, setSessionScrollTarget] = useState<SessionScrollTarget | null>(null);
+  const sessionScrollNonceRef = useRef(0);
 
   const closeConfigPanel = useCallback(() => {
     setActivePanel(null);
@@ -68,6 +75,19 @@ function HomePage() {
     setExecutingSessionId(sessionId);
   };
 
+  const handleSessionSelect = (sessionId: string, target?: { roundId: string }) => {
+    setCurrentSessionId(sessionId);
+    if (target?.roundId) {
+      setSessionScrollTarget({
+        sessionId,
+        roundId: target.roundId,
+        nonce: ++sessionScrollNonceRef.current,
+      });
+    } else {
+      setSessionScrollTarget(null);
+    }
+  };
+
   const handleExecutionEnd = (sessionId?: string) => {
     // 如果传了 sessionId，只在匹配时清除（避免切换会话时误清其他正在运行的会话）
     if (sessionId) {
@@ -92,6 +112,7 @@ function HomePage() {
     const response = await apiService.createSession(modelId);
     setRefreshTrigger((prev) => prev + 1); // 刷新侧边栏列表
     setCurrentSessionId(response.session_id);
+    setSessionScrollTarget(null);
     return response.session_id;
   }, []);
 
@@ -99,13 +120,16 @@ function HomePage() {
     <div className="flex h-screen overflow-hidden">
       <SessionList
         currentSessionId={currentSessionId}
-        onSessionSelect={setCurrentSessionId}
+        onSessionSelect={handleSessionSelect}
         refreshTrigger={refreshTrigger}
         executingSessionId={executingSessionId}
         onRunningSessionDetected={handleRunningSessionDetected}
         isCollapsed={isSidebarCollapsed}
         onModelChange={setSelectedModelId}
-        onNewChat={() => setCurrentSessionId('')}
+        onNewChat={() => {
+          setCurrentSessionId('');
+          setSessionScrollTarget(null);
+        }}
         cronUnreadCount={cronUnreadCount}
         onOpenConfig={() => {
           const next = activePanel === 'config' ? null : 'config';
@@ -133,6 +157,7 @@ function HomePage() {
         onModelChange={setSelectedModelId}
         availableModels={availableModels}
         onCreateSession={handleCreateSessionForChat}
+        scrollTarget={sessionScrollTarget}
       />
       {/* Config panel overlay drawer */}
       {panelMounted && (

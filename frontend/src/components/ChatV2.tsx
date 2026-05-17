@@ -50,6 +50,11 @@ interface ChatV2Props {
   availableModels?: ModelInfo[];
   /** 从欢迎页触发创建会话：返回新 sessionId */
   onCreateSession?: (modelId?: string) => Promise<string>;
+  scrollTarget?: {
+    sessionId: string;
+    roundId: string;
+    nonce: number;
+  } | null;
 }
 
 type StepUpdater = (patchOrFn: Partial<StepData> | ((step: StepData) => StepData)) => void;
@@ -82,9 +87,10 @@ const isUserCancelledOutcome = (outcome: string, interrupt: any, result?: any): 
   return false;
 };
 
-export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutionEnd, onPanelToggle, selectedModelId, onModelChange, availableModels = [], onCreateSession }: ChatV2Props) {
+export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutionEnd, onPanelToggle, selectedModelId, onModelChange, availableModels = [], onCreateSession, scrollTarget }: ChatV2Props) {
   const [rounds, setRounds] = useState<RoundData[]>([]);
   const [disableInitialMotion, setDisableInitialMotion] = useState(false);
+  const [highlightedRoundId, setHighlightedRoundId] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
@@ -155,6 +161,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const stopTerminalArrivedRef = useRef(false); // stop 请求期间若终态事件先到达，则不再用失败分支覆盖本地收敛
   const sessionIdRef = useRef(sessionId); // 追踪当前会话，防止旧 SSE 回调污染新会话状态
   const scrollPosBySessionRef = useRef<Record<string, number>>({});
+  const roundElementRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const handledScrollTargetNonceRef = useRef<number | null>(null);
   const pendingRestoreScrollRef = useRef<number | null>(null);
   const suppressAutoScrollRef = useRef<boolean>(false); // 切会话期间抑制自动 smooth 滚动
   const titleRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -253,6 +261,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       setIsDragging(false);
       setLoading(false);
       setDisableInitialMotion(false);
+      setHighlightedRoundId(null);
+      roundElementRefs.current = {};
       isInitialLoadRef.current = true;
       suppressAutoScrollRef.current = false;
       pendingRestoreScrollRef.current = null;
@@ -280,6 +290,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     sessionIdRef.current = sessionId; // 立即更新，后续所有旧回调通过 ref 感知到会话已切换
     isInitialLoadRef.current = true; // 🆕 切换会话时重置为首次加载
     suppressAutoScrollRef.current = true; // 切会话期间抑制自动 smooth 滚动
+    roundElementRefs.current = {};
+    setHighlightedRoundId(null);
     setIsAtBottom(false); // 避免会话切换瞬间误触发 smooth scroll
     historyLoadedRef.current = false; // 重置历史加载标记
     prevRoundsLengthRef.current = 0;
@@ -335,6 +347,26 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
     prevRoundsLengthRef.current = rounds.reduce((sum, r) => sum + 1 + r.steps.length, 0);
   }, [rounds, sessionId]);
+
+  useEffect(() => {
+    if (!scrollTarget || scrollTarget.sessionId !== sessionId || loading) return;
+    if (handledScrollTargetNonceRef.current === scrollTarget.nonce) return;
+
+    const target = roundElementRefs.current[scrollTarget.roundId];
+    if (!target) return;
+
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    handledScrollTargetNonceRef.current = scrollTarget.nonce;
+    setHighlightedRoundId(scrollTarget.roundId);
+
+    const timer = setTimeout(() => {
+      setHighlightedRoundId((current) => (
+        current === scrollTarget.roundId ? null : current
+      ));
+    }, 1800);
+
+    return () => clearTimeout(timer);
+  }, [scrollTarget?.nonce, scrollTarget?.roundId, scrollTarget?.sessionId, sessionId, loading, rounds]);
 
   // 🔥 流式新内容时：仅在用户位于底部时平滑滚动跟随
   useEffect(() => {
@@ -1660,15 +1692,27 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           ) : (
             <div className="mx-auto px-4 md:px-8 py-6 space-y-6 max-w-3xl">
               {rounds.map((round, index) => (
-                <Round
+                <div
                   key={round.round_id}
-                  round={round}
-                  userAttachments={round.user_attachments || []}
-                  sessionId={sessionId}
-                  onPreviewAttachment={handlePreviewAttachment}
-                  isStreaming={(sending || resuming) && index === rounds.length - 1}
-                  disableMotion={disableInitialMotion}
-                />
+                  ref={(el) => {
+                    roundElementRefs.current[round.round_id] = el;
+                  }}
+                  data-round-id={round.round_id}
+                  className={`scroll-mt-20 rounded-2xl transition-colors duration-300 ${
+                    highlightedRoundId === round.round_id
+                      ? 'bg-claude-accent/10 ring-2 ring-claude-accent/30 px-3 py-3 -mx-3'
+                      : ''
+                  }`}
+                >
+                  <Round
+                    round={round}
+                    userAttachments={round.user_attachments || []}
+                    sessionId={sessionId}
+                    onPreviewAttachment={handlePreviewAttachment}
+                    isStreaming={(sending || resuming) && index === rounds.length - 1}
+                    disableMotion={disableInitialMotion}
+                  />
+                </div>
               ))}
 
               <div ref={messagesEndRef} />

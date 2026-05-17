@@ -342,6 +342,9 @@ export interface Session {
   updated_at: string;
   title?: string;
   model_id?: string;
+  match_type?: 'title' | 'user' | 'assistant';
+  match_excerpt?: string;
+  match_round_id?: string;
 }
 
 // 认证响应

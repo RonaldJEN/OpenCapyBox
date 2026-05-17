@@ -1,14 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
 import { Session } from '../types';
-import { MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Zap, Clock } from 'lucide-react';
+import { MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Zap, Clock, Search, X } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
 
 interface SessionListProps {
   currentSessionId?: string;
-  onSessionSelect: (sessionId: string) => void;
+  onSessionSelect: (sessionId: string, target?: { roundId: string }) => void;
   refreshTrigger?: number;
   executingSessionId?: string | null;
   onRunningSessionDetected?: (sessionId: string) => void;
@@ -24,17 +24,30 @@ interface SessionListProps {
 export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionId, onRunningSessionDetected, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenSkills, onOpenCron }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
+  const [searchLoading, setSearchLoading] = useState(false);
+  const searchRequestSeqRef = useRef(0);
+  const debouncedSearchQueryRef = useRef('');
   const navigate = useNavigate();
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   // 合併為單一 useEffect，避免重複 API 請求
   useEffect(() => {
-    loadSessions();
-  }, [refreshTrigger, currentSessionId]);
+    debouncedSearchQueryRef.current = debouncedSearchQuery;
+    loadSessions(debouncedSearchQuery);
+  }, [refreshTrigger, currentSessionId, debouncedSearchQuery]);
 
   // 30s 自动刷新会话列表
   useEffect(() => {
     const timer = setInterval(() => {
-      loadSessions();
+      loadSessions(debouncedSearchQueryRef.current);
     }, 30000);
     return () => clearInterval(timer);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -47,14 +60,25 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
 
-  const loadSessions = async () => {
+  const loadSessions = async (query = debouncedSearchQueryRef.current) => {
+    const requestSeq = ++searchRequestSeqRef.current;
+    const normalizedQuery = query.trim();
+    setSearchLoading(normalizedQuery.length > 0);
+
     try {
-      const response = await apiService.getSessions();
+      const response = normalizedQuery
+        ? await apiService.getSessions(normalizedQuery)
+        : await apiService.getSessions();
+      if (requestSeq !== searchRequestSeqRef.current) return;
       setSessions(response.sessions);
     } catch (error) {
+      if (requestSeq !== searchRequestSeqRef.current) return;
       console.error('Failed to load sessions:', error);
     } finally {
-      setLoading(false);
+      if (requestSeq === searchRequestSeqRef.current) {
+        setLoading(false);
+        setSearchLoading(false);
+      }
     }
   };
 
@@ -88,6 +112,12 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
   const handleLogout = () => {
     apiService.logout();
     navigate('/login');
+  };
+
+  const isSearchActive = debouncedSearchQuery.trim().length > 0;
+  const matchSourceLabel: Partial<Record<NonNullable<Session['match_type']>, string>> = {
+    user: '我的问题',
+    assistant: 'Agent 回复',
   };
 
   if (loading) {
@@ -127,6 +157,34 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
         )}
       </div>
 
+      <div className="px-1 pt-4 pb-3">
+        <div className="relative">
+          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-claude-muted pointer-events-none" />
+          <input
+            aria-label="搜索会话"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="搜索对话"
+            className="w-full h-9 rounded-lg border border-claude-border bg-white pl-9 pr-8 text-[13px] text-claude-text placeholder:text-claude-muted focus:outline-none focus:border-claude-accent focus:ring-2 focus:ring-claude-accent/20 transition-colors"
+          />
+          {searchLoading ? (
+            <span className="absolute right-3 top-1/2 -translate-y-1/2 flex h-4 w-4 items-center justify-center">
+              <Loader2 size={14} className="text-claude-muted animate-spin" />
+            </span>
+          ) : searchQuery ? (
+            <button
+              type="button"
+              aria-label="清空搜索"
+              title="清空搜索"
+              onClick={() => setSearchQuery('')}
+              className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-claude-muted hover:text-claude-secondary hover:bg-claude-hover rounded transition-colors"
+            >
+              <X size={13} />
+            </button>
+          ) : null}
+        </div>
+      </div>
+
       {/* History List */}
       <div className="flex-1 overflow-y-auto space-y-1.5 scrollbar-hide -mx-2 px-2">
         <p className="px-3 pb-2 text-xs font-medium text-claude-muted uppercase tracking-widest">History</p>
@@ -134,14 +192,20 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
         {sessions.length === 0 ? (
           <div className="px-2 py-12 text-center">
             <MessageSquare className="w-8 h-8 mx-auto mb-3 text-claude-border" />
-            <p className="text-sm text-claude-muted">暂无对话记录</p>
+            <p className="text-sm text-claude-muted">
+              {isSearchActive ? '没有匹配的对话' : '暂无对话记录'}
+            </p>
           </div>
         ) : (
           sessions.map((session) => (
             <div
               key={session.id}
               onClick={() => {
-                onSessionSelect(session.id);
+                if (session.match_round_id) {
+                  onSessionSelect(session.id, { roundId: session.match_round_id });
+                } else {
+                  onSessionSelect(session.id);
+                }
                 // 切換 session 時同步模型顯示
                 if (session.model_id && onModelChange) {
                   onModelChange(session.model_id);
@@ -184,6 +248,17 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
                     addSuffix: true,
                     locale: zhCN,
                   })}
+                </p>
+              )}
+
+              {session.match_type && session.match_type !== 'title' && session.match_excerpt && (
+                <p className="text-[11px] text-claude-muted mt-1 truncate">
+                  {matchSourceLabel[session.match_type] && (
+                    <span className="mr-1 text-claude-secondary">
+                      {matchSourceLabel[session.match_type]}:
+                    </span>
+                  )}
+                  {session.match_excerpt}
                 </p>
               )}
             </div>

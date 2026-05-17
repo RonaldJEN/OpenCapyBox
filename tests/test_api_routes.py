@@ -143,6 +143,257 @@ class TestAuthRouter:
 class TestSessionsRouter:
     """會話路由測試"""
 
+    @pytest.fixture
+    def sessions_client(self):
+        """创建会话路由测试客户端（真实 SQLite DB）。"""
+        from src.api.deps import get_current_user
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+
+        app = FastAPI()
+        app.include_router(sessions.router, prefix="/sessions")
+        app.dependency_overrides[get_current_user] = lambda: "user-1"
+
+        def _override_get_db():
+            db = TestingSessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = _override_get_db
+
+        with TestClient(app) as test_client:
+            test_client.SessionLocal = TestingSessionLocal  # type: ignore[attr-defined]
+            yield test_client
+
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+    def _add_session(self, db, session_id: str, *, user_id: str = "user-1", title: str = "新会话", updated_at=None):
+        from src.api.models.session import Session as SessionModel
+
+        updated = updated_at or datetime(2026, 5, 15, 10, 0, 0)
+        db.add(SessionModel(
+            id=session_id,
+            user_id=user_id,
+            title=title,
+            status="active",
+            created_at=updated,
+            updated_at=updated,
+        ))
+
+    def _add_message(
+        self,
+        db,
+        session_id: str,
+        content: str,
+        *,
+        role: str = "user",
+        sequence: int = 1,
+        is_summary: bool = False,
+        is_synthetic: bool = False,
+    ):
+        from src.api.models.conversation_message import ConversationMessage
+
+        db.add(ConversationMessage(
+            session_id=session_id,
+            sequence=sequence,
+            role=role,
+            content=content,
+            is_summary=is_summary,
+            is_synthetic=is_synthetic,
+        ))
+
+    def _add_round(
+        self,
+        db,
+        session_id: str,
+        *,
+        round_id: str = "round-1",
+        user_message: str = "hello",
+        final_response: str | None = None,
+    ):
+        from src.api.models.round import Round
+
+        db.add(Round(
+            id=round_id,
+            session_id=session_id,
+            thread_id=session_id,
+            user_message=user_message,
+            final_response=final_response,
+            status="completed",
+        ))
+
+    def test_list_sessions_without_query_preserves_existing_behavior(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "older", updated_at=datetime(2026, 5, 14, 10, 0, 0))
+            self._add_session(db, "newer", updated_at=datetime(2026, 5, 15, 10, 0, 0))
+            self._add_session(db, "other-user", user_id="user-2", updated_at=datetime(2026, 5, 16, 10, 0, 0))
+            db.commit()
+
+        response = sessions_client.get("/sessions/list")
+
+        assert response.status_code == 200
+        sessions_payload = response.json()["sessions"]
+        assert [item["id"] for item in sessions_payload] == ["newer", "older"]
+        assert all(item["match_type"] is None for item in sessions_payload)
+
+    def test_list_sessions_search_matches_title(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "s-title", title="预算复盘")
+            self._add_session(db, "s-other", title="日常记录")
+            db.commit()
+
+        response = sessions_client.get("/sessions/list", params={"q": "预算"})
+
+        assert response.status_code == 200
+        sessions_payload = response.json()["sessions"]
+        assert [item["id"] for item in sessions_payload] == ["s-title"]
+        assert sessions_payload[0]["match_type"] == "title"
+        assert sessions_payload[0]["match_excerpt"] is None
+
+    def test_list_sessions_search_matches_user_message_with_excerpt(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "s-message", title="普通标题")
+            self._add_round(
+                db,
+                "s-message",
+                round_id="round-user-message",
+                user_message="请帮我整理 session 搜索 的实现方案，并考虑测试覆盖",
+                final_response="好的",
+            )
+            db.commit()
+
+        response = sessions_client.get("/sessions/list", params={"q": "搜索"})
+
+        assert response.status_code == 200
+        item = response.json()["sessions"][0]
+        assert item["id"] == "s-message"
+        assert item["match_type"] == "user"
+        assert "搜索" in item["match_excerpt"]
+        assert item["match_round_id"] == "round-user-message"
+
+    def test_list_sessions_search_ignores_internal_user_context_content(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "s-internal-user", title="普通标题")
+            self._add_message(
+                db,
+                "s-internal-user",
+                '[{"type":"text","text":"internal-only-token 文件已就绪"}]',
+                role="user",
+                sequence=1,
+            )
+            self._add_round(
+                db,
+                "s-internal-user",
+                round_id="round-visible-user",
+                user_message="用户实际看到的问题",
+                final_response="好的",
+            )
+            db.commit()
+
+        response = sessions_client.get("/sessions/list", params={"q": "internal-only-token"})
+
+        assert response.status_code == 200
+        assert response.json()["sessions"] == []
+
+    def test_list_sessions_search_matches_assistant_message(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "s-assistant", title="普通标题")
+            self._add_message(
+                db,
+                "s-assistant",
+                "Agent 回复里提到了 PostgreSQL 部署和索引方案",
+                role="assistant",
+            )
+            db.commit()
+
+        response = sessions_client.get("/sessions/list", params={"q": "PostgreSQL"})
+
+        assert response.status_code == 200
+        item = response.json()["sessions"][0]
+        assert item["id"] == "s-assistant"
+        assert item["match_type"] == "assistant"
+        assert "PostgreSQL" in item["match_excerpt"]
+
+    def test_list_sessions_search_matches_round_final_response_fallback(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "s-round-final", title="普通标题")
+            self._add_round(
+                db,
+                "s-round-final",
+                final_response="更新了你的 USER.md（用户画像文件），加了这段内容",
+            )
+            db.commit()
+
+        response = sessions_client.get("/sessions/list", params={"q": "用户画像"})
+
+        assert response.status_code == 200
+        item = response.json()["sessions"][0]
+        assert item["id"] == "s-round-final"
+        assert item["match_type"] == "assistant"
+        assert "用户画像" in item["match_excerpt"]
+        assert item["match_round_id"] == "round-1"
+
+    def test_list_sessions_search_matches_round_user_message_fallback(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "s-round-user", title="普通标题")
+            self._add_round(
+                db,
+                "s-round-user",
+                user_message="帮我检查用户画像有没有更新",
+                final_response="已经处理好了",
+            )
+            db.commit()
+
+        response = sessions_client.get("/sessions/list", params={"q": "用户画像"})
+
+        assert response.status_code == 200
+        item = response.json()["sessions"][0]
+        assert item["id"] == "s-round-user"
+        assert item["match_type"] == "user"
+        assert "用户画像" in item["match_excerpt"]
+        assert item["match_round_id"] == "round-1"
+
+    def test_list_sessions_search_ignores_tool_summary_synthetic_and_other_users(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "tool-hit")
+            self._add_session(db, "summary-hit")
+            self._add_session(db, "synthetic-hit")
+            self._add_session(db, "other-user-hit", user_id="user-2")
+            self._add_message(db, "tool-hit", "hidden-token", role="tool")
+            self._add_message(db, "summary-hit", "hidden-token", is_summary=True)
+            self._add_message(db, "synthetic-hit", "hidden-token", is_synthetic=True)
+            self._add_message(db, "other-user-hit", "hidden-token")
+            db.commit()
+
+        response = sessions_client.get("/sessions/list", params={"q": "hidden-token"})
+
+        assert response.status_code == 200
+        assert response.json()["sessions"] == []
+
+    def test_list_sessions_search_escapes_like_wildcards(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "literal", title="literal %_ token")
+            self._add_session(db, "wildcard-lookalike", title="literal ax token")
+            self._add_session(db, "backslash", title="contains \\ slash")
+            db.commit()
+
+        wildcard_response = sessions_client.get("/sessions/list", params={"q": "%_"})
+        slash_response = sessions_client.get("/sessions/list", params={"q": "\\"})
+
+        assert wildcard_response.status_code == 200
+        assert [item["id"] for item in wildcard_response.json()["sessions"]] == ["literal"]
+        assert slash_response.status_code == 200
+        assert [item["id"] for item in slash_response.json()["sessions"]] == ["backslash"]
+
     def test_encode_filename_header_ascii(self):
         """測試 ASCII 文件名編碼"""
         from src.api.routes.sessions import encode_filename_header

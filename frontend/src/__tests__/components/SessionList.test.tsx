@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '../utils/test-utils';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, waitFor, act } from '../utils/test-utils';
 import { SessionList } from '../../components/SessionList';
 import { apiService } from '../../services/api';
 import { SessionStatus } from '../../types';
@@ -52,6 +52,10 @@ describe('SessionList 組件', () => {
     });
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('應該顯示載入狀態', () => {
     vi.mocked(apiService.getSessions).mockImplementation(
       () => new Promise(() => {})
@@ -82,6 +86,27 @@ describe('SessionList 組件', () => {
 
     fireEvent.click(screen.getByText('測試會話 1'));
     expect(mockOnSelect).toHaveBeenCalledWith('session-1');
+  });
+
+  it('点击搜索命中的会话时应传递 round 定位目标', async () => {
+    const mockOnSelect = vi.fn();
+    vi.mocked(apiService.getSessions).mockResolvedValue({
+      sessions: [{
+        ...mockSessions[0],
+        match_type: 'assistant',
+        match_excerpt: '包含 用户画像 的回复摘要',
+        match_round_id: 'round-hit-1',
+      }],
+    });
+
+    render(<SessionList onSessionSelect={mockOnSelect} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('測試會話 1')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('測試會話 1'));
+    expect(mockOnSelect).toHaveBeenCalledWith('session-1', { roundId: 'round-hit-1' });
   });
 
   it('點擊登出應該調用 logout 並導航', async () => {
@@ -143,5 +168,146 @@ describe('SessionList 組件', () => {
     });
 
     expect(screen.getByText('2')).toBeInTheDocument();
+  });
+
+  it('输入搜索词后应调用带 q 的 getSessions', async () => {
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('測試會話 1')).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText('搜索会话'), {
+      target: { value: '測試' },
+    });
+
+    await waitFor(() => {
+      expect(apiService.getSessions).toHaveBeenCalledWith('測試');
+    });
+  });
+
+  it('清空搜索后应恢复完整列表请求', async () => {
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('測試會話 1')).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText('搜索会话'), {
+      target: { value: '測試' },
+    });
+
+    await waitFor(() => {
+      expect(apiService.getSessions).toHaveBeenCalledWith('測試');
+    });
+
+    const callsBeforeClear = vi.mocked(apiService.getSessions).mock.calls.length;
+    fireEvent.click(screen.getByLabelText('清空搜索'));
+
+    await waitFor(() => {
+      expect(vi.mocked(apiService.getSessions).mock.calls.length).toBeGreaterThan(callsBeforeClear);
+    });
+    const calls = vi.mocked(apiService.getSessions).mock.calls;
+    expect(calls[calls.length - 1]).toEqual([]);
+  });
+
+  it('消息命中时应显示摘要', async () => {
+    vi.mocked(apiService.getSessions).mockResolvedValue({
+      sessions: [{
+        ...mockSessions[0],
+        match_type: 'assistant',
+        match_excerpt: '这里是包含 搜索 关键词的消息摘要',
+      }],
+    });
+
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('这里是包含 搜索 关键词的消息摘要')).toBeInTheDocument();
+    });
+    expect(screen.getByText('Agent 回复:')).toBeInTheDocument();
+  });
+
+  it('搜索无结果时应显示专用空态', async () => {
+    vi.mocked(apiService.getSessions)
+      .mockResolvedValueOnce({ sessions: mockSessions })
+      .mockResolvedValueOnce({ sessions: [] });
+
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('測試會話 1')).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText('搜索会话'), {
+      target: { value: '不存在' },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('没有匹配的对话')).toBeInTheDocument();
+    });
+  });
+
+  it('旧搜索响应晚返回时不应覆盖新结果', async () => {
+    let resolveOldSearch!: (value: { sessions: typeof mockSessions }) => void;
+    let resolveNewSearch!: (value: { sessions: typeof mockSessions }) => void;
+    const oldSearchPromise = new Promise<{ sessions: typeof mockSessions }>((resolve) => {
+      resolveOldSearch = resolve;
+    });
+    const newSearchPromise = new Promise<{ sessions: typeof mockSessions }>((resolve) => {
+      resolveNewSearch = resolve;
+    });
+
+    vi.mocked(apiService.getSessions)
+      .mockResolvedValueOnce({ sessions: mockSessions })
+      .mockImplementationOnce(() => oldSearchPromise)
+      .mockImplementationOnce(() => newSearchPromise);
+
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('測試會話 1')).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText('搜索会话'), {
+      target: { value: '旧' },
+    });
+    await waitFor(() => {
+      expect(apiService.getSessions).toHaveBeenCalledWith('旧');
+    });
+
+    fireEvent.change(screen.getByLabelText('搜索会话'), {
+      target: { value: '新' },
+    });
+    await waitFor(() => {
+      expect(apiService.getSessions).toHaveBeenCalledWith('新');
+    });
+
+    await act(async () => {
+      resolveNewSearch({
+        sessions: [{
+          ...mockSessions[0],
+          id: 'new-result',
+          title: '新结果',
+        }],
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('新结果')).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      resolveOldSearch({
+        sessions: [{
+          ...mockSessions[0],
+          id: 'old-result',
+          title: '旧结果',
+        }],
+      });
+    });
+
+    expect(screen.getByText('新结果')).toBeInTheDocument();
+    expect(screen.queryByText('旧结果')).not.toBeInTheDocument();
   });
 });

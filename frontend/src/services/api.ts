@@ -208,8 +208,10 @@ class APIService {
   /**
    * 获取用户的所有会话
    */
-  async getSessions(): Promise<SessionListResponse> {
-    const response = await this.client.get<SessionListResponse>('/sessions/list');
+  async getSessions(q?: string): Promise<SessionListResponse> {
+    const trimmedQuery = q?.trim();
+    const params = trimmedQuery ? { q: trimmedQuery } : undefined;
+    const response = await this.client.get<SessionListResponse>('/sessions/list', { params });
     return response.data;
   }
 

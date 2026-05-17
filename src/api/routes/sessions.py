@@ -9,6 +9,7 @@ import posixpath
 import re as _re
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response, StreamingResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session as DBSession
 from src.api.models.database import get_db
 from src.api.deps import get_current_user
@@ -197,6 +198,90 @@ def _build_fileinfo_from_path(path: str, root_path: str) -> FileInfo | None:
     )
 
 
+def _escape_like_query(value: str) -> str:
+    """Escape user input for LIKE/ILIKE so wildcards are treated literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _message_content_to_text(content: str) -> str:
+    """Convert persisted conversation content into compact user-facing text."""
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+
+    def flatten(value) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                parts.extend(flatten(item))
+            return parts
+        if isinstance(value, dict):
+            if isinstance(value.get("text"), str):
+                return [value["text"]]
+            if isinstance(value.get("content"), str):
+                return [value["content"]]
+            parts: list[str] = []
+            for item in value.values():
+                parts.extend(flatten(item))
+            return parts
+        return []
+
+    return " ".join(flatten(parsed)) or content
+
+
+def _make_match_excerpt(content: str, query: str, max_len: int = 96) -> str:
+    text = " ".join(_message_content_to_text(content).split())
+    if not text:
+        return ""
+
+    lowered_text = text.lower()
+    lowered_query = query.lower()
+    match_index = lowered_text.find(lowered_query)
+
+    if match_index < 0:
+        excerpt = text[:max_len]
+        return excerpt + ("..." if len(text) > max_len else "")
+
+    radius = max((max_len - len(query)) // 2, 20)
+    start = max(0, match_index - radius)
+    end = min(len(text), match_index + len(query) + radius)
+    excerpt = text[start:end].strip()
+    if start > 0:
+        excerpt = "..." + excerpt
+    if end < len(text):
+        excerpt = excerpt + "..."
+    return excerpt
+
+
+_SESSION_MATCH_PRIORITY = {
+    "title": 0,
+    "user": 1,
+    "assistant": 2,
+}
+
+
+def _set_session_match(
+    matches: dict[str, tuple[Session, int]],
+    session: Session,
+    match_type: str,
+    excerpt: str | None,
+    *,
+    round_id: str | None = None,
+) -> None:
+    priority = _SESSION_MATCH_PRIORITY[match_type]
+    existing = matches.get(session.id)
+    if existing and existing[1] <= priority:
+        return
+
+    session.match_type = match_type
+    session.match_excerpt = excerpt
+    session.match_round_id = round_id
+    matches[session.id] = (session, priority)
+
+
 def _get_user_sandbox_id(db: DBSession, user_id: str) -> str | None:
     """從 UserSandbox 表查詢用戶的 sandbox_id。"""
     user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
@@ -380,16 +465,100 @@ async def create_session(
 
 @router.get("/list", response_model=SessionListResponse)
 async def list_sessions(
+    q: str | None = Query(None, description="搜索会话标题或讨论内容"),
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
     """获取用户的会话列表"""
-    sessions = (
+    query = (q or "").strip()
+    if not query:
+        sessions = (
+            db.query(Session)
+            .filter(Session.user_id == user_id)
+            .order_by(Session.updated_at.desc())
+            .all()
+        )
+        return SessionListResponse(sessions=sessions)
+
+    pattern = f"%{_escape_like_query(query)}%"
+
+    matches: dict[str, tuple[Session, int]] = {}
+
+    title_sessions = (
         db.query(Session)
-        .filter(Session.user_id == user_id)
-        .order_by(Session.updated_at.desc())
+        .filter(
+            Session.user_id == user_id,
+            Session.title.ilike(pattern, escape="\\"),
+        )
         .all()
     )
+
+    for session in title_sessions:
+        _set_session_match(matches, session, "title", None)
+
+    message_rows = (
+        db.query(Session, ConversationMessage.content, ConversationMessage.round_id)
+        .join(ConversationMessage, ConversationMessage.session_id == Session.id)
+        .filter(
+            Session.user_id == user_id,
+            ConversationMessage.role == "assistant",
+            ConversationMessage.is_summary.is_(False),
+            ConversationMessage.is_synthetic.is_(False),
+            ConversationMessage.content.ilike(pattern, escape="\\"),
+        )
+        .order_by(Session.updated_at.desc(), ConversationMessage.sequence.asc())
+        .all()
+    )
+
+    for session, content, round_id in message_rows:
+        _set_session_match(
+            matches,
+            session,
+            "assistant",
+            _make_match_excerpt(content or "", query),
+            round_id=round_id,
+        )
+
+    round_rows = (
+        db.query(Session, Round.id, Round.user_message, Round.final_response)
+        .join(Round, or_(Round.session_id == Session.id, Round.thread_id == Session.id))
+        .filter(
+            Session.user_id == user_id,
+            or_(
+                Round.user_message.ilike(pattern, escape="\\"),
+                Round.final_response.ilike(pattern, escape="\\"),
+            ),
+        )
+        .order_by(Session.updated_at.desc(), Round.created_at.asc())
+        .all()
+    )
+
+    for session, round_id, user_message, final_response in round_rows:
+        user_text = user_message or ""
+        assistant_text = final_response or ""
+        if query.lower() in user_text.lower():
+            _set_session_match(
+                matches,
+                session,
+                "user",
+                _make_match_excerpt(user_text, query),
+                round_id=round_id,
+            )
+        else:
+            _set_session_match(
+                matches,
+                session,
+                "assistant",
+                _make_match_excerpt(assistant_text, query),
+                round_id=round_id,
+            )
+
+    def sort_key(entry: tuple[Session, int]) -> tuple[int, float]:
+        session, priority = entry
+        updated_ts = session.updated_at.timestamp() if session.updated_at else 0.0
+        return (priority, -updated_ts)
+
+    sessions = [entry[0] for entry in sorted(matches.values(), key=sort_key)]
 
     return SessionListResponse(sessions=sessions)
 

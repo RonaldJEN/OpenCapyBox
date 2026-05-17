@@ -1,7 +1,7 @@
 """会话相关 Schema"""
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 
 class SessionCreate(BaseModel):
@@ -28,6 +28,9 @@ class SessionResponse(BaseModel):
     updated_at: datetime  # 前端期望 updated_at 而不是 last_active
     title: Optional[str] = None
     model_id: Optional[str] = None
+    match_type: Optional[Literal["title", "user", "assistant"]] = None
+    match_excerpt: Optional[str] = None
+    match_round_id: Optional[str] = None
 
     class Config:
         from_attributes = True

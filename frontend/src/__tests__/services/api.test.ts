@@ -85,6 +85,18 @@ describe('APIService', () => {
 
       expect(logoutSpy).not.toHaveBeenCalled();
     });
+
+    it('getSessions 应支持搜索参数并裁剪空白', async () => {
+      const axiosModule = await import('axios');
+      const client = vi.mocked(axiosModule.default.create).mock.results[0].value as any;
+      client.get.mockResolvedValue({ data: { sessions: [] } });
+
+      await apiService.getSessions('  搜索词  ');
+
+      expect(client.get).toHaveBeenCalledWith('/sessions/list', {
+        params: { q: '搜索词' },
+      });
+    });
   });
 
   describe('流式连接可靠性', () => {

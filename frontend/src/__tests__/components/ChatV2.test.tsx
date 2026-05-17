@@ -126,6 +126,27 @@ describe('ChatV2 组件', () => {
     expect(screen.queryByTestId('artifacts-panel')).not.toBeInTheDocument();
   });
 
+  it('带 scrollTarget 时加载历史后应定位到对应 round', async () => {
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+        scrollTarget={{ sessionId: 'test-session', roundId: 'round-1', nonce: 1 }}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Round: round-1')).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({
+        behavior: 'smooth',
+        block: 'center',
+      });
+    });
+  });
+
   it('欢迎页点击快捷建议应该填入输入框', () => {
     render(
       <ChatV2

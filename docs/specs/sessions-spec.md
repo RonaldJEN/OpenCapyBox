@@ -30,6 +30,8 @@
 
 别名：Thread（AG-UI 协议中 session = thread）
 
+`match_type` / `match_excerpt` 是列表搜索响应的派生字段，不落库。
+
 ## 3. API 契约
 
 所有端点均需 Bearer auth。
@@ -42,8 +44,16 @@
 
 ### GET /api/sessions/list
 
-- Response 200: `{sessions: [{id, user_id, status, created_at, updated_at, title, model_id}]}`
-- 按 `created_at` 降序
+- Query: `q: str | None`（可选；搜索会话标题或讨论内容）
+- Response 200: `{sessions: [{id, user_id, status, created_at, updated_at, title, model_id, match_type?, match_excerpt?, match_round_id?}]}`
+- `q` 为空或全空格时返回完整列表；非空时仅返回当前用户匹配的 sessions
+- 搜索范围：`sessions.title` + `rounds.user_message` + `conversation_messages(role=assistant).content` + `rounds.final_response`
+- 用户消息只搜索 `rounds.user_message` 这种前端可见文本，不搜索 `conversation_messages(role=user).content` 中的 Agent 内部上下文 / 附件提示 / Data URL
+- Agent 回复搜索 `conversation_messages(role=assistant).content`，排除 `tool` / `summary` / `synthetic`；`rounds.final_response` 作为历史重建兜底
+- 搜索使用 PostgreSQL 兼容的 `ILIKE ... ESCAPE` 轻量匹配，用户输入中的 `\`、`%`、`_` 必须转义为普通字符
+- `match_type` 取值：`title` / `user` / `assistant`
+- `match_round_id` 在命中具体轮次时返回，供前端切换 session 后定位
+- 排序优先级：title → user → assistant；同级内按更新时间倒序
 
 ### GET /api/sessions/{id}/history/v2
 
