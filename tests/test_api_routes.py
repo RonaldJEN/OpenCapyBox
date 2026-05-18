@@ -1,7 +1,7 @@
 """API 路由測試"""
 import json
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
@@ -393,6 +393,57 @@ class TestSessionsRouter:
         assert [item["id"] for item in wildcard_response.json()["sessions"]] == ["literal"]
         assert slash_response.status_code == 200
         assert [item["id"] for item in slash_response.json()["sessions"]] == ["backslash"]
+
+    def test_list_sessions_search_limits_results(self, sessions_client):
+        base_time = datetime(2026, 5, 15, 10, 0, 0)
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            for index in range(sessions._SESSION_SEARCH_RESULT_LIMIT + 5):
+                self._add_session(
+                    db,
+                    f"match-{index:02d}",
+                    title="bounded-search-token",
+                    updated_at=base_time + timedelta(seconds=index),
+                )
+            db.commit()
+
+        response = sessions_client.get("/sessions/list", params={"q": "bounded-search-token"})
+
+        assert response.status_code == 200
+        sessions_payload = response.json()["sessions"]
+        assert len(sessions_payload) == sessions._SESSION_SEARCH_RESULT_LIMIT
+        assert [item["id"] for item in sessions_payload[:3]] == [
+            "match-54",
+            "match-53",
+            "match-52",
+        ]
+        assert sessions_payload[-1]["id"] == "match-05"
+
+    def test_list_sessions_search_uses_best_message_match_per_session(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "s-best-message", title="普通标题")
+            self._add_message(
+                db,
+                "s-best-message",
+                "first needle assistant reply",
+                role="assistant",
+                sequence=1,
+            )
+            self._add_message(
+                db,
+                "s-best-message",
+                "second needle assistant reply",
+                role="assistant",
+                sequence=2,
+            )
+            db.commit()
+
+        response = sessions_client.get("/sessions/list", params={"q": "needle"})
+
+        assert response.status_code == 200
+        sessions_payload = response.json()["sessions"]
+        assert len(sessions_payload) == 1
+        assert sessions_payload[0]["id"] == "s-best-message"
+        assert "first needle" in sessions_payload[0]["match_excerpt"]
 
     def test_encode_filename_header_ascii(self):
         """測試 ASCII 文件名編碼"""

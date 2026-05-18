@@ -204,6 +204,7 @@ Authorization: Bearer <access_token>
 - Agent 回复搜索 `conversation_messages(role=assistant).content`，并查询 `rounds.final_response` 作为历史兜底；搜索不包含 tool / summary / synthetic 内容。
 - `match_type` 可能为 `title` / `user` / `assistant`。
 - 排序优先级为 title → user → assistant；同级内按更新时间倒序。
+- 非空搜索最多返回 50 个 sessions；后端会在 DB 侧为每个 session 取最佳命中并截断候选。
 - `match_excerpt` 在用户消息或 Agent 回复命中时返回短摘要。
 - `match_round_id` 在命中具体轮次时返回，前端可用于打开会话后定位。
 - 搜索使用 PostgreSQL 兼容的轻量 `ILIKE ... ESCAPE`，`%`、`_`、`\` 按普通字符处理。

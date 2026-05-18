@@ -1145,16 +1145,29 @@ class AgentService:
         if not self.agent:
             return None
 
-        pending = getattr(self.agent, "_pending_interrupt", None)
-        if isinstance(pending, dict) and pending.get("interrupt_id") == interrupt_id:
-            return dict(pending)
-
         getter = getattr(type(self.agent), "get_pending_interrupt", None)
         if callable(getter):
             snapshot = self.agent.get_pending_interrupt()
             if isinstance(snapshot, dict) and snapshot.get("interrupt_id") == interrupt_id:
                 return snapshot
+
+        pending = getattr(self.agent, "_pending_interrupt", None)
+        if isinstance(pending, dict) and pending.get("interrupt_id") == interrupt_id:
+            return dict(pending)
         return None
+
+    def _attach_agent_pending_interrupt_round_id(self, interrupt_id: str, round_id: str) -> None:
+        """将 pending interrupt 和触发它的 round 绑定到同一个内存快照。"""
+        if not self.agent:
+            return
+
+        setter = getattr(type(self.agent), "set_pending_interrupt_round_id", None)
+        if callable(setter) and self.agent.set_pending_interrupt_round_id(interrupt_id, round_id):
+            return
+
+        pending = getattr(self.agent, "_pending_interrupt", None)
+        if isinstance(pending, dict) and pending.get("interrupt_id") == interrupt_id:
+            pending["round_id"] = round_id
 
     def _replace_agent_interrupt_tool_result(self, tool_call_id: str, content: str) -> bool:
         """替换恢复出的 ask_user tool 占位，供冷 resume 路径使用。"""
@@ -1193,9 +1206,9 @@ class AgentService:
             persisted_interrupt = self._load_persisted_interrupt(interrupt_id)
             pending_interrupt = self._get_agent_pending_interrupt_snapshot(interrupt_id)
             parent_run_id = (
-                persisted_interrupt["round_id"]
-                if persisted_interrupt
-                else self._pending_interrupt_round_ids.get(interrupt_id)
+                (persisted_interrupt or {}).get("round_id")
+                or (pending_interrupt or {}).get("round_id")
+                or self._pending_interrupt_round_ids.get(interrupt_id)
             )
             if not parent_run_id:
                 raise ValueError("No pending interrupt to resume from")
@@ -1436,7 +1449,13 @@ class AgentService:
                         else:
                             status = "interrupted"
                             if event.interrupt:
-                                self._pending_interrupt_round_ids[event.interrupt.id] = run_id
+                                interrupt_id = event.interrupt.id
+                                if interrupt_id:
+                                    self._attach_agent_pending_interrupt_round_id(
+                                        interrupt_id,
+                                        run_id,
+                                    )
+                                    self._pending_interrupt_round_ids[interrupt_id] = run_id
                                 _interrupt_json = json.dumps(
                                     event.interrupt.model_dump(exclude_none=True),
                                     ensure_ascii=False,

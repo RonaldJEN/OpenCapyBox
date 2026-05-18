@@ -127,6 +127,7 @@ const handleExecutionEnd = (sessionId?: string) => {
 - 搜索使用单一后端 `q` 参数，不暴露也不保留搜索模式选择。
 - 搜索输入只影响会话列表，不改变当前选中 session。
 - 搜索为空时请求完整列表；搜索非空时调用 `GET /api/sessions/list?q=...`。
+- 搜索结果由后端限制为最多 50 个 sessions，前端不做额外分页。
 - 快速输入必须使用请求序号 stale guard，旧响应不得覆盖新结果。
 - 搜索非空且无结果时显示"没有匹配的对话"。
 - `match_type=user|assistant` 且有 `match_excerpt` 时，在 session 标题下展示一行摘要，前缀分别为"我的问题"、"Agent 回复"。

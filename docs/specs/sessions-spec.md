@@ -51,6 +51,7 @@
 - 用户消息只搜索 `rounds.user_message` 这种前端可见文本，不搜索 `conversation_messages(role=user).content` 中的 Agent 内部上下文 / 附件提示 / Data URL
 - Agent 回复搜索 `conversation_messages(role=assistant).content`，排除 `tool` / `summary` / `synthetic`；`rounds.final_response` 作为历史重建兜底
 - 搜索使用 PostgreSQL 兼容的 `ILIKE ... ESCAPE` 轻量匹配，用户输入中的 `\`、`%`、`_` 必须转义为普通字符
+- 非空搜索最多返回 50 个 sessions；各搜索来源在 DB 侧按 session 取最佳命中并截断，避免侧栏搜索拉回无界历史
 - `match_type` 取值：`title` / `user` / `assistant`
 - `match_round_id` 在命中具体轮次时返回，供前端切换 session 后定位
 - 排序优先级：title → user → assistant；同级内按更新时间倒序

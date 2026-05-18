@@ -964,3 +964,25 @@ class TestAgentServiceResumeAgui:
         assert service.history_service.create_resume_round.call_args.kwargs["parent_run_id"] == "round-interrupted"
         service.history_service.create_round.assert_not_called()
         assert "iid-1" not in service._pending_interrupt_round_ids
+
+    @pytest.mark.asyncio
+    async def test_resume_agui_uses_hot_pending_snapshot_parent_without_side_map(self, service):
+        """热恢复应能直接从 pending interrupt 快照拿到 parent round。"""
+        answers = {"Which DB?": "PostgreSQL"}
+        service.agent._pending_interrupt = {
+            "interrupt_id": "iid-1",
+            "round_id": "round-interrupted",
+            "tool_call_id": "tc-ask",
+            "questions": [{"question": "Which DB?"}],
+        }
+
+        with patch.object(service, "_load_persisted_interrupt", return_value=None):
+            with patch.object(service, "_save_conversation_message"):
+                async for _ in service.resume_agui("iid-1", answers):
+                    pass
+
+        service.agent.resume_from_interrupt.assert_called_once_with("iid-1", answers)
+        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
+        assert create_kwargs["parent_run_id"] == "round-interrupted"
+        assert create_kwargs["tool_call_id"] == "tc-ask"
+        service.history_service.create_round.assert_not_called()

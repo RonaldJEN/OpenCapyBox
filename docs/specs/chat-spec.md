@@ -888,6 +888,7 @@ Agent 调用 ask_user 工具
 **Resolution 写入时机**:
 
 - `POST /resume` 创建新 Round 时，同时写入 `interrupt_resolutions`。
+- 定位被中断 Round 时，优先使用持久化 interrupt；热路径的 Agent pending interrupt 快照必须携带触发它的 `round_id`，用于覆盖 `RUN_FINISHED` 已发出但 DB 状态尚未提交为 interrupted 的窗口。
 - `answers_json` 保存用户回答结构；`tool_result_content` 保存热路径实际注入 LLM 的文本。
 - `restore_strategy` 记录本次 resume 采用 `hot_replace`、`cold_replace` 或 `cold_fallback_user_message`。
 - `fallback_reason` 在运行时 fallback 时写入；若后续冷启动 stitching 发现已创建的 resolution 无法回填 parent tool result，也允许更新该字段。

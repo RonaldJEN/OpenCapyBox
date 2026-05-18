@@ -221,6 +221,13 @@ class Agent:
             return None
         return dict(self._pending_interrupt)
 
+    def set_pending_interrupt_round_id(self, interrupt_id: str, round_id: str) -> bool:
+        """将 pending interrupt 关联到触发它的 round。"""
+        if not self.has_pending_interrupt(interrupt_id):
+            return False
+        self._pending_interrupt["round_id"] = round_id
+        return True
+
     @staticmethod
     def format_interrupt_tool_result(answers: dict[str, str]) -> str:
         """格式化 ask_user 回答为热 resume 写入 tool result 的内容。"""

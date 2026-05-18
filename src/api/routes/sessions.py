@@ -9,7 +9,7 @@ import posixpath
 import re as _re
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response, StreamingResponse
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session as DBSession
 from src.api.models.database import get_db
 from src.api.deps import get_current_user
@@ -39,6 +39,8 @@ import uuid
 from urllib.parse import quote
 
 router = APIRouter()
+
+_SESSION_SEARCH_RESULT_LIMIT = 50
 
 # 使用 AgentPoolService 管理 Agent 實例
 from src.api.services.agent_pool_service import get_agent_pool
@@ -483,6 +485,7 @@ async def list_sessions(
     pattern = f"%{_escape_like_query(query)}%"
 
     matches: dict[str, tuple[Session, int]] = {}
+    search_limit = _SESSION_SEARCH_RESULT_LIMIT
 
     title_sessions = (
         db.query(Session)
@@ -490,66 +493,148 @@ async def list_sessions(
             Session.user_id == user_id,
             Session.title.ilike(pattern, escape="\\"),
         )
+        .order_by(Session.updated_at.desc())
+        .limit(search_limit)
         .all()
     )
 
     for session in title_sessions:
         _set_session_match(matches, session, "title", None)
 
-    message_rows = (
-        db.query(Session, ConversationMessage.content, ConversationMessage.round_id)
-        .join(ConversationMessage, ConversationMessage.session_id == Session.id)
-        .filter(
-            Session.user_id == user_id,
-            ConversationMessage.role == "assistant",
-            ConversationMessage.is_summary.is_(False),
-            ConversationMessage.is_synthetic.is_(False),
-            ConversationMessage.content.ilike(pattern, escape="\\"),
-        )
-        .order_by(Session.updated_at.desc(), ConversationMessage.sequence.asc())
-        .all()
-    )
-
-    for session, content, round_id in message_rows:
-        _set_session_match(
-            matches,
-            session,
-            "assistant",
-            _make_match_excerpt(content or "", query),
-            round_id=round_id,
-        )
-
-    round_rows = (
-        db.query(Session, Round.id, Round.user_message, Round.final_response)
-        .join(Round, or_(Round.session_id == Session.id, Round.thread_id == Session.id))
-        .filter(
-            Session.user_id == user_id,
-            or_(
+    if len(matches) < search_limit:
+        user_round_ranked = (
+            db.query(
+                Session.id.label("session_id"),
+                Round.id.label("round_id"),
+                Round.user_message.label("user_message"),
+                func.row_number()
+                .over(
+                    partition_by=Session.id,
+                    order_by=(Round.created_at.asc(), Round.id.asc()),
+                )
+                .label("match_rank"),
+            )
+            .join(
+                Round,
+                or_(Round.session_id == Session.id, Round.thread_id == Session.id),
+            )
+            .filter(
+                Session.user_id == user_id,
                 Round.user_message.ilike(pattern, escape="\\"),
-                Round.final_response.ilike(pattern, escape="\\"),
-            ),
+            )
+            .subquery()
         )
-        .order_by(Session.updated_at.desc(), Round.created_at.asc())
-        .all()
-    )
 
-    for session, round_id, user_message, final_response in round_rows:
-        user_text = user_message or ""
-        assistant_text = final_response or ""
-        if query.lower() in user_text.lower():
+        user_round_rows = (
+            db.query(
+                Session,
+                user_round_ranked.c.round_id,
+                user_round_ranked.c.user_message,
+            )
+            .join(user_round_ranked, user_round_ranked.c.session_id == Session.id)
+            .filter(user_round_ranked.c.match_rank == 1)
+            .order_by(Session.updated_at.desc())
+            .limit(search_limit)
+            .all()
+        )
+
+        for session, round_id, user_message in user_round_rows:
             _set_session_match(
                 matches,
                 session,
                 "user",
-                _make_match_excerpt(user_text, query),
+                _make_match_excerpt(user_message or "", query),
                 round_id=round_id,
             )
-        else:
+
+    if len(matches) < search_limit:
+        message_ranked = (
+            db.query(
+                ConversationMessage.session_id.label("session_id"),
+                ConversationMessage.content.label("content"),
+                ConversationMessage.round_id.label("round_id"),
+                func.row_number()
+                .over(
+                    partition_by=ConversationMessage.session_id,
+                    order_by=(
+                        ConversationMessage.sequence.asc(),
+                        ConversationMessage.id.asc(),
+                    ),
+                )
+                .label("match_rank"),
+            )
+            .join(Session, ConversationMessage.session_id == Session.id)
+            .filter(
+                Session.user_id == user_id,
+                ConversationMessage.role == "assistant",
+                ConversationMessage.is_summary.is_(False),
+                ConversationMessage.is_synthetic.is_(False),
+                ConversationMessage.content.ilike(pattern, escape="\\"),
+            )
+            .subquery()
+        )
+
+        message_rows = (
+            db.query(Session, message_ranked.c.content, message_ranked.c.round_id)
+            .join(message_ranked, message_ranked.c.session_id == Session.id)
+            .filter(message_ranked.c.match_rank == 1)
+            .order_by(Session.updated_at.desc())
+            .limit(search_limit)
+            .all()
+        )
+
+        for session, content, round_id in message_rows:
             _set_session_match(
                 matches,
                 session,
                 "assistant",
-                _make_match_excerpt(assistant_text, query),
+                _make_match_excerpt(content or "", query),
+                round_id=round_id,
+            )
+
+    if len(matches) < search_limit:
+        final_response_ranked = (
+            db.query(
+                Session.id.label("session_id"),
+                Round.id.label("round_id"),
+                Round.final_response.label("final_response"),
+                func.row_number()
+                .over(
+                    partition_by=Session.id,
+                    order_by=(Round.created_at.asc(), Round.id.asc()),
+                )
+                .label("match_rank"),
+            )
+            .join(
+                Round,
+                or_(Round.session_id == Session.id, Round.thread_id == Session.id),
+            )
+            .filter(
+                Session.user_id == user_id,
+                Round.final_response.ilike(pattern, escape="\\"),
+            )
+            .subquery()
+        )
+
+        final_response_rows = (
+            db.query(
+                Session,
+                final_response_ranked.c.round_id,
+                final_response_ranked.c.final_response,
+            )
+            .join(final_response_ranked, final_response_ranked.c.session_id == Session.id)
+            .filter(final_response_ranked.c.match_rank == 1)
+            .order_by(Session.updated_at.desc())
+            .limit(search_limit)
+            .all()
+        )
+
+        for session, round_id, final_response in final_response_rows:
+            _set_session_match(
+                matches,
+                session,
+                "assistant",
+                _make_match_excerpt(final_response or "", query),
                 round_id=round_id,
             )
 
@@ -558,7 +643,10 @@ async def list_sessions(
         updated_ts = session.updated_at.timestamp() if session.updated_at else 0.0
         return (priority, -updated_ts)
 
-    sessions = [entry[0] for entry in sorted(matches.values(), key=sort_key)]
+    sessions = [
+        entry[0]
+        for entry in sorted(matches.values(), key=sort_key)[:search_limit]
+    ]
 
     return SessionListResponse(sessions=sessions)
 
