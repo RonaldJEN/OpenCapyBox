@@ -21,6 +21,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _is_interrupt_resolution_unique_violation(exc: IntegrityError) -> bool:
+    orig = getattr(exc, "orig", None)
+    pgcode = getattr(orig, "pgcode", None)
+    if pgcode and pgcode != "23505":
+        return False
+    constraint_name = getattr(getattr(orig, "diag", None), "constraint_name", None)
+    if constraint_name:
+        return constraint_name in {
+            "interrupt_resolutions_pkey",
+            "uq_interrupt_resolution_resume_round",
+        }
+    message = str(orig or exc).lower()
+    return "interrupt_resolutions" in message and (
+        "unique" in message or "duplicate" in message
+    )
+
+
 class HistoryService:
     """对话历史服务"""
 
@@ -143,29 +160,30 @@ class HistoryService:
             status="running",
             parent_run_id=parent_run_id,
         )
-        self.db.add(round_obj)
-        if interrupt_id:
-            if tool_result_content is None:
-                self.db.rollback()
-                raise ValueError("tool_result_content is required for interrupt resolution")
-            resolution = InterruptResolution(
-                interrupt_id=interrupt_id,
-                session_id=session_id,
-                parent_round_id=parent_run_id,
-                resume_round_id=round_id,
-                tool_call_id=tool_call_id,
-                answers_json=json.dumps(answers or {}, ensure_ascii=False),
-                resume_user_message=user_message,
-                tool_result_content=tool_result_content,
-                restore_strategy=restore_strategy,
-                fallback_reason=fallback_reason,
-            )
-            self.db.add(resolution)
         try:
+            self.db.add(round_obj)
+            self.db.flush()
+            if interrupt_id:
+                if tool_result_content is None:
+                    self.db.rollback()
+                    raise ValueError("tool_result_content is required for interrupt resolution")
+                resolution = InterruptResolution(
+                    interrupt_id=interrupt_id,
+                    session_id=session_id,
+                    parent_round_id=parent_run_id,
+                    resume_round_id=round_id,
+                    tool_call_id=tool_call_id,
+                    answers_json=json.dumps(answers or {}, ensure_ascii=False),
+                    resume_user_message=user_message,
+                    tool_result_content=tool_result_content,
+                    restore_strategy=restore_strategy,
+                    fallback_reason=fallback_reason,
+                )
+                self.db.add(resolution)
             self.db.commit()
         except IntegrityError as e:
             self.db.rollback()
-            if interrupt_id:
+            if interrupt_id and _is_interrupt_resolution_unique_violation(e):
                 raise ValueError(f"Interrupt already resumed: {interrupt_id}") from e
             raise
         except Exception:
