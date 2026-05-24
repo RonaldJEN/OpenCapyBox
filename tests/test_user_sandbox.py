@@ -210,6 +210,27 @@ class TestAgentPoolServiceUserSessions:
 
         assert "session-A" in pool._user_sessions["user-1"]
 
+    @pytest.mark.asyncio
+    async def test_get_or_create_cache_hit_reuses_agent_without_history_refresh(self):
+        """AgentPool 只复用资源，runtime messages 刷新由 AgentService run 入口负责。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        cached_agent = MagicMock()
+        cached_agent._refresh_runtime_messages_from_history = MagicMock()
+        _inject_pool_session(pool, "session-A", "user-1", mock_agent=cached_agent)
+        pool._last_renew["user-1"] = time.time()
+
+        result = await pool.get_or_create(
+            user_id="user-1",
+            session_id="user-1",
+            chat_session_id="session-A",
+            db=MagicMock(),
+        )
+
+        assert result is cached_agent
+        cached_agent._refresh_runtime_messages_from_history.assert_not_called()
+
     def test_remove_cleans_user_sessions_mapping(self):
         """remove() 应从 _user_sessions 中移除 session"""
         from src.api.services.agent_pool_service import AgentPoolService

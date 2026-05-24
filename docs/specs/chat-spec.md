@@ -1,7 +1,7 @@
 # 聊天与 Agent 执行 (Chat) — Spec
 
 > **模块归属**: `src/api/routes/chat.py`, `src/api/services/agent_service.py`, `src/agent/agent.py`
-> **最后更新**: 2026-05-14
+> **最后更新**: 2026-05-22
 > **状态**: Draft
 
 ---
@@ -593,6 +593,19 @@ Agent 执行循环中有 **3 个取消检查点**:
 
 - 倒数第 2 步（step == max_steps - 1）时，注入一条**合成提醒消息**（`is_synthetic=True`），告知 Agent 即将达到步数上限
 - max_steps 耗尽时，发射 `RUN_FINISHED` 事件，`outcome="interrupt"`，附带 `max_steps_reached` 标记
+
+#### AgentPool 缓存与 runtime messages 一致性
+
+`AgentPoolService` 只缓存可复用运行资源，包括沙箱连接、工具集合、LLM client 与 AgentService 实例；它不把 `agent.messages` 视为跨轮次、跨 worker 的权威上下文。
+
+每次 `send` / `resume` 真正启动 Agent run 前，`AgentService` 必须从 DB 权威历史重建本轮 runtime messages：
+
+1. 保留当前 Agent 的 system prompt。
+2. 从 `rounds` + `conversation_messages` + `agui_events` + `interrupt_resolutions` 重建历史消息，并应用 `_restore_history` 的摘要锚点和尾窗裁剪规则。
+3. 用重建结果替换本进程内旧 `agent.messages`，不得追加到旧热缓存后面。
+4. 再注入本轮用户输入或 resume 答案后进入 LLM 调用。
+
+因此，即使多 worker 下某个旧 worker 命中本地 AgentPool 热缓存，LLM request 也必须基于 DB 中最新 conversation history 构造。`llm_call_records.request_messages` 应能审计到刷新后的输入快照：上一轮已落库的用户纠错/确认信息不得因为 stale hot cache 缺失。
 
 ### 4.2 幂等性保证
 

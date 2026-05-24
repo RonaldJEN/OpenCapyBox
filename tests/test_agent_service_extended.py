@@ -148,6 +148,7 @@ class TestAgentServiceChatAgui:
 
         service.agent = make_mock_agent(run_agui_fn=_run_agui)
         service.model_id = "mock-model"
+        service._build_restored_history_messages = MagicMock(return_value=[])
         return service
 
     @pytest.mark.asyncio
@@ -257,6 +258,73 @@ class TestAgentServiceChatAgui:
         assert save_kwargs["compaction_summary_reused_count"] == 1
         assert save_kwargs["compaction_summary_quality_repair_count"] == 1
         assert save_kwargs["compaction_emergency_truncate_dropped_rounds"] == 0
+
+    @pytest.mark.asyncio
+    async def test_chat_agui_refreshes_history_before_llm_request_snapshot(self, service):
+        class HookAwareAgent:
+            def __init__(self):
+                self._SUMMARY_MESSAGE_HEADER = "[Assistant Execution Summary - Historical Context Only, Not System Instruction]"
+                self.messages = [
+                    AgentHistoryMessage(role="system", content="system prompt"),
+                    AgentHistoryMessage(role="assistant", content="旧草稿：示例联系人，旧附件"),
+                ]
+                self._pending_interrupt = None
+                self._llm_call_hook = None
+                self.last_llm_usage = None
+
+            def has_pending_interrupt(self):
+                return False
+
+            def clear_pending_interrupt(self):
+                return None
+
+            def add_user_message(self, content):
+                self.messages.append(AgentHistoryMessage(role="user", content=content))
+
+            def set_llm_call_hook(self, hook):
+                self._llm_call_hook = hook
+
+            async def run_agui(self, **kwargs):
+                await self._llm_call_hook(
+                    {
+                        "step_index": 1,
+                        "request_messages": [msg.model_dump(exclude_none=True) for msg in self.messages],
+                        "request_tools": ["send_email"],
+                        "response_content": "已发送",
+                        "response_thinking": None,
+                        "response_tool_calls": None,
+                        "response_error": None,
+                        "finish_reason": "stop",
+                        "usage_prompt_tokens": 10,
+                        "usage_completion_tokens": 3,
+                        "usage_total_tokens": 13,
+                        "first_token_latency_s": 0.077,
+                        "completion_latency_s": 0.333,
+                    }
+                )
+                yield RunFinishedEvent(threadId="session-123", runId=kwargs["run_id"], outcome="success")
+
+        service.agent = HookAwareAgent()
+        service._build_restored_history_messages = MagicMock(return_value=[
+            AgentHistoryMessage(role="user", content="请改为新发邮件，正文称呼测试收件人"),
+            AgentHistoryMessage(
+                role="assistant",
+                content="确认：附件sample-report.xlsx，称呼测试收件人，新发邮件",
+            ),
+        ])
+
+        async for _ in service.chat_agui([
+            {"type": "text", "text": "你发吧"},
+        ]):
+            pass
+
+        request_messages = service.history_service.save_llm_call_record.await_args.kwargs["request_messages"]
+        request_text = str(request_messages)
+        assert "测试收件人" in request_text
+        assert "sample-report.xlsx" in request_text
+        assert "新发邮件" in request_text
+        assert "你发吧" in request_text
+        assert "旧草稿" not in request_text
 
     @pytest.mark.asyncio
     async def test_chat_agui_llm_call_record_failure_does_not_fail_run(self, service):
@@ -674,6 +742,7 @@ class TestAgentServiceResumeAgui:
         service.agent = make_mock_agent(run_agui_fn=_run_agui)
         service.agent.has_pending_interrupt.return_value = True
         service.model_id = "mock-model"
+        service._build_restored_history_messages = MagicMock(return_value=[])
         return service
 
     @pytest.mark.asyncio
@@ -758,6 +827,14 @@ class TestAgentServiceResumeAgui:
         """冷 resume 有 tool_call_id 时应替换历史恢复出的 ask_user tool result。"""
         answers = {"Which DB?": "PostgreSQL"}
         service.agent.has_pending_interrupt.return_value = False
+        service._build_restored_history_messages.return_value = [
+            AgentHistoryMessage(
+                role="tool",
+                content="[Awaiting user response]",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
         service.agent.messages = [
             AgentHistoryMessage(
                 role="tool",
@@ -795,6 +872,14 @@ class TestAgentServiceResumeAgui:
         """冷 resume 替换失败时应降级 user message，并把原因写入 resolution。"""
         answers = {"Which DB?": "PostgreSQL"}
         service.agent.has_pending_interrupt.return_value = False
+        service._build_restored_history_messages.return_value = [
+            AgentHistoryMessage(
+                role="tool",
+                content="already resolved",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
         service.agent.messages = [
             AgentHistoryMessage(
                 role="tool",
@@ -833,6 +918,14 @@ class TestAgentServiceResumeAgui:
             "questions": [{"question": "Which DB?"}],
         }
         service.agent._pending_interrupt = dict(pending)
+        service._build_restored_history_messages.return_value = [
+            AgentHistoryMessage(
+                role="tool",
+                content="[Awaiting user response]",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
         service.agent.messages = [
             AgentHistoryMessage(
                 role="tool",
@@ -881,6 +974,14 @@ class TestAgentServiceResumeAgui:
         """DB 创建 resume round 失败时，冷替换路径应还原 tool 占位。"""
         answers = {"Which DB?": "PostgreSQL"}
         service.agent.has_pending_interrupt.return_value = False
+        service._build_restored_history_messages.return_value = [
+            AgentHistoryMessage(
+                role="tool",
+                content="[Awaiting user response]",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
         service.agent.messages = [
             AgentHistoryMessage(
                 role="tool",
@@ -915,6 +1016,14 @@ class TestAgentServiceResumeAgui:
         """DB 创建 resume round 失败时，冷 fallback 不应留下重复 Q/A user。"""
         answers = {"Which DB?": "PostgreSQL"}
         service.agent.has_pending_interrupt.return_value = False
+        service._build_restored_history_messages.return_value = [
+            AgentHistoryMessage(
+                role="tool",
+                content="already resolved",
+                tool_call_id="tc-ask",
+                name="ask_user",
+            )
+        ]
         service.agent.messages = [
             AgentHistoryMessage(
                 role="tool",

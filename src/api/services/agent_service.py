@@ -250,31 +250,26 @@ class AgentService:
                 high = mid - 1
         return text[:low] + "\n...(truncated)"
 
-    def _restore_history(self):
-        """从 conversation_messages 表恢复对话历史
+    def _build_restored_history_messages(self) -> list[AgentMessage]:
+        """从 DB 权威历史构建本轮 Agent runtime messages。
 
-        从乾淨的 conversation_messages 表中讀取消息，用於 Agent 上下文恢復。
-        若該表無記錄（首次運行或舊數據），fallback 到 HistoryService.get_minimal_history()。
+        从 rounds / conversation_messages / agui_events / interrupt_resolutions 重建
+        LLM 消息数组，并在存在摘要锚点时按裁剪规则注入。
 
         注意：為防止歷史消息過多導致模型 context 膨脹（特別是 tool calling 能力較弱的模型），
         會限制最多注入 agent_max_history_messages 條消息，超出時只保留最近的消息。
         """
-        if not self.agent:
-            return
-
-        from src.api.config import get_settings
+        from src.api.config import get_settings as _get_settings
 
         # 從 agui_events 重建完整消息列表（含 tool_calls 和 tool results）
         messages = self._rebuild_messages_from_events()
         summary_anchor = self._load_latest_summary_anchor()
 
         if not messages and not summary_anchor:
-            # 沒有任何歷史事件，保持空
-            self._last_saved_index = len(self.agent.messages)
-            return
+            return []
 
         # 限制歷史消息數量
-        max_msgs = get_settings().agent_max_history_messages
+        max_msgs = _get_settings().agent_max_history_messages
         if messages and len(messages) > max_msgs:
             start_idx = len(messages) - max_msgs
             trimmed = messages[start_idx:]
@@ -319,13 +314,31 @@ class AgentService:
             messages = [summary_anchor] + messages
             logger.info("歷史恢復注入摘要錨點 (session=%s)", self.session_id)
 
-        self.agent.messages.extend(messages)
+        return messages
+
+    def _refresh_runtime_messages_from_history(self) -> None:
+        """用 DB 历史替换本进程 Agent runtime messages，保留 system prompt。"""
+        if not self.agent:
+            return
+
+        restored_messages = self._build_restored_history_messages()
+        system_messages = []
+        if self.agent.messages and self.agent.messages[0].role == "system":
+            system_messages = [self.agent.messages[0]]
+
+        self.agent.messages = system_messages + restored_messages
+        self.agent._cached_token_count = 0
+        self.agent._cached_message_count = 0
 
         logger.info(
-            "從 agui_events 重建 %d 條消息 (session=%s)",
-            len(messages), self.session_id,
+            "已刷新 Agent runtime messages: history=%d total=%d (session=%s)",
+            len(restored_messages), len(self.agent.messages), self.session_id,
         )
         self._last_saved_index = len(self.agent.messages)
+
+    def _restore_history(self):
+        """从 conversation_messages 表恢复对话历史。"""
+        self._refresh_runtime_messages_from_history()
 
     def _rebuild_messages_from_events(self) -> list[AgentMessage]:
         """從 agui_events + conversation_messages 重建完整的 LLM messages 數組。
@@ -1033,6 +1046,8 @@ class AgentService:
         user_message_for_history = self._blocks_to_plain_text(normalized_blocks)
         user_attachments = self._extract_user_attachments(normalized_blocks)
 
+        self._refresh_runtime_messages_from_history()
+
         # 創建運行 ID
         run_id = str(uuid.uuid4())
         
@@ -1235,6 +1250,8 @@ class AgentService:
             pending_round_ids_snapshot = dict(self._pending_interrupt_round_ids)
 
             try:
+                self._refresh_runtime_messages_from_history()
+
                 if self.agent.has_pending_interrupt(interrupt_id):
                     # 热恢复：直接替换 ask_user 占位 tool_result
                     self.agent.resume_from_interrupt(interrupt_id, answers)

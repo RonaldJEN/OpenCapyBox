@@ -718,6 +718,38 @@ class TestRestoreHistory:
         assert service.agent.messages[0].role == "user"
         assert service.agent.messages[1].role == "assistant"
 
+    def test_restore_history_replaces_runtime_messages_without_duplication(self):
+        """重复刷新 runtime messages 不应把同一段 DB 历史追加多次。"""
+        service = make_agent_service()
+        service.agent = MagicMock()
+        system_message = AgentMessage(role="system", content="system prompt")
+        service.agent.messages = [
+            system_message,
+            AgentMessage(role="user", content="stale hot-cache message"),
+        ]
+        service.agent._cached_token_count = 123
+        service.agent._cached_message_count = 2
+
+        fake_messages = [
+            AgentMessage(role="user", content="测试收件人，请新发邮件"),
+            AgentMessage(role="assistant", content="附件sample-report.xlsx 已确认"),
+        ]
+
+        mock_settings = MagicMock()
+        mock_settings.agent_max_history_messages = 100
+
+        with patch.object(service, "_rebuild_messages_from_events", return_value=fake_messages):
+            with patch.object(service, "_load_latest_summary_anchor", return_value=None):
+                with patch("src.api.config.get_settings", return_value=mock_settings):
+                    service._restore_history()
+                    service._restore_history()
+
+        assert service.agent.messages == [system_message] + fake_messages
+        assert [msg.content for msg in service.agent.messages].count("测试收件人，请新发邮件") == 1
+        assert service.agent._cached_token_count == 0
+        assert service.agent._cached_message_count == 0
+        assert service._last_saved_index == 3
+
     def test_restore_history_trims_to_max(self):
         service = make_agent_service()
         service.agent = MagicMock()
