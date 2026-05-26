@@ -26,7 +26,7 @@ passlib[bcrypt]>=1.7.4  # 密码哈希（未来用）
 # 需要安装 mini_agent 的依赖，但不需要安装 mini_agent 包本身
 
 # HTTP 客户端（LLM API 调用）
-httpx>=0.27.0
+httpx[socks]>=0.27.0
 
 # LLM SDK
 anthropic>=0.39.0
