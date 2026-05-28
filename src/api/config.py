@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     agent_max_steps: int = 100
     agent_max_history_messages: int = 120  # 歷史消息注入上限（條數，含 user/assistant/tool），超出時只保留最近 N 條
     agent_tool_timeout: int = 300  # 单次工具执行超时（秒），0 表示不限
+    agent_user_concurrency_limit: int = 1  # 同一用户允许同时运行的不同会话数，至少为 1
 
     # Cron 配置（去中心化 worker）
     cron_fire_max_age_days: int = 7  # cron_fires 清理保留天数（后续清理任务使用）

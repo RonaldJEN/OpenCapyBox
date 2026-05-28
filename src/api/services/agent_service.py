@@ -57,9 +57,15 @@ class AgentService:
         self.skill_loader = None  # 保存 skill_loader 引用
         self.cancel_token: asyncio.Event | None = None  # per-run 取消令牌
         self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
+        self._active_run_count = 0
         # 每個 session 使用沙箱內的隔離子目錄
         mount = get_sandbox_mount_path()
         self._workspace_dir = f"{mount}/sessions/{session_id}" if session_id else mount
+
+    @property
+    def is_running(self) -> bool:
+        """当前 AgentService 是否正在消费一个 round 流。"""
+        return self._active_run_count > 0
 
     async def initialize_agent(self):
         """初始化 Agent（使用 Model Registry 驅動 LLM 配置）"""
@@ -144,8 +150,14 @@ class AgentService:
 
     def _get_db_session_factory(self):
         """返回 DB session 工厂函数（供 memory_tools 延迟获取 DB session）"""
+        if self.history_service.session_factory is not None:
+            return self.history_service.session_factory
         from src.api.models.database import SessionLocal
         return SessionLocal
+
+    def close(self) -> None:
+        """释放 AgentService 持有的独立资源。"""
+        self.history_service.close()
 
     def _load_system_prompt(self) -> str:
         """从 DB 记忆文件组装 
@@ -174,6 +186,8 @@ class AgentService:
                 logger.info("新用户默认文件初始化完成: user=%s, count=%d", self.user_id, count)
         except Exception as e:
             logger.warning("默认文件初始化失败（非致命）: %s", e)
+        finally:
+            self.history_service.reset_session()
 
     def _build_memory_context(self) -> str:
         """从 DB 读取 SOUL/USER/AGENTS/MEMORY 并按优先级组装 system prompt 前缀"""
@@ -234,6 +248,8 @@ class AgentService:
         except Exception as e:
             logger.warning("构建记忆上下文失败: %s", e)
             return ""
+        finally:
+            self.history_service.reset_session()
 
     @staticmethod
     def _truncate_to_tokens(text: str, max_tokens: int, count_fn) -> str:
@@ -364,6 +380,7 @@ class AgentService:
             .all()
         )
         if not rounds:
+            self.history_service.reset_session()
             return []
 
         # 2. 預載所有 user + assistant 消息（按 round_id 索引）
@@ -567,6 +584,7 @@ class AgentService:
             "歷史重建完成: %d rounds → %d messages (session=%s)",
             len(rounds), len(messages), self.session_id,
         )
+        self.history_service.reset_session()
         return messages
 
     @staticmethod
@@ -620,6 +638,7 @@ class AgentService:
             .first()
         )
         content = getattr(row, "content", None)
+        self.history_service.db.rollback()
         return content if isinstance(content, str) else None
 
     def _load_latest_summary_anchor(self) -> AgentMessage | None:
@@ -1116,38 +1135,41 @@ class AgentService:
         from src.api.models.round import Round
 
         db = self.history_service.db
-        candidates = (
-            db.query(Round)
-            .filter(Round.session_id == self.session_id, Round.status == "interrupted")
-            .order_by(Round.created_at.desc())
-            .all()
-        )
+        try:
+            candidates = (
+                db.query(Round)
+                .filter(Round.session_id == self.session_id, Round.status == "interrupted")
+                .order_by(Round.created_at.desc())
+                .all()
+            )
 
-        for round_obj in candidates:
-            raw_payload = getattr(round_obj, "interrupt_payload", None)
-            if not raw_payload:
-                continue
+            for round_obj in candidates:
+                raw_payload = getattr(round_obj, "interrupt_payload", None)
+                if not raw_payload:
+                    continue
 
-            try:
-                payload = json.loads(raw_payload)
-            except (TypeError, json.JSONDecodeError):
-                continue
+                try:
+                    payload = json.loads(raw_payload)
+                except (TypeError, json.JSONDecodeError):
+                    continue
 
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("id") != interrupt_id:
-                continue
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("id") != interrupt_id:
+                    continue
 
-            details = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
-            questions = details.get("questions") if isinstance(details.get("questions"), list) else []
-            return {
-                "interrupt_id": interrupt_id,
-                "round_id": round_obj.id,
-                "tool_call_id": details.get("tool_call_id"),
-                "questions": questions,
-            }
+                details = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                questions = details.get("questions") if isinstance(details.get("questions"), list) else []
+                return {
+                    "interrupt_id": interrupt_id,
+                    "round_id": round_obj.id,
+                    "tool_call_id": details.get("tool_call_id"),
+                    "questions": questions,
+                }
 
-        return None
+            return None
+        finally:
+            db.rollback()
 
     def has_pending_interrupt(self, interrupt_id: str) -> bool:
         """检查是否存在匹配的待处理中断（内存态 + 持久化态）。"""
@@ -1351,6 +1373,7 @@ class AgentService:
         _externally_terminated = False
         # 固化本輪 cancel_token，避免後續新 run 覆蓋 self.cancel_token 導致判定串擾。
         run_cancel_token = self.cancel_token
+        self._active_run_count += 1
 
         async def _record_llm_call(payload: dict[str, Any]) -> None:
             try:
@@ -1541,6 +1564,7 @@ class AgentService:
                 except Exception:
                     logger.error("Round %s 異常退出後無法更新 DB", run_id, exc_info=True)
             self.agent.set_llm_call_hook(None)
+            self._active_run_count = max(0, self._active_run_count - 1)
 
     async def _post_round_tasks(
         self,

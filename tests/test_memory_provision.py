@@ -151,6 +151,7 @@ class TestAgentServiceProvision:
             svc._provision_default_files_if_needed()
 
             mock_instance.provision_default_files.assert_called_once_with("test-user")
+            svc.history_service.reset_session.assert_called_once()
 
     def test_provision_failure_non_fatal(self):
         """验证 provision 失败不会中断 Agent 初始化"""
@@ -166,6 +167,7 @@ class TestAgentServiceProvision:
 
             # 不应抛异常
             svc._provision_default_files_if_needed()
+            svc.history_service.reset_session.assert_called_once()
 
 
 # =========================================================================

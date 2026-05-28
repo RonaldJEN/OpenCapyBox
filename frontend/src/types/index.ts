@@ -461,9 +461,13 @@ export interface FileListResponse {
 }
 
 // 运行中会话响应
-export interface RunningSessionResponse {
-  running_session_id: string | null;
+export interface RunningSessionInfo {
+  session_id: string;
   round_id: string | null;
+}
+
+export interface RunningSessionsResponse {
+  running_sessions: RunningSessionInfo[];
 }
 
 // =============================================================================
@@ -473,6 +477,7 @@ export interface RunningSessionResponse {
 // 流式消息回调 (sendMessageStreamV2)
 export interface StreamCallbacks {
   // 生命周期事件
+  onStreamAccepted?: () => void;
   onRunStarted?: (threadId: string, runId: string) => void;
   onRunFinished?: (threadId: string, runId: string, result: any, outcome: string, interrupt?: InterruptDetails) => void;
   onRunError?: (message: string, code?: string) => void;

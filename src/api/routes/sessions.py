@@ -28,10 +28,12 @@ from src.api.services.sandbox_service import (
 from src.api.services.history_service import HistoryService
 from src.api.services.agent_service import AgentService
 from src.api.model_registry import get_model_registry
+from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_sandbox import UserSandbox
 from src.api.models.conversation_message import ConversationMessage
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from src.api.utils.timezone import now_naive
+from src.api.config import get_settings
 import shlex
 
 logger = logging.getLogger(__name__)
@@ -925,44 +927,40 @@ async def download_file(
     )
 
 
-@router.get("/running-session")
-async def get_running_session(
+@router.get("/running-sessions")
+async def get_running_sessions(
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    """检查用户是否有运行中的会话（单次 API 调用，避免 N+1 查询）
+    """检查用户当前运行中的会话集合（单次 API 调用，避免 N+1 查询）
 
     Returns:
-        running_session_id: 运行中会话的 ID，如果没有则为 null
-        round_id: 运行中轮次的 ID
+        running_sessions: 运行中会话列表；init-window 时 round_id 可能为 null
     """
-    from src.api.models.round import Round
-
-    # 获取用户所有会话
-    sessions = (
-        db.query(Session)
-        .filter(Session.user_id == user_id)
+    settings = get_settings()
+    stale_cutoff = now_naive() - timedelta(seconds=max(settings.sse_subscribe_timeout, 1))
+    rows = (
+        db.query(UserRunLock.session_id, Round.id.label("round_id"))
+        .join(
+            Session,
+            (Session.id == UserRunLock.session_id) & (Session.user_id == user_id),
+        )
+        .outerjoin(
+            Round,
+            (Round.session_id == UserRunLock.session_id) & (Round.status == "running"),
+        )
+        .filter(UserRunLock.user_id == user_id)
+        .filter(UserRunLock.updated_at >= stale_cutoff)
+        .order_by(UserRunLock.updated_at.desc(), UserRunLock.created_at.desc())
         .all()
     )
 
-    session_ids = [s.id for s in sessions]
-    if not session_ids:
-        return {"running_session_id": None, "round_id": None}
-
-    # 查找运行中的轮次（单次查询）
-    running_round = (
-        db.query(Round)
-        .filter(Round.session_id.in_(session_ids), Round.status == "running")
-        .first()
-    )
-
-    if running_round:
-        return {
-            "running_session_id": running_round.session_id,
-            "round_id": running_round.id,
-        }
-
-    return {"running_session_id": None, "round_id": None}
+    return {
+        "running_sessions": [
+            {"session_id": session_id, "round_id": round_id}
+            for session_id, round_id in rows
+        ],
+    }
 
 
 @router.post("/{chat_session_id}/upload")

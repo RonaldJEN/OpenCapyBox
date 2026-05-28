@@ -7,7 +7,7 @@
 - 会话 CRUD（创建、列表、删除、标题更新）
 - 文件浏览与下载（代理沙箱文件操作）
 - 文件上传
-- 运行状态查询（running-session）
+- 运行状态查询（running-sessions）
 - 历史记录查询（Round/Step 结构化）
 
 **不负责：**
@@ -131,9 +131,11 @@
 - 可预览类型：text/\*、image/\*、PDF、JSON、XML
 - Error 404, 400（"文件路径不合法"）, 503（"沙箱不可用"）
 
-### GET /api/sessions/running-session
+### GET /api/sessions/running-sessions
 
-- Response 200: `{running_session_id: str|null, round_id: str|null}`
+- Response 200: `{running_sessions: [{session_id: str, round_id: str|null}]}`
+- `running_sessions` 返回当前用户所有持有新鲜 `UserRunLock` slot 的 session；新鲜判定为 `updated_at >= now - SSE_SUBSCRIBE_TIMEOUT`。
+- `round_id=null` 表示仍处于 Agent 初始化窗口，尚未写入 running round。
 - 单次查询避免 N+1
 
 ### POST /api/sessions/{id}/upload
@@ -149,7 +151,7 @@
 - 一个 Session = 一个 AG-UI Thread
 - Session 删除是级联的：rounds → agui_events → conversation_messages → llm_call_records 全部删除
 - 文件路径校验：必须在沙箱 mount 路径内（`is_within_sandbox_root`），否则 403
-- running-session 查询通过 JOIN `UserRunLock` + `Round` 实现单次查询
+- running-sessions 查询通过 `UserRunLock` + `Session` + `Round` 实现单次查询，返回所有活跃且未超过 `SSE_SUBSCRIBE_TIMEOUT` 的 slot
 - 历史 v2 通过 AGUI 事件动态重建 Step 结构，而非直接查表
 
 ## 5. 失败模式与错误处理

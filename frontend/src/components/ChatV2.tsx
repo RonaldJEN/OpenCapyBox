@@ -39,6 +39,8 @@ const WELCOME_SUGGESTIONS = [
   '生成一份周报模板',
 ] as const;
 
+const INIT_WINDOW_POLL_INTERVAL_MS = 1500;
+
 interface ChatV2Props {
   sessionId: string;
   onTitleUpdated?: () => void;
@@ -50,6 +52,8 @@ interface ChatV2Props {
   availableModels?: ModelInfo[];
   /** 从欢迎页触发创建会话：返回新 sessionId */
   onCreateSession?: (modelId?: string) => Promise<string>;
+  /** Sessions that currently hold a backend run slot, including init-window slots with no running round yet. */
+  activeSlotSessionIds?: Set<string>;
   scrollTarget?: {
     sessionId: string;
     roundId: string;
@@ -67,7 +71,7 @@ interface StreamCallbacksFactoryOptions {
   setBusyFalse: () => void;
   onStreamSuccess: () => void;
   onStreamError: (errorMsg: string, code?: string) => void;
-  /** 后端确认运行后（RUN_STARTED）才通知父组件，避免被拒请求（如 429）污染执行标记 */
+  /** 后端确认请求已占用运行 slot 后通知父组件；429 等拒绝请求不会触发。 */
   notifyExecutionStart?: () => void;
   /** 绑定的会话 ID，用于防止旧 SSE 回调在用户切换会话后污染新会话状态 */
   boundSessionId?: string;
@@ -87,7 +91,7 @@ const isUserCancelledOutcome = (outcome: string, interrupt: any, result?: any): 
   return false;
 };
 
-export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutionEnd, onPanelToggle, selectedModelId, onModelChange, availableModels = [], onCreateSession, scrollTarget }: ChatV2Props) {
+export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutionEnd, onPanelToggle, selectedModelId, onModelChange, availableModels = [], onCreateSession, activeSlotSessionIds, scrollTarget }: ChatV2Props) {
   const [rounds, setRounds] = useState<RoundData[]>([]);
   const [disableInitialMotion, setDisableInitialMotion] = useState(false);
   const [highlightedRoundId, setHighlightedRoundId] = useState<string | null>(null);
@@ -166,6 +170,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const pendingRestoreScrollRef = useRef<number | null>(null);
   const suppressAutoScrollRef = useRef<boolean>(false); // 切会话期间抑制自动 smooth 滚动
   const titleRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const initWindowPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 🆕 欢迎页「输入即创建」相关状态
   const [creatingSession, setCreatingSession] = useState(false);
@@ -178,6 +183,45 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const selectedModel = availableModels.find((m) => m.id === selectedModelId);
 
   // readFileAsDataUrl / compressImage 已从 utils/imageUtils 导入
+
+  const clearInitWindowPoll = () => {
+    if (initWindowPollTimeoutRef.current) {
+      clearTimeout(initWindowPollTimeoutRef.current);
+      initWindowPollTimeoutRef.current = null;
+    }
+  };
+
+  const scheduleInitWindowPoll = (targetSessionId: string) => {
+    if (initWindowPollTimeoutRef.current) {
+      return;
+    }
+
+    initWindowPollTimeoutRef.current = setTimeout(async () => {
+      initWindowPollTimeoutRef.current = null;
+      if (sessionIdRef.current !== targetSessionId) {
+        return;
+      }
+
+      try {
+        const running = await apiService.getRunningSessions();
+        const stillActive = running.running_sessions.some((item) => item.session_id === targetSessionId);
+        if (!stillActive) {
+          if (sessionIdRef.current === targetSessionId) {
+            setSending(false);
+            setAgentState((prev) => ({ ...prev, status: 'idle', lastUpdated: Date.now() }));
+            onExecutionEnd?.(targetSessionId);
+          }
+          return;
+        }
+      } catch (err) {
+        console.warn('Failed to poll init-window slot state:', err);
+      }
+
+      if (sessionIdRef.current === targetSessionId) {
+        void loadHistory();
+      }
+    }, INIT_WINDOW_POLL_INTERVAL_MS);
+  };
 
   const buildDisplayMessage = (text: string, files: FileInfo[]) => {
     const trimmed = text.trim();
@@ -286,6 +330,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       subscriptionAbortRef.current();
       subscriptionAbortRef.current = null;
     }
+    clearInitWindowPoll();
 
     sessionIdRef.current = sessionId; // 立即更新，后续所有旧回调通过 ref 感知到会话已切换
     isInitialLoadRef.current = true; // 🆕 切换会话时重置为首次加载
@@ -313,6 +358,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         clearTimeout(titleRefreshTimeoutRef.current);
         titleRefreshTimeoutRef.current = null;
       }
+      clearInitWindowPoll();
     };
   }, [sessionId]);
 
@@ -322,6 +368,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         clearTimeout(titleRefreshTimeoutRef.current);
         titleRefreshTimeoutRef.current = null;
       }
+      clearInitWindowPoll();
     };
   }, []);
 
@@ -425,10 +472,22 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       })));
       // 检查是否有运行中的轮次，如果有则订阅更新
       const runningRound = response.rounds.find(r => r.status === 'running');
+      const hasActiveSlot = activeSlotSessionIds?.has(sessionId) ?? false;
 
       // 🆕 检查是否有中断的轮次，恢复 QuestionCard
       if (!runningRound) {
-        // 当前会话没有运行中轮次，通知父组件清除该会话的执行标记（如有）
+        if (hasActiveSlot) {
+          // 仍持有后端运行 slot 但尚未创建 running round（Agent 初始化窗口）时，
+          // 保留侧栏执行标记和输入禁用态，并继续探测直到 round 建立或 slot 消失。
+          onExecutionStart?.(sessionId);
+          setSending(true);
+          setAgentState((prev) => ({ ...prev, status: 'running', lastUpdated: Date.now() }));
+          scheduleInitWindowPoll(sessionId);
+          return;
+        }
+
+        // 当前会话没有运行中轮次/运行 slot，通知父组件清除该会话的执行标记（如有）
+        clearInitWindowPoll();
         onExecutionEnd?.(sessionId);
 
         const interruptedRound = [...response.rounds].reverse().find(
@@ -442,6 +501,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       }
 
       if (runningRound) {
+        clearInitWindowPoll();
         onExecutionStart?.(sessionId);
         setDisableInitialMotion(false);
         setSending(true);
@@ -973,33 +1033,36 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     const isStale = () => boundSessionId !== undefined && sessionIdRef.current !== boundSessionId;
 
     return {
-    onRunStarted: (_threadId, runId) => {
-      if (isStale()) return;
-      setCurrentRunId(runId);
-      // 后端已确认运行，此时才通知父组件设置执行标记
-      notifyExecutionStart?.();
+      onStreamAccepted: () => {
+        notifyExecutionStart?.();
+      },
 
-      setRounds((prev) =>
-        prev.map((r) =>
-          r.round_id === tempRoundId
-            ? {
-                ...r,
-                round_id: runId,
-                ...(setRoundRunningOnStart ? { status: 'running' } : {}),
-              }
-            : r
-        )
-      );
+      onRunStarted: (_threadId, runId) => {
+        setCurrentRunId(runId);
+        notifyExecutionStart?.();
+        if (isStale()) return;
 
-      setAgentState({
-        currentStep: 0,
-        status: 'running',
-        toolLogs: [],
-        lastUpdated: Date.now(),
-      });
-    },
+        setRounds((prev) =>
+          prev.map((r) =>
+            r.round_id === tempRoundId
+              ? {
+                  ...r,
+                  round_id: runId,
+                  ...(setRoundRunningOnStart ? { status: 'running' } : {}),
+                }
+              : r
+          )
+        );
 
-    onRunFinished: (_threadId, runId, result, outcome, interrupt) => {
+        setAgentState({
+          currentStep: 0,
+          status: 'running',
+          toolLogs: [],
+          lastUpdated: Date.now(),
+        });
+      },
+
+      onRunFinished: (_threadId, runId, result, outcome, interrupt) => {
       if (isStale()) {
         // 旧会话的执行已结束，通知父组件清除该会话的执行标记（避免侧栏残留）
         if (boundSessionId) onStreamSuccess();

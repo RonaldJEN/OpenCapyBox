@@ -65,6 +65,16 @@ get_or_resume 的恢复链：
 - 目的：避免调用方持有失效旧 id → 反复 fallback create → 沙箱泄漏。
 - 调用方（cron / sessions / agent_pool）无需再各自手动回写 `user_sandbox.sandbox_id`。
 
+### AgentPool sandbox 代际一致性
+
+- `AgentPoolService` 缓存 Agent 时必须记录该 Agent 绑定的 `sandbox_id`。
+- 当前用户级 `sandbox_id` 判定必须同时比较 `SandboxSessionService.get_sandbox_id(user_id)` 与调用方从 `user_sandboxes` 读出的 `sandbox_id`；当 DB 中的持久化 id 与进程内缓存冲突时，DB id 用于触发旧 Agent 失效，并清理本地旧 sandbox 缓存后重建。
+- 热缓存命中时，若 cached Agent 的 `sandbox_id` 与当前用户级 sandbox 不一致，不得返回旧 Agent；必须移除该 session 缓存并重建。
+- 用户级 sandbox fallback create 或跨 worker 持久化为新 `sandbox_id` 后，同用户旧 Agent 必须懒失效或主动失效，避免工具继续请求 OpenSandbox 已不存在的旧 sandbox。
+- 该约束不表示同用户 Agent run 串行化；`AGENT_USER_CONCURRENCY_LIMIT` 仍只限制同时运行的不同 session 数。处在额度内、且绑定当前 `sandbox_id` 的多个 Agent 可以并发运行。
+- 若同用户 cached Agent 数超过 `AGENT_USER_CONCURRENCY_LIMIT` 形成资源压力，只能优先失效旧且 idle 的 Agent；不得为了缓存收敛移除仍在运行的 session。
+- `renew(user_id)` 失败时应失效该用户全部已缓存 Agent；一用户一 sandbox 架构下，其他 session 大概率也持有同一失效 sandbox 对象。正在创建但尚未进入 Agent 缓存的 session 占位不得被删除。
+
 ### 暂停策略
 
 - 仅当用户所有 session 都从 AgentPool TTL 过期时才触发 pause

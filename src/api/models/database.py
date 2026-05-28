@@ -86,6 +86,7 @@ def init_db():
     _configure_postgres_extensions()
     Base.metadata.create_all(bind=engine)
     _configure_sqlite_pragmas()
+    _migrate_user_run_locks_schema()
     _migrate_add_columns()
 
 
@@ -151,6 +152,30 @@ def _sync_postgres_sequence(conn, table_name: str) -> None:
             logger.info("DB 迁移: %s 序列 %s -> %s", seq_name, last_value, max_id)
 
 
+def _migrate_user_run_locks_schema() -> None:
+    """重建短生命周期运行锁表，使其支持 per-user 多 slot 并发。
+
+    user_run_locks 只保存运行时心跳锁，服务启动时也会清空，因此遇到旧版
+    user_id 主键 schema 时直接 drop/recreate，比在线改主键更简单可靠。
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table("user_run_locks"):
+        return
+
+    pk_cols = inspector.get_pk_constraint("user_run_locks").get("constrained_columns") or []
+    columns = {col["name"] for col in inspector.get_columns("user_run_locks")}
+    if pk_cols == ["lock_id"] and "slot" in columns:
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE user_run_locks"))
+
+    from src.api.models.user_run_lock import UserRunLock
+
+    UserRunLock.__table__.create(bind=engine, checkfirst=True)
+    logger.info("DB 迁移: 重建 user_run_locks 表以支持 per-user 并发 slot")
+
+
 # ============================================================
 # 简易数据库迁移（无 Alembic 场景下的安全 ALTER TABLE）
 # ============================================================
@@ -180,6 +205,7 @@ _PENDING_COLUMNS = [
     ("llm_call_records", "compaction_summary_quality_repair_count", "INTEGER"),
     ("llm_call_records", "compaction_emergency_truncate_dropped_rounds", "INTEGER"),
     ("user_run_locks", "lock_id", "VARCHAR(36) DEFAULT ''"),
+    ("user_run_locks", "slot", "INTEGER NOT NULL DEFAULT 0"),
     # Cron 消息中心：未读标记（存量默认已读）、产物元数据、运行工作目录
     ("cron_job_runs", "is_read", f"BOOLEAN DEFAULT {_BOOL_TRUE}"),
     ("cron_job_runs", "artifacts", "TEXT"),
@@ -197,6 +223,7 @@ _PENDING_COLUMNS = [
 # 注意：值均為可信硬編碼常量，直接用於 DDL 語句拼接
 _PENDING_UNIQUE_CONSTRAINTS = [
     ("rounds", "uq_round_session_idempkey", ["session_id", "idempotency_key"]),
+    ("user_sandboxes", "uq_user_sandboxes_user_id", ["user_id"]),
 ]
 
 

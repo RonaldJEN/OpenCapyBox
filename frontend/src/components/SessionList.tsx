@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
-import { Session } from '../types';
+import type { RunningSessionInfo, Session } from '../types';
 import { MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Zap, Clock, Search, X } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
@@ -10,8 +10,8 @@ interface SessionListProps {
   currentSessionId?: string;
   onSessionSelect: (sessionId: string, target?: { roundId: string }) => void;
   refreshTrigger?: number;
-  executingSessionId?: string | null;
-  onRunningSessionDetected?: (sessionId: string) => void;
+  executingSessionIds?: Set<string>;
+  onRunningSessionsDetected?: (runningSessions: RunningSessionInfo[]) => void;
   isCollapsed?: boolean;
   onModelChange?: (modelId: string) => void;
   onNewChat?: () => void;
@@ -21,7 +21,7 @@ interface SessionListProps {
   onOpenCron?: () => void;
 }
 
-export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionId, onRunningSessionDetected, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenSkills, onOpenCron }: SessionListProps) {
+export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionIds, onRunningSessionsDetected, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenSkills, onOpenCron }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -54,8 +54,8 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
 
   // 檢測運行中的會話 — 僅首次掛載時執行一次
   useEffect(() => {
-    if (!executingSessionId && onRunningSessionDetected) {
-      checkForRunningSession();
+    if ((executingSessionIds?.size ?? 0) === 0 && onRunningSessionsDetected) {
+      checkForRunningSessions();
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -82,15 +82,15 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     }
   };
 
-  const checkForRunningSession = async () => {
+  const checkForRunningSessions = async () => {
     try {
-      const result = await apiService.getRunningSession();
-      if (result.running_session_id) {
-        console.log(`[SessionList] 检测到运行中的会话: ${result.running_session_id}`);
-        onRunningSessionDetected?.(result.running_session_id);
+      const result = await apiService.getRunningSessions();
+      if (result.running_sessions.length > 0) {
+        console.log(`[SessionList] 检测到运行中的会话: ${result.running_sessions.map((item) => item.session_id).join(', ')}`);
+        onRunningSessionsDetected?.(result.running_sessions);
       }
     } catch (error) {
-      console.error('Failed to check running session:', error);
+      console.error('Failed to check running sessions:', error);
     }
   };
 
@@ -226,7 +226,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
                 </span>
 
                 {/* 执行状态动画 */}
-                {executingSessionId === session.id && (
+                {executingSessionIds?.has(session.id) && (
                   <div className="flex items-center ml-2">
                     <div className="w-1.5 h-1.5 bg-claude-accent rounded-full animate-dot-pulse" />
                   </div>

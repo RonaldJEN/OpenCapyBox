@@ -435,14 +435,14 @@ Authorization: Bearer <access_token>
 
 ---
 
-### 检查运行中会话
+### 检查运行中会话集合
 
-检查用户是否有正在运行的会话（单次 API 调用，避免 N+1 查询）。
+检查用户当前正在运行的会话集合（单次 API 调用，避免 N+1 查询）。当 `AGENT_USER_CONCURRENCY_LIMIT > 1` 时，可能返回多个不同 session。仅返回 `updated_at` 未超过 `SSE_SUBSCRIBE_TIMEOUT` 的新鲜运行 slot。
 
 **请求**
 
 ```
-GET /api/sessions/running-session
+GET /api/sessions/running-sessions
 Authorization: Bearer <access_token>
 ```
 
@@ -454,17 +454,24 @@ Authorization: Bearer <access_token>
 
 ```json
 {
-  "running_session_id": "550e8400-e29b-41d4-a716-446655440000",
-  "round_id": "round-001"
+  "running_sessions": [
+    {
+      "session_id": "550e8400-e29b-41d4-a716-446655440000",
+      "round_id": "round-001"
+    },
+    {
+      "session_id": "660e8400-e29b-41d4-a716-446655440000",
+      "round_id": null
+    }
+  ]
 }
 ```
 
-或无运行中会话时：
+`round_id` 为 `null` 表示该 session 已占用新鲜运行 slot，但仍处于 Agent 初始化窗口、尚未创建 running round。无运行中会话时：
 
 ```json
 {
-  "running_session_id": null,
-  "round_id": null
+  "running_sessions": []
 }
 ```
 
@@ -612,8 +619,9 @@ RUN_STARTED → STATE_SNAPSHOT → THINKING_TEXT_MESSAGE_START → THINKING_TEXT
 
 **并发限制说明**
 
-- 同一用户同一时刻只允许一个运行中的任务
-- 并发限制基于数据库行锁 `UserRunLock` 实现（跨 worker 生效），执行期间通过心跳保活
+- 同一用户同一时刻最多允许 `AGENT_USER_CONCURRENCY_LIMIT` 个不同 session 运行，默认 1
+- 同一 session 同一时刻仍只允许一个运行中的任务
+- 并发限制基于数据库 slot 锁 `UserRunLock` 实现（跨 worker 生效），执行期间通过心跳保活
 - 心跳超过 `sse_subscribe_timeout` 未更新时，锁被视为陈旧并自动回收
 - 当存在运行中的任务时，接口返回 `429 Too Many Requests`
 
@@ -637,7 +645,7 @@ RUN_STARTED → STATE_SNAPSHOT → THINKING_TEXT_MESSAGE_START → THINKING_TEXT
 | ------ | ---- |
 | 404    | 会话不存在 |
 | 410    | 会话已完成（不可继续发送消息） |
-| 429    | 当前用户已有运行中的任务（并发限制） |
+| 429    | 当前用户运行任务数已达上限（并发限制） |
 | 503    | 服务暂时不可用（数据库异常等系统错误） |
 
 ---
@@ -860,16 +868,22 @@ Content-Type: text/event-stream
 
 **并发限制**
 
-与 `message/stream` 共享同一把用户锁，同一用户同时只能有一个 send 或 resume 在执行。
+与 `message/stream` 共享同一套用户 slot 锁；同一用户最多同时运行 `AGENT_USER_CONCURRENCY_LIMIT` 个不同 session，同一 session 不可重入。
 
 **错误响应**
+
+`resume` 返回 SSE 后，恢复过程中的运行期错误以 AG-UI `RUN_ERROR` 事件结束流。
 
 | 状态码 | 说明 |
 | ------ | ---- |
 | 404    | 会话不存在 |
-| 409    | 无待处理的中断 |
-| 429    | 当前用户已有运行中的任务 |
+| 429    | 当前用户运行任务数已达上限 |
 | 503    | 服务暂时不可用 |
+
+| RUN_ERROR code | 说明 |
+| -------------- | ---- |
+| `NO_PENDING_INTERRUPT` | 无待处理的中断，或中断 ID 已过期/已恢复 |
+| `AGENT_INIT_FAILED` | Agent 初始化失败 |
 
 ---
 
@@ -1289,17 +1303,20 @@ GET /api/models/{model_id}
 
 ### UserRunLock（用户运行锁）
 
-跨 worker 用户级运行互斥锁。每个用户最多一把锁（主键 `user_id`），执行 worker 通过定时刷新 `updated_at` 实现心跳保活。
+跨 worker 用户级运行 slot。每个用户最多持有 `AGENT_USER_CONCURRENCY_LIMIT` 个不同 session 的运行 slot；同一 session 同一时刻只能持有一个 slot。执行 worker 通过定时刷新 `updated_at` 实现心跳保活。
 
 | 字段       | 类型     | 说明                            |
 | ---------- | -------- | ------------------------------- |
-| user_id    | string   | 用户 ID（主键）                 |
+| lock_id    | string   | 锁实例 UUID（主键，用于 owner 校验释放） |
+| user_id    | string   | 用户 ID                         |
 | session_id | string   | 当前持锁的会话 ID               |
-| lock_id    | string   | 锁实例 UUID（防止 TOCTOU 误删） |
+| slot       | int      | 用户内并发 slot 编号            |
 | created_at | datetime | 锁创建时间                      |
 | updated_at | datetime | 最后心跳时间                    |
 
-**心跳与过期**：`_cancel_request_watcher` 每 15s 刷新 `updated_at`。当 `updated_at` 超过 `sse_subscribe_timeout` 秒未更新时，锁被视为陈旧，新请求可回收并清理关联的孤儿 Round。
+**约束**：`lock_id` 为主键；`Unique(user_id, slot)` 限制用户并发配额；`Unique(user_id, session_id)` 保证同一会话不可重入。
+
+**心跳与过期**：`_cancel_request_watcher` 每 15s 刷新 `updated_at`。当 `updated_at` 超过 `sse_subscribe_timeout` 秒未更新时，slot 被视为陈旧，新请求可回收并清理该 session 关联的孤儿 Round。
 
 ### RunCancelRequest（跨 worker 取消请求）
 

@@ -27,7 +27,7 @@
 #
 # ============================================================
 
-default_model: qwen3.6-plus
+default_model: mimo-v2.5-pro
 cron_default_model: glm  # Cron 任务默认模型（不配置思考）
 
 models:
@@ -163,8 +163,22 @@ models:
     max_videos: 0
     enabled: true
     tags: [thinking]
+  mimo-v2.5-pro:
+    display_name: "mimo-v2.5-pro"
+    provider: openai
+    api_base: "https://api.xiaomimimo.com/v1"
+    api_key: "${XIAOMI_KEY}"
+    model_name: "mimo-v2.5-pro"
+    max_tokens: 32768
+    context_window: 102400
+    reasoning_format: reasoning_content
+    reasoning_split: true
+    enable_thinking: true
+    enabled: true
+    tags: [thinking, coding, long-context]
   # ======================== DeepSeek（阿里 DashScope 三方）========================
   # 通過阿里 DashScope 統一接入，使用 LLM_API_KEY
+  
   deepseek-pro:
     display_name: "DeepSeek V4 pro"
     provider: openai
@@ -181,8 +195,8 @@ models:
   deepseek-flash:
     display_name: "DeepSeek V4 Flash"
     provider: openai
-    api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    api_key: "${LLM_API_KEY}"
+    api_base: "https://api.deepseek.com/v1"
+    api_key: "${DEEPSEEK_KEY}"
     model_name: "deepseek-v4-flash"
     max_tokens: 384000
     context_window: 1024000

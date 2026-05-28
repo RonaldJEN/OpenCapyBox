@@ -187,17 +187,18 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 
 ### 2.5 `user_run_locks` 表
 
-用户级执行互斥锁。确保每个用户同一时刻只有一个 Agent 在执行。
+用户级执行并发 slot。确保每个用户同一时刻最多有 `AGENT_USER_CONCURRENCY_LIMIT` 个不同 session 在执行，且同一 session 仍只能有一个 active run。
 
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
-| `user_id` | String(100) | PK | 每个用户最多持有一把锁 |
+| `lock_id` | String(36) | PK | UUID，用于标识锁的持有者 |
+| `user_id` | String(100) | NOT NULL, indexed | 锁所属用户 |
 | `session_id` | String(36) | NOT NULL, indexed | 锁定的会话 |
-| `lock_id` | String(36) | NOT NULL | UUID，用于标识锁的持有者 |
+| `slot` | Integer | NOT NULL | 用户内并发 slot 编号 |
 | `created_at` | DateTime | NOT NULL | 锁创建时间 |
 | `updated_at` | DateTime | NOT NULL, onupdate=now | 心跳刷新时间 |
 
-**并发语义**: 使用 PK 冲突（INSERT conflict）实现无等待互斥。若 INSERT 失败，说明用户已有正在运行的任务。
+**并发语义**: `Unique(user_id, slot)` 原子限制同一用户可占用的 slot 数，`Unique(user_id, session_id)` 保证同一会话不可重入。若所有 slot 已占用，返回 429。
 
 ### 2.6 `run_cancel_requests` 表
 
@@ -311,7 +312,7 @@ SSE 事件流格式遵循 AG-UI 协议（详见 [第 4.6 节](#46-ag-ui-事件�
 |-------------|------|------|
 | 404 | 会话不存在 | `session_id` 无效或不属于当前用户 |
 | 410 | 会话已完成 | 会话处于终态，不再接受新消息 |
-| 429 | 当前有正在运行的任务 | 用户已有活跃的 Agent 执行（UserRunLock 冲突） |
+| 429 | 当前运行任务数已达上限 | 用户 slot 已满，或同 session 已有 active run |
 | 503 | 服务不可用 | DB 锁冲突等内部错误 |
 
 #### 流内错误事件
@@ -330,15 +331,15 @@ SSE 事件流格式遵循 AG-UI 协议（详见 [第 4.6 节](#46-ag-ui-事件�
 用户发送消息
     │
     ▼
-INSERT INTO user_run_locks (user_id, ...)
+INSERT INTO user_run_locks (lock_id, user_id, session_id, slot)
     │
-    ├── 成功 → 获取锁，启动 Agent
+    ├── 成功 → 获取 slot，启动 Agent
     │              │
     │              ├── 每 15s 心跳: UPDATE updated_at
     │              │
     │              └── Agent 终态 → DELETE FROM user_run_locks
     │
-    └── PK 冲突 → 返回 429 "当前有正在运行的任务"
+    └── slot 已满 / 同 session 已在跑 → 返回 429
 ```
 
 ### 3.2 `POST /api/chat/{session_id}/resume`
@@ -363,6 +364,7 @@ Content-Type: application/json
 #### 响应
 
 SSE 事件流，格式与 `message/stream` 相同。
+Agent 初始化和中断状态校验在 SSE generator 内执行；入口只做会话、token、用户并发 slot 等前置校验，避免请求级 DB Session 跨 Agent / sandbox 初始化长时间持有连接。
 
 #### 恢复路径
 
@@ -379,10 +381,15 @@ SSE 事件流，格式与 `message/stream` 相同。
 | HTTP 状态码 | 含义 | 场景 |
 |-------------|------|------|
 | 404 | 会话不存在 | `session_id` 无效 |
-| 409 | 没有待处理的中断 | 会话没有处于 `interrupted` 状态的 Round |
-| 429 | 当前有正在运行的任务 | UserRunLock 冲突 |
-| 500 | Agent 获取失败 | Agent 恢复过程出错 |
+| 429 | 当前运行任务数已达上限 | 用户 slot 已满，或同 session 已有 active run |
 | 503 | 服务不可用 | 内部错误 |
+
+返回 SSE 后的恢复期错误以 AG-UI `RUN_ERROR` 结束流：
+
+| RUN_ERROR code | 含义 | 场景 |
+|----------------|------|------|
+| `NO_PENDING_INTERRUPT` | 没有待处理的中断 | 会话没有匹配的 pending interrupt，或中断 ID 已过期/已恢复 |
+| `AGENT_INIT_FAILED` | Agent 初始化失败 | AgentPool 获取或初始化失败 |
 
 ### 3.3 `GET /api/chat/{session_id}/round/{round_id}/subscribe`
 
@@ -462,7 +469,7 @@ SSE 事件流。
 |--------------|------|
 | `cancelled` + `reason: "force_aborted"` | 已将 running round 直接收敛为 cancelled，并立即释放会话锁 |
 | `cancelled` + `reason: "force_stopped"` | 命中本地 active runner，已执行 task cancel 并等待收敛完成（锁已释放） |
-| `cancelled` + `reason: "worker_dead"` | 锁已超时（> 3 倍心跳间隔），判定 Worker 死亡，直接强制清理锁和 Round 状态 |
+| `cancelled` + `reason: "worker_dead"` | 锁已超过 `SSE_SUBSCRIBE_TIMEOUT` 未刷新，判定 Worker 死亡，直接强制清理锁和 Round 状态 |
 | `cancelled` + `reason: "force_unlocked"` | init-window（无 running round）也立即释放会话锁，允许用户立刻重发 |
 
 > 约束：`cancelled(*)` 仅在目标会话锁确认已释放时返回；若释放失败（例如数据库锁冲突），接口返回 `HTTP 503`，不会返回“假成功”。
@@ -519,16 +526,19 @@ SSE 事件流。
 用户消息到达
     │
     ▼
-创建 Round (status=running)
-    │
-    ▼
-获取 UserRunLock
+获取 UserRunLock slot
     │
     ▼
 初始化 Agent (Lazy Init)
     │  ├── 连接/恢复沙箱
     │  ├── 加载对话历史
     │  └── 初始化技能 (Skills)
+    │
+    ▼
+刷新 Agent runtime messages
+    │
+    ▼
+创建 Round (status=running)
     │
     ▼
 ┌─── Agent 主循环 (step 1..max_steps) ──────────────┐
@@ -565,7 +575,8 @@ SSE 事件流。
 
 | 参数 | 默认值 | 可配置 | 说明 |
 |------|--------|--------|------|
-| `AGENT_MAX_STEPS` | 50 | 是（最大 100） | 单次 Round 最大步数 |
+| `AGENT_MAX_STEPS` | 100 | 是 | 单次 Round 最大步数 |
+| 用户并发上限 | 1 | 是 (`AGENT_USER_CONCURRENCY_LIMIT`) | 同一用户可同时运行的不同 session 数 |
 | 心跳间隔 | 15s | 是 (`SSE_HEARTBEAT_INTERVAL`) | SSE 心跳与锁刷新间隔 |
 | 工具超时 | 300s | 是 (`tool_timeout`) | 单个工具执行超时 |
 | 流式块超时 | 100s | — | LLM 流式响应相邻 chunk 的最大间隔 |
@@ -652,8 +663,8 @@ INSERT INTO rounds (..., idempotency_key)
 
 #### Worker 死亡检测
 
-- 每 15s 心跳刷新 `user_run_locks.updated_at`
-- 超过 **3 倍心跳间隔**（默认 45s）未刷新 → 判定 Worker 死亡
+- 每 15s 心跳刷新 `user_run_locks.updated_at`（由 `SSE_HEARTBEAT_INTERVAL` 控制）
+- 超过 `SSE_SUBSCRIBE_TIMEOUT`（默认 300s）未刷新 → 视为 stale lock；下一次获取用户 slot 时回收该锁并清理对应 session 的孤儿 running round
 - `abort` 统一采用“接口即时收敛”策略：
     1. 写入取消请求（用于跨 worker 可观测）
     2. 若存在 running round，直接标记 `cancelled` 并补发 `RUN_FINISHED(outcome=interrupt)`
@@ -665,9 +676,11 @@ INSERT INTO rounds (..., idempotency_key)
 
 > 说明：即时释放锁后，旧 worker 可能在极短时间内仍在退出过程。系统通过“终态后丢弃迟到事件”避免 UI/回放被旧 run 污染。
 
-#### Per-User 串行（更新）
+#### Per-User 并发 slot
 
-系统保证 **同一用户同一时刻最多持有一个活动锁**（`UserRunLock`）。
+系统保证 **同一用户同一时刻最多持有 `AGENT_USER_CONCURRENCY_LIMIT` 个活动锁**。默认值为 `1`，保持严格串行；配置为 `3` 时，同一用户最多可让 3 个不同 session 同时运行。
+
+同一 `chat_session_id` 始终只能有一个 active run；即使用户并发上限大于 1，重复发送同一 session 仍会被 `Unique(user_id, session_id)` 拦截。
 
 在“abort 即时释放锁”语义下，存在短时窗口：旧 run 正在退出而新 run 已启动（无锁重叠执行）。为避免状态污染，后端执行以下约束：
 
@@ -675,7 +688,7 @@ INSERT INTO rounds (..., idempotency_key)
 2. `complete_round` 不允许覆写终态 round
 3. 订阅端以终态事件为准，不再回跳 `running`
 
-- `user_run_locks` 表仍以 `user_id` 为 PK，而非 `session_id`
+- worker 心跳过期时仅回收对应 session 的孤儿 round，不影响同用户其他仍健康的并发 session。
 
 #### DB 连接生命周期约束（强约束）
 
@@ -687,9 +700,10 @@ INSERT INTO rounds (..., idempotency_key)
    - `_cancel_request_watcher`：每轮单独 `with SessionLocal() as check_db` / `hb_db`，`sleep` 前必须释放。
    - `subscribe_to_round.heartbeat_and_poll`：每次增量回放查询单独 `with SessionLocal() as replay_db`，查完立即释放。
 2. **SQLite 必须使用 `NullPool`**：文件型 DB 连接开销极低，NullPool 彻底规避 QueuePool 超时阻塞 event loop 的风险。其它数据库（MySQL/Postgres）保留默认 `QueuePool`。
-3. **请求级 `db: Depends(get_db)` 在 SSE 流路径上只能用于入口校验**；进入 event_generator / producer 后，必须使用独立短生命周期 Session 做持久化。
-4. **AG-UI 事件持久化不得跨 Agent/LLM/tool 的 `await` 间隙保留未提交事务**；非 delta 事件写入后必须提交，delta 事件完成终态读取后也必须结束只读事务，避免 PostgreSQL 远端连接在 idle-in-transaction 状态被断开。
-5. **请求清理阶段的连接断开只记录日志，不改变已完成响应**：若 `get_db` 在 `db.close()` 隐式 rollback 时发现 PostgreSQL 连接已被远端关闭，记录 warning 并丢弃该连接；业务查询/提交阶段的 DB 异常仍必须正常抛出。
+3. **请求级 `db: Depends(get_db)` 在 SSE 流路径上只能用于入口校验**；进入 event_generator / producer 后，必须使用独立短生命周期 Session 做持久化。`subscribe_to_round` 完成初始 replay / 终态检查后，若要进入长时间队列等待，必须先结束请求级只读事务。
+4. **AgentPool 热缓存不得持有请求级 DB Session**：缓存的 `AgentService` 使用独立的 `SessionLocal` factory / owned session，命中缓存时不得把当前请求的 `db: Depends(get_db)` rebind 到共享 Agent 上。Agent 初始化期间需要更新 `user_sandboxes` 或同步 memory 时，也必须使用独立短生命周期 Session；入口请求级 `db` 只能传递已预读出的标量值（如 `model_id` / `sandbox_id` / `round_count`），不得跨 sandbox / Agent 初始化 await 持有。
+5. **AG-UI 事件持久化不得跨 Agent/LLM/tool 的 `await` 间隙保留未提交事务**；非 delta 事件写入后必须提交，delta 事件完成终态读取后也必须结束只读事务，run 收尾的只读状态/摘要查询也必须结束事务，避免 PostgreSQL 远端连接在 idle-in-transaction 状态被断开。`commit()` 后的 `refresh()` 会再次发起只读 `SELECT`，返回 ORM 对象前必须分离对象并结束该只读事务。
+6. **请求清理阶段的连接断开只记录日志，不改变已完成响应**：若 `get_db` 在 `db.close()` 隐式 rollback 时发现 PostgreSQL 连接已被远端关闭，记录 warning 并丢弃该连接；业务查询/提交阶段的 DB 异常仍必须正常抛出。
 
 不遵守上述规则会表现为：多并发会话切换/拉取时，`get_db` 从连接池获取连接超时，抛 `sqlalchemy.exc.TimeoutError: QueuePool limit ... connection timed out`。
 
@@ -1048,7 +1062,7 @@ SSE 连接建立
 | **abort 收敛后释放锁失败** | `POST /abort` 执行到锁释放阶段但 DB 冲突/异常 | 返回 `HTTP 503`，不返回 `cancelled` 假成功 | 前端保持运行态或提示重试，避免误判“已可重发” |
 | **abort 后旧 run 迟到输出** | round 已终态但仍收到后续 AG-UI 事件 | 丢弃迟到事件，不再入库，不污染 replay/UI | 前端状态保持 cancelled，不再回跳 running |
 | **DB 锁冲突** | 数据库异常捕获 | 返回 HTTP 503 | 前端提示稍后重试 |
-| **Worker 死亡** | 锁超时检测（> 3 倍心跳） | abort 接口直接清理锁和 Round 状态 | 用户调用 abort 时得到即时响应 |
+| **Worker 死亡** | 锁超时检测（> `SSE_SUBSCRIBE_TIMEOUT`） | abort 接口直接清理锁和 Round 状态 | 用户调用 abort 时得到即时响应 |
 
 ### SSE 断线重连详细流程
 

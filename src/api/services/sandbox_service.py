@@ -16,6 +16,7 @@
   文件全部存在沙箱中，Agent Server 僅作為代理。
 """
 
+import asyncio
 import logging
 import re
 import hashlib
@@ -29,6 +30,7 @@ from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
 from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.sandboxes import Volume, Host
+from sqlalchemy.exc import IntegrityError
 
 from src.api.config import get_settings
 
@@ -129,8 +131,18 @@ class SandboxSessionService:
             return
         self._cache: dict[str, Sandbox] = {}         # user_id → Sandbox
         self._pushed_skills: dict[str, set[str]] = {}  # user_id → pushed skill names
+        self._lifecycle_locks: dict[str, asyncio.Lock] = {}  # user_id → sandbox lifecycle lock
         self._config = _build_connection_config()
         self._initialized = True
+
+    def _get_lifecycle_lock(self, user_id: str) -> asyncio.Lock:
+        """Return the per-user sandbox lifecycle lock for this process."""
+        return self._lifecycle_locks.setdefault(user_id, asyncio.Lock())
+
+    @staticmethod
+    def _sandbox_id_from_instance(sandbox: Sandbox | None) -> str | None:
+        sandbox_id = getattr(sandbox, "id", None)
+        return sandbox_id if isinstance(sandbox_id, str) and sandbox_id else None
 
     @staticmethod
     def _collect_skill_files(skills_path: Path, root_path: Path) -> list[tuple[str, bytes]]:
@@ -265,6 +277,30 @@ class SandboxSessionService:
     async def get_or_resume(
         self, user_id: str, sandbox_id: str | None = None
     ) -> Sandbox:
+        """獲取沙箱實例（按 user_id 在本進程內串行化生命週期）。"""
+        async with self._get_lifecycle_lock(user_id):
+            return await self._get_or_resume_unlocked(user_id, sandbox_id)
+
+    async def get_or_resume_with_persisted_id(
+        self, user_id: str, sandbox_id: str | None = None
+    ) -> tuple[Sandbox, str | None]:
+        """獲取沙箱並在同一 user lifecycle lock 內持久化本次 sandbox.id。
+
+        調用方應使用返回的 sandbox_id 綁定 Agent / metadata / DB 狀態，
+        避免拿到 sandbox 後再讀 mutable cache 造成錯綁。
+        """
+        async with self._get_lifecycle_lock(user_id):
+            sandbox = await self._get_or_resume_unlocked(user_id, sandbox_id)
+            current_sandbox_id = self._sandbox_id_from_instance(sandbox)
+            if current_sandbox_id:
+                self._upsert_user_sandbox_id(user_id, current_sandbox_id)
+                self._cache[user_id] = sandbox
+                self._pushed_skills.setdefault(user_id, set())
+            return sandbox, current_sandbox_id
+
+    async def _get_or_resume_unlocked(
+        self, user_id: str, sandbox_id: str | None = None
+    ) -> Sandbox:
         """獲取沙箱實例（先快取 → connect → resume → create）
 
         Args:
@@ -350,6 +386,52 @@ class SandboxSessionService:
         except Exception:
             logger.exception("回寫 user_sandbox 失敗 (user=%s, new_id=%s)", user_id, sandbox.id)
         return sandbox
+
+    @staticmethod
+    def _upsert_user_sandbox_id(user_id: str, sandbox_id: str) -> None:
+        """Persist current user sandbox id while the lifecycle lock is held.
+
+        The IntegrityError fallback is only a best-effort guard for cross-worker
+        races; it does not replace a distributed lock.
+        """
+        if not sandbox_id:
+            return
+
+        from src.api.models.database import SessionLocal
+        from src.api.models.user_sandbox import UserSandbox
+        import uuid
+
+        with SessionLocal() as db:
+            try:
+                user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+                if user_sandbox:
+                    if user_sandbox.sandbox_id != sandbox_id or user_sandbox.status != "active":
+                        user_sandbox.sandbox_id = sandbox_id
+                        user_sandbox.status = "active"
+                        db.commit()
+                    else:
+                        db.rollback()
+                    return
+
+                db.add(UserSandbox(
+                    id=str(uuid.uuid4()),
+                    user_id=user_id,
+                    sandbox_id=sandbox_id,
+                    status="active",
+                ))
+                try:
+                    db.commit()
+                except IntegrityError:
+                    db.rollback()
+                    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+                    if not user_sandbox:
+                        raise
+                    user_sandbox.sandbox_id = sandbox_id
+                    user_sandbox.status = "active"
+                    db.commit()
+            except Exception:
+                db.rollback()
+                raise
 
     @staticmethod
     def _persist_sandbox_id_if_exists(user_id: str, new_sandbox_id: str, *, previous_id: str | None) -> None:

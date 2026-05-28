@@ -846,6 +846,7 @@ class TestContextAssembly:
         with patch.object(MemoryService, "get_all_memory_files", return_value={}):
             result = AgentService._build_memory_context(svc)
         assert result == ""
+        svc.history_service.reset_session.assert_called_once()
 
     def test_with_soul_and_user(self):
         from src.api.services.agent_service import AgentService
@@ -869,6 +870,7 @@ class TestContextAssembly:
         assert "友善的助手" in result
         assert "用户画像" in result
         assert "Alice" in result
+        svc.history_service.reset_session.assert_called_once()
 
     def test_without_soul_only_user_and_memory(self):
         """无 soul_md 时仍正确注入 user_md 和 memory_md"""
@@ -895,6 +897,7 @@ class TestContextAssembly:
         assert "Bob" in result
         assert "长期记忆" in result
         assert "AI 聊天应用" in result
+        svc.history_service.reset_session.assert_called_once()
 
 
 class TestTruncateToTokens:

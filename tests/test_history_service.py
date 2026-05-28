@@ -52,6 +52,9 @@ class TestHistoryServiceRound:
         assert added_round.session_id == "session-123"
         assert added_round.user_message == "Hello"
         assert added_round.status == "running"
+        mock_db.refresh.assert_called_once_with(added_round)
+        mock_db.expunge.assert_called_once_with(added_round)
+        mock_db.rollback.assert_called_once()
 
     def test_create_round_with_parent_run_id(self, history_service, mock_db):
         """resume 新 Round 应记录被中断的父 Round。"""
@@ -87,8 +90,9 @@ class TestHistoryServiceRound:
         assert added_round.parent_run_id == "round-interrupted"
         assert added_round.status == "running"
         mock_db.commit.assert_called_once()
-        mock_db.rollback.assert_not_called()
         mock_db.refresh.assert_called_once_with(added_round)
+        mock_db.expunge.assert_called_once_with(added_round)
+        mock_db.rollback.assert_called_once()
 
     def test_create_resume_round_persists_interrupt_resolution(self, history_service, mock_db):
         """resume round 应同事务记录结构化 ask_user resolution。"""
@@ -121,7 +125,7 @@ class TestHistoryServiceRound:
         assert added_resolution.tool_result_content == "User answered:\n- Confirm?: yes"
         assert added_resolution.restore_strategy == "hot_replace"
         mock_db.commit.assert_called_once()
-        mock_db.rollback.assert_not_called()
+        mock_db.rollback.assert_called_once()
 
     def test_create_resume_round_persists_fallback_without_tool_call_id(self, history_service, mock_db):
         """tool_call_id 缺失时仍应记录 resolution 与 fallback 原因。"""
@@ -166,7 +170,11 @@ class TestHistoryServiceRound:
     def test_create_resume_round_rejects_duplicate_interrupt_resolution(self, history_service, mock_db):
         """同一 interrupt 不应被并发 resume 成多个 child round。"""
         mock_db.query.return_value.filter.return_value.update.return_value = 1
-        mock_db.commit.side_effect = IntegrityError("INSERT", {}, Exception("UNIQUE constraint"))
+        mock_db.commit.side_effect = IntegrityError(
+            "INSERT",
+            {},
+            Exception("UNIQUE constraint failed: interrupt_resolutions.interrupt_id"),
+        )
 
         with pytest.raises(ValueError, match="Interrupt already resumed: interrupt-1"):
             history_service.create_resume_round(
@@ -200,7 +208,7 @@ class TestHistoryServiceRound:
 
         mock_db.add.assert_not_called()
         mock_db.commit.assert_not_called()
-        mock_db.rollback.assert_called_once()
+        assert mock_db.rollback.call_count == 2
 
     def test_complete_round(self, history_service, mock_db):
         """測試完成 Round"""
@@ -252,7 +260,11 @@ class TestHistoryServiceRound:
             )
 
             assert result.status == terminal, f"终态 {terminal} 不应被覆写"
+            mock_db.expunge.assert_called_once_with(mock_round)
+            mock_db.rollback.assert_called_once()
             mock_db.commit.reset_mock()
+            mock_db.expunge.reset_mock()
+            mock_db.rollback.reset_mock()
 
     def test_complete_round_backfills_resumed_interrupt_metadata(self, history_service, mock_db):
         """resume 抢先标记旧 round 后，迟到的 interrupted 完成仍可补写展示元数据。"""
@@ -279,6 +291,17 @@ class TestHistoryServiceRound:
         assert result.completed_at is not None
         mock_db.commit.assert_called_once()
         mock_db.refresh.assert_called_once_with(mock_round)
+        mock_db.expunge.assert_called_once_with(mock_round)
+        mock_db.rollback.assert_called_once()
+
+    def test_get_round_status_releases_read_transaction(self, history_service, mock_db):
+        """只读查询 round 状态后应立即结束事务，避免 PG idle-in-transaction。"""
+        mock_db.query.return_value.filter.return_value.first.return_value = ("running",)
+
+        result = history_service.get_round_status("round-456")
+
+        assert result == "running"
+        mock_db.rollback.assert_called_once()
 
 
 class TestHistoryServiceGetSessionRounds:
@@ -531,6 +554,8 @@ class TestHistoryServiceLLMCallRecord:
         assert row.compaction_emergency_truncate_dropped_rounds == 0
         mock_db.commit.assert_called_once()
         mock_db.refresh.assert_called_once_with(row)
+        mock_db.expunge.assert_called_once_with(row)
+        mock_db.rollback.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_save_llm_call_record_counts_provider_snapshot_messages(self, history_service, mock_db):

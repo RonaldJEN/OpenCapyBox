@@ -146,6 +146,7 @@ describe('APIService', () => {
         });
 
       const callbacks = {
+        onStreamAccepted: vi.fn(),
         onRunError: vi.fn(),
       };
 
@@ -160,6 +161,64 @@ describe('APIService', () => {
 
       expect(subscribeSpy).toHaveBeenCalledTimes(3);
       expect(callbacks.onRunError).not.toHaveBeenCalled();
+    });
+
+    it('sendMessageStreamV2 在响应通过后应触发 onStreamAccepted', async () => {
+      const encoder = new TextEncoder();
+      const reader = {
+        read: vi
+          .fn()
+          .mockResolvedValueOnce({
+            done: false,
+            value: encoder.encode('data: {"type":"RUN_FINISHED","threadId":"session-1","runId":"run-1","result":{},"outcome":"success"}\n\n'),
+          })
+          .mockResolvedValueOnce({ done: true, value: undefined }),
+      };
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        body: {
+          getReader: () => reader,
+        },
+      }));
+
+      const callbacks = {
+        onStreamAccepted: vi.fn(),
+        onRunFinished: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      await apiService.sendMessageStreamV2(
+        'session-1',
+        [{ type: 'text', text: 'hello' }],
+        callbacks,
+      );
+
+      expect(callbacks.onStreamAccepted).toHaveBeenCalledOnce();
+      expect(callbacks.onRunFinished).toHaveBeenCalledOnce();
+      expect(callbacks.onRunError).not.toHaveBeenCalled();
+    });
+
+    it('sendMessageStreamV2 被 429 拒绝时不应触发 onStreamAccepted', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        text: vi.fn().mockResolvedValue('{"detail":"当前有正在运行的任务"}'),
+      }));
+
+      const callbacks = {
+        onStreamAccepted: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      await apiService.sendMessageStreamV2(
+        'session-1',
+        [{ type: 'text', text: 'hello' }],
+        callbacks,
+      );
+
+      expect(callbacks.onStreamAccepted).not.toHaveBeenCalled();
+      expect(callbacks.onRunError).toHaveBeenCalledWith('当前有正在运行的任务', 'USER_BUSY');
     });
 
     it('resumeStream 在未收到终态事件时应 reject', async () => {
@@ -182,6 +241,7 @@ describe('APIService', () => {
       }));
 
       const callbacks = {
+        onStreamAccepted: vi.fn(),
         onRunError: vi.fn(),
       };
 
@@ -189,6 +249,7 @@ describe('APIService', () => {
         apiService.resumeStream('session-1', 'interrupt-1', { Q: 'A' }, callbacks),
       ).rejects.toThrow('Resume stream ended without terminal event');
 
+      expect(callbacks.onStreamAccepted).toHaveBeenCalledOnce();
       expect(callbacks.onRunError).toHaveBeenCalledTimes(1);
       expect(callbacks.onRunError).toHaveBeenCalledWith('Resume stream ended without terminal event');
     });

@@ -9,7 +9,7 @@ import CronSchedule from './components/CronSchedule';
 import SkillManager from './components/SkillManager';
 import { apiService } from './services/api';
 import { getUnreadCount } from './services/configApi';
-import type { ModelInfo } from './types';
+import type { ModelInfo, RunningSessionInfo } from './types';
 
 type ConfigPanel = 'config' | 'skills' | 'cron' | null;
 type SessionScrollTarget = {
@@ -18,11 +18,18 @@ type SessionScrollTarget = {
   nonce: number;
 };
 
+const RUNNING_SESSIONS_RECONCILE_INTERVAL_MS = 5000;
+
+const sameStringSet = (left: Set<string>, right: Set<string>) => (
+  left.size === right.size && Array.from(left).every((item) => right.has(item))
+);
+
 // 主页面组件
 function HomePage() {
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const [executingSessionId, setExecutingSessionId] = useState<string | null>(null);
+  const [executingSessionIds, setExecutingSessionIds] = useState<Set<string>>(() => new Set());
+  const [activeSlotSessionIds, setActiveSlotSessionIds] = useState<Set<string>>(() => new Set());
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [selectedModelId, setSelectedModelId] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
@@ -72,7 +79,18 @@ function HomePage() {
 
   // 执行状态回调
   const handleExecutionStart = (sessionId: string) => {
-    setExecutingSessionId(sessionId);
+    setExecutingSessionIds((prev) => {
+      if (prev.has(sessionId)) return prev;
+      const next = new Set(prev);
+      next.add(sessionId);
+      return next;
+    });
+    setActiveSlotSessionIds((prev) => {
+      if (prev.has(sessionId)) return prev;
+      const next = new Set(prev);
+      next.add(sessionId);
+      return next;
+    });
   };
 
   const handleSessionSelect = (sessionId: string, target?: { roundId: string }) => {
@@ -89,21 +107,72 @@ function HomePage() {
   };
 
   const handleExecutionEnd = (sessionId?: string) => {
-    // 如果传了 sessionId，只在匹配时清除（避免切换会话时误清其他正在运行的会话）
     if (sessionId) {
-      setExecutingSessionId((prev) => (prev === sessionId ? null : prev));
+      setExecutingSessionIds((prev) => {
+        if (!prev.has(sessionId)) return prev;
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
+      setActiveSlotSessionIds((prev) => {
+        if (!prev.has(sessionId)) return prev;
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
     } else {
-      setExecutingSessionId(null);
+      setExecutingSessionIds(new Set());
+      setActiveSlotSessionIds(new Set());
     }
   };
 
+  const reconcileRunningSessions = useCallback(async () => {
+    try {
+      const result = await apiService.getRunningSessions();
+      const nextSessionIds = new Set(result.running_sessions.map((item) => item.session_id));
+
+      setExecutingSessionIds((prev) => (
+        sameStringSet(prev, nextSessionIds) ? prev : new Set(nextSessionIds)
+      ));
+      setActiveSlotSessionIds((prev) => (
+        sameStringSet(prev, nextSessionIds) ? prev : new Set(nextSessionIds)
+      ));
+    } catch (error) {
+      console.error('Failed to reconcile running sessions:', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      void reconcileRunningSessions();
+    }, RUNNING_SESSIONS_RECONCILE_INTERVAL_MS);
+
+    return () => clearInterval(timer);
+  }, [reconcileRunningSessions]);
+
   // 🆕 处理检测到运行中会话的回调
-  const handleRunningSessionDetected = (sessionId: string) => {
-    console.log(`🔄 自动选择运行中的会话: ${sessionId}`);
-    setExecutingSessionId(sessionId);
-    // 自动选择该会话，让用户能看到运行状态
+  const handleRunningSessionsDetected = (runningSessions: RunningSessionInfo[]) => {
+    const sessionIds = runningSessions.map((item) => item.session_id);
+    if (sessionIds.length === 0) return;
+
+    console.log(`🔄 检测到运行中的会话: ${sessionIds.join(', ')}`);
+    setExecutingSessionIds((prev) => {
+      const next = new Set(prev);
+      for (const sessionId of sessionIds) {
+        next.add(sessionId);
+      }
+      return next;
+    });
+    setActiveSlotSessionIds((prev) => {
+      const next = new Set(prev);
+      for (const sessionId of sessionIds) {
+        next.add(sessionId);
+      }
+      return next;
+    });
+    // 自动选择第一个运行中会话，让用户能看到运行状态
     if (!currentSessionId) {
-      setCurrentSessionId(sessionId);
+      setCurrentSessionId(sessionIds[0]);
     }
   };
 
@@ -122,8 +191,8 @@ function HomePage() {
         currentSessionId={currentSessionId}
         onSessionSelect={handleSessionSelect}
         refreshTrigger={refreshTrigger}
-        executingSessionId={executingSessionId}
-        onRunningSessionDetected={handleRunningSessionDetected}
+        executingSessionIds={executingSessionIds}
+        onRunningSessionsDetected={handleRunningSessionsDetected}
         isCollapsed={isSidebarCollapsed}
         onModelChange={setSelectedModelId}
         onNewChat={() => {
@@ -158,6 +227,7 @@ function HomePage() {
         availableModels={availableModels}
         onCreateSession={handleCreateSessionForChat}
         scrollTarget={sessionScrollTarget}
+        activeSlotSessionIds={activeSlotSessionIds}
       />
       {/* Config panel overlay drawer */}
       {panelMounted && (

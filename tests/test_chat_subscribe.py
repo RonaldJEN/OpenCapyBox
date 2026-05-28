@@ -7,6 +7,25 @@ import asyncio
 from tests.helpers import make_mock_round
 
 
+class TestRequestDbReadTransactions:
+    def test_has_cancel_activity_since_releases_read_transaction(self):
+        from src.api.routes.chat import _has_cancel_activity_since
+        from src.api.utils.timezone import now_naive
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+
+        result = _has_cancel_activity_since(
+            mock_db,
+            user_id="user-1",
+            session_id="session-1",
+            started_at=now_naive(),
+        )
+
+        assert result is False
+        mock_db.rollback.assert_called_once()
+
+
 class TestRoundSubscribersManagement:
     """轮次订阅者管理测试"""
 
@@ -790,6 +809,7 @@ class TestSseDetachedProducer:
         service.history_service = mock_history
         service.session_id = "test-session"
         service.cancel_token = None
+        service._active_run_count = 0
         service.agent = MagicMock()
 
         # 模拟 agent.run_agui 只产出 RUN_STARTED 就被关闭（模拟断线）
@@ -841,6 +861,7 @@ class TestSseDetachedProducer:
         service.history_service = mock_history
         service.session_id = "test-session"
         service.cancel_token = None
+        service._active_run_count = 0
         service.agent = MagicMock()
 
         async def fake_run_agui(**kwargs):
@@ -875,6 +896,7 @@ class TestSseDetachedProducer:
         service.session_id = "test-session"
         service.cancel_token = asyncio.Event()
         service.cancel_token.set()
+        service._active_run_count = 0
         service.agent = MagicMock()
 
         from src.agent.schema.agui_events import RunStartedEvent
@@ -926,6 +948,7 @@ class TestSseDetachedProducer:
         service.history_service = mock_history
         service.session_id = "test-session"
         service.cancel_token = None
+        service._active_run_count = 0
         service.agent = MagicMock()
         service._last_saved_index = 0
         service._pending_interrupt_round_ids = {}
@@ -1168,6 +1191,7 @@ class TestSubscribeCrossWorkerPolling:
 
         assert any("RUN_FINISHED" in c for c in chunks)
         assert replay_calls["count"] >= 1
+        mock_db.rollback.assert_called_once()
 
 
 class TestSubscriberAbortScenarios:
@@ -1784,6 +1808,7 @@ class TestUserCancelledRoundStatus:
         service.history_service = mock_history
         service.session_id = "test-session"
         service.cancel_token = None
+        service._active_run_count = 0
         service.agent = MagicMock()
         service._last_saved_index = 0
 
@@ -1832,6 +1857,7 @@ class TestUserCancelledRoundStatus:
         service.history_service = mock_history
         service.session_id = "test-session"
         service.cancel_token = None
+        service._active_run_count = 0
         service.agent = MagicMock()
         service._last_saved_index = 0
         service._pending_interrupt_round_ids = {}

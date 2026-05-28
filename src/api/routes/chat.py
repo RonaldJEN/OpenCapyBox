@@ -252,15 +252,18 @@ def _has_cancel_activity_since(
     started_at: datetime,
 ) -> bool:
     """檢查 run 啟動後是否發生過 cancel 活動。"""
-    row = (
-        db.query(RunCancelRequest)
-        .filter(
-            RunCancelRequest.session_id == session_id,
-            RunCancelRequest.user_id == user_id,
+    try:
+        row = (
+            db.query(RunCancelRequest)
+            .filter(
+                RunCancelRequest.session_id == session_id,
+                RunCancelRequest.user_id == user_id,
+            )
+            .first()
         )
-        .first()
-    )
-    return _cancel_row_touched_after(row=row, started_at=started_at)
+        return _cancel_row_touched_after(row=row, started_at=started_at)
+    finally:
+        db.rollback()
 
 
 async def _cancel_request_watcher(
@@ -440,126 +443,141 @@ def _format_datetime(value: datetime | None) -> str | None:
     return value.isoformat()
 
 async def _acquire_user_run_lock(*, user_id: str, session_id: str) -> str | None:
-    """嘗試獲取用戶運行鎖（跨 worker）。
+    """嘗試獲取用戶運行 slot（跨 worker）。
 
     使用獨立 DB Session，避免 rollback 污染請求級 Session 中已載入的 ORM 物件。
-    返回 lock_id 表示獲取成功；返回 None 表示已有運行中的任務。
+    返回 lock_id 表示獲取成功；返回 None 表示同 session 已在跑或用户并发已达上限。
     """
     settings = get_settings()
     stale_threshold_seconds = max(settings.sse_subscribe_timeout, 1)
+    concurrency_limit = max(int(getattr(settings, "agent_user_concurrency_limit", 1) or 1), 1)
     max_busy_retries = 5
     retry_interval_seconds = 0.1
 
     with SessionLocal() as lock_db:
-        async def _try_insert_lock(lock_id: str) -> str | None:
-            for attempt in range(max_busy_retries):
-                try:
-                    lock_db.execute(
-                        insert(UserRunLock).values(
-                            user_id=user_id,
-                            session_id=session_id,
-                            lock_id=lock_id,
-                        )
-                    )
-                    lock_db.commit()
-                    return lock_id
-                except IntegrityError:
-                    lock_db.rollback()
-                    return None
-                except OperationalError as exc:
-                    lock_db.rollback()
-                    if not _is_sqlite_locked_error(exc):
-                        raise
-                    if attempt + 1 < max_busy_retries:
-                        await asyncio.sleep(retry_interval_seconds)
-                        continue
-                    logger.warning(
-                        "獲取用戶運行鎖遇到 SQLite 寫鎖衝突: user=%s session=%s",
-                        user_id,
-                        session_id,
-                        exc_info=True,
-                    )
-                    return None
-                except Exception:
-                    lock_db.rollback()
-                    raise
-            return None
+        def _lock_age_seconds(lock: UserRunLock) -> float:
+            heartbeat_at = lock.updated_at or lock.created_at
+            return (now_naive() - heartbeat_at).total_seconds()
 
-        acquired_lock_id = await _try_insert_lock(str(uuid.uuid4()))
-        if acquired_lock_id:
-            return acquired_lock_id
-
-        # 主鍵衝突：可能是另一個 worker 正在運行，也可能是崩潰遺留的陳舊鎖。
-        try:
-            existing_lock = lock_db.query(UserRunLock).filter(UserRunLock.user_id == user_id).first()
-        except OperationalError as exc:
-            lock_db.rollback()
-            if _is_sqlite_locked_error(exc):
+        def _delete_stale_locks() -> list[str]:
+            locks = (
+                lock_db.query(UserRunLock)
+                .filter(UserRunLock.user_id == user_id)
+                .all()
+            )
+            stale_session_ids: list[str] = []
+            for lock in locks:
+                age = _lock_age_seconds(lock)
+                if age < stale_threshold_seconds:
+                    continue
                 logger.warning(
-                    "查詢用戶運行鎖遇到 SQLite 鎖衝突: user=%s session=%s",
+                    "檢測到陳舊用戶運行鎖（心跳 %.1fs 前），回收: user=%s session=%s lock=%s slot=%s",
+                    age,
+                    user_id,
+                    lock.session_id,
+                    lock.lock_id,
+                    lock.slot,
+                )
+                stale_session_ids.append(lock.session_id)
+                lock_db.delete(lock)
+            if stale_session_ids:
+                lock_db.commit()
+            return stale_session_ids
+
+        for attempt in range(max_busy_retries):
+            try:
+                stale_session_ids = _delete_stale_locks()
+                for stale_session_id in stale_session_ids:
+                    try:
+                        _cleanup_orphaned_rounds(
+                            lock_db,
+                            user_id=user_id,
+                            session_id=stale_session_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "清理孤兒 round 失敗: user=%s session=%s",
+                            user_id,
+                            stale_session_id,
+                            exc_info=True,
+                        )
+
+                active_locks = (
+                    lock_db.query(UserRunLock)
+                    .filter(UserRunLock.user_id == user_id)
+                    .all()
+                )
+                if any(lock.session_id == session_id for lock in active_locks):
+                    return None
+                if len(active_locks) >= concurrency_limit:
+                    return None
+
+                occupied_slots = {lock.slot for lock in active_locks}
+                free_slot = next(
+                    slot
+                    for slot in range(concurrency_limit)
+                    if slot not in occupied_slots
+                )
+                lock_id = str(uuid.uuid4())
+                lock_db.execute(
+                    insert(UserRunLock).values(
+                        user_id=user_id,
+                        session_id=session_id,
+                        lock_id=lock_id,
+                        slot=free_slot,
+                    )
+                )
+                lock_db.commit()
+                return lock_id
+            except IntegrityError:
+                lock_db.rollback()
+                if attempt + 1 < max_busy_retries:
+                    await asyncio.sleep(retry_interval_seconds)
+                    continue
+                return None
+            except OperationalError as exc:
+                lock_db.rollback()
+                if not _is_sqlite_locked_error(exc):
+                    raise
+                if attempt + 1 < max_busy_retries:
+                    await asyncio.sleep(retry_interval_seconds)
+                    continue
+                logger.warning(
+                    "獲取用戶運行鎖遇到 SQLite 寫鎖衝突: user=%s session=%s",
                     user_id,
                     session_id,
                     exc_info=True,
                 )
                 return None
-            raise
-        if not existing_lock:
-            return await _try_insert_lock(str(uuid.uuid4()))
-
-        # 用 updated_at（心跳時間）判斷 worker 是否存活。
-        # _cancel_request_watcher 定期刷新 lock.updated_at（間隔 sse_heartbeat_interval），
-        # 所以 updated_at 陳舊 = worker 已死（而非用 created_at 猜測）。
-        lock_heartbeat_age = (now_naive() - existing_lock.updated_at).total_seconds()
-        if lock_heartbeat_age < stale_threshold_seconds:
-            return None
-
-        # 心跳已過期，worker 很可能已死。直接回收陳舊鎖。
-        # 使用 user_id + lock_id 精確刪除，避免 TOCTOU 窗口誤刪新鎖。
-        stale_lock_id = existing_lock.lock_id
-        logger.warning(
-            "檢測到陳舊用戶鎖（心跳 %.1fs 前），回收: user=%s session=%s lock=%s",
-            lock_heartbeat_age, user_id, existing_lock.session_id, stale_lock_id,
-        )
-        try:
-            deleted = (
-                lock_db.query(UserRunLock)
-                .filter(
-                    UserRunLock.user_id == user_id,
-                    UserRunLock.lock_id == stale_lock_id,
-                )
-                .delete(synchronize_session=False)
-            )
-            if deleted != 1:
+            except Exception:
                 lock_db.rollback()
-                return None
-            lock_db.commit()
-        except Exception:
-            lock_db.rollback()
-            return None
-
-        # 回收陳舊鎖後，連帶清理遺留的 running round（避免永久卡死）
-        try:
-            _cleanup_orphaned_rounds(lock_db, user_id=user_id)
-        except Exception:
-            logger.warning("清理孤兒 round 失敗: user=%s", user_id, exc_info=True)
-
-        return await _try_insert_lock(str(uuid.uuid4()))
+                raise
+        return None
 
 
-def _cleanup_orphaned_rounds(db: DBSession, *, user_id: str) -> int:
-    """將用戶所有 running round 標記為 cancelled（用於 worker 崩潰後回收）。
+def _cleanup_orphaned_rounds(
+    db: DBSession,
+    *,
+    user_id: str,
+    session_id: str | None = None,
+) -> int:
+    """將已失去心跳鎖的 running round 標記為 cancelled（用於 worker 崩潰後回收）。
 
-    只在鎖心跳已過期且鎖被回收後調用 — 此時可確定原 worker 已死。
+    只在鎖心跳已過期且鎖被回收後調用 — 此時可確定該 session 的原 worker 已死。
     """
-    user_session_ids_stmt = select(Session.id).where(Session.user_id == user_id)
+    if session_id is not None:
+        session_filter = or_(Round.session_id == session_id, Round.thread_id == session_id)
+    else:
+        user_session_ids_stmt = select(Session.id).where(Session.user_id == user_id)
+        session_filter = or_(
+            Round.session_id.in_(user_session_ids_stmt),
+            Round.thread_id.in_(user_session_ids_stmt),
+        )
     orphaned_rounds = (
         db.query(Round)
         .filter(
             Round.status == "running",
-            or_(
-                Round.session_id.in_(user_session_ids_stmt),
-                Round.thread_id.in_(user_session_ids_stmt),
-            ),
+            session_filter,
         )
         .all()
     )
@@ -635,15 +653,33 @@ async def _release_user_run_lock(
             query = query.filter(UserRunLock.lock_id == lock_id)
         elif session_id is not None:
             query = query.filter(UserRunLock.session_id == session_id)
+        else:
+            query.delete(synchronize_session=False)
+            db.commit()
+            return True
 
         lock_row = query.first()
         if not lock_row:
-            # 带过滤条件时：锁可能存在但不匹配（属于其他 session/lock_id），应返回 False
-            if lock_id is not None or session_id is not None:
+            # 同 session 已被新 lock_id 占用时，旧 owner 不能宣称释放成功。
+            # 其他 session 的 slot 与本次释放目标无关。
+            if session_id is not None:
+                same_session_lock = (
+                    db.query(UserRunLock)
+                    .filter(
+                        UserRunLock.user_id == user_id,
+                        UserRunLock.session_id == session_id,
+                    )
+                    .first()
+                )
+                db.rollback()
+                return same_session_lock is None
+            if lock_id is not None:
                 any_lock = db.query(UserRunLock).filter(UserRunLock.user_id == user_id).first()
+                db.rollback()
                 if any_lock:
                     return False
             # 锁确实不存在，视为已释放
+            db.rollback()
             return True
 
         db.delete(lock_row)
@@ -992,9 +1028,10 @@ async def _acquire_lock_and_clear_cancel(
         logger.error("獲取用戶運行鎖時發生異常: user=%s session=%s", user_id, session_id, exc_info=True)
         raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
     if not lock_id:
+        limit = max(int(getattr(get_settings(), "agent_user_concurrency_limit", 1) or 1), 1)
         raise HTTPException(
             status_code=429,
-            detail="当前有正在运行的任务，请等待完成后再发送新消息",
+            detail=f"当前有正在运行的任务，运行任务数已达上限（{limit}），请等待完成后再发送新消息",
         )
 
     # 清理旧 run 遗留的取消请求，避免新 run 被陈旧 requested 误杀
@@ -1237,39 +1274,46 @@ async def resume_interrupt(
 
     enforce_token_limits(db, user_id=user_id)
 
-    # 获取 Agent Service
-    agent_pool = get_agent_pool()
-    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
-    user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
-
-    try:
-        agent_service = await agent_pool.get_or_create(
-            user_id=user_id,
-            session_id=user_id,
-            chat_session_id=chat_session_id,
-            db=db,
-            model_id=session.model_id,
-            sandbox_id=user_sandbox_id,
-        )
-    except Exception as e:
-        logger.error("Agent 获取失败: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail="Agent 获取失败，请稍后重试")
-
-    # 验证中断状态
-    if not agent_service.has_pending_interrupt(request.interrupt_id):
-        raise HTTPException(status_code=409, detail="没有待处理的中断（可能已过期或已恢复），或中断 ID 不匹配")
-
-    # 用戶級並發限制 + 清理遺留取消請求
+    # 用戶級並發限制 + 清理遺留取消請求。必须先拿 slot，再触碰 cached Agent。
     lock_id = await _acquire_lock_and_clear_cancel(db, user_id=user_id, session_id=chat_session_id)
     run_guard_started_at = now_naive()
 
-    # 创建 per-run 取消令牌
-    cancel_token = asyncio.Event()
-    agent_service.cancel_token = cancel_token
+    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+    user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+    model_id = session.model_id
 
     async def event_generator():
         _entered_sse = False  # 追蹤是否已進入 _sse_with_heartbeat（producer 負責清理用戶鎖）
+        settings = get_settings()
+        init_task = _start_agent_init(
+            user_id=user_id,
+            chat_session_id=chat_session_id,
+            db=db,
+            model_id=model_id,
+            sandbox_id=user_sandbox_id,
+        )
         try:
+            try:
+                while not init_task.done():
+                    done, _ = await asyncio.wait({init_task}, timeout=settings.sse_heartbeat_interval)
+                    if not done:
+                        yield event_encoder.encode(CustomEvent(
+                            name="heartbeat",
+                            value={"timestamp": int(datetime.now().timestamp() * 1000)},
+                        ))
+
+                agent_service = _resolve_agent_init(init_task)
+            except _AgentInitFailed as e:
+                yield event_encoder.encode(RunErrorEvent(message=str(e), code="AGENT_INIT_FAILED"))
+                return
+            finally:
+                if not init_task.done():
+                    init_task.cancel()
+                    try:
+                        await init_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
             if _has_cancel_activity_since(
                 db,
                 user_id=user_id,
@@ -1283,12 +1327,18 @@ async def resume_interrupt(
                 )
                 yield event_encoder.encode(RunErrorEvent(message="Aborted by user", code="USER_ABORT"))
                 await _complete_cancel_request_in_new_session(user_id=user_id, session_id=chat_session_id)
-                await _release_user_run_lock_in_new_session(
-                    user_id=user_id,
-                    lock_id=lock_id,
-                    session_id=chat_session_id,
-                )
                 return
+
+            if not agent_service.has_pending_interrupt(request.interrupt_id):
+                yield event_encoder.encode(RunErrorEvent(
+                    message="没有待处理的中断（可能已过期或已恢复），或中断 ID 不匹配",
+                    code="NO_PENDING_INTERRUPT",
+                ))
+                return
+
+            # 创建 per-run 取消令牌
+            cancel_token = asyncio.Event()
+            agent_service.cancel_token = cancel_token
 
             # 先構造 event_source，若 resume_agui 拋異常則 _entered_sse 仍為 False → finally 會釋放鎖
             event_source = agent_service.resume_agui(
@@ -1531,9 +1581,12 @@ async def subscribe_to_round(
                     has_run_finished_in_replay=has_run_finished_in_replay,
                 )
                 if handled:
+                    db.rollback()
                     for terminal_chunk in terminal_chunks:
                         yield terminal_chunk
                 return
+
+            db.rollback()
 
             # === 3. 輪次仍在運行，註冊為訂閱者 ===
             with _round_subscribers_lock:
@@ -1673,7 +1726,7 @@ async def abort_chat(
         raise HTTPException(status_code=404, detail="會話不存在")
 
     settings = get_settings()
-    stale_threshold = max(settings.sse_heartbeat_interval * 3, 1)
+    stale_threshold = max(settings.sse_subscribe_timeout, 1)
 
     # 取消可在兩種情況發起：
     # 1) 已有 running round
@@ -1758,7 +1811,7 @@ async def abort_chat(
         except Exception:
             logger.warning("等待本地 runner 結束異常，回退為異步取消: session=%s", chat_session_id, exc_info=True)
 
-    # 若有 running round，立即收斂為 cancelled，避免前端與 running-session 視圖回跳。
+    # 若有 running round，立即收斂為 cancelled，避免前端與 running-sessions 視圖回跳。
     if running_round:
         running_round.status = "cancelled"
         running_round.final_response = running_round.final_response or "Aborted by user"
@@ -1813,7 +1866,11 @@ async def abort_chat(
 
     # 立即釋放該會話鎖（如果存在），允許用戶立刻重發。
     if user_lock_id:
-        released = await _release_user_run_lock_in_new_session(user_id=user_id, lock_id=user_lock_id)
+        released = await _release_user_run_lock_in_new_session(
+            user_id=user_id,
+            lock_id=user_lock_id,
+            session_id=chat_session_id,
+        )
         if not released:
             logger.error(
                 "abort 收斂完成但釋放鎖失敗，拒絕返回 cancelled: user=%s session=%s lock_id=%s",

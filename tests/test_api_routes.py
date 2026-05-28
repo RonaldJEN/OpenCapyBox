@@ -231,6 +231,124 @@ class TestSessionsRouter:
             status="completed",
         ))
 
+    def _add_running_round(self, db, session_id: str, *, round_id: str):
+        from src.api.models.round import Round
+
+        db.add(Round(
+            id=round_id,
+            session_id=session_id,
+            thread_id=session_id,
+            user_message="running",
+            status="running",
+        ))
+
+    def _add_user_run_lock(
+        self,
+        db,
+        session_id: str,
+        *,
+        lock_id: str,
+        slot: int,
+        user_id: str = "user-1",
+        updated_at=None,
+    ):
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.utils.timezone import now_naive
+
+        timestamp = updated_at or now_naive()
+        db.add(UserRunLock(
+            user_id=user_id,
+            session_id=session_id,
+            lock_id=lock_id,
+            slot=slot,
+            created_at=timestamp,
+            updated_at=timestamp,
+        ))
+
+    def test_get_running_sessions_returns_all_user_slots(self, sessions_client):
+        from src.api.utils.timezone import now_naive
+
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "session-a")
+            self._add_session(db, "session-b")
+            self._add_session(db, "other-user-session", user_id="user-2")
+            self._add_user_run_lock(
+                db,
+                "session-a",
+                lock_id="lock-a",
+                slot=0,
+                updated_at=now_naive() - timedelta(seconds=1),
+            )
+            self._add_user_run_lock(
+                db,
+                "session-b",
+                lock_id="lock-b",
+                slot=1,
+                updated_at=now_naive(),
+            )
+            self._add_user_run_lock(
+                db,
+                "other-user-session",
+                lock_id="lock-other",
+                slot=0,
+                user_id="user-2",
+            )
+            self._add_running_round(db, "session-a", round_id="round-a")
+            self._add_running_round(db, "session-b", round_id="round-b")
+            db.commit()
+
+        response = sessions_client.get("/sessions/running-sessions")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "running_sessions": [
+                {"session_id": "session-b", "round_id": "round-b"},
+                {"session_id": "session-a", "round_id": "round-a"},
+            ],
+        }
+
+    def test_get_running_sessions_includes_init_window_lock_without_round(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "session-init")
+            self._add_user_run_lock(db, "session-init", lock_id="lock-init", slot=0)
+            db.commit()
+
+        response = sessions_client.get("/sessions/running-sessions")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "running_sessions": [
+                {"session_id": "session-init", "round_id": None},
+            ],
+        }
+
+    def test_get_running_sessions_excludes_stale_locks(self, sessions_client):
+        from src.api.utils.timezone import now_naive
+
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "session-stale")
+            self._add_session(db, "session-fresh")
+            self._add_user_run_lock(
+                db,
+                "session-stale",
+                lock_id="lock-stale",
+                slot=0,
+                updated_at=now_naive() - timedelta(seconds=600),
+            )
+            self._add_user_run_lock(db, "session-fresh", lock_id="lock-fresh", slot=1)
+            self._add_running_round(db, "session-stale", round_id="round-stale")
+            self._add_running_round(db, "session-fresh", round_id="round-fresh")
+            db.commit()
+
+        response = sessions_client.get("/sessions/running-sessions")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "running_sessions": [
+                {"session_id": "session-fresh", "round_id": "round-fresh"},
+            ],
+        }
+
     def test_list_sessions_without_query_preserves_existing_behavior(self, sessions_client):
         with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
             self._add_session(db, "older", updated_at=datetime(2026, 5, 14, 10, 0, 0))
@@ -1555,11 +1673,16 @@ class TestAbortEndpoint:
         assert response.json()["reason"] == "force_aborted"
         mock_broadcast.assert_awaited_once()
         assert mock_broadcast.await_args.args[0] == "round-1"
-        mock_release.assert_awaited_once_with(user_id="testuser", lock_id="lock-1")
+        mock_release.assert_awaited_once_with(
+            user_id="testuser",
+            lock_id="lock-1",
+            session_id="session-1",
+        )
 
     @patch("src.api.routes.chat.get_agent_pool")
-    def test_abort_init_window_with_recent_lock_returns_200(self, mock_pool_fn, client):
-        """无 running round 但持有近期会话锁（init 窗口）也应允许发起取消。"""
+    def test_abort_init_window_with_lock_within_subscribe_timeout_returns_200(self, mock_pool_fn, client):
+        """无 running round 但会话锁未超过 subscribe timeout 时也应允许发起取消。"""
+        from datetime import timedelta
         from src.api.models.session import Session as SessionModel
         from src.api.models.round import Round as RoundModel
         from src.api.models.user_run_lock import UserRunLock as UserRunLockModel
@@ -1574,7 +1697,7 @@ class TestAbortEndpoint:
         mock_lock.user_id = "testuser"
         mock_lock.session_id = "session-1"
         mock_lock.lock_id = "lock-init-window"
-        mock_lock.updated_at = now_naive()
+        mock_lock.updated_at = now_naive() - timedelta(seconds=120)
 
         def query_side_effect(model):
             chain = MagicMock()
@@ -1607,8 +1730,8 @@ class TestAbortEndpoint:
         assert response.json()["request_id"] == "req-init-window"
 
     @patch("src.api.routes.chat.get_agent_pool")
-    def test_abort_worker_dead_uses_three_times_heartbeat_threshold(self, mock_pool_fn, client):
-        """worker_dead 判定应基于 3x heartbeat，而非 sse_subscribe_timeout。"""
+    def test_abort_worker_dead_uses_subscribe_timeout_threshold(self, mock_pool_fn, client):
+        """worker_dead 判定应与 stale lock 回收一致，基于 sse_subscribe_timeout。"""
         from datetime import timedelta
         from src.api.models.session import Session as SessionModel
         from src.api.models.round import Round as RoundModel
@@ -1624,11 +1747,9 @@ class TestAbortEndpoint:
         mock_round = MagicMock()
         mock_round.id = "round-1"
 
-        # 120s > 3 * 15s(heartbeat)，但 < 300s(subscribe_timeout)
-        # 若误用 subscribe_timeout 判定则不会进入 worker_dead。
         mock_lock = MagicMock()
-        mock_lock.updated_at = now_naive() - timedelta(seconds=120)
-        mock_lock.lock_id = "lock-stale-by-heartbeat"
+        mock_lock.updated_at = now_naive() - timedelta(seconds=360)
+        mock_lock.lock_id = "lock-stale-by-subscribe-timeout"
 
         def query_side_effect(model):
             chain = MagicMock()

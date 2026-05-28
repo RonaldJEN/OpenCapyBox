@@ -12,7 +12,7 @@ vi.mock('../../services/api', () => ({
     getSessionFiles: vi.fn(),
     sendMessageStreamV2: vi.fn(),
     uploadFile: vi.fn(),
-    getRunningSession: vi.fn(),
+    getRunningSessions: vi.fn(),
     createSession: vi.fn(),
     getUserId: vi.fn(() => 'demo-session'),
   },

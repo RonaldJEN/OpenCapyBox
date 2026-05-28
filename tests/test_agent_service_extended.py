@@ -75,13 +75,49 @@ class TestAgentServiceRestoreHistory:
         service._restore_history()
 
         assert len(service.agent.messages) == 0
+        history_service.reset_session.assert_called_once()
 
     def test_restore_history_no_agent(self):
         service = make_agent_service()
         service._restore_history()  # should not raise
 
+    def test_load_persisted_interrupt_releases_read_transaction(self):
+        history_service = MagicMock()
+        mock_db = MagicMock()
+        round_row = MagicMock()
+        round_row.id = "round-1"
+        round_row.interrupt_payload = '{"id":"interrupt-1","payload":{"tool_call_id":"tc-1","questions":[{"text":"ok?"}]}}'
+        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [round_row]
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service)
+        service.session_id = "session-123"
+
+        result = service._load_persisted_interrupt("interrupt-1")
+
+        assert result == {
+            "interrupt_id": "interrupt-1",
+            "round_id": "round-1",
+            "tool_call_id": "tc-1",
+            "questions": [{"text": "ok?"}],
+        }
+        mock_db.rollback.assert_called_once()
+
 
 class TestSummaryAnchorPersistence:
+    def test_latest_persisted_summary_anchor_releases_read_transaction(self):
+        history_service = MagicMock()
+        mock_db = MagicMock()
+        row = MagicMock()
+        row.content = "summary-v1"
+        mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = row
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service)
+
+        assert service._latest_persisted_summary_anchor_content() == "summary-v1"
+        mock_db.rollback.assert_called_once()
+
     def test_persist_latest_summary_anchor_saves_when_new_summary_exists(self):
         service = make_agent_service(history_service=MagicMock())
         service.agent = make_mock_agent()

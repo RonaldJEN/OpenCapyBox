@@ -9,7 +9,7 @@
 - 会话列表拉取与展示
 - 会话标题 + 讨论内容搜索
 - 新建 / 删除 / 切换会话
-- 启动时检测运行中会话并自动选中
+- 启动时检测运行中会话集合并自动选中第一个运行中会话
 - 切换会话时通知下游组件（`ChatV2` 重新加载，`ModelSelector` 同步）
 
 **不职责**：
@@ -21,7 +21,8 @@
 ```ts
 const [currentSessionId, setCurrentSessionId] = useState<string>('');
 const [refreshTrigger, setRefreshTrigger] = useState(0);         // 触发 SessionList 重拉
-const [executingSessionId, setExecutingSessionId] = useState<string | null>(null);
+const [executingSessionIds, setExecutingSessionIds] = useState<Set<string>>(() => new Set());
+const [activeSlotSessionIds, setActiveSlotSessionIds] = useState<Set<string>>(() => new Set());
 const [selectedModelId, setSelectedModelId] = useState<string>('');
 ```
 
@@ -30,8 +31,8 @@ const [selectedModelId, setSelectedModelId] = useState<string>('');
 ```
 SessionList 挂载
   → GET /api/sessions/list             (loadSessions)
-  → GET /api/sessions/running          (checkForRunningSession, 仅首次)
-      → onRunningSessionDetected(sid)  → App 自动 setCurrentSessionId
+  → GET /api/sessions/running-sessions (checkForRunningSessions, 仅首次)
+      → onRunningSessionsDetected(items) → App 标记全部运行中 session 与 active slot，必要时自动 setCurrentSessionId(first)
 
 用户输入搜索词
   → 300ms debounce
@@ -62,14 +63,14 @@ SessionList 挂载
 
 原因：避免大量空会话污染列表。
 
-### 4.2 运行中会话仅检测一次
+### 4.2 运行中会话集合仅检测一次
 
-`checkForRunningSession` 仅在 `SessionList` **首次挂载**且 `!executingSessionId` 时执行。多次执行会在切会话时造成误跳。
+`checkForRunningSessions` 仅在 `SessionList` **首次挂载**且 `executingSessionIds.size === 0` 时执行。多次执行会在切会话时造成误跳。
 
 ```ts
 useEffect(() => {
-  if (!executingSessionId && onRunningSessionDetected) {
-    checkForRunningSession();
+  if (executingSessionIds.size === 0 && onRunningSessionsDetected) {
+    checkForRunningSessions();
   }
 }, []);  // 空依赖，仅挂载时
 ```
@@ -93,26 +94,41 @@ if (session.model_id && onModelChange) {
 
 原因：不同会话可能用不同模型，顶部 ModelSelector 必须反映当前会话的模型。
 
-### 4.5 执行标记的清除时机
+### 4.5 执行标记集合的清除时机
 
-`executingSessionId` 清除路径：
+`executingSessionIds` 清除路径：
+- `RUN_STARTED` / 本地发送开始 → ChatV2 调用 `onExecutionStart(sessionId)`，将 sid 加入集合。
 - `RUN_FINISHED` → ChatV2 调用 `onExecutionEnd(sessionId)`（传 sid，精确清除）。
 - **禁止**在切换会话时无条件清除 → 会误清其他正在运行的会话标记。
 
 ```ts
+const handleExecutionStart = (sessionId: string) => {
+  setExecutingSessionIds((prev) => new Set(prev).add(sessionId));
+};
+
 const handleExecutionEnd = (sessionId?: string) => {
   if (sessionId) {
-    setExecutingSessionId((prev) => (prev === sessionId ? null : prev));
+    setExecutingSessionIds((prev) => {
+      const next = new Set(prev);
+      next.delete(sessionId);
+      return next;
+    });
   } else {
-    setExecutingSessionId(null);
+    setExecutingSessionIds(new Set());
   }
 };
 ```
+
+`activeSlotSessionIds` 保存后端 `/running-sessions` 返回或本地已启动的运行 slot。本地发送 / resume 在 HTTP 响应通过后、`RUN_STARTED` 到达前也必须先加入该集合；429 等请求级拒绝不得加入。若 ChatV2 加载当前 session 历史时尚未看到 `running` round，但该 session 仍在 `activeSlotSessionIds` 中，必须保留执行标记并禁用输入；这表示 Agent 初始化窗口，不能误判为空闲。进入该分支后 ChatV2 必须短间隔探测 `/running-sessions`：slot 消失则清除执行态，slot 仍存在则重拉 history，直到看到 `running` round 并进入 `subscribeToRound` 订阅路径。
+
+`App` 必须周期性 reconcile `/running-sessions`，只更新 `executingSessionIds` 与 `activeSlotSessionIds`，不得自动切换当前会话。该收敛用于清理非当前会话后台完成后的侧栏执行标记。
 
 ## 5. 轮询契约
 
 | 轮询 | 间隔 | 实现 |
 |---|---|---|
+| init-window 补偿探测 | 1.5s | `ChatV2` 在 active slot 但无 running round 时触发，直至订阅或清标记 |
+| running-sessions 后台收敛 | 5s | `App` 周期调用 `/running-sessions`，只同步运行态集合，不自动跳转 |
 | 会话列表刷新 | 30s | `SessionList` 内部 `setInterval` |
 | Cron 未读计数 | 60s | `App.tsx` 内部 `setInterval`，调用 `getUnreadCount` |
 
@@ -149,15 +165,18 @@ const handleExecutionEnd = (sessionId?: string) => {
 |---|---|
 | `getSessions` 失败 | `console.error`，显示"加载失败"空态 |
 | `deleteSession` 失败 | `console.error`，不改变 UI |
-| `getRunningSession` 失败 | `console.error`，不影响正常流程 |
+| `getRunningSessions` 失败 | `console.error`，不影响正常流程 |
 
 ## 9. 测试清单
 
-- [ ] 首次进入自动检测并切换到运行中会话
+- [ ] 首次进入自动检测全部运行中会话，并切换到第一个运行中会话
 - [ ] 切换会话时 `ModelSelector` 同步到新会话的 model_id
 - [ ] 删除当前会话回到欢迎页
 - [ ] 欢迎页输入第一条消息才创建会话
-- [ ] A 会话运行中切到 B 会话，A 的 `executingSessionId` 不被误清
+- [ ] A/B 多会话并行时，侧栏同时显示多个执行标记
+- [ ] 非当前会话后台完成后，周期收敛会清理对应执行标记
+- [ ] 本地 run 在 `RUN_STARTED` 前的 init-window 会保留执行标记；429 不污染执行标记
+- [ ] A 会话运行中切到 B 会话，A 的 `executingSessionIds` 标记不被误清
 - [ ] 30s 后列表自动刷新
 - [ ] 搜索输入 300ms 后调用 `getSessions(q)`
 - [ ] 清空搜索恢复完整列表

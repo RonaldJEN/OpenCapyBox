@@ -13,7 +13,7 @@ vi.mock('../../services/api', () => ({
     sendMessageStreamV2: vi.fn(),
     resumeStream: vi.fn(),
     uploadFile: vi.fn(),
-    getRunningSession: vi.fn(),
+    getRunningSessions: vi.fn(),
     createSession: vi.fn(),
     abortChat: vi.fn(),
     getUserId: vi.fn(() => 'demo-session'),
@@ -94,6 +94,9 @@ describe('ChatV2 组件', () => {
     vi.mocked(apiService.getSessionFiles).mockResolvedValue({
       files: [],
       total: 0,
+    });
+    vi.mocked(apiService.getRunningSessions).mockResolvedValue({
+      running_sessions: [],
     });
     vi.mocked(apiService.resumeStream).mockResolvedValue(undefined);
   });
@@ -675,6 +678,82 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('init-window active slot 无 running round 时不应清除执行标记', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'session-init',
+      total: 0,
+    });
+
+    render(
+      <ChatV2
+        sessionId="session-init"
+        activeSlotSessionIds={new Set(['session-init'])}
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledWith('session-init');
+    });
+
+    expect(defaultProps.onExecutionStart).toHaveBeenCalledWith('session-init');
+    expect(defaultProps.onExecutionEnd).not.toHaveBeenCalledWith('session-init');
+
+    await waitFor(() => {
+      const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+      expect(textarea).toBeDisabled();
+    });
+  });
+
+  it('init-window active slot 轮询到 running round 后应订阅该轮次', async () => {
+    const runningRound: RoundData = {
+      round_id: 'round-ready',
+      user_message: '初始化完成',
+      final_response: '',
+      steps: [],
+      step_count: 0,
+      status: 'running',
+      created_at: new Date().toISOString(),
+    };
+
+    vi.mocked(apiService.getSessionHistoryV2)
+      .mockResolvedValueOnce({
+        rounds: [],
+        session_id: 'session-init',
+        total: 0,
+      })
+      .mockResolvedValueOnce({
+        rounds: [runningRound],
+        session_id: 'session-init',
+        total: 1,
+      });
+    vi.mocked(apiService.getRunningSessions).mockResolvedValue({
+      running_sessions: [{ session_id: 'session-init', round_id: null }],
+    });
+
+    render(
+      <ChatV2
+        sessionId="session-init"
+        activeSlotSessionIds={new Set(['session-init'])}
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(1);
+    });
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(2);
+      expect(apiService.subscribeToRound).toHaveBeenCalledWith(
+        'session-init',
+        'round-ready',
+        expect.any(Object)
+      );
+    }, { timeout: 3000 });
+  });
+
   it('handleStop 应该立即更新 UI 状态而不等待 SSE', async () => {
     // 模拟一个运行中的轮次
     const runningRounds: RoundData[] = [
@@ -1166,7 +1245,7 @@ describe('ChatV2 组件', () => {
       total: 0,
     });
 
-    // sendMessageStreamV2：直接调用 onRunError(USER_BUSY)，不调用 onRunStarted
+    // sendMessageStreamV2：直接调用 onRunError(USER_BUSY)，不调用 onStreamAccepted/onRunStarted
     vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
       callbacks.onRunError?.('当前有正在运行的任务', 'USER_BUSY');
     });
@@ -1200,6 +1279,37 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(textarea).not.toBeDisabled();
     });
+  });
+
+  it('后端接受 SSE 后应在 RUN_STARTED 前标记执行态', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'test-session',
+      total: 0,
+    });
+
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
+      callbacks.onStreamAccepted?.();
+    });
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: '测试初始化窗口标记' } });
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    expect(defaultProps.onExecutionStart).toHaveBeenCalledWith('test-session');
   });
 
   it('ask_user 中断事件不应泄漏到用户已切换到的新会话', async () => {

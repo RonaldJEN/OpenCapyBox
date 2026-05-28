@@ -11,7 +11,7 @@ vi.mock('../../services/api', () => ({
     deleteSession: vi.fn(),
     logout: vi.fn(),
     getUserId: vi.fn(() => 'mock-session'),
-    getRunningSession: vi.fn().mockResolvedValue({ running_session_id: null }),
+    getRunningSessions: vi.fn().mockResolvedValue({ running_sessions: [] }),
   },
 }));
 
@@ -50,6 +50,7 @@ describe('SessionList 組件', () => {
     vi.mocked(apiService.getSessions).mockResolvedValue({
       sessions: mockSessions,
     });
+    vi.mocked(apiService.getRunningSessions).mockResolvedValue({ running_sessions: [] });
   });
 
   afterEach(() => {
@@ -168,6 +169,46 @@ describe('SessionList 組件', () => {
     });
 
     expect(screen.getByText('2')).toBeInTheDocument();
+  });
+
+  it('首次挂载时应上报所有运行中会话', async () => {
+    const mockOnRunningSessionsDetected = vi.fn();
+    vi.mocked(apiService.getRunningSessions).mockResolvedValue({
+      running_sessions: [
+        { session_id: 'session-1', round_id: 'round-1' },
+        { session_id: 'session-2', round_id: null },
+      ],
+    });
+
+    render(
+      <SessionList
+        onSessionSelect={vi.fn()}
+        onRunningSessionsDetected={mockOnRunningSessionsDetected}
+      />
+    );
+
+    await waitFor(() => {
+      expect(mockOnRunningSessionsDetected).toHaveBeenCalledWith([
+        { session_id: 'session-1', round_id: 'round-1' },
+        { session_id: 'session-2', round_id: null },
+      ]);
+    });
+  });
+
+  it('应为多个运行中会话同时显示执行标记', async () => {
+    render(
+      <SessionList
+        onSessionSelect={vi.fn()}
+        executingSessionIds={new Set(['session-1', 'session-2'])}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('測試會話 1')).toBeInTheDocument();
+      expect(screen.getByText('測試會話 2')).toBeInTheDocument();
+    });
+
+    expect(document.querySelectorAll('.animate-dot-pulse')).toHaveLength(2);
   });
 
   it('输入搜索词后应调用带 q 的 getSessions', async () => {

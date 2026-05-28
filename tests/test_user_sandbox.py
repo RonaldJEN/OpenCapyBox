@@ -23,11 +23,16 @@ from tests.helpers import make_mock_sandbox, make_agent_service
 # ── 共享工厂 ────────────────────────────────────────────────
 
 
-def _inject_pool_session(pool, session_id, user_id, mock_agent=None, *, timestamp=None):
+def _inject_pool_session(pool, session_id, user_id, mock_agent=None, *, timestamp=None, sandbox_id=None):
     """向 AgentPoolService 注入一个模拟会话，减少 pool 状态设置样板"""
     if mock_agent is None:
         mock_agent = MagicMock()
         mock_agent.sandbox = MagicMock()
+    if sandbox_id is not None:
+        if not hasattr(mock_agent, "sandbox") or mock_agent.sandbox is None:
+            mock_agent.sandbox = MagicMock()
+        mock_agent.sandbox.id = sandbox_id
+        pool._agent_sandbox_ids[session_id] = sandbox_id
     pool._cache[session_id] = mock_agent
     pool._last_access[session_id] = timestamp if timestamp is not None else time.time()
     pool._session_user[session_id] = user_id
@@ -218,29 +223,468 @@ class TestAgentPoolServiceUserSessions:
         pool = AgentPoolService(ttl=3600)
         cached_agent = MagicMock()
         cached_agent._refresh_runtime_messages_from_history = MagicMock()
-        _inject_pool_session(pool, "session-A", "user-1", mock_agent=cached_agent)
-        pool._last_renew["user-1"] = time.time()
-
-        result = await pool.get_or_create(
-            user_id="user-1",
-            session_id="user-1",
-            chat_session_id="session-A",
-            db=MagicMock(),
+        _inject_pool_session(
+            pool,
+            "session-A",
+            "user-1",
+            mock_agent=cached_agent,
+            sandbox_id="sbx-current",
         )
+        pool._last_renew["user-1"] = time.time()
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = "sbx-current"
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-A",
+                db=MagicMock(),
+                sandbox_id="sbx-current",
+            )
 
         assert result is cached_agent
         cached_agent._refresh_runtime_messages_from_history.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_cache_hit_reuses_agent_when_sandbox_id_matches(self):
+        """cached Agent sandbox_id 与当前用户 sandbox_id 一致时应复用。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        cached_agent = MagicMock()
+        _inject_pool_session(
+            pool,
+            "session-A",
+            "user-1",
+            mock_agent=cached_agent,
+            sandbox_id="sbx-current",
+        )
+        pool._last_renew["user-1"] = time.time()
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = "sbx-current"
+        pool._create_agent_instance = AsyncMock()
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-A",
+                db=MagicMock(),
+                sandbox_id="sbx-current",
+            )
+
+        assert result is cached_agent
+        pool._create_agent_instance.assert_not_called()
+        mock_sandbox_service.renew.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_cache_hit_does_not_rebind_history_service_db(self):
+        """缓存命中不应将共享 Agent 重新绑定到请求级 DB。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        old_db = MagicMock()
+        current_db = MagicMock()
+        cached_agent = MagicMock()
+        cached_agent.history_service.db = old_db
+        _inject_pool_session(
+            pool,
+            "session-A",
+            "user-1",
+            mock_agent=cached_agent,
+            sandbox_id="sbx-current",
+        )
+        pool._last_renew["user-1"] = time.time()
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = "sbx-current"
+        pool._create_agent_instance = AsyncMock()
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-A",
+                db=current_db,
+                sandbox_id="sbx-current",
+            )
+
+        assert result is cached_agent
+        assert cached_agent.history_service.db is old_db
+        pool._create_agent_instance.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_rebuilds_when_db_sandbox_id_differs_from_service_cache(self):
+        """DB 中的跨 worker 新 sandbox_id 应触发旧 Agent 重建。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        new_agent = MagicMock()
+        _inject_pool_session(
+            pool,
+            "session-A",
+            "user-1",
+            sandbox_id="sbx-old",
+        )
+        pool._last_renew["user-1"] = time.time()
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = "sbx-old"
+
+        async def create_agent(**_kwargs):
+            assert _kwargs["sandbox_id"] == "sbx-new-db"
+            _inject_pool_session(
+                pool,
+                "session-A",
+                "user-1",
+                mock_agent=new_agent,
+                sandbox_id="sbx-new-db",
+            )
+            return new_agent
+
+        pool._create_agent_instance = AsyncMock(side_effect=create_agent)
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-A",
+                db=MagicMock(),
+                sandbox_id="sbx-new-db",
+            )
+
+        assert result is new_agent
+        assert pool._cache["session-A"] is new_agent
+        assert pool._agent_sandbox_ids["session-A"] == "sbx-new-db"
+        pool._create_agent_instance.assert_awaited_once()
+        mock_sandbox_service.invalidate_cache.assert_called_once_with("user-1")
+        mock_sandbox_service.renew.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_cache_miss_invalidates_stale_service_sandbox_cache(self):
+        """新 session 创建前也应清理落后于 DB 的 sandbox_service 快取。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        new_agent = MagicMock()
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = "sbx-old"
+        pool._create_agent_instance = AsyncMock(return_value=new_agent)
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-new",
+                db=MagicMock(),
+                sandbox_id="sbx-new-db",
+            )
+
+        assert result is new_agent
+        pool._create_agent_instance.assert_awaited_once()
+        assert pool._create_agent_instance.await_args.kwargs["sandbox_id"] == "sbx-new-db"
+        mock_sandbox_service.invalidate_cache.assert_called_once_with("user-1")
+        mock_sandbox_service.renew.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_uses_db_sandbox_id_when_service_has_no_cached_sandbox(self):
+        """服务内没有 sandbox 时，使用 DB sandbox_id 判定 cached Agent 是否过期。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        new_agent = MagicMock()
+        _inject_pool_session(
+            pool,
+            "session-A",
+            "user-1",
+            sandbox_id="sbx-old",
+        )
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = None
+
+        async def create_agent(**_kwargs):
+            _inject_pool_session(
+                pool,
+                "session-A",
+                "user-1",
+                mock_agent=new_agent,
+                sandbox_id="sbx-new-db",
+            )
+            return new_agent
+
+        pool._create_agent_instance = AsyncMock(side_effect=create_agent)
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-A",
+                db=MagicMock(),
+                sandbox_id="sbx-new-db",
+            )
+
+        assert result is new_agent
+        assert pool._cache["session-A"] is new_agent
+        assert pool._agent_sandbox_ids["session-A"] == "sbx-new-db"
+        pool._create_agent_instance.assert_awaited_once()
+        mock_sandbox_service.renew.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_rebuilds_when_cached_sandbox_id_is_stale(self):
+        """cached Agent sandbox_id 落后于当前用户 sandbox_id 时必须重建。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        old_agent = MagicMock()
+        new_agent = MagicMock()
+        _inject_pool_session(
+            pool,
+            "session-A",
+            "user-1",
+            mock_agent=old_agent,
+            sandbox_id="sbx-old",
+        )
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = "sbx-new"
+
+        async def create_agent(**_kwargs):
+            _inject_pool_session(
+                pool,
+                "session-A",
+                "user-1",
+                mock_agent=new_agent,
+                sandbox_id="sbx-new",
+            )
+            return new_agent
+
+        pool._create_agent_instance = AsyncMock(side_effect=create_agent)
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-A",
+                db=MagicMock(),
+                sandbox_id="sbx-new",
+            )
+
+        assert result is new_agent
+        assert pool._cache["session-A"] is new_agent
+        assert pool._agent_sandbox_ids["session-A"] == "sbx-new"
+        pool._create_agent_instance.assert_awaited_once()
+        mock_sandbox_service.renew.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_do_create_agent_invalidates_other_sessions_with_old_sandbox_id(self):
+        """创建出新 sandbox 后，同用户其他旧 sandbox Agent 应主动失效。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        _inject_pool_session(pool, "session-old", "user-1", sandbox_id="sbx-old")
+        fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-new")
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_or_resume_with_persisted_id = AsyncMock(
+            return_value=(fresh_sandbox, "sbx-new")
+        )
+
+        mock_db = MagicMock()
+
+        agent_instance = MagicMock()
+        agent_instance.initialize_agent = AsyncMock()
+
+        with (
+            patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service),
+            patch("src.api.services.agent_service.AgentService", return_value=agent_instance),
+            patch.object(pool, "_sync_memory_to_sandbox", new_callable=AsyncMock) as sync_memory,
+        ):
+            result = await pool._do_create_agent(
+                user_id="user-1",
+                chat_session_id="session-new",
+                db=mock_db,
+                model_id=None,
+                sandbox_id="sbx-old",
+            )
+
+        assert result is agent_instance
+        assert "session-old" not in pool._cache
+        assert pool._cache["session-new"] is agent_instance
+        assert pool._agent_sandbox_ids["session-new"] == "sbx-new"
+        mock_sandbox_service.get_or_resume_with_persisted_id.assert_awaited_once_with("user-1", "sbx-old")
+        sync_memory.assert_awaited_once_with(user_id="user-1", sandbox=fresh_sandbox)
+        mock_db.query.assert_not_called()
+        mock_db.commit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_do_create_agent_binds_only_returned_sandbox_id(self):
+        """Agent metadata 应只绑定本次返回的 sandbox.id，不再二次读取 mutable cache。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-returned")
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_or_resume_with_persisted_id = AsyncMock(
+            return_value=(fresh_sandbox, "sbx-returned")
+        )
+        mock_sandbox_service.get_sandbox_id.return_value = "sbx-wrong-cache"
+
+        agent_instance = MagicMock()
+        agent_instance.initialize_agent = AsyncMock()
+
+        with (
+            patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service),
+            patch("src.api.services.agent_service.AgentService", return_value=agent_instance),
+            patch.object(pool, "_sync_memory_to_sandbox", new_callable=AsyncMock),
+        ):
+            result = await pool._do_create_agent(
+                user_id="user-1",
+                chat_session_id="session-new",
+                db=MagicMock(),
+                model_id=None,
+                sandbox_id="sbx-old",
+            )
+
+        assert result is agent_instance
+        assert pool._agent_sandbox_ids["session-new"] == "sbx-returned"
+        mock_sandbox_service.get_sandbox_id.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_do_create_agent_closes_agent_when_initialize_fails(self):
+        """AgentService 创建后初始化失败时应释放 owned HistoryService session。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-new")
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_or_resume_with_persisted_id = AsyncMock(
+            return_value=(fresh_sandbox, "sbx-new")
+        )
+
+        agent_instance = MagicMock()
+        agent_instance.initialize_agent = AsyncMock(side_effect=RuntimeError("init failed"))
+        agent_instance.close = MagicMock()
+
+        with (
+            patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service),
+            patch("src.api.services.agent_service.AgentService", return_value=agent_instance),
+        ):
+            with pytest.raises(RuntimeError, match="init failed"):
+                await pool._do_create_agent(
+                    user_id="user-1",
+                    chat_session_id="session-new",
+                    db=MagicMock(),
+                    model_id=None,
+                    sandbox_id="sbx-old",
+                )
+
+        agent_instance.close.assert_called_once()
+        assert "session-new" not in pool._cache
+
+    @pytest.mark.asyncio
+    async def test_do_create_agent_keeps_running_old_sandbox_agent_for_lazy_invalidation(self):
+        """创建出新 sandbox 时，不应移除同用户仍在运行的旧 Agent。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        running_agent = MagicMock()
+        running_agent.is_running = True
+        _inject_pool_session(
+            pool,
+            "session-running",
+            "user-1",
+            mock_agent=running_agent,
+            sandbox_id="sbx-old",
+        )
+        fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-new")
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_or_resume_with_persisted_id = AsyncMock(
+            return_value=(fresh_sandbox, "sbx-new")
+        )
+
+        agent_instance = MagicMock()
+        agent_instance.initialize_agent = AsyncMock()
+
+        with (
+            patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service),
+            patch("src.api.services.agent_service.AgentService", return_value=agent_instance),
+            patch.object(pool, "_running_session_ids_for_user", return_value=set()),
+            patch.object(pool, "_sync_memory_to_sandbox", new_callable=AsyncMock),
+        ):
+            result = await pool._do_create_agent(
+                user_id="user-1",
+                chat_session_id="session-new",
+                db=MagicMock(),
+                model_id=None,
+                sandbox_id="sbx-old",
+            )
+
+        assert result is agent_instance
+        assert pool._cache["session-running"] is running_agent
+        assert pool._agent_sandbox_ids["session-running"] == "sbx-old"
+        assert pool._cache["session-new"] is agent_instance
+        running_agent.close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_renew_failure_invalidates_all_user_agents_before_rebuild(self):
+        """renew 失败时应失效该用户全部 Agent，避免其他 session 继续拿旧 sandbox。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        rebuilt_agent = MagicMock()
+        _inject_pool_session(pool, "session-A", "user-1", sandbox_id="sbx-old")
+        _inject_pool_session(pool, "session-B", "user-1", sandbox_id="sbx-old")
+        _inject_pool_session(pool, "session-C", "user-2", sandbox_id="sbx-other")
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = "sbx-old"
+        mock_sandbox_service.renew = AsyncMock(return_value=False)
+
+        async def create_agent(**_kwargs):
+            _inject_pool_session(
+                pool,
+                "session-A",
+                "user-1",
+                mock_agent=rebuilt_agent,
+                sandbox_id="sbx-new",
+            )
+            return rebuilt_agent
+
+        pool._create_agent_instance = AsyncMock(side_effect=create_agent)
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-A",
+                db=MagicMock(),
+                sandbox_id="sbx-old",
+            )
+
+        assert result is rebuilt_agent
+        assert pool._cache["session-A"] is rebuilt_agent
+        assert "session-B" not in pool._cache
+        assert "session-C" in pool._cache
+        mock_sandbox_service.renew.assert_awaited_once_with("user-1")
 
     def test_remove_cleans_user_sessions_mapping(self):
         """remove() 应从 _user_sessions 中移除 session"""
         from src.api.services.agent_pool_service import AgentPoolService
 
         pool = AgentPoolService(ttl=3600)
-        _inject_pool_session(pool, "session-A", "user-1")
+        _inject_pool_session(pool, "session-A", "user-1", sandbox_id="sbx-current")
 
         pool.remove("session-A")
 
         assert "session-A" not in pool._cache
+        assert "session-A" not in pool._agent_sandbox_ids
         assert "user-1" not in pool._user_sessions  # 集合清空后键也应被删除
 
     def test_remove_keeps_user_if_other_sessions_exist(self):
@@ -301,16 +745,61 @@ class TestAgentPoolServiceUserSessions:
         assert "session-A" in expired
         mock_sandbox_service.pause.assert_called_once_with("user-1")
 
+    @pytest.mark.asyncio
+    async def test_cleanup_skips_pause_when_other_worker_has_fresh_lock(self):
+        """本进程 session 全过期但 DB 有其他 worker 活跃锁时应跳过 pause"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=1)
+
+        expired_time = time.time() - 10
+        _inject_pool_session(pool, "session-A", "user-1", timestamp=expired_time)
+
+        mock_sandbox_service = AsyncMock()
+        mock_sandbox_service.pause = AsyncMock(return_value=True)
+
+        with (
+            patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service),
+            patch.object(AgentPoolService, "_user_has_fresh_run_lock", return_value=True),
+        ):
+            expired = await pool.cleanup_expired_async()
+
+        assert "session-A" in expired
+        mock_sandbox_service.pause.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_pauses_when_no_fresh_lock_in_db(self):
+        """本进程 session 全过期且 DB 无活跃锁时应正常 pause"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=1)
+
+        expired_time = time.time() - 10
+        _inject_pool_session(pool, "session-A", "user-1", timestamp=expired_time)
+
+        mock_sandbox_service = AsyncMock()
+        mock_sandbox_service.pause = AsyncMock(return_value=True)
+
+        with (
+            patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service),
+            patch.object(AgentPoolService, "_user_has_fresh_run_lock", return_value=False),
+        ):
+            expired = await pool.cleanup_expired_async()
+
+        assert "session-A" in expired
+        mock_sandbox_service.pause.assert_called_once_with("user-1")
+
     def test_get_stats_includes_user_id(self):
-        """get_stats 应包含 user_id 信息"""
+        """get_stats 应包含 user_id 和 sandbox_id 信息"""
         from src.api.services.agent_pool_service import AgentPoolService
 
         pool = AgentPoolService(ttl=3600)
-        _inject_pool_session(pool, "session-X", "user-42")
+        _inject_pool_session(pool, "session-X", "user-42", sandbox_id="sbx-visible")
 
         stats = pool.get_stats()
         assert stats["active_users"] == 1
         assert stats["sessions"]["session-X"]["user_id"] == "user-42"
+        assert stats["sessions"]["session-X"]["sandbox_id"] == "sbx-visible"
 
     def test_invalidate_user_removes_all_sessions(self):
         """invalidate_user() 应移除该用户的全部 session 缓存"""
@@ -329,6 +818,25 @@ class TestAgentPoolServiceUserSessions:
         assert "session-C" in pool._cache
         assert "user-1" not in pool._user_sessions
         assert "user-2" in pool._user_sessions
+
+    def test_invalidate_user_keeps_inflight_session_placeholder(self):
+        """invalidate_user() 不应删除正在创建的 session 占位。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        _inject_pool_session(pool, "session-cached", "user-1")
+        pool._last_access["session-inflight"] = time.time()
+        pool._session_user["session-inflight"] = "user-1"
+        pool._user_sessions.setdefault("user-1", set()).add("session-inflight")
+        pool._create_locks["session-inflight"] = object()
+
+        removed = pool.invalidate_user("user-1")
+
+        assert removed == 1
+        assert "session-cached" not in pool._cache
+        assert "session-inflight" in pool._session_user
+        assert "session-inflight" in pool._user_sessions["user-1"]
+        assert "session-inflight" in pool._create_locks
 
     @pytest.mark.asyncio
     async def test_cleanup_skips_pause_when_user_creating(self):
@@ -396,6 +904,25 @@ class TestAgentPoolServiceUserSessions:
         pool._user_creating.add("user-1")
         pool.clear_all()
         assert len(pool._user_creating) == 0
+
+    def test_clear_all_evicts_agents_before_clearing_metadata(self):
+        """clear_all 应复用 evict 路径，释放 AgentService 持有的资源。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        agent_a = MagicMock()
+        agent_a.agent.tools = {}
+        agent_b = MagicMock()
+        agent_b.agent.tools = {}
+        _inject_pool_session(pool, "session-A", "user-1", mock_agent=agent_a, sandbox_id="sbx-1")
+        _inject_pool_session(pool, "session-B", "user-2", mock_agent=agent_b, sandbox_id="sbx-2")
+
+        assert pool.clear_all() == 2
+
+        agent_a.close.assert_called_once()
+        agent_b.close.assert_called_once()
+        assert pool._cache == {}
+        assert pool._agent_sandbox_ids == {}
 
 
 # ============================================================

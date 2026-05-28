@@ -85,14 +85,22 @@ class TestUserRunLockHelpers:
             assert lock_row is not None
             assert lock_row.session_id == "session-a"
             assert lock_row.lock_id == lock_id
+            assert lock_row.slot == 0
 
     async def test_acquire_rejects_when_lock_exists_and_heartbeat_fresh(self):
-        """心跳新鲜的锁不能被回收（worker 还活着）。"""
+        """默认串行配置下，心跳新鲜的锁不能被回收（worker 还活着）。"""
+        mock_settings = MagicMock()
+        mock_settings.sse_subscribe_timeout = 300
+        mock_settings.agent_user_concurrency_limit = 1
+
         with self._TestingSessionLocal() as db:
             db.add(UserRunLock(user_id="user-1", session_id="session-init", lock_id="young-lock"))
             db.commit()
 
-        with patch("src.api.routes.chat.SessionLocal", self._TestingSessionLocal):
+        with (
+            patch("src.api.routes.chat.SessionLocal", self._TestingSessionLocal),
+            patch("src.api.routes.chat.get_settings", return_value=mock_settings),
+        ):
             ok = await _acquire_user_run_lock(user_id="user-1", session_id="session-steal")
 
         assert ok is None
@@ -100,6 +108,28 @@ class TestUserRunLockHelpers:
             lock_row = db.query(UserRunLock).filter(UserRunLock.user_id == "user-1").first()
             assert lock_row is not None
             assert lock_row.session_id == "session-init"  # 原锁保持不变
+
+    async def test_acquire_allows_different_sessions_until_configured_limit(self):
+        """同一用户可按配置同时运行多个不同 session。"""
+        mock_settings = MagicMock()
+        mock_settings.sse_subscribe_timeout = 300
+        mock_settings.agent_user_concurrency_limit = 3
+
+        with (
+            patch("src.api.routes.chat.SessionLocal", self._TestingSessionLocal),
+            patch("src.api.routes.chat.get_settings", return_value=mock_settings),
+        ):
+            lock_a = await _acquire_user_run_lock(user_id="user-1", session_id="session-a")
+            lock_b = await _acquire_user_run_lock(user_id="user-1", session_id="session-b")
+            lock_c = await _acquire_user_run_lock(user_id="user-1", session_id="session-c")
+            lock_d = await _acquire_user_run_lock(user_id="user-1", session_id="session-d")
+
+        assert all(isinstance(lock_id, str) for lock_id in (lock_a, lock_b, lock_c))
+        assert lock_d is None
+        with self._TestingSessionLocal() as db:
+            rows = db.query(UserRunLock).filter(UserRunLock.user_id == "user-1").all()
+            assert {row.session_id for row in rows} == {"session-a", "session-b", "session-c"}
+            assert {row.slot for row in rows} == {0, 1, 2}
 
     async def test_acquire_cleans_stale_lock_by_heartbeat(self):
         """心跳过期的锁应被回收（worker 已死），同时清理孤儿 round。"""
@@ -125,13 +155,44 @@ class TestUserRunLockHelpers:
             orphan = db.query(Round).filter(Round.id == "orphan-round").first()
             assert orphan.status == "cancelled"
 
-    async def test_release_requires_matching_session(self, lock_db_session):
+    async def test_stale_cleanup_only_cancels_that_session_rounds(self):
+        """多 session 并发时，回收一个陈旧 slot 不应取消其他活跃 session。"""
+        mock_settings = MagicMock()
+        mock_settings.sse_subscribe_timeout = 300
+        mock_settings.agent_user_concurrency_limit = 2
+
+        with self._TestingSessionLocal() as db:
+            _add_session(db, session_id="session-old", user_id="user-1")
+            _add_session(db, session_id="session-live", user_id="user-1")
+            old_lock = UserRunLock(user_id="user-1", session_id="session-old", lock_id="stale", slot=0)
+            old_lock.created_at = now_naive() - timedelta(seconds=600)
+            old_lock.updated_at = now_naive() - timedelta(seconds=600)
+            db.add(old_lock)
+            db.add(UserRunLock(user_id="user-1", session_id="session-live", lock_id="live", slot=1))
+            db.add(Round(id="old-round", session_id="session-old", user_message="hi", status="running"))
+            db.add(Round(id="live-round", session_id="session-live", user_message="hi", status="running"))
+            db.commit()
+
+        with (
+            patch("src.api.routes.chat.SessionLocal", self._TestingSessionLocal),
+            patch("src.api.routes.chat.get_settings", return_value=mock_settings),
+        ):
+            lock_id = await _acquire_user_run_lock(user_id="user-1", session_id="session-new")
+
+        assert isinstance(lock_id, str)
+        with self._TestingSessionLocal() as db:
+            old_round = db.query(Round).filter(Round.id == "old-round").first()
+            live_round = db.query(Round).filter(Round.id == "live-round").first()
+            assert old_round.status == "cancelled"
+            assert live_round.status == "running"
+
+    async def test_release_missing_session_ignores_other_session_slots(self, lock_db_session):
         lock_db_session.add(UserRunLock(user_id="user-1", session_id="session-a", lock_id="lock-a"))
         lock_db_session.commit()
 
         released = await _release_user_run_lock(lock_db_session, user_id="user-1", session_id="session-b")
 
-        assert released is False
+        assert released is True
         still_exists = lock_db_session.query(UserRunLock).filter(UserRunLock.user_id == "user-1").first()
         assert still_exists is not None
         assert still_exists.session_id == "session-a"
@@ -140,12 +201,32 @@ class TestUserRunLockHelpers:
         lock_db_session.add(UserRunLock(user_id="user-1", session_id="session-a", lock_id="current-lock"))
         lock_db_session.commit()
 
-        released = await _release_user_run_lock(lock_db_session, user_id="user-1", lock_id="stale-lock")
+        released = await _release_user_run_lock(
+            lock_db_session,
+            user_id="user-1",
+            lock_id="stale-lock",
+            session_id="session-a",
+        )
 
         assert released is False
         still_exists = lock_db_session.query(UserRunLock).filter(UserRunLock.user_id == "user-1").first()
         assert still_exists is not None
         assert still_exists.lock_id == "current-lock"
+
+    async def test_release_missing_target_lock_ignores_other_session_slots(self, lock_db_session):
+        lock_db_session.add(UserRunLock(user_id="user-1", session_id="session-b", lock_id="lock-b", slot=1))
+        lock_db_session.commit()
+
+        released = await _release_user_run_lock(
+            lock_db_session,
+            user_id="user-1",
+            lock_id="missing-lock-a",
+            session_id="session-a",
+        )
+
+        assert released is True
+        remaining = lock_db_session.query(UserRunLock).filter(UserRunLock.user_id == "user-1").all()
+        assert [(row.session_id, row.lock_id) for row in remaining] == [("session-b", "lock-b")]
 
     async def test_release_without_session_releases_any_lock(self, lock_db_session):
         lock_db_session.add(UserRunLock(user_id="user-1", session_id="session-a", lock_id="lock-a"))
@@ -410,6 +491,97 @@ class TestSendMessageConcurrencyBlock:
 
         # updated_at 失败现在不 503，返回 SSE 流（200）
         assert response.status_code == 200
+
+    async def test_resume_returns_stream_before_agent_init(self):
+        """resume 不应在返回 StreamingResponse 前等待 Agent 初始化。"""
+        from src.api.routes.chat import resume_interrupt
+        from src.api.schemas.chat import ResumeRequest
+        from starlette.responses import StreamingResponse
+
+        mock_db = MagicMock()
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.model_id = "model-1"
+
+        def query_side_effect(model):
+            from src.api.models.session import Session as SessionModel
+            from src.api.models.user_sandbox import UserSandbox
+
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                chain.filter.return_value.first.return_value = None
+            return chain
+
+        mock_db.query.side_effect = query_side_effect
+
+        with patch("src.api.routes.chat.enforce_token_limits", return_value=None), patch(
+            "src.api.routes.chat._acquire_lock_and_clear_cancel", new_callable=AsyncMock, return_value="lock-resume"
+        ), patch("src.api.routes.chat.get_agent_pool") as get_pool:
+            response = await resume_interrupt(
+                "session-1",
+                ResumeRequest(interrupt_id="int-1", answers={"question": "answer"}),
+                user_id="testuser",
+                db=mock_db,
+            )
+
+        assert isinstance(response, StreamingResponse)
+        get_pool.assert_not_called()
+
+    async def test_resume_no_pending_interrupt_stream_error_releases_lock(self):
+        """Agent 初始化已进入 SSE 后，无待处理中断应以 RUN_ERROR 结束并释放锁。"""
+        from src.api.routes.chat import resume_interrupt
+        from src.api.schemas.chat import ResumeRequest
+
+        mock_db = MagicMock()
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "testuser"
+        mock_session.model_id = "model-1"
+
+        def query_side_effect(model):
+            from src.api.models.session import Session as SessionModel
+            from src.api.models.user_sandbox import UserSandbox
+            from src.api.models.run_cancel_request import RunCancelRequest as RunCancelRequestModel
+
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                chain.filter.return_value.first.return_value = None
+            elif model is RunCancelRequestModel:
+                chain.filter.return_value.first.return_value = None
+            return chain
+
+        mock_db.query.side_effect = query_side_effect
+
+        mock_agent_service = MagicMock()
+        mock_agent_service.has_pending_interrupt.return_value = False
+
+        with patch("src.api.routes.chat.enforce_token_limits", return_value=None), patch(
+            "src.api.routes.chat._acquire_lock_and_clear_cancel", new_callable=AsyncMock, return_value="lock-resume"
+        ), patch("src.api.routes.chat.get_agent_pool") as get_pool, patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock, return_value=True
+        ) as release_lock:
+            get_pool.return_value.get_or_create = AsyncMock(return_value=mock_agent_service)
+            response = await resume_interrupt(
+                "session-1",
+                ResumeRequest(interrupt_id="int-1", answers={"question": "answer"}),
+                user_id="testuser",
+                db=mock_db,
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        body = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
+        assert "RUN_ERROR" in body
+        assert "NO_PENDING_INTERRUPT" in body
+        release_lock.assert_called_once_with(
+            user_id="testuser",
+            lock_id="lock-resume",
+            session_id="session-1",
+        )
 
     def test_non_sqlite_exception_returns_503(self):
         """_acquire_user_run_lock 抛非 SQLite 异常时应返回 503（系统错误）。
@@ -715,7 +887,7 @@ class TestAbortCleansUpUserLock:
         assert response.json()["reason"] == "force_aborted"
         assert response.json()["request_id"] == "req-1"
         upsert_cancel.assert_called_once()
-        release_lock.assert_called_once_with(user_id="testuser", lock_id="lock-1")
+        release_lock.assert_called_once_with(user_id="testuser", lock_id="lock-1", session_id="session-1")
         assert mock_agent_service.cancel_token.is_set()
 
     def test_abort_live_worker_mutates_round_to_cancelled(self):
@@ -830,7 +1002,7 @@ class TestAbortCleansUpUserLock:
         # round 应被直接标记为 cancelled
         assert mock_round.status == "cancelled"
         # 锁应被释放
-        release_lock.assert_called_once_with(user_id="testuser", lock_id="dead-lock")
+        release_lock.assert_called_once_with(user_id="testuser", lock_id="dead-lock", session_id="session-1")
 
 
 class TestReleaseLockRetry:

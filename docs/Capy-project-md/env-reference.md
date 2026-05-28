@@ -71,6 +71,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 | `AGENT_MAX_STEPS` | 否 | `100` | Agent 单次 run 最大步数 |
 | `AGENT_MAX_HISTORY_MESSAGES` | 否 | `120` | 历史消息注入上限（条数） |
 | `AGENT_TOOL_TIMEOUT` | 否 | `300` | 单次工具执行超时（秒），0 表示不限。详见下方超时体系说明 |
+| `AGENT_USER_CONCURRENCY_LIMIT` | 否 | `1` | 同一用户允许同时运行的不同会话数 |
 | `SSE_HEARTBEAT_INTERVAL` | 否 | `15` | SSE 心跳间隔（秒） |
 | `SSE_SUBSCRIBE_TIMEOUT` | 否 | `300` | SSE 订阅超时（秒） |
 | `TIMEZONE_OFFSET` | 否 | `8` | UTC 偏移小时数（中国大陆常用 8） |

@@ -4,6 +4,7 @@
 - Round: 對話輪次（用戶輸入 + 最終響應）
 - AGUIEventLog: AG-UI 事件流（包含完整的步驟細節，用於 SSE 重連和歷史重建）
 """
+from collections.abc import Callable
 from sqlalchemy.orm import Session as DBSession
 from sqlalchemy.exc import IntegrityError
 from src.api.models.session import Session
@@ -41,23 +42,65 @@ def _is_interrupt_resolution_unique_violation(exc: IntegrityError) -> bool:
 class HistoryService:
     """对话历史服务"""
 
-    def __init__(self, db: DBSession):
-        self.db = db
+    def __init__(self, db: DBSession | Callable[[], DBSession]):
+        if callable(db) and not hasattr(db, "query"):
+            self._session_factory: Callable[[], DBSession] | None = db
+            self._db: DBSession | None = None
+            self._owns_db = True
+        else:
+            self._session_factory = None
+            self._db = db  # type: ignore[assignment]
+            self._owns_db = False
         # per-instance 状态，避免类级别共享导致跨会话数据混乱
         self._event_sequences: Dict[str, int] = {}
         self._stream_buffers: Dict[str, Dict[str, str]] = {}
         self._terminal_runs: set[str] = set()
 
+    @property
+    def db(self) -> DBSession:
+        if self._db is None:
+            if self._session_factory is None:
+                raise RuntimeError("HistoryService has no DB session factory")
+            self._db = self._session_factory()
+        return self._db
+
+    @db.setter
+    def db(self, value: DBSession) -> None:
+        if self._owns_db and self._db is not None and self._db is not value:
+            self.close()
+        self._db = value
+        self._owns_db = False
+
+    @property
+    def session_factory(self) -> Callable[[], DBSession] | None:
+        return self._session_factory
+
+    def close(self) -> None:
+        if self._db is not None:
+            try:
+                self._db.close()
+            finally:
+                self._db = None
+
     def reset_session(self):
         """回滚当前事务并清除 Session 状态，确保后续操作不受前序脏状态影响。"""
         self.db.rollback()
 
+    def _refresh_detached(self, obj: Any) -> None:
+        """刷新 DB 生成字段后分离对象，并结束 refresh 打开的只读事务。"""
+        self.db.refresh(obj)
+        self.db.expunge(obj)
+        self.db.rollback()
+
     def get_round_status(self, round_id: str) -> str | None:
         """查询 round 当前状态。"""
-        row = self.db.query(Round.status).filter(Round.id == round_id).first()
-        if not row:
-            return None
-        return row[0]
+        try:
+            row = self.db.query(Round.status).filter(Round.id == round_id).first()
+            if not row:
+                return None
+            return row[0]
+        finally:
+            self.db.rollback()
 
     def is_round_terminal(self, round_id: str) -> bool:
         """判断 round 是否已进入 subscribe 终态。"""
@@ -102,9 +145,12 @@ class HistoryService:
                     .first()
                 )
                 if existing:
+                    self.db.expunge(existing)
+                    self.db.rollback()
                     return existing
+            self.db.rollback()
             raise
-        self.db.refresh(round_obj)
+        self._refresh_detached(round_obj)
         return round_obj
 
     def create_resume_round(
@@ -146,10 +192,12 @@ class HistoryService:
                 .filter(Round.id == parent_run_id, Round.session_id == session_id)
                 .first()
             )
+            parent_status = parent_round.status if parent_round else None
+            self.db.rollback()
             if not parent_round:
                 raise ValueError(f"Interrupted round not found: {parent_run_id}")
             raise ValueError(
-                f"Round is not resumable: {parent_run_id} status={parent_round.status}"
+                f"Round is not resumable: {parent_run_id} status={parent_status}"
             )
 
         round_obj = Round(
@@ -189,7 +237,7 @@ class HistoryService:
         except Exception:
             self.db.rollback()
             raise
-        self.db.refresh(round_obj)
+        self._refresh_detached(round_obj)
         return round_obj
 
     def update_interrupt_resolution_fallback(
@@ -257,12 +305,17 @@ class HistoryService:
                         changed = True
                     if changed:
                         self.db.commit()
-                        self.db.refresh(round_obj)
+                        self._refresh_detached(round_obj)
+                    else:
+                        self.db.expunge(round_obj)
+                        self.db.rollback()
                     return round_obj
                 logger.info(
                     "Round %s 已處於終態 %s，跳過 complete_round(status=%s)",
                     round_id, round_obj.status, status,
                 )
+                self.db.expunge(round_obj)
+                self.db.rollback()
                 return round_obj
             round_obj.final_response = final_response
             round_obj.step_count = step_count
@@ -270,7 +323,9 @@ class HistoryService:
             round_obj.interrupt_payload = interrupt_payload
             round_obj.completed_at = now_naive() if status != "interrupted" else None
             self.db.commit()
-            self.db.refresh(round_obj)
+            self._refresh_detached(round_obj)
+        else:
+            self.db.rollback()
         return round_obj
 
     def _rebuild_steps_from_events(self, run_id: str) -> List[Dict]:
@@ -855,5 +910,5 @@ class HistoryService:
         )
         self.db.add(row)
         self.db.commit()
-        self.db.refresh(row)
+        self._refresh_detached(row)
         return row

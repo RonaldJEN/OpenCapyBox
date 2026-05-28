@@ -7,7 +7,7 @@ import type {
   HistoryResponseV2,
   FileListResponse,
   FileInfo,
-  RunningSessionResponse,
+  RunningSessionsResponse,
   ChatContentBlock,
   StreamCallbacks,
   SubscribeCallbacks,
@@ -235,10 +235,10 @@ class APIService {
   }
 
   /**
-   * 检查用户是否有运行中的会话（单次 API 调用）
+   * 检查用户当前运行中的会话集合（单次 API 调用）
    */
-  async getRunningSession(): Promise<RunningSessionResponse> {
-    const response = await this.client.get<RunningSessionResponse>('/sessions/running-session');
+  async getRunningSessions(): Promise<RunningSessionsResponse> {
+    const response = await this.client.get<RunningSessionsResponse>('/sessions/running-sessions');
     return response.data;
   }
 
@@ -313,6 +313,8 @@ class APIService {
               } catch { /* not JSON, use raw text */ }
               throw new HttpError(response.status, friendlyMsg);
             }
+
+            callbacks.onStreamAccepted?.();
 
             const reader = response.body?.getReader();
             if (!reader) {
@@ -864,6 +866,8 @@ class APIService {
             const errorText = await response.text();
             throw new Error(`HTTP ${response.status}: ${errorText}`);
           }
+
+          callbacks.onStreamAccepted?.();
 
           const reader = response.body?.getReader();
           if (!reader) {
