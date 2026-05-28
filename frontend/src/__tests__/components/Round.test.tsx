@@ -129,6 +129,28 @@ describe('Round 组件', () => {
     expect(screen.queryByText('这是我的分析结果...')).not.toBeInTheDocument();
   });
 
+  it('流式正文和工具同 step 时仍应渲染正文', () => {
+    const round = createMockRound({
+      final_response: '',
+      status: 'running',
+      steps: [
+        {
+          step_number: 1,
+          thinking: '',
+          assistant_content: '正文已经开始流式输出。',
+          tool_calls: [{ name: 'search_web', input: { query: '黄金价格' } }],
+          tool_results: [{ success: true, content: 'result' }],
+          status: 'streaming',
+        },
+      ],
+      step_count: 1,
+    });
+
+    render(<Round round={round} isStreaming={true} />);
+
+    expect(screen.getByText('正文已经开始流式输出。')).toBeInTheDocument();
+  });
+
   it('用户消息包含附件标记时应该显示附件', () => {
     const round = createMockRound({
       user_message: '请分析这个文件 [ATTACHMENT:report.pdf|1 KB]',

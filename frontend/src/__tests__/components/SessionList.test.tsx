@@ -171,28 +171,14 @@ describe('SessionList 組件', () => {
     expect(screen.getByText('2')).toBeInTheDocument();
   });
 
-  it('首次挂载时应上报所有运行中会话', async () => {
-    const mockOnRunningSessionsDetected = vi.fn();
-    vi.mocked(apiService.getRunningSessions).mockResolvedValue({
-      running_sessions: [
-        { session_id: 'session-1', round_id: 'round-1' },
-        { session_id: 'session-2', round_id: null },
-      ],
-    });
-
-    render(
-      <SessionList
-        onSessionSelect={vi.fn()}
-        onRunningSessionsDetected={mockOnRunningSessionsDetected}
-      />
-    );
+  it('首次挂载时不应独立请求运行中会话', async () => {
+    render(<SessionList onSessionSelect={vi.fn()} />);
 
     await waitFor(() => {
-      expect(mockOnRunningSessionsDetected).toHaveBeenCalledWith([
-        { session_id: 'session-1', round_id: 'round-1' },
-        { session_id: 'session-2', round_id: null },
-      ]);
+      expect(screen.getByText('OpenCapyBox')).toBeInTheDocument();
     });
+
+    expect(apiService.getRunningSessions).not.toHaveBeenCalled();
   });
 
   it('应为多个运行中会话同时显示执行标记', async () => {

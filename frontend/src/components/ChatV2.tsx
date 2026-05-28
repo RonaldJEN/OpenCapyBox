@@ -171,6 +171,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const suppressAutoScrollRef = useRef<boolean>(false); // 切会话期间抑制自动 smooth 滚动
   const titleRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const initWindowPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeSlotSessionIdsRef = useRef(activeSlotSessionIds);
 
   // 🆕 欢迎页「输入即创建」相关状态
   const [creatingSession, setCreatingSession] = useState(false);
@@ -180,7 +181,12 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     attachments: FileInfo[];
   } | null>(null);
   const historyLoadedRef = useRef(false); // 标记 loadHistory 是否已完成
+  const historyRequestIdRef = useRef(0); // 标记最新 loadHistory 请求，丢弃过期响应
   const selectedModel = availableModels.find((m) => m.id === selectedModelId);
+
+  useEffect(() => {
+    activeSlotSessionIdsRef.current = activeSlotSessionIds;
+  }, [activeSlotSessionIds]);
 
   // readFileAsDataUrl / compressImage 已从 utils/imageUtils 导入
 
@@ -202,19 +208,14 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         return;
       }
 
-      try {
-        const running = await apiService.getRunningSessions();
-        const stillActive = running.running_sessions.some((item) => item.session_id === targetSessionId);
-        if (!stillActive) {
-          if (sessionIdRef.current === targetSessionId) {
-            setSending(false);
-            setAgentState((prev) => ({ ...prev, status: 'idle', lastUpdated: Date.now() }));
-            onExecutionEnd?.(targetSessionId);
-          }
-          return;
+      const stillActive = activeSlotSessionIdsRef.current?.has(targetSessionId) ?? false;
+      if (!stillActive) {
+        if (sessionIdRef.current === targetSessionId) {
+          setSending(false);
+          setAgentState((prev) => ({ ...prev, status: 'idle', lastUpdated: Date.now() }));
+          onExecutionEnd?.(targetSessionId);
         }
-      } catch (err) {
-        console.warn('Failed to poll init-window slot state:', err);
+        return;
       }
 
       if (sessionIdRef.current === targetSessionId) {
@@ -283,6 +284,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
   useEffect(() => {
     if (!sessionId) {
+      historyRequestIdRef.current += 1;
       if (subscriptionAbortRef.current) {
         subscriptionAbortRef.current();
         subscriptionAbortRef.current = null;
@@ -349,6 +351,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
     // 🆕 cleanup 函数：组件卸载或 sessionId 变化时取消订阅
     return () => {
+      historyRequestIdRef.current += 1;
       if (subscriptionAbortRef.current) {
         console.log('🧹 清理订阅');
         subscriptionAbortRef.current();
@@ -459,36 +462,44 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   };
 
   const loadHistory = async () => {
+    const requestId = ++historyRequestIdRef.current;
+    const targetSessionId = sessionId;
+    const isCurrentRequest = () => (
+      historyRequestIdRef.current === requestId && sessionIdRef.current === targetSessionId
+    );
+
     setLoading(true);
     setError('');
     try {
-      const response = await apiService.getSessionHistoryV2(sessionId);
+      const response = await apiService.getSessionHistoryV2(targetSessionId);
+      if (!isCurrentRequest()) return;
+
       setRounds(response.rounds.map((round) => ({
         ...round,
         user_attachments: (round.user_attachments || []).map((attachment) => ({
           ...attachment,
-          session_id: attachment.session_id || sessionId,
+          session_id: attachment.session_id || targetSessionId,
         })),
       })));
       // 检查是否有运行中的轮次，如果有则订阅更新
       const runningRound = response.rounds.find(r => r.status === 'running');
-      const hasActiveSlot = activeSlotSessionIds?.has(sessionId) ?? false;
+      const hasActiveSlot = activeSlotSessionIdsRef.current?.has(targetSessionId) ?? false;
 
       // 🆕 检查是否有中断的轮次，恢复 QuestionCard
       if (!runningRound) {
         if (hasActiveSlot) {
           // 仍持有后端运行 slot 但尚未创建 running round（Agent 初始化窗口）时，
           // 保留侧栏执行标记和输入禁用态，并继续探测直到 round 建立或 slot 消失。
-          onExecutionStart?.(sessionId);
+          onExecutionStart?.(targetSessionId);
           setSending(true);
           setAgentState((prev) => ({ ...prev, status: 'running', lastUpdated: Date.now() }));
-          scheduleInitWindowPoll(sessionId);
+          scheduleInitWindowPoll(targetSessionId);
           return;
         }
 
         // 当前会话没有运行中轮次/运行 slot，通知父组件清除该会话的执行标记（如有）
         clearInitWindowPoll();
-        onExecutionEnd?.(sessionId);
+        onExecutionEnd?.(targetSessionId);
 
         const interruptedRound = [...response.rounds].reverse().find(
           r => r.status === 'interrupted' && r.interrupt
@@ -502,14 +513,19 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
       if (runningRound) {
         clearInitWindowPoll();
-        onExecutionStart?.(sessionId);
+        onExecutionStart?.(targetSessionId);
         setDisableInitialMotion(false);
         setSending(true);
 
         console.log(`🔄 检测到运行中轮次 ${runningRound.round_id}，开始订阅更新...`);
 
+        if (subscriptionAbortRef.current) {
+          subscriptionAbortRef.current();
+          subscriptionAbortRef.current = null;
+        }
+
         // 使用 AG-UI 协议订阅轮次更新
-        const subscription = apiService.subscribeToRound(sessionId, runningRound.round_id, {
+        const subscription = apiService.subscribeToRound(targetSessionId, runningRound.round_id, {
           // 状态快照 - 恢复完整状态
           onStateSnapshot: (snapshot) => {
             setAgentState(snapshot);
@@ -575,19 +591,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           onTextMessageContent: (messageId, delta) => {
             if (streamingContentRef.current.currentTextMessageId === messageId) {
               streamingContentRef.current.textContent += delta;
-              // 更新当前轮次的最后一个步骤的 assistant_content
-              setRounds((prev) =>
-                prev.map((round) => {
-                  if (round.round_id === runningRound.round_id && round.steps.length > 0) {
-                    const steps = [...round.steps];
-                    const lastStep = { ...steps[steps.length - 1] };
-                    lastStep.assistant_content = streamingContentRef.current.textContent;
-                    steps[steps.length - 1] = lastStep;
-                    return { ...round, steps };
-                  }
-                  return round;
-                })
-              );
+              updateRoundTextContent(runningRound.round_id, streamingContentRef.current.textContent);
             }
           },
 
@@ -716,8 +720,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           // 运行完成
           onRunFinished: (_threadId, runId, result, outcome, interrupt) => {
             // 用户已切换到其他会话，释放旧会话的执行标记但跳过状态更新
-            if (sessionIdRef.current !== sessionId) {
-              onExecutionEnd?.(sessionId);
+            if (sessionIdRef.current !== targetSessionId) {
+              onExecutionEnd?.(targetSessionId);
               return;
             }
             const isUserCancelled = isUserCancelledOutcome(outcome, interrupt, result);
@@ -752,15 +756,15 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
               return;
             }
             setSending(false);
-            onExecutionEnd?.(sessionId);
+            onExecutionEnd?.(targetSessionId);
             subscriptionAbortRef.current = null;
             console.log(`✅ 轮次 ${runId} 订阅完成`);
           },
 
           // 错误处理
           onRunError: (errorMsg) => {
-            if (sessionIdRef.current !== sessionId) {
-              onExecutionEnd?.(sessionId);
+            if (sessionIdRef.current !== targetSessionId) {
+              onExecutionEnd?.(targetSessionId);
               return;
             }
             setError(errorMsg);
@@ -778,7 +782,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
             );
             if (suppressStopCallbacksRef.current) return;
             setSending(false);
-            onExecutionEnd?.(sessionId);
+            onExecutionEnd?.(targetSessionId);
             subscriptionAbortRef.current = null;
             console.error(`❌ 订阅错误: ${errorMsg}`);
           },
@@ -797,20 +801,22 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
         subscription.promise.catch((err) => {
           console.error('订阅失败:', err);
-          if (sessionIdRef.current !== sessionId) {
-            onExecutionEnd?.(sessionId);
+          if (sessionIdRef.current !== targetSessionId) {
+            onExecutionEnd?.(targetSessionId);
             return;
           }
           if (suppressStopCallbacksRef.current) return;
           setSending(false);
-          onExecutionEnd?.(sessionId);
+          onExecutionEnd?.(targetSessionId);
           subscriptionAbortRef.current = null;
         });
       }
     } catch (err) {
+      if (!isCurrentRequest()) return;
       console.error('Failed to load history:', err);
       setError('加载历史记录失败');
     } finally {
+      if (!isCurrentRequest()) return;
       setLoading(false);
       historyLoadedRef.current = true;
 
@@ -819,7 +825,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         const { displayMessage, content, attachments } = pendingMessageRef.current;
         pendingMessageRef.current = null;
         setCreatingSession(false);
-        sendMessageForSession(sessionId, displayMessage, content, attachments);
+        sendMessageForSession(targetSessionId, displayMessage, content, attachments);
       }
     }
   };
@@ -1013,6 +1019,41 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         })
       );
     };
+  };
+
+  const updateRoundTextContent = (runId: string, content: string) => {
+    setRounds((prev) =>
+      prev.map((round) => {
+        if (round.round_id !== runId || round.steps.length === 0) {
+          return round;
+        }
+
+        const steps = [...round.steps];
+        const lastStep = steps[steps.length - 1];
+
+        if (lastStep.tool_calls.length > 0 && lastStep.status !== 'streaming') {
+          const newStepNumber = round.steps.length + 1;
+          return {
+            ...round,
+            steps: [
+              ...steps,
+              {
+                step_number: newStepNumber,
+                thinking: '',
+                assistant_content: content,
+                tool_calls: [],
+                tool_results: [],
+                status: 'streaming' as const,
+              },
+            ],
+            step_count: newStepNumber,
+          };
+        }
+
+        steps[steps.length - 1] = { ...lastStep, assistant_content: content };
+        return { ...round, steps };
+      })
+    );
   };
 
   const createStreamCallbacks = ({
@@ -1215,7 +1256,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
     onTextMessageContent: (_messageId, delta) => {
       streamingContentRef.current.textContent += delta;
-      updateLastStep({ assistant_content: streamingContentRef.current.textContent });
+      updateRoundTextContent(getCurrentRunId(), streamingContentRef.current.textContent);
 
       if (mirrorTextToFinalResponse) {
         updateRoundFinalResponse(getCurrentRunId(), streamingContentRef.current.textContent);

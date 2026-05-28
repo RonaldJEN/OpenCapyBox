@@ -24,6 +24,10 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
 
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'max_steps_reached', 'interrupted', 'resumed', 'cancelled']);
   const isCompleted = TERMINAL_STATUSES.has(round.status);
+  const latestStreamingContent = isStreaming
+    ? [...round.steps].reverse().find((step) => step.assistant_content)?.assistant_content
+    : undefined;
+  const assistantContent = round.final_response || latestStreamingContent;
 
   return (
     <div className={`space-y-6 ${disableMotion ? '' : 'animate-fade-in'}`}>
@@ -113,7 +117,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
           )}
 
           {/* 最终答案 OR 流式传输中的答案 */}
-          {(round.final_response || (isStreaming && round.steps.length > 0 && !round.steps[round.steps.length - 1].tool_calls.length && round.steps[round.steps.length - 1].assistant_content)) && (
+          {assistantContent && (
             <div className="prose max-w-none mt-4">
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
@@ -216,7 +220,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
                   ),
                 }}
               >
-                {round.final_response || round.steps[round.steps.length - 1].assistant_content}
+                {assistantContent}
               </ReactMarkdown>
               {/* 流式传输光标 */}
               {!round.final_response && isStreaming && (

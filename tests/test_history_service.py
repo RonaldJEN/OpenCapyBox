@@ -467,6 +467,95 @@ class TestHistoryServiceRebuildSteps:
         assert steps[0]["tool_calls"][0]["input"] == {"path": "test.txt"}
         assert len(steps[0]["tool_results"]) == 1
 
+    def test_rebuild_steps_preserves_agui_timing_metadata(self, history_service, mock_db):
+        """history/v2 重建 steps 时应保留 AG-UI 时间戳和工具耗时。"""
+        events = [
+            MagicMock(
+                event_type="STEP_STARTED",
+                payload=json.dumps({"type": "STEP_STARTED"}),
+                timestamp=1000,
+                created_at=datetime.now(),
+                id="e1",
+            ),
+            MagicMock(
+                event_type="THINKING_TEXT_MESSAGE_START",
+                payload=json.dumps({"type": "THINKING_TEXT_MESSAGE_START", "messageId": "think-1"}),
+                timestamp=1100,
+                created_at=datetime.now(),
+                id="e2",
+            ),
+            MagicMock(
+                event_type="THINKING_TEXT_MESSAGE_END",
+                payload=json.dumps({"type": "THINKING_TEXT_MESSAGE_END", "fullContent": "正在思考"}),
+                timestamp=1500,
+                created_at=datetime.now(),
+                id="e3",
+            ),
+            MagicMock(
+                event_type="TOOL_CALL_START",
+                payload=json.dumps({
+                    "type": "TOOL_CALL_START",
+                    "toolCallId": "tc-1",
+                    "toolCallName": "search_web",
+                }),
+                timestamp=1600,
+                created_at=datetime.now(),
+                id="e4",
+            ),
+            MagicMock(
+                event_type="TOOL_CALL_ARGS",
+                payload=json.dumps({"type": "TOOL_CALL_ARGS", "delta": '{"query": "黄金价格"}'}),
+                timestamp=1650,
+                created_at=datetime.now(),
+                id="e5",
+            ),
+            MagicMock(
+                event_type="TOOL_CALL_END",
+                payload=json.dumps({"type": "TOOL_CALL_END"}),
+                timestamp=1700,
+                created_at=datetime.now(),
+                id="e6",
+            ),
+            MagicMock(
+                event_type="TOOL_CALL_RESULT",
+                payload=json.dumps({
+                    "type": "TOOL_CALL_RESULT",
+                    "toolCallId": "tc-1",
+                    "messageId": "tool-msg-1",
+                    "content": "搜索结果",
+                    "executionTimeMs": 230,
+                }),
+                timestamp=1900,
+                created_at=datetime.now(),
+                id="e7",
+            ),
+            MagicMock(
+                event_type="STEP_FINISHED",
+                payload=json.dumps({"type": "STEP_FINISHED"}),
+                timestamp=2000,
+                created_at=datetime.now(),
+                id="e8",
+            ),
+        ]
+
+        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = events
+
+        steps = history_service._rebuild_steps_from_events("run-123")
+
+        assert len(steps) == 1
+        step = steps[0]
+        assert step["started_at_ts"] == 1000
+        assert step["thinking_start_ts"] == 1100
+        assert step["thinking_end_ts"] == 1500
+        assert step["finished_at_ts"] == 2000
+        assert step["thinking"] == "正在思考"
+        assert step["tool_calls"][0]["id"] == "tc-1"
+        assert step["tool_calls"][0]["started_at_ts"] == 1600
+        assert step["tool_calls"][0]["ended_at_ts"] == 1700
+        assert step["tool_results"][0]["tool_call_id"] == "tc-1"
+        assert step["tool_results"][0]["received_at_ts"] == 1900
+        assert step["tool_results"][0]["execution_time_ms"] == 230
+
 
 class TestHistoryServiceIntegration:
     """整合測試"""

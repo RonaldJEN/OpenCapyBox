@@ -47,6 +47,7 @@ export interface ToolGroupItem {
   filePath?: string;            // 文件操作的路径
   diffStats?: { added: number; removed: number };
   executionTimeMs?: number;
+  startTs?: number;
   status: 'running' | 'completed' | 'failed';
 }
 
@@ -238,9 +239,10 @@ export function transformToDisplayBlocks(
   const flushToolGroup = (isDone: boolean) => {
     if (pendingToolItems.length === 0) return;
 
-    const allCompleted = pendingToolStepsStatus.every(s => s === 'completed');
-    const anyFailed = pendingToolStepsStatus.some(s => s === 'failed');
-    const status: 'running' | 'completed' | 'failed' = anyFailed ? 'failed' : allCompleted ? 'completed' : 'running';
+    const anyRunningItem = pendingToolItems.some(item => item.status === 'running');
+    const anyFailed = pendingToolItems.some(item => item.status === 'failed') || pendingToolStepsStatus.some(s => s === 'failed');
+    const allCompleted = pendingToolItems.every(item => item.status === 'completed');
+    const status: 'running' | 'completed' | 'failed' = anyFailed ? 'failed' : (anyRunningItem || !allCompleted) ? 'running' : 'completed';
 
     // 计算主要工具类别（出现次数最多的类别，平局按优先级）
     const catCounts: Record<string, number> = {};
@@ -277,11 +279,9 @@ export function transformToDisplayBlocks(
 
     // 1. Thinking block
     if (step.thinking) {
-      // 如果之前累积了工具组，先 flush
-      const nextStepHasTools = step.tool_calls.length > 0;
-      if (!nextStepHasTools) {
-        flushToolGroup(true);
-      }
+      // 新 thinking 表示上一轮工具尝试已经结束；即使当前 step 同时会发起新工具，
+      // 也必须先切断旧工具组，避免两轮工具调用被合并到同一个 group。
+      flushToolGroup(true);
 
       const durationMs = (step.thinking_start_ts && step.thinking_end_ts)
         ? step.thinking_end_ts - step.thinking_start_ts
@@ -304,8 +304,8 @@ export function transformToDisplayBlocks(
         const filePath = extractFilePath(tc.name, tc.input);
         const diffStats = extractDiffStats(tc.name, tr);
 
-        const itemStatus: 'running' | 'completed' | 'failed' = 
-          tr ? (tr.success === false ? 'failed' : 'completed') : 'running';
+        const itemStatus: 'running' | 'completed' | 'failed' =
+          tr ? (tr.success === false ? 'failed' : 'completed') : (isStepStreaming ? 'running' : 'completed');
 
         pendingToolItems.push({
           description: getToolDescription(tc.name, tc.input),
@@ -315,14 +315,15 @@ export function transformToDisplayBlocks(
           filePath,
           diffStats,
           executionTimeMs: tr?.execution_time_ms,
+          startTs: tc.started_at_ts,
           status: itemStatus,
         });
       }
       pendingToolStepsStatus.push(step.status);
     }
 
-    // 3. Narrative (assistant_content with no tool_calls)
-    if (step.assistant_content && step.tool_calls.length === 0) {
+    // 3. Narrative
+    if (step.assistant_content) {
       flushToolGroup(true);
       // Narrative blocks are typically absorbed into final_response by Round.tsx.
       // We only emit them if streaming (preview of in-progress text).

@@ -93,12 +93,35 @@
   "step_number": 1,
   "thinking": "...",
   "assistant_content": "...",
-  "tool_calls": [{"name": "...", "input": {}}],
-  "tool_results": [{"success": true, "content": "...", "error": null}],
+  "tool_calls": [
+    {
+      "id": "...",
+      "name": "...",
+      "input": {},
+      "started_at_ts": 1710000000000,
+      "ended_at_ts": 1710000000100
+    }
+  ],
+  "tool_results": [
+    {
+      "tool_call_id": "...",
+      "success": true,
+      "content": "...",
+      "error": null,
+      "received_at_ts": 1710000000300,
+      "execution_time_ms": 200
+    }
+  ],
   "status": "...",
-  "created_at": "..."
+  "created_at": "...",
+  "thinking_start_ts": 1710000000000,
+  "thinking_end_ts": 1710000000100,
+  "started_at_ts": 1710000000000,
+  "finished_at_ts": 1710000000400
 }
 ```
+
+`*_ts` 字段均为 AG-UI 事件时间戳（毫秒），用于前端恢复历史时重建思考、工具调用和工具结果耗时；旧事件缺少对应时间戳时字段为 `null` 或省略。
 
 - Error 404
 

@@ -817,15 +817,24 @@ class SandboxSessionService:
             logger.warning("discover_sandbox_skills: find 命令失敗 (user=%s): %s", user_id, e)
             return []
 
+        async def _read_skill(skill_md_path: str):
+            content = await sandbox.files.read_file(skill_md_path)
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            return content
+
+        raw_results = await asyncio.gather(
+            *(_read_skill(skill_md_path) for skill_md_path in paths),
+            return_exceptions=True,
+        )
+
         results: list[dict] = []
-        for skill_md_path in paths:
-            try:
-                content = await sandbox.files.read_file(skill_md_path)
-                if isinstance(content, bytes):
-                    content = content.decode("utf-8", errors="replace")
-            except Exception as e:
-                logger.debug("discover_sandbox_skills: 讀取 %s 失敗: %s", skill_md_path, e)
+        for skill_md_path, raw in zip(paths, raw_results):
+            if isinstance(raw, BaseException):
+                logger.debug("discover_sandbox_skills: 讀取 %s 失敗: %s", skill_md_path, raw)
                 continue
+
+            content = raw
 
             name = self._extract_skill_name_from_skill_md(content)
             if not name:

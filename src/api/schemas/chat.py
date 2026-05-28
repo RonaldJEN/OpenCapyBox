@@ -87,15 +87,21 @@ class ResumeRequest(BaseModel):
 
 class ToolCall(BaseModel):
     """工具调用"""
+    id: Optional[str] = None
     name: str
     input: Dict[str, Any]
+    started_at_ts: Optional[int] = None
+    ended_at_ts: Optional[int] = None
 
 
 class ToolResult(BaseModel):
     """工具结果"""
+    tool_call_id: Optional[str] = None
     success: bool
     content: str
     error: Optional[str] = None
+    received_at_ts: Optional[int] = None
+    execution_time_ms: Optional[int] = None
 
 
 class StepData(BaseModel):
@@ -107,6 +113,10 @@ class StepData(BaseModel):
     tool_results: List[ToolResult] = Field(default_factory=list)
     status: str = "completed"
     created_at: Optional[str] = None
+    thinking_start_ts: Optional[int] = None
+    thinking_end_ts: Optional[int] = None
+    started_at_ts: Optional[int] = None
+    finished_at_ts: Optional[int] = None
 
 
 

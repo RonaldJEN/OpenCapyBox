@@ -9,7 +9,7 @@
 - 会话列表拉取与展示
 - 会话标题 + 讨论内容搜索
 - 新建 / 删除 / 切换会话
-- 启动时检测运行中会话集合并自动选中第一个运行中会话
+- App 启动时检测运行中会话集合，并仅在首次恢复时自动选中第一个运行中会话
 - 切换会话时通知下游组件（`ChatV2` 重新加载，`ModelSelector` 同步）
 
 **不职责**：
@@ -29,10 +29,12 @@ const [selectedModelId, setSelectedModelId] = useState<string>('');
 ## 3. 数据流
 
 ```
+App 挂载
+  → GET /api/sessions/running-sessions (reconcileRunningSessions, 立即一次 + 5s 周期)
+      → App 标记全部运行中 session 与 active slot，首次 reconcile 返回运行态且当前无 session 时自动 setCurrentSessionId(first)
+
 SessionList 挂载
   → GET /api/sessions/list             (loadSessions)
-  → GET /api/sessions/running-sessions (checkForRunningSessions, 仅首次)
-      → onRunningSessionsDetected(items) → App 标记全部运行中 session 与 active slot，必要时自动 setCurrentSessionId(first)
 
 用户输入搜索词
   → 300ms debounce
@@ -63,16 +65,18 @@ SessionList 挂载
 
 原因：避免大量空会话污染列表。
 
-### 4.2 运行中会话集合仅检测一次
+### 4.2 运行中会话集合由 App 统一收敛
 
-`checkForRunningSessions` 仅在 `SessionList` **首次挂载**且 `executingSessionIds.size === 0` 时执行。多次执行会在切会话时造成误跳。
+`SessionList` 不得请求 `/running-sessions`。运行态集合统一由 `App.reconcileRunningSessions` 维护：挂载后立即执行一次，之后 5s 周期执行。首次 reconcile 响应若返回运行态且 `currentSessionId` 为空时，可以自动选择第一个运行中会话；该自动选择机会只在首次 reconcile 响应中消耗一次。若首次响应为空，后续周期只同步运行态集合，不再自动切换当前会话，避免用户已在欢迎页或当前会话操作时被后台跳转打断。
 
 ```ts
 useEffect(() => {
-  if (executingSessionIds.size === 0 && onRunningSessionsDetected) {
-    checkForRunningSessions();
-  }
-}, []);  // 空依赖，仅挂载时
+  void reconcileRunningSessions();
+  const timer = setInterval(() => {
+    void reconcileRunningSessions();
+  }, RUNNING_SESSIONS_RECONCILE_INTERVAL_MS);
+  return () => clearInterval(timer);
+}, [reconcileRunningSessions]);
 ```
 
 ### 4.3 删除当前会话后清空
@@ -119,16 +123,16 @@ const handleExecutionEnd = (sessionId?: string) => {
 };
 ```
 
-`activeSlotSessionIds` 保存后端 `/running-sessions` 返回或本地已启动的运行 slot。本地发送 / resume 在 HTTP 响应通过后、`RUN_STARTED` 到达前也必须先加入该集合；429 等请求级拒绝不得加入。若 ChatV2 加载当前 session 历史时尚未看到 `running` round，但该 session 仍在 `activeSlotSessionIds` 中，必须保留执行标记并禁用输入；这表示 Agent 初始化窗口，不能误判为空闲。进入该分支后 ChatV2 必须短间隔探测 `/running-sessions`：slot 消失则清除执行态，slot 仍存在则重拉 history，直到看到 `running` round 并进入 `subscribeToRound` 订阅路径。
+`activeSlotSessionIds` 保存后端 `/running-sessions` 返回或本地已启动的运行 slot。本地发送 / resume 在 HTTP 响应通过后、`RUN_STARTED` 到达前也必须先加入该集合；429 等请求级拒绝不得加入。若 ChatV2 加载当前 session 历史时尚未看到 `running` round，但该 session 仍在 `activeSlotSessionIds` 中，必须保留执行标记并禁用输入；这表示 Agent 初始化窗口，不能误判为空闲。进入该分支后 ChatV2 必须短间隔检查最新 `activeSlotSessionIds` prop/ref：slot 消失则清除执行态，slot 仍存在则重拉 history，直到看到 `running` round 并进入 `subscribeToRound` 订阅路径。ChatV2 不得为该探测额外请求 `/running-sessions`。
 
-`App` 必须周期性 reconcile `/running-sessions`，只更新 `executingSessionIds` 与 `activeSlotSessionIds`，不得自动切换当前会话。该收敛用于清理非当前会话后台完成后的侧栏执行标记。
+`App` 必须立即并周期性 reconcile `/running-sessions`，更新 `executingSessionIds` 与 `activeSlotSessionIds`。除首次恢复运行态外，不得自动切换当前会话。该收敛用于清理非当前会话后台完成后的侧栏执行标记。
 
 ## 5. 轮询契约
 
 | 轮询 | 间隔 | 实现 |
 |---|---|---|
-| init-window 补偿探测 | 1.5s | `ChatV2` 在 active slot 但无 running round 时触发，直至订阅或清标记 |
-| running-sessions 后台收敛 | 5s | `App` 周期调用 `/running-sessions`，只同步运行态集合，不自动跳转 |
+| init-window 补偿探测 | 1.5s | `ChatV2` 在 active slot 但无 running round 时触发，通过最新 `activeSlotSessionIds` 判断是否重拉 history 或清标记 |
+| running-sessions 后台收敛 | 5s | `App` 立即并周期调用 `/running-sessions`，同步运行态集合；仅首次 reconcile 返回运行态且当前为空时可自动跳转 |
 | 会话列表刷新 | 30s | `SessionList` 内部 `setInterval` |
 | Cron 未读计数 | 60s | `App.tsx` 内部 `setInterval`，调用 `getUnreadCount` |
 
@@ -169,13 +173,14 @@ const handleExecutionEnd = (sessionId?: string) => {
 
 ## 9. 测试清单
 
-- [ ] 首次进入自动检测全部运行中会话，并切换到第一个运行中会话
+- [ ] 首次进入由 App 自动检测全部运行中会话，并切换到第一个运行中会话
 - [ ] 切换会话时 `ModelSelector` 同步到新会话的 model_id
 - [ ] 删除当前会话回到欢迎页
 - [ ] 欢迎页输入第一条消息才创建会话
 - [ ] A/B 多会话并行时，侧栏同时显示多个执行标记
 - [ ] 非当前会话后台完成后，周期收敛会清理对应执行标记
 - [ ] 本地 run 在 `RUN_STARTED` 前的 init-window 会保留执行标记；429 不污染执行标记
+- [ ] ChatV2 init-window 补偿探测不额外请求 `/running-sessions`
 - [ ] A 会话运行中切到 B 会话，A 的 `executingSessionIds` 标记不被误清
 - [ ] 30s 后列表自动刷新
 - [ ] 搜索输入 300ms 后调用 `getSessions(q)`

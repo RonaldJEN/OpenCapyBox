@@ -6,6 +6,7 @@
 - push_skills 文件上傳
 - 全局單例
 """
+import asyncio
 import pytest
 from pathlib import Path
 from types import SimpleNamespace
@@ -692,6 +693,41 @@ class TestDiscoverSandboxSkills:
         results = await service.discover_sandbox_skills("user-1")
         assert len(results) == 1
         assert results[0]["name"] == "good-skill"
+
+    @pytest.mark.asyncio
+    async def test_discover_sandbox_skills_reads_skill_files_concurrently(self, service, mock_sandbox):
+        """讀取多個 SKILL.md 時應並發發起沙箱文件請求"""
+        service._cache["user-1"] = mock_sandbox
+
+        exec_result = MagicMock()
+        exec_result.logs = MagicMock()
+        exec_result.logs.stdout = (
+            "/home/user/skills/first/SKILL.md\n"
+            "/home/user/skills/second/SKILL.md\n"
+        )
+        mock_sandbox.commands.run = AsyncMock(return_value=exec_result)
+
+        all_reads_started = asyncio.Event()
+        read_paths: list[str] = []
+
+        async def _read_file(path):
+            read_paths.append(path)
+            if len(read_paths) == 2:
+                all_reads_started.set()
+            await all_reads_started.wait()
+            if "first" in path:
+                return "---\nname: first-skill\ndescription: First\n---\ncontent"
+            return b"---\nname: second-skill\ndescription: Second\n---\ncontent"
+
+        mock_sandbox.files.read_file = AsyncMock(side_effect=_read_file)
+
+        results = await asyncio.wait_for(service.discover_sandbox_skills("user-1"), timeout=2)
+
+        assert read_paths == [
+            "/home/user/skills/first/SKILL.md",
+            "/home/user/skills/second/SKILL.md",
+        ]
+        assert [item["name"] for item in results] == ["first-skill", "second-skill"]
 
 
 # ============== read_sandbox_skill_content ==============

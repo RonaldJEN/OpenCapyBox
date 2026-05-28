@@ -269,50 +269,67 @@ class AgentPoolService:
             return 0
 
         mount = get_sandbox_mount_path()
-        synced = 0
+        sync_items = []
         for file_type, db_content in records.items():
             filename = FILE_TYPE_TO_FILENAME.get(file_type)
             if not filename:
                 continue
+            sync_items.append((file_type, filename, f"{mount}/{filename}", db_content))
 
-            path = f"{mount}/{filename}"
-            try:
-                if not force:
-                    sandbox_content = None
-                    try:
-                        sandbox_content = await sandbox.files.read_file(path)
-                    except Exception as read_err:
-                        status = (
-                            getattr(read_err, "status_code", None)
-                            or getattr(getattr(read_err, "response", None), "status_code", None)
-                            or getattr(read_err, "status", None)
-                        )
-                        if status == 404 or isinstance(read_err, FileNotFoundError):
-                            pass
-                        else:
-                            logger.warning("读取沙箱文件失败 (%s)，跳过同步: %s", filename, read_err)
-                            continue
+        write_items = sync_items
 
-                    if sandbox_content and sandbox_content.strip():
-                        if sandbox_content != db_content:
+        if not force:
+            read_results = await asyncio.gather(
+                *(sandbox.files.read_file(path) for _, _, path, _ in sync_items),
+                return_exceptions=True,
+            )
+            write_items = []
+            for (file_type, filename, path, db_content), sandbox_content in zip(sync_items, read_results):
+                if isinstance(sandbox_content, BaseException):
+                    status = (
+                        getattr(sandbox_content, "status_code", None)
+                        or getattr(getattr(sandbox_content, "response", None), "status_code", None)
+                        or getattr(sandbox_content, "status", None)
+                    )
+                    if status == 404 or isinstance(sandbox_content, FileNotFoundError):
+                        write_items.append((file_type, filename, path, db_content))
+                    else:
+                        logger.warning("读取沙箱文件失败 (%s)，跳过同步: %s", filename, sandbox_content)
+                    continue
+
+                if sandbox_content and sandbox_content.strip():
+                    if sandbox_content != db_content:
+                        try:
                             with SessionLocal() as db:
                                 try:
                                     MemoryService(db).upsert_memory_file(user_id, file_type, sandbox_content)
-                                    db.rollback()
+                                    db.commit()
                                 except Exception:
                                     db.rollback()
                                     raise
-                            logger.info(
-                                "沙箱优先：%s 已从沙箱回写 DB (%d chars)",
-                                filename,
-                                len(sandbox_content),
-                            )
-                        continue
+                        except Exception as e:
+                            logger.warning("同步记忆到沙箱失败 (%s): %s", filename, e)
+                            continue
+                        logger.info(
+                            "沙箱优先：%s 已从沙箱回写 DB (%d chars)",
+                            filename,
+                            len(sandbox_content),
+                        )
+                    continue
 
-                await sandbox.files.write_file(path, db_content)
-                synced += 1
-            except Exception as e:
-                logger.warning("同步记忆到沙箱失败 (%s): %s", filename, e)
+                write_items.append((file_type, filename, path, db_content))
+
+        write_results = await asyncio.gather(
+            *(sandbox.files.write_file(path, db_content) for _, _, path, db_content in write_items),
+            return_exceptions=True,
+        )
+
+        synced = 0
+        for (_, filename, _, _), write_result in zip(write_items, write_results):
+            if isinstance(write_result, BaseException):
+                logger.warning("同步记忆到沙箱失败 (%s): %s", filename, write_result)
+                continue
+            synced += 1
 
         return synced
 

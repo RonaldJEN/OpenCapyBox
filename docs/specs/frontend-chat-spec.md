@@ -38,8 +38,8 @@ StepData {
   step_number: number
   thinking?: string
   assistant_content?: string
-  tool_calls: ToolCall[]
-  tool_results: ToolResult[]
+  tool_calls: ToolCall[]       // { id?, name, input, started_at_ts?, ended_at_ts? }
+  tool_results: ToolResult[]   // { tool_call_id?, success, content, error?, received_at_ts?, execution_time_ms? }
   status: string
   created_at?: string
   thinking_start_ts?: number
@@ -162,8 +162,8 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 `transformToDisplayBlocks(steps: StepData[]): DisplayBlock[]`
 
 - `ThinkingBlock`：连续 `type === 'thinking'` 合并。
-- `ToolGroupBlock`：连续 `type === 'tool_call'` 合并（**跨 step**）。
-- `NarrativeBlock`：其他文本步骤。
+- `ToolGroupBlock`：连续工具调用合并（**跨 step**），但新的 `ThinkingBlock` 必须切断上一组工具调用；即使同一个 step 同时包含 thinking 与新的 tool_call，也不得把该 tool_call 合并进 thinking 之前的工具组。
+- `NarrativeBlock`：其他文本步骤。若流式正文与工具调用暂时落在同一个 step，前端也必须先结束当前 ToolGroupBlock，再按 NarrativeBlock 处理正文，避免正文到达后仍显示工具结果处理中。
 
 ### 7.2 工具描述
 
@@ -184,11 +184,14 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - 完成态：`Edited 2 files, read a file`
 - 运行态：`Reading src/app.py...`（Typewriter Preview）
 
-### 7.4 展开态
+### 7.4 活动入口与抽屉
 
-- ThinkingBlock：默认折叠，点击展开显示完整思考内容。
-- ToolGroupBlock：默认展开，完成后显示 `✓ Done` 标记。
-- ToolItem：hover 显示展开箭头，点击查看工具入参/结果。
+- ThinkingBlock / ThinkingGroupBlock：在单个 round 内聚合为一个思考入口，不按 step 或工具分隔重复渲染多个入口。
+  - 进行中：渲染醒目的 `正在思考` 卡片，显示实时耗时、当前最新 thinking 全文与 `查看活动` 入口；外部内容不得省略截断，末尾用流式闪烁点表示仍在生成。
+  - 完成态：渲染紧凑的 `已完成思考` 胶囊，显示整轮思考总耗时。
+  - 点击 `查看活动` 或完成态胶囊后打开右侧活动抽屉；不得在主聊天区展开 thinking 详情。
+- ToolGroupBlock：完成态不在主聊天区直接渲染；工具摘要、工具项、输入输出、`✓ Done` 标记均在活动抽屉内展示。若 round 没有 thinking 但存在已完成工具活动，主聊天区渲染紧凑的 `已完成活动` 入口，仅用于打开活动抽屉。只有 round 仍处于 streaming 时，最新 ToolGroupBlock 的未返回工具结果才可视为运行中；若最新 ToolGroupBlock 仍在运行且没有正在流式的 thinking，主聊天区必须显示 `正在调用工具` 活动态卡片和工具摘要。终态 round 中缺少 tool_result 的工具调用不得显示 `正在调用工具`。若工具已返回但 round 仍处于 streaming，且下一段 thinking/正文尚未到达，主聊天区必须显示 `正在处理工具结果` 活动态卡片，避免 think/tool 与下一段 think 之间的空窗期看起来已经完成。
+- ToolItem：在活动抽屉内 hover 显示展开箭头，点击查看工具入参/结果。
 
 ## 8. 附件上传
 

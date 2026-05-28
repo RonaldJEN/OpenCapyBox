@@ -350,11 +350,21 @@ class HistoryService:
         steps = []
         current_step = None
         current_tool_call = None
+
+        def event_timestamp(event_log, event_data: dict) -> int | None:
+            timestamp = getattr(event_log, "timestamp", None)
+            if isinstance(timestamp, (int, float)):
+                return int(timestamp)
+            payload_timestamp = event_data.get("timestamp")
+            if isinstance(payload_timestamp, (int, float)):
+                return int(payload_timestamp)
+            return None
         
         for event_log in events:
             try:
                 event_data = json.loads(event_log.payload)
                 event_type = event_log.event_type
+                timestamp = event_timestamp(event_log, event_data)
                 
                 if event_type == "STEP_STARTED":
                     # 开始新步骤
@@ -366,11 +376,16 @@ class HistoryService:
                         "tool_results": [],
                         "status": "running",
                         "created_at": event_log.created_at.isoformat() if event_log.created_at else None,
+                        "started_at_ts": timestamp,
                     }
                     steps.append(current_step)
                     
                 elif event_type == "STEP_FINISHED" and current_step:
                     current_step["status"] = "completed"
+                    current_step["finished_at_ts"] = timestamp
+
+                elif event_type == "THINKING_TEXT_MESSAGE_START" and current_step:
+                    current_step["thinking_start_ts"] = timestamp
                     
                 # === CONTENT delta 事件：累積內容（新格式 + 舊數據兼容）===
                 elif event_type == "THINKING_TEXT_MESSAGE_CONTENT" and current_step:
@@ -386,6 +401,7 @@ class HistoryService:
                     full_content = event_data.get("fullContent", "")
                     if full_content and not current_step["thinking"]:
                         current_step["thinking"] = full_content
+                    current_step["thinking_end_ts"] = timestamp
                     
                 elif event_type == "TEXT_MESSAGE_END" and current_step:
                     full_content = event_data.get("fullContent", "")
@@ -398,6 +414,7 @@ class HistoryService:
                         "id": event_data.get("toolCallId", ""),
                         "name": event_data.get("toolCallName", ""),
                         "input": "",
+                        "started_at_ts": timestamp,
                     }
                     
                 elif event_type == "TOOL_CALL_ARGS" and current_tool_call:
@@ -417,6 +434,7 @@ class HistoryService:
                     except (json.JSONDecodeError, TypeError):
                         # 解析失敗則包裝為 dict
                         current_tool_call["input"] = {"raw": current_tool_call["input"]}
+                    current_tool_call["ended_at_ts"] = timestamp
                     current_step["tool_calls"].append(current_tool_call)
                     current_tool_call = None
                     
@@ -429,6 +447,8 @@ class HistoryService:
                         "success": not is_error,
                         "content": result_content if isinstance(result_content, str) else json.dumps(result_content, ensure_ascii=False),
                         "error": result_content if is_error else None,
+                        "received_at_ts": timestamp,
+                        "execution_time_ms": event_data.get("executionTimeMs"),
                     }
                     current_step["tool_results"].append(result)
                     

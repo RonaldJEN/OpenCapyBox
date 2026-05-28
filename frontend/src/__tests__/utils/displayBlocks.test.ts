@@ -320,33 +320,33 @@ describe('transformToDisplayBlocks', () => {
     expect(tg.dominantCategory).toBe('edit');
   });
 
-  it('thinking + tool + thinking + tool 应生成交替 blocks', () => {
+  it('新 thinking 应切断上一轮工具组，即使当前 step 也会发起工具', () => {
     const steps = [
       makeStep({
         step_number: 1,
-        thinking: '第一次思考',
-        tool_calls: [{ name: 'bash', input: { command: 'ls' } }],
-        tool_results: [{ success: true, content: 'files' }],
+        tool_calls: [{ name: 'search_web', input: { query: '美伊局势 黄金价格 影响 2026年5月' } }],
+        tool_results: [{ success: false, content: '', error: 'Search failed:' }],
+        status: 'failed',
       }),
       makeStep({
         step_number: 2,
-        thinking: '第二次思考',
-        tool_calls: [{ name: 'bash', input: { command: 'cat a' } }],
-        tool_results: [{ success: true, content: 'content' }],
+        thinking: '搜索失败了，让我换个方式搜一下。',
+        tool_calls: [{ name: 'search_web', input: { query: 'gold price Iran US conflict impact 2026' } }],
+        tool_results: [],
+        status: 'streaming',
       }),
     ];
-    const blocks = transformToDisplayBlocks(steps);
+    const blocks = transformToDisplayBlocks(steps, true);
 
-    // 预期：thinking → toolGroup（合并两步bash）→ thinking（第二次）
-    // 但由于第二步同时有 thinking + tool_call，thinking 会先输出
-    // 然后两步的 tool_calls 会尝试合并
-    // 实际行为取决于 flush 逻辑
-
-    // 两个连续 thinking 会被合并为 thinkingGroup
-    const thinkingBlocks = blocks.filter(b => b.type === 'thinking');
-    const thinkingGroups = blocks.filter(b => b.type === 'thinkingGroup');
-    // 应至少有 thinking 或 thinkingGroup
-    expect(thinkingBlocks.length + thinkingGroups.length).toBeGreaterThanOrEqual(1);
+    expect(blocks).toHaveLength(3);
+    expect(blocks[0].type).toBe('toolGroup');
+    expect((blocks[0] as ToolGroupBlock).items).toHaveLength(1);
+    expect((blocks[0] as ToolGroupBlock).summary).toBe('Searched');
+    expect(blocks[1].type).toBe('thinking');
+    expect(blocks[2].type).toBe('toolGroup');
+    expect((blocks[2] as ToolGroupBlock).items).toHaveLength(1);
+    expect((blocks[2] as ToolGroupBlock).summary).toBe('Searched');
+    expect((blocks[2] as ToolGroupBlock).status).toBe('running');
   });
 
   it('多个连续 thinking 块应合并为 ThinkingGroupBlock', () => {
@@ -438,6 +438,20 @@ describe('transformToDisplayBlocks', () => {
     expect(tg.status).toBe('running');
   });
 
+  it('终态步骤中缺少结果的工具不应标记 running', () => {
+    const steps = [
+      makeStep({
+        tool_calls: [{ name: 'bash', input: { command: 'npm test' } }],
+        tool_results: [],
+        status: 'completed',
+      }),
+    ];
+    const blocks = transformToDisplayBlocks(steps, false);
+    const tg = blocks[0] as ToolGroupBlock;
+    expect(tg.items[0].status).toBe('completed');
+    expect(tg.status).toBe('completed');
+  });
+
   it('含 diff 统计的 edit 工具应提取 diffStats', () => {
     const steps = [
       makeStep({
@@ -484,6 +498,28 @@ describe('transformToDisplayBlocks', () => {
     expect(blocks[0].type).toBe('narrative');
     const nb = blocks[0] as { type: 'narrative'; content: string; isStreaming: boolean };
     expect(nb.content).toBe('正在生成回复...');
+    expect(nb.isStreaming).toBe(true);
+  });
+
+  it('同一 step 工具返回后流式正文应生成 NarrativeBlock', () => {
+    const steps = [
+      makeStep({
+        tool_calls: [{ name: 'search_web', input: { query: '黄金价格' } }],
+        tool_results: [{ success: true, content: 'result' }],
+        assistant_content: '正文已经开始流式输出。',
+        status: 'streaming',
+      }),
+    ];
+    const blocks = transformToDisplayBlocks(steps, true);
+
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0].type).toBe('toolGroup');
+    const tg = blocks[0] as ToolGroupBlock;
+    expect(tg.status).toBe('completed');
+    expect(tg.hasDone).toBe(true);
+    expect(blocks[1].type).toBe('narrative');
+    const nb = blocks[1] as { type: 'narrative'; content: string; isStreaming: boolean };
+    expect(nb.content).toBe('正文已经开始流式输出。');
     expect(nb.isStreaming).toBe(true);
   });
 

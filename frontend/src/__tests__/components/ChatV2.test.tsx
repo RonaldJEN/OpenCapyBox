@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { StrictMode } from 'react';
 import { render, screen, fireEvent, waitFor, act } from '../utils/test-utils';
 import { ChatV2 } from '../../components/ChatV2';
 import { apiService } from '../../services/api';
@@ -752,6 +753,79 @@ describe('ChatV2 组件', () => {
         expect.any(Object)
       );
     }, { timeout: 3000 });
+    expect(apiService.getRunningSessions).not.toHaveBeenCalled();
+  });
+
+  it('StrictMode 下并发历史加载只应保留最新 running 订阅', async () => {
+    const runningRounds: RoundData[] = [
+      {
+        round_id: 'round-strict-running',
+        user_message: '运行中',
+        final_response: '',
+        steps: [],
+        step_count: 0,
+        status: 'running',
+        created_at: new Date().toISOString(),
+      },
+    ];
+    const historyResponse = {
+      rounds: runningRounds,
+      session_id: 'test-session',
+      total: runningRounds.length,
+    };
+
+    let resolveFirstHistory!: (value: typeof historyResponse) => void;
+    let resolveLatestHistory!: (value: typeof historyResponse) => void;
+    const firstHistory = new Promise<typeof historyResponse>((resolve) => {
+      resolveFirstHistory = resolve;
+    });
+    const latestHistory = new Promise<typeof historyResponse>((resolve) => {
+      resolveLatestHistory = resolve;
+    });
+
+    let historyCallCount = 0;
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(() => {
+      historyCallCount += 1;
+      return historyCallCount === 1 ? firstHistory : latestHistory;
+    });
+    vi.mocked(apiService.subscribeToRound).mockReturnValue({
+      abort: vi.fn(),
+      promise: new Promise(() => {}),
+    } as any);
+
+    render(
+      <StrictMode>
+        <ChatV2
+          sessionId="test-session"
+          {...defaultProps}
+        />
+      </StrictMode>
+    );
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(2);
+    });
+
+    await act(async () => {
+      resolveLatestHistory(historyResponse);
+      await latestHistory;
+    });
+
+    await waitFor(() => {
+      expect(apiService.subscribeToRound).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      resolveFirstHistory(historyResponse);
+      await firstHistory;
+    });
+
+    expect(apiService.subscribeToRound).toHaveBeenCalledTimes(1);
+    expect(apiService.subscribeToRound).toHaveBeenCalledWith(
+      'test-session',
+      'round-strict-running',
+      expect.any(Object)
+    );
   });
 
   it('handleStop 应该立即更新 UI 状态而不等待 SSE', async () => {

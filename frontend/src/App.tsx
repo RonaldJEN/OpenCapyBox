@@ -9,7 +9,7 @@ import CronSchedule from './components/CronSchedule';
 import SkillManager from './components/SkillManager';
 import { apiService } from './services/api';
 import { getUnreadCount } from './services/configApi';
-import type { ModelInfo, RunningSessionInfo } from './types';
+import type { ModelInfo } from './types';
 
 type ConfigPanel = 'config' | 'skills' | 'cron' | null;
 type SessionScrollTarget = {
@@ -38,6 +38,9 @@ function HomePage() {
   const [cronUnreadCount, setCronUnreadCount] = useState(0);
   const [sessionScrollTarget, setSessionScrollTarget] = useState<SessionScrollTarget | null>(null);
   const sessionScrollNonceRef = useRef(0);
+  const currentSessionIdRef = useRef(currentSessionId);
+  const initialRunningSessionsHandledRef = useRef(false);
+  currentSessionIdRef.current = currentSessionId;
 
   const closeConfigPanel = useCallback(() => {
     setActivePanel(null);
@@ -129,7 +132,8 @@ function HomePage() {
   const reconcileRunningSessions = useCallback(async () => {
     try {
       const result = await apiService.getRunningSessions();
-      const nextSessionIds = new Set(result.running_sessions.map((item) => item.session_id));
+      const sessionIds = result.running_sessions.map((item) => item.session_id);
+      const nextSessionIds = new Set(sessionIds);
 
       setExecutingSessionIds((prev) => (
         sameStringSet(prev, nextSessionIds) ? prev : new Set(nextSessionIds)
@@ -137,44 +141,28 @@ function HomePage() {
       setActiveSlotSessionIds((prev) => (
         sameStringSet(prev, nextSessionIds) ? prev : new Set(nextSessionIds)
       ));
+
+      if (!initialRunningSessionsHandledRef.current) {
+        initialRunningSessionsHandledRef.current = true;
+        if (!currentSessionIdRef.current && sessionIds.length > 0) {
+          console.log(`🔄 检测到运行中的会话: ${sessionIds.join(', ')}`);
+          setCurrentSessionId(sessionIds[0]);
+          setSessionScrollTarget(null);
+        }
+      }
     } catch (error) {
       console.error('Failed to reconcile running sessions:', error);
     }
   }, []);
 
   useEffect(() => {
+    void reconcileRunningSessions();
     const timer = setInterval(() => {
       void reconcileRunningSessions();
     }, RUNNING_SESSIONS_RECONCILE_INTERVAL_MS);
 
     return () => clearInterval(timer);
   }, [reconcileRunningSessions]);
-
-  // 🆕 处理检测到运行中会话的回调
-  const handleRunningSessionsDetected = (runningSessions: RunningSessionInfo[]) => {
-    const sessionIds = runningSessions.map((item) => item.session_id);
-    if (sessionIds.length === 0) return;
-
-    console.log(`🔄 检测到运行中的会话: ${sessionIds.join(', ')}`);
-    setExecutingSessionIds((prev) => {
-      const next = new Set(prev);
-      for (const sessionId of sessionIds) {
-        next.add(sessionId);
-      }
-      return next;
-    });
-    setActiveSlotSessionIds((prev) => {
-      const next = new Set(prev);
-      for (const sessionId of sessionIds) {
-        next.add(sessionId);
-      }
-      return next;
-    });
-    // 自动选择第一个运行中会话，让用户能看到运行状态
-    if (!currentSessionId) {
-      setCurrentSessionId(sessionIds[0]);
-    }
-  };
 
   // 🆕 从 ChatV2 欢迎页触发创建会话（输入即创建）
   const handleCreateSessionForChat = useCallback(async (modelId?: string): Promise<string> => {
@@ -192,7 +180,6 @@ function HomePage() {
         onSessionSelect={handleSessionSelect}
         refreshTrigger={refreshTrigger}
         executingSessionIds={executingSessionIds}
-        onRunningSessionsDetected={handleRunningSessionsDetected}
         isCollapsed={isSidebarCollapsed}
         onModelChange={setSelectedModelId}
         onNewChat={() => {

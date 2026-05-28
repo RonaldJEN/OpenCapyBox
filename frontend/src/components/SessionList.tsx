@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
-import type { RunningSessionInfo, Session } from '../types';
+import type { Session } from '../types';
 import { MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Zap, Clock, Search, X } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
@@ -11,7 +11,6 @@ interface SessionListProps {
   onSessionSelect: (sessionId: string, target?: { roundId: string }) => void;
   refreshTrigger?: number;
   executingSessionIds?: Set<string>;
-  onRunningSessionsDetected?: (runningSessions: RunningSessionInfo[]) => void;
   isCollapsed?: boolean;
   onModelChange?: (modelId: string) => void;
   onNewChat?: () => void;
@@ -21,7 +20,7 @@ interface SessionListProps {
   onOpenCron?: () => void;
 }
 
-export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionIds, onRunningSessionsDetected, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenSkills, onOpenCron }: SessionListProps) {
+export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionIds, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenSkills, onOpenCron }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -52,14 +51,6 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     return () => clearInterval(timer);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 檢測運行中的會話 — 僅首次掛載時執行一次
-  useEffect(() => {
-    if ((executingSessionIds?.size ?? 0) === 0 && onRunningSessionsDetected) {
-      checkForRunningSessions();
-    }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-
   const loadSessions = async (query = debouncedSearchQueryRef.current) => {
     const requestSeq = ++searchRequestSeqRef.current;
     const normalizedQuery = query.trim();
@@ -79,18 +70,6 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
         setLoading(false);
         setSearchLoading(false);
       }
-    }
-  };
-
-  const checkForRunningSessions = async () => {
-    try {
-      const result = await apiService.getRunningSessions();
-      if (result.running_sessions.length > 0) {
-        console.log(`[SessionList] 检测到运行中的会话: ${result.running_sessions.map((item) => item.session_id).join(', ')}`);
-        onRunningSessionsDetected?.(result.running_sessions);
-      }
-    } catch (error) {
-      console.error('Failed to check running sessions:', error);
     }
   };
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { StepData } from '../types';
 import {
   ChevronDown,
@@ -16,6 +16,7 @@ import {
   BookOpen,
   CheckCircle2,
   Info,
+  X,
   Zap,
 } from 'lucide-react';
 import {
@@ -25,7 +26,6 @@ import {
   getToolCategory,
   type DisplayBlock,
   type ThinkingBlock,
-  type ThinkingGroupBlock,
   type ToolGroupBlock,
   type ToolGroupItem,
 } from '../utils/displayBlocks';
@@ -65,169 +65,411 @@ export function ReasoningPanel({ steps, isStreaming = false, isCompleted: _isCom
     );
   }
 
+  const activityBlocks = blocks.filter((block) => block.type !== 'narrative');
+
+  if (activityBlocks.length === 0) {
+    return null;
+  }
+
   return (
     <div className={`space-y-1 ${disableMotion ? '' : 'animate-fade-in'}`}>
-      {blocks.map((block, idx) => (
-        <BlockRenderer
-          key={`${block.type}-${idx}`}
-          block={block}
-          isLast={idx === blocks.length - 1}
-          isStreaming={isStreaming}
-          disableMotion={disableMotion}
-        />
-      ))}
+      <ActivityOverview
+        blocks={activityBlocks}
+        lastDisplayBlock={blocks[blocks.length - 1]}
+        isStreaming={isStreaming}
+        disableMotion={disableMotion}
+      />
     </div>
   );
 }
 
-// ─── Block Dispatcher ────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// ActivityOverview — 主聊天区只渲染一个活动入口
+// ═════════════════════════════════════════════════════════════════════════════
 
-function BlockRenderer({ block, isLast, isStreaming, disableMotion }: {
-  block: DisplayBlock;
-  isLast: boolean;
+function ActivityOverview({ blocks, lastDisplayBlock, isStreaming, disableMotion }: {
+  blocks: DisplayBlock[];
+  lastDisplayBlock: DisplayBlock;
   isStreaming: boolean;
   disableMotion: boolean;
 }) {
-  switch (block.type) {
-    case 'thinking':
-      return <ThinkingBlockView block={block} disableMotion={disableMotion} />;
-    case 'thinkingGroup':
-      return <ThinkingGroupBlockView block={block} disableMotion={disableMotion} />;
-    case 'toolGroup':
-      return <ToolGroupBlockView block={block} isLast={isLast} isStreaming={isStreaming} disableMotion={disableMotion} />;
-    case 'narrative':
-      return null; // Narrative rendered by Round.tsx via final_response
-    default:
-      return null;
-  }
-}
+  const [isActivityOpen, setIsActivityOpen] = useState(false);
+  const items = collectThinkingItems(blocks);
+  const activeItem = [...items].reverse().find((item) => item.isStreaming);
+  const activeToolGroup = isStreaming ? [...blocks].reverse().find(
+    (block): block is ToolGroupBlock => block.type === 'toolGroup' && block.status === 'running'
+  ) : undefined;
+  const waitingToolGroup = isStreaming && !activeItem && !activeToolGroup && lastDisplayBlock.type === 'toolGroup'
+    ? lastDisplayBlock
+    : undefined;
+  const previewItem = activeItem || items[items.length - 1];
+  const activeToolStartTs = activeToolGroup ? getRunningToolStartTs(activeToolGroup) : undefined;
+  const waitingStartTs = waitingToolGroup ? getLastToolCompletionTs(waitingToolGroup) : undefined;
+  const liveDuration = useLiveDuration(!!activeItem, activeItem?.startTs);
+  const liveToolDuration = useLiveDuration(!activeItem && !!activeToolGroup, activeToolStartTs);
+  const liveWaitingDuration = useLiveDuration(!!waitingToolGroup, waitingStartTs);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ThinkingGroupBlock — 合并多个连续思考块，可折叠显示
-// ═════════════════════════════════════════════════════════════════════════════
-
-function ThinkingGroupBlockView({ block, disableMotion }: { block: ThinkingGroupBlock; disableMotion: boolean }) {
-  const [isExpanded, setIsExpanded] = useState(false);
-  const [liveDuration, setLiveDuration] = useState(0);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // 实时计时器（针对组内最后一个正在流式的 item，1s 间隔足够秒级显示）
-  const lastItem = block.items[block.items.length - 1];
-  useEffect(() => {
-    if (lastItem.isStreaming && lastItem.startTs) {
-      const id = setInterval(() => {
-        setLiveDuration(Date.now() - lastItem.startTs!);
-      }, 1000);
-      intervalRef.current = id;
-      return () => { clearInterval(id); intervalRef.current = null; };
-    }
-    // 非流式时确保清理
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-  }, [lastItem.isStreaming, lastItem.startTs]);
-
-  const count = block.items.length;
-  const totalMs = block.hasStreaming
-    ? (block.totalDurationMs || 0) + liveDuration
-    : block.totalDurationMs;
+  const totalDurationMs = getActivityDurationMs(blocks);
+  const totalMs = activeItem
+    ? totalDurationMs + liveDuration
+    : activeToolGroup
+      ? totalDurationMs + liveToolDuration
+      : waitingToolGroup
+        ? totalDurationMs + liveWaitingDuration
+      : totalDurationMs;
   const durationText = totalMs ? formatDuration(totalMs) : undefined;
+  const stepCount = countActivitySteps(blocks);
 
-  const headerText = block.hasStreaming
-    ? `思考中 ${count}次${durationText ? ` (${durationText})` : ''}...`
-    : `思考 ${count}次${durationText ? ` (${durationText})` : ''}`;
+  if (activeItem) {
+    return (
+      <>
+        <ActiveThinkingCard
+          content={previewItem.content}
+          durationText={durationText}
+          onOpenActivity={() => setIsActivityOpen(true)}
+          disableMotion={disableMotion}
+        />
+        <ActivityDrawer
+          isOpen={isActivityOpen}
+          onClose={() => setIsActivityOpen(false)}
+          blocks={blocks}
+          stepCount={stepCount}
+          durationText={durationText}
+          disableMotion={disableMotion}
+        />
+      </>
+    );
+  }
+
+  if (activeToolGroup) {
+    return (
+      <>
+        <ActiveToolCard
+          summary={activeToolGroup.summary}
+          durationText={durationText}
+          onOpenActivity={() => setIsActivityOpen(true)}
+          disableMotion={disableMotion}
+        />
+        <ActivityDrawer
+          isOpen={isActivityOpen}
+          onClose={() => setIsActivityOpen(false)}
+          blocks={blocks}
+          stepCount={stepCount}
+          durationText={durationText}
+          disableMotion={disableMotion}
+        />
+      </>
+    );
+  }
+
+  if (waitingToolGroup) {
+    return (
+      <>
+        <ActiveWaitingCard
+          summary={waitingToolGroup.summary}
+          durationText={durationText}
+          onOpenActivity={() => setIsActivityOpen(true)}
+          disableMotion={disableMotion}
+        />
+        <ActivityDrawer
+          isOpen={isActivityOpen}
+          onClose={() => setIsActivityOpen(false)}
+          blocks={blocks}
+          stepCount={stepCount}
+          durationText={durationText}
+          disableMotion={disableMotion}
+        />
+      </>
+    );
+  }
 
   return (
-    <div className={disableMotion ? '' : 'animate-fade-in'}>
+    <>
       <button
         type="button"
-        onClick={() => setIsExpanded(!isExpanded)}
-        className="inline-flex items-center gap-1.5 text-sm text-claude-secondary hover:text-claude-text transition-colors py-1 group"
+        onClick={() => setIsActivityOpen(true)}
+        className="inline-flex items-center gap-1.5 rounded-full border border-claude-border bg-white/70 px-3 py-1 text-sm text-claude-secondary shadow-sm transition-colors hover:border-claude-border-strong hover:bg-white hover:text-claude-text group"
       >
-        {block.hasStreaming ? (
-          <Loader2 size={13} className="text-claude-muted animate-spin flex-shrink-0" />
-        ) : (
-          <Lightbulb size={13} className="text-claude-muted flex-shrink-0" />
-        )}
-        <span className="font-medium">{headerText}</span>
+        <Lightbulb size={13} className="text-claude-muted flex-shrink-0" />
+        <span className="font-medium">{getCompletedActivityLabel(items.length > 0, durationText)}</span>
         <ChevronRight
           size={12}
-          className={`text-claude-muted transition-transform duration-200 ${isExpanded ? 'rotate-90' : ''}`}
+          className="text-claude-muted transition-transform duration-200 group-hover:translate-x-0.5"
         />
       </button>
+      <ActivityDrawer
+        isOpen={isActivityOpen}
+        onClose={() => setIsActivityOpen(false)}
+        blocks={blocks}
+        stepCount={stepCount}
+        durationText={durationText}
+        disableMotion={disableMotion}
+      />
+    </>
+  );
+}
 
-      {isExpanded && (
-        <div className={`ml-5 mt-0.5 space-y-0.5 ${disableMotion ? '' : 'animate-fade-in'}`}>
-          {block.items.map((item, idx) => (
-            <ThinkingBlockView key={idx} block={item} disableMotion={disableMotion} />
-          ))}
+function ActiveWaitingCard({ summary, durationText, onOpenActivity, disableMotion }: {
+  summary: string;
+  durationText?: string;
+  onOpenActivity: () => void;
+  disableMotion: boolean;
+}) {
+  return (
+    <div className={`my-2 rounded-xl border border-claude-border bg-white/75 px-4 py-3 shadow-sm ${disableMotion ? '' : 'animate-fade-in'}`}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2 text-sm">
+          <Loader2 size={14} className="shrink-0 animate-spin text-claude-muted" />
+          <span className="font-medium text-claude-text">正在处理工具结果</span>
+          {durationText && <span className="text-claude-muted">{durationText}</span>}
         </div>
-      )}
+
+        <button
+          type="button"
+          onClick={onOpenActivity}
+          className="inline-flex shrink-0 items-center gap-1 rounded-full border border-claude-border bg-claude-bg px-2.5 py-1 text-xs font-medium text-claude-secondary transition-colors hover:border-claude-border-strong hover:bg-white hover:text-claude-text"
+        >
+          <span>查看活动</span>
+          <ChevronRight size={12} />
+        </button>
+      </div>
+
+      <div className="mt-3 border-l-2 border-claude-border pl-3 text-[15px] leading-relaxed text-claude-text">
+        {summary || '等待模型继续'}
+        <span className={`ml-1 inline-block text-claude-accent ${disableMotion ? '' : 'animate-pulse'}`}>_</span>
+      </div>
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ThinkingBlock — "思考 3s >"
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function ThinkingBlockView({ block, disableMotion }: { block: ThinkingBlock; disableMotion: boolean }) {
-  const [isExpanded, setIsExpanded] = useState(false);
-  const [liveDuration, setLiveDuration] = useState(0);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // 实时计时器（1s 间隔足够秒级显示）
-  useEffect(() => {
-    if (block.isStreaming && block.startTs) {
-      const id = setInterval(() => {
-        setLiveDuration(Date.now() - block.startTs!);
-      }, 1000);
-      intervalRef.current = id;
-      return () => { clearInterval(id); intervalRef.current = null; };
-    }
-    // 非流式时确保清理
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-  }, [block.isStreaming, block.startTs]);
-
-  const durationMs = block.durationMs || (block.isStreaming ? liveDuration : undefined);
-  const durationText = durationMs ? formatDuration(durationMs) : undefined;
-
-  const headerText = block.isStreaming
-    ? `思考中${durationText ? ` ${durationText}` : ''}...`
-    : `思考${durationText ? ` ${durationText}` : ''}`;
-
+function ActiveToolCard({ summary, durationText, onOpenActivity, disableMotion }: {
+  summary: string;
+  durationText?: string;
+  onOpenActivity: () => void;
+  disableMotion: boolean;
+}) {
   return (
-    <div className={disableMotion ? '' : 'animate-fade-in'}>
-      <button
-        type="button"
-        onClick={() => setIsExpanded(!isExpanded)}
-        className="inline-flex items-center gap-1.5 text-sm text-claude-secondary hover:text-claude-text transition-colors py-1 group"
-      >
-        {block.isStreaming ? (
-          <Loader2 size={13} className="text-claude-muted animate-spin flex-shrink-0" />
-        ) : (
-          <Lightbulb size={13} className="text-claude-muted flex-shrink-0" />
-        )}
-        <span className="font-medium">{headerText}</span>
-        <ChevronRight
-          size={12}
-          className={`text-claude-muted transition-transform duration-200 ${isExpanded ? 'rotate-90' : ''}`}
-        />
-      </button>
-
-      {isExpanded && (
-        <div className={`mt-1 mb-2 ml-5 ${disableMotion ? '' : 'animate-fade-in'}`}>
-          <p className="text-sm text-claude-secondary leading-relaxed border-l-2 border-claude-accent/30 pl-3 py-1.5 whitespace-pre-wrap">
-            {block.content}
-          </p>
+    <div className={`my-2 rounded-xl border border-claude-border bg-white/75 px-4 py-3 shadow-sm ${disableMotion ? '' : 'animate-fade-in'}`}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2 text-sm">
+          <Loader2 size={14} className="shrink-0 animate-spin text-claude-muted" />
+          <span className="font-medium text-claude-text">正在调用工具</span>
+          {durationText && <span className="text-claude-muted">{durationText}</span>}
         </div>
-      )}
+
+        <button
+          type="button"
+          onClick={onOpenActivity}
+          className="inline-flex shrink-0 items-center gap-1 rounded-full border border-claude-border bg-claude-bg px-2.5 py-1 text-xs font-medium text-claude-secondary transition-colors hover:border-claude-border-strong hover:bg-white hover:text-claude-text"
+        >
+          <span>查看活动</span>
+          <ChevronRight size={12} />
+        </button>
+      </div>
+
+      <div className="mt-3 border-l-2 border-claude-border pl-3 text-[15px] leading-relaxed text-claude-text">
+        {summary || '等待工具返回'}
+        <span className={`ml-1 inline-block text-claude-accent ${disableMotion ? '' : 'animate-pulse'}`}>_</span>
+      </div>
     </div>
   );
+}
+
+function ActiveThinkingCard({ content, durationText, onOpenActivity, disableMotion }: {
+  content: string;
+  durationText?: string;
+  onOpenActivity: () => void;
+  disableMotion: boolean;
+}) {
+  return (
+    <div className={`my-2 rounded-xl border border-claude-border bg-white/75 px-4 py-3 shadow-sm ${disableMotion ? '' : 'animate-fade-in'}`}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2 text-sm">
+          <span className={`h-2 w-2 rounded-full bg-claude-accent ${disableMotion ? '' : 'animate-dot-pulse'}`} />
+          <span className="font-medium text-claude-text">正在思考</span>
+          {durationText && <span className="text-claude-muted">{durationText}</span>}
+        </div>
+
+        <button
+          type="button"
+          onClick={onOpenActivity}
+          className="inline-flex shrink-0 items-center gap-1 rounded-full border border-claude-border bg-claude-bg px-2.5 py-1 text-xs font-medium text-claude-secondary transition-colors hover:border-claude-border-strong hover:bg-white hover:text-claude-text"
+        >
+          <span>查看活动</span>
+          <ChevronRight size={12} />
+        </button>
+      </div>
+
+      <div className="mt-3 border-l-2 border-claude-accent/40 pl-3 text-[15px] leading-relaxed text-claude-text whitespace-pre-wrap">
+        {content}
+        <span className={`ml-1 inline-block text-claude-accent ${disableMotion ? '' : 'animate-pulse'}`}>_</span>
+      </div>
+    </div>
+  );
+}
+
+function ActivityDrawer({ isOpen, onClose, blocks, stepCount, durationText, disableMotion }: {
+  isOpen: boolean;
+  onClose: () => void;
+  blocks: DisplayBlock[];
+  stepCount: number;
+  durationText?: string;
+  disableMotion: boolean;
+}) {
+  if (!isOpen) return null;
+
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-30 bg-black/20 backdrop-blur-[2px]"
+        onClick={onClose}
+        aria-hidden="true"
+      />
+      <aside className={`fixed right-0 top-0 bottom-0 z-40 w-[460px] max-w-[calc(100vw-24px)] border-l border-claude-border bg-claude-bg shadow-2xl ${disableMotion ? '' : 'animate-slide-in-right'}`}>
+        <div className="flex h-full flex-col">
+          <div className="flex items-center justify-between border-b border-claude-border px-5 py-4">
+            <div className="min-w-0 text-sm text-claude-secondary">
+              <span className="font-semibold text-claude-text">活动</span>
+              <span className="mx-1">·</span>
+              <span>共 {stepCount} 步</span>
+              {durationText && <span> · {durationText}</span>}
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-full p-1.5 text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text"
+              aria-label="关闭活动"
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto px-5 py-4">
+            <ActivityBlockList blocks={blocks} disableMotion={disableMotion} />
+          </div>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function ActivityBlockList({ blocks, disableMotion }: { blocks: DisplayBlock[]; disableMotion: boolean }) {
+  return (
+    <div className="space-y-4">
+      {blocks.map((block, index) => {
+        if (block.type === 'thinking') {
+          return <ActivityThinkingItem key={`thinking-${index}`} item={block} />;
+        }
+        if (block.type === 'thinkingGroup') {
+          return block.items.map((item, itemIndex) => (
+            <ActivityThinkingItem key={`thinking-group-${index}-${itemIndex}`} item={item} />
+          ));
+        }
+        if (block.type === 'toolGroup') {
+          return <ToolGroupBlockView key={`tool-${index}`} block={block} isLast={false} isStreaming={false} disableMotion={disableMotion} />;
+        }
+        return null;
+      })}
+    </div>
+  );
+}
+
+function ActivityThinkingItem({ item }: { item: ThinkingBlock }) {
+  const title = getThinkingTitle(item.content);
+  const durationText = item.durationMs ? formatDuration(item.durationMs) : undefined;
+
+  return (
+    <div className="flex gap-3">
+      <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-claude-accent" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between gap-3 text-sm">
+          <span className="font-medium text-claude-text truncate">{title}</span>
+          {durationText && <span className="shrink-0 text-xs text-claude-muted">{durationText}</span>}
+        </div>
+        <p className="mt-1 text-sm leading-relaxed text-claude-secondary whitespace-pre-wrap">
+          {item.content}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function useLiveDuration(isStreaming: boolean, startTs?: number): number {
+  const [liveDuration, setLiveDuration] = useState(0);
+
+  useEffect(() => {
+    if (!isStreaming || !startTs) {
+      setLiveDuration(0);
+      return;
+    }
+
+    const updateLiveDuration = () => setLiveDuration(Date.now() - startTs);
+    updateLiveDuration();
+    const intervalId = setInterval(updateLiveDuration, 1000);
+    return () => clearInterval(intervalId);
+  }, [isStreaming, startTs]);
+
+  return liveDuration;
+}
+
+function collectThinkingItems(blocks: DisplayBlock[]): ThinkingBlock[] {
+  const items: ThinkingBlock[] = [];
+  for (const block of blocks) {
+    if (block.type === 'thinking') {
+      items.push(block);
+    } else if (block.type === 'thinkingGroup') {
+      items.push(...block.items);
+    }
+  }
+  return items;
+}
+
+function countActivitySteps(blocks: DisplayBlock[]): number {
+  let count = 0;
+  for (const block of blocks) {
+    if (block.type === 'thinking') {
+      count += 1;
+    } else if (block.type === 'thinkingGroup') {
+      count += block.items.length;
+    } else if (block.type === 'toolGroup') {
+      count += block.items.length;
+    }
+  }
+  return count;
+}
+
+function getActivityDurationMs(blocks: DisplayBlock[]): number {
+  let totalMs = 0;
+  for (const block of blocks) {
+    if (block.type === 'thinking') {
+      totalMs += block.durationMs || 0;
+    } else if (block.type === 'thinkingGroup') {
+      totalMs += block.items.reduce((sum, item) => sum + (item.durationMs || 0), 0);
+    } else if (block.type === 'toolGroup') {
+      totalMs += block.items.reduce((sum, item) => sum + (item.executionTimeMs || 0), 0);
+    }
+  }
+  return totalMs;
+}
+
+function getRunningToolStartTs(block: ToolGroupBlock): number | undefined {
+  return [...block.items].reverse().find((item) => item.status === 'running' && item.startTs)?.startTs;
+}
+
+function getLastToolCompletionTs(block: ToolGroupBlock): number | undefined {
+  return [...block.items].reverse().find((item) => item.result?.received_at_ts)?.result?.received_at_ts;
+}
+
+function getThinkingTitle(content: string): string {
+  const firstLine = content.split('\n').map((line) => line.trim()).find(Boolean) || '思考中';
+  const punctuationIndex = firstLine.search(/[，。！？；：,.!?;:]/);
+  const title = punctuationIndex > 0 ? firstLine.slice(0, punctuationIndex) : firstLine;
+  return title.length > 28 ? `${title.slice(0, 28)}...` : title;
+}
+
+function getCompletedActivityLabel(hasThinking: boolean, durationText?: string): string {
+  const durationPart = durationText ? ` ${durationText}` : '';
+  return `${hasThinking ? '已完成思考' : '已完成活动'}${durationPart}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

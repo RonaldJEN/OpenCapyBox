@@ -27,7 +27,7 @@
 #
 # ============================================================
 
-default_model: mimo-v2.5-pro
+default_model: mimo
 cron_default_model: glm  # Cron 任务默认模型（不配置思考）
 
 models:
@@ -163,12 +163,12 @@ models:
     max_videos: 0
     enabled: true
     tags: [thinking]
-  mimo-v2.5-pro:
-    display_name: "mimo-v2.5-pro"
+  mimo:
+    display_name: "mimo-v2.5"
     provider: openai
     api_base: "https://api.xiaomimimo.com/v1"
     api_key: "${XIAOMI_KEY}"
-    model_name: "mimo-v2.5-pro"
+    model_name: "mimo-v2-flash"
     max_tokens: 32768
     context_window: 102400
     reasoning_format: reasoning_content

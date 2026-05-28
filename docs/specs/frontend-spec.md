@@ -182,12 +182,13 @@
 - `transformToDisplayBlocks`：`StepData[]` → `DisplayBlock[]`（ThinkingBlock / ToolGroupBlock / NarrativeBlock）。
 - **跨 step 合并**：连续工具调用步骤合并为一个 ToolGroupBlock。
 - **分组摘要**：`getGroupSummary()` 生成 "Edited 2 files, read a file" 风格。
+- 主聊天区只显示一个思考/活动入口；工具调用和完整思考详情通过右侧覆盖式活动抽屉查看。
 - 外层**无边框容器**，不使用 `rounded-xl border` 包裹整个面板。
 
 ### 5.10 文字语言约定
 
 - 工具描述、摘要、技术术语：**英文**（"Read src/app.py"、"Edited 2 files"、"Done"）。
-- UI 标签、提示、按钮：**中文**（"思考 3s"、"正在分析请求..."、"输入"、"输出"）。
+- UI 标签、提示、按钮：**中文**（"正在思考"、"已完成思考 3s"、"正在分析请求..."、"输入"、"输出"）。
 
 ### 5.11 交互微动效
 
