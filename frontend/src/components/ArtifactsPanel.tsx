@@ -20,9 +20,11 @@ interface ArtifactsPanelProps {
   sessionId: string;
   isOpen: boolean;
   onClose: () => void;
+  targetFile?: FileInfo | null;
+  targetFileNonce?: number;
 }
 
-export function ArtifactsPanel({ sessionId, isOpen, onClose }: ArtifactsPanelProps) {
+export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetFileNonce }: ArtifactsPanelProps) {
   const [isMounted, setIsMounted] = useState(isOpen);
   const [items, setItems] = useState<FileInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -48,6 +50,17 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose }: ArtifactsPanelPro
       setSelectedFile(null);
     }
   }, [isOpen, sessionId]);
+
+  useEffect(() => {
+    if (isOpen && sessionId && targetFile) {
+      const normalizedTarget = normalizeTargetFile(targetFile);
+      const parentPath = getParentPath(normalizedTarget.path);
+      setCurrentPath(parentPath);
+      setPathHistory([parentPath]);
+      setHistoryIndex(0);
+      setSelectedFile(normalizedTarget);
+    }
+  }, [isOpen, sessionId, targetFile, targetFileNonce]);
 
   // currentPath 变化时加载目录
   const loadDir = useCallback(async (path: string) => {
@@ -76,6 +89,16 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose }: ArtifactsPanelPro
       loadDir(currentPath);
     }
   }, [isOpen, sessionId, currentPath, loadDir]);
+
+  useEffect(() => {
+    if (selectedFile) {
+      const selectedPath = normalizePathForCompare(selectedFile.path);
+      const matched = items.find((item) => !item.is_directory && normalizePathForCompare(item.path) === selectedPath);
+      if (matched && matched !== selectedFile) {
+        setSelectedFile(matched);
+      }
+    }
+  }, [items, selectedFile]);
 
   // --- 导航逻辑 ---
   const navigateTo = (subPath: string) => {
@@ -317,4 +340,23 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose }: ArtifactsPanelPro
       </div>
     </>
   );
+}
+
+function normalizeTargetFile(file: FileInfo): FileInfo {
+  const path = file.path.replace(/^\/+/, '');
+  return {
+    ...file,
+    path,
+  };
+}
+
+function normalizePathForCompare(path: string): string {
+  return path.replace(/^\/+/, '');
+}
+
+function getParentPath(path: string): string {
+  const normalizedPath = path.replace(/^\/+/, '');
+  return normalizedPath.includes('/')
+    ? normalizedPath.substring(0, normalizedPath.lastIndexOf('/'))
+    : '';
 }

@@ -24,8 +24,8 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "date-fns": "^3.6.0",
-    "fast-json-patch": "^3.1.1",
     "dompurify": "^3.3.0",
+    "fast-json-patch": "^3.1.1",
     "lucide-react": "^0.294.0",
     "mammoth": "^1.6.0",
     "react": "^18.2.0",
@@ -34,7 +34,8 @@
     "react-router-dom": "^6.20.1",
     "react-syntax-highlighter": "^16.1.0",
     "remark-gfm": "^4.0.0",
-    "tailwind-merge": "^3.5.0"
+    "tailwind-merge": "^3.5.0",
+    "xlsx": "^0.18.5"
   },
   "overrides": {
     "@remix-run/router": "^1.23.2"

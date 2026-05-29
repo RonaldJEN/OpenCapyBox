@@ -23,7 +23,13 @@ type PreviewCacheEntry =
   | { kind: 'text'; text: string }
   | { kind: 'docx'; html: string }
   | { kind: 'csv'; rows: string[][] }
+  | { kind: 'spreadsheet'; sheets: SpreadsheetSheet[] }
   | { kind: 'binary'; blob: Blob };
+
+interface SpreadsheetSheet {
+  name: string;
+  rows: string[][];
+}
 
 const PREVIEW_CACHE_LIMIT = 30;
 const previewCache = new Map<string, PreviewCacheEntry>();
@@ -56,6 +62,8 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
   const [textContent, setTextContent] = useState('');
   const [docxHtml, setDocxHtml] = useState('');
   const [tableData, setTableData] = useState<string[][]>([]);
+  const [spreadsheetSheets, setSpreadsheetSheets] = useState<SpreadsheetSheet[]>([]);
+  const [activeSheetIndex, setActiveSheetIndex] = useState(0);
   const [binaryPreviewUrl, setBinaryPreviewUrl] = useState('');
   const [htmlBlobUrl, setHtmlBlobUrl] = useState('');
   const [htmlFrameLoading, setHtmlFrameLoading] = useState(false);
@@ -95,6 +103,8 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
     setTextContent('');
     setDocxHtml('');
     setTableData([]);
+    setSpreadsheetSheets([]);
+    setActiveSheetIndex(0);
     setHtmlFrameLoading(false);
     setHtmlBlobUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
@@ -111,6 +121,8 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
       void loadDocxContent(currentRequestId);
     } else if (isCsvFile(file.type)) {
       void loadCsvContent(currentRequestId);
+    } else if (isExcelFile(file.type)) {
+      void loadSpreadsheetContent(currentRequestId);
     } else if (isImageFile(file.type) || isPdfFile(file.type)) {
       void loadBinaryPreview(currentRequestId);
     }
@@ -244,6 +256,53 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
     }
   };
 
+  const loadSpreadsheetContent = async (requestId: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      const cacheKey = getPreviewCacheKey();
+      const cached = cacheKey ? readPreviewCache(cacheKey) : null;
+      if (cached && cached.kind === 'spreadsheet') {
+        if (requestId !== requestIdRef.current) return;
+        setSpreadsheetSheets(cached.sheets);
+        setActiveSheetIndex(0);
+        return;
+      }
+
+      const response = await fetchPreviewResponse();
+      const arrayBuffer = await response.arrayBuffer();
+      const XLSX = await import('xlsx');
+      const workbook = XLSX.read(arrayBuffer, { type: 'array', cellDates: true });
+      const sheets = workbook.SheetNames.map((name) => {
+        const worksheet = workbook.Sheets[name];
+        const rawRows = XLSX.utils.sheet_to_json<unknown[]>(worksheet, {
+          header: 1,
+          raw: false,
+          defval: '',
+          blankrows: false,
+        }) as unknown[][];
+        const rows = rawRows
+          .map((row) => row.map(formatSpreadsheetCell))
+          .filter((row) => row.some((cell) => cell.length > 0));
+        return { name, rows };
+      });
+      if (requestId !== requestIdRef.current) return;
+      setSpreadsheetSheets(sheets);
+      setActiveSheetIndex(0);
+      if (cacheKey) {
+        writePreviewCache(cacheKey, { kind: 'spreadsheet', sheets });
+      }
+    } catch (err) {
+      if (requestId !== requestIdRef.current) return;
+      console.error('Failed to load spreadsheet content:', err);
+      setError('加载电子表格失败');
+    } finally {
+      if (requestId === requestIdRef.current) {
+        setLoading(false);
+      }
+    }
+  };
+
   const loadBinaryPreview = async (requestId: number) => {
     setLoading(true);
     setError('');
@@ -293,6 +352,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
   const isTextFile = (type: string) => ['txt', 'log', 'ini', 'conf', 'cfg', 'toml'].includes(type.toLowerCase());
   const isDocxFile = (type: string) => ['docx', 'doc'].includes(type.toLowerCase());
   const isCsvFile = (type: string) => type.toLowerCase() === 'csv';
+  const isExcelFile = (type: string) => ['xlsx', 'xls'].includes(type.toLowerCase());
   const isSpreadsheetFile = (type: string) => ['xlsx', 'xls', 'csv'].includes(type.toLowerCase());
   const isPptxFile = (type: string) => ['pptx', 'ppt'].includes(type.toLowerCase());
 
@@ -346,6 +406,32 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
   const closeButtonClassName = inline
     ? 'p-2.5 hover:bg-claude-hover rounded-full transition-all text-claude-muted'
     : 'p-2.5 bg-black text-white rounded-full hover:opacity-80 transition-all active:scale-90 shadow-lg';
+
+  const activeSpreadsheetSheet = spreadsheetSheets[activeSheetIndex];
+
+  const renderTablePreview = (rows: string[][]) => (
+    <div className="bg-white rounded-2xl shadow-sm border border-black/[0.03] overflow-hidden">
+      {rows.length === 0 ? (
+        <div className="py-16 text-center text-[13px] text-claude-muted">空表格</div>
+      ) : (
+        <div className="overflow-auto p-4 max-h-[60vh]">
+          <table className="min-w-full border-collapse">
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={rowIndex} className={rowIndex === 0 ? 'bg-claude-surface font-medium' : ''}>
+                  {row.map((cell, cellIndex) => (
+                    <td key={cellIndex} className="border border-claude-border px-4 py-2 text-[13px] text-claude-text whitespace-pre-wrap align-top">
+                      {cell}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
 
   const previewCard = (
     <div
@@ -517,35 +603,30 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
           </div>
         ) : isSpreadsheetFile(file.type) ? (
           isCsvFile(file.type) ? (
-            <div className="bg-white rounded-2xl shadow-sm border border-black/[0.03] overflow-hidden">
-              <div className="overflow-auto p-4 max-h-[60vh]">
-                <table className="min-w-full border-collapse">
-                  <tbody>
-                    {tableData.map((row, rowIndex) => (
-                      <tr key={rowIndex} className={rowIndex === 0 ? 'bg-claude-surface font-medium' : ''}>
-                        {row.map((cell, cellIndex) => (
-                          <td key={cellIndex} className="border border-claude-border px-4 py-2 text-[13px] text-claude-text">
-                            {cell}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            renderTablePreview(tableData)
           ) : (
-            <div className="text-center py-16 bg-white rounded-2xl shadow-sm border border-black/[0.03]">
-              <AlertCircle className="w-10 h-10 mx-auto text-claude-border mb-3" />
-              <p className="text-claude-text font-medium mb-2">出于安全原因，已禁用 XLS/XLSX 在线预览</p>
-              <p className="text-claude-muted text-sm mb-5">请下载后使用本地办公软件打开。</p>
-              <button
-                onClick={handleDownload}
-                className="inline-flex items-center gap-2 px-6 py-3 bg-black hover:bg-black/80 text-white rounded-xl transition-colors font-medium"
-              >
-                <Download className="w-4 h-4" />
-                下载文件
-              </button>
+            <div className="space-y-3">
+              {spreadsheetSheets.length > 1 && (
+                <div className="flex gap-1 overflow-x-auto rounded-xl bg-claude-surface p-1" role="tablist" aria-label="工作表">
+                  {spreadsheetSheets.map((sheet, index) => (
+                    <button
+                      key={`${sheet.name}-${index}`}
+                      type="button"
+                      role="tab"
+                      aria-selected={activeSheetIndex === index}
+                      onClick={() => setActiveSheetIndex(index)}
+                      className={`shrink-0 rounded-lg px-3 py-1.5 text-[12px] font-medium transition-colors ${
+                        activeSheetIndex === index
+                          ? 'bg-white text-claude-text shadow-sm'
+                          : 'text-claude-muted hover:text-claude-text'
+                      }`}
+                    >
+                      {sheet.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {renderTablePreview(activeSpreadsheetSheet?.rows || [])}
             </div>
           )
         ) : isPptxFile(file.type) ? (
@@ -622,4 +703,11 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function formatSpreadsheetCell(value: unknown): string {
+  if (value instanceof Date) {
+    return value.toLocaleString();
+  }
+  return String(value);
 }

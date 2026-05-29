@@ -9,6 +9,7 @@
 - 发送用户消息（含附件、引用图片）
 - 消费后端 SSE（AG-UI 事件）增量构建 `RoundData[]`
 - 渲染消息流（user → reasoning → assistant）
+- 将助手回复中的会话文件引用渲染为可点击文件卡片
 - 处理中断/恢复：断连重连、ask_user 中断、用户主动取消
 - 滚动控制：首次恢复 + 底部跟随
 
@@ -54,6 +55,28 @@ AgentState {
   // ...其余字段通过 JSON Patch 增量更新
 }
 ```
+
+### 2.1 助手文件引用卡片
+
+`Round` 在渲染助手 markdown 前先解析文件提示行，将可访问的会话文件渲染为内嵌文件卡片。
+
+识别范围：
+- 仅解析 fenced code block 外的独立提示行。
+- 支持标签：`文件位置` / `文件路径` / `保存位置` / `已保存到` / `输出文件` / `生成文件` / `文件`。
+- 支持助手正文中的反引号文件引用，例如 `` `DeepSeek_V4_解读.docx` ``。
+- 支持当前 session 的绝对沙箱路径：`/home/user/sessions/{sessionId}/path/to/file.ext`。
+- 支持相对路径：`path/to/file.ext`。
+- 文件扩展名必须属于 `FilePreview` 当前处理的类型集合（文本、Markdown、HTML、代码、DOC/DOCX、CSV/XLS/XLSX、PPT/PPTX、图片、PDF）。
+
+拒绝范围：
+- 跨 session 的 `/home/user/sessions/{otherSessionId}/...`。
+- URL、目录、含 `.` / `..` 段的路径、当前不可预览的扩展名。
+- 代码块中的命令或文件名，例如 `python3 quick_sort.py`。
+
+点击行为：
+- 文件卡片调用 `ChatV2` 的文件面板入口，打开 `ArtifactsPanel` 并传入目标文件。
+- `ArtifactsPanel` 直接进入面板内 `FilePreview`，不走全屏预览弹窗。
+- 用户上传附件仍沿用原有 `onPreviewAttachment` 全屏预览链路。
 
 ## 3. 核心不变量（Critical Invariants）
 
@@ -220,6 +243,8 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] 滚动记忆：A 滚到中间 → 切 B → 切回 A，位置恢复
 - [ ] 首屏历史渲染无瀑布动画
 - [ ] 底部跟随：用户滚离底部时新消息不强制滚动
+- [ ] 助手文件提示行渲染为文件卡片，点击后打开 Files 抽屉并直接预览目标文件
+- [ ] 代码块内的文件名/命令不触发文件卡片
 
 ## 11. 已知易错点
 

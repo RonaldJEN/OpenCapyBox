@@ -69,6 +69,9 @@ items: FileInfo[]           // 当前目录文件列表
 currentPath: string         // 当前路径（'' = 根目录）
 pathHistory: string[]       // 前进/后退历史
 historyIndex: number
+selectedFile: FileInfo|null // 面板内预览目标
+targetFile?: FileInfo|null  // 外部入口传入的目标文件
+targetFileNonce?: number    // 同一目标文件重复打开时用于触发 effect
 ```
 
 `FileInfo.modified` 来自会话文件接口，必须按带显式时区偏移的 ISO 8601 字符串解析。
@@ -110,13 +113,24 @@ useEffect(() => {
 | 后退 `←` | `historyIndex--` |
 | 前进 `→` | `historyIndex++` |
 | 上一级 `↑` | 取 `currentPath` 的父路径 `navigateTo` |
-| 点击文件 | `onFilePreview(file)` → 弹 FilePreview Modal |
+| 点击文件 | `setSelectedFile(file)` → 面板内 `FilePreview(inline)` |
+| 外部目标文件 | 设置目标父目录为 `currentPath`，并直接 `setSelectedFile(targetFile)` |
 
 ### 3.4 文件操作
 
 - **下载**：`GET /api/sessions/{sid}/files/download?path={p}`，使用 blob 触发浏览器下载。
-- **预览**：走 FilePreview，文本/Markdown/图片/PDF/HTML 内联渲染；HTML 使用 `Blob URL + <iframe sandbox="allow-scripts">`，支持渲染/源码切换，不提供外部浏览器打开入口。
+- **预览**：走 FilePreview，文本/Markdown/图片/PDF/HTML/CSV/XLS/XLSX 内联渲染；HTML 使用 `Blob URL + <iframe sandbox="allow-scripts">`，支持渲染/源码切换，不提供外部浏览器打开入口。
 - **上传**：当前版本**不支持**通过面板上传，文件通过聊天附件上传到沙箱。
+
+### 3.5 外部目标文件入口
+
+聊天消息中的助手文件卡片通过 `targetFile` + `targetFileNonce` 打开 `ArtifactsPanel`。
+
+行为要求：
+- 面板打开且收到 `targetFile` 时，计算目标文件父目录并写入 `currentPath` / `pathHistory`。
+- 同时设置 `selectedFile`，让面板直接进入内联预览。
+- 父目录文件列表加载完成后，如果列表中存在相同路径文件，必须用列表项刷新 `selectedFile` 的 `size` / `modified` / `type` 等元数据。
+- session 切换或手动从 Header 打开 Files 时，外部目标状态由 `ChatV2` 清空，避免旧 session 目标污染新 session。
 
 ## 4. AgentConfig（记忆文件编辑）
 
@@ -233,6 +247,8 @@ useEffect(() => {
 | `.html` / `.htm` | `Blob URL` + `<iframe sandbox="allow-scripts">`（不含 `allow-same-origin`），支持 rendered/source 双视图 |
 | `text/*` / `.md` | Markdown/文本渲染（`.md`/`.html` 支持源码视图） |
 | `application/pdf` | `<iframe>` |
+| `.csv` | 读取文本并渲染为表格 |
+| `.xls` / `.xlsx` | 使用 SheetJS `xlsx` 在浏览器端解析工作簿，按 sheet 渲染表格并提供 sheet tab 切换 |
 | 其他 | 占位图 + 下载按钮 |
 
 ### 7.3 关键不变量

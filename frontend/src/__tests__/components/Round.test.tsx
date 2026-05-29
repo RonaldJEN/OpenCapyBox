@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '../utils/test-utils';
+import { fireEvent, render, screen } from '../utils/test-utils';
 import { Round } from '../../components/Round';
 import { RoundData } from '../../types';
 
@@ -271,5 +271,78 @@ describe('Round 组件', () => {
 
     const authImg = screen.getByTestId('auth-image');
     expect(authImg.getAttribute('src')).toBe('data:image/png;base64,iVBOR');
+  });
+
+  it('助手回复中的文件位置应该渲染为可点击文件卡片', () => {
+    const round = createMockRound({
+      final_response: [
+        '写好了，领导！',
+        '',
+        '**文件位置：** `/home/user/sessions/s1/quick_sort.py`',
+        '',
+        '包含两个版本：',
+      ].join('\n'),
+    });
+    const onOpenFileInPanel = vi.fn();
+
+    render(
+      <Round
+        round={round}
+        isStreaming={false}
+        sessionId="s1"
+        onOpenFileInPanel={onOpenFileInPanel}
+      />,
+    );
+
+    expect(screen.getByText('quick_sort.py')).toBeInTheDocument();
+    expect(screen.getByText('包含两个版本：')).toBeInTheDocument();
+    expect(screen.queryByText(/\/home\/user\/sessions\/s1/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '查看 quick_sort.py' }));
+
+    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'quick_sort.py',
+      path: 'quick_sort.py',
+      session_id: 's1',
+      type: 'py',
+    }));
+  });
+
+  it('助手回复句子里的 docx 文件名也应该渲染为文件卡片', () => {
+    const round = createMockRound({
+      final_response: '搞定！ `DeepSeek_V4_解读.docx` 已生成，22KB。',
+      steps: [],
+    });
+    const onOpenFileInPanel = vi.fn();
+
+    render(
+      <Round
+        round={round}
+        isStreaming={false}
+        sessionId="s1"
+        onOpenFileInPanel={onOpenFileInPanel}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '查看 DeepSeek_V4_解读.docx' }));
+
+    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'DeepSeek_V4_解读.docx',
+      path: 'DeepSeek_V4_解读.docx',
+      session_id: 's1',
+      type: 'docx',
+    }));
+  });
+
+  it('助手回复代码块中的文件提示不应该渲染为文件卡片', () => {
+    const round = createMockRound({
+      final_response: ['```text', '文件位置： quick_sort.py', '```'].join('\n'),
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} sessionId="s1" />);
+
+    expect(screen.queryByRole('button', { name: '查看 quick_sort.py' })).not.toBeInTheDocument();
+    expect(screen.getByText(/文件位置： quick_sort.py/)).toBeInTheDocument();
   });
 });

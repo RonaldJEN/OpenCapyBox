@@ -151,6 +151,45 @@ describe('ArtifactsPanel 组件', () => {
     });
   });
 
+  it('外部目标文件应该直接打开面板内预览并加载父目录', async () => {
+    const targetFile: FileInfo = {
+      name: 'summary.md',
+      path: 'reports/summary.md',
+      size: 0,
+      type: 'md',
+      modified: '',
+      is_directory: false,
+    };
+    const hydratedFile: FileInfo = {
+      ...targetFile,
+      size: 2048,
+      modified: new Date().toISOString(),
+    };
+    vi.mocked(apiService.getSessionFiles).mockImplementation(async (_sessionId, path) => {
+      if (path === 'reports') {
+        return { files: [hydratedFile], total: 1 };
+      }
+      return { files: mockFiles, total: mockFiles.length };
+    });
+
+    render(
+      <ArtifactsPanel
+        sessionId="test-session"
+        isOpen
+        onClose={vi.fn()}
+        targetFile={targetFile}
+        targetFileNonce={1}
+      />,
+    );
+
+    expect(screen.getByTestId('file-preview-inline-mock')).toBeInTheDocument();
+    expect(screen.getByText('Inline Preview: summary.md')).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session', 'reports');
+    });
+  });
+
   it('关闭内联预览后应该返回文件列表', async () => {
     render(
       <ArtifactsPanel

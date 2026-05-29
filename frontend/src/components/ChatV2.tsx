@@ -132,6 +132,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
   // Apple 风格 UI 状态
   const [isFilesOpen, setIsFilesOpen] = useState(false);
+  const [filePanelTarget, setFilePanelTarget] = useState<{ file: FileInfo; nonce: number } | null>(null);
 
   // 监听面板状态变化并通知父组件
   useEffect(() => {
@@ -304,6 +305,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       setPreviewFile(null);
       setPreviewSessionId('');
       setIsFilesOpen(false);
+      setFilePanelTarget(null);
       setIsDragging(false);
       setLoading(false);
       setDisableInitialMotion(false);
@@ -339,6 +341,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     suppressAutoScrollRef.current = true; // 切会话期间抑制自动 smooth 滚动
     roundElementRefs.current = {};
     setHighlightedRoundId(null);
+    setFilePanelTarget(null);
     setIsAtBottom(false); // 避免会话切换瞬间误触发 smooth scroll
     historyLoadedRef.current = false; // 重置历史加载标记
     prevRoundsLengthRef.current = 0;
@@ -962,6 +965,18 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
 
     setPreviewSessionId(targetSessionId);
     setPreviewFile(normalizedFile);
+  };
+
+  const handleOpenAssistantFile = (file: FileInfo) => {
+    const normalizedFile = toFileInfo(file, sessionId);
+    setFilePanelTarget((prev) => ({
+      file: {
+        ...normalizedFile,
+        session_id: sessionId,
+      },
+      nonce: (prev?.nonce ?? 0) + 1,
+    }));
+    setIsFilesOpen(true);
   };
 
   // 🆕 检测输入变化
@@ -1741,7 +1756,10 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           {sessionId ? (
             <button
               type="button"
-              onClick={() => setIsFilesOpen(!isFilesOpen)}
+              onClick={() => {
+                setFilePanelTarget(null);
+                setIsFilesOpen(!isFilesOpen);
+              }}
               className={`p-2 rounded-lg transition-all active:scale-95 flex items-center gap-2 ${
                 isFilesOpen
                   ? 'bg-claude-text text-white'
@@ -1813,6 +1831,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
                     userAttachments={round.user_attachments || []}
                     sessionId={sessionId}
                     onPreviewAttachment={handlePreviewAttachment}
+                    onOpenFileInPanel={handleOpenAssistantFile}
                     isStreaming={(sending || resuming) && index === rounds.length - 1}
                     disableMotion={disableInitialMotion}
                   />
@@ -1897,7 +1916,12 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         <ArtifactsPanel
           sessionId={sessionId}
           isOpen={isFilesOpen}
-          onClose={() => setIsFilesOpen(false)}
+          onClose={() => {
+            setIsFilesOpen(false);
+            setFilePanelTarget(null);
+          }}
+          targetFile={filePanelTarget?.file || null}
+          targetFileNonce={filePanelTarget?.nonce}
         />
       )}
 
