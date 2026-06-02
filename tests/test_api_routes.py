@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from src.api.routes import auth, sessions, config as config_routes
+from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.database import Base, get_db
 from tests.helpers import make_test_client, make_mock_settings, make_fake_execution
 
@@ -54,6 +55,7 @@ class TestAuthRouter:
 
         app.dependency_overrides[get_db] = _override_get_db
         with TestClient(app) as test_client:
+            test_client.SessionLocal = TestingSessionLocal  # type: ignore[attr-defined]
             yield test_client
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
@@ -74,6 +76,114 @@ class TestAuthRouter:
         assert data["role"] == "user"
         assert data["is_admin"] is False
         assert data["message"] == "登录成功"
+
+    def test_login_records_forwarded_ip_event(self, client, mock_settings):
+        """登录成功后应记录代理透传的客户端 IP。"""
+        response = client.post(
+            "/auth/login",
+            data={"username": "testuser", "password": "testpass"},
+            headers={
+                "X-Forwarded-For": "198.51.100.7, 10.0.0.2",
+                "X-Real-IP": "203.0.113.9",
+                "User-Agent": "pytest-browser",
+            },
+        )
+
+        assert response.status_code == 200
+        with client.SessionLocal() as db:  # type: ignore[attr-defined]
+            event = db.query(AuthLoginEvent).filter(AuthLoginEvent.user_id == "testuser").one()
+
+        assert event.username == "testuser"
+        assert event.auth_type == "simple"
+        assert event.ip_address == "198.51.100.7"
+        assert event.user_agent == "pytest-browser"
+        assert event.login_at is not None
+
+    def test_login_records_real_ip_event_when_forwarded_for_missing(self, client, mock_settings):
+        response = client.post(
+            "/auth/login",
+            data={"username": "testuser", "password": "testpass"},
+            headers={"X-Real-IP": "203.0.113.9"},
+        )
+
+        assert response.status_code == 200
+        with client.SessionLocal() as db:  # type: ignore[attr-defined]
+            event = db.query(AuthLoginEvent).filter(AuthLoginEvent.user_id == "testuser").one()
+
+        assert event.ip_address == "203.0.113.9"
+
+    def test_login_records_request_client_host_when_proxy_headers_missing(self, client, mock_settings):
+        response = client.post(
+            "/auth/login",
+            data={"username": "testuser", "password": "testpass"},
+        )
+
+        assert response.status_code == 200
+        with client.SessionLocal() as db:  # type: ignore[attr-defined]
+            event = db.query(AuthLoginEvent).filter(AuthLoginEvent.user_id == "testuser").one()
+
+        assert event.ip_address
+        assert event.ip_address not in ("198.51.100.7", "203.0.113.9")
+
+    def test_login_failure_does_not_record_ip_event(self, client, mock_settings):
+        response = client.post(
+            "/auth/login",
+            data={"username": "testuser", "password": "wrongpass"},
+            headers={"X-Forwarded-For": "198.51.100.7"},
+        )
+
+        assert response.status_code == 401
+        with client.SessionLocal() as db:  # type: ignore[attr-defined]
+            assert db.query(AuthLoginEvent).count() == 0
+
+    def test_disabled_simple_user_does_not_record_login_event(self, client, mock_settings):
+        from src.api.models.auth_user import AuthUser
+
+        with client.SessionLocal() as db:  # type: ignore[attr-defined]
+            user = db.query(AuthUser).filter(AuthUser.user_id == "testuser").one()
+            user.enabled = False
+            db.commit()
+
+        response = client.post(
+            "/auth/login",
+            data={"username": "testuser", "password": "testpass"},
+            headers={"X-Forwarded-For": "198.51.100.7"},
+        )
+
+        assert response.status_code == 403
+        with client.SessionLocal() as db:  # type: ignore[attr-defined]
+            assert db.query(AuthLoginEvent).count() == 0
+
+    def test_ldap_login_records_ip_event(self, client, mock_settings):
+        from src.api.services.auth_service import create_ldap_user
+
+        with client.SessionLocal() as db:  # type: ignore[attr-defined]
+            create_ldap_user(
+                db,
+                user_id="zhangsan",
+                username=None,
+                enabled=True,
+                is_admin=False,
+                token_limit_per_week=None,
+                token_limit_per_month=None,
+                created_by="admin",
+            )
+
+        with patch("src.api.services.auth_service.authenticate_ldap_credentials") as ldap_auth:
+            response = client.post(
+                "/auth/login",
+                data={"username": "zhangsan", "password": "domain-pass"},
+                headers={"X-Real-IP": "203.0.113.9"},
+            )
+
+        assert response.status_code == 200
+        ldap_auth.assert_called_once_with("zhangsan", "domain-pass")
+        with client.SessionLocal() as db:  # type: ignore[attr-defined]
+            event = db.query(AuthLoginEvent).filter(AuthLoginEvent.user_id == "zhangsan").one()
+
+        assert event.username == "zhangsan"
+        assert event.auth_type == "ldap"
+        assert event.ip_address == "203.0.113.9"
 
     def test_login_wrong_password(self, client, mock_settings):
         """測試密碼錯誤"""
@@ -98,6 +208,8 @@ class TestAuthRouter:
         """登录入口应统一交给认证服务按用户类型分流。"""
         user_obj = MagicMock()
         user_obj.user_id = "zhangsan"
+        user_obj.username = "zhangsan"
+        user_obj.auth_type = "ldap"
         user_obj.is_admin = False
         user_obj.token_generation = 7
 

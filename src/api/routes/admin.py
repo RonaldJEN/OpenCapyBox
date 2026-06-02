@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import get_settings
 from src.api.deps import get_current_admin_user
+from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
 from src.api.models.database import get_db
 from src.api.models.session import Session
@@ -108,6 +109,18 @@ class AdminResetPasswordPayload(BaseModel):
 
 def _iso(dt) -> str | None:
     return dt.isoformat() if dt else None
+
+
+def _auth_login_event_to_payload(event: AuthLoginEvent) -> dict[str, Any]:
+    return {
+        "id": int(event.id),
+        "user_id": event.user_id,
+        "username": event.username,
+        "auth_type": event.auth_type,
+        "ip_address": event.ip_address,
+        "user_agent": event.user_agent,
+        "login_at": _iso(event.login_at),
+    }
 
 
 def _percentile(values: list[float], p: float) -> float | None:
@@ -696,6 +709,36 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
         for row in lock_rows
     }
 
+    latest_login_subq = (
+        db.query(
+            AuthLoginEvent.user_id,
+            func.max(AuthLoginEvent.login_at).label("last_login_event_at"),
+        )
+        .filter(AuthLoginEvent.user_id.in_(user_ids))
+        .group_by(AuthLoginEvent.user_id)
+        .subquery()
+    )
+    latest_login_rows = (
+        db.query(
+            AuthLoginEvent.user_id,
+            AuthLoginEvent.ip_address,
+            AuthLoginEvent.login_at,
+        )
+        .join(
+            latest_login_subq,
+            (AuthLoginEvent.user_id == latest_login_subq.c.user_id)
+            & (AuthLoginEvent.login_at == latest_login_subq.c.last_login_event_at),
+        )
+        .all()
+    )
+    latest_login_map = {
+        row.user_id: {
+            "ip_address": row.ip_address,
+            "login_at": row.login_at,
+        }
+        for row in latest_login_rows
+    }
+
     users: list[dict[str, Any]] = []
     for auth_user in auth_user_rows:
         user_id = auth_user.user_id
@@ -746,6 +789,7 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
                 "cron_failed_24h": int(cron_failed_map.get(user_id, 0)),
                 "last_active_at": _iso(last_active),
                 "last_login_at": _iso(auth_user.last_login_at),
+                "last_login_ip": latest_login_map.get(user_id, {}).get("ip_address"),
                 "created_by": auth_user.created_by,
                 "created_at": _iso(auth_user.created_at),
                 "updated_at": _iso(auth_user.updated_at),
@@ -760,6 +804,24 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
             "running_total": len([item for item in users if item["status"] == "running"]),
         },
         "users": users,
+    }
+
+
+def _build_user_login_events_payload(db: DBSession, *, user_id: str, limit: int) -> dict[str, Any]:
+    user = db.query(AuthUser).filter(AuthUser.user_id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    events = (
+        db.query(AuthLoginEvent)
+        .filter(AuthLoginEvent.user_id == user_id)
+        .order_by(AuthLoginEvent.login_at.desc(), AuthLoginEvent.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "user_id": user_id,
+        "events": [_auth_login_event_to_payload(event) for event in events],
     }
 
 
@@ -925,6 +987,17 @@ async def get_admin_users(
 ):
     """管理端用户列表与角色信息。"""
     return _build_users_payload(db)
+
+
+@router.get("/users/{user_id}/login-events")
+async def get_admin_user_login_events(
+    user_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """查看指定用户的登录审计历史。"""
+    return _build_user_login_events_payload(db, user_id=user_id, limit=limit)
 
 
 @router.post("/users/simple")

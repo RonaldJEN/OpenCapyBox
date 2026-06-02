@@ -98,6 +98,10 @@ function parseInlineFileRefs(line: string, sessionId: string) {
   INLINE_FILE_REF_RE.lastIndex = 0;
 
   while ((match = INLINE_FILE_REF_RE.exec(line)) !== null) {
+    if (!isInlinePathCandidate(match[1])) {
+      continue;
+    }
+
     const file = createFileInfoFromCandidate(match[1], sessionId);
     if (file) {
       refs.push({ start: match.index, end: match.index + match[0].length, file });
@@ -175,4 +179,8 @@ function normalizeAssistantFilePath(candidate: string, sessionId: string): strin
 
 function isOnlyPunctuation(value: string): boolean {
   return /^[\s。。，，；;、,.!?！？:：]*$/.test(value);
+}
+
+function isInlinePathCandidate(raw: string): boolean {
+  return !/\s/.test(extractPathCandidate(raw));
 }

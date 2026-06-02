@@ -123,6 +123,7 @@ export interface AdminUserItem {
   cron_failed_24h: number;
   last_active_at: string | null;
   last_login_at: string | null;
+  last_login_ip: string | null;
   created_by: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -194,6 +195,32 @@ export async function getAdminLLMCallRecordDetail(
 
 export async function getAdminUsers(): Promise<AdminUsersResponse> {
   const resp = await client.get<AdminUsersResponse>('/admin/users');
+  return resp.data;
+}
+
+export interface AdminUserLoginEventItem {
+  id: number;
+  user_id: string;
+  username: string;
+  auth_type: 'simple' | 'ldap';
+  ip_address: string | null;
+  user_agent: string | null;
+  login_at: string | null;
+}
+
+export interface AdminUserLoginEventsResponse {
+  user_id: string;
+  events: AdminUserLoginEventItem[];
+}
+
+export async function getAdminUserLoginEvents(
+  userId: string,
+  limit: number = 50,
+): Promise<AdminUserLoginEventsResponse> {
+  const resp = await client.get<AdminUserLoginEventsResponse>(
+    `/admin/users/${encodeURIComponent(userId)}/login-events`,
+    { params: { limit } },
+  );
   return resp.data;
 }
 

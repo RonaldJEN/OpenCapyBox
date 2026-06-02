@@ -1,5 +1,6 @@
 """认证与用户授权服务。"""
 
+import logging
 import base64
 import hashlib
 import hmac
@@ -10,10 +11,12 @@ from fastapi import HTTPException
 from ldap3 import Connection, Server
 from ldap3.core.exceptions import LDAPBindError, LDAPCommunicationError
 from sqlalchemy import func, or_, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import Settings, get_settings
 from src.api.models.agui_event import AGUIEventLog
+from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
 from src.api.models.conversation_message import ConversationMessage
 from src.api.models.cron_fire import CronFire
@@ -33,6 +36,8 @@ _PASSWORD_ITERATIONS = 260000
 _LDAP_CONNECT_TIMEOUT_SECONDS = 5
 _LDAP_RECEIVE_TIMEOUT_SECONDS = 10
 _SIMPLE_USERNAME_FORBIDDEN_CHARS = ("\\", "@")
+_LOGIN_EVENT_IP_MAX_LENGTH = 64
+logger = logging.getLogger(__name__)
 
 
 def hash_password(password: str) -> str:
@@ -148,6 +153,44 @@ def login_user(db: DBSession, username: str, password: str) -> AuthUser:
     user.last_login_at = now_naive()
     db.commit()
     return user
+
+
+def record_login_event(
+    db: DBSession,
+    *,
+    user: AuthUser,
+    ip_address: str | None,
+    user_agent: str | None,
+) -> AuthLoginEvent | None:
+    """记录成功登录事件；审计失败不阻断主登录流程。"""
+    user_id = user.user_id
+    username = user.username
+    auth_type = user.auth_type
+    try:
+        event = AuthLoginEvent(
+            user_id=user_id,
+            username=username,
+            auth_type=auth_type,
+            ip_address=_normalize_login_event_ip(ip_address),
+            user_agent=user_agent,
+        )
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+        return event
+    except SQLAlchemyError:
+        db.rollback()
+        logger.warning(
+            "Failed to record login audit event for user_id=%s",
+            user_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _normalize_login_event_ip(ip_address: str | None) -> str | None:
+    value = (ip_address or "").strip()
+    return value[:_LOGIN_EVENT_IP_MAX_LENGTH] if value else None
 
 
 def authenticate_ldap_credentials(username: str, password: str) -> None:

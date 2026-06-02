@@ -13,6 +13,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from src.api.deps import get_current_admin_user
+from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
 from src.api.models.database import Base, get_db
 from src.api.models.llm_call_record import LLMCallRecord
@@ -306,6 +307,112 @@ def test_users_payload_counts_recent_user_run_lock_as_running(admin_integration_
     assert demo["running_rounds"] == 1
     assert idle["status"] == "idle"
     assert idle["running_rounds"] == 0
+
+
+def test_users_payload_includes_latest_simple_login_ip(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    older = now_naive() - timedelta(hours=2)
+    newer = now_naive() - timedelta(minutes=5)
+    db = SessionLocal()
+    db.add(
+        AuthUser(
+            user_id="demo",
+            username="demo",
+            auth_type="simple",
+            password_hash="hash",
+            enabled=True,
+            is_admin=False,
+            created_by="test",
+        )
+    )
+    db.add(
+        AuthLoginEvent(
+            user_id="demo",
+            username="demo",
+            auth_type="simple",
+            ip_address="198.51.100.1",
+            user_agent="old-browser",
+            login_at=older,
+        )
+    )
+    db.add(
+        AuthLoginEvent(
+            user_id="demo",
+            username="demo",
+            auth_type="simple",
+            ip_address="198.51.100.2",
+            user_agent="new-browser",
+            login_at=newer,
+        )
+    )
+    db.commit()
+    db.close()
+
+    resp = client.get("/admin/users")
+
+    assert resp.status_code == 200
+    demo = next(item for item in resp.json()["users"] if item["user_id"] == "demo")
+    assert demo["last_login_ip"] == "198.51.100.2"
+
+
+def test_user_login_events_returns_recent_history(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    older = now_naive() - timedelta(hours=2)
+    newer = now_naive() - timedelta(minutes=5)
+    db = SessionLocal()
+    db.add(
+        AuthUser(
+            user_id="demo",
+            username="demo",
+            auth_type="simple",
+            password_hash="hash",
+            enabled=True,
+            is_admin=False,
+            created_by="test",
+        )
+    )
+    db.add(
+        AuthLoginEvent(
+            user_id="demo",
+            username="demo",
+            auth_type="simple",
+            ip_address="198.51.100.1",
+            user_agent="old-browser",
+            login_at=older,
+        )
+    )
+    db.add(
+        AuthLoginEvent(
+            user_id="demo",
+            username="demo",
+            auth_type="simple",
+            ip_address="198.51.100.2",
+            user_agent="new-browser",
+            login_at=newer,
+        )
+    )
+    db.commit()
+    db.close()
+
+    resp = client.get("/admin/users/demo/login-events", params={"limit": 1})
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["user_id"] == "demo"
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["ip_address"] == "198.51.100.2"
+    assert payload["events"][0]["user_agent"] == "new-browser"
+
+
+def test_user_login_events_rejects_missing_user(admin_integration_client):
+    client, _ = admin_integration_client
+
+    resp = client.get("/admin/users/missing/login-events")
+
+    assert resp.status_code == 404
+    assert "用户不存在" in resp.json()["detail"]
 
 
 def test_delete_user_rejects_recent_run_lock(admin_integration_client):

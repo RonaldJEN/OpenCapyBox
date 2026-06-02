@@ -18,6 +18,7 @@ from .interrupt_resolution import InterruptResolution
 from .user_run_lock import UserRunLock
 from .run_cancel_request import RunCancelRequest
 from .auth_user import AuthUser
+from .auth_login_event import AuthLoginEvent
 
 __all__ = [
     # 數據庫基礎
@@ -34,6 +35,7 @@ __all__ = [
     "UserRunLock",
     "RunCancelRequest",
     "AuthUser",
+    "AuthLoginEvent",
     
     # AG-UI 命名（協議兼容）
     "Thread",  # = Session

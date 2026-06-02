@@ -20,6 +20,7 @@ def _import_models():
     from src.api.models import user_run_lock as _  # noqa: F401
     from src.api.models import run_cancel_request as _  # noqa: F401
     from src.api.models.auth_user import AuthUser as _  # noqa: F401
+    from src.api.models.auth_login_event import AuthLoginEvent as _  # noqa: F401
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
     from src.api.models.conversation_message import ConversationMessage as _  # noqa: F401
     from src.api.models.interrupt_resolution import InterruptResolution as _  # noqa: F401

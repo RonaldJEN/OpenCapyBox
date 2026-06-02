@@ -7,10 +7,12 @@ import pytest
 from fastapi import HTTPException
 from ldap3.core.exceptions import LDAPBindError, LDAPSocketOpenError, LDAPSocketReceiveError
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from src.api.models.agui_event import AGUIEventLog
+from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
 from src.api.models.conversation_message import ConversationMessage
 from src.api.models.cron_fire import CronFire
@@ -34,6 +36,7 @@ from src.api.services.auth_service import (
     hash_password,
     login_user,
     normalize_domain_user,
+    record_login_event,
     reset_simple_user_password,
     update_user_enabled,
     verify_password,
@@ -186,6 +189,67 @@ def test_login_user_reports_disabled_simple_user(db):
 
     assert exc_info.value.status_code == 403
     assert "账户已被禁用" in exc_info.value.detail
+
+
+def test_record_login_event_clamps_ip_address(db):
+    user = create_simple_user(
+        db,
+        username="audit-user",
+        password="pass123",
+        enabled=True,
+        is_admin=False,
+        token_limit_per_week=None,
+        token_limit_per_month=None,
+        created_by="test",
+    )
+
+    event = record_login_event(
+        db,
+        user=user,
+        ip_address="1" * 80,
+        user_agent="pytest-browser",
+    )
+
+    assert event is not None
+    assert event.ip_address == "1" * 64
+    assert db.query(AuthLoginEvent).filter(AuthLoginEvent.user_id == "audit-user").count() == 1
+
+
+def test_record_login_event_is_best_effort_on_db_error(db, monkeypatch):
+    user = create_simple_user(
+        db,
+        username="audit-failure-user",
+        password="pass123",
+        enabled=True,
+        is_admin=False,
+        token_limit_per_week=None,
+        token_limit_per_month=None,
+        created_by="test",
+    )
+    session_cls = type(db)
+    original_rollback = session_cls.rollback
+    rollback_calls = 0
+
+    def fail_commit(self):
+        raise SQLAlchemyError("audit insert failed")
+
+    def track_rollback(self):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        original_rollback(self)
+
+    monkeypatch.setattr(session_cls, "commit", fail_commit, raising=True)
+    monkeypatch.setattr(session_cls, "rollback", track_rollback, raising=True)
+
+    event = record_login_event(
+        db,
+        user=user,
+        ip_address="198.51.100.7",
+        user_agent="pytest-browser",
+    )
+
+    assert event is None
+    assert rollback_calls == 1
 
 
 def test_login_user_authenticates_simple_user(db):

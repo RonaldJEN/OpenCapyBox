@@ -10,6 +10,7 @@ import {
   getAdminOverview,
   getAdminRoundsTree,
   getAdminSystem,
+  getAdminUserLoginEvents,
   getAdminUsers,
   resetAdminSimpleUserPassword,
   updateAdminUserAdmin,
@@ -36,6 +37,7 @@ vi.mock('../../services/adminApi', () => ({
   getAdminLLMCallRecordDetail: vi.fn(),
   getAdminUsers: vi.fn(),
   getAdminSystem: vi.fn(),
+  getAdminUserLoginEvents: vi.fn(),
   updateAdminUserEnabled: vi.fn(),
   updateAdminUserAdmin: vi.fn(),
   updateAdminUserTokenLimits: vi.fn(),
@@ -74,6 +76,7 @@ function makeAdminUser(overrides: Partial<AdminUserItem> = {}): AdminUserItem {
     cron_failed_24h: 0,
     last_active_at: '2026-05-10T10:00:00',
     last_login_at: '2026-05-10T09:00:00',
+    last_login_ip: '198.51.100.7',
     created_by: 'admin',
     created_at: '2026-05-01T08:00:00',
     updated_at: '2026-05-10T09:00:00',
@@ -177,6 +180,21 @@ describe('AdminConsole 组件', () => {
         compaction_emergency_drops: 0,
         llm_response_errors: 0,
       },
+    });
+
+    vi.mocked(getAdminUserLoginEvents).mockResolvedValue({
+      user_id: 'demo',
+      events: [
+        {
+          id: 1,
+          user_id: 'demo',
+          username: 'demo',
+          auth_type: 'simple',
+          ip_address: '198.51.100.7',
+          user_agent: 'pytest-browser',
+          login_at: '2026-05-10T09:00:00',
+        },
+      ],
     });
 
     vi.mocked(updateAdminLLMCallReview).mockResolvedValue({
@@ -487,6 +505,97 @@ describe('AdminConsole 组件', () => {
         delete (URL as { revokeObjectURL?: unknown }).revokeObjectURL;
       }
     }
+  });
+
+  it('用户管理页可查看登录历史', async () => {
+    vi.mocked(getAdminUsers).mockResolvedValue({
+      summary: {
+        users_total: 1,
+        admins_total: 0,
+        active_total: 1,
+        running_total: 0,
+      },
+      users: [makeAdminUser()],
+    });
+
+    render(<AdminConsole />);
+
+    await waitFor(() => {
+      expect(getAdminOverview).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /用户管理/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('IP 198.51.100.7')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '更多 demo' }));
+    fireEvent.click(screen.getByRole('button', { name: '登录历史 demo' }));
+
+    await waitFor(() => {
+      expect(getAdminUserLoginEvents).toHaveBeenCalledWith('demo', 50);
+    });
+
+    expect(screen.getByRole('dialog', { name: '登录历史' })).toBeInTheDocument();
+    expect(screen.getAllByText('198.51.100.7').length).toBeGreaterThan(0);
+    expect(screen.getByText('pytest-browser')).toBeInTheDocument();
+  });
+
+  it('LDAP 用户也可查看登录历史', async () => {
+    vi.mocked(getAdminUsers).mockResolvedValue({
+      summary: {
+        users_total: 1,
+        admins_total: 0,
+        active_total: 1,
+        running_total: 0,
+      },
+      users: [
+        makeAdminUser({
+          user_id: 'ldap-user',
+          username: 'ldap-user',
+          auth_type: 'ldap',
+          last_login_ip: '203.0.113.9',
+        }),
+      ],
+    });
+    vi.mocked(getAdminUserLoginEvents).mockResolvedValue({
+      user_id: 'ldap-user',
+      events: [
+        {
+          id: 2,
+          user_id: 'ldap-user',
+          username: 'ldap-user',
+          auth_type: 'ldap',
+          ip_address: '203.0.113.9',
+          user_agent: 'ldap-browser',
+          login_at: '2026-05-10T09:30:00',
+        },
+      ],
+    });
+
+    render(<AdminConsole />);
+
+    await waitFor(() => {
+      expect(getAdminOverview).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /用户管理/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('IP 203.0.113.9')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '更多 ldap-user' }));
+    fireEvent.click(screen.getByRole('button', { name: '登录历史 ldap-user' }));
+
+    await waitFor(() => {
+      expect(getAdminUserLoginEvents).toHaveBeenCalledWith('ldap-user', 50);
+    });
+
+    expect(screen.getByRole('dialog', { name: '登录历史' })).toBeInTheDocument();
+    expect(screen.getAllByText('203.0.113.9').length).toBeGreaterThan(0);
+    expect(screen.getByText('ldap-browser')).toBeInTheDocument();
   });
 
   it('用户管理页可更新启用权限限额并重置密码', async () => {

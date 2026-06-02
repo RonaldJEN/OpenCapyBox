@@ -166,6 +166,32 @@ class TestAdminRouter:
         assert resp.json() == payload
         assert mocked.call_count == 1
 
+    def test_user_login_events_delegates_to_builder(self):
+        client = _make_client(admin_enabled=True)
+        payload = {
+            "user_id": "demo",
+            "events": [
+                {
+                    "id": 1,
+                    "user_id": "demo",
+                    "username": "demo",
+                    "auth_type": "simple",
+                    "ip_address": "198.51.100.7",
+                    "user_agent": "pytest-browser",
+                    "login_at": "2026-05-10T09:00:00",
+                }
+            ],
+        }
+
+        with patch("src.api.routes.admin._build_user_login_events_payload", return_value=payload) as mocked:
+            resp = client.get("/admin/users/demo/login-events", params={"limit": 20})
+
+        assert resp.status_code == 200
+        assert resp.json() == payload
+        assert mocked.call_count == 1
+        assert mocked.call_args.kwargs["user_id"] == "demo"
+        assert mocked.call_args.kwargs["limit"] == 20
+
     def test_create_simple_user_delegates_to_service(self):
         client = _make_client(admin_enabled=True)
         user_obj = object()

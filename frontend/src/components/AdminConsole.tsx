@@ -7,6 +7,7 @@ import {
   ChevronRight,
   Download,
   Gauge,
+  History,
   KeyRound,
   LayoutDashboard,
   LogOut,
@@ -30,6 +31,7 @@ import {
   getAdminOverview,
   getAdminRoundsTree,
   getAdminSystem,
+  getAdminUserLoginEvents,
   getAdminUsers,
   resetAdminSimpleUserPassword,
   updateAdminUserAdmin,
@@ -44,6 +46,7 @@ import {
   type AdminSystemResponse,
   type AdminTokenLimitsUpdateRequest,
   type AdminUserItem,
+  type AdminUserLoginEventsResponse,
   type AdminUsersResponse,
 } from '../services/adminApi';
 import './AdminConsole.css';
@@ -323,6 +326,7 @@ function buildUsersCsv(users: AdminUserItem[]): string {
     'token_limit_per_month',
     'last_active_at',
     'last_login_at',
+    'last_login_ip',
   ];
   const rows = users.map((user) => [
     user.user_id,
@@ -341,6 +345,7 @@ function buildUsersCsv(users: AdminUserItem[]): string {
     user.token_limit_per_month,
     user.last_active_at,
     user.last_login_at,
+    user.last_login_ip,
   ]);
   return [headers, ...rows]
     .map((row) => row.map((cell) => escapeCsvCell(cell)).join(','))
@@ -1230,6 +1235,10 @@ function UsersPanel({
   const [authFilter, setAuthFilter] = useState<UserAuthFilter>('all');
   const [sortKey, setSortKey] = useState<UserSortKey>('recent');
   const [actionMenuUserId, setActionMenuUserId] = useState<string | null>(null);
+  const [loginEventsUser, setLoginEventsUser] = useState<AdminUserItem | null>(null);
+  const [loginEvents, setLoginEvents] = useState<AdminUserLoginEventsResponse | null>(null);
+  const [loginEventsLoading, setLoginEventsLoading] = useState(false);
+  const [loginEventsError, setLoginEventsError] = useState('');
 
   useEffect(() => {
     const nextDrafts: Record<string, { weeklyLimit: string; monthlyLimit: string }> = {};
@@ -1286,6 +1295,29 @@ function UsersPanel({
 
   const updateCreateField = <Key extends keyof UserCreateFormValues>(key: Key, value: UserCreateFormValues[Key]) => {
     setCreateForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const openLoginEvents = async (user: AdminUserItem) => {
+    setActionMenuUserId(null);
+    setLoginEventsUser(user);
+    setLoginEvents(null);
+    setLoginEventsError('');
+    setLoginEventsLoading(true);
+    try {
+      setLoginEvents(await getAdminUserLoginEvents(user.user_id, 50));
+    } catch (err) {
+      console.error('Failed to load user login events:', err);
+      setLoginEventsError('加载登录历史失败，请稍后重试');
+    } finally {
+      setLoginEventsLoading(false);
+    }
+  };
+
+  const closeLoginEvents = () => {
+    setLoginEventsUser(null);
+    setLoginEvents(null);
+    setLoginEventsError('');
+    setLoginEventsLoading(false);
   };
 
   return (
@@ -1510,6 +1542,7 @@ function UsersPanel({
                       <div className="admin-token-stack">
                         <span>活跃 {formatDateTime(item.last_active_at)}</span>
                         <span>登录 {formatDateTime(item.last_login_at)}</span>
+                        <span>IP {item.last_login_ip || '-'}</span>
                       </div>
                     </td>
                     <td>
@@ -1525,6 +1558,14 @@ function UsersPanel({
                           </button>
                           {actionMenuUserId === item.user_id ? (
                             <div className="admin-more-menu">
+                              <button
+                                className="admin-button admin-icon-button"
+                                aria-label={`登录历史 ${item.user_id}`}
+                                onClick={() => { void openLoginEvents(item); }}
+                              >
+                                <History size={14} />
+                                登录历史
+                              </button>
                               {item.auth_type === 'simple' ? (
                                 <div className="admin-password-reset">
                                   <input
@@ -1734,6 +1775,57 @@ function UsersPanel({
               </div>
             </form>
           </aside>
+        </div>
+      ) : null}
+
+      {loginEventsUser ? (
+        <div className="admin-modal-backdrop" role="presentation">
+          <section className="admin-modal admin-login-events-modal" role="dialog" aria-modal="true" aria-labelledby="admin-login-events-title">
+            <div className="admin-modal-header">
+              <div>
+                <h3 id="admin-login-events-title">登录历史</h3>
+                <p>{loginEventsUser.username} · @{loginEventsUser.user_id}</p>
+              </div>
+              <button
+                className="admin-button admin-icon-button admin-icon-only-button"
+                type="button"
+                aria-label="关闭登录历史"
+                onClick={closeLoginEvents}
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <div className="admin-login-events-body">
+              {loginEventsLoading ? (
+                <div className="admin-loading">正在加载登录历史</div>
+              ) : loginEventsError ? (
+                <div className="admin-error admin-inline-message">{loginEventsError}</div>
+              ) : (loginEvents?.events.length || 0) > 0 ? (
+                <div className="admin-table-wrap">
+                  <table className="admin-table admin-login-events-table">
+                    <thead>
+                      <tr>
+                        <th>登录时间</th>
+                        <th>IP</th>
+                        <th>User-Agent</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {loginEvents?.events.map((event) => (
+                        <tr key={event.id}>
+                          <td>{formatDateTime(event.login_at)}</td>
+                          <td>{event.ip_address || '-'}</td>
+                          <td className="admin-user-agent-cell">{event.user_agent || '-'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="admin-loading">暂无登录记录</div>
+              )}
+            </div>
+          </section>
         </div>
       ) : null}
     </>

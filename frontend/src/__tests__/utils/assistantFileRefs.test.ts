@@ -89,6 +89,13 @@ describe('assistantFileRefs', () => {
     expect(blocks).toEqual([{ type: 'markdown', content }]);
   });
 
+  it('不会把行内命令中的文件名转成文件卡片', () => {
+    const content = '运行 `python3 quick_sort.py` 看效果。';
+    const blocks = extractAssistantContentBlocks(content, 'session-1');
+
+    expect(blocks).toEqual([{ type: 'markdown', content }]);
+  });
+
   it('拒绝跨 session 的绝对路径并保留原 markdown', () => {
     const content = '文件位置： /home/user/sessions/other-session/quick_sort.py';
     const blocks = extractAssistantContentBlocks(content, 'session-1');

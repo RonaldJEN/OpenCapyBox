@@ -967,16 +967,38 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     setPreviewFile(normalizedFile);
   };
 
-  const handleOpenAssistantFile = (file: FileInfo) => {
+  const handleOpenAssistantFile = async (file: FileInfo) => {
+    if (!sessionId) return;
+    setError('');
+
     const normalizedFile = toFileInfo(file, sessionId);
-    setFilePanelTarget((prev) => ({
-      file: {
-        ...normalizedFile,
-        session_id: sessionId,
-      },
-      nonce: (prev?.nonce ?? 0) + 1,
-    }));
-    setIsFilesOpen(true);
+    const targetPath = normalizeAssistantTargetPath(normalizedFile.path);
+    const parentPath = getAssistantTargetParentPath(targetPath);
+
+    try {
+      const list = await apiService.getSessionFiles(sessionId, parentPath || undefined);
+      const matchedFile = list.files.find((item) => (
+        !item.is_directory && normalizeAssistantTargetPath(item.path) === targetPath
+      ));
+
+      if (!matchedFile) {
+        setError(`文件不存在或尚未生成：${normalizedFile.name}`);
+        return;
+      }
+
+      setFilePanelTarget((prev) => ({
+        file: {
+          ...matchedFile,
+          path: normalizeAssistantTargetPath(matchedFile.path),
+          session_id: sessionId,
+        },
+        nonce: (prev?.nonce ?? 0) + 1,
+      }));
+      setIsFilesOpen(true);
+    } catch (err) {
+      console.warn('Failed to verify assistant file target:', err);
+      setError(`无法确认文件是否存在：${normalizedFile.name}`);
+    }
   };
 
   // 🆕 检测输入变化
@@ -1938,4 +1960,15 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       )}
     </div>
   );
+}
+
+function normalizeAssistantTargetPath(path: string): string {
+  return path.replace(/^\/+/, '');
+}
+
+function getAssistantTargetParentPath(path: string): string {
+  const normalizedPath = normalizeAssistantTargetPath(path);
+  return normalizedPath.includes('/')
+    ? normalizedPath.substring(0, normalizedPath.lastIndexOf('/'))
+    : '';
 }

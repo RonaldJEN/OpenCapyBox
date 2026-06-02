@@ -64,6 +64,7 @@ AgentState {
 - 仅解析 fenced code block 外的独立提示行。
 - 支持标签：`文件位置` / `文件路径` / `保存位置` / `已保存到` / `输出文件` / `生成文件` / `文件`。
 - 支持助手正文中的反引号文件引用，例如 `` `DeepSeek_V4_解读.docx` ``。
+- 行内反引号仅接受单一路径形态；含空白的命令片段（如 `` `python3 quick_sort.py` ``）保持 markdown。
 - 支持当前 session 的绝对沙箱路径：`/home/user/sessions/{sessionId}/path/to/file.ext`。
 - 支持相对路径：`path/to/file.ext`。
 - 文件扩展名必须属于 `FilePreview` 当前处理的类型集合（文本、Markdown、HTML、代码、DOC/DOCX、CSV/XLS/XLSX、PPT/PPTX、图片、PDF）。
@@ -75,6 +76,8 @@ AgentState {
 
 点击行为：
 - 文件卡片调用 `ChatV2` 的文件面板入口，打开 `ArtifactsPanel` 并传入目标文件。
+- 点击前必须按目标父目录查询当前 session 文件列表；只有命中同路径文件时才打开 Files 抽屉。
+- 未命中说明该文本只是助手描述或文件尚未生成，必须提示用户且不得打开预览。
 - `ArtifactsPanel` 直接进入面板内 `FilePreview`，不走全屏预览弹窗。
 - 用户上传附件仍沿用原有 `onPreviewAttachment` 全屏预览链路。
 

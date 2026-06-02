@@ -125,6 +125,7 @@ useEffect(() => {
 ### 3.5 外部目标文件入口
 
 聊天消息中的助手文件卡片通过 `targetFile` + `targetFileNonce` 打开 `ArtifactsPanel`。
+`ChatV2` 必须先确认目标文件存在于当前 session 文件列表中，未命中时不得打开面板预览。
 
 行为要求：
 - 面板打开且收到 `targetFile` 时，计算目标文件父目录并写入 `currentPath` / `pathHistory`。

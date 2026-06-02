@@ -45,7 +45,23 @@ PostgreSQL 部署使用事务级 advisory lock 串行化多 worker 首次初始�
 
 JWT payload 包含 `user_id` 和 `gen`（凭据代次）。Token 过期时间：默认 43200 秒（12 小时）。密钥来源：`AUTH_SECRET_KEY` 环境变量；若为空，则通过 SHA-256(app_name) 派生确定性密钥，仅用于开发环境。
 
-### 2.3 LDAP 配置
+### 2.3 `auth_login_events` 表
+
+`auth_login_events` 保存账号每次 Web 登录成功的审计历史，覆盖 simple 与 LDAP 登录。
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | Integer | PK | 自增主键 |
+| `user_id` | String(100) | indexed | 登录用户 ID；不做外键，删除账号后保留审计历史 |
+| `username` | String(100) | NOT NULL | 登录时用户名快照 |
+| `auth_type` | String(20) | NOT NULL | 登录用户认证类型：`simple` 或 `ldap` |
+| `ip_address` | String(64) | nullable | 登录来源 IP |
+| `user_agent` | Text | nullable | 浏览器 User-Agent |
+| `login_at` | DateTime | indexed | 登录时间 |
+
+IP 提取顺序：`X-Forwarded-For` 首个 IP → `X-Real-IP` → FastAPI `request.client.host`；写入前去除首尾空白并截断到 64 字符。部署时应确保后端仅接收可信反向代理流量，避免客户端直连伪造代理头。
+
+### 2.4 LDAP 配置
 
 LDAP 用户仍由 `auth_users` 表控制是否开通、是否启用、是否管理员。登录时 `/api/auth/login` 根据 `auth_type=ldap` 直接连接目录服务校验账号密码，不保存 LDAP 密码。
 
@@ -72,6 +88,14 @@ LDAP 用户仍由 `auth_users` 表控制是否开通、是否启用、是否管�
 - **错误 401**：token 无效或已过期
 - **鉴权要求**：Bearer token，通过 `get_current_user` 注入
 
+### GET /api/admin/users/{user_id}/login-events
+
+- **请求**：query `limit`，默认 50，范围 1-200
+- **响应 200**：`{user_id: str, events: [{id, user_id, username, auth_type, ip_address, user_agent, login_at}]}`
+- **错误 403**：非管理员
+- **错误 404**：用户不存在
+- **鉴权要求**：管理员 Bearer token
+
 ## 4. 行为语义与不变量
 
 - Token 过期时间默认 12 小时，不支持刷新
@@ -90,6 +114,8 @@ LDAP 用户仍由 `auth_users` 表控制是否开通、是否启用、是否管�
 - 若 `SIMPLE_AUTH_USERS` 为空，启动时输出 warning 日志
 - simple 用户密码仅保存 PBKDF2 hash；ldap 用户不保存密码
 - `/api/auth/login` 是唯一登录入口：先按归一化后的 `user_id` 查询 `auth_users`，再检查 `enabled`，最后按 `auth_type` 分流认证
+- 用户登录成功后写入 `auth_login_events`；登录失败、账号禁用不写入该表
+- 管理后台用户列表返回用户最近一次登录 IP，并支持按用户查看最近登录历史
 - ldap 登录使用 `LDAP_URLS` 顺序尝试；某个地址连接失败时尝试下一个地址，simple bind 成功即视为鉴权成功，绑定失败则视为用户名或密码错误；生产部署建议配置 `ldaps://`
 
 ## 5. 失败模式与错误处理

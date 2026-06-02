@@ -1236,6 +1236,10 @@
   box-shadow: 0 22px 60px rgba(31, 29, 24, 0.22);
 }
 
+.admin-login-events-modal {
+  width: min(760px, 100%);
+}
+
 .admin-modal-header {
   display: flex;
   align-items: flex-start;
@@ -1283,6 +1287,21 @@
 .admin-modal-actions {
   justify-content: flex-end;
   padding-top: 4px;
+}
+
+.admin-login-events-body {
+  padding: 14px 16px 16px;
+}
+
+.admin-login-events-table {
+  min-width: 620px;
+}
+
+.admin-user-agent-cell {
+  max-width: 360px;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.35;
 }
 
 @media (max-width: 1080px) {
