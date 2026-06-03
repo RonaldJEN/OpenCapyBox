@@ -169,12 +169,14 @@ class TestCronServiceDB:
 
         mock_db.rollback.assert_called_once()
 
-    def test_create_job_sqlite_busy_maps_to_busy_error(self):
+    def test_create_job_db_busy_maps_to_busy_error(self):
         from sqlalchemy.exc import OperationalError
         from src.api.services.cron_service import CronJobBusyError
 
         svc, mock_db = _make_cron_service(first_return=None)
-        mock_db.commit.side_effect = OperationalError("stmt", {}, Exception("database is locked"))
+        orig = Exception("deadlock detected")
+        orig.pgcode = "40P01"
+        mock_db.commit.side_effect = OperationalError("stmt", {}, orig)
 
         with pytest.raises(CronJobBusyError, match="数据库繁忙"):
             svc.create_job("user-1", name="daily", cron_expr="0 9 * * *")
@@ -186,8 +188,10 @@ class TestCronServiceDB:
         from src.api.services.cron_service import CronJobBusyError
 
         svc, mock_db = _make_cron_service(first_return=None)
+        orig = Exception("deadlock detected")
+        orig.pgcode = "40P01"
         mock_db.query.return_value.filter.return_value.first.side_effect = (
-            OperationalError("stmt", {}, Exception("database is locked"))
+            OperationalError("stmt", {}, orig)
         )
 
         with pytest.raises(CronJobBusyError, match="数据库繁忙"):
@@ -195,7 +199,7 @@ class TestCronServiceDB:
 
         mock_db.rollback.assert_called_once()
 
-    def test_update_job_sqlite_busy_maps_to_busy_error(self):
+    def test_update_job_db_busy_maps_to_busy_error(self):
         from sqlalchemy.exc import OperationalError
         from src.api.services.cron_service import CronJobBusyError
 
@@ -206,7 +210,9 @@ class TestCronServiceDB:
         job.enabled = True
 
         svc, mock_db = _make_cron_service(first_return=job)
-        mock_db.commit.side_effect = OperationalError("stmt", {}, Exception("database is locked"))
+        orig = Exception("deadlock detected")
+        orig.pgcode = "40P01"
+        mock_db.commit.side_effect = OperationalError("stmt", {}, orig)
 
         with pytest.raises(CronJobBusyError, match="数据库繁忙"):
             svc.update_job("user-1", "daily", enabled=False)
@@ -218,8 +224,10 @@ class TestCronServiceDB:
         from src.api.services.cron_service import CronJobBusyError
 
         svc, mock_db = _make_cron_service(first_return=None)
+        orig = Exception("deadlock detected")
+        orig.pgcode = "40P01"
         mock_db.query.return_value.filter.return_value.first.side_effect = (
-            OperationalError("stmt", {}, Exception("database is locked"))
+            OperationalError("stmt", {}, orig)
         )
 
         with pytest.raises(CronJobBusyError, match="数据库繁忙"):
@@ -227,7 +235,7 @@ class TestCronServiceDB:
 
         mock_db.rollback.assert_called_once()
 
-    def test_delete_job_sqlite_busy_maps_to_busy_error(self):
+    def test_delete_job_db_busy_maps_to_busy_error(self):
         from sqlalchemy.exc import OperationalError
         from src.api.services.cron_service import CronJobBusyError
 
@@ -236,7 +244,9 @@ class TestCronServiceDB:
         job.name = "daily"
 
         svc, mock_db = _make_cron_service(first_return=job)
-        mock_db.commit.side_effect = OperationalError("stmt", {}, Exception("database is locked"))
+        orig = Exception("deadlock detected")
+        orig.pgcode = "40P01"
+        mock_db.commit.side_effect = OperationalError("stmt", {}, orig)
 
         with pytest.raises(CronJobBusyError, match="数据库繁忙"):
             svc.delete_job("user-1", "daily")
@@ -248,8 +258,10 @@ class TestCronServiceDB:
         from src.api.services.cron_service import CronJobBusyError
 
         svc, mock_db = _make_cron_service(first_return=None)
+        orig = Exception("deadlock detected")
+        orig.pgcode = "40P01"
         mock_db.query.return_value.filter.return_value.first.side_effect = (
-            OperationalError("stmt", {}, Exception("database is locked"))
+            OperationalError("stmt", {}, orig)
         )
 
         with pytest.raises(CronJobBusyError, match="数据库繁忙"):
@@ -268,8 +280,10 @@ class TestCronServiceDB:
 
         svc, mock_db = _make_cron_service(first_return=job)
         # 模拟 query(CronFire).filter(...).delete() 抛出锁冲突
+        orig = Exception("deadlock detected")
+        orig.pgcode = "40P01"
         mock_db.query.return_value.filter.return_value.delete.side_effect = (
-            OperationalError("stmt", {}, Exception("database is locked"))
+            OperationalError("stmt", {}, orig)
         )
 
         with pytest.raises(CronJobBusyError, match="数据库繁忙"):

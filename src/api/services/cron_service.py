@@ -44,16 +44,13 @@ class CronJobNotFoundError(CronJobValidationError):
 
 
 class CronJobBusyError(RuntimeError):
-    """SQLite 写冲突（database is locked/busy）。"""
+    """PostgreSQL 写冲突（死锁 / 序列化失败）。"""
 
 
-def _is_sqlite_busy_error(error: OperationalError) -> bool:
-    msg = str(error).lower()
-    return (
-        "database is locked" in msg
-        or "database table is locked" in msg
-        or "database is busy" in msg
-    )
+def _is_db_busy_error(error: OperationalError) -> bool:
+    pgcode = getattr(getattr(error, "orig", None), "pgcode", None)
+    # 40001 = serialization_failure, 40P01 = deadlock_detected
+    return pgcode in ("40001", "40P01")
 
 
 def _mark_run_failed(run_id: str, output: str, run_workspace: str | None = None) -> None:
@@ -190,7 +187,7 @@ class CronService:
             yield
         except OperationalError as e:
             self.db.rollback()
-            if _is_sqlite_busy_error(e):
+            if _is_db_busy_error(e):
                 raise CronJobBusyError("数据库繁忙，请稍后重试") from e
             raise
 

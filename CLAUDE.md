@@ -204,7 +204,7 @@ SANDBOX_API_KEY=your-sandbox-key
 
 # 应用
 API_PREFIX=/api
-DATABASE_URL=sqlite:///./data/database/open_capy_box.db
+DATABASE_URL=postgresql://user:password@localhost:5432/open_capy_box
 AUTH_SECRET_KEY=replace-with-random-secret
 
 # Agent/SSE

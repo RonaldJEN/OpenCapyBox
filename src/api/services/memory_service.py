@@ -23,7 +23,6 @@ from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import get_settings
 from src.api.models.user_memory import UserMemory, MemoryEmbedding
-from src.api.models.database import _IS_SQLITE
 from src.api.utils.timezone import now_naive
 from src.api.utils.embedding_vector import normalize_embedding_vector, serialize_pgvector
 
@@ -377,7 +376,7 @@ class MemoryService:
         self, user_id: str, query: str, top_k: int,
         *, dt_start: datetime | None = None, dt_end: datetime | None = None,
     ) -> list[dict]:
-        """向量语义检索：PostgreSQL 使用 pgvector 原生距离算子，SQLite 回退 Python 计算。"""
+        """向量语义检索：PostgreSQL 使用 pgvector 原生距离算子。"""
         query_embedding = await self._generate_embeddings([query])
         if not query_embedding or not query_embedding[0]:
             return []
@@ -397,39 +396,7 @@ class MemoryService:
             for kw in ("MEMORY.md", "USER.md", "SOUL.md", "AGENTS.md"):
                 filters.append(or_(MemoryEmbedding.file_path.is_(None), MemoryEmbedding.file_path.notlike(f"%{kw}%")))
 
-        if not _IS_SQLITE:
-            return self._search_by_pgvector(qvec, filters, top_k)
-
-        # SQLite fallback: 全量加载 + Python 余弦计算
-        all_chunks = (
-            self.db.query(MemoryEmbedding)
-            .filter(*filters)
-            .all()
-        )
-
-        scored = []
-        for chunk in all_chunks:
-            try:
-                cvec = normalize_embedding_vector(chunk.embedding)
-                if not cvec:
-                    continue
-                score = self._cosine_similarity(qvec, cvec)
-                scored.append((score, chunk))
-            except (TypeError, ValueError):
-                continue
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        return [
-            {
-                "file_path": item.file_path,
-                "chunk_index": item.chunk_index,
-                "text": item.chunk_text,
-                "score": round(score, 4),
-                "created_at": item.created_at,
-            }
-            for score, item in scored[:top_k]
-        ]
+        return self._search_by_pgvector(qvec, filters, top_k)
 
     def _search_by_pgvector(
         self, qvec: list[float], filters: list, top_k: int
@@ -828,18 +795,6 @@ class MemoryService:
         except Exception as e:
             logger.warning("Embedding API 调用失败: %s", e)
             return [None] * len(texts)
-
-    @staticmethod
-    def _cosine_similarity(a: list[float], b: list[float]) -> float:
-        """计算余弦相似度"""
-        if len(a) != len(b) or not a:
-            return 0.0
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = math.sqrt(sum(x * x for x in a))
-        norm_b = math.sqrt(sum(x * x for x in b))
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
 
     # ------------------------------------------------------------------
     # 对话内容自动索引

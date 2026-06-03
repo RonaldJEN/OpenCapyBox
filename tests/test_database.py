@@ -187,8 +187,7 @@ class TestMemoryEmbeddingColumnType:
         fake_engine = MagicMock()
         fake_engine.begin.return_value = context
 
-        with patch.object(database_module, "_IS_SQLITE", False), \
-             patch.object(database_module, "engine", fake_engine), \
+        with patch.object(database_module, "engine", fake_engine), \
              patch.object(database_module, "inspect", return_value=inspector), \
              patch.object(database_module, "_sync_postgres_sequence"):
             database_module._migrate_add_columns()

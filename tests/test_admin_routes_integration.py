@@ -28,26 +28,18 @@ from tests.db_safety import create_all_for_test_engine, ensure_safe_test_databas
 @pytest.fixture
 def admin_integration_client(tmp_path):
     test_db_url = os.environ.get("TEST_DATABASE_URL", "")
-    if test_db_url.startswith("postgresql"):
-        ensure_safe_test_database_url(test_db_url, load_dotenv_database_url(Path(__file__).parent.parent))
-        engine = create_engine(test_db_url)
-    else:
-        db_file = tmp_path / "admin-routes-integration.db"
-        engine = create_engine(
-            f"sqlite:///{db_file}",
-            connect_args={"check_same_thread": False},
-        )
+    ensure_safe_test_database_url(test_db_url, load_dotenv_database_url(Path(__file__).parent.parent))
+    engine = create_engine(test_db_url)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
     # Ensure required tables exist for real SQL query coverage.
     create_all_for_test_engine(engine, Base.metadata)
 
-    # PG: 清理可能遗留的脏数据（前次失败遗留）
-    if test_db_url.startswith("postgresql"):
-        from sqlalchemy import text as _text
-        with engine.begin() as conn:
-            table_names = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
-            conn.execute(_text(f"TRUNCATE TABLE {table_names} CASCADE"))
+    # 清理可能遗留的脏数据（前次失败遗留）
+    from sqlalchemy import text as _text
+    with engine.begin() as conn:
+        table_names = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
+        conn.execute(_text(f"TRUNCATE TABLE {table_names} CASCADE"))
 
     app = FastAPI()
     app.include_router(admin_routes.router, prefix="/admin")
@@ -65,14 +57,11 @@ def admin_integration_client(tmp_path):
     with TestClient(app) as client:
         yield client, TestingSessionLocal
 
-    # 清理：PG 用 TRUNCATE CASCADE，SQLite 直接 drop
-    if test_db_url.startswith("postgresql"):
-        from sqlalchemy import text as _text
-        with engine.begin() as conn:
-            table_names = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
-            conn.execute(_text(f"TRUNCATE TABLE {table_names} CASCADE"))
-    else:
-        Base.metadata.drop_all(bind=engine)
+    # 清理：PG 用 TRUNCATE CASCADE
+    from sqlalchemy import text as _text
+    with engine.begin() as conn:
+        table_names = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
+        conn.execute(_text(f"TRUNCATE TABLE {table_names} CASCADE"))
     engine.dispose()
 
 

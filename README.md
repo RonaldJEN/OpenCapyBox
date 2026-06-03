@@ -284,7 +284,7 @@ OpenCapyBox uses **AG-UI (Agent User Interaction Protocol)** for frontend-backen
 ├──────────────┬───────────────────────────────────────────────────┤
 │              │  REST API + SSE (AG-UI Event Protocol)            │
 ├──────────────▼───────────────────────────────────────────────────┤
-│  Backend — FastAPI + SQLAlchemy + SQLite                         │
+│  Backend — FastAPI + SQLAlchemy + PostgreSQL                     │
 │  JWT Auth · Agent Pool · Memory Service · Cron Scheduler · SSE  │
 ├──────────────┬───────────────────────────────────────────────────┤
 │              │  Agent ↔ LLM Provider / OpenSandbox               │

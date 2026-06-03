@@ -34,7 +34,7 @@
 | file_path | String(255) | nullable |
 | chunk_index | Integer | nullable |
 | chunk_text | Text | NOT NULL |
-| embedding | SQLite: JSON / PostgreSQL: pgvector `vector(2560)` | nullable（float 数组；不足 2560 维右侧补 0） |
+| embedding | PostgreSQL pgvector `vector(2560)` | nullable（float 数组；不足 2560 维右侧补 0） |
 | created_at | DateTime | default=now |
 
 ### user_skill_configs 表

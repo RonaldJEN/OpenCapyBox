@@ -699,7 +699,7 @@ INSERT INTO rounds (..., idempotency_key)
 1. **后台长轮询协程不得跨 `await asyncio.sleep` 持有 DB Session**。典型场景：
    - `_cancel_request_watcher`：每轮单独 `with SessionLocal() as check_db` / `hb_db`，`sleep` 前必须释放。
    - `subscribe_to_round.heartbeat_and_poll`：每次增量回放查询单独 `with SessionLocal() as replay_db`，查完立即释放。
-2. **SQLite 必须使用 `NullPool`**：文件型 DB 连接开销极低，NullPool 彻底规避 QueuePool 超时阻塞 event loop 的风险。其它数据库（MySQL/Postgres）保留默认 `QueuePool`。
+2. **PostgreSQL 使用 `QueuePool + pool_pre_ping`**：事实库仅支持 PostgreSQL，连接池容量必须覆盖请求级校验、SSE 后台 producer、cancel watcher 心跳与事件重放的短生命周期 Session 峰值，避免同步 ORM 获取连接时阻塞 event loop。
 3. **请求级 `db: Depends(get_db)` 在 SSE 流路径上只能用于入口校验**；进入 event_generator / producer 后，必须使用独立短生命周期 Session 做持久化。`subscribe_to_round` 完成初始 replay / 终态检查后，若要进入长时间队列等待，必须先结束请求级只读事务。
 4. **AgentPool 热缓存不得持有请求级 DB Session**：缓存的 `AgentService` 使用独立的 `SessionLocal` factory / owned session，命中缓存时不得把当前请求的 `db: Depends(get_db)` rebind 到共享 Agent 上。Agent 初始化期间需要更新 `user_sandboxes` 或同步 memory 时，也必须使用独立短生命周期 Session；入口请求级 `db` 只能传递已预读出的标量值（如 `model_id` / `sandbox_id` / `round_count`），不得跨 sandbox / Agent 初始化 await 持有。
 5. **AG-UI 事件持久化不得跨 Agent/LLM/tool 的 `await` 间隙保留未提交事务**；非 delta 事件写入后必须提交，delta 事件完成终态读取后也必须结束只读事务，run 收尾的只读状态/摘要查询也必须结束事务，避免 PostgreSQL 远端连接在 idle-in-transaction 状态被断开。`commit()` 后的 `refresh()` 会再次发起只读 `SELECT`，返回 ORM 对象前必须分离对象并结束该只读事务。

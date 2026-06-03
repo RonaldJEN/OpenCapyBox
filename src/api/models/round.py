@@ -37,8 +37,8 @@ class Round(Base):
 
     __tablename__ = "rounds"
     __table_args__ = (
-        # 注意：依賴 SQL 標準 NULL ≠ NULL 行為（SQLite, PostgreSQL 正確）。
-        # MySQL 8.0.16+ 需該約束只對非 NULL 值生效，如需遷移請驗證。
+        # 注意：依賴 PostgreSQL UNIQUE 約束中 NULL 不互相衝突的行為。
+        # 若未來遷移到其他数据库，需验证该约束只对非 NULL 值生效。
         UniqueConstraint('session_id', 'idempotency_key', name='uq_round_session_idempkey'),
     )
 

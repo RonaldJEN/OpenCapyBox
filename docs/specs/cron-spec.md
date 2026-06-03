@@ -87,19 +87,19 @@ All require Bearer auth.
   - `cron_expr` 必须是 5 字段标准 cron；不是 → 400。
   - 重名 → 400。
 - Response 201: `{job: <同上表项>}`
-- Error 400 (校验失败), 503 (SQLite 写锁冲突，建议重试)
+- Error 400 (校验失败), 503 (PostgreSQL 写冲突：死锁 / 序列化失败，建议重试)
 
 ### PUT /api/cron/jobs/{name}
 
 - Body: `{description? (<=500), content? (<=8000), schedule?, cron_expr?, enabled?}` —— 所有字段可选，省略则保持原值；`name` 不可改。
 - `schedule` / `cron_expr` 同斶传入 → 以 `schedule` 为准；两者均不传 → 时间不变。
 - Response 200: `{job: ...}`
-- Error 404 (任务不存在), 400 (其他校验失败), 503 (SQLite 写锁冲突，建议重试)
+- Error 404 (任务不存在), 400 (其他校验失败), 503 (PostgreSQL 写冲突：死锁 / 序列化失败，建议重试)
 
 ### DELETE /api/cron/jobs/{name}
 
 - Response 204 (空 body)。历史 `cron_job_runs` 保留；`cron_fires` 允许级联清理（按 `job_id` 删除），以保证删除可用。
-- Error 404, 503 (SQLite 写锁冲突，建议重试)
+- Error 404, 503 (PostgreSQL 写冲突：死锁 / 序列化失败，建议重试)
 
 ### POST /api/cron/jobs/preview
 
@@ -163,10 +163,10 @@ All require Bearer auth.
 - 仅借用 `apscheduler.triggers.cron.CronTrigger` 做单分钟语义匹配，**未使用任何 scheduler 主进程或 jobstore**（无 `AsyncIOScheduler` / 文件锁主节点）；持久化与去重全部走 DB。
 - Worker 每分钟唤醒一次（对齐到本地分钟边界 + 0-2s 随机 jitter）
 - 查询所有 enabled CronJob，通过一次性 `CronTrigger` 匹配当前分钟（本地时区）
-- 匹配成功后 INSERT OR IGNORE 到 cron_fires 表
+- 匹配成功后使用 PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` 写入 cron_fires 表
   - 插入成功 = 本 worker 赢得执行权
   - 插入失败 (UNIQUE 冲突) = 其他 worker 已认领
-  - SQLite OperationalError (busy) → 本分钟调度丢失，下次 cron 命中再触发（同分钟不会重补）
+  - PostgreSQL 写冲突（SQLSTATE `40001` / `40P01`）→ 当前 worker 放弃本次抢占；若无其他 worker 成功认领，则等下一次 cron 命中再触发（同分钟不会重补）
 
 ### 执行前二次校验
 
@@ -256,7 +256,7 @@ All require Bearer auth.
 
 - Worker loop 内每日（当 `minute.hour == 0` 且日期与上次清理不同）触发 `_cleanup_old_fires()`。
 - 删除 `cron_fires` 表中 `scheduled_at < now - cron_fire_max_age_days` 的记录（默认 7 天，通过 `settings.cron_fire_max_age_days` 配置；≤0 时禁用清理）。
-- 删除操作幂等，多 worker 并发下由 SQLite 写锁串行化，不会产生冲突。
+- 删除操作幂等，多 worker 并发清理同一批过期记录也不会改变最终结果。
 - worker 启动当天若已过 00:xx，本日不补清，最早次日 00:xx 触发。
 
 ### Worker 生命周期
@@ -272,8 +272,8 @@ All require Bearer auth.
 - 沙箱 resume 失败 → run failed
 - Agent 执行异常 → run failed, output 记录错误信息
 - Artifact 扫描失败 → 降级（最终只返回路径）
-- SQLite busy → 本分钟调度丢失（不重试同分钟，cron_fires 键不变时无法重新抢占）；下一次 cron 命中恢复正常
-- CRUD 写接口遇到 SQLite `database is locked|busy` → 返回 503（瞬时冲突，调用方重试）
+- PostgreSQL 写冲突（SQLSTATE `40001` / `40P01`）→ 本 worker 放弃本分钟抢占；下一次 cron 命中恢复正常
+- CRUD 写接口遇到 PostgreSQL 死锁 / 序列化失败 → 返回 503（瞬时冲突，调用方重试）
 - 调度快照期间 job 被删除/禁用 → `_run_by_id` 二次校验 skip
 
 ## 6. 可观测性
@@ -288,7 +288,7 @@ All require Bearer auth.
 - 不做秒级调度（最小粒度 = 1 分钟）
 - 不做作业依赖编排
 - 不做执行重试（失败即终态）
-- 不做分布式锁（依赖 SQLite UNIQUE 约束）
+- 不引入外部分布式锁（依赖 `cron_fires` 的 PostgreSQL UNIQUE 约束）
 - 不做执行日志实时流式输出
 - 不做 `cron_expr` 反解析 → `schedule`；老数据/工具创建的作业 `schedule=null`，前端只能读 `cron_expr` 只读展示。
 
@@ -296,10 +296,10 @@ All require Bearer auth.
 
 ### `cron_fires` → Redis（可选）
 
-`cron_fires` 表语义上等价于一个带 TTL 的分布式锁，仅在 SQLite 单机部署下作为执行权仲裁凭证。若未来切多机部署或引入 Redis，可按以下路径迁移：
+`cron_fires` 表语义上等价于一个带 TTL 的执行权仲裁键，当前由 PostgreSQL UNIQUE 约束保证同一 `(job_id, scheduled_at)` 只被认领一次。若未来引入 Redis，可按以下路径迁移：
 
 - 抽象 `FireArbiter` 接口：`try_acquire(job_id, minute) -> bool`
-- 保留当前实现为 `SqliteFireArbiter`（`INSERT OR IGNORE`）
+- 保留当前实现为 `PostgresFireArbiter`（`INSERT ... ON CONFLICT DO NOTHING`）
 - 新增 `RedisFireArbiter`：`SET cron:fire:{job_id}:{minute} 1 NX PX <ttl_ms>`
   - TTL 按 cron 最小粒度设（如 120s），自动回收，无需历史行清理
 - 按部署模式（单机 vs 多机）在启动时选择具体实现

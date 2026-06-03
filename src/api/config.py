@@ -33,8 +33,8 @@ class Settings(BaseSettings):
     ldap_urls: str = ""
     ldap_user_domain: str = ""
 
-    # 数据库配置
-    database_url: str = "sqlite:///./data/database/open_capy_box.db"
+    # 数据库配置（仅支持 PostgreSQL，必须在 .env 中配置 DATABASE_URL）
+    database_url: str = "postgresql://postgres:postgres@localhost:5432/open_capy_box"
 
     # LLM API 配置（仅作为 Model Registry 不可用时的 fallback）
     llm_api_key: str = ""  # API 密钥（必须在 .env 中配置 LLM_API_KEY）

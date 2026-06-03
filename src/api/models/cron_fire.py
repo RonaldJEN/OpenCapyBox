@@ -2,13 +2,13 @@
 
 用于在多 worker 场景下通过 UNIQUE 约束实现同一分钟只触发一次。
 
-TODO(迁移): 该表是 SQLite 单机部署下的执行权仲裁凭证，语义上等价于一个
-带 TTL 的分布式锁。后续如果切到多机部署或引入 Redis，可用
+TODO(迁移): 该表是 PostgreSQL 部署下的执行权仲裁凭证，语义上等价于一个
+带 TTL 的去重键。后续如果引入 Redis，可用
 `SET NX PX <ttl>` 取代整张表，key 形如 `cron:fire:{job_id}:{scheduled_at}`，
 TTL 按 cron 最小粒度设（如 120s）自动回收，无需再做历史行清理。
 迁移路径：
   1. 抽象 `FireArbiter` 接口（`try_acquire(job_id, minute) -> bool`）
-  2. 保留当前 SQLite 实现为 `SqliteFireArbiter`
+  2. 保留当前 PostgreSQL 实现为 `PostgresFireArbiter`
   3. 新增 `RedisFireArbiter` 作为可选实现，按部署模式切换
 届时本 Model 与 `cron_fires` 表可整体下线。
 """

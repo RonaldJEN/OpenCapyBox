@@ -1006,10 +1006,10 @@ class TestAbortCleansUpUserLock:
 
 
 class TestReleaseLockRetry:
-    """锁释放 SQLite locked 重试测试。"""
+    """锁释放 DB 写冲突重试测试。"""
 
-    async def test_release_retries_on_sqlite_locked_then_succeeds(self, lock_db_session):
-        """commit 首次 SQLite locked、重试后成功，释放应成功。"""
+    async def test_release_retries_on_db_locked_then_succeeds(self, lock_db_session):
+        """commit 首次 PG 写冲突、重试后成功，释放应成功。"""
         lock_db_session.add(UserRunLock(user_id="user-1", session_id="session-a", lock_id="lock-a"))
         lock_db_session.commit()
 
@@ -1020,10 +1020,12 @@ class TestReleaseLockRetry:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
+                orig = Exception("deadlock detected")
+                orig.pgcode = "40P01"
                 raise OperationalError(
                     "DELETE FROM user_run_locks",
                     {},
-                    sqlite3.OperationalError("database is locked"),
+                    orig,
                 )
             return original_commit()
 
@@ -1035,16 +1037,18 @@ class TestReleaseLockRetry:
         assert call_count == 2  # 首次失败 + 重试成功
 
     async def test_release_fails_after_max_retries(self):
-        """commit 持续 SQLite locked，释放应失败且锁仍在。"""
+        """commit 持续 PG 写冲突，释放应失败且锁仍在。"""
         mock_db = MagicMock()
         mock_lock = MagicMock()
         mock_lock.user_id = "user-1"
         mock_lock.lock_id = "lock-a"
         mock_db.query.return_value.filter.return_value.first.return_value = mock_lock
+        orig = Exception("deadlock detected")
+        orig.pgcode = "40P01"
         mock_db.commit.side_effect = OperationalError(
             "DELETE FROM user_run_locks",
             {},
-            sqlite3.OperationalError("database is locked"),
+            orig,
         )
 
         released = await _release_user_run_lock(mock_db, user_id="user-1", lock_id="lock-a")

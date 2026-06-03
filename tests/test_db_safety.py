@@ -6,15 +6,18 @@ import pytest
 
 from tests import db_safety
 from tests.db_safety import (
-    SAFE_SQLITE_TEST_DATABASE_URL,
     configure_pytest_database_urls,
     create_all_for_test_engine,
     ensure_safe_test_database_url,
 )
 
 
-def test_sqlite_test_database_is_allowed():
-    ensure_safe_test_database_url(SAFE_SQLITE_TEST_DATABASE_URL, "postgresql://app@host/prod")
+def test_rejects_non_postgres_test_database():
+    with pytest.raises(RuntimeError, match="postgresql"):
+        ensure_safe_test_database_url(
+            "sqlite:///./data/database/open_capy_box_test.db",
+            "postgresql://app@host/prod",
+        )
 
 
 def test_rejects_same_postgres_database_as_production():
@@ -39,7 +42,7 @@ def test_allows_distinct_postgres_test_database():
     )
 
 
-def test_configure_pytest_database_urls_defaults_to_sqlite(monkeypatch, tmp_path):
+def test_configure_pytest_database_urls_requires_test_database_url(monkeypatch, tmp_path):
     monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     (tmp_path / ".env").write_text(
@@ -47,11 +50,8 @@ def test_configure_pytest_database_urls_defaults_to_sqlite(monkeypatch, tmp_path
         encoding="utf-8",
     )
 
-    configured = configure_pytest_database_urls(Path(tmp_path))
-
-    assert configured == SAFE_SQLITE_TEST_DATABASE_URL
-    assert os.environ["DATABASE_URL"] == SAFE_SQLITE_TEST_DATABASE_URL
-    assert os.environ["TEST_DATABASE_URL"] == SAFE_SQLITE_TEST_DATABASE_URL
+    with pytest.raises(RuntimeError):
+        configure_pytest_database_urls(Path(tmp_path))
 
 
 def test_configure_pytest_database_urls_uses_dotenv_test_database_url(monkeypatch, tmp_path):

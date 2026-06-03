@@ -9,7 +9,6 @@ from dotenv import dotenv_values
 from sqlalchemy.engine import make_url
 
 
-SAFE_SQLITE_TEST_DATABASE_URL = "sqlite:///./data/database/open_capy_box_test.db"
 _SAFE_PG_NAME_MARKERS = ("test", "pytest", "ci")
 
 
@@ -48,11 +47,8 @@ def ensure_safe_test_database_url(test_url: str, production_url: str = "") -> No
 
     url = make_url(test_url)
     backend = url.get_backend_name()
-    if backend == "sqlite":
-        return
-
     if backend != "postgresql":
-        raise RuntimeError(f"测试数据库仅允许 sqlite/postgresql，当前是: {backend}")
+        raise RuntimeError(f"测试数据库仅允许 postgresql，当前是: {backend}")
 
     if _same_database(test_url, production_url):
         raise RuntimeError("TEST_DATABASE_URL 指向了生产 DATABASE_URL，已阻止测试运行")
@@ -67,7 +63,12 @@ def ensure_safe_test_database_url(test_url: str, production_url: str = "") -> No
 
 def configure_pytest_database_urls(project_root: Path) -> str:
     production_url = os.environ.get("DATABASE_URL") or load_dotenv_database_url(project_root)
-    test_url = os.environ.get("TEST_DATABASE_URL") or load_dotenv_test_database_url(project_root) or SAFE_SQLITE_TEST_DATABASE_URL
+    test_url = os.environ.get("TEST_DATABASE_URL") or load_dotenv_test_database_url(project_root)
+    if not test_url:
+        raise RuntimeError(
+            "未配置 TEST_DATABASE_URL：本项目只支持 PostgreSQL，"
+            "请在环境变量或 .env 中设置一个 PostgreSQL 测试库 URL"
+        )
 
     ensure_safe_test_database_url(test_url, production_url)
     os.environ["TEST_DATABASE_URL"] = test_url

@@ -16,7 +16,6 @@ from contextlib import suppress
 from datetime import datetime, timedelta
 
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import insert
 from sqlalchemy.exc import OperationalError
 
 from src.api.models.auth_user import AuthUser
@@ -99,7 +98,7 @@ async def _cron_worker_loop(worker_id: str, user_locks: dict[str, asyncio.Lock])
             await _dispatch_and_run(worker_id, user_locks, minute)
 
             # 每天凌晨第一次触发时清理过期 cron_fires。
-            # 即使多 worker 同时清理也无害：DELETE 幂等，且走 SQLite 写锁串行。
+            # 即使多 worker 同时清理也无害：DELETE 幂等，最终状态一致。
             if last_cleanup_date != minute.date() and minute.hour == 0:
                 _cleanup_old_fires()
                 last_cleanup_date = minute.date()
@@ -187,9 +186,8 @@ def _cron_matches_minute(expr: str, minute: datetime) -> bool:
 def _try_insert_fire(job_id: int, minute: datetime) -> bool:
     """尝试插入去重记录：成功插入返回 True，唯一约束冲突返回 False。
 
-    SQLite 使用 INSERT OR IGNORE，PostgreSQL 使用 ON CONFLICT DO NOTHING。
+    PostgreSQL 使用 ON CONFLICT DO NOTHING。
     """
-    from src.api.models.database import _IS_SQLITE
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     try:
@@ -199,26 +197,19 @@ def _try_insert_fire(job_id: int, minute: datetime) -> bool:
                 job_id=job_id,
                 scheduled_at=minute,
             )
-            if _IS_SQLITE:
-                result = db.execute(
-                    insert(CronFire).prefix_with("OR IGNORE").values(**values)
-                )
-                db.commit()
-                return result.rowcount == 1
-            else:
-                stmt = pg_insert(CronFire).values(**values).on_conflict_do_nothing(
-                    constraint="uq_cronfire_job_time"
-                )
-                result = db.execute(stmt)
-                db.commit()
-                return result.rowcount == 1
+            stmt = pg_insert(CronFire).values(**values).on_conflict_do_nothing(
+                constraint="uq_cronfire_job_time"
+            )
+            result = db.execute(stmt)
+            db.commit()
+            return result.rowcount == 1
     except OperationalError as e:
-        # 只有 "database is locked / busy" 属于预期抢占失败，其余（例如 no such table）
+        # 只有死锁 / 序列化失败属于预期抢占冲突，其余（例如 no such table）
         # 都是严重配置错误，必须响亮报错，避免静默吞掉导致 cron 看起来"没运行"
-        msg = str(e).lower()
-        if "locked" in msg or "busy" in msg:
+        pgcode = getattr(getattr(e, "orig", None), "pgcode", None)
+        if pgcode in ("40001", "40P01"):
             logger.debug(
-                "dispatch sqlite busy job_id=%s minute=%s err=%s",
+                "dispatch db conflict job_id=%s minute=%s err=%s",
                 job_id,
                 minute,
                 e,

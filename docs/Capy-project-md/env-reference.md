@@ -24,8 +24,8 @@
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `API_PREFIX` | 否 | `/api` | API 路由前缀 |
-| `DATABASE_URL` | 是（使用 `.env.example` 启动时） | 未配置时应用内默认 `sqlite:///./data/database/open_capy_box.db` | 数据库连接串。当前 `.env.example` 使用 PostgreSQL 模板，启动前必须替换为真实 PostgreSQL URL。 |
-| `TEST_DATABASE_URL` | 否 | `sqlite:///./data/database/open_capy_box_test.db` | pytest 集成测试数据库连接串；使用 PostgreSQL 时库名必须包含 `test` / `pytest` / `ci`，且禁止指向生产库。 |
+| `DATABASE_URL` | 是（使用 `.env.example` 启动时） | `postgresql://postgres:postgres@localhost:5432/open_capy_box` | PostgreSQL 数据库连接串。当前 `.env.example` 使用占位模板，启动前必须替换为真实 PostgreSQL URL。 |
+| `TEST_DATABASE_URL` | 是（运行 pytest 时） | 无 | pytest 集成测试 PostgreSQL 连接串；库名必须包含 `test` / `pytest` / `ci`，且禁止指向生产库。 |
 | `CORS_ORIGINS` | 否 | `["http://localhost:3000","http://localhost:5173"]` | 允许的跨域源 |
 
 PostgreSQL 目标库必须提前创建，并安装 `pgvector` 扩展：
@@ -34,7 +34,7 @@ PostgreSQL 目标库必须提前创建，并安装 `pgvector` 扩展：
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-未安装 pgvector 时，启动 / `init_db()` 会在扩展检查阶段直接失败。若仅做本地 SQLite 开发，可改用 `sqlite:///./data/database/open_capy_box.db`，但生产与迁移脚本按 PostgreSQL + pgvector 路径维护。
+未安装 pgvector 时，启动 / `init_db()` 会在扩展检查阶段直接失败。本地开发、测试与生产环境均按 PostgreSQL + pgvector 路径维护。
 
 ## 模型能力（Model Registry）
 

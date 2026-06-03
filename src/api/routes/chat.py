@@ -130,7 +130,7 @@ async def _upsert_cancel_request(
         db.commit()
         return request_id
 
-    result = await _with_sqlite_retry(_do, rollback=db.rollback)
+    result = await _with_db_retry(_do, rollback=db.rollback)
     logger.info(
         "cancel request -> requested: user=%s session=%s request_id=%s",
         user_id,
@@ -172,7 +172,7 @@ async def _clear_pending_cancel_request(
             return True
         return False
 
-    return await _with_sqlite_retry(_do, rollback=db.rollback)
+    return await _with_db_retry(_do, rollback=db.rollback)
 
 
 async def _run_in_new_session(
@@ -227,7 +227,7 @@ async def _complete_cancel_request_in_new_session(
                 )
             return True
 
-        return await _with_sqlite_retry(_do, rollback=db.rollback)
+        return await _with_db_retry(_do, rollback=db.rollback)
 
     return await _run_in_new_session(
         _op, label="完成 cancel request", user_id=user_id, session_id=session_id,
@@ -331,9 +331,9 @@ async def _cancel_request_watcher(
                         )
                         return
             except OperationalError as exc:
-                if not _is_sqlite_locked_error(exc):
+                if not _is_retryable_db_error(exc):
                     raise
-                # SQLite 瞬时锁冲突，下次再试
+                # PostgreSQL 瞬时写冲突（死锁/序列化失败），下次再试
 
             # 2. 定期刷新锁心跳（频率低于 cancel check）—— 独立短生命周期 Session
             if lock_id and (time.monotonic() - _last_heartbeat) >= heartbeat_interval:
@@ -356,10 +356,10 @@ async def _cancel_request_watcher(
                         cancel_token.set()
                         return
                 except OperationalError as exc:
-                    if _is_sqlite_locked_error(exc):
+                    if _is_retryable_db_error(exc):
                         _heartbeat_fail_count += 1
                         logger.warning(
-                            "心跳写入失败（SQLite 锁冲突）: user=%s fail_count=%d/%d",
+                            "心跳写入失败（DB 写冲突）: user=%s fail_count=%d/%d",
                             user_id, _heartbeat_fail_count, max_heartbeat_failures,
                         )
                     else:
@@ -392,20 +392,21 @@ async def _cancel_request_watcher(
         )
 
 
-def _is_sqlite_locked_error(exc: OperationalError) -> bool:
-    """判斷是否為 SQLite 常見鎖衝突錯誤（database is locked / table is locked）。"""
-    message = str(getattr(exc, "orig", exc)).lower()
-    return "database is locked" in message or "database table is locked" in message
+def _is_retryable_db_error(exc: OperationalError) -> bool:
+    """判斷是否為 PostgreSQL 瞬時可重試錯誤（死鎖 / 序列化失敗）。"""
+    pgcode = getattr(getattr(exc, "orig", None), "pgcode", None)
+    # 40001 = serialization_failure, 40P01 = deadlock_detected
+    return pgcode in ("40001", "40P01")
 
 
-async def _with_sqlite_retry(
+async def _with_db_retry(
     fn: Callable[[], any],
     *,
     max_retries: int = 5,
     retry_interval: float = 0.1,
     rollback: Callable[[], None] | None = None,
 ) -> any:
-    """SQLite 瞬時寫鎖衝突的通用重試 wrapper。
+    """PostgreSQL 瞬時寫衝突（死鎖 / 序列化失敗）的通用重試 wrapper。
 
     Args:
         fn: 要執行的同步 callable（包含 DB 操作 + commit）。
@@ -425,7 +426,7 @@ async def _with_sqlite_retry(
             last_exc = exc
             if rollback:
                 rollback()
-            if _is_sqlite_locked_error(exc) and attempt + 1 < max_retries:
+            if _is_retryable_db_error(exc) and attempt + 1 < max_retries:
                 await asyncio.sleep(retry_interval)
                 continue
             raise
@@ -537,13 +538,13 @@ async def _acquire_user_run_lock(*, user_id: str, session_id: str) -> str | None
                 return None
             except OperationalError as exc:
                 lock_db.rollback()
-                if not _is_sqlite_locked_error(exc):
+                if not _is_retryable_db_error(exc):
                     raise
                 if attempt + 1 < max_busy_retries:
                     await asyncio.sleep(retry_interval_seconds)
                     continue
                 logger.warning(
-                    "獲取用戶運行鎖遇到 SQLite 寫鎖衝突: user=%s session=%s",
+                    "獲取用戶運行鎖遇到 DB 寫衝突: user=%s session=%s",
                     user_id,
                     session_id,
                     exc_info=True,
@@ -645,7 +646,7 @@ async def _release_user_run_lock(
 
     若傳入 lock_id，僅在鎖歸屬於該 lock_id 時釋放，避免舊請求誤刪新鎖。
     若未傳 lock_id 但傳入 session_id，僅在鎖歸屬於該會話時釋放。
-    遇到 SQLite 瞬時鎖衝突時最多重試 5 次。
+    遇到 PostgreSQL 瞬時寫衝突時最多重試 5 次。
     """
     def _do():
         query = db.query(UserRunLock).filter(UserRunLock.user_id == user_id)
@@ -687,7 +688,7 @@ async def _release_user_run_lock(
         return True
 
     try:
-        return await _with_sqlite_retry(_do, rollback=db.rollback)
+        return await _with_db_retry(_do, rollback=db.rollback)
     except OperationalError:
         logger.warning(
             "釋放用戶運行鎖失敗: user=%s lock_id=%s session=%s",

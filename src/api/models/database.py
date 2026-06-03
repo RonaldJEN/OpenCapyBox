@@ -3,8 +3,6 @@ import logging
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import NullPool, QueuePool
-from pathlib import Path
 from sqlalchemy.exc import OperationalError
 
 from src.api.config import get_settings
@@ -36,31 +34,22 @@ logger = logging.getLogger(__name__)
 # 从 Settings 读取数据库 URL（可通过 .env 的 DATABASE_URL 覆盖）
 _settings = get_settings()
 DATABASE_URL = _settings.database_url
-_IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
-# 从 URL 推断并确保数据库目录存在
-if _IS_SQLITE:
-    # sqlite:///./data/database/open_capy_box.db → ./data/database/
-    _db_path = DATABASE_URL.split("///", 1)[-1]
-    db_dir = Path(_db_path).parent
-    db_dir.mkdir(parents=True, exist_ok=True)
+# 系统事实库只支持 PostgreSQL：非 PG URL 直接 fail-fast，避免误用 SQLite。
+if not DATABASE_URL.startswith(("postgresql", "postgres")):
+    raise RuntimeError(
+        f"DATABASE_URL 必须是 PostgreSQL（当前: {DATABASE_URL!r}）。"
+        "本项目只支持 PostgreSQL 作为事实库。"
+    )
 
-# 创建引擎
-# SQLite: 使用 NullPool（文件型 DB 连接开销极低，按需创建/立即释放），
-# 彻底避免 asyncio 环境下 QueuePool 耗尽导致的 30s 阻塞死锁。
-# PostgreSQL: 使用 QueuePool + pool_pre_ping 保证连接活性。
-_engine_kwargs: dict = dict(echo=False)
-
-if _IS_SQLITE:
-    _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
-    _engine_kwargs["poolclass"] = NullPool
-else:
-    # PostgreSQL / MySQL 等
-    _engine_kwargs["pool_size"] = 5
-    _engine_kwargs["max_overflow"] = 10
-    _engine_kwargs["pool_pre_ping"] = True
-
-engine = create_engine(DATABASE_URL, **_engine_kwargs)
+# 创建引擎：PostgreSQL 使用 QueuePool + pool_pre_ping 保证连接活性。
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
+)
 
 # 会话工厂
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -86,28 +75,12 @@ def init_db():
     _import_models()
     _configure_postgres_extensions()
     Base.metadata.create_all(bind=engine)
-    _configure_sqlite_pragmas()
     _migrate_user_run_locks_schema()
     _migrate_add_columns()
 
 
-def _configure_sqlite_pragmas():
-    """SQLite 运行时参数（仅 SQLite 生效）。"""
-    if not _IS_SQLITE:
-        return
-    try:
-        with engine.begin() as conn:
-            mode = conn.execute(text("PRAGMA journal_mode=WAL")).scalar()
-            conn.execute(text("PRAGMA busy_timeout=5000"))
-            logger.info("SQLite PRAGMA journal_mode=%s", mode)
-    except Exception:
-        logger.warning("设置 SQLite WAL 模式失败，继续使用默认 journal_mode", exc_info=True)
-
-
 def _configure_postgres_extensions():
     """PostgreSQL 扩展初始化。"""
-    if _IS_SQLITE:
-        return
     with engine.begin() as conn:
         _ensure_postgres_vector_extension(conn)
 
@@ -181,9 +154,9 @@ def _migrate_user_run_locks_schema() -> None:
 # 简易数据库迁移（无 Alembic 场景下的安全 ALTER TABLE）
 # ============================================================
 
-# 布尔默认值根据方言选择：SQLite 用 0/1，PostgreSQL 用 FALSE/TRUE
-_BOOL_FALSE = "0" if _IS_SQLITE else "FALSE"
-_BOOL_TRUE = "1" if _IS_SQLITE else "TRUE"
+# 布尔默认值（PostgreSQL）
+_BOOL_FALSE = "FALSE"
+_BOOL_TRUE = "TRUE"
 
 # 格式: (表名, 列名, 列 DDL 片段)
 _PENDING_COLUMNS = [
@@ -271,7 +244,7 @@ def _migrate_add_columns():
             logger.info("DB 迁移: 新建唯一约束 %s.%s (%s)", table_name, constraint_name, cols_str)
 
         # PostgreSQL: 修正列类型（毫秒时间戳超出 INTEGER 范围；tool_call_id 超出 36 字符）
-        if not _IS_SQLITE and inspector.has_table("agui_events"):
+        if inspector.has_table("agui_events"):
             for col in inspector.get_columns("agui_events"):
                 if col["name"] == "timestamp" and str(col["type"]) == "INTEGER":
                     conn.execute(text("ALTER TABLE agui_events ALTER COLUMN timestamp TYPE BIGINT"))
@@ -281,7 +254,7 @@ def _migrate_add_columns():
                     logger.info("DB 迁移: agui_events.tool_call_id 从 VARCHAR(%s) 升级为 VARCHAR(64)", col["type"].length)
 
         # PostgreSQL: memory_embeddings.embedding 统一为目标 pgvector 维度
-        if not _IS_SQLITE and inspector.has_table("memory_embeddings"):
+        if inspector.has_table("memory_embeddings"):
             has_pgvector = _ensure_postgres_vector_extension(conn)
             if has_pgvector:
                 col_type = _get_postgres_column_type(conn, "memory_embeddings", "embedding")
@@ -352,11 +325,10 @@ def _migrate_add_columns():
 
         # PostgreSQL: 同步自增序列到 max(id)（pgloader 等工具插入显式 id 后序列可能过时）
         # 注意：下方表名均为硬编码常量，不来自外部输入，f-string 拼接安全。
-        if not _IS_SQLITE:
-            _SERIAL_TABLES = [
-                "agui_events", "conversation_messages", "llm_call_records",
-                "user_memory", "memory_embeddings", "cron_jobs", "user_skill_configs",
-            ]
-            for t in _SERIAL_TABLES:
-                if inspector.has_table(t):
-                    _sync_postgres_sequence(conn, t)
+        _SERIAL_TABLES = [
+            "agui_events", "conversation_messages", "llm_call_records",
+            "user_memory", "memory_embeddings", "cron_jobs", "user_skill_configs",
+        ]
+        for t in _SERIAL_TABLES:
+            if inspector.has_table(t):
+                _sync_postgres_sequence(conn, t)

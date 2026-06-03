@@ -976,8 +976,9 @@ class AgentService:
         用於 Agent 上下文恢復，與 agui_events 互相獨立。
 
         使用原子 INSERT…SELECT 在單條 SQL 語句內完成
-        MAX(sequence) 讀取 + 行寫入，SQLite 對單條寫語句持
-        排他鎖，從結構上消除併發 UNIQUE 衝突。
+        MAX(sequence) 讀取 + 行寫入。同一 session 的寫入由 UserRunLock
+        （uq_user_run_lock_user_session）串行化，單 worker 下不存在並發寫者；
+        `uq_convmsg_session_seq` 唯一約束作為最終兜底。
         """
         from sqlalchemy import text
 

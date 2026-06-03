@@ -610,27 +610,6 @@ class TestEmbeddingVectorNormalization:
         assert len(vector) == MEMORY_EMBEDDING_DIMENSIONS
         assert vector[:2] == [0.1, -0.2]
 
-    @pytest.mark.asyncio
-    async def test_sqlite_embedding_search_normalizes_legacy_short_vectors(self):
-        from src.api.services.memory_service import MemoryService
-
-        chunk = MagicMock()
-        chunk.embedding = [0.1, 0.2]
-        chunk.file_path = "conversation/s1/r1"
-        chunk.chunk_index = 0
-        chunk.chunk_text = "legacy short vector"
-        chunk.created_at = None
-
-        mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.all.return_value = [chunk]
-        svc = MemoryService(mock_db)
-
-        with patch("src.api.services.memory_service._IS_SQLITE", True), \
-             patch.object(svc, "_generate_embeddings", new_callable=AsyncMock, return_value=[[0.1, 0.2]]):
-            results = await svc._search_by_embedding("u1", "query", top_k=1)
-
-        assert results[0]["score"] == 1.0
-
     def test_pgvector_search_builds_bound_vector_query(self):
         from sqlalchemy.dialects import postgresql
 
