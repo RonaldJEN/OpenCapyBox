@@ -182,7 +182,7 @@ All require Bearer auth.
 
 1. 获取 per-user lock（同一 worker 进程内同用户作业串行执行；跨 worker 不串行，详见下方「多 worker 并发模型」）
 2. Resume 用户沙箱
-3. 创建临时 Agent（排除 AskUserQuestionTool 和 memory tools；保留 `write_file` / `edit_file` 这类受控文件工具）
+3. 创建临时 Agent（排除 AskUserQuestionTool、SubAgentTool 和 memory tools；保留 `write_file` / `edit_file` 这类受控文件工具）
 4. Workspace = `{mount}/cron/runs/{run_id}`，通过 `mkdir -p {shlex.quote(...)}` 创建（防 mount 路径含空格时注入）；普通产物文件必须写入该 workspace，后续所有针对 workspace 的 shell 命令（artifact 扫描的 `find` 链）同样使用 `shlex.quote` 保护
 5. `Agent.run_agui` 执行
 6. 扫描 artifacts（fallback 链：GNU `find -printf '%p\t%s'` → `find -exec stat -c '%n\t%s'` → 仅路径 `find -type f`；最后一档 size 置 0）
@@ -191,6 +191,7 @@ All require Bearer auth.
 ### 记忆与配置文件边界
 
 - Cron Agent 不提供 `record_memory` / `update_long_term_memory` / `search_memory` / `read_user` / `update_user`，避免定时执行器默认具备对话记忆检索、整理和专用写入能力。
+- Cron Agent 不提供 `ask_user` 或 `sub_agent`：定时任务无人值守，不能等待用户输入，也不能递归创建子 Agent run。
 - Cron Agent 复用共享的受控文件工具。若 `write_file` / `edit_file` 成功写入根目录 `{mount}/USER.md`、`{mount}/MEMORY.md`、`{mount}/SOUL.md`、`{mount}/AGENTS.md`，则按 [memory-spec.md](./memory-spec.md) 的「受控工具即时同步」语义同步回 DB；`USER.md` / `MEMORY.md` 内容变化时同步重建 embedding。
 - 上述根目录配置写入只用于任务明确要求更新用户画像、长期记忆或 Agent 配置的场景；普通执行产物仍必须保存在 run workspace，并只作为 cron artifacts 扫描和展示。
 

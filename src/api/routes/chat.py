@@ -7,20 +7,18 @@ AG-UI 協議的瀏覽器刷新/重連機制：
 4. 使用 MESSAGES_SNAPSHOT 恢復歷史，然後繼續流式推送
 
 重構說明 (v2):
-- 主路由使用 agent_service.chat_agui() 直接透傳 AG-UI 事件
+- 主路由只做 Web HTTP/SSE adapter，run 创建通过 TurnOrchestrator 下沉
 - 移除了 ~350 行的手動事件轉換代碼
 - 事件持久化由 AgentService 內部處理
 - 保留訂閱者廣播和標題生成功能
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import insert, or_, select
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session as DBSession
 from src.api.models.database import get_db
 from src.api.deps import get_current_user
 from src.api.models.session import Session
-from src.api.models.agui_event import AGUIEventLog
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.run_cancel_request import RunCancelRequest
 from src.api.schemas.chat import SendMessageRequest, ResumeRequest
@@ -33,18 +31,24 @@ import time
 from datetime import datetime
 from src.api.utils.timezone import now_naive
 # AG-UI 事件類型統一從 Agent 層導入
-from src.agent.schema.agui_events import AGUIEvent, RunStartedEvent, CustomEvent, EventType, RunErrorEvent, RunFinishedEvent, MessagesSnapshotEvent, InterruptDetails
+from src.agent.schema.agui_events import CustomEvent, EventType, RunErrorEvent, RunFinishedEvent
 from src.api.utils.agui_encoder import EventEncoder
 from src.api.services.agent_service import DuplicateRoundError
+from src.api.services.agui_event_bus import AguiEventBus, get_agui_event_bus
+from src.api.services.run_completion_service import RunCompletionService
+from src.api.services.run_cancel_service import get_run_cancel_service
+from src.api.services.run_coordinator import get_run_coordinator
+from src.api.services.running_rounds import get_main_running_round
+from src.api.services.subagent_graph_service import get_subagent_graph_service
+from src.api.services.turn_orchestrator import TurnExecution, get_turn_orchestrator
+from src.api.services.web_chat_adapter import WebCancelAdapter, WebChatAdapter, WebResumeAdapter
 from src.api.models.round import Round
 from src.api.services.history_service import HistoryService
 from src.api.models.database import SessionLocal
 import asyncio
 import json
 import traceback
-import uuid
-import threading
-from typing import AsyncIterator, Callable, Awaitable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -79,66 +83,17 @@ def _extract_text_for_title(content_blocks) -> str:
 # =========================================================================
 
 # 輪次訂閱者管理（round_id -> list of asyncio.Queue）
-_round_subscribers: dict[str, list[asyncio.Queue]] = {}
-_round_subscribers_lock = threading.Lock()
+_agui_event_bus = get_agui_event_bus()
+_run_cancel_service = get_run_cancel_service()
+_run_coordinator = get_run_coordinator()
+_turn_orchestrator = get_turn_orchestrator()
+_web_chat_adapter = WebChatAdapter()
+_web_resume_adapter = WebResumeAdapter()
+_web_cancel_adapter = WebCancelAdapter()
 
 # 活躍的後台 Agent 運行任務（session_id -> producer task）
 # Agent 執行與 SSE 連接解耦：瀏覽器斷開後 Agent 繼續在後台運行
-_active_runners: dict[str, asyncio.Task] = {}
-
-_CANCEL_STATE_REQUESTED = "requested"
-_CANCEL_STATE_ACKED = "acked"
-_CANCEL_STATE_COMPLETED = "completed"
-_LOCAL_RUNNER_ABORT_WAIT_SECONDS = 0.2
-
-
-async def _upsert_cancel_request(
-    db: DBSession,
-    *,
-    user_id: str,
-    session_id: str,
-) -> str:
-    """写入/覆盖会话取消请求（跨 worker 可见）。"""
-    request_id = str(uuid.uuid4())
-
-    def _do():
-        now = now_naive()
-        row = (
-            db.query(RunCancelRequest)
-            .filter(
-                RunCancelRequest.session_id == session_id,
-                RunCancelRequest.user_id == user_id,
-            )
-            .first()
-        )
-        if row:
-            row.state = _CANCEL_STATE_REQUESTED
-            row.request_id = request_id
-            row.requested_at = now
-            row.acked_at = None
-            row.completed_at = None
-        else:
-            db.add(
-                RunCancelRequest(
-                    session_id=session_id,
-                    user_id=user_id,
-                    state=_CANCEL_STATE_REQUESTED,
-                    request_id=request_id,
-                    requested_at=now,
-                )
-            )
-        db.commit()
-        return request_id
-
-    result = await _with_db_retry(_do, rollback=db.rollback)
-    logger.info(
-        "cancel request -> requested: user=%s session=%s request_id=%s",
-        user_id,
-        session_id,
-        result,
-    )
-    return result
-
+_active_runners: dict[str, asyncio.Task] = _turn_orchestrator.active_runners
 
 async def _clear_pending_cancel_request(
     db: DBSession,
@@ -146,33 +101,9 @@ async def _clear_pending_cancel_request(
     user_id: str,
     session_id: str,
 ) -> bool:
-    """新 run 开始前清理可能遗留的 requested/acked 取消请求。"""
-
-    def _do():
-        row = (
-            db.query(RunCancelRequest)
-            .filter(
-                RunCancelRequest.session_id == session_id,
-                RunCancelRequest.user_id == user_id,
-            )
-            .first()
-        )
-        if not row:
-            return False
-        if row.state in (_CANCEL_STATE_REQUESTED, _CANCEL_STATE_ACKED):
-            row.state = _CANCEL_STATE_COMPLETED
-            row.completed_at = now_naive()
-            db.commit()
-            logger.info(
-                "clear stale cancel request -> completed: user=%s session=%s request_id=%s",
-                user_id,
-                session_id,
-                row.request_id,
-            )
-            return True
-        return False
-
-    return await _with_db_retry(_do, rollback=db.rollback)
+    """Append-only cancel rows are audit-only, so stale rows do not kill new runs."""
+    db.rollback()
+    return False
 
 
 async def _run_in_new_session(
@@ -203,45 +134,17 @@ async def _complete_cancel_request_in_new_session(
 
     async def _op(db, *, user_id, session_id):
         def _do():
-            row = (
-                db.query(RunCancelRequest)
-                .filter(
-                    RunCancelRequest.session_id == session_id,
-                    RunCancelRequest.user_id == user_id,
-                )
-                .first()
-            )
-            if not row:
-                return False
-            if row.state != _CANCEL_STATE_COMPLETED:
-                prev_state = row.state
-                row.state = _CANCEL_STATE_COMPLETED
-                row.completed_at = now_naive()
-                db.commit()
-                logger.info(
-                    "cancel request %s -> completed: user=%s session=%s request_id=%s",
-                    prev_state,
-                    user_id,
-                    session_id,
-                    row.request_id,
-                )
-            return True
+            return bool(_run_cancel_service.mark_completed(
+                db,
+                user_id=user_id,
+                session_id=session_id,
+            ))
 
         return await _with_db_retry(_do, rollback=db.rollback)
 
     return await _run_in_new_session(
         _op, label="完成 cancel request", user_id=user_id, session_id=session_id,
     )
-
-
-def _cancel_row_touched_after(*, row: RunCancelRequest | None, started_at: datetime) -> bool:
-    """判斷取消請求是否在 run 啟動後被更新過（作為 abort epoch）。"""
-    if not row:
-        return False
-    for ts in (row.requested_at, row.acked_at, row.completed_at):
-        if ts and ts > started_at:
-            return True
-    return False
 
 
 def _has_cancel_activity_since(
@@ -258,138 +161,17 @@ def _has_cancel_activity_since(
             .filter(
                 RunCancelRequest.session_id == session_id,
                 RunCancelRequest.user_id == user_id,
+                RunCancelRequest.requested_at > started_at,
             )
+            .order_by(RunCancelRequest.requested_at.desc())
             .first()
         )
-        return _cancel_row_touched_after(row=row, started_at=started_at)
+        if row is None:
+            return False
+        requested_at = getattr(row, "requested_at", None)
+        return isinstance(requested_at, datetime) and requested_at > started_at
     finally:
         db.rollback()
-
-
-async def _cancel_request_watcher(
-    *,
-    user_id: str,
-    session_id: str,
-    cancel_token: asyncio.Event,
-    lock_id: str | None = None,
-    run_started_at: datetime | None = None,
-):
-    """轮询 DB 取消请求并触发本地 cancel_token（跨 worker cancel）。
-
-    同时定期刷新 UserRunLock.updated_at 作为心跳。
-    每轮检查使用独立短生命周期 Session，在 asyncio.sleep 期间将连接归还连接池，
-    避免长时间独占 DB 连接导致 QueuePool 耗尽（FIFO 阻塞 event loop 死锁）。
-    cancel check 频率由 cancel_watcher_interval_seconds 控制（默认 3s），
-    心跳频率复用 sse_heartbeat_interval（默认 15s）。
-    连续心跳失败 N 次后自杀，避免被其他 worker 误判存活。
-
-    心跳失败语义：OperationalError/Exception 分支不刷新 `_last_heartbeat`，
-    下一轮 `check_interval`（默认 3s）后立即重试；连续 `max_heartbeat_failures`
-    次失败则触发自杀。与旧实现（无条件刷新、每 `heartbeat_interval` 重试一次）
-    相比，最坏自杀时间由 ~45s 缩短到 ~9s，更快收敛到 "worker 死亡" 判定。
-    """
-    settings = get_settings()
-    check_interval = max(settings.cancel_watcher_interval_seconds, 0.5)
-    heartbeat_interval = max(settings.sse_heartbeat_interval, check_interval)
-    max_heartbeat_failures = 3
-    _heartbeat_fail_count = 0
-    _last_heartbeat = time.monotonic()
-
-    try:
-        while not cancel_token.is_set():
-            # 1. 检查取消请求 —— 独立短生命周期 Session
-            try:
-                with SessionLocal() as check_db:
-                    row = (
-                        check_db.query(RunCancelRequest)
-                        .filter(
-                            RunCancelRequest.session_id == session_id,
-                            RunCancelRequest.user_id == user_id,
-                        )
-                        .first()
-                    )
-                    if row and row.state == _CANCEL_STATE_REQUESTED:
-                        row.state = _CANCEL_STATE_ACKED
-                        row.acked_at = now_naive()
-                        check_db.commit()
-                        cancel_token.set()
-                        logger.info(
-                            "检测到跨 worker cancel 请求，已触发本地取消: user=%s session=%s request_id=%s",
-                            user_id, session_id, row.request_id,
-                        )
-                        return
-                    # abort-epoch：即使 requested 已被其他流程快速收敛为 completed，
-                    # 只要該次更新發生在本 run 啟動之後，也應終止本地執行。
-                    if row and run_started_at and _cancel_row_touched_after(row=row, started_at=run_started_at):
-                        cancel_token.set()
-                        logger.info(
-                            "检测到较新 cancel epoch，触发本地取消: user=%s session=%s request_id=%s state=%s",
-                            user_id,
-                            session_id,
-                            row.request_id,
-                            row.state,
-                        )
-                        return
-            except OperationalError as exc:
-                if not _is_retryable_db_error(exc):
-                    raise
-                # PostgreSQL 瞬时写冲突（死锁/序列化失败），下次再试
-
-            # 2. 定期刷新锁心跳（频率低于 cancel check）—— 独立短生命周期 Session
-            if lock_id and (time.monotonic() - _last_heartbeat) >= heartbeat_interval:
-                try:
-                    with SessionLocal() as hb_db:
-                        updated = hb_db.query(UserRunLock).filter(
-                            UserRunLock.user_id == user_id,
-                            UserRunLock.lock_id == lock_id,
-                        ).update({UserRunLock.updated_at: now_naive()}, synchronize_session=False)
-                        hb_db.commit()
-                    if updated:
-                        _heartbeat_fail_count = 0
-                        _last_heartbeat = time.monotonic()
-                    else:
-                        # 锁已不存在（被其他 worker 回收），自杀
-                        logger.warning(
-                            "心跳发现锁已被回收，触发取消: user=%s session=%s",
-                            user_id, session_id,
-                        )
-                        cancel_token.set()
-                        return
-                except OperationalError as exc:
-                    if _is_retryable_db_error(exc):
-                        _heartbeat_fail_count += 1
-                        logger.warning(
-                            "心跳写入失败（DB 写冲突）: user=%s fail_count=%d/%d",
-                            user_id, _heartbeat_fail_count, max_heartbeat_failures,
-                        )
-                    else:
-                        raise
-                except Exception:
-                    _heartbeat_fail_count += 1
-                    logger.warning(
-                        "心跳写入异常: user=%s fail_count=%d/%d",
-                        user_id, _heartbeat_fail_count, max_heartbeat_failures,
-                        exc_info=True,
-                    )
-
-                if _heartbeat_fail_count >= max_heartbeat_failures:
-                    logger.error(
-                        "心跳连续失败 %d 次，触发取消防止假活: user=%s session=%s",
-                        _heartbeat_fail_count, user_id, session_id,
-                    )
-                    cancel_token.set()
-                    return
-
-            await asyncio.sleep(check_interval)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.warning(
-            "cancel watcher 异常退出: user=%s session=%s",
-            user_id,
-            session_id,
-            exc_info=True,
-        )
 
 
 def _is_retryable_db_error(exc: OperationalError) -> bool:
@@ -400,16 +182,16 @@ def _is_retryable_db_error(exc: OperationalError) -> bool:
 
 
 async def _with_db_retry(
-    fn: Callable[[], any],
+    fn: Callable[[], Any | Awaitable[Any]],
     *,
     max_retries: int = 5,
     retry_interval: float = 0.1,
     rollback: Callable[[], None] | None = None,
-) -> any:
+) -> Any:
     """PostgreSQL 瞬時寫衝突（死鎖 / 序列化失敗）的通用重試 wrapper。
 
     Args:
-        fn: 要執行的同步 callable（包含 DB 操作 + commit）。
+        fn: 要執行的 callable（包含 DB 操作 + commit），可返回同步值或 awaitable。
         max_retries: 最大嘗試次數。
         retry_interval: 每次重試前的等待秒數。
         rollback: 遇到 OperationalError 時的回滾 callable（可選）。
@@ -421,7 +203,10 @@ async def _with_db_retry(
     last_exc: Exception | None = None
     for attempt in range(max_retries):
         try:
-            return fn()
+            result = fn()
+            if hasattr(result, "__await__"):
+                return await result
+            return result
         except OperationalError as exc:
             last_exc = exc
             if rollback:
@@ -444,116 +229,14 @@ def _format_datetime(value: datetime | None) -> str | None:
     return value.isoformat()
 
 async def _acquire_user_run_lock(*, user_id: str, session_id: str) -> str | None:
-    """嘗試獲取用戶運行 slot（跨 worker）。
+    """嘗試獲取用戶運行 slot。
 
     使用獨立 DB Session，避免 rollback 污染請求級 Session 中已載入的 ORM 物件。
     返回 lock_id 表示獲取成功；返回 None 表示同 session 已在跑或用户并发已达上限。
     """
-    settings = get_settings()
-    stale_threshold_seconds = max(settings.sse_subscribe_timeout, 1)
-    concurrency_limit = max(int(getattr(settings, "agent_user_concurrency_limit", 1) or 1), 1)
-    max_busy_retries = 5
-    retry_interval_seconds = 0.1
-
-    with SessionLocal() as lock_db:
-        def _lock_age_seconds(lock: UserRunLock) -> float:
-            heartbeat_at = lock.updated_at or lock.created_at
-            return (now_naive() - heartbeat_at).total_seconds()
-
-        def _delete_stale_locks() -> list[str]:
-            locks = (
-                lock_db.query(UserRunLock)
-                .filter(UserRunLock.user_id == user_id)
-                .all()
-            )
-            stale_session_ids: list[str] = []
-            for lock in locks:
-                age = _lock_age_seconds(lock)
-                if age < stale_threshold_seconds:
-                    continue
-                logger.warning(
-                    "檢測到陳舊用戶運行鎖（心跳 %.1fs 前），回收: user=%s session=%s lock=%s slot=%s",
-                    age,
-                    user_id,
-                    lock.session_id,
-                    lock.lock_id,
-                    lock.slot,
-                )
-                stale_session_ids.append(lock.session_id)
-                lock_db.delete(lock)
-            if stale_session_ids:
-                lock_db.commit()
-            return stale_session_ids
-
-        for attempt in range(max_busy_retries):
-            try:
-                stale_session_ids = _delete_stale_locks()
-                for stale_session_id in stale_session_ids:
-                    try:
-                        _cleanup_orphaned_rounds(
-                            lock_db,
-                            user_id=user_id,
-                            session_id=stale_session_id,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "清理孤兒 round 失敗: user=%s session=%s",
-                            user_id,
-                            stale_session_id,
-                            exc_info=True,
-                        )
-
-                active_locks = (
-                    lock_db.query(UserRunLock)
-                    .filter(UserRunLock.user_id == user_id)
-                    .all()
-                )
-                if any(lock.session_id == session_id for lock in active_locks):
-                    return None
-                if len(active_locks) >= concurrency_limit:
-                    return None
-
-                occupied_slots = {lock.slot for lock in active_locks}
-                free_slot = next(
-                    slot
-                    for slot in range(concurrency_limit)
-                    if slot not in occupied_slots
-                )
-                lock_id = str(uuid.uuid4())
-                lock_db.execute(
-                    insert(UserRunLock).values(
-                        user_id=user_id,
-                        session_id=session_id,
-                        lock_id=lock_id,
-                        slot=free_slot,
-                    )
-                )
-                lock_db.commit()
-                return lock_id
-            except IntegrityError:
-                lock_db.rollback()
-                if attempt + 1 < max_busy_retries:
-                    await asyncio.sleep(retry_interval_seconds)
-                    continue
-                return None
-            except OperationalError as exc:
-                lock_db.rollback()
-                if not _is_retryable_db_error(exc):
-                    raise
-                if attempt + 1 < max_busy_retries:
-                    await asyncio.sleep(retry_interval_seconds)
-                    continue
-                logger.warning(
-                    "獲取用戶運行鎖遇到 DB 寫衝突: user=%s session=%s",
-                    user_id,
-                    session_id,
-                    exc_info=True,
-                )
-                return None
-            except Exception:
-                lock_db.rollback()
-                raise
-        return None
+    _run_coordinator.session_factory = SessionLocal
+    _run_coordinator.settings_provider = get_settings
+    return await _run_coordinator.acquire_user_run_lock(user_id=user_id, session_id=session_id)
 
 
 def _cleanup_orphaned_rounds(
@@ -566,73 +249,13 @@ def _cleanup_orphaned_rounds(
 
     只在鎖心跳已過期且鎖被回收後調用 — 此時可確定該 session 的原 worker 已死。
     """
-    if session_id is not None:
-        session_filter = or_(Round.session_id == session_id, Round.thread_id == session_id)
-    else:
-        user_session_ids_stmt = select(Session.id).where(Session.user_id == user_id)
-        session_filter = or_(
-            Round.session_id.in_(user_session_ids_stmt),
-            Round.thread_id.in_(user_session_ids_stmt),
-        )
-    orphaned_rounds = (
-        db.query(Round)
-        .filter(
-            Round.status == "running",
-            session_filter,
-        )
-        .all()
+    _run_coordinator.session_factory = SessionLocal
+    _run_coordinator.settings_provider = get_settings
+    return _run_coordinator.cleanup_orphaned_rounds(
+        db,
+        user_id=user_id,
+        session_id=session_id,
     )
-    if not orphaned_rounds:
-        return 0
-    for r in orphaned_rounds:
-        r.status = "cancelled"
-        r.final_response = r.final_response or "Worker crashed, round orphaned"
-        r.completed_at = now_naive()
-    db.commit()
-    logger.warning(
-        "已回收 %d 個孤兒 round: user=%s round_ids=%s",
-        len(orphaned_rounds), user_id, [r.id for r in orphaned_rounds],
-    )
-    return len(orphaned_rounds)
-
-
-def _parse_event_sequence(event_data: dict) -> int | None:
-    """从事件字典中提取 sequence（兼容 sequence/_sequence）。"""
-    for key in ("sequence", "_sequence"):
-        value = event_data.get(key)
-        if isinstance(value, int):
-            return value
-    return None
-
-
-def _load_persisted_run_events_after_sequence(
-    db: DBSession,
-    *,
-    run_id: str,
-    last_sequence: int,
-) -> tuple[list[dict], int]:
-    """从 agui_events 表加载指定 run 在某序号后的持久化事件。"""
-    rows = (
-        db.query(AGUIEventLog)
-        .filter(
-            AGUIEventLog.run_id == run_id,
-            AGUIEventLog.sequence > last_sequence,
-        )
-        .order_by(AGUIEventLog.sequence)
-        .all()
-    )
-
-    latest_sequence = last_sequence
-    events: list[dict] = []
-    for row in rows:
-        try:
-            event_data = json.loads(row.payload)
-            events.append(event_data)
-            latest_sequence = max(latest_sequence, row.sequence)
-        except json.JSONDecodeError as e:
-            logger.warning("解析持久化事件失败: run=%s id=%s err=%s", run_id, row.id, e)
-
-    return events, latest_sequence
 
 
 async def _release_user_run_lock(
@@ -648,59 +271,14 @@ async def _release_user_run_lock(
     若未傳 lock_id 但傳入 session_id，僅在鎖歸屬於該會話時釋放。
     遇到 PostgreSQL 瞬時寫衝突時最多重試 5 次。
     """
-    def _do():
-        query = db.query(UserRunLock).filter(UserRunLock.user_id == user_id)
-        if lock_id is not None:
-            query = query.filter(UserRunLock.lock_id == lock_id)
-        elif session_id is not None:
-            query = query.filter(UserRunLock.session_id == session_id)
-        else:
-            query.delete(synchronize_session=False)
-            db.commit()
-            return True
-
-        lock_row = query.first()
-        if not lock_row:
-            # 同 session 已被新 lock_id 占用时，旧 owner 不能宣称释放成功。
-            # 其他 session 的 slot 与本次释放目标无关。
-            if session_id is not None:
-                same_session_lock = (
-                    db.query(UserRunLock)
-                    .filter(
-                        UserRunLock.user_id == user_id,
-                        UserRunLock.session_id == session_id,
-                    )
-                    .first()
-                )
-                db.rollback()
-                return same_session_lock is None
-            if lock_id is not None:
-                any_lock = db.query(UserRunLock).filter(UserRunLock.user_id == user_id).first()
-                db.rollback()
-                if any_lock:
-                    return False
-            # 锁确实不存在，视为已释放
-            db.rollback()
-            return True
-
-        db.delete(lock_row)
-        db.commit()
-        return True
-
-    try:
-        return await _with_db_retry(_do, rollback=db.rollback)
-    except OperationalError:
-        logger.warning(
-            "釋放用戶運行鎖失敗: user=%s lock_id=%s session=%s",
-            user_id, lock_id, session_id, exc_info=True,
-        )
-        return False
-    except Exception:
-        logger.warning(
-            "釋放用戶運行鎖異常: user=%s lock_id=%s session=%s",
-            user_id, lock_id, session_id, exc_info=True,
-        )
-        return False
+    _run_coordinator.session_factory = SessionLocal
+    _run_coordinator.settings_provider = get_settings
+    return await _run_coordinator.release_user_run_lock(
+        db,
+        user_id=user_id,
+        lock_id=lock_id,
+        session_id=session_id,
+    )
 
 
 async def _release_user_run_lock_in_new_session(
@@ -713,243 +291,111 @@ async def _release_user_run_lock_in_new_session(
 
     用於 SSE 背景 producer finally，避免依賴請求作用域的 DB Session。
     """
-
-    async def _op(db, *, user_id, lock_id, session_id):
-        return await _release_user_run_lock(
-            db, user_id=user_id, lock_id=lock_id, session_id=session_id,
-        )
-
-    return await _run_in_new_session(
-        _op, label="釋放用戶運行鎖",
-        user_id=user_id, lock_id=lock_id, session_id=session_id,
+    _run_coordinator.session_factory = SessionLocal
+    _run_coordinator.settings_provider = get_settings
+    return await _run_coordinator.release_user_run_lock_in_new_session(
+        user_id=user_id,
+        lock_id=lock_id,
+        session_id=session_id,
     )
 
 
-# =========================================================================
-# SSE + 心跳保活通用助手
-# =========================================================================
-
-
-async def _sse_with_heartbeat(
-    event_source: AsyncIterator[AGUIEvent],
+async def _sse_from_turn_execution(
+    execution: TurnExecution,
     *,
-    session_id: str | None = None,
-    user_id: str | None = None,
-    lock_id: str | None = None,
-    cancel_token: asyncio.Event | None = None,
-    run_started_at: datetime | None = None,
     on_run_finished: Callable[[str | None], Awaitable[AsyncIterator[str]]] | None = None,
     error_message: str | None = None,
 ):
-    """通用的 SSE 事件生成器，內建 producer/heartbeat/consumer 隊列模式。
+    """Render an orchestrator-managed run stream as Web SSE.
 
-    Producer 負責驅動 Agent 執行和廣播事件給訂閱者。當 SSE 連接斷開（瀏覽器關閉）
-    時，producer 不會被取消——Agent 繼續在後台運行，事件通過 DB 持久化和
-    subscriber 機制傳遞給重連的客戶端。
-
-    Args:
-        event_source: Agent 層的 AG-UI 事件異步迭代器。
-        session_id: 會話 ID，用於追蹤後台運行任務（傳入則啟用後台運行模式）。
-        lock_id: 用戶運行鎖 ID，用於 owner 校驗釋放鎖。
-        on_run_finished: 可選回調，在 RUN_FINISHED 事件之後調用，
-                         返回一個異步迭代器以 yield 額外的 SSE 字串（如標題更新）。
-        error_message: 錯誤時對外顯示的訊息；為 None 則使用實際異常訊息。
+    The run producer, cancel registry and lock cleanup live in TurnOrchestrator.
+    This adapter only handles heartbeat, encoding, terminal callbacks, and
+    disconnecting the current Web consumer without cancelling the run task.
     """
-    current_run_id: str | None = None
-    event_queue: asyncio.Queue = asyncio.Queue()
-    _SENTINEL = object()
-    _run_completed = False
-    _consumer_active = True  # SSE 消費者是否仍存活
-
     settings = get_settings()
+    current_run_id = execution.handle.run_id
+    run_completed = False
+    iterator = execution.event_source.__aiter__()
+    next_event_task = asyncio.create_task(iterator.__anext__())
+    heartbeat_task = asyncio.create_task(asyncio.sleep(settings.sse_heartbeat_interval))
 
-    def now_ms():
-        return int(datetime.now().timestamp() * 1000)
+    def _event_type(event):
+        if isinstance(event, dict):
+            return event.get("type")
+        return getattr(event, "type", None)
 
-    # 生產者：消費 event_source → 廣播 + 放入本地隊列
-    async def producer():
-        nonlocal current_run_id
-        try:
-            async for event in event_source:
-                if hasattr(event, 'run_id') and event.run_id:
-                    current_run_id = event.run_id
-                # 廣播給所有訂閱者（確保重連客戶端能收到實時事件）
-                if current_run_id:
-                    try:
-                        event_dict = event.model_dump(by_alias=True, exclude_none=True)
-                        await _broadcast_to_subscribers(current_run_id, event_dict)
-                    except Exception:
-                        pass
-                # 只在 SSE 消費者存活時才放入本地隊列
-                if _consumer_active:
-                    event_queue.put_nowait(event)
-        except asyncio.CancelledError:
-            # 防禦性路徑：abort_chat 不再主動調用 runner.cancel()（改用 cancel_token），
-            # 但 asyncio 框架或 ASGI server 仍可能取消 task（如進程關閉、超時等）。
-            # 此處補發 RUN_FINISHED 確保 SSE consumer 能正常收尾。
-            # 守衛：若 Agent 已正常 yield 過 RUN_FINISHED（_run_completed=True），不重複發送。
-            if current_run_id and not _run_completed:
-                finished_event = RunFinishedEvent(
-                    threadId=session_id or "",
-                    runId=current_run_id,
-                    outcome="interrupt",
-                    result={"reason": "user_cancelled"},
-                )
-                if _consumer_active:
-                    event_queue.put_nowait(finished_event)
-                # 同步廣播給訂閱者（put_nowait 保證在 finally cleanup 前完成）
-                event_dict = finished_event.model_dump(by_alias=True, exclude_none=True)
-                with _round_subscribers_lock:
-                    subscriber_queues = list(_round_subscribers.get(current_run_id, []))
-                for q in subscriber_queues:
-                    try:
-                        q.put_nowait(event_dict)
-                    except Exception:
-                        pass
-            raise
-        except Exception as e:
-            if _consumer_active:
-                event_queue.put_nowait(e)
-        finally:
-            if _consumer_active:
-                event_queue.put_nowait(_SENTINEL)
-            # 清理追蹤
-            if session_id:
-                # 僅允許當前 producer 移除自己，避免舊 run finally 誤刪新 run 映射。
-                current_task = asyncio.current_task()
-                if _active_runners.get(session_id) is current_task:
-                    _active_runners.pop(session_id, None)
-            if user_id:
-                if session_id:
-                    await _complete_cancel_request_in_new_session(
-                        user_id=user_id,
-                        session_id=session_id,
-                    )
-                await _release_user_run_lock_in_new_session(
-                    user_id=user_id,
-                    lock_id=lock_id,
-                    session_id=session_id,
-                )
-            if current_run_id:
-                _cleanup_subscribers(current_run_id)
-
-    # 心跳：每 sse_heartbeat_interval 秒發送 CUSTOM heartbeat 事件
-    async def heartbeat():
-        try:
-            while True:
-                await asyncio.sleep(settings.sse_heartbeat_interval)
-                await event_queue.put(CustomEvent(
-                    name="heartbeat",
-                    value={"timestamp": now_ms()},
-                ))
-        except asyncio.CancelledError:
-            pass
-
-    producer_task = asyncio.create_task(producer())
-    heartbeat_task = asyncio.create_task(heartbeat())
-    cancel_watch_task: asyncio.Task | None = None
-
-    # 跨 worker cancel：輪詢 DB 取消請求並觸發本地 cancel_token，同時刷新鎖心跳
-    if cancel_token and session_id and user_id:
-        cancel_watch_task = asyncio.create_task(
-            _cancel_request_watcher(
-                user_id=user_id,
-                session_id=session_id,
-                cancel_token=cancel_token,
-                lock_id=lock_id,
-                run_started_at=run_started_at,
-            )
-        )
-
-    # 註冊為活躍運行任務
-    if session_id:
-        _active_runners[session_id] = producer_task
+    def _encode_event(event):
+        if isinstance(event, dict):
+            return event_encoder.encode_dict(event)
+        return event_encoder.encode(event)
 
     try:
         while True:
-            item = await event_queue.get()
+            done, _ = await asyncio.wait(
+                {next_event_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                yield event_encoder.encode(CustomEvent(
+                    name="heartbeat",
+                    value={"timestamp": int(datetime.now().timestamp() * 1000)},
+                ))
+                heartbeat_task = asyncio.create_task(asyncio.sleep(settings.sse_heartbeat_interval))
 
-            if item is _SENTINEL:
+            if next_event_task not in done:
+                continue
+
+            try:
+                event = next_event_task.result()
+            except StopAsyncIteration:
                 break
 
-            if isinstance(item, Exception):
-                raise item
-
-            event = item
-
-            if hasattr(event, 'run_id') and event.run_id:
+            event_type = _event_type(event)
+            if isinstance(event, dict) and event.get("runId"):
+                current_run_id = event.get("runId")
+            elif hasattr(event, "run_id") and event.run_id:
                 current_run_id = event.run_id
 
-            event_str = event_encoder.encode(event)
+            yield _encode_event(event)
 
-            # 廣播已在 producer 中處理，此處僅 yield 給當前 SSE 連接
-
-            yield event_str
-
-            if event.type == EventType.RUN_FINISHED:
-                _run_completed = True
-                # 允許調用方注入額外事件（如標題更新）
+            if event_type == EventType.RUN_FINISHED or event_type == EventType.RUN_FINISHED.value:
+                run_completed = True
                 if on_run_finished:
                     async for extra in await on_run_finished(current_run_id):
                         yield extra
                 break
 
-            if event.type == EventType.RUN_ERROR:
-                _run_completed = True
+            if event_type == EventType.RUN_ERROR or event_type == EventType.RUN_ERROR.value:
+                run_completed = True
                 break
 
+            next_event_task = asyncio.create_task(iterator.__anext__())
     except Exception as e:
-        _run_completed = True
-        error_detail = traceback.format_exc()
-        logger.error("AG-UI 事件流錯誤: %s\n%s", e, error_detail)
-
-        # DuplicateRoundError: 發送 existing_round_id 供客戶端切換到 subscribe
+        run_completed = True
+        logger.error("orchestrated AG-UI 事件流錯誤: %s\n%s", e, traceback.format_exc())
         if isinstance(e, DuplicateRoundError):
             display_msg = e.existing_round_id
             display_code = "ROUND_IN_PROGRESS"
         else:
             display_msg = error_message or str(e)
             display_code = "INTERNAL_ERROR" if error_message else type(e).__name__
-        try:
-            yield event_encoder.encode(RunErrorEvent(message=display_msg, code=display_code))
-        except Exception:
-            fallback_json = json.dumps({
-                "type": EventType.RUN_ERROR.value,
-                "message": display_msg,
-                "code": display_code,
-                "timestamp": datetime.now().timestamp() * 1000,
-            })
-            yield f"data: {fallback_json}\n\n"
-
+        yield event_encoder.encode(RunErrorEvent(message=display_msg, code=display_code))
     finally:
-        _consumer_active = False
         heartbeat_task.cancel()
-
-        if _run_completed:
-            # 運行已結束，清理所有後台任務
-            producer_task.cancel()
-            if cancel_watch_task:
-                cancel_watch_task.cancel()
+        if not next_event_task.done():
+            next_event_task.cancel()
             try:
-                await producer_task
-            except asyncio.CancelledError:
+                await next_event_task
+            except (asyncio.CancelledError, StopAsyncIteration):
                 pass
-            if cancel_watch_task:
-                try:
-                    await cancel_watch_task
-                except asyncio.CancelledError:
-                    pass
-        else:
-            # SSE 斷開但 Agent 仍在運行 → 保留 producer 和 cancel_watch_task，
-            # 讓 Agent 繼續後台執行，watcher 繼續刷心跳和輪詢取消請求。
-            # 不 await 它們，否則 finally 會卡住。
-            # producer finally 會在 Agent 結束後釋放鎖並完成取消請求，
-            # 屆時 watcher 下次心跳發現鎖已刪除會自行退出。
+            except Exception:
+                logger.debug("closing orchestrated SSE event iterator raised", exc_info=True)
+        if not run_completed:
             logger.info(
-                "SSE 連接斷開，Agent 繼續後台運行 (session=%s, run=%s)",
-                session_id, current_run_id,
+                "SSE 連接斷開，orchestrated Agent 繼續後台運行 (session=%s, run=%s)",
+                execution.handle.session_id,
+                current_run_id,
             )
-
         try:
             await heartbeat_task
         except asyncio.CancelledError:
@@ -1035,8 +481,8 @@ async def _acquire_lock_and_clear_cancel(
             detail=f"当前有正在运行的任务，运行任务数已达上限（{limit}），请等待完成后再发送新消息",
         )
 
-    # 清理旧 run 遗留的取消请求，避免新 run 被陈旧 requested 误杀
-    # 失败时仅 warning：最坏情况是 watcher 首次轮询时 ack + cancel，用户可重发
+    # append-only 审计行不承担投递职责，陈旧 requested 不应误杀新 run。
+    # 失败时仅 warning；requested_after 会继续防止旧取消请求误伤后续 run。
     try:
         await _clear_pending_cancel_request(db, user_id=user_id, session_id=session_id)
     except Exception:
@@ -1099,6 +545,12 @@ async def send_message_stream(
     if session.status == "completed":
         raise HTTPException(status_code=410, detail="會話已完成")
 
+    turn = _web_chat_adapter.normalize_send(
+        session_id=chat_session_id,
+        user_id=user_id,
+        request=request,
+    )
+
     enforce_token_limits(db, user_id=user_id)
 
     # 用戶級並發限制 + 清理遺留取消請求
@@ -1116,7 +568,7 @@ async def send_message_stream(
 
     # 定義事件生成器（Agent 初始化移入 generator 內部，讓 SSE 響應頭先返回，心跳保活撐住連接）
     async def event_generator():
-        _entered_sse = False  # 追蹤是否已進入 _sse_with_heartbeat（producer 負責清理用戶鎖）
+        _entered_sse = False  # 追蹤 producer 是否已由 TurnOrchestrator 接管
         settings = get_settings()
 
         # --- Agent 初始化（帶心跳保活，防止 HAProxy 30s 超時）---
@@ -1184,7 +636,7 @@ async def send_message_stream(
 
                 async def generate_title_async():
                     try:
-                        title_source = _extract_text_for_title(request.content)
+                        title_source = _extract_text_for_title(turn.content)
                         title = await agent_service.generate_session_title(title_source)
                         with SessionLocal() as title_db:
                             title_session = title_db.query(Session).filter(Session.id == chat_session_id).first()
@@ -1200,10 +652,6 @@ async def send_message_stream(
 
                 title_generation_task = asyncio.create_task(generate_title_async())
 
-            # 創建 per-run 取消令牌
-            cancel_token = asyncio.Event()
-            agent_service.cancel_token = cancel_token
-
             # RUN_FINISHED 後追加標題更新事件
             async def on_run_finished(_run_id):
                 async def _extra():
@@ -1215,22 +663,31 @@ async def send_message_stream(
                                     name="title_updated",
                                     value={"sessionId": chat_session_id, "title": title},
                                 )
+                                if _run_id:
+                                    await _agui_event_bus.publish_ephemeral(_run_id, title_event)
                                 yield event_encoder.encode(title_event)
                         except Exception as e:
                             print(f"⚠️  等待標題生成失敗: {e}")
                 return _extra()
 
-            _entered_sse = True  # producer 即將啟動，鎖的釋放由 _sse_with_heartbeat 的 finally 負責
-            async for chunk in _sse_with_heartbeat(
-                agent_service.chat_agui(
-                    user_content=request.content,
-                    idempotency_key=request.idempotency_key,
-                ),
-                session_id=chat_session_id,
-                user_id=user_id,
-                lock_id=lock_id,
-                cancel_token=cancel_token,
-                run_started_at=run_guard_started_at,
+            try:
+                execution = await _turn_orchestrator.submit_turn(
+                    turn,
+                    agent_service=agent_service,
+                    lock_id=lock_id,
+                    run_started_at=run_guard_started_at,
+                )
+            except DuplicateRoundError as e:
+                yield event_encoder.encode(RunErrorEvent(message=e.existing_round_id, code="ROUND_IN_PROGRESS"))
+                return
+            except Exception:
+                logger.error("submit turn failed before orchestrated SSE started", exc_info=True)
+                yield event_encoder.encode(RunErrorEvent(message="Agent 執行失敗", code="INTERNAL_ERROR"))
+                return
+
+            _entered_sse = True  # producer 已由 TurnOrchestrator 接管，鎖的釋放由 orchestrator 負責
+            async for chunk in _sse_from_turn_execution(
+                execution,
                 on_run_finished=on_run_finished,
                 error_message="Agent 執行失敗",
             ):
@@ -1238,7 +695,7 @@ async def send_message_stream(
         finally:
             if title_generation_task and not title_generation_task.done():
                 title_generation_task.cancel()
-            # 若未進入 _sse_with_heartbeat（producer 未啟動），手動釋放用戶鎖
+            # 若 producer 未由 TurnOrchestrator 接管，手動釋放用戶鎖
             if not _entered_sse:
                 await _release_user_run_lock_in_new_session(
                     user_id=user_id,
@@ -1274,6 +731,11 @@ async def resume_interrupt(
         raise HTTPException(status_code=404, detail="会话不存在")
 
     enforce_token_limits(db, user_id=user_id)
+    resume_turn = _web_resume_adapter.normalize_resume(
+        session_id=chat_session_id,
+        user_id=user_id,
+        request=request,
+    )
 
     # 用戶級並發限制 + 清理遺留取消請求。必须先拿 slot，再触碰 cached Agent。
     lock_id = await _acquire_lock_and_clear_cancel(db, user_id=user_id, session_id=chat_session_id)
@@ -1284,7 +746,7 @@ async def resume_interrupt(
     model_id = session.model_id
 
     async def event_generator():
-        _entered_sse = False  # 追蹤是否已進入 _sse_with_heartbeat（producer 負責清理用戶鎖）
+        _entered_sse = False  # 追蹤 producer 是否已由 TurnOrchestrator 接管
         settings = get_settings()
         init_task = _start_agent_init(
             user_id=user_id,
@@ -1330,35 +792,33 @@ async def resume_interrupt(
                 await _complete_cancel_request_in_new_session(user_id=user_id, session_id=chat_session_id)
                 return
 
-            if not agent_service.has_pending_interrupt(request.interrupt_id):
+            if not agent_service.has_pending_interrupt(resume_turn.interrupt_id):
                 yield event_encoder.encode(RunErrorEvent(
                     message="没有待处理的中断（可能已过期或已恢复），或中断 ID 不匹配",
                     code="NO_PENDING_INTERRUPT",
                 ))
                 return
 
-            # 创建 per-run 取消令牌
-            cancel_token = asyncio.Event()
-            agent_service.cancel_token = cancel_token
+            try:
+                execution = await _turn_orchestrator.resume_turn(
+                    resume_turn,
+                    agent_service=agent_service,
+                    lock_id=lock_id,
+                    run_started_at=run_guard_started_at,
+                )
+            except Exception:
+                logger.error("resume turn failed before orchestrated SSE started", exc_info=True)
+                yield event_encoder.encode(RunErrorEvent(message="服务暂时不可用，请稍后重试", code="INTERNAL_ERROR"))
+                return
 
-            # 先構造 event_source，若 resume_agui 拋異常則 _entered_sse 仍為 False → finally 會釋放鎖
-            event_source = agent_service.resume_agui(
-                interrupt_id=request.interrupt_id,
-                answers=request.answers,
-            )
-            _entered_sse = True  # producer 即將啟動，鎖的釋放由 _sse_with_heartbeat 的 finally 負責
-            async for chunk in _sse_with_heartbeat(
-                event_source,
-                session_id=chat_session_id,
-                user_id=user_id,
-                lock_id=lock_id,
-                cancel_token=cancel_token,
-                run_started_at=run_guard_started_at,
+            _entered_sse = True  # producer 已由 TurnOrchestrator 接管，鎖的釋放由 orchestrator 負責
+            async for chunk in _sse_from_turn_execution(
+                execution,
                 error_message="服务暂时不可用，请稍后重试",
             ):
                 yield chunk
         finally:
-            # 若未進入 _sse_with_heartbeat（producer 未啟動），手動釋放用戶鎖
+            # 若 producer 未由 TurnOrchestrator 接管，手動釋放用戶鎖
             if not _entered_sse:
                 await _release_user_run_lock_in_new_session(
                     user_id=user_id,
@@ -1370,52 +830,6 @@ async def resume_interrupt(
         event_generator(),
         db=db, session=session, user_id=user_id, session_id=chat_session_id,
     )
-
-
-
-# 🆕 辅助函数：广播事件给所有订阅者
-async def _broadcast_to_subscribers(round_id: str, event: dict):
-    """向所有订阅该轮次的客户端广播事件（AG-UI 格式）"""
-    with _round_subscribers_lock:
-        subscribers = list(_round_subscribers.get(round_id, []))
-
-    if not subscribers:
-        return
-
-    failed_queues: list[asyncio.Queue] = []
-    for queue in subscribers:
-        try:
-            await queue.put(event)
-        except Exception as e:
-            failed_queues.append(queue)
-            print(f"⚠️ 广播事件失败: {e}")
-
-    if not failed_queues:
-        return
-
-    with _round_subscribers_lock:
-        active = _round_subscribers.get(round_id)
-        if not active:
-            return
-        for queue in failed_queues:
-            if queue in active:
-                active.remove(queue)
-        if not active:
-            del _round_subscribers[round_id]
-
-
-
-# 🆕 辅助函数：清理订阅者
-def _cleanup_subscribers(round_id: str):
-    """清理已完成轮次的订阅者"""
-    removed = False
-    with _round_subscribers_lock:
-        if round_id in _round_subscribers:
-            del _round_subscribers[round_id]
-            removed = True
-    if removed:
-        print(f"🧹 已清理轮次 {round_id} 的订阅者")
-
 
 @router.get("/{chat_session_id}/round/{round_id}/subscribe")
 async def subscribe_to_round(
@@ -1453,244 +867,77 @@ async def subscribe_to_round(
     if not round_obj:
         raise HTTPException(status_code=404, detail="轮次不存在")
 
-    # 創建 HistoryService 實例用於消息快照構建
-    history_service = HistoryService(db)
-    
-    # 创建订阅者队列
-    subscriber_queue = asyncio.Queue()
-
     async def subscribe_generator():
+        settings = get_settings()
+        now_ms = lambda: int(datetime.now().timestamp() * 1000)
+        iterator = None
+        next_event_task: asyncio.Task | None = None
+        heartbeat_task: asyncio.Task | None = None
+
         try:
-            now_ms = lambda: int(datetime.now().timestamp() * 1000)
-            latest_sequence = last_sequence
-
-            def _build_terminal_chunks(*, has_run_finished_in_replay: bool = False) -> tuple[bool, list[str]]:
-                if round_obj.status not in Round.SUBSCRIBE_TERMINAL_STATUSES:
-                    return False, []
-
-                # 如果重放事件中已包含 RUN_FINISHED，直接返回不重複發送
-                if has_run_finished_in_replay:
-                    print(f"✅ 重放事件已包含 RUN_FINISHED，輪次 {round_id} 訂閱正常結束")
-                    return True, []
-
-                # 發送 RUN_FINISHED（重放中沒有時才發送）
-                print(f"📤 輪次 {round_id} 已完成但重放中無 RUN_FINISHED，補發完成事件")
-                # 使用 HistoryService 構建 MESSAGES_SNAPSHOT
-                messages = history_service.build_messages_snapshot(round_id)
-                chunks: list[str] = [event_encoder.encode(MessagesSnapshotEvent(messages=messages))]
-
-                # 发送终态事件
-                if round_obj.status == "failed":
-                    # failed 路径：仅发 RUN_ERROR 后结束，避免误标为 interrupt
-                    chunks.append(event_encoder.encode(RunErrorEvent(
-                        message="Run failed (status=failed)",
-                        code="RUN_FAILED",
-                    )))
-                    return True, chunks
-
-                if round_obj.status == "interrupted":
-                    # interrupted 路径：补发 RUN_FINISHED(outcome=interrupt) 并携带中断详情
-                    import json as _json
-                    _interrupt_details = None
-                    if round_obj.interrupt_payload:
-                        try:
-                            _interrupt_details = InterruptDetails(**_json.loads(round_obj.interrupt_payload))
-                        except Exception:
-                            _interrupt_details = None
-                    complete_event = RunFinishedEvent(
-                        threadId=chat_session_id,
-                        runId=round_id,
-                        result={
-                            "finalResponse": round_obj.final_response or "",
-                            "stepCount": round_obj.step_count,
-                        },
-                        outcome="interrupt",
-                        interrupt=_interrupt_details,
-                    )
-                    chunks.append(event_encoder.encode(complete_event))
-                    return True, chunks
-
-                if round_obj.status == "resumed":
-                    # resumed 路径：该轮次曾被中断，已由新 run 接管
-                    # 语义上仍是 interrupt，不应标为 success
-                    complete_event = RunFinishedEvent(
-                        threadId=chat_session_id,
-                        runId=round_id,
-                        result={
-                            "finalResponse": round_obj.final_response or "",
-                            "stepCount": round_obj.step_count,
-                            "reason": "resumed_by_new_run",
-                        },
-                        outcome="interrupt",
-                    )
-                    chunks.append(event_encoder.encode(complete_event))
-                    return True, chunks
-
-                if round_obj.status == "cancelled":
-                    # cancelled 路径：用户主动取消，视为 interrupt（无中断详情）
-                    complete_event = RunFinishedEvent(
-                        threadId=chat_session_id,
-                        runId=round_id,
-                        result={
-                            "finalResponse": round_obj.final_response or "",
-                            "stepCount": round_obj.step_count,
-                            "reason": "user_cancelled",
-                        },
-                        outcome="interrupt",
-                    )
-                    chunks.append(event_encoder.encode(complete_event))
-                    return True, chunks
-
-                # completed 路径
-                complete_event = RunFinishedEvent(
-                    threadId=chat_session_id,
-                    runId=round_id,
-                    result={
-                        "finalResponse": round_obj.final_response or "",
-                        "stepCount": round_obj.step_count,
-                    },
-                    outcome="success",
-                )
-                chunks.append(event_encoder.encode(complete_event))
-                return True, chunks
-
-            # === 1. 重放錯過的事件（AG-UI 核心機制）===
-            replayed_events, latest_sequence = _load_persisted_run_events_after_sequence(
-                db,
-                run_id=round_id,
-                last_sequence=last_sequence,
-            )
-
-            # 檢查重放事件中是否已包含 RUN_FINISHED
-            has_run_finished_in_replay = any(
-                e.get("type") == EventType.RUN_FINISHED.value for e in replayed_events
-            )
-
-            if replayed_events:
-                print(f"📤 重放 {len(replayed_events)} 個錯過的事件 (sequence > {last_sequence})")
-                for event_data in replayed_events:
-                    event_sequence = _parse_event_sequence(event_data)
-                    if event_sequence is not None:
-                        latest_sequence = max(latest_sequence, event_sequence)
-                    yield event_encoder.encode_dict(event_data)
-
-            # === 2. 重新查詢輪次狀態（修復競態條件）===
             db.refresh(round_obj)
-
             if round_obj.status in Round.SUBSCRIBE_TERMINAL_STATUSES:
-                handled, terminal_chunks = _build_terminal_chunks(
-                    has_run_finished_in_replay=has_run_finished_in_replay,
-                )
-                if handled:
-                    db.rollback()
-                    for terminal_chunk in terminal_chunks:
-                        yield terminal_chunk
-                return
+                RunCompletionService(db).ensure_terminal_sync(round_id)
+            else:
+                db.rollback()
 
-            db.rollback()
+            event_bus = AguiEventBus(SessionLocal)
+            iterator = event_bus.subscribe(round_id, after_sequence=last_sequence).__aiter__()
+            next_event_task = asyncio.create_task(iterator.__anext__())
+            heartbeat_task = asyncio.create_task(asyncio.sleep(settings.sse_heartbeat_interval))
 
-            # === 3. 輪次仍在運行，註冊為訂閱者 ===
-            with _round_subscribers_lock:
-                if round_id not in _round_subscribers:
-                    _round_subscribers[round_id] = []
-                _round_subscribers[round_id].append(subscriber_queue)
-                subscriber_count = len(_round_subscribers[round_id])
-            print(f"📡 新订阅者已注册到轮次 {round_id}，当前订阅者数: {subscriber_count}")
+            while True:
+                active_tasks = {task for task in (next_event_task, heartbeat_task) if task is not None}
+                if not active_tasks:
+                    return
+                done, _ = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
 
-            # 获取配置
-            settings = get_settings()
+                if heartbeat_task in done:
+                    yield event_encoder.encode(CustomEvent(
+                        name="heartbeat",
+                        value={"timestamp": now_ms()},
+                    ))
+                    heartbeat_task = asyncio.create_task(asyncio.sleep(settings.sse_heartbeat_interval))
 
-            # 心跳 + 跨 worker 持久化事件轮询（使用独立 DB Session，避免与请求级 Session 竞争）
-            last_realtime_event_at = time.monotonic()
+                if next_event_task not in done:
+                    continue
 
-            async def heartbeat_and_poll():
-                nonlocal latest_sequence
-                terminal_types = (EventType.RUN_FINISHED.value, EventType.RUN_ERROR.value)
-                poll_interval = max(settings.cancel_watcher_interval_seconds, 0.5)
-                last_heartbeat_sent = time.monotonic()
                 try:
-                    while True:
-                        await asyncio.sleep(poll_interval)
+                    event_dict = next_event_task.result()
+                except StopAsyncIteration:
+                    return
 
-                        # 没有本地实时事件时，回放持久化增量，兜住跨 worker 订阅
-                        # 每次查询使用独立短生命周期 Session，避免长期独占 DB 连接
-                        if time.monotonic() - last_realtime_event_at >= poll_interval:
-                            try:
-                                with SessionLocal() as replay_db:
-                                    replayed_events, replay_latest = _load_persisted_run_events_after_sequence(
-                                        replay_db,
-                                        run_id=round_id,
-                                        last_sequence=latest_sequence,
-                                    )
-                            except Exception:
-                                logger.warning(
-                                    "订阅增量回放查询失败: round=%s", round_id, exc_info=True,
-                                )
-                                replayed_events, replay_latest = [], latest_sequence
-                            latest_sequence = max(latest_sequence, replay_latest)
-                            for event_data in replayed_events:
-                                await subscriber_queue.put(event_data)
-                                if event_data.get("type") in terminal_types:
-                                    return
+                yield event_encoder.encode_dict(event_dict)
 
-                        # SSE 心跳按 sse_heartbeat_interval 频率发送
-                        if time.monotonic() - last_heartbeat_sent >= settings.sse_heartbeat_interval:
-                            heartbeat_event = CustomEvent(
-                                name="heartbeat",
-                                value={"timestamp": now_ms()},
-                            )
-                            await subscriber_queue.put(heartbeat_event.model_dump(by_alias=True))
-                            last_heartbeat_sent = time.monotonic()
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    logger.warning("订阅心跳轮询异常: round=%s", round_id, exc_info=True)
+                if event_dict.get("type") in (EventType.RUN_FINISHED.value, EventType.RUN_ERROR.value):
+                    return
 
-            heartbeat_task = asyncio.create_task(heartbeat_and_poll())
-
-            try:
-                # 监听队列中的事件
-                while True:
-                    # subscriber_queue 中的 event 已经是 dict (from broadcast)
-                    event_dict = await asyncio.wait_for(subscriber_queue.get(), timeout=settings.sse_subscribe_timeout)
-                    if event_dict.get("type") != EventType.CUSTOM.value or event_dict.get("name") != "heartbeat":
-                        last_realtime_event_at = time.monotonic()
-                    event_sequence = _parse_event_sequence(event_dict)
-                    if event_sequence is not None:
-                        latest_sequence = max(latest_sequence, event_sequence)
-                    yield event_encoder.encode_dict(event_dict)
-
-                    # 如果是 RUN_FINISHED 或 RUN_ERROR 事件，结束订阅
-                    if event_dict.get("type") in (EventType.RUN_FINISHED.value, EventType.RUN_ERROR.value):
-                        break
-            except asyncio.TimeoutError:
-                # 超时，发送 RUN_ERROR 事件
-                error_event = RunErrorEvent(
-                    message="订阅超时",
-                    code="TIMEOUT"
-                )
-                yield event_encoder.encode(error_event)
-            finally:
+                next_event_task = asyncio.create_task(iterator.__anext__())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("订阅事件流异常: round=%s", round_id, exc_info=True)
+            yield event_encoder.encode(RunErrorEvent(message="订阅失败", code="SUBSCRIBE_FAILED"))
+        finally:
+            if heartbeat_task is not None:
                 heartbeat_task.cancel()
                 try:
                     await heartbeat_task
                 except asyncio.CancelledError:
                     pass
-
-        finally:
-            # 移除订阅者
-            removed = False
-            remaining = 0
-            with _round_subscribers_lock:
-                queues = _round_subscribers.get(round_id)
-                if queues and subscriber_queue in queues:
-                    queues.remove(subscriber_queue)
-                    removed = True
-                    remaining = len(queues)
-                    if not queues:
-                        del _round_subscribers[round_id]
-            if removed:
-                print(f"📡 订阅者已从轮次 {round_id} 移除，剩余订阅者数: {remaining}")
+            if next_event_task is not None and not next_event_task.done():
+                next_event_task.cancel()
+                try:
+                    await next_event_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+                except Exception:
+                    logger.debug("closing subscribe event task raised", exc_info=True)
+            if iterator is not None and hasattr(iterator, "aclose"):
+                try:
+                    await iterator.aclose()
+                except Exception:
+                    logger.debug("closing subscribe iterator raised", exc_info=True)
 
     return StreamingResponse(
         subscribe_generator(),
@@ -1703,6 +950,23 @@ async def subscribe_to_round(
     )
 
 
+@router.get("/{chat_session_id}/round/{round_id}/subagent-graph")
+async def get_subagent_graph(
+    chat_session_id: str,
+    round_id: str,
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """查询指定 run 所属的 subagent run graph。"""
+    graph = get_subagent_graph_service().get_graph(
+        db,
+        user_id=user_id,
+        session_id=chat_session_id,
+        run_id=round_id,
+    )
+    return graph.model_dump(mode="json")
+
+
 @router.post("/{chat_session_id}/abort")
 async def abort_chat(
     chat_session_id: str,
@@ -1711,11 +975,10 @@ async def abort_chat(
 ):
     """中止正在進行的 Agent 執行
 
-    多 worker 安全語義：
-    1. 寫入跨 worker 可見的取消請求（DB requested）
-    2. 若當前 worker 命中本地 Agent，額外 fast-path 設置 cancel_token
+    单 worker 取消语义：
+    1. 写入 append-only 取消审计行
+    2. 若当前 worker 命中本地 Agent，额外 fast-path 设置 cancel_token
     3. 立即收斂 running round 為 cancelled 並釋放用戶鎖（不等待執行 worker 自行結束）
-    4. 若命中本地 active runner，額外 cancel task 以縮短後台殘留窗口
     """
     # 驗證會話
     session = (
@@ -1732,14 +995,7 @@ async def abort_chat(
     # 取消可在兩種情況發起：
     # 1) 已有 running round
     # 2) 初始化窗口（尚未建 round）但該會話仍持有「年輕」用戶鎖
-    running_round = (
-        db.query(Round)
-        .filter(
-            Round.session_id == chat_session_id,
-            Round.status == "running",
-        )
-        .first()
-    )
+    running_round = get_main_running_round(db, session_id=chat_session_id)
     user_lock = (
         db.query(UserRunLock)
         .filter(
@@ -1759,13 +1015,25 @@ async def abort_chat(
     if not running_round and not lock_recent:
         raise HTTPException(status_code=409, detail="該會話沒有正在進行的執行")
 
-    # 寫入跨 worker 取消請求
+    cancel_target = _web_cancel_adapter.normalize_cancel(
+        session_id=chat_session_id,
+        user_id=user_id,
+        round_id=running_round_id,
+        root_run_id=running_round_id,
+        requested_after=(
+            getattr(running_round, "created_at", None)
+            if running_round and isinstance(getattr(running_round, "created_at", None), datetime)
+            else now_naive()
+        ),
+    )
+
+    # 寫入 append-only 取消審計請求
     try:
-        request_id = await _upsert_cancel_request(
-            db,
-            user_id=user_id,
-            session_id=chat_session_id,
+        cancel_result = await _with_db_retry(
+            lambda: _turn_orchestrator.cancel_turn(cancel_target, db=db),
+            rollback=db.rollback,
         )
+        request_id = cancel_result.request_id
     except OperationalError:
         db.rollback()
         logger.warning(
@@ -1792,56 +1060,31 @@ async def abort_chat(
         agent_service.cancel_token.set()
         logger.info("cancel_token 已設置 (fast-path): session=%s", chat_session_id)
 
-    # 命中同 worker 的 active runner 時，額外嘗試強制取消，縮短後台殘留窗口。
     local_runner = _active_runners.get(chat_session_id)
-    runner_stopped = False
     if local_runner and not local_runner.done():
-        logger.info("abort 命中本地 runner，執行強制停止: session=%s", chat_session_id)
-        local_runner.cancel()
-        try:
-            # 不長時間阻塞 abort 接口；若超時，語義仍以“已強制收斂 round + 釋放鎖”為準。
-            await asyncio.wait_for(
-                asyncio.shield(local_runner),
-                timeout=_LOCAL_RUNNER_ABORT_WAIT_SECONDS,
-            )
-            runner_stopped = True
-        except asyncio.CancelledError:
-            runner_stopped = local_runner.done()
-        except asyncio.TimeoutError:
-            logger.warning("本地 runner 強制停止超時，回退為異步取消: session=%s", chat_session_id)
-        except Exception:
-            logger.warning("等待本地 runner 結束異常，回退為異步取消: session=%s", chat_session_id, exc_info=True)
+        logger.info("abort 命中本地 runner，等待其通过 cancel_token/终态检查退出: session=%s", chat_session_id)
 
     # 若有 running round，立即收斂為 cancelled，避免前端與 running-sessions 視圖回跳。
     if running_round:
-        running_round.status = "cancelled"
-        running_round.final_response = running_round.final_response or "Aborted by user"
-        running_round.completed_at = now_naive()
-
+        final_response = running_round.final_response or "Aborted by user"
         finished_event = RunFinishedEvent(
             threadId=chat_session_id,
             runId=running_round_id,
             outcome="interrupt",
             result={
                 "reason": "user_cancelled",
-                "finalResponse": running_round.final_response,
+                "finalResponse": final_response,
                 "stepCount": running_round.step_count or 0,
             },
         )
-        event_payload = finished_event.model_dump_json(by_alias=True)
-        next_seq = (
-            db.query(AGUIEventLog)
-            .filter(AGUIEventLog.run_id == running_round_id)
-            .count()
-        ) + 1
-        db.add(AGUIEventLog(
-            run_id=running_round_id,
-            event_type=EventType.RUN_FINISHED.value,
-            payload=event_payload,
-            sequence=next_seq,
-        ))
         try:
-            db.commit()
+            await RunCompletionService(db).complete(
+                run_id=running_round_id,
+                status="cancelled",
+                final_response=final_response,
+                step_count=running_round.step_count or 0,
+                terminal_event=finished_event,
+            )
         except OperationalError:
             db.rollback()
             logger.warning(
@@ -1861,9 +1104,7 @@ async def abort_chat(
             )
             raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
 
-        event_dict = finished_event.model_dump(by_alias=True, exclude_none=True)
-        await _broadcast_to_subscribers(running_round_id, event_dict)
-        _cleanup_subscribers(running_round_id)
+        _agui_event_bus.cleanup_subscribers(running_round_id)
 
     # 立即釋放該會話鎖（如果存在），允許用戶立刻重發。
     if user_lock_id:
@@ -1887,8 +1128,6 @@ async def abort_chat(
     if running_round:
         if lock_heartbeat_age is not None and lock_heartbeat_age >= stale_threshold:
             reason = "worker_dead"
-        elif runner_stopped:
-            reason = "force_stopped"
         else:
             reason = "force_aborted"
         return {"status": "cancelled", "request_id": request_id, "reason": reason}
@@ -1903,7 +1142,7 @@ async def get_abort_status(
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    """查询会话取消请求状态（用于多 worker 观测与排障）。"""
+    """查询会话取消请求状态（用于取消审计与排障）。"""
     session = (
         db.query(Session)
         .filter(Session.id == chat_session_id, Session.user_id == user_id)
@@ -1918,6 +1157,7 @@ async def get_abort_status(
             RunCancelRequest.session_id == chat_session_id,
             RunCancelRequest.user_id == user_id,
         )
+        .order_by(RunCancelRequest.requested_at.desc())
         .first()
     )
     running_round = (
@@ -1937,6 +1177,9 @@ async def get_abort_status(
             "requested_at": None,
             "acked_at": None,
             "completed_at": None,
+            "target_run_id": None,
+            "root_run_id": None,
+            "requested_after": None,
             "running": bool(running_round),
             "running_round_id": running_round.id if running_round else None,
         }
@@ -1948,6 +1191,9 @@ async def get_abort_status(
         "requested_at": _format_datetime(cancel_row.requested_at),
         "acked_at": _format_datetime(cancel_row.acked_at),
         "completed_at": _format_datetime(cancel_row.completed_at),
+        "target_run_id": cancel_row.target_run_id,
+        "root_run_id": cancel_row.root_run_id,
+        "requested_after": _format_datetime(cancel_row.requested_after),
         "running": bool(running_round),
         "running_round_id": running_round.id if running_round else None,
     }

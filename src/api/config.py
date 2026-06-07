@@ -72,7 +72,8 @@ class Settings(BaseSettings):
     # SSE 订阅配置
     sse_heartbeat_interval: int = 15  # 心跳间隔（秒），同时用作锁心跳写入间隔
     sse_subscribe_timeout: int = 300  # 订阅超时（秒，5分钟），同时用作锁陈旧阈值
-    cancel_watcher_interval_seconds: float = 3.0  # 跨 worker 轮询间隔（秒）：取消请求检查 + 订阅事件补偿
+    cancel_watcher_interval_seconds: float = 3.0  # 订阅持久化事件补偿轮询间隔（秒）
+    agui_repair_terminal_since_hours: int = 24  # terminal repair 默认扫描窗口（小时）
 
     # Embedding 配置（不填则向量检索降级为关键词搜索）
     embedding_api_key: str = ""

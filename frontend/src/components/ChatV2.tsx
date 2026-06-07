@@ -91,6 +91,29 @@ const isUserCancelledOutcome = (outcome: string, interrupt: any, result?: any): 
   return false;
 };
 
+const getRunFinishedRoundStatus = (outcome: string, isUserCancelled: boolean): string => {
+  if (isUserCancelled) return 'cancelled';
+  if (outcome === 'interrupt') return 'interrupted';
+  if (outcome === 'success') return 'completed';
+  return outcome;
+};
+
+const getRunFinishedCompletedAt = (outcome: string, isUserCancelled: boolean): string | undefined => {
+  return outcome === 'interrupt' && !isUserCancelled ? undefined : new Date().toISOString();
+};
+
+const finalizeStepsForTerminal = (steps: StepData[], hasFinalResponse: boolean): StepData[] =>
+  steps.map((step) => {
+    const status = step.status === 'streaming' || step.status === 'running'
+      ? 'completed'
+      : step.status;
+    return {
+      ...step,
+      status,
+      ...(hasFinalResponse ? { assistant_content: '' } : {}),
+    };
+  });
+
 export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutionEnd, onPanelToggle, selectedModelId, onModelChange, availableModels = [], onCreateSession, activeSlotSessionIds, scrollTarget }: ChatV2Props) {
   const [rounds, setRounds] = useState<RoundData[]>([]);
   const [disableInitialMotion, setDisableInitialMotion] = useState(false);
@@ -560,9 +583,15 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
             streamingContentRef.current.thinkingContent = '';
           },
 
-          onThinkingContent: (messageId, delta) => {
-            if (streamingContentRef.current.currentThinkingMessageId === messageId) {
-              streamingContentRef.current.thinkingContent += delta;
+          onThinkingContent: (messageId, delta, meta) => {
+            const isAggregate = meta?.isAggregate === true;
+            if (streamingContentRef.current.currentThinkingMessageId === messageId || isAggregate) {
+              if (isAggregate) {
+                streamingContentRef.current.currentThinkingMessageId = messageId;
+                streamingContentRef.current.thinkingContent = delta;
+              } else {
+                streamingContentRef.current.thinkingContent += delta;
+              }
               // 更新当前轮次的最后一个步骤的 thinking
               setRounds((prev) =>
                 prev.map((round) => {
@@ -591,9 +620,15 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
             streamingContentRef.current.textContent = '';
           },
 
-          onTextMessageContent: (messageId, delta) => {
-            if (streamingContentRef.current.currentTextMessageId === messageId) {
-              streamingContentRef.current.textContent += delta;
+          onTextMessageContent: (messageId, delta, meta) => {
+            const isAggregate = meta?.isAggregate === true;
+            if (streamingContentRef.current.currentTextMessageId === messageId || isAggregate) {
+              if (isAggregate) {
+                streamingContentRef.current.currentTextMessageId = messageId;
+                streamingContentRef.current.textContent = delta;
+              } else {
+                streamingContentRef.current.textContent += delta;
+              }
               updateRoundTextContent(runningRound.round_id, streamingContentRef.current.textContent);
             }
           },
@@ -672,9 +707,10 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
             );
           },
 
-          onToolCallArgs: (toolCallId, delta) => {
-            streamingContentRef.current.toolArgs[toolCallId] =
-              (streamingContentRef.current.toolArgs[toolCallId] || '') + delta;
+          onToolCallArgs: (toolCallId, delta, meta) => {
+            streamingContentRef.current.toolArgs[toolCallId] = meta?.isAggregate === true
+              ? delta
+              : (streamingContentRef.current.toolArgs[toolCallId] || '') + delta;
             // 尝试解析参数并更新
             try {
               const args = JSON.parse(streamingContentRef.current.toolArgs[toolCallId]);
@@ -731,17 +767,21 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
             setRounds((prev) =>
               prev.map((round) =>
                 round.round_id === runId
-                  ? {
-                      ...round,
-                      final_response: result?.finalResponse || round.final_response,
-                      status: outcome === 'interrupt' ? 'interrupted' : (outcome === 'success' ? 'completed' : outcome),
-                      completed_at: (outcome === 'interrupt') ? undefined : new Date().toISOString(),
-                    }
+                  ? (() => {
+                      const finalResponse = result?.finalResponse || round.final_response;
+                      return {
+                        ...round,
+                        steps: finalizeStepsForTerminal(round.steps, !!finalResponse),
+                        final_response: finalResponse,
+                        status: getRunFinishedRoundStatus(outcome, isUserCancelled),
+                        completed_at: getRunFinishedCompletedAt(outcome, isUserCancelled),
+                      };
+                    })()
                   : round
               )
             );
             // 处理中断恢复
-            if (outcome === 'interrupt' && interrupt) {
+            if (outcome === 'interrupt' && interrupt && !isUserCancelled) {
               setPendingInterrupt(interrupt);
               setAgentState((prev) => ({ ...prev, status: 'waiting', lastUpdated: Date.now() }));
               setSending(false);
@@ -798,7 +838,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
               console.log(`⚡ Failover: 切换到备用模型 ${_value?.model || ''}`);
             }
           },
-        });
+        }, runningRound.last_event_sequence || 0);
 
         subscriptionAbortRef.current = subscription.abort;
 
@@ -1150,27 +1190,28 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       const targetRunId = runId || getCurrentRunId();
       setCurrentRunId(targetRunId);
       let shouldScheduleTitleRefresh = false;
+      const isUserCancelled = isUserCancelledOutcome(outcome, interrupt, result);
 
       setRounds((prev) => {
+        let matchedRound = false;
         const updatedRounds = prev.map((round) => {
-          if (round.round_id === targetRunId) {
-            const completedSteps = round.steps.map((s) => ({
-              ...s,
-              status: s.status === 'streaming' || s.status === 'running' ? 'completed' : s.status,
-            }));
+          if (round.round_id === targetRunId || round.round_id === tempRoundId) {
+            matchedRound = true;
+            const finalResponse = result?.finalResponse || finalContent || round.final_response;
 
             return {
               ...round,
-              steps: completedSteps,
-              final_response: result?.finalResponse || finalContent || round.final_response,
-              status: outcome === 'interrupt' ? 'interrupted' : (outcome === 'success' ? 'completed' : outcome),
-              completed_at: (outcome === 'interrupt') ? undefined : new Date().toISOString(),
+              round_id: targetRunId,
+              steps: finalizeStepsForTerminal(round.steps, !!finalResponse),
+              final_response: finalResponse,
+              status: getRunFinishedRoundStatus(outcome, isUserCancelled),
+              completed_at: getRunFinishedCompletedAt(outcome, isUserCancelled),
             };
           }
           return round;
         });
 
-        if (shouldRefreshTitleOnFirstRound && updatedRounds.length === 1 && outcome === 'success') {
+        if (shouldRefreshTitleOnFirstRound && matchedRound && updatedRounds.length === 1 && outcome === 'success') {
           shouldScheduleTitleRefresh = true;
         }
 
@@ -1188,9 +1229,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         }, 3000);
       }
 
-      const isUserCancelled = isUserCancelledOutcome(outcome, interrupt, result);
-
-      if (outcome === 'interrupt' && interrupt) {
+      if (outcome === 'interrupt' && interrupt && !isUserCancelled) {
         setPendingInterrupt(interrupt);
         setAgentState((prev) => ({
           ...prev,
@@ -1291,8 +1330,13 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       streamingContentRef.current.textContent = '';
     },
 
-    onTextMessageContent: (_messageId, delta) => {
-      streamingContentRef.current.textContent += delta;
+    onTextMessageContent: (messageId, delta, meta) => {
+      if (meta?.isAggregate === true) {
+        streamingContentRef.current.currentTextMessageId = messageId;
+        streamingContentRef.current.textContent = delta;
+      } else {
+        streamingContentRef.current.textContent += delta;
+      }
       updateRoundTextContent(getCurrentRunId(), streamingContentRef.current.textContent);
 
       if (mirrorTextToFinalResponse) {
@@ -1312,8 +1356,13 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       }
     },
 
-    onThinkingContent: (_messageId, delta) => {
-      streamingContentRef.current.thinkingContent += delta;
+    onThinkingContent: (messageId, delta, meta) => {
+      if (meta?.isAggregate === true) {
+        streamingContentRef.current.currentThinkingMessageId = messageId;
+        streamingContentRef.current.thinkingContent = delta;
+      } else {
+        streamingContentRef.current.thinkingContent += delta;
+      }
       updateLastStep({ thinking: streamingContentRef.current.thinkingContent });
     },
 
@@ -1350,9 +1399,10 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       }));
     },
 
-    onToolCallArgs: (toolCallId, delta) => {
-      streamingContentRef.current.toolArgs[toolCallId] =
-        (streamingContentRef.current.toolArgs[toolCallId] || '') + delta;
+    onToolCallArgs: (toolCallId, delta, meta) => {
+      streamingContentRef.current.toolArgs[toolCallId] = meta?.isAggregate === true
+        ? delta
+        : (streamingContentRef.current.toolArgs[toolCallId] || '') + delta;
 
       const argsString = streamingContentRef.current.toolArgs[toolCallId];
       try {
@@ -1607,7 +1657,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
         round.status === 'running'
           ? {
               ...round,
-              status: 'interrupted',
+              status: 'cancelled',
+              completed_at: new Date().toISOString(),
               steps: round.steps.map((step) =>
                 step.status === 'streaming' || step.status === 'running'
                   ? { ...step, status: 'completed' as const }

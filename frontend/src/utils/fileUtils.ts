@@ -132,6 +132,28 @@ export function getFileExtLabel(file: { name: string; type?: string }): string {
   }
 }
 
+/**
+ * 返回文件的語義類型標籤（如 Document / Spreadsheet），用於卡片副標題。
+ */
+export function getFileCategoryLabel(file: { name: string; type?: string }): string {
+  switch (detectFileCategory(file)) {
+    case 'image':
+      return 'Image';
+    case 'sheet':
+      return 'Spreadsheet';
+    case 'pdf':
+      return 'PDF';
+    case 'doc':
+      return 'Document';
+    case 'ppt':
+      return 'Presentation';
+    case 'code':
+      return 'Code';
+    default:
+      return 'File';
+  }
+}
+
 export function getFileBadgeClass(file: { name: string; type?: string }): string {
   switch (detectFileCategory(file)) {
     case 'sheet':

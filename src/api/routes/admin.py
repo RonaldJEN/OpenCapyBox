@@ -27,6 +27,7 @@ from src.api.models.user_sandbox import UserSandbox
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_memory import CronJobRun
 from src.api.models.llm_call_record import LLMCallRecord
+from src.api.models.subagent_run import SubagentRun
 from src.api.services.agent_pool_service import get_agent_pool
 from src.api.services.auth_service import (
     auth_user_to_payload,
@@ -286,6 +287,7 @@ def _build_rounds_tree_payload(
             Round.step_count,
             Round.created_at,
             Round.completed_at,
+            Round.parent_run_id,
             Round.user_message,
             Round.final_response,
         )
@@ -296,6 +298,27 @@ def _build_rounds_tree_payload(
     ) if session_ids else []
 
     round_ids = [row.id for row in round_rows]
+
+    subagent_edges = (
+        db.query(SubagentRun)
+        .filter(
+            or_(
+                SubagentRun.child_run_id.in_(round_ids),
+                SubagentRun.parent_run_id.in_(round_ids),
+            )
+        )
+        .all()
+    ) if round_ids else []
+    subagent_by_child_run_id = {
+        edge.child_run_id: edge
+        for edge in subagent_edges
+        if edge.child_run_id
+    }
+    subagent_child_count_by_parent: dict[str, int] = {}
+    for edge in subagent_edges:
+        subagent_child_count_by_parent[edge.parent_run_id] = (
+            subagent_child_count_by_parent.get(edge.parent_run_id, 0) + 1
+        )
 
     usage_rows = (
         db.query(
@@ -395,6 +418,8 @@ def _build_rounds_tree_payload(
     }
 
     for row in round_rows:
+        subagent_edge = subagent_by_child_run_id.get(row.id)
+        is_subagent_round = subagent_edge is not None
         usage = usage_map.get(
             row.id,
             {
@@ -407,12 +432,22 @@ def _build_rounds_tree_payload(
         ended_at = row.completed_at or now
         duration_s = round((ended_at - row.created_at).total_seconds(), 3)
         steps = step_map.get(row.id, [])
+        subagent_prompt = subagent_edge.prompt if subagent_edge else None
+        subagent_description = subagent_edge.description if subagent_edge else None
 
         round_item = {
             "round_id": row.id,
             "session_id": row.session_id,
             "user_id": row.user_id,
             "session_title": row.session_title,
+            "run_kind": "subagent" if is_subagent_round else "main",
+            "parent_run_id": subagent_edge.parent_run_id if subagent_edge else row.parent_run_id,
+            "root_run_id": subagent_edge.root_run_id if subagent_edge else row.id,
+            "subagent_edge_id": subagent_edge.id if subagent_edge else None,
+            "subagent_type": subagent_edge.agent_type if subagent_edge else None,
+            "subagent_description": subagent_description,
+            "subagent_prompt_preview": (subagent_prompt or "")[:180],
+            "subagent_child_count": int(subagent_child_count_by_parent.get(row.id, 0)),
             "status": row.status,
             "step_count": int(row.step_count or 0),
             "started_at": _iso(row.created_at),
@@ -446,7 +481,7 @@ def _build_rounds_tree_payload(
             continue
 
         status_flags = session_item.pop("_status_flags")
-        if any(flag in {"running", "resumed"} for flag in status_flags):
+        if any(flag == "running" for flag in status_flags):
             session_item["status"] = "running"
         elif any(flag in {"failed", "cancelled", "interrupted"} for flag in status_flags):
             session_item["status"] = "error"

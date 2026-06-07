@@ -9,7 +9,7 @@ import posixpath
 import re as _re
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response, StreamingResponse
-from sqlalchemy import func, or_
+from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import Session as DBSession
 from src.api.models.database import get_db
 from src.api.deps import get_current_user
@@ -27,9 +27,11 @@ from src.api.services.sandbox_service import (
 )
 from src.api.services.history_service import HistoryService
 from src.api.services.agent_service import AgentService
+from src.api.services.running_rounds import main_running_round_join_condition
 from src.api.model_registry import get_model_registry
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_sandbox import UserSandbox
+from src.api.models.channel_session_binding import ChannelSessionBinding
 from src.api.models.conversation_message import ConversationMessage
 from datetime import datetime, timedelta, timezone
 from src.api.utils.timezone import now_naive
@@ -267,6 +269,15 @@ _SESSION_MATCH_PRIORITY = {
 }
 
 
+def _visible_web_session_filters(user_id: str):
+    non_web_binding = (
+        exists()
+        .where(ChannelSessionBinding.session_id == Session.id)
+        .where(ChannelSessionBinding.channel != "web")
+    )
+    return (Session.user_id == user_id, ~non_web_binding)
+
+
 def _set_session_match(
     matches: dict[str, tuple[Session, int]],
     session: Session,
@@ -478,7 +489,7 @@ async def list_sessions(
     if not query:
         sessions = (
             db.query(Session)
-            .filter(Session.user_id == user_id)
+            .filter(*_visible_web_session_filters(user_id))
             .order_by(Session.updated_at.desc())
             .all()
         )
@@ -492,7 +503,7 @@ async def list_sessions(
     title_sessions = (
         db.query(Session)
         .filter(
-            Session.user_id == user_id,
+            *_visible_web_session_filters(user_id),
             Session.title.ilike(pattern, escape="\\"),
         )
         .order_by(Session.updated_at.desc())
@@ -521,7 +532,7 @@ async def list_sessions(
                 or_(Round.session_id == Session.id, Round.thread_id == Session.id),
             )
             .filter(
-                Session.user_id == user_id,
+                *_visible_web_session_filters(user_id),
                 Round.user_message.ilike(pattern, escape="\\"),
             )
             .subquery()
@@ -567,7 +578,7 @@ async def list_sessions(
             )
             .join(Session, ConversationMessage.session_id == Session.id)
             .filter(
-                Session.user_id == user_id,
+                *_visible_web_session_filters(user_id),
                 ConversationMessage.role == "assistant",
                 ConversationMessage.is_summary.is_(False),
                 ConversationMessage.is_synthetic.is_(False),
@@ -612,7 +623,7 @@ async def list_sessions(
                 or_(Round.session_id == Session.id, Round.thread_id == Session.id),
             )
             .filter(
-                Session.user_id == user_id,
+                *_visible_web_session_filters(user_id),
                 Round.final_response.ilike(pattern, escape="\\"),
             )
             .subquery()
@@ -947,7 +958,7 @@ async def get_running_sessions(
         )
         .outerjoin(
             Round,
-            (Round.session_id == UserRunLock.session_id) & (Round.status == "running"),
+            main_running_round_join_condition(UserRunLock.session_id),
         )
         .filter(UserRunLock.user_id == user_id)
         .filter(UserRunLock.updated_at >= stale_cutoff)

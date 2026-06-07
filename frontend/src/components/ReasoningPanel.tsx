@@ -42,7 +42,7 @@ interface ReasoningPanelProps {
   disableMotion?: boolean;
 }
 
-export function ReasoningPanel({ steps, isStreaming = false, isCompleted: _isCompleted = false, disableMotion = false }: ReasoningPanelProps) {
+export function ReasoningPanel({ steps, isStreaming = false, disableMotion = false }: ReasoningPanelProps) {
   if (steps.length === 0 && !isStreaming) {
     return null;
   }
@@ -366,7 +366,7 @@ function ActivityBlockList({ blocks, disableMotion }: { blocks: DisplayBlock[]; 
           ));
         }
         if (block.type === 'toolGroup') {
-          return <ToolGroupBlockView key={`tool-${index}`} block={block} isLast={false} isStreaming={false} disableMotion={disableMotion} />;
+          return <ToolGroupBlockView key={`tool-${index}`} block={block} disableMotion={disableMotion} />;
         }
         return null;
       })}
@@ -476,10 +476,8 @@ function getCompletedActivityLabel(hasThinking: boolean, durationText?: string):
 // ToolGroupBlock — "Edited 2 files, read a file ▾"
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function ToolGroupBlockView({ block, isLast: _isLast, isStreaming: _isStreaming, disableMotion }: {
+function ToolGroupBlockView({ block, disableMotion }: {
   block: ToolGroupBlock;
-  isLast: boolean;
-  isStreaming: boolean;
   disableMotion: boolean;
 }) {
   const [isExpanded, setIsExpanded] = useState(true);
@@ -525,6 +523,14 @@ function ToolGroupBlockView({ block, isLast: _isLast, isStreaming: _isStreaming,
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function ToolItemView({ item, disableMotion }: { item: ToolGroupItem; disableMotion: boolean }) {
+  if (getToolCategory(item.toolName) === 'subagent') {
+    return <SubAgentToolItemView item={item} disableMotion={disableMotion} />;
+  }
+
+  return <DefaultToolItemView item={item} disableMotion={disableMotion} />;
+}
+
+function DefaultToolItemView({ item, disableMotion }: { item: ToolGroupItem; disableMotion: boolean }) {
   const [isExpanded, setIsExpanded] = useState(false);
   const isRunning = item.status === 'running';
   const isFailed = item.status === 'failed';
@@ -624,6 +630,95 @@ function ToolItemView({ item, disableMotion }: { item: ToolGroupItem; disableMot
   );
 }
 
+function SubAgentToolItemView({ item, disableMotion }: { item: ToolGroupItem; disableMotion: boolean }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const isRunning = item.status === 'running';
+  const isFailed = item.status === 'failed';
+  const info = getSubAgentInfo(item);
+  const durationText = item.executionTimeMs ? formatDuration(item.executionTimeMs) : undefined;
+
+  return (
+    <div className={disableMotion ? '' : 'animate-fade-in'}>
+      <button
+        type="button"
+        onClick={() => setIsExpanded(!isExpanded)}
+        className="w-full rounded-xl border border-claude-border bg-white/80 px-3 py-2.5 text-left shadow-sm transition-colors hover:border-claude-border-strong hover:bg-white group"
+      >
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-purple-200 bg-purple-50 text-purple-700">
+            {isRunning ? (
+              <Loader2 size={15} className="animate-spin" />
+            ) : (
+              <Zap size={15} />
+            )}
+            <span className={`absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-white ${
+              isFailed ? 'bg-claude-error' : isRunning ? 'bg-amber-500' : 'bg-claude-success'
+            }`} />
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className={`shrink-0 text-sm font-semibold ${isFailed ? 'text-claude-error' : 'text-claude-text'}`}>
+                委派子任务
+              </span>
+              <span className="truncate text-sm text-claude-secondary">{info.title}</span>
+            </div>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-2">
+            <span className="rounded-md bg-claude-bg px-2 py-1 text-xs font-semibold text-claude-secondary">
+              {info.type}
+            </span>
+            {durationText && <span className="text-xs font-medium text-claude-muted">{durationText}</span>}
+            <ChevronRight
+              size={13}
+              className={`text-claude-muted transition-transform duration-200 ${isExpanded ? 'rotate-90' : ''}`}
+            />
+          </div>
+        </div>
+      </button>
+
+      {isExpanded && (
+        <div className={`ml-11 mt-2 mb-3 space-y-2 ${disableMotion ? '' : 'animate-fade-in'}`}>
+          {info.childRunId && (
+            <div className="text-xs text-claude-muted">子任务运行 {info.childRunId}</div>
+          )}
+
+          {info.prompt && (
+            <div>
+              <div className="flex items-center gap-1 text-xs text-claude-muted mb-1">
+                <Terminal size={10} />
+                <span>任务</span>
+              </div>
+              <TruncatedCodeBlock
+                content={info.prompt}
+                className="bg-[#1e1e1e] text-gray-300"
+              />
+            </div>
+          )}
+
+          {item.result && (
+            <div>
+              <div className="flex items-center gap-1 text-xs text-claude-muted mb-1">
+                <Cpu size={10} />
+                <span>{item.result.success !== false ? '输出' : '错误'}</span>
+                {durationText && <span className="text-claude-muted/70 ml-1">({durationText})</span>}
+              </div>
+              <TruncatedCodeBlock
+                content={item.result.content || item.result.error || ''}
+                className={item.result.success !== false
+                  ? 'bg-claude-success/5 text-claude-text border border-claude-success/20'
+                  : 'bg-claude-error/5 text-claude-error border border-claude-error/20'
+                }
+              />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // DoneMarker
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -693,6 +788,7 @@ function getToolIcon(toolName: string): typeof Terminal {
     case 'create': return FilePlus;
     case 'read':   return FileText;
     case 'search': return Search;
+    case 'subagent': return Zap;
     default:       return Terminal;
   }
 }
@@ -717,6 +813,8 @@ function getObservation(toolName: string, result: { content: string; success?: b
     case 'search':
     case 'skill':
       return truncateObs(content);
+    case 'subagent':
+      return null;
     default:
       return null;
   }
@@ -736,6 +834,43 @@ function GroupIcon({ category }: { category: string }) {
     case 'bash':   return <TerminalSquare size={13} className="text-claude-muted flex-shrink-0" />;
     case 'search': return <Search size={13} className="text-claude-muted flex-shrink-0" />;
     case 'skill':  return <BookOpen size={13} className="text-claude-muted flex-shrink-0" />;
+    case 'subagent': return <Zap size={13} className="text-purple-600 flex-shrink-0" />;
     default:       return <Zap size={13} className="text-claude-muted flex-shrink-0" />;
   }
+}
+
+function getSubAgentInfo(item: ToolGroupItem): {
+  title: string;
+  type: string;
+  prompt: string;
+  childRunId?: string;
+} {
+  const input = item.input || {};
+  const description = typeof input.description === 'string' ? input.description.trim() : '';
+  const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : '';
+  const type = typeof input.subagent_type === 'string' && input.subagent_type.trim()
+    ? input.subagent_type.trim()
+    : 'general';
+  const title = description || firstMeaningfulLine(prompt) || '子任务';
+  const childRunId = extractResultField(item.result?.content, 'child_run_id');
+
+  return {
+    title,
+    type,
+    prompt,
+    childRunId,
+  };
+}
+
+function extractResultField(content: string | undefined, field: string): string | undefined {
+  if (!content) return undefined;
+  const match = content.match(new RegExp(`^${field}:\\s*(.+)$`, 'm'));
+  return match?.[1]?.trim();
+}
+
+function firstMeaningfulLine(str: string): string {
+  return str
+    .split('\n')
+    .map(line => line.trim())
+    .find(Boolean) || '';
 }

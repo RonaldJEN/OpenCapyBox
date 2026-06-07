@@ -6,8 +6,8 @@ import { CodeBlock } from './CodeBlock';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { parseMessageContent } from '../utils/messageParser';
-import { extractAssistantContentBlocks } from '../utils/assistantFileRefs';
-import { getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, toFileInfo, buildSandboxFileUrl, isImageFile } from '../utils/fileUtils';
+import { extractAssistantFiles } from '../utils/assistantFileRefs';
+import { getFileIcon, getFileExtLabel, getFileCategoryLabel, getFileBadgeClass, getFileIconClass, toFileInfo, buildSandboxFileUrl, isImageFile } from '../utils/fileUtils';
 import { AuthenticatedImage } from './AuthenticatedImage';
 
 interface RoundProps {
@@ -131,14 +131,14 @@ function AssistantMarkdown({ content }: { content: string }) {
 function AssistantFileCard({ file, onOpen }: { file: FileInfo; onOpen?: (file: FileInfo) => void }) {
   const Icon = getFileIcon(file);
   const meta = file.size > 0
-    ? `${getFileExtLabel(file)} · ${formatAssistantFileSize(file.size)}`
-    : getFileExtLabel(file);
+    ? `${getFileCategoryLabel(file)} · ${getFileExtLabel(file)} · ${formatAssistantFileSize(file.size)}`
+    : `${getFileCategoryLabel(file)} · ${getFileExtLabel(file)}`;
 
   return (
     <button
       type="button"
       onClick={() => onOpen?.(file)}
-      className="not-prose group my-4 flex w-full items-center gap-3 rounded-xl border border-claude-border bg-white px-4 py-3 text-left transition-colors hover:border-claude-border-strong hover:bg-claude-hover active:scale-[0.99]"
+      className="not-prose group flex w-full items-center gap-3 rounded-xl border border-claude-border bg-white px-4 py-3 text-left transition-colors hover:border-claude-border-strong hover:bg-claude-hover active:scale-[0.99]"
       aria-label={`查看 ${file.name}`}
       title={`查看 ${file.name}`}
     >
@@ -173,12 +173,13 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
 
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'max_steps_reached', 'interrupted', 'resumed', 'cancelled']);
   const isCompleted = TERMINAL_STATUSES.has(round.status);
-  const latestStreamingContent = isStreaming
+  const effectiveStreaming = isStreaming && !isCompleted;
+  const latestStreamingContent = effectiveStreaming
     ? [...round.steps].reverse().find((step) => step.assistant_content)?.assistant_content
     : undefined;
   const assistantContent = round.final_response || latestStreamingContent;
-  const assistantBlocks = assistantContent
-    ? extractAssistantContentBlocks(assistantContent, sessionId)
+  const assistantFiles = assistantContent
+    ? extractAssistantFiles(assistantContent, sessionId)
     : [];
 
   return (
@@ -262,7 +263,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
           {(round.steps.length > 0 || isStreaming) && (
             <ReasoningPanel
               steps={round.steps}
-              isStreaming={isStreaming}
+              isStreaming={effectiveStreaming}
               isCompleted={isCompleted && !!round.final_response}
               disableMotion={disableMotion}
             />
@@ -271,20 +272,22 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
           {/* 最终答案 OR 流式传输中的答案 */}
           {assistantContent && (
             <div className="prose max-w-none mt-4">
-              {assistantBlocks.map((block, index) => (
-                block.type === 'file' ? (
-                  <AssistantFileCard
-                    key={`file-${block.file.path}-${index}`}
-                    file={block.file}
-                    onOpen={onOpenFileInPanel}
-                  />
-                ) : (
-                  <AssistantMarkdown key={`markdown-${index}`} content={block.content} />
-                )
-              ))}
+              <AssistantMarkdown content={assistantContent} />
               {/* 流式传输光标 */}
-              {!round.final_response && isStreaming && (
+              {!round.final_response && effectiveStreaming && (
                 <span className="inline-block w-0.5 h-5 bg-claude-muted ml-0.5 animate-blink align-middle" />
+              )}
+              {/* 底部文件卡片（去重） */}
+              {assistantFiles.length > 0 && (
+                <div className="not-prose mt-4 flex flex-col gap-2">
+                  {assistantFiles.map((file) => (
+                    <AssistantFileCard
+                      key={`file-${file.path}`}
+                      file={file}
+                      onOpen={onOpenFileInPanel}
+                    />
+                  ))}
+                </div>
               )}
             </div>
           )}

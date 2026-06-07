@@ -17,6 +17,8 @@ def _import_models():
     from src.api.models import agui_event as _  # noqa: F401
     from src.api.models import user_run_lock as _  # noqa: F401
     from src.api.models import run_cancel_request as _  # noqa: F401
+    from src.api.models import channel_session_binding as _  # noqa: F401
+    from src.api.models import subagent_run as _  # noqa: F401
     from src.api.models.auth_user import AuthUser as _  # noqa: F401
     from src.api.models.auth_login_event import AuthLoginEvent as _  # noqa: F401
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
@@ -76,6 +78,7 @@ def init_db():
     _configure_postgres_extensions()
     Base.metadata.create_all(bind=engine)
     _migrate_user_run_locks_schema()
+    _migrate_run_cancel_requests_schema()
     _migrate_add_columns()
 
 
@@ -150,6 +153,85 @@ def _migrate_user_run_locks_schema() -> None:
     logger.info("DB 迁移: 重建 user_run_locks 表以支持 per-user 并发 slot")
 
 
+def _migrate_run_cancel_requests_schema() -> None:
+    """Migrate cancel requests to append-only request_id primary key."""
+    inspector = inspect(engine)
+    if not inspector.has_table("run_cancel_requests"):
+        return
+
+    pk_cols = inspector.get_pk_constraint("run_cancel_requests").get("constrained_columns") or []
+    columns = {col["name"] for col in inspector.get_columns("run_cancel_requests")}
+    required = {"request_id", "session_id", "user_id", "target_run_id", "root_run_id", "requested_after"}
+    if pk_cols == ["request_id"] and required.issubset(columns):
+        return
+
+    def _col_or_default(column_name: str, default_sql: str) -> str:
+        return column_name if column_name in columns else default_sql
+
+    request_id_expr = (
+        "COALESCE(NULLIF(request_id, ''), md5(random()::text || clock_timestamp()::text))"
+        if "request_id" in columns
+        else "md5(random()::text || clock_timestamp()::text)"
+    )
+    state_expr = _col_or_default("state", "'completed'")
+    requested_at_expr = _col_or_default("requested_at", "NOW()")
+    updated_at_expr = _col_or_default("updated_at", requested_at_expr)
+    acked_at_expr = _col_or_default("acked_at", "NULL")
+    completed_at_expr = _col_or_default("completed_at", "NULL")
+    user_id_expr = _col_or_default("user_id", "''")
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE run_cancel_requests_new (
+                request_id VARCHAR(36) PRIMARY KEY,
+                session_id VARCHAR(36) NOT NULL,
+                user_id VARCHAR(100) NOT NULL,
+                target_run_id VARCHAR(36),
+                root_run_id VARCHAR(36),
+                requested_after TIMESTAMP,
+                state VARCHAR(20) NOT NULL DEFAULT 'requested',
+                requested_at TIMESTAMP NOT NULL,
+                acked_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO run_cancel_requests_new (
+                request_id, session_id, user_id, state,
+                requested_at, acked_at, completed_at, updated_at
+            )
+            SELECT
+                {request_id_expr},
+                session_id,
+                {user_id_expr},
+                COALESCE({state_expr}, 'completed'),
+                COALESCE({requested_at_expr}, {updated_at_expr}, NOW()),
+                {acked_at_expr},
+                {completed_at_expr},
+                COALESCE({updated_at_expr}, {requested_at_expr}, NOW())
+            FROM run_cancel_requests
+        """.format(
+            request_id_expr=request_id_expr,
+            user_id_expr=user_id_expr,
+            state_expr=state_expr,
+            requested_at_expr=requested_at_expr,
+            updated_at_expr=updated_at_expr,
+            acked_at_expr=acked_at_expr,
+            completed_at_expr=completed_at_expr,
+        )))
+        conn.execute(text("DROP TABLE run_cancel_requests"))
+        conn.execute(text("ALTER TABLE run_cancel_requests_new RENAME TO run_cancel_requests"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_run_cancel_requests_session_id ON run_cancel_requests (session_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_run_cancel_requests_user_id ON run_cancel_requests (user_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_run_cancel_requests_user_session ON run_cancel_requests (user_id, session_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_run_cancel_requests_target_run ON run_cancel_requests (target_run_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_run_cancel_requests_root_run ON run_cancel_requests (root_run_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_run_cancel_requests_requested_after ON run_cancel_requests (requested_after)"))
+
+    logger.info("DB 迁移: run_cancel_requests 调整为 request_id 主键 append-only 审计表")
+
+
 # ============================================================
 # 简易数据库迁移（无 Alembic 场景下的安全 ALTER TABLE）
 # ============================================================
@@ -222,6 +304,8 @@ def _migrate_add_columns():
                 conn.execute(text(stmt))
                 existing_columns.add(column_name)
                 logger.info("DB 迁移: %s 表新增列 %s (%s)", table_name, column_name, column_type)
+
+        _ensure_agui_events_run_sequence_unique(conn, inspector)
 
         # 补建唯一约束（仅对存量库：如果已有覆盖相同列的唯一索引/约束则跳过）
         for table_name, constraint_name, columns in _PENDING_UNIQUE_CONSTRAINTS:
@@ -323,7 +407,7 @@ def _migrate_add_columns():
                 else:
                     raise RuntimeError(f"memory_embeddings.embedding 类型不支持迁移: {col_type}")
 
-        # PostgreSQL: 同步自增序列到 max(id)（pgloader 等工具插入显式 id 后序列可能过时）
+        # PostgreSQL: 同步自增序列到 max(id)（外部工具插入显式 id 后序列可能过时）
         # 注意：下方表名均为硬编码常量，不来自外部输入，f-string 拼接安全。
         _SERIAL_TABLES = [
             "agui_events", "conversation_messages", "llm_call_records",
@@ -332,3 +416,46 @@ def _migrate_add_columns():
         for t in _SERIAL_TABLES:
             if inspector.has_table(t):
                 _sync_postgres_sequence(conn, t)
+
+
+def _ensure_agui_events_run_sequence_unique(conn, inspector) -> None:
+    """Ensure agui_events(run_id, sequence) is unique without rewriting history."""
+    table_name = "agui_events"
+    if not inspector.has_table(table_name):
+        return
+
+    cols_set = {"run_id", "sequence"}
+    already_covered = any(
+        set(idx["column_names"]) == cols_set and idx.get("unique")
+        for idx in inspector.get_indexes(table_name)
+    ) or any(
+        set(uc["column_names"]) == cols_set
+        for uc in inspector.get_unique_constraints(table_name)
+    )
+    if already_covered:
+        logger.debug("DB 迁移: agui_events(run_id, sequence) 唯一约束已存在，跳过")
+        return
+
+    duplicates = conn.execute(text("""
+        SELECT run_id, sequence, COUNT(*) AS count
+        FROM agui_events
+        GROUP BY run_id, sequence
+        HAVING COUNT(*) > 1
+        ORDER BY count DESC, run_id, sequence
+        LIMIT 10
+    """)).mappings().all()
+    if duplicates:
+        sample = [
+            f"run_id={row['run_id']} sequence={row['sequence']} count={row['count']}"
+            for row in duplicates
+        ]
+        raise RuntimeError(
+            "agui_events 存在重复 (run_id, sequence)，请先用一次性运维脚本清洗后再启动："
+            + "; ".join(sample)
+        )
+
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_agui_events_run_sequence "
+        "ON agui_events (run_id, sequence)"
+    ))
+    logger.info("DB 迁移: 新建唯一索引 agui_events.uq_agui_events_run_sequence (run_id, sequence)")

@@ -65,6 +65,14 @@ export interface AdminRoundTreeItem {
   session_id: string;
   user_id: string | null;
   session_title: string | null;
+  run_kind: 'main' | 'subagent';
+  parent_run_id: string | null;
+  root_run_id: string | null;
+  subagent_edge_id: string | null;
+  subagent_type: string | null;
+  subagent_description: string | null;
+  subagent_prompt_preview: string | null;
+  subagent_child_count: number;
   status: string;
   step_count: number;
   started_at: string;

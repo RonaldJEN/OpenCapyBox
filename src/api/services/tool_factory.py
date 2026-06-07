@@ -27,6 +27,7 @@ from src.agent.tools.memory_tools import (
 )
 from src.agent.tools.cron_tool import ManageCronTool
 from src.agent.tools.ask_user_tool import AskUserQuestionTool
+from src.agent.tools.sub_agent_tool import SubAgentTool
 from src.agent.tools.skill_loader import SkillLoader
 from src.agent.tools.skill_tool import GetSkillTool
 
@@ -78,6 +79,7 @@ async def create_agent_tools(
     mount: str,
     user_id: str,
     db_session_factory: Callable,
+    subagent_runner: Callable | None = None,
     exclude: Optional[Set[str]] = None,
 ) -> tuple[List, Optional[SkillLoader]]:
     """创建标准 Agent 工具列表。
@@ -146,6 +148,8 @@ async def create_agent_tools(
         )),
         # 用户交互工具（Human-in-the-Loop）
         ("AskUserQuestionTool", lambda: AskUserQuestionTool()),
+        # 子 Agent 委托工具（服务层 runner 创建 child Round）
+        ("SubAgentTool", lambda: SubAgentTool(runner=subagent_runner)),
     ]
 
     tools: List = [factory() for cls_name, factory in _candidates if cls_name not in exclude]

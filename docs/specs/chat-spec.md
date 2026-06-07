@@ -1,7 +1,7 @@
 # 聊天与 Agent 执行 (Chat) — Spec
 
-> **模块归属**: `src/api/routes/chat.py`, `src/api/services/agent_service.py`, `src/agent/agent.py`
-> **最后更新**: 2026-05-22
+> **模块归属**: `src/api/routes/chat.py`, `src/api/services/turn_orchestrator.py`, `src/api/services/agent_service.py`, `src/agent/agent.py`
+> **最后更新**: 2026-06-07
 > **状态**: Draft
 
 ---
@@ -28,7 +28,7 @@
 | Agent 执行生命周期 | 管理从启动到终态的完整流程：启动 → 工具调用 → 完成/中断/取消/错误 |
 | SSE 订阅与断线重连 | 支持客户端重连后从指定 sequence 恢复事件流 |
 | 执行中断与恢复 | Human-in-the-Loop：Agent 调用 `ask_user` 工具时暂停执行，等待用户输入后恢复 |
-| 执行取消 | 支持主动取消正在运行的 Agent（含跨 worker 场景） |
+| 执行取消 | 支持主动取消当前单 worker 进程内正在运行的 Agent；跨 worker 投递不属于第一版能力 |
 | 幂等性保证 | 前端重复提交相同 `idempotency_key` 不会产生多次执行 |
 | AG-UI 事件生成与持久化 | 生成标准 AG-UI 事件并写入数据库，支持事后重放 |
 | 上下文压缩 | 多级压缩策略，确保对话历史不超出模型上下文窗口 |
@@ -202,16 +202,19 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 
 ### 2.6 `run_cancel_requests` 表
 
-跨 worker 取消请求的协调表。Worker 通过轮询此表检测取消信号。
+取消请求 append-only 审计表。第一版按单 worker 部署，取消投递由进程内 `RunCancelService` registry + per-run cancel token 完成；DB 行只记录审计与诊断线索，不承担跨 worker command delivery。
 
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
-| `session_id` | String(36) | PK | 一个会话最多一个活跃取消请求 |
+| `request_id` | String(36) | PK | UUID，用于跟踪取消请求 |
+| `session_id` | String(36) | NOT NULL, indexed | 目标会话 |
 | `user_id` | String(100) | NOT NULL, indexed | 请求取消的用户 |
+| `target_run_id` | String(36) | nullable, indexed | 目标 run；未命中本地 registry 时可为空 |
+| `root_run_id` | String(36) | nullable, indexed | 根 run，用于 subagent/派生 run 审计 |
+| `requested_after` | DateTime | nullable, indexed | cancel epoch；避免旧取消误杀后续新 run |
 | `state` | String(20) | NOT NULL, default=`"requested"` | 取消状态（见下方状态机） |
-| `request_id` | String(36) | NOT NULL | UUID，用于跟踪取消请求 |
 | `requested_at` | DateTime | NOT NULL | 请求时间 |
-| `acked_at` | DateTime | nullable | Worker 确认时间 |
+| `acked_at` | DateTime | nullable | 本进程 registry 命中确认时间 |
 | `completed_at` | DateTime | nullable | 取消完成时间 |
 | `updated_at` | DateTime | NOT NULL | 最后更新时间 |
 
@@ -224,7 +227,35 @@ requested  ──→  acked  ──→  completed
           (worker 死亡时直接跳到 completed)
 ```
 
-### 2.7 `interrupt_resolutions` 表
+### 2.7 `channel_session_bindings` 表
+
+外部 channel peer 到内部 session 的绑定表。当前 Web SSE 入口仍以
+`session_id` 为主；本表提供 typed turn/channel 边界中的持久化 binding。
+`src/api/schemas/turn.py` 供 Web adapter、Cron adapter 和未来外部 channel
+adapter 复用，未来外部 channel adapter 可用本表将 peer 映射到 session。
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | String(36) | PK | 绑定 UUID |
+| `user_id` | String(100) | FK → `auth_users.user_id` (CASCADE), indexed | 绑定所属用户 |
+| `session_id` | String(36) | FK → `sessions.id` (CASCADE), indexed | 内部会话 |
+| `channel` | String(50) | NOT NULL, indexed | 渠道标识，如 `web` / `cron` / 未来外部 channel |
+| `account_id` | String(100) | nullable, indexed | 渠道账号或 bot 实例 |
+| `peer_kind` | String(20) | NOT NULL | `web` / `direct` / `group` / `thread` / `cron` / `webhook` |
+| `peer_id` | String(255) | NOT NULL | 渠道内对端标识 |
+| `external_thread_id` | String(255) | nullable | 渠道线程标识 |
+| `binding_key` | String(64) | NOT NULL, indexed | 对 `(channel, account_id, peer_kind, peer_id, external_thread_id)` 做规范 JSON 后的 SHA-256 |
+| `reply_route_json` | Text | nullable | `ReplyRoute` 快照 |
+| `metadata_json` | Text | nullable | adapter 元数据 |
+| `created_at` / `updated_at` | DateTime | NOT NULL | 创建与更新时间 |
+
+**唯一约束**: `Unique(user_id, binding_key)`。
+
+**当前阶段语义**: `DeliveryService` 是 no-op 边界；`ChannelProjection` 只把
+`ChannelMessageReplyRoute` 上的终态 `RUN_FINISHED` 投影为 `DeliveryIntent`，
+不会发送外部网络消息。Web SSE 仍由 chat route 直接返回。
+
+### 2.8 `interrupt_resolutions` 表
 
 `ask_user` 中断恢复的结构化事实表。它记录某个 `interrupt_id` 被哪一个 resume round 接管，以及热路径当时写入 LLM 历史的 tool result 文本，用于冷启动后还原等价上下文。
 
@@ -436,18 +467,11 @@ SSE 事件流。
 #### 响应
 
 ```json
-// 常规即时取消（live worker / 跨 worker）
+// 常规即时取消（单 worker registry / 接口即时收敛）
 {
     "status": "cancelled",
     "request_id": "uuid",
     "reason": "force_aborted"
-}
-
-// 命中本地 active runner，立即强制停止
-{
-    "status": "cancelled",
-    "request_id": "uuid",
-    "reason": "force_stopped"
 }
 
 // Worker 已死亡，直接清理
@@ -468,7 +492,6 @@ SSE 事件流。
 | `status` 值 | 含义 |
 |--------------|------|
 | `cancelled` + `reason: "force_aborted"` | 已将 running round 直接收敛为 cancelled，并立即释放会话锁 |
-| `cancelled` + `reason: "force_stopped"` | 命中本地 active runner，已执行 task cancel 并等待收敛完成（锁已释放） |
 | `cancelled` + `reason: "worker_dead"` | 锁已超过 `SSE_SUBSCRIBE_TIMEOUT` 未刷新，判定 Worker 死亡，直接强制清理锁和 Round 状态 |
 | `cancelled` + `reason: "force_unlocked"` | init-window（无 running round）也立即释放会话锁，允许用户立刻重发 |
 
@@ -520,6 +543,16 @@ SSE 事件流。
 
 ### 4.1 Agent 执行循环
 
+#### Turn 编排边界
+
+Web send/resume/abort 入口先由 `WebChatAdapter` / `WebResumeAdapter` /
+`WebCancelAdapter` 归一化为 typed turn contract，再交给 `TurnOrchestrator`
+启动 prepared Agent run、注册 cancel token、维护 active runner、刷新
+`UserRunLock` 心跳，并在终态释放锁和完成取消审计。`CronChannelAdapter`
+提供 no-reply turn 规范化；未来外部 channel 通过 `ReplyRoute`、
+`ChannelProjection` 与 no-op `DeliveryService` 接入，不改变当前 Web SSE
+协议。
+
 #### 基本流程
 
 ```
@@ -543,7 +576,7 @@ SSE 事件流。
     ▼
 ┌─── Agent 主循环 (step 1..max_steps) ──────────────┐
 │                                                     │
-│  ① 取消检查 ──── 检测 run_cancel_requests 表       │
+│  ① 取消检查 ──── 检测当前 run cancel token        │
 │      │                                              │
 │      ▼                                              │
 │  ② LLM 调用（流式）                                │
@@ -598,7 +631,7 @@ Agent 执行循环中有 **3 个取消检查点**:
 2. **LLM 完成后、工具执行前**: LLM 响应解析完成时
 3. **每个工具执行前**: 多工具调用时，每个工具执行前单独检查
 
-检查逻辑：查询 `run_cancel_requests` 表，若存在 `state=requested` 的记录，将其更新为 `acked`，然后抛出取消异常。
+检查逻辑：Agent 运行时读取当前 run 的 `cancel_token`；`abort` 命中本进程 registry 时立即置位 token，并写入 `run_cancel_requests` 审计行。DB 行不参与第一版取消投递。
 
 #### Max Steps 处理
 
@@ -607,7 +640,7 @@ Agent 执行循环中有 **3 个取消检查点**:
 
 #### AgentPool 缓存与 runtime messages 一致性
 
-`AgentPoolService` 只缓存可复用运行资源，包括沙箱连接、工具集合、LLM client 与 AgentService 实例；它不把 `agent.messages` 视为跨轮次、跨 worker 的权威上下文。
+`AgentPoolService` 只缓存可复用运行资源，包括沙箱连接、工具集合、LLM client 与 AgentService 实例；它不把 `agent.messages` 视为跨轮次、跨进程重启后的权威上下文。
 
 每次 `send` / `resume` 真正启动 Agent run 前，`AgentService` 必须从 DB 权威历史重建本轮 runtime messages：
 
@@ -616,7 +649,7 @@ Agent 执行循环中有 **3 个取消检查点**:
 3. 用重建结果替换本进程内旧 `agent.messages`，不得追加到旧热缓存后面。
 4. 再注入本轮用户输入或 resume 答案后进入 LLM 调用。
 
-因此，即使多 worker 下某个旧 worker 命中本地 AgentPool 热缓存，LLM request 也必须基于 DB 中最新 conversation history 构造。`llm_call_records.request_messages` 应能审计到刷新后的输入快照：上一轮已落库的用户纠错/确认信息不得因为 stale hot cache 缺失。
+因此，即使重启后命中本地 AgentPool 热缓存，LLM request 也必须基于 DB 中最新 conversation history 构造。`llm_call_records.request_messages` 应能审计到刷新后的输入快照：上一轮已落库的用户纠错/确认信息不得因为 stale hot cache 缺失。
 
 ### 4.2 幂等性保证
 
@@ -666,15 +699,15 @@ INSERT INTO rounds (..., idempotency_key)
 - 每 15s 心跳刷新 `user_run_locks.updated_at`（由 `SSE_HEARTBEAT_INTERVAL` 控制）
 - 超过 `SSE_SUBSCRIBE_TIMEOUT`（默认 300s）未刷新 → 视为 stale lock；下一次获取用户 slot 时回收该锁并清理对应 session 的孤儿 running round
 - `abort` 统一采用“接口即时收敛”策略：
-    1. 写入取消请求（用于跨 worker 可观测）
+    1. 写入 append-only 取消审计行（用于本进程 registry 命中状态与诊断）
     2. 若存在 running round，直接标记 `cancelled` 并补发 `RUN_FINISHED(outcome=interrupt)`
     3. 立即释放 `user_run_locks`（不等待执行 worker 自行结束）
     4. 完成取消请求状态（`completed`）
-- `abort` 若命中本地 active runner，会额外执行 `runner.cancel()` 缩短后台残留窗口
+- `abort` 若命中本进程 active runner，仅向本地 cancel token 投递协作式取消信号并记录审计状态；接口不等待 runner 自行结束，也不执行 task-level `runner.cancel()`
 - `abort` 检测到 Worker 死亡时返回 `reason=worker_dead`，其余即时收敛路径返回 `force_aborted/force_unlocked`
-- 执行侧引入 abort-epoch 守卫：若 run 启动后检测到较新 cancel 活动（`requested/acked/completed` 时间戳晚于 run 启动点），旧请求会被短路，避免 init-window 穿透创建新 round
+- 执行侧引入 abort-epoch 守卫：若 run 启动后检测到较新取消请求（`requested_at` 晚于 run 启动点），旧请求会被短路，避免 init-window 穿透创建新 round
 
-> 说明：即时释放锁后，旧 worker 可能在极短时间内仍在退出过程。系统通过“终态后丢弃迟到事件”避免 UI/回放被旧 run 污染。
+> 说明：即时释放锁后，旧 worker 可能仍在协作式退出过程。系统通过 AgentPool detach、终态后丢弃迟到 AG-UI 事件、禁止终态 round 被覆写，避免 UI/回放/后续新 run 被旧 run 污染。
 
 #### Per-User 并发 slot
 
@@ -697,9 +730,9 @@ INSERT INTO rounds (..., idempotency_key)
 规则：
 
 1. **后台长轮询协程不得跨 `await asyncio.sleep` 持有 DB Session**。典型场景：
-   - `_cancel_request_watcher`：每轮单独 `with SessionLocal() as check_db` / `hb_db`，`sleep` 前必须释放。
+   - `TurnOrchestrator` 的 lock heartbeat guard：每轮单独 `with SessionLocal() as hb_db`，`sleep` 前必须释放。
    - `subscribe_to_round.heartbeat_and_poll`：每次增量回放查询单独 `with SessionLocal() as replay_db`，查完立即释放。
-2. **PostgreSQL 使用 `QueuePool + pool_pre_ping`**：事实库仅支持 PostgreSQL，连接池容量必须覆盖请求级校验、SSE 后台 producer、cancel watcher 心跳与事件重放的短生命周期 Session 峰值，避免同步 ORM 获取连接时阻塞 event loop。
+2. **PostgreSQL 使用 `QueuePool + pool_pre_ping`**：事实库仅支持 PostgreSQL，连接池容量必须覆盖请求级校验、SSE 后台 producer、TurnOrchestrator lock heartbeat 与事件重放的短生命周期 Session 峰值，避免同步 ORM 获取连接时阻塞 event loop。
 3. **请求级 `db: Depends(get_db)` 在 SSE 流路径上只能用于入口校验**；进入 event_generator / producer 后，必须使用独立短生命周期 Session 做持久化。`subscribe_to_round` 完成初始 replay / 终态检查后，若要进入长时间队列等待，必须先结束请求级只读事务。
 4. **AgentPool 热缓存不得持有请求级 DB Session**：缓存的 `AgentService` 使用独立的 `SessionLocal` factory / owned session，命中缓存时不得把当前请求的 `db: Depends(get_db)` rebind 到共享 Agent 上。Agent 初始化期间需要更新 `user_sandboxes` 或同步 memory 时，也必须使用独立短生命周期 Session；入口请求级 `db` 只能传递已预读出的标量值（如 `model_id` / `sandbox_id` / `round_count`），不得跨 sandbox / Agent 初始化 await 持有。
 5. **AG-UI 事件持久化不得跨 Agent/LLM/tool 的 `await` 间隙保留未提交事务**；非 delta 事件写入后必须提交，delta 事件完成终态读取后也必须结束只读事务，run 收尾的只读状态/摘要查询也必须结束事务，避免 PostgreSQL 远端连接在 idle-in-transaction 状态被断开。`commit()` 后的 `refresh()` 会再次发起只读 `SELECT`，返回 ORM 对象前必须分离对象并结束该只读事务。
@@ -1058,7 +1091,7 @@ SSE 连接建立
 | **Subscribe 超时** | 5 分钟定时器 | 发射 `RUN_ERROR(TIMEOUT)` 事件，关闭连接 | 前端收到超时事件，提示用户 |
 | **resume 冷实时替换失败** | 未找到 ask_user `tool_call_id` 或 tool result 占位 | 写入 `interrupt_resolutions.fallback_reason`，将用户答案作为新 user 消息注入 | Agent 仍继续执行，冷恢复可通过 child user 消息保留语义 |
 | **resume 冷启动 stitching 失败** | resolution 与 parent/child 不对齐，或 parent tool result 无法替换 | 不跳过 child resume user 消息，并更新/记录 `fallback_reason` | 刷新后不会丢失用户回答，但上下文形态会退化为 user Q/A |
-| **用户主动 abort（任意 worker）** | `POST /abort` 被调用且会话处于 running / init-window | 接口直接收敛 round 并尝试释放锁；释放成功返回 `cancelled(force_aborted/force_unlocked)`；本地命中 runner 时额外 `cancel()` | 释放成功后用户可立即重发 |
+| **用户主动 abort（任意 worker）** | `POST /abort` 被调用且会话处于 running / init-window | 接口直接收敛 round 并尝试释放锁；释放成功返回 `cancelled(force_aborted/force_unlocked)`；本地命中 runner 时投递协作式 cancel token | 释放成功后用户可立即重发 |
 | **abort 收敛后释放锁失败** | `POST /abort` 执行到锁释放阶段但 DB 冲突/异常 | 返回 `HTTP 503`，不返回 `cancelled` 假成功 | 前端保持运行态或提示重试，避免误判“已可重发” |
 | **abort 后旧 run 迟到输出** | round 已终态但仍收到后续 AG-UI 事件 | 丢弃迟到事件，不再入库，不污染 replay/UI | 前端状态保持 cancelled，不再回跳 running |
 | **DB 锁冲突** | 数据库异常捕获 | 返回 HTTP 503 | 前端提示稍后重试 |

@@ -16,7 +16,7 @@ echo "[INFO] 启动后端 uvicorn (port 8000)..."
 uvicorn src.api.main:app \
     --host 127.0.0.1 \
     --port 8000 \
-    --workers "${UVICORN_WORKERS:-2}" \
+    --workers "${UVICORN_WORKERS:-1}" \
     --log-level "${LOG_LEVEL:-info}" &
 
 BACKEND_PID=$!

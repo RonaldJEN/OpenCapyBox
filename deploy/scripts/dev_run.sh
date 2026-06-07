@@ -118,11 +118,11 @@ start_backend() {
 
     success "后端启动于 http://localhost:8000"
     success "API 文档: http://localhost:8000/api/v1/docs"
-    start_uvicorn_backend 4
+    start_uvicorn_backend 1
 }    
 #$PYTHON_CMD -m uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000 --reload-dir src
 
-#$PYTHON_CMD -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 4
+#$PYTHON_CMD -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 1
 
 
 # 启动前端
@@ -205,7 +205,7 @@ start_all() {
     fi
 
     info "启动后端 (http://localhost:8000)..."
-    start_uvicorn_backend 2 &
+    start_uvicorn_backend 1 &
     BACKEND_PID=$!
     
     # 等待后端启动

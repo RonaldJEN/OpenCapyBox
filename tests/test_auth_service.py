@@ -14,6 +14,7 @@ from sqlalchemy.pool import StaticPool
 from src.api.models.agui_event import AGUIEventLog
 from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
+from src.api.models.channel_session_binding import ChannelSessionBinding
 from src.api.models.conversation_message import ConversationMessage
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
@@ -22,6 +23,7 @@ from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.round import Round
 from src.api.models.run_cancel_request import RunCancelRequest
 from src.api.models.session import Session
+from src.api.models.subagent_run import SubagentRun
 from src.api.models.user_memory import CronJobRun, MemoryEmbedding, UserMemory, UserSkillConfig
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_sandbox import UserSandbox
@@ -404,6 +406,23 @@ def test_delete_auth_user_purges_owned_data(db):
     db.add(UserSkillConfig(user_id="purge-user", skill_name="docx", enabled=False))
     db.add(RunCancelRequest(session_id="s-purge", user_id="purge-user"))
     db.add(UserRunLock(user_id="purge-user", session_id="s-purge"))
+    db.add(ChannelSessionBinding(
+        user_id="purge-user",
+        session_id="s-purge",
+        channel="web",
+        peer_kind="web",
+        peer_id="s-purge",
+        binding_key="binding-purge",
+    ))
+    db.add(SubagentRun(
+        user_id="purge-user",
+        session_id="s-purge",
+        root_run_id="r-purge",
+        parent_run_id="r-purge",
+        child_run_id=None,
+        prompt="delegate this",
+        status="requested",
+    ))
     db.add(UserSandbox(id="usb-purge", user_id="purge-user", sandbox_id="sbx-old", status="active"))
     db.add(UserMemory(user_id="keep-user", file_type="user_md", content="keep memory"))
     db.commit()
@@ -424,6 +443,8 @@ def test_delete_auth_user_purges_owned_data(db):
     assert db.query(UserSkillConfig).filter(UserSkillConfig.user_id == "purge-user").count() == 0
     assert db.query(RunCancelRequest).filter(RunCancelRequest.user_id == "purge-user").count() == 0
     assert db.query(UserRunLock).filter(UserRunLock.user_id == "purge-user").count() == 0
+    assert db.query(ChannelSessionBinding).filter(ChannelSessionBinding.user_id == "purge-user").count() == 0
+    assert db.query(SubagentRun).filter(SubagentRun.user_id == "purge-user").count() == 0
     assert db.query(UserSandbox).filter(UserSandbox.user_id == "purge-user").count() == 0
     assert db.query(AuthUser).filter(AuthUser.user_id == "keep-user").count() == 1
     assert db.query(Session).filter(Session.user_id == "keep-user").count() == 1

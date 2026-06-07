@@ -74,6 +74,8 @@
 {
   "round_id": "...",
   "parent_run_id": "... | null",
+  "idempotency_key": "... | null",
+  "last_event_sequence": 0,
   "user_message": "...",
   "user_attachments": [],
   "final_response": "...",
@@ -85,6 +87,10 @@
   "interrupt": null
 }
 ```
+
+`idempotency_key` 由客户端发送消息时生成；history/v2 必须返回该字段，供 accepted 但尚未收到 `runId` 的断线恢复路径按因果标识定位本次 round，不能用时间窗口猜测旧 round。
+`last_event_sequence` 是该 round 已持久化 AG-UI 事件的最大 sequence；前端在 history 已经重建 running round 后订阅 SSE 时必须从该 sequence 之后接续，避免重复消费已展示事件。
+`history/v2` 只返回主聊天流可见 round；被 `subagent_runs.child_run_id` 指向的 child round 属于 sidechain，不得作为普通用户/助手对话返回。注意不能用 `parent_run_id != null` 过滤，因为 ask_user resume round 也有 `parent_run_id` 且必须保留在主聊天流。
 
 其中 `StepData`:
 

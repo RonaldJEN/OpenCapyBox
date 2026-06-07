@@ -10,6 +10,7 @@ import type {
   RunningSessionsResponse,
   ChatContentBlock,
   StreamCallbacks,
+  StreamDeltaMeta,
   SubscribeCallbacks,
   SubscriptionResult,
 } from '../types';
@@ -51,6 +52,10 @@ function _tryRecoverRoundFinished(
   callbacks: StreamCallbacks,
 ): boolean {
   if (!round || !_ROUND_TERMINAL_STATUSES.has(round.status)) return false;
+  if (round.status === 'failed') {
+    callbacks.onRunError?.(round.final_response || 'Run failed', 'RUN_FAILED');
+    return true;
+  }
   const outcome = round.status === 'completed'
     ? 'success'
     : (round.status === 'interrupted' || round.status === 'cancelled' || round.status === 'resumed')
@@ -62,6 +67,36 @@ function _tryRecoverRoundFinished(
     ...(round.status === 'cancelled' ? { reason: 'user_cancelled' } : {}),
   }, outcome, round.interrupt);
   return true;
+}
+
+function _roundCreatedAtMs(round: any): number {
+  const value = new Date(round?.created_at || 0).getTime();
+  return Number.isFinite(value) ? value : 0;
+}
+
+function _eventSequence(event: any): number | undefined {
+  const value = typeof event?.sequence === 'number'
+    ? event.sequence
+    : (typeof event?._sequence === 'number' ? event._sequence : undefined);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function _aggregateDeltaMeta(event: any): StreamDeltaMeta | undefined {
+  const sequence = _eventSequence(event);
+  if (sequence === undefined) {
+    return undefined;
+  }
+  return { sequence, isAggregate: true };
+}
+
+function _newestRound(rounds: any[] | undefined, predicate: (round: any) => boolean): any | undefined {
+  return [...(rounds || [])]
+    .filter(predicate)
+    .sort((a, b) => _roundCreatedAtMs(b) - _roundCreatedAtMs(a))[0];
+}
+
+function _matchesAcceptedRequest(round: any, idempotencyKey: string): boolean {
+  return round?.idempotency_key === idempotencyKey;
 }
 
 class APIService {
@@ -274,8 +309,24 @@ class APIService {
     let currentThreadId: string | null = null;
     let currentRunId: string | null = null;
     let runCompleted = false;
+    let streamAccepted = false;
     let retryCount = 0;
     const maxRetries = 3;
+    let latestSequence = 0;
+    const seenSequences = new Set<number>();
+
+    const markSequence = (event: any): boolean => {
+      const sequence = _eventSequence(event);
+      if (sequence === undefined) {
+        return true;
+      }
+      if (seenSequences.has(sequence)) {
+        return false;
+      }
+      seenSequences.add(sequence);
+      latestSequence = Math.max(latestSequence, sequence);
+      return true;
+    };
 
     const doRequest = async (): Promise<void> => {
       const abortController = new AbortController();
@@ -314,6 +365,7 @@ class APIService {
               throw new HttpError(response.status, friendlyMsg);
             }
 
+            streamAccepted = true;
             callbacks.onStreamAccepted?.();
 
             const reader = response.body?.getReader();
@@ -323,12 +375,46 @@ class APIService {
 
             const decoder = new TextDecoder();
             let buffer = '';
+            const processSSELine = (line: string) => {
+              if (!line.startsWith('data: ')) {
+                return;
+              }
+              const data = line.slice(6);
+
+              try {
+                const event = JSON.parse(data);
+                if (!markSequence(event)) {
+                  return;
+                }
+                this.handleAGUIEvent(event, callbacks, (tid, rid) => {
+                  currentThreadId = tid;
+                  currentRunId = rid;
+                }, () => {
+                  runCompleted = true;
+                });
+              } catch (e) {
+                // RoundExistsError: 更新 currentRunId 為已有的 round_id，讓重連循環 subscribe 到正確目標
+                if (e instanceof RoundExistsError) {
+                  currentRunId = e.roundId;
+                  currentThreadId = chatSessionId;
+                  throw e;
+                }
+                console.error('Failed to parse SSE data:', e, 'Line:', data);
+              }
+            };
 
             while (true) {
               const { done, value } = await reader.read();
               lastDataTime = Date.now();
 
               if (done) {
+                const trailing = buffer.trim();
+                if (trailing) {
+                  for (const line of buffer.split('\n')) {
+                    processSSELine(line);
+                  }
+                  buffer = '';
+                }
                 if (runCompleted) {
                   resolve();
                 } else {
@@ -343,27 +429,7 @@ class APIService {
               buffer = lines.pop() || '';
 
               for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  const data = line.slice(6);
-
-                  try {
-                    const event = JSON.parse(data);
-                    this.handleAGUIEvent(event, callbacks, (tid, rid) => {
-                      currentThreadId = tid;
-                      currentRunId = rid;
-                    }, () => {
-                      runCompleted = true;
-                    });
-                  } catch (e) {
-                    // RoundExistsError: 更新 currentRunId 為已有的 round_id，讓重連循環 subscribe 到正確目標
-                    if (e instanceof RoundExistsError) {
-                      currentRunId = e.roundId;
-                      currentThreadId = chatSessionId;
-                      throw e;
-                    }
-                    console.error('Failed to parse SSE data:', e, 'Line:', data);
-                  }
-                }
+                processSSELine(line);
               }
             }
           })
@@ -412,14 +478,33 @@ class APIService {
               onMessagesSnapshot: callbacks.onMessagesSnapshot,
               onStateSnapshot: callbacks.onStateSnapshot,
               onStateDelta: callbacks.onStateDelta,
+              onStepStarted: callbacks.onStepStarted,
+              onStepFinished: callbacks.onStepFinished,
+              onTextMessageStart: callbacks.onTextMessageStart,
+              onTextMessageContent: callbacks.onTextMessageContent,
+              onTextMessageEnd: callbacks.onTextMessageEnd,
+              onThinkingStart: callbacks.onThinkingStart,
+              onThinkingContent: callbacks.onThinkingContent,
+              onThinkingEnd: callbacks.onThinkingEnd,
+              onToolCallStart: callbacks.onToolCallStart,
+              onToolCallArgs: callbacks.onToolCallArgs,
+              onToolCallEnd: callbacks.onToolCallEnd,
+              onToolCallResult: callbacks.onToolCallResult,
               onRunFinished: (tid, rid, result, outcome, interrupt) => {
                 runCompleted = true;
                 callbacks.onRunFinished?.(tid, rid, result, outcome, interrupt);
               },
               onRunError: callbacks.onRunError,
               onCustomEvent: callbacks.onCustomEvent,
-            });
-            await subscription.promise;
+            }, latestSequence);
+            try {
+              await subscription.promise;
+            } finally {
+              latestSequence = Math.max(
+                latestSequence,
+                subscription.getLatestSequence?.() ?? latestSequence,
+              );
+            }
             if (runCompleted) {
               console.log('✅ 重连成功');
               return;
@@ -427,12 +512,33 @@ class APIService {
             // subscription resolved 但 runCompleted 仍为 false（不应发生，但防御性处理）
             throw new Error('SSE_STREAM_CLOSED');
           } else {
-            // 尚无 runId → 先检查后端是否已创建 running 轮次（避免重复 POST）
+            // 尚无 runId → 先检查后端是否已创建/完成本次轮次（避免重复 POST）
             try {
               const history = await this.getSessionHistoryV2(chatSessionId);
-              const runningRound = history.rounds
-                ?.filter((r: any) => r.status === 'running')
-                .sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+              const acceptedRound = streamAccepted
+                ? _newestRound(history.rounds, (r) => (
+                    _matchesAcceptedRequest(r, idempotencyKey)
+                    && (r.status === 'running' || _ROUND_TERMINAL_STATUSES.has(r.status))
+                  ))
+                : undefined;
+              const runningRound = acceptedRound?.status === 'running'
+                ? acceptedRound
+                : undefined;
+
+              if (
+                acceptedRound
+                && acceptedRound.status !== 'running'
+                && _tryRecoverRoundFinished(
+                  acceptedRound,
+                  chatSessionId,
+                  acceptedRound.round_id,
+                  callbacks,
+                )
+              ) {
+                runCompleted = true;
+                console.log(`✅ 检测到本次轮次 ${acceptedRound.round_id} 已完成，恢复 UI`);
+                return;
+              }
 
               if (runningRound) {
                 // 后端已受理请求，改为 subscribe
@@ -679,10 +785,9 @@ class APIService {
 
                 try {
                   const event = JSON.parse(data);
-                  if (typeof event.sequence === 'number') {
-                    latestSequence = event.sequence;
-                  } else if (typeof event._sequence === 'number') {
-                    latestSequence = event._sequence;
+                  const sequence = _eventSequence(event);
+                  if (sequence !== undefined) {
+                    latestSequence = Math.max(latestSequence, sequence);
                   }
 
                   switch (event.type) {
@@ -724,7 +829,7 @@ class APIService {
                       break;
 
                     case 'TEXT_MESSAGE_CONTENT':
-                      callbacks.onTextMessageContent?.(event.messageId, event.delta);
+                      callbacks.onTextMessageContent?.(event.messageId, event.delta, _aggregateDeltaMeta(event));
                       break;
 
                     case 'TEXT_MESSAGE_END':
@@ -737,7 +842,7 @@ class APIService {
                       break;
 
                     case 'THINKING_TEXT_MESSAGE_CONTENT':
-                      callbacks.onThinkingContent?.(event.messageId, event.delta);
+                      callbacks.onThinkingContent?.(event.messageId, event.delta, _aggregateDeltaMeta(event));
                       break;
 
                     case 'THINKING_TEXT_MESSAGE_END':
@@ -750,7 +855,7 @@ class APIService {
                       break;
 
                     case 'TOOL_CALL_ARGS':
-                      callbacks.onToolCallArgs?.(event.toolCallId, event.delta);
+                      callbacks.onToolCallArgs?.(event.toolCallId, event.delta, _aggregateDeltaMeta(event));
                       break;
 
                     case 'TOOL_CALL_END':

@@ -2,7 +2,7 @@
 
 职责：
 - 从 CronJob DB 表管理定时任务定义（CRUD：HTTP 路由与 Agent 工具共用）
-- Runner：恢复用户沙箱 → 创建临时 Agent → 执行任务 → 写 CronJobRun
+- Runner：恢复用户沙箱 → 归一化 cron turn → TurnOrchestrator 执行 → 写 CronJobRun
 
 注：调度由 `cron_worker` 去中心化执行（不再依赖 APScheduler 持久注册），
 本模块仅暴露 `parse_cron_fields` 与 `run_cron_job` 供 worker 调用。
@@ -64,6 +64,54 @@ def _mark_run_failed(run_id: str, output: str, run_workspace: str | None = None)
             record.completed_at = now_naive()
             record.run_workspace = run_workspace
             db.commit()
+
+
+def _ensure_cron_session(
+    *,
+    db: DBSession,
+    user_id: str,
+    session_id: str,
+    job_name: str,
+    run_id: str,
+    cron_expr: str,
+    source: str,
+    model_id: str | None,
+) -> None:
+    """Create the internal session/binding required by TurnOrchestrator."""
+    from src.api.models.session import Session
+    from src.api.schemas.turn import NoReplyRoute
+    from src.api.services.channel_binding_service import get_channel_binding_service
+
+    session = db.query(Session).filter(Session.id == session_id).first()
+    if session is None:
+        session = Session(
+            id=session_id,
+            user_id=user_id,
+            title=f"Cron: {job_name}",
+            status="active",
+            model_id=model_id,
+        )
+        db.add(session)
+        db.commit()
+    elif session.user_id != user_id:
+        raise RuntimeError(f"内部 cron session 冲突: {session_id}")
+
+    get_channel_binding_service().get_or_create_binding(
+        db,
+        user_id=user_id,
+        session_id=session_id,
+        channel="cron",
+        peer_kind="cron",
+        peer_id=job_name,
+        external_thread_id=run_id,
+        reply_route=NoReplyRoute(),
+        metadata={
+            "job_name": job_name,
+            "run_id": run_id,
+            "cron_expr": cron_expr,
+            "source": source,
+        },
+    )
 
 
 def _validate_name(name: str) -> str:
@@ -365,7 +413,7 @@ class CronService:
 async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -> str | None:
     """执行单个 Cron 任务（从 CronJob DB 查任务定义）
 
-    流程：查 DB 任务 → 恢复沙箱 → 创建临时 Agent → 执行任务 → 记录结果 → 注入聊天
+    流程：查 DB 任务 → 恢复沙箱 → 创建内部 cron session → 统一 orchestrator 执行 → 记录结果
 
     Args:
         user_id: 用户 ID
@@ -377,6 +425,7 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
     """
     from src.api.models.database import SessionLocal
 
+    source = "manual" if run_id else "scheduled"
     if not run_id:
         run_id = str(uuid.uuid4())
 
@@ -434,17 +483,10 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
 
         sandbox = await sandbox_service.get_or_resume(user_id, sandbox_id)
 
-        # 创建临时 Agent 执行任务
-        from src.agent.llm import LLMClient
-        from src.agent.schema import Message as AgentMessage
-
         try:
             from src.api.model_registry import get_model_registry
             model_config = get_model_registry().get_cron_default()
-            llm_client = LLMClient.from_model_config(model_config)
-            cron_token_limit = model_config.compute_token_limit()
-            cron_context_window = model_config.context_window
-            cron_max_output_tokens = model_config.max_tokens
+            cron_model_id = model_config.id
         except FileNotFoundError as e:
             raise RuntimeError(
                 f"Model Registry 不可用: {e}. "
@@ -456,9 +498,8 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                 "請修復 models.yaml 或環境變數後重試。"
             ) from e
 
-        # 创建与聊天 Agent 相同的工具集（排除 AskUserQuestionTool，Cron 无人交互）
+        # 创建与聊天 Agent 同源的工具集，但排除无人值守场景不应具备的交互、记忆、Cron 管理和 sub_agent 工具。
         from src.api.services.sandbox_service import get_sandbox_mount_path
-        from src.api.services.tool_factory import create_agent_tools
 
         mount = get_sandbox_mount_path()
         run_workspace = f"{mount}/cron/runs/{run_id}"
@@ -469,13 +510,49 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
         # 确保 run 工作目录存在
         await sandbox.commands.run(f"mkdir -p {run_workspace_q}")
 
-        tools, _ = await create_agent_tools(
-            sandbox=sandbox,
-            workspace_dir=run_workspace,
-            mount=mount,
+        from src.api.services.cron_channel_adapter import get_cron_channel_adapter
+        from src.api.services.history_service import HistoryService
+        from src.api.services.agent_service import AgentService
+        from src.api.services.turn_orchestrator import get_turn_orchestrator
+        from src.api.schemas.chat import TextContentBlock
+        from src.agent.schema.agui_events import EventType
+
+        cron_session_id = run_id
+        with SessionLocal() as db:
+            _ensure_cron_session(
+                db=db,
+                user_id=user_id,
+                session_id=cron_session_id,
+                job_name=job_name,
+                run_id=run_id,
+                cron_expr=cron_expr,
+                source=source,
+                model_id=cron_model_id,
+            )
+
+        cron_adapter = get_cron_channel_adapter()
+        cron_turn = cron_adapter.normalize_run(
             user_id=user_id,
-            db_session_factory=SessionLocal,
-            exclude={
+            session_id=cron_session_id,
+            job_name=job_name,
+            run_id=run_id,
+            prompt=task_description,
+            cron_expr=cron_expr,
+            source=source,
+        )
+        task_prompt = cron_adapter.render_agent_prompt(cron_turn)
+        orchestrated_turn = cron_turn.model_copy(
+            update={"content": [TextContentBlock(type="text", text=task_prompt)]}
+        )
+
+        history_service = HistoryService(SessionLocal)
+        agent_service = AgentService(
+            sandbox=sandbox,
+            history_service=history_service,
+            session_id=cron_session_id,
+            user_id=user_id,
+            model_id=cron_model_id,
+            tool_exclude={
                 "AskUserQuestionTool",
                 "SandboxSessionNoteTool",
                 "SandboxRecallNoteTool",
@@ -485,47 +562,63 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                 "ReadUserProfileTool",
                 "UpdateUserProfileTool",
                 "ManageCronTool",
+                "SubAgentTool",
             },
-        )
-
-        task_prompt = (
-            f"你是一个定时任务执行器。请执行以下任务：\n\n"
-            f"任务名：{job_name}\n"
-            f"描述：{task_description}\n\n"
-            f"请执行任务并给出简洁的结果摘要。"
-        )
-
-        from src.agent.agent import Agent
-
-        agent = Agent(
-            llm_client=llm_client,
-            system_prompt=(
+            system_prompt_override=(
                 "You are a cron job executor. Complete the task efficiently.\n"
                 f"所有产出文件必须保存在当前工作目录下（{run_workspace}），禁止写入其他路径。"
             ),
-            tools=tools,
-            max_steps=settings.agent_max_steps,
             workspace_dir=run_workspace,
-            token_limit=cron_token_limit,
-            context_window=cron_context_window,
-            max_output_tokens=cron_max_output_tokens,
-            tool_timeout=settings.agent_tool_timeout,
         )
+        await agent_service.initialize_agent()
 
-        # 执行（不使用 run_agui，简单收集最终结果）
-        agent.add_user_message(task_prompt)
         final_response = None
-        async for event in agent.run_agui(
-            thread_id=f"cron-{user_id}",
-            run_id=run_id,
-        ):
-            from src.agent.schema.agui_events import EventType
-            if event.type == EventType.TEXT_MESSAGE_CONTENT:
-                if final_response is None:
-                    final_response = ""
-                final_response += event.delta
+        accumulated_content = ""
+        output_messages: list[str] = []
+        run_status = "success"
 
-        output = final_response or "Task completed (no output)"
+        try:
+            execution = await get_turn_orchestrator().submit_turn(
+                orchestrated_turn,
+                agent_service=agent_service,
+            )
+            async for event in execution.event_source:
+                event_type = event.get("type") if isinstance(event, dict) else getattr(event, "type", None)
+                if hasattr(event_type, "value"):
+                    event_type = event_type.value
+
+                if event_type == EventType.TEXT_MESSAGE_CONTENT.value:
+                    delta = event.get("delta") if isinstance(event, dict) else getattr(event, "delta", "")
+                    accumulated_content += delta or ""
+                elif event_type == EventType.TEXT_MESSAGE_END.value:
+                    final_response = accumulated_content or final_response
+                    if accumulated_content:
+                        output_messages.append(accumulated_content)
+                    accumulated_content = ""
+                elif event_type == EventType.RUN_FINISHED.value:
+                    result = event.get("result") if isinstance(event, dict) else getattr(event, "result", None)
+                    if isinstance(result, dict):
+                        terminal_text = result.get("finalResponse") or result.get("final_response")
+                        if isinstance(terminal_text, str) and terminal_text:
+                            final_response = terminal_text
+                    outcome = event.get("outcome") if isinstance(event, dict) else getattr(event, "outcome", None)
+                    if outcome != "success":
+                        run_status = "failed"
+                elif event_type == EventType.RUN_ERROR.value:
+                    run_status = "failed"
+                    message = event.get("message") if isinstance(event, dict) else getattr(event, "message", None)
+                    if isinstance(message, str) and message:
+                        final_response = message
+
+            if execution.task is not None:
+                await execution.task
+        finally:
+            history_service.close()
+
+        if final_response is None and accumulated_content:
+            final_response = accumulated_content
+
+        output = "\n\n".join(output_messages) or final_response or "Task completed (no output)"
 
         # 扫描产物文件
         artifacts_json = await _scan_run_artifacts(sandbox, run_workspace)
@@ -534,12 +627,16 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
         with SessionLocal() as db:
             record = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
             if record:
-                record.status = "success"
+                record.status = run_status
                 record.completed_at = now_naive()
                 record.output = output[:10000]  # 截断
                 record.run_workspace = run_workspace
                 record.artifacts = artifacts_json
                 db.commit()
+
+        if run_status != "success":
+            logger.warning("Cron 任务失败 (user=%s, job=%s, status=%s)", user_id, job_name, run_status)
+            return None
 
         logger.info("Cron 任务完成 (user=%s, job=%s)", user_id, job_name)
 

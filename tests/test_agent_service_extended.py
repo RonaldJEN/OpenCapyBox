@@ -11,6 +11,7 @@ from src.agent.schema.agui_events import (
     ToolCallArgsEvent,
     ToolCallEndEvent,
     ToolCallResultEvent,
+    EventType,
 )
 from src.agent.schema import Message as AgentHistoryMessage
 from tests.helpers import (
@@ -57,6 +58,7 @@ class TestAgentServiceCreateTools:
         assert "bash" in tool_names
         assert "bash_output" in tool_names
         assert "bash_kill" in tool_names
+        assert "sub_agent" in tool_names
         assert "record_note" in tool_names
 
 
@@ -214,7 +216,9 @@ class TestAgentServiceChatAgui:
         assert len(events) == 4
         service.history_service.create_round.assert_called_once()
         service.history_service.complete_round.assert_called_once()
-        assert service.history_service.save_agui_event.await_count == 4
+        assert service.history_service.save_agui_event.await_count == 3
+        complete_kwargs = service.history_service.complete_round.call_args.kwargs
+        assert complete_kwargs["terminal_event"].type == EventType.RUN_FINISHED
 
     @pytest.mark.asyncio
     async def test_chat_agui_persists_llm_call_record(self, service):

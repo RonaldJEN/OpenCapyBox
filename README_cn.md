@@ -122,7 +122,7 @@
 | 🔍 Web 搜索 | GLMSearch / BatchSearch | 博查搜索引擎，支持批量并行 |
 | 🧠 记忆系统 | RecordDailyLog / SearchMemory | 分层持久化记忆 + 混合检索 |
 | 📝 会话笔记 | SessionNote / RecallNote | 跨轮次上下文保持 |
-| ⏰ 定时任务 | ManageCron | DB 驱动的去中心化 cron worker |
+| ⏰ 定时任务 | ManageCron | DB 驱动的 cron worker |
 | 🎒 技能加载 | GetSkill | 40+ 可动态加载的专业技能 |
 | 🔌 MCP 协议 | MCP Tools | 模型上下文协议工具集成 |
 
@@ -284,8 +284,8 @@ OpenCapyBox 采用 **AG-UI（Agent User Interaction Protocol）** 作为前后�
 ├──────────────┬───────────────────────────────────────────────────┤
 │              │  REST API + SSE（AG-UI 事件协议）                  │
 ├──────────────▼───────────────────────────────────────────────────┤
-│  Backend — FastAPI + SQLAlchemy + SQLite                         │
-│  JWT 鉴权 · Agent 实例池 · 记忆服务 · Cron 调度 · SSE 广播      │
+│  Backend — FastAPI + SQLAlchemy + PostgreSQL + pgvector         │
+│  JWT 鉴权 · Turn 编排 · Agent 实例池 · 记忆服务 · Cron 调度     │
 ├──────────────┬───────────────────────────────────────────────────┤
 │              │  Agent ↔ LLM Provider / OpenSandbox               │
 ├──────────────▼───────────────────────────────────────────────────┤
@@ -298,6 +298,48 @@ OpenCapyBox 采用 **AG-UI（Agent User Interaction Protocol）** 作为前后�
 │  DeepSeek / MiniMax           一用户一沙箱                        │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+### Turn 编排（Turn Orchestrator）
+
+聊天后端把「一轮对话」拆成三层职责：**网关层**只翻译协议、**编排层**统一掌管生命周期、**运行时**保证一致性。每层只做一件事，互不越界，PostgreSQL 是唯一事实源。
+
+```mermaid
+flowchart TB
+    Client["前端 / 未来的外部渠道"]
+
+    subgraph Gateway["① 网关 + Adapter（薄翻译层）"]
+        G["HTTP/SSE 编解码 · 鉴权 · 心跳保活"]
+        A["Web Adapter：把不同渠道的请求归一化成统一的 Turn 契约"]
+    end
+
+    subgraph Orchestrator["② TurnOrchestrator（生命周期大脑）"]
+        O["建/恢复 Round · 运行锁 · cancel token<br/>后台 producer：执行与连接解耦"]
+    end
+
+    subgraph Runtime["③ 进程内运行时（一致性保障）"]
+        BUS["EventBus<br/>事件持久化 + 重放/订阅"]
+        RCS["CompletionService<br/>终态单入口"]
+        CANCEL["CancelService<br/>精确取消"]
+    end
+
+    DB[("PostgreSQL · 唯一事实源")]
+
+    Client --> Gateway
+    Gateway --> Orchestrator
+    Orchestrator --> Runtime
+    Runtime --> DB
+    Orchestrator -.->|执行不依赖连接| Client
+```
+
+**每层的优势**
+
+| 层 | 解决什么问题 | 带来的好处 |
+| --- | --- | --- |
+| ① 网关 + Adapter | 协议细节（HTTP/SSE、鉴权、字段格式）和业务逻辑混在一起 | 业务层完全不感知传输协议；未来接微信/钉钉等新渠道，只加一个 Adapter，编排层零改动 |
+| ② TurnOrchestrator | Round 创建、锁、取消、后台任务散落在路由里 | 生命周期收口到一处，**执行与 SSE 连接解耦**：浏览器断开 run 照样跑，重连无损续传 |
+| ③ 运行时三件套 | 并发下事件错乱、终态重复提交、取消误杀 | EventBus 保证重放一致；CompletionService 让终态只有一个入口；CancelService 精确命中当前 run，不误伤新任务 |
+
+> 📐 详细契约与失败模式见 [docs/specs/chat-spec.md](docs/specs/chat-spec.md)
 
 ### 项目结构
 
@@ -436,6 +478,7 @@ AUTH_SECRET_KEY=                        # 不配则自动派生
 AUTH_TOKEN_EXPIRE_MINUTES=720
 
 # === Agent ===
+UVICORN_WORKERS=1
 AGENT_MAX_STEPS=100
 AGENT_TOKEN_LIMIT=200000
 AGENT_USER_CONCURRENCY_LIMIT=1
@@ -467,6 +510,7 @@ EMBEDDING_MODEL=text-embedding-v4
 | [sandbox-spec.md](docs/specs/sandbox-spec.md) | 沙箱交互 |
 | [models-spec.md](docs/specs/models-spec.md) | 模型注册与切换 |
 | [config-spec.md](docs/specs/config-spec.md) | Agent 配置与技能 |
+| [subagent-run-graph-spec.md](docs/specs/subagent-run-graph-spec.md) | Subagent 运行图 |
 | [frontend-spec.md](docs/specs/frontend-spec.md) | 前端总规范与设计体系 |
 | [frontend-chat-spec.md](docs/specs/frontend-chat-spec.md) | 前端聊天 / SSE / 推理面板 |
 | [frontend-session-spec.md](docs/specs/frontend-session-spec.md) | 前端会话列表与切换 |
@@ -556,14 +600,30 @@ docs(api): 更新 Cron API 文档
 
 ## 🗺️ 路线图
 
+### ⚡ 性能与扩展性
+
+- [ ] **多 Subagent 并行执行** —— 当前 Subagent 串行，计划改为多个子任务同时调度
+- [ ] **多 Worker 部署 + Redis 同步** —— 引入 Redis 做跨 worker 的事件 fanout / cancel registry / 运行锁，打破单 worker 假设
+- [ ] EventBus 抽象化：进程内 bus 升级为可插拔（进程内 / Redis Pub-Sub）
+- [ ] 会话 / 记忆检索的缓存层
+
+### 🔌 渠道与集成
+
+- [ ] 外部渠道 Adapter（微信 / 钉钉 / Slack 等）—— 复用 TurnOrchestrator 编排层
+- [ ] WebSocket 双向通信
+- [ ] 更多模型供应商接入（Gemini、Claude 直连等）
+
+### 🎒 技能与生态
+
 - [ ] Skill ZIP 包上传安装
+- [ ] Skill 市场
+- [ ] Agent 工作流编排
+
+### 👥 协作与多租户
+
 - [ ] 多租户权限系统
 - [ ] 会话分享与协作
-- [ ] Skill 市场
-- [ ] WebSocket 双向通信
 - [ ] 多语言界面
-- [ ] Agent 工作流编排
-- [ ] 更多模型供应商接入（Gemini、Claude 直连等）
 
 ---
 

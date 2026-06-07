@@ -285,6 +285,14 @@ class TestModelRegistryLoad:
         with pytest.raises(ValueError, match="nonexistent-cron"):
             ModelRegistry.load(path)
 
+    def test_invalid_subagent_default_model_raises(self, tmp_path):
+        """subagent_default_model 指向不存在的模型時拋出 ValueError"""
+        data = self._minimal_yaml()
+        data["subagent_default_model"] = "nonexistent-subagent"
+        path = self._write_yaml(tmp_path, data)
+        with pytest.raises(ValueError, match="nonexistent-subagent"):
+            ModelRegistry.load(path)
+
     def test_load_with_cron_default_model(self, tmp_path):
         """載入包含 cron_default_model 的 YAML"""
         data = self._minimal_yaml()
@@ -292,6 +300,15 @@ class TestModelRegistryLoad:
         path = self._write_yaml(tmp_path, data)
         registry = ModelRegistry.load(path)
         assert registry.get_cron_default().id == "test-model"
+
+    def test_load_with_subagent_default_model(self, tmp_path):
+        """載入包含 subagent_default_model 的 YAML"""
+        data = self._minimal_yaml()
+        data["subagent_default_model"] = "test-model"
+        path = self._write_yaml(tmp_path, data)
+        registry = ModelRegistry.load(path)
+        assert registry.get_subagent_default().id == "test-model"
+        assert registry.subagent_default_model_id == "test-model"
 
     def test_invalid_provider_in_yaml_raises(self, tmp_path):
         """YAML 中無效 provider 拋出 ValueError"""
@@ -403,6 +420,30 @@ class TestModelRegistryQuery:
         """未配置 cron_default_model 时，加载阶段继承 default_model"""
         # registry fixture 未设 cron_default_model_id，应与 default 一致
         assert registry.get_cron_default().id == "enabled-model"
+
+    def test_get_subagent_default_with_dedicated_model(self, registry):
+        """subagent_default_model 單獨配置時返回專屬模型"""
+        subagent_model = ModelConfig(
+            id="subagent-model",
+            display_name="SubagentModel",
+            provider="openai",
+            api_base="https://s.com",
+            api_key="key",
+            model_name="subagent-v1",
+            enabled=True,
+        )
+        models = {**registry._models, "subagent-model": subagent_model}
+        r = ModelRegistry(
+            models=models,
+            default_model_id="enabled-model",
+            subagent_default_model_id="subagent-model",
+        )
+        assert r.get_subagent_default().id == "subagent-model"
+        assert r.subagent_default_model_id == "subagent-model"
+
+    def test_get_subagent_default_inherits_default_at_load(self, registry):
+        """未配置 subagent_default_model 时，加载阶段继承 default_model"""
+        assert registry.get_subagent_default().id == "enabled-model"
 
     def test_list_models_enabled_only(self, registry):
         """僅列出啟用的模型"""

@@ -103,6 +103,7 @@ class TestDatabaseConfig:
         # 至少应该有 sessions 表
         assert len(tables) > 0
         assert "llm_call_records" in tables
+        assert "subagent_runs" in tables
 
         llm_columns = {col["name"] for col in inspector.get_columns("llm_call_records")}
         assert "request_message_count" in llm_columns
@@ -150,6 +151,41 @@ class TestDatabaseMigration:
             "SELECT last_value, is_called FROM user_memory_id_seq",
             "SELECT setval('user_memory_id_seq', 1, true)",
         ]
+
+    def test_run_cancel_request_migration_handles_legacy_schema_without_request_id(self):
+        from src.api.models import database as database_module
+
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+        inspector.get_pk_constraint.return_value = {"constrained_columns": ["session_id"]}
+        inspector.get_columns.return_value = [
+            {"name": "session_id"},
+            {"name": "user_id"},
+            {"name": "state"},
+            {"name": "requested_at"},
+            {"name": "acked_at"},
+            {"name": "completed_at"},
+            {"name": "updated_at"},
+        ]
+
+        conn = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = conn
+        context.__exit__.return_value = None
+        fake_engine = MagicMock()
+        fake_engine.begin.return_value = context
+
+        with patch.object(database_module, "engine", fake_engine), \
+             patch.object(database_module, "inspect", return_value=inspector):
+            database_module._migrate_run_cancel_requests_schema()
+
+        insert_sql = next(
+            str(call.args[0])
+            for call in conn.execute.call_args_list
+            if "INSERT INTO run_cancel_requests_new" in str(call.args[0])
+        )
+        assert "NULLIF(request_id" not in insert_sql
+        assert "md5(random()::text || clock_timestamp()::text)" in insert_sql
 
 
 class TestMemoryEmbeddingColumnType:

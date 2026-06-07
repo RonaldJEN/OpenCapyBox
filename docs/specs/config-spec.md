@@ -37,6 +37,7 @@
 | UpdateUserProfile | update_user | 更新用户画像 |
 | ManageCron | manage_cron | 管理定时任务 |
 | AskUserQuestion | ask_user | 人机交互中断 |
+| SubAgentTool | sub_agent | 子 Agent 委托（创建 child Round + graph edge，父 Agent 等待结果） |
 | GetSkillTool | get_skill | 渐进式加载 L2 |
 | GLMSearchTool | glm_search | 搜索（条件加载）|
 | GLMBatchSearchTool | glm_batch_search | 批量搜索（条件加载）|
@@ -69,7 +70,7 @@
 ### 工具装配流程（create_agent_tools）
 
 1. 从候选表实例化工具（lazy lambda）
-2. 通过 `exclude` set 排除不需要的工具（如 cron worker 排除 AskUserQuestion 和 memory tools）
+2. 通过 `exclude` set 排除不需要的工具（如 cron worker 排除 AskUserQuestion、SubAgentTool 和 memory tools）
 3. 条件加载搜索工具（检查 `BOCHA_SEARCH_APPCODE` env var）
 4. 发现 official skills（文件系统）→ 过滤 disabled skills → 发现沙箱 user skills
 5. 注册 GetSkillTool（带 lazy push/read 回调）
@@ -87,6 +88,42 @@
 1. DB upsert（乐观锁）
 2. Force push to sandbox
 3. Invalidate AgentPool cache（下次请求重建 Agent with 新 system prompt）
+
+### 子 Agent Profile（sub_agent）
+
+`sub_agent` 工具的 `subagent_type` 参数解析为一个 **profile**，决定子 Agent 的系统提示与工具集。Profile 定义在 `src/agent/subagent_profiles.py`（`PROFILES` + `resolve_profile()`）。
+
+**核心不变量**：
+
+- 子 Agent **不继承**父 Agent 的分层记忆（SOUL/AGENTS）作为系统提示，而是加载 profile 自带的精简系统提示（runner 通过 `AgentService(system_prompt_override=...)` 注入）。
+- 子 Agent 一律禁用 `AskUserQuestionTool`（无人值守）与 `SubAgentTool`（防止无限嵌套）。
+- 子 Agent 一律禁用 `ManageCronTool`。
+- profile 通过 `tool_exclude` set 喂入 `create_agent_tools`，复用既有 exclude 机制。
+
+**三个 profile**：
+
+| profile | 定位 | 额外禁用工具（在公共禁用之外） |
+| --- | --- | --- |
+| `research` | 读 + 联网 + 抓取（bash），靠提示约束不主动改 workspace | `SandboxWriteTool`、`SandboxEditTool`、记忆写工具（`RecordDailyLog`/`UpdateLongTermMemory`/`UpdateUserProfile`） |
+| `write` | 办公长任务产物工：创建/更新/修改/批注 workspace 文件 | 记忆写工具 |
+| `general` | 兜底（默认） | 无 |
+
+> 公共禁用 = `AskUserQuestionTool` + `SubAgentTool` + `ManageCronTool`。
+
+**legacy 值映射**（向后兼容，大小写不敏感）：
+
+- `research` / `explore` / `plan` / `review` → `research`
+- `write` / `code` / `debug` → `write`
+- 未知 / 空 / `general` → `general`
+
+**graph edge**：`agent_type` 字段保留调用方传入的原始 `subagent_type`（用于展示），实际解析出的 profile 记录在 edge metadata 的 `profile` 字段。
+
+**超时**：`SubAgentTool.execute_timeout = 0`，即子 Round 由自身步数上限管控，不受父 Agent 单次工具超时（`agent_tool_timeout`，默认 300s）拦截——避免 research 长抓取被中途 kill 留下不一致 child Round。
+
+**委派触发指引（主 Agent 何时用 sub_agent）**：
+
+- 工具层：`SubAgentTool.description` 写明"何时用 / 何时不用"——子任务产生大量一次性输出（联网抓取、长文档检索、批量产物）时委派以隔离上下文；需要与用户频繁来回或与当前上下文紧密迭代时不委派。
+- 系统提示层：`AGENTS.md` 模板的"工具使用规则"含 `sub_agent` 小节与判断框架行，作为主 Agent 的委派策略默认注入（用户可编辑）。
 
 ## 5. 失败模式与错误处理
 

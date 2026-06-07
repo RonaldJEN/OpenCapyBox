@@ -235,6 +235,54 @@
   background: #fffdf8;
 }
 
+.admin-round-row.subagent td {
+  background: #fbf8ff;
+}
+
+.admin-round-title-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.admin-round-title-line .admin-tree-toggle {
+  min-width: 0;
+}
+
+.admin-round-title-line .admin-tree-toggle span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-run-kind {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.admin-run-kind.main {
+  color: #6b5533;
+  background: #f3ead8;
+}
+
+.admin-run-kind.subagent {
+  color: #6042a6;
+  background: #ece6ff;
+  border-color: #ddd0ff;
+}
+
+.admin-run-kind.muted {
+  color: #746c59;
+  background: #f0ecdf;
+}
+
 .admin-tree-toggle {
   border: none;
   background: transparent;

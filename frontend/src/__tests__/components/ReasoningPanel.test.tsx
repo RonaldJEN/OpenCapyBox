@@ -120,6 +120,48 @@ describe('ReasoningPanel 组件', () => {
     expect(screen.getByText('活动')).toBeInTheDocument();
     expect(screen.getAllByText(/Read package\.json/).length).toBeGreaterThanOrEqual(1);
   });
+
+  it('sub_agent 在活动抽屉中应显示专用子任务胶囊', () => {
+    const subAgentSteps: StepData[] = [
+      {
+        step_number: 1,
+        thinking: '',
+        assistant_content: '',
+        tool_calls: [{
+          name: 'sub_agent',
+          input: {
+            description: 'vlog 完整制作方案 + 分镜脚本 + 爆款标题',
+            subagent_type: 'general-purpose',
+            prompt: '你是顶级 vlog 导演，请输出完整制作方案。',
+          },
+        }],
+        tool_results: [{
+          success: true,
+          content: 'Sub-agent run finished.\nchild_run_id: child-1\nedge_id: edge-1\nstatus: completed\n\nResult:\n完成方案',
+          execution_time_ms: 21000,
+        }],
+        status: 'completed',
+      },
+    ];
+
+    render(
+      <ReasoningPanel steps={subAgentSteps} isStreaming={false} isCompleted={true} />
+    );
+
+    fireEvent.click(screen.getByText('已完成活动 21s'));
+
+    expect(screen.getAllByText('委派子任务').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('vlog 完整制作方案 + 分镜脚本 + 爆款标题')).toBeInTheDocument();
+    expect(screen.getByText('general-purpose')).toBeInTheDocument();
+    expect(screen.getAllByText('21s').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText(/"prompt"/)).toBeNull();
+    expect(screen.queryByText('子任务运行 child-1')).toBeNull();
+
+    fireEvent.click(screen.getByText('vlog 完整制作方案 + 分镜脚本 + 爆款标题'));
+    expect(screen.getByText('子任务运行 child-1')).toBeInTheDocument();
+    expect(screen.getByText('你是顶级 vlog 导演，请输出完整制作方案。')).toBeInTheDocument();
+    expect(screen.getByText(/完成方案/)).toBeInTheDocument();
+  });
   it('工具描述应使用粗体样式', () => {
     const { container } = render(
       <ReasoningPanel steps={mockSteps} isStreaming={false} isCompleted={true} />

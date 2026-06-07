@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from typing import List, Dict, Optional, AsyncIterator, Any
 
 from opensandbox import Sandbox
@@ -16,10 +17,14 @@ from src.agent.schema import Message as AgentMessage
 from src.agent.schema.agui_events import AGUIEvent, EventType
 
 from src.api.services.history_service import HistoryService
+from src.api.services.agui_event_bus import SequencedAGUIEvent, StoredEvent, get_agui_event_bus
+from src.api.services.run_completion_service import RunCompletionService
 from src.api.services.sandbox_service import get_sandbox_service, get_sandbox_mount_path
+from src.api.services.subagent_graph_service import get_subagent_graph_service
 from src.api.services.tool_factory import create_agent_tools
 from src.api.config import get_settings
 from src.api.model_registry import get_model_registry
+from src.agent.tools.base import ToolResult, ToolRuntimeContext
 from pathlib import Path as PathlibPath
 
 logger = logging.getLogger(__name__)
@@ -30,6 +35,15 @@ class DuplicateRoundError(Exception):
     def __init__(self, existing_round_id: str):
         self.existing_round_id = existing_round_id
         super().__init__(f"Duplicate round: {existing_round_id}")
+
+
+@dataclass(frozen=True)
+class PreparedAgentRun:
+    """A round that has been created and is ready to execute."""
+
+    run_id: str
+    user_message: str
+    parent_run_id: str | None = None
 
 
 settings = get_settings()
@@ -45,12 +59,17 @@ class AgentService:
         session_id: str,
         user_id: str,
         model_id: str | None = None,
+        tool_exclude: set[str] | None = None,
+        system_prompt_override: str | None = None,
+        workspace_dir: str | None = None,
     ):
         self.sandbox = sandbox
         self.history_service = history_service
         self.session_id = session_id
         self.user_id = user_id
         self.model_id = model_id
+        self.tool_exclude = set(tool_exclude or set())
+        self.system_prompt_override = system_prompt_override
         self.agent: Agent | None = None
         self._last_saved_index = 0
         self._pending_interrupt_round_ids: dict[str, str] = {}
@@ -60,7 +79,7 @@ class AgentService:
         self._active_run_count = 0
         # 每個 session 使用沙箱內的隔離子目錄
         mount = get_sandbox_mount_path()
-        self._workspace_dir = f"{mount}/sessions/{session_id}" if session_id else mount
+        self._workspace_dir = workspace_dir or (f"{mount}/sessions/{session_id}" if session_id else mount)
 
     @property
     def is_running(self) -> bool:
@@ -112,8 +131,8 @@ class AgentService:
         # === 新用户默认文件初始化 ===
         self._provision_default_files_if_needed()
 
-        # 加载 system prompt
-        system_prompt = self._load_system_prompt()
+        # 加载 system prompt：子 Agent 走 profile 精简提示（override），否则拼装父记忆
+        system_prompt = self.system_prompt_override or self._load_system_prompt()
 
         # 创建工具列表
         tools, self.skill_loader = await create_agent_tools(
@@ -122,6 +141,8 @@ class AgentService:
             mount=get_sandbox_mount_path(),
             user_id=self.user_id,
             db_session_factory=self._get_db_session_factory(),
+            subagent_runner=self._run_subagent_invocation,
+            exclude=self.tool_exclude,
         )
 
         # 注入技能元数据到系统提示符（Progressive Disclosure - Level 1）
@@ -154,6 +175,232 @@ class AgentService:
             return self.history_service.session_factory
         from src.api.models.database import SessionLocal
         return SessionLocal
+
+    @staticmethod
+    def _format_subagent_user_message(
+        *,
+        prompt: str,
+        subagent_type: str,
+        description: str,
+        parent_run_id: str,
+        tool_call_id: str,
+    ) -> str:
+        parts = [
+            "You are a child agent run spawned by a parent OpenCapyBox agent.",
+            "Complete only the delegated task. Use your available tools when useful.",
+            "Do not ask the user questions; if information is missing, state the assumption and proceed.",
+            "Report concise, concrete results back to the parent agent.",
+            "",
+            f"Sub-agent type: {subagent_type or 'general'}",
+            f"Description: {description or '(none)'}",
+            f"Parent run id: {parent_run_id}",
+            f"Parent tool call id: {tool_call_id}",
+            "",
+            "Task:",
+            prompt,
+        ]
+        return "\n".join(parts)
+
+    @staticmethod
+    def _subagent_tool_result_content(
+        *,
+        child_run_id: str,
+        edge_id: str,
+        status: str,
+        agent_type: str,
+        model_id: str | None,
+        output: str,
+    ) -> str:
+        header = [
+            "Sub-agent run finished.",
+            f"child_run_id: {child_run_id}",
+            f"edge_id: {edge_id}",
+            f"status: {status}",
+            f"agent_type: {agent_type or 'general'}",
+        ]
+        if model_id:
+            header.append(f"model_id: {model_id}")
+        header.append("")
+        header.append("Result:")
+        header.append(output or "(no output)")
+        return "\n".join(header)
+
+    async def _run_subagent_invocation(
+        self,
+        *,
+        prompt: str,
+        subagent_type: str,
+        description: str,
+        context: ToolRuntimeContext,
+    ) -> ToolResult:
+        """Run sub_agent as a real child Round and return its final output."""
+        from src.api.models.round import Round
+        from src.api.models.subagent_run import SubagentRun
+        from src.agent.subagent_profiles import resolve_profile
+
+        profile = resolve_profile(subagent_type)
+
+        db_factory = self._get_db_session_factory()
+        graph_db = db_factory()
+        child_history = HistoryService(db_factory)
+        child_service: AgentService | None = None
+        edge_id: str | None = None
+        child_run_id = str(uuid.uuid4())
+        child_status = SubagentRun.FAILED
+        child_output = ""
+        child_error: str | None = None
+
+        try:
+            registry = get_model_registry()
+            subagent_model = registry.get_subagent_default()
+            model_id = subagent_model.id
+
+            graph_service = get_subagent_graph_service()
+            edge = graph_service.create_edge(
+                graph_db,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                parent_run_id=context.run_id,
+                tool_call_id=context.tool_call_id,
+                agent_type=subagent_type or "general",
+                agent_name=description or None,
+                model_id=model_id,
+                description=description or None,
+                prompt=prompt,
+                status=SubagentRun.REQUESTED,
+                metadata={
+                    "executor": "AgentService.sub_agent",
+                    "mode": "sync_child_round",
+                    "profile": profile.name,
+                },
+            )
+            edge_id = edge.id
+
+            child_service = AgentService(
+                sandbox=self.sandbox,
+                history_service=child_history,
+                session_id=self.session_id,
+                user_id=self.user_id,
+                model_id=model_id,
+                tool_exclude=set(profile.tool_exclude),
+                system_prompt_override=profile.system_prompt,
+            )
+            await child_service.initialize_agent()
+            child_service.cancel_token = context.cancel_token
+
+            if not child_service.agent:
+                raise RuntimeError("child agent failed to initialize")
+
+            # Subagents are sidechains: they get their own task prompt, not the
+            # full parent conversation replay. Their transcript is persisted via
+            # the child Round and graph edge.
+            child_service.agent.messages = [child_service.agent.messages[0]]
+            child_user_message = self._format_subagent_user_message(
+                prompt=prompt,
+                subagent_type=subagent_type,
+                description=description,
+                parent_run_id=context.run_id,
+                tool_call_id=context.tool_call_id,
+            )
+
+            child_service.history_service.create_round(
+                session_id=self.session_id,
+                round_id=child_run_id,
+                user_message=child_user_message,
+                user_attachments=[],
+                parent_run_id=context.run_id,
+            )
+            child_service.agent.add_user_message(child_user_message)
+            child_service._save_conversation_message(
+                "user",
+                child_user_message,
+                round_id=child_run_id,
+            )
+
+            graph_service.attach_child_run(
+                graph_db,
+                edge_id=edge_id,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                child_run_id=child_run_id,
+                status=SubagentRun.RUNNING,
+            )
+
+            async for _event in child_service.run_prepared_round(
+                PreparedAgentRun(
+                    run_id=child_run_id,
+                    user_message=child_user_message,
+                    parent_run_id=context.run_id,
+                ),
+                error_label="Sub-agent 执行失败",
+            ):
+                pass
+
+            child_round = (
+                child_history.db.query(Round)
+                .filter(Round.id == child_run_id, Round.session_id == self.session_id)
+                .first()
+            )
+            round_status = getattr(child_round, "status", None) or "failed"
+            child_output = getattr(child_round, "final_response", None) or ""
+
+            if round_status == "completed":
+                child_status = SubagentRun.COMPLETED
+            elif round_status == "cancelled":
+                child_status = SubagentRun.CANCELLED
+                child_error = "sub-agent was cancelled"
+            elif round_status == "failed":
+                child_status = SubagentRun.FAILED
+                child_error = child_output or "sub-agent failed"
+            else:
+                child_status = SubagentRun.FAILED
+                child_error = f"sub-agent ended in unsupported status: {round_status}"
+
+            graph_service.mark_status(
+                graph_db,
+                edge_id=edge_id,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                status=child_status,
+                output=child_output if child_status == SubagentRun.COMPLETED else None,
+                error=child_error,
+            )
+
+            if child_status != SubagentRun.COMPLETED:
+                return ToolResult(success=False, error=child_error or "sub-agent failed")
+
+            return ToolResult(
+                success=True,
+                content=self._subagent_tool_result_content(
+                    child_run_id=child_run_id,
+                    edge_id=edge_id,
+                    status=child_status,
+                    agent_type=subagent_type,
+                    model_id=model_id,
+                    output=child_output,
+                ),
+            )
+
+        except Exception as exc:
+            child_error = f"{type(exc).__name__}: {exc}"
+            if edge_id:
+                try:
+                    get_subagent_graph_service().mark_status(
+                        graph_db,
+                        edge_id=edge_id,
+                        user_id=self.user_id,
+                        session_id=self.session_id,
+                        status=SubagentRun.FAILED,
+                        error=child_error,
+                    )
+                except Exception:
+                    logger.warning("标记 subagent edge 失败: edge=%s", edge_id, exc_info=True)
+            return ToolResult(success=False, error=f"sub-agent execution failed: {child_error}")
+        finally:
+            if child_service is not None:
+                child_service.close()
+            child_history.close()
+            graph_db.close()
 
     def close(self) -> None:
         """释放 AgentService 持有的独立资源。"""
@@ -369,6 +616,7 @@ class AgentService:
         from src.api.models.conversation_message import ConversationMessage
         from src.api.models.interrupt_resolution import InterruptResolution
         from src.api.models.round import Round
+        from src.api.models.subagent_run import SubagentRun
 
         db = self.history_service.db
 
@@ -382,6 +630,23 @@ class AgentService:
         if not rounds:
             self.history_service.reset_session()
             return []
+        subagent_child_round_ids = {
+            row[0]
+            for row in (
+                db.query(SubagentRun.child_run_id)
+                .filter(
+                    SubagentRun.session_id == self.session_id,
+                    SubagentRun.child_run_id.isnot(None),
+                )
+                .all()
+            )
+            if row[0]
+        }
+        if subagent_child_round_ids:
+            rounds = [r for r in rounds if r.id not in subagent_child_round_ids]
+            if not rounds:
+                self.history_service.reset_session()
+                return []
 
         # 2. 預載所有 user + assistant 消息（按 round_id 索引）
         conv_msgs = (
@@ -1042,6 +1307,24 @@ class AgentService:
             async for event in agent_service.chat_agui(message):
                 yield f"event: {event.type.value}\\ndata: {event.model_dump_json()}\\n\\n"
         """
+        prepared = await self.prepare_chat_round(
+            user_content=user_content,
+            idempotency_key=idempotency_key,
+        )
+
+        async for event in self.run_prepared_round(
+            prepared,
+            error_label="Agent執行失敗",
+        ):
+            yield event
+
+    async def prepare_chat_round(
+        self,
+        *,
+        user_content: list[Any],
+        idempotency_key: str | None = None,
+    ) -> PreparedAgentRun:
+        """Create the user round and update Agent memory before execution."""
         if not self.agent:
             raise RuntimeError("Agent not initialized")
 
@@ -1093,10 +1376,19 @@ class AgentService:
         # 持久化用戶消息到 conversation_messages
         self._save_conversation_message("user", agent_content, round_id=run_id)
 
+        return PreparedAgentRun(run_id=run_id, user_message=user_message_for_history)
+
+    async def run_prepared_round(
+        self,
+        prepared: PreparedAgentRun,
+        *,
+        error_label: str = "执行失败",
+    ) -> AsyncIterator[AGUIEvent]:
+        """Execute an already-created round."""
         async for event in self._run_round_stream(
-            run_id=run_id,
-            user_message=user_message_for_history,
-            error_label="Agent執行失敗",
+            run_id=prepared.run_id,
+            user_message=prepared.user_message,
+            error_label=error_label,
         ):
             yield event
 
@@ -1233,6 +1525,24 @@ class AgentService:
         Yields:
             AGUIEvent: AG-UI 协议事件
         """
+        prepared = await self.prepare_resume_round(
+            interrupt_id=interrupt_id,
+            answers=answers,
+        )
+
+        async for event in self.run_prepared_round(
+            prepared,
+            error_label="Resume 执行失败",
+        ):
+            yield event
+
+    async def prepare_resume_round(
+        self,
+        *,
+        interrupt_id: str,
+        answers: dict[str, str],
+    ) -> PreparedAgentRun:
+        """Create a resume round and stitch the interrupted parent atomically."""
         if self._resume_lock.locked():
             raise RuntimeError("另一个 resume 操作正在进行中，请等待完成后重试")
 
@@ -1337,12 +1647,11 @@ class AgentService:
             # 持久化用户 resume 消息到 conversation_messages（用于上下文恢复）
             self._save_conversation_message("user", resume_user_message, round_id=run_id)
 
-            async for event in self._run_round_stream(
+            return PreparedAgentRun(
                 run_id=run_id,
                 user_message=resume_user_message,
-                error_label="Resume 执行失败",
-            ):
-                yield event
+                parent_run_id=parent_run_id,
+            )
 
     async def _run_round_stream(
         self,
@@ -1435,10 +1744,17 @@ class AgentService:
                     _externally_terminated = True
                     if run_cancel_token and not run_cancel_token.is_set():
                         run_cancel_token.set()
+                    stored_terminal = RunCompletionService(
+                        self.history_service.db
+                    ).ensure_terminal_sync(run_id)
                     self.history_service.reset_session()
+                    if isinstance(stored_terminal, StoredEvent):
+                        yield stored_terminal.event
                     break
 
-                await self.history_service.save_agui_event(run_id, event)
+                stored_event = None
+                if event.type not in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
+                    stored_event = await self.history_service.save_agui_event(run_id, event)
 
                 if event.type == EventType.TEXT_MESSAGE_CONTENT:
                     accumulated_content += event.delta
@@ -1500,11 +1816,12 @@ class AgentService:
                                 _interrupt_json = json.dumps(
                                     event.interrupt.model_dump(exclude_none=True),
                                     ensure_ascii=False,
-                                )
+                        )
                     else:
                         status = "failed"
                 elif event.type == EventType.RUN_ERROR:
                     status = "failed"
+                    final_response = getattr(event, "message", None) or final_response
                 elif event.type == EventType.CUSTOM:
                     # 合成 user message 持久化（truncation retry / empty nudge / step reminder）
                     if getattr(event, "name", "") == "synthetic_user_message":
@@ -1514,28 +1831,44 @@ class AgentService:
                                 "user", syn_content, round_id=run_id, is_synthetic=True,
                             )
 
-                yield event
+                if event.type in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
+                    self.history_service.complete_round(
+                        round_id=run_id,
+                        final_response=final_response,
+                        step_count=step_count,
+                        status=status,
+                        interrupt_payload=_interrupt_json,
+                        terminal_event=event,
+                    )
+                    stored_event = self.history_service.last_terminal_event
+                    if isinstance(stored_event, StoredEvent):
+                        await get_agui_event_bus().publish_committed(run_id, stored_event.event)
+                    _round_finished = True
+
+                yield SequencedAGUIEvent(event, stored_event) if stored_event else event
 
             if _externally_terminated:
                 return
 
-            self.history_service.complete_round(
-                round_id=run_id,
-                final_response=final_response,
-                step_count=step_count,
-                status=status,
-                interrupt_payload=_interrupt_json,
-            )
-            _round_finished = True
-            self._persist_latest_summary_anchor(run_id)
+            if not _round_finished:
+                self.history_service.complete_round(
+                    round_id=run_id,
+                    final_response=final_response,
+                    step_count=step_count,
+                    status=status,
+                    interrupt_payload=_interrupt_json,
+                )
+                _round_finished = True
+            if status == "completed" and not bool(run_cancel_token and run_cancel_token.is_set()):
+                self._persist_latest_summary_anchor(run_id)
 
-            task = asyncio.create_task(self._post_round_tasks(
-                sync_memory=_dirty_memory,
-                round_id=run_id,
-                user_message=user_message,
-                assistant_response=final_response,
-            ))
-            task.add_done_callback(self._on_post_round_done)
+                task = asyncio.create_task(self._post_round_tasks(
+                    sync_memory=_dirty_memory,
+                    round_id=run_id,
+                    user_message=user_message,
+                    assistant_response=final_response,
+                ))
+                task.add_done_callback(self._on_post_round_done)
 
         except Exception as e:
             _final_status = "failed"
@@ -1558,6 +1891,10 @@ class AgentService:
                         step_count=step_count,
                         status=_actual_status,
                     )
+                    stored_event = self.history_service.last_terminal_event
+                    if isinstance(stored_event, StoredEvent):
+                        await get_agui_event_bus().publish_committed(run_id, stored_event.event)
+                    _round_finished = True
                     logger.warning(
                         "Round %s 異常退出（disconnect/cancel/error），已標記為 %s (steps=%d)",
                         run_id, _actual_status, step_count,

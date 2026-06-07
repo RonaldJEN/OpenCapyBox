@@ -9,7 +9,7 @@ import type { StepData, ToolResult } from '../types';
 
 // ─── 工具分类 ────────────────────────────────────────────────────────────────
 
-export type ToolCategory = 'edit' | 'create' | 'read' | 'bash' | 'search' | 'skill' | 'note' | 'other';
+export type ToolCategory = 'edit' | 'create' | 'read' | 'bash' | 'search' | 'skill' | 'note' | 'subagent' | 'other';
 
 /** 统一的工具分类函数 — 所有分类逻辑的唯一来源 */
 export function getToolCategory(name: string): ToolCategory {
@@ -21,6 +21,7 @@ export function getToolCategory(name: string): ToolCategory {
   if (lower.includes('search')) return 'search';
   if (lower === 'get_skill') return 'skill';
   if (lower === 'session_note' || lower === 'note') return 'note';
+  if (lower === 'sub_agent' || lower === 'subagenttool') return 'subagent';
   return 'other';
 }
 
@@ -42,7 +43,7 @@ export interface ThinkingBlock {
 export interface ToolGroupItem {
   description: string;          // 智能描述，如 "Read src/app.py"
   toolName: string;
-  input?: Record<string, any>;
+  input?: Record<string, unknown>;
   result?: ToolResult;
   filePath?: string;            // 文件操作的路径
   diffStats?: { added: number; removed: number };
@@ -80,28 +81,28 @@ export type DisplayBlock = ThinkingBlock | ThinkingGroupBlock | ToolGroupBlock |
 /**
  * 智能生成工具描述（1 行中文/英文混合文字）
  */
-export function getToolDescription(name: string, input: Record<string, any>): string {
+export function getToolDescription(name: string, input: Record<string, unknown>): string {
   const category = getToolCategory(name);
   const lowerName = name.toLowerCase();
 
   switch (category) {
     case 'read': {
-      const path = input.path || input.file_path || '';
+      const path = getStringField(input, 'path', 'file_path');
       return path ? `Read ${shortenPath(path)}` : 'Read file';
     }
     case 'create': {
-      const path = input.path || input.file_path || '';
+      const path = getStringField(input, 'path', 'file_path');
       return path ? `Create ${shortenPath(path)}` : 'Create file';
     }
     case 'edit': {
-      const path = input.path || input.file_path || '';
+      const path = getStringField(input, 'path', 'file_path');
       return path ? `Update ${shortenPath(path)}` : 'Edit file';
     }
     case 'bash': {
       // 区分子类型
       if (lowerName === 'bash_output' || lowerName === 'bashoutputtool') return 'Read command output';
       if (lowerName === 'bash_kill' || lowerName === 'bashkilltool') return 'Stop process';
-      const cmd = input.command || input.cmd || '';
+      const cmd = getStringField(input, 'command', 'cmd');
       if (cmd) {
         const firstCmd = cmd.split(/[;&|]/).map((s: string) => s.trim()).filter(Boolean)[0] || cmd;
         if (firstCmd.length > 60) return 'Run command';
@@ -110,15 +111,21 @@ export function getToolDescription(name: string, input: Record<string, any>): st
       return 'Run command';
     }
     case 'search': {
-      const query = input.query || input.q || '';
+      const query = getStringField(input, 'query', 'q');
       return query ? `Search "${truncate(query, 40)}"` : 'Search';
     }
     case 'skill': {
-      const skillName = input.skill_name || input.name || '';
+      const skillName = getStringField(input, 'skill_name', 'name');
       return skillName ? `Load skill: ${skillName}` : 'Load skill';
     }
     case 'note':
       return 'Save note';
+    case 'subagent': {
+      const description = typeof input.description === 'string' ? input.description.trim() : '';
+      const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : '';
+      const title = description || firstMeaningfulLine(prompt);
+      return title ? `委派子任务 ${truncate(title, 42)}` : '委派子任务';
+    }
     default:
       return name;
   }
@@ -127,9 +134,9 @@ export function getToolDescription(name: string, input: Record<string, any>): st
 /**
  * 从工具调用中提取文件路径（如有）
  */
-export function extractFilePath(name: string, input: Record<string, any>): string | undefined {
+export function extractFilePath(name: string, input: Record<string, unknown>): string | undefined {
   if (isFileToolCategory(getToolCategory(name))) {
-    return input.path || input.file_path;
+    return getStringField(input, 'path', 'file_path') || undefined;
   }
   return undefined;
 }
@@ -169,8 +176,8 @@ export function getGroupSummary(items: ToolGroupItem[]): string {
 
   const parts: string[] = [];
 
-  // 按优先级排序：edit > create > read > bash > search > other
-  const priorityOrder = ['edit', 'create', 'read', 'bash', 'search', 'skill', 'other'];
+  // 按优先级排序：edit > create > read > bash > search > subagent > other
+  const priorityOrder = ['edit', 'create', 'read', 'bash', 'search', 'subagent', 'skill', 'other'];
 
   for (const cat of priorityOrder) {
     const count = counts[cat];
@@ -200,6 +207,9 @@ export function getGroupSummary(items: ToolGroupItem[]): string {
         break;
       case 'skill':
         parts.push(count === 1 ? `Loaded a skill` : `Loaded ${count} skills`);
+        break;
+      case 'subagent':
+        parts.push(count === 1 ? `委派子任务` : `委派 ${count} 个子任务`);
         break;
       case 'other':
         parts.push(count === 1 ? `Used a tool` : `Used ${count} tools`);
@@ -250,7 +260,7 @@ export function transformToDisplayBlocks(
       const cat = categorizeToolAction(item.toolName);
       catCounts[cat] = (catCounts[cat] || 0) + 1;
     }
-    const catPriority = ['edit', 'bash', 'create', 'read', 'search', 'skill', 'other'];
+    const catPriority = ['edit', 'bash', 'create', 'read', 'search', 'subagent', 'skill', 'other'];
     let dominantCategory = 'other';
     let maxCount = 0;
     for (const cat of catPriority) {
@@ -413,6 +423,21 @@ export function shortenPath(path: string): string {
 function truncate(str: string, maxLen: number): string {
   if (str.length <= maxLen) return str;
   return str.slice(0, maxLen) + '...';
+}
+
+function firstMeaningfulLine(str: string): string {
+  return str
+    .split('\n')
+    .map(line => line.trim())
+    .find(Boolean) || '';
+}
+
+function getStringField(input: Record<string, unknown>, ...keys: string[]): string {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === 'string') return value;
+  }
+  return '';
 }
 
 /**

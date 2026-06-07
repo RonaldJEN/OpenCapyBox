@@ -64,6 +64,14 @@ describe('getToolDescription', () => {
     expect(getToolDescription('my_custom_tool', {})).toBe('my_custom_tool');
   });
 
+  it('应为 sub_agent 生成业务化描述', () => {
+    expect(getToolDescription('sub_agent', {
+      description: 'vlog 完整制作方案 + 分镜脚本 + 爆款标题',
+      subagent_type: 'general-purpose',
+      prompt: '你是短视频专家...',
+    })).toBe('委派子任务 vlog 完整制作方案 + 分镜脚本 + 爆款标题');
+  });
+
   it('应处理 bash_output 和 bash_kill', () => {
     expect(getToolDescription('bash_output', {})).toBe('Read command output');
     expect(getToolDescription('bash_kill', {})).toBe('Stop process');
@@ -134,6 +142,7 @@ describe('getToolCategory', () => {
     expect(getToolCategory('get_skill')).toBe('skill');
     expect(getToolCategory('session_note')).toBe('note');
     expect(getToolCategory('note')).toBe('note');
+    expect(getToolCategory('sub_agent')).toBe('subagent');
     expect(getToolCategory('my_custom_tool')).toBe('other');
   });
 });
@@ -195,6 +204,11 @@ describe('getGroupSummary', () => {
 
   it('应为 skill 操作生成正确描述', () => {
     expect(getGroupSummary([makeItem('get_skill')])).toBe('Loaded a skill');
+  });
+
+  it('应为 sub_agent 操作生成业务摘要', () => {
+    expect(getGroupSummary([makeItem('sub_agent')])).toBe('委派子任务');
+    expect(getGroupSummary([makeItem('sub_agent'), makeItem('sub_agent')])).toBe('委派 2 个子任务');
   });
 });
 
@@ -295,6 +309,28 @@ describe('transformToDisplayBlocks', () => {
     expect(tg.status).toBe('completed');
     expect(tg.hasDone).toBe(true);
     expect(tg.dominantCategory).toBe('read');
+  });
+
+  it('sub_agent 工具组应有专用摘要和 dominantCategory', () => {
+    const steps = [
+      makeStep({
+        tool_calls: [{
+          name: 'sub_agent',
+          input: {
+            description: 'vlog 完整制作方案',
+            subagent_type: 'general-purpose',
+            prompt: '生成完整方案',
+          },
+        }],
+        tool_results: [{ success: true, content: 'child result', execution_time_ms: 21000 }],
+      }),
+    ];
+    const blocks = transformToDisplayBlocks(steps);
+    const tg = blocks[0] as ToolGroupBlock;
+
+    expect(tg.summary).toBe('委派子任务');
+    expect(tg.dominantCategory).toBe('subagent');
+    expect(tg.items[0].description).toBe('委派子任务 vlog 完整制作方案');
   });
 
   it('跨步骤的连续工具调用应合并为一个 ToolGroupBlock', () => {

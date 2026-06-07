@@ -9,7 +9,7 @@
 - 发送用户消息（含附件、引用图片）
 - 消费后端 SSE（AG-UI 事件）增量构建 `RoundData[]`
 - 渲染消息流（user → reasoning → assistant）
-- 将助手回复中的会话文件引用渲染为可点击文件卡片
+- 将助手回复中的会话文件引用抽取为回复底部的可点击文件卡片，同时保留 markdown 正文原样显示
 - 处理中断/恢复：断连重连、ask_user 中断、用户主动取消
 - 滚动控制：首次恢复 + 底部跟随
 
@@ -58,10 +58,10 @@ AgentState {
 
 ### 2.1 助手文件引用卡片
 
-`Round` 在渲染助手 markdown 前先解析文件提示行，将可访问的会话文件渲染为内嵌文件卡片。
+`Round` 按原文渲染助手 markdown；`extractAssistantFiles()` 只从 fenced code block 外的可访问会话文件引用中抽取候选，在助手回复底部统一渲染去重文件卡片。解析不得删除、替换或隐藏正文里的路径文本。
 
 识别范围：
-- 仅解析 fenced code block 外的独立提示行。
+- 仅解析 fenced code block 外的提示行或单一路径引用，用于生成底部文件卡片。
 - 支持标签：`文件位置` / `文件路径` / `保存位置` / `已保存到` / `输出文件` / `生成文件` / `文件`。
 - 支持助手正文中的反引号文件引用，例如 `` `DeepSeek_V4_解读.docx` ``。
 - 行内反引号仅接受单一路径形态；含空白的命令片段（如 `` `python3 quick_sort.py` ``）保持 markdown。
@@ -75,6 +75,7 @@ AgentState {
 - 代码块中的命令或文件名，例如 `python3 quick_sort.py`。
 
 点击行为：
+- 文件卡片位于助手 markdown 后方，不是正文内联替换。
 - 文件卡片调用 `ChatV2` 的文件面板入口，打开 `ArtifactsPanel` 并传入目标文件。
 - 点击前必须按目标父目录查询当前 session 文件列表；只有命中同路径文件时才打开 Files 抽屉。
 - 未命中说明该文本只是助手描述或文件尚未生成，必须提示用户且不得打开预览。
@@ -124,7 +125,7 @@ catch (SSE error)
 
 用户点击取消：
 1. 前端点击后必须立即取消当前订阅（`subscription.abort()`），防止后续迟到回调覆盖状态。
-2. 本地将当前 `running` round 先收敛为中断态（用于即时反馈），结束 `sending/resuming`，并立即恢复输入可用；不得等待 `/abort` HTTP 响应或 SSE 终态事件。
+2. 本地将当前 `running` round 先收敛为取消态 `cancelled`（用于即时反馈），结束 `sending/resuming`，并立即恢复输入可用；不得等待 `/abort` HTTP 响应或 SSE 终态事件。
 3. 进入 `stopping` 状态：输入框保持可编辑，但新的发送动作必须禁用，直到 `/abort` 返回，避免用户立即发送新问题时撞到后端尚未释放的 user/session lock。
 4. 同步发起 POST `/api/chat/{sid}/abort`。
 5. 若请求返回 409（会话已无运行任务）：按“已停止”处理，保持本地已收敛 UI。
@@ -202,6 +203,7 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 | `edit_file` | `Edited {path}` | Keep-Head |
 | `bash` | `Run \`{cmd}\`` | Keep-Head |
 | `search_*` | `Search "{query}"` | Keep-Head |
+| `sub_agent` | `委派子任务 {description 或 prompt 首行}` | Keep-Head |
 | 其他 | `{tool_name}` | — |
 
 ### 7.3 分组摘要
@@ -218,6 +220,7 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
   - 点击 `查看活动` 或完成态胶囊后打开右侧活动抽屉；不得在主聊天区展开 thinking 详情。
 - ToolGroupBlock：完成态不在主聊天区直接渲染；工具摘要、工具项、输入输出、`✓ Done` 标记均在活动抽屉内展示。若 round 没有 thinking 但存在已完成工具活动，主聊天区渲染紧凑的 `已完成活动` 入口，仅用于打开活动抽屉。只有 round 仍处于 streaming 时，最新 ToolGroupBlock 的未返回工具结果才可视为运行中；若最新 ToolGroupBlock 仍在运行且没有正在流式的 thinking，主聊天区必须显示 `正在调用工具` 活动态卡片和工具摘要。终态 round 中缺少 tool_result 的工具调用不得显示 `正在调用工具`。若工具已返回但 round 仍处于 streaming，且下一段 thinking/正文尚未到达，主聊天区必须显示 `正在处理工具结果` 活动态卡片，避免 think/tool 与下一段 think 之间的空窗期看起来已经完成。
 - ToolItem：在活动抽屉内 hover 显示展开箭头，点击查看工具入参/结果。
+- `sub_agent` ToolItem 必须使用专用子任务胶囊展示：折叠态保持单行，仅显示 `委派子任务`、业务标题、`subagent_type` 与耗时；不得默认展开原始 JSON 入参。点击展开后展示任务 prompt、子任务输出/错误与可选 child run id，便于理解长耗时委派执行。child run id 等父子 run 元数据应优先来自结构化 metadata 或 `subagent_runs` 查询；从 `TOOL_CALL_RESULT.content` 文本中解析仅允许作为当前兼容兜底。
 
 ## 8. 附件上传
 
@@ -246,7 +249,7 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] 滚动记忆：A 滚到中间 → 切 B → 切回 A，位置恢复
 - [ ] 首屏历史渲染无瀑布动画
 - [ ] 底部跟随：用户滚离底部时新消息不强制滚动
-- [ ] 助手文件提示行渲染为文件卡片，点击后打开 Files 抽屉并直接预览目标文件
+- [ ] 助手文件提示行/路径保留在 markdown 正文，同时在回复底部渲染去重文件卡片；点击后打开 Files 抽屉并直接预览目标文件
 - [ ] 代码块内的文件名/命令不触发文件卡片
 
 ## 11. 已知易错点

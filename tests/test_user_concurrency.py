@@ -3,12 +3,13 @@
 import asyncio
 import sqlite3
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -18,6 +19,12 @@ from src.api.models.session import Session
 from src.api.models.user_run_lock import UserRunLock
 from src.api.routes.chat import _acquire_user_run_lock, _release_user_run_lock
 from src.api.utils.timezone import now_naive
+
+
+def _cancel_result(request_id: str):
+    from src.api.schemas.turn import CancelResult
+
+    return CancelResult(request_id=request_id, state="acked")
 
 
 @pytest.fixture
@@ -130,6 +137,72 @@ class TestUserRunLockHelpers:
             rows = db.query(UserRunLock).filter(UserRunLock.user_id == "user-1").all()
             assert {row.session_id for row in rows} == {"session-a", "session-b", "session-c"}
             assert {row.slot for row in rows} == {0, 1, 2}
+
+    async def test_acquire_retries_integrity_error_and_returns_busy(self):
+        """唯一约束竞争是正常 busy 语义，不应冒泡成 503。"""
+        from src.api.services.run_coordinator import RunCoordinator
+
+        mock_settings = MagicMock()
+        mock_settings.sse_subscribe_timeout = 300
+        mock_settings.agent_user_concurrency_limit = 1
+        fresh_lock = SimpleNamespace(
+            session_id="session-other",
+            slot=0,
+            lock_id="lock-other",
+            created_at=now_naive(),
+            updated_at=now_naive(),
+        )
+
+        class FakeQuery:
+            def __init__(self, fake_db):
+                self.fake_db = fake_db
+
+            def filter(self, *_args, **_kwargs):
+                return self
+
+            def all(self):
+                self.fake_db.all_calls += 1
+                if self.fake_db.all_calls in (1, 2, 3):
+                    return []
+                return [fresh_lock]
+
+        class FakeDB:
+            def __init__(self):
+                self.all_calls = 0
+                self.rollback_count = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def query(self, *_args, **_kwargs):
+                return FakeQuery(self)
+
+            def execute(self, *_args, **_kwargs):
+                raise IntegrityError("INSERT INTO user_run_locks", {}, Exception("duplicate"))
+
+            def commit(self):
+                return None
+
+            def rollback(self):
+                self.rollback_count += 1
+
+        fake_db = FakeDB()
+        coordinator = RunCoordinator(
+            session_factory=lambda: fake_db,
+            settings_provider=lambda: mock_settings,
+        )
+
+        lock_id = await coordinator.acquire_user_run_lock(
+            user_id="user-1",
+            session_id="session-new",
+        )
+
+        assert lock_id is None
+        assert fake_db.rollback_count == 1
+        assert fake_db.all_calls == 4
 
     async def test_acquire_cleans_stale_lock_by_heartbeat(self):
         """心跳过期的锁应被回收（worker 已死），同时清理孤儿 round。"""
@@ -829,7 +902,7 @@ class TestResumeConcurrencyBlock:
 
 
 class TestAbortCleansUpUserLock:
-    """abort 端点跨 worker 取消请求测试。"""
+    """abort 端点取消审计与锁释放测试。"""
 
     def test_abort_with_cancel_token_releases_lock_immediately(self):
         """abort 时 worker 存活（cancel_token 可设置），也应立即释放锁。"""
@@ -873,8 +946,10 @@ class TestAbortCleansUpUserLock:
         client = make_test_client(chat_routes.router, "/chat", db=mock_db)
 
         with patch("src.api.routes.chat.get_agent_pool") as mock_pool, patch(
-            "src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-1"
-        ) as upsert_cancel, patch(
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=_cancel_result("req-1"),
+        ) as cancel_turn, patch(
             "src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock, return_value=True
         ) as release_lock, patch(
             "src.api.routes.chat._complete_cancel_request_in_new_session", new_callable=AsyncMock, return_value=True
@@ -886,7 +961,7 @@ class TestAbortCleansUpUserLock:
         assert response.json()["status"] == "cancelled"
         assert response.json()["reason"] == "force_aborted"
         assert response.json()["request_id"] == "req-1"
-        upsert_cancel.assert_called_once()
+        cancel_turn.assert_called_once()
         release_lock.assert_called_once_with(user_id="testuser", lock_id="lock-1", session_id="session-1")
         assert mock_agent_service.cancel_token.is_set()
 
@@ -929,8 +1004,10 @@ class TestAbortCleansUpUserLock:
         client = make_test_client(chat_routes.router, "/chat", db=mock_db)
 
         with patch("src.api.routes.chat.get_agent_pool") as mock_pool, patch(
-            "src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-2"
-        ) as upsert_cancel, patch(
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=_cancel_result("req-2"),
+        ) as cancel_turn, patch(
             "src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock, return_value=True
         ), patch(
             "src.api.routes.chat._complete_cancel_request_in_new_session", new_callable=AsyncMock, return_value=True
@@ -941,7 +1018,7 @@ class TestAbortCleansUpUserLock:
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
         assert response.json()["reason"] == "force_aborted"
-        upsert_cancel.assert_called_once()
+        cancel_turn.assert_called_once()
         assert mock_round.status == "cancelled"
 
     def test_abort_dead_worker_directly_cancels_round(self):
@@ -988,11 +1065,14 @@ class TestAbortCleansUpUserLock:
         client = make_test_client(chat_routes.router, "/chat", db=mock_db)
 
         with patch("src.api.routes.chat.get_agent_pool") as mock_pool, \
-             patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-dead"), \
+             patch(
+                 "src.api.routes.chat._turn_orchestrator.cancel_turn",
+                 new_callable=AsyncMock,
+                 return_value=_cancel_result("req-dead"),
+             ), \
              patch("src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock, return_value=True) as release_lock, \
              patch("src.api.routes.chat._complete_cancel_request_in_new_session", new_callable=AsyncMock, return_value=True), \
-             patch("src.api.routes.chat._broadcast_to_subscribers", new_callable=AsyncMock), \
-             patch("src.api.routes.chat._cleanup_subscribers"):
+             patch("src.api.routes.chat._agui_event_bus.cleanup_subscribers"):
             mock_pool.return_value.get.return_value = None
             response = client.post("/chat/session-1/abort")
 

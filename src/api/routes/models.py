@@ -15,7 +15,8 @@ async def list_models():
     Returns:
         {
             "models": [{"id", "name", "provider", "supports_thinking", "max_tokens", "tags"}],
-            "default_model": "minimax-text-01"
+            "default_model": "minimax-text-01",
+            "subagent_default_model": "minimax-text-01"
         }
     """
     try:
@@ -23,6 +24,7 @@ async def list_models():
         return {
             "models": registry.list_public(),
             "default_model": registry.default_model_id,
+            "subagent_default_model": registry.subagent_default_model_id,
         }
     except Exception as e:
         logger.error("加載模型配置失敗: %s", e)

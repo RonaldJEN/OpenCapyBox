@@ -163,6 +163,190 @@ describe('APIService', () => {
       expect(callbacks.onRunError).not.toHaveBeenCalled();
     });
 
+    it('sendMessageStreamV2 断线订阅恢复应从已消费 sequence 后续接', async () => {
+      vi.useFakeTimers();
+
+      const encoder = new TextEncoder();
+      const reader = {
+        read: vi
+          .fn()
+          .mockResolvedValueOnce({
+            done: false,
+            value: encoder.encode([
+              'data: {"type":"RUN_STARTED","threadId":"thread-1","runId":"run-1","sequence":1}',
+              'data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"msg-1","delta":"hello","sequence":2}',
+              '',
+            ].join('\n')),
+          })
+          .mockRejectedValueOnce(new Error('stream dropped')),
+      };
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        body: {
+          getReader: () => reader,
+        },
+      }));
+
+      const subscribeSpy = vi.spyOn(apiService, 'subscribeToRound');
+      subscribeSpy.mockImplementationOnce((...args: unknown[]) => {
+        const cbs = args[2] as {
+          onRunFinished?: (threadId: string, runId: string, result: any, outcome: string) => void;
+        };
+        cbs.onRunFinished?.('thread-1', 'run-1', { finalResponse: 'done' }, 'success');
+        return { promise: Promise.resolve(), abort: vi.fn(), getLatestSequence: () => 3 };
+      });
+
+      const callbacks = {
+        onTextMessageContent: vi.fn(),
+        onRunFinished: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      const requestPromise = apiService.sendMessageStreamV2(
+        'session-1',
+        [{ type: 'text', text: 'hello' }],
+        callbacks,
+      );
+
+      await vi.runAllTimersAsync();
+      await requestPromise;
+
+      expect(callbacks.onTextMessageContent).toHaveBeenCalledOnce();
+      expect(callbacks.onTextMessageContent.mock.calls[0][2]).toBeUndefined();
+      expect(subscribeSpy).toHaveBeenCalledWith(
+        'session-1',
+        'run-1',
+        expect.any(Object),
+        2,
+      );
+      expect(callbacks.onRunFinished).toHaveBeenCalledWith(
+        'thread-1',
+        'run-1',
+        { finalResponse: 'done' },
+        'success',
+        undefined,
+      );
+    });
+
+    it('sendMessageStreamV2 重连聚合内容不应重复拼接已显示 raw delta', async () => {
+      vi.useFakeTimers();
+
+      const encoder = new TextEncoder();
+      const reader = {
+        read: vi
+          .fn()
+          .mockResolvedValueOnce({
+            done: false,
+            value: encoder.encode([
+              'data: {"type":"RUN_STARTED","threadId":"thread-1","runId":"run-1","sequence":1}',
+              'data: {"type":"TEXT_MESSAGE_START","messageId":"msg-1","role":"assistant","sequence":2}',
+              'data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"msg-1","delta":"hel"}',
+              '',
+            ].join('\n')),
+          })
+          .mockRejectedValueOnce(new Error('stream dropped')),
+      };
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        body: {
+          getReader: () => reader,
+        },
+      }));
+
+      const subscribeSpy = vi.spyOn(apiService, 'subscribeToRound');
+      subscribeSpy.mockImplementationOnce((...args: unknown[]) => {
+        const cbs = args[2] as {
+          onTextMessageContent?: (messageId: string, delta: string, meta?: { isAggregate?: boolean; sequence?: number }) => void;
+          onRunFinished?: (threadId: string, runId: string, result: any, outcome: string) => void;
+        };
+        cbs.onTextMessageContent?.('msg-1', 'hello', { sequence: 3, isAggregate: true });
+        cbs.onRunFinished?.('thread-1', 'run-1', { finalResponse: 'hello' }, 'success');
+        return { promise: Promise.resolve(), abort: vi.fn(), getLatestSequence: () => 4 };
+      });
+
+      let renderedText = '';
+      const callbacks = {
+        onTextMessageContent: vi.fn((_messageId: string, delta: string, meta?: { isAggregate?: boolean }) => {
+          renderedText = meta?.isAggregate ? delta : renderedText + delta;
+        }),
+        onRunFinished: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      const requestPromise = apiService.sendMessageStreamV2(
+        'session-1',
+        [{ type: 'text', text: 'hello' }],
+        callbacks,
+      );
+
+      await vi.runAllTimersAsync();
+      await requestPromise;
+
+      expect(renderedText).toBe('hello');
+      expect(callbacks.onTextMessageContent).toHaveBeenCalledTimes(2);
+      expect(callbacks.onTextMessageContent.mock.calls[0]).toEqual(['msg-1', 'hel']);
+      expect(callbacks.onTextMessageContent).toHaveBeenNthCalledWith(
+        2,
+        'msg-1',
+        'hello',
+        { sequence: 3, isAggregate: true },
+      );
+      expect(subscribeSpy).toHaveBeenCalledWith(
+        'session-1',
+        'run-1',
+        expect.any(Object),
+        2,
+      );
+    });
+
+    it('subscribeToRound 应将带 sequence 的内容 delta 标记为聚合 replay 视图', async () => {
+      const encoder = new TextEncoder();
+      const reader = {
+        read: vi
+          .fn()
+          .mockResolvedValueOnce({
+            done: false,
+            value: encoder.encode([
+              'data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"msg-1","delta":"hello","sequence":7}',
+              'data: {"type":"RUN_FINISHED","threadId":"thread-1","runId":"run-1","result":{"finalResponse":"hello"},"outcome":"success","sequence":8}',
+              '',
+            ].join('\n')),
+          })
+          .mockResolvedValueOnce({ done: true, value: undefined }),
+      };
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        body: {
+          getReader: () => reader,
+        },
+      }));
+
+      const callbacks = {
+        onTextMessageContent: vi.fn(),
+        onRunFinished: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      const subscription = apiService.subscribeToRound(
+        'session-1',
+        'run-1',
+        callbacks,
+        6,
+      );
+
+      await subscription.promise;
+
+      expect(callbacks.onTextMessageContent).toHaveBeenCalledWith(
+        'msg-1',
+        'hello',
+        { sequence: 7, isAggregate: true },
+      );
+      expect(subscription.getLatestSequence()).toBe(8);
+    });
+
     it('sendMessageStreamV2 在响应通过后应触发 onStreamAccepted', async () => {
       const encoder = new TextEncoder();
       const reader = {
@@ -197,6 +381,164 @@ describe('APIService', () => {
       expect(callbacks.onStreamAccepted).toHaveBeenCalledOnce();
       expect(callbacks.onRunFinished).toHaveBeenCalledOnce();
       expect(callbacks.onRunError).not.toHaveBeenCalled();
+    });
+
+    it('sendMessageStreamV2 应处理关闭前未换行的最终 SSE 事件', async () => {
+      const encoder = new TextEncoder();
+      const reader = {
+        read: vi
+          .fn()
+          .mockResolvedValueOnce({
+            done: false,
+            value: encoder.encode('data: {"type":"RUN_FINISHED","threadId":"session-1","runId":"run-1","result":{"finalResponse":"Done"},"outcome":"success"}'),
+          })
+          .mockResolvedValueOnce({ done: true, value: undefined }),
+      };
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        body: {
+          getReader: () => reader,
+        },
+      }));
+
+      const callbacks = {
+        onStreamAccepted: vi.fn(),
+        onRunFinished: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      await apiService.sendMessageStreamV2(
+        'session-1',
+        [{ type: 'text', text: 'hello' }],
+        callbacks,
+      );
+
+      expect(callbacks.onRunFinished).toHaveBeenCalledWith(
+        'session-1',
+        'run-1',
+        { finalResponse: 'Done' },
+        'success',
+        undefined,
+      );
+      expect(callbacks.onRunError).not.toHaveBeenCalled();
+    });
+
+    it('sendMessageStreamV2 已被接受但未收到 runId 时应从最新完成 round 恢复', async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal('crypto', {
+        randomUUID: vi.fn(() => 'idempotency-restored'),
+      });
+
+      const reader = {
+        read: vi.fn().mockResolvedValueOnce({ done: true, value: undefined }),
+      };
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        body: {
+          getReader: () => reader,
+        },
+      }));
+
+      vi.spyOn(apiService, 'getSessionHistoryV2').mockResolvedValue({
+        session_id: 'session-1',
+        total: 1,
+        rounds: [
+          {
+            round_id: 'run-restored',
+            idempotency_key: 'idempotency-restored',
+            user_message: 'hello',
+            final_response: 'Recovered final',
+            steps: [],
+            step_count: 0,
+            status: 'completed',
+            created_at: new Date().toISOString(),
+          },
+        ],
+      });
+
+      const callbacks = {
+        onStreamAccepted: vi.fn(),
+        onRunFinished: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      const requestPromise = apiService.sendMessageStreamV2(
+        'session-1',
+        [{ type: 'text', text: 'hello' }],
+        callbacks,
+      );
+
+      await vi.runAllTimersAsync();
+      await requestPromise;
+
+      expect(callbacks.onStreamAccepted).toHaveBeenCalledOnce();
+      expect(callbacks.onRunFinished).toHaveBeenCalledWith(
+        'session-1',
+        'run-restored',
+        { finalResponse: 'Recovered final', stepCount: 0 },
+        'success',
+        undefined,
+      );
+      expect(callbacks.onRunError).not.toHaveBeenCalled();
+    });
+
+    it('sendMessageStreamV2 accepted 后不应按时间窗误恢复旧 round', async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal('crypto', {
+        randomUUID: vi.fn(() => 'idempotency-current'),
+      });
+
+      const reader = {
+        read: vi.fn().mockResolvedValueOnce({ done: true, value: undefined }),
+      };
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        body: {
+          getReader: () => reader,
+        },
+      }));
+
+      vi.spyOn(apiService, 'getSessionHistoryV2').mockResolvedValue({
+        session_id: 'session-1',
+        total: 1,
+        rounds: [
+          {
+            round_id: 'run-old',
+            idempotency_key: 'idempotency-old',
+            user_message: 'old message',
+            final_response: 'Old final',
+            steps: [],
+            step_count: 0,
+            status: 'completed',
+            created_at: new Date().toISOString(),
+          },
+        ],
+      });
+
+      const callbacks = {
+        onStreamAccepted: vi.fn(),
+        onRunFinished: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      const requestPromise = apiService.sendMessageStreamV2(
+        'session-1',
+        [{ type: 'text', text: 'hello' }],
+        callbacks,
+      );
+
+      await vi.runAllTimersAsync();
+      await requestPromise;
+
+      expect(callbacks.onStreamAccepted).toHaveBeenCalledOnce();
+      expect(callbacks.onRunFinished).not.toHaveBeenCalled();
+      expect(callbacks.onRunError).toHaveBeenCalledWith(
+        '网络中断，请检查连接后重试',
+        'REQUEST_FAILED',
+      );
     });
 
     it('sendMessageStreamV2 被 429 拒绝时不应触发 onStreamAccepted', async () => {

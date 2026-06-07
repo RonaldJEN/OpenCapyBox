@@ -12,7 +12,10 @@ from src.api.models.round import Round
 from src.api.models.agui_event import AGUIEventLog
 from src.api.models.interrupt_resolution import InterruptResolution
 from src.api.models.llm_call_record import LLMCallRecord
+from src.api.models.subagent_run import SubagentRun
 from src.agent.schema.agui_events import AGUIEvent, EventType
+from src.api.services.agui_event_bus import AguiEventBus, StoredEvent
+from src.api.services.run_completion_service import RunCompletionService
 from typing import List, Dict, Optional, AsyncIterator, Any
 from datetime import datetime
 from src.api.utils.timezone import now_naive
@@ -51,10 +54,7 @@ class HistoryService:
             self._session_factory = None
             self._db = db  # type: ignore[assignment]
             self._owns_db = False
-        # per-instance 状态，避免类级别共享导致跨会话数据混乱
-        self._event_sequences: Dict[str, int] = {}
-        self._stream_buffers: Dict[str, Dict[str, str]] = {}
-        self._terminal_runs: set[str] = set()
+        self._last_terminal_event: StoredEvent | None = None
 
     @property
     def db(self) -> DBSession:
@@ -280,12 +280,14 @@ class HistoryService:
     def complete_round(
         self, round_id: str, final_response: str, step_count: int,
         status: str = "completed", interrupt_payload: str | None = None,
+        terminal_event: AGUIEvent | dict[str, Any] | None = None,
     ) -> Round:
         """完成对话轮次
 
         若 round 已處於終態（completed/failed/cancelled/resumed），跳過狀態覆寫。
         resumed round 允許接收遲到的 interrupted 完成回填展示元數據，但狀態保持 resumed。
         """
+        self._last_terminal_event = None
         round_obj = self.db.query(Round).filter(Round.id == round_id).first()
         if round_obj:
             if round_obj.status in self._TERMINAL_STATUSES:
@@ -317,18 +319,30 @@ class HistoryService:
                 self.db.expunge(round_obj)
                 self.db.rollback()
                 return round_obj
-            round_obj.final_response = final_response
-            round_obj.step_count = step_count
-            round_obj.status = status
-            round_obj.interrupt_payload = interrupt_payload
-            round_obj.completed_at = now_naive() if status != "interrupted" else None
-            self.db.commit()
+            completion = RunCompletionService(self.db)
+            self._last_terminal_event = completion.complete_sync(
+                run_id=round_id,
+                status=status,
+                final_response=final_response,
+                step_count=step_count,
+                interrupt_payload=interrupt_payload,
+                terminal_event=terminal_event,
+            )
+            round_obj = self.db.query(Round).filter(Round.id == round_id).first()
+            if round_obj is None:
+                self.db.rollback()
+                return None
             self._refresh_detached(round_obj)
         else:
             self.db.rollback()
         return round_obj
 
-    def _rebuild_steps_from_events(self, run_id: str) -> List[Dict]:
+    def _rebuild_steps_from_events(
+        self,
+        run_id: str,
+        *,
+        return_last_sequence: bool = False,
+    ) -> List[Dict] | tuple[List[Dict], int]:
         """从 AG-UI 事件重建步骤列表
         
         解析 STEP_STARTED/FINISHED, TEXT_MESSAGE_*, TOOL_CALL_* 等事件
@@ -346,6 +360,11 @@ class HistoryService:
             .order_by(AGUIEventLog.sequence)
             .all()
         )
+        def event_sequence(event_log) -> int:
+            value = getattr(event_log, "sequence", 0)
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        last_event_sequence = max((event_sequence(event_log) for event_log in events), default=0)
         
         steps = []
         current_step = None
@@ -456,6 +475,8 @@ class HistoryService:
                 print(f"⚠️ 解析事件失败: {e} (run_id={run_id}, id={event_log.id})")
                 continue
         
+        if return_last_sequence:
+            return steps, last_event_sequence
         return steps
 
     def get_session_rounds(self, session_id: str) -> List[Dict]:
@@ -463,17 +484,23 @@ class HistoryService:
         
         步骤(steps)从 AG-UI 事件日志动态重建，而非单独存储。
         """
+        subagent_child_round_ids = self._get_subagent_child_round_ids(session_id)
         rounds = (
             self.db.query(Round)
             .filter(Round.session_id == session_id)
             .order_by(Round.created_at)
             .all()
         )
+        if subagent_child_round_ids:
+            rounds = [round_obj for round_obj in rounds if round_obj.id not in subagent_child_round_ids]
 
         result = []
         for round_obj in rounds:
             # 从 AG-UI 事件重建步骤
-            steps = self._rebuild_steps_from_events(round_obj.id)
+            steps, last_event_sequence = self._rebuild_steps_from_events(
+                round_obj.id,
+                return_last_sequence=True,
+            )
             attachments: List[Dict] = []
             if round_obj.user_attachments:
                 try:
@@ -495,6 +522,8 @@ class HistoryService:
                 {
                     "round_id": round_obj.id,
                     "parent_run_id": round_obj.parent_run_id,
+                    "idempotency_key": round_obj.idempotency_key,
+                    "last_event_sequence": last_event_sequence,
                     "user_message": round_obj.user_message,
                     "user_attachments": attachments,
                     "final_response": round_obj.final_response,
@@ -511,192 +540,40 @@ class HistoryService:
 
         return result
 
+    def _get_subagent_child_round_ids(self, session_id: str) -> set[str]:
+        """Return child round ids that belong to subagent sidechains."""
+        rows = (
+            self.db.query(SubagentRun.child_run_id)
+            .filter(
+                SubagentRun.session_id == session_id,
+                SubagentRun.child_run_id.isnot(None),
+            )
+            .all()
+        )
+        child_ids: set[str] = set()
+        for row in rows:
+            value = row[0] if isinstance(row, tuple) else getattr(row, "child_run_id", None)
+            if value:
+                child_ids.add(value)
+        return child_ids
+
     # =========================================================================
     # AG-UI 事件相關方法
     # =========================================================================
 
-    # 需要聚合的流式 delta 事件類型
-    _STREAM_DELTA_EVENTS = {
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.THINKING_TEXT_MESSAGE_CONTENT,
-        EventType.TOOL_CALL_ARGS,
-    }
-    
-    # delta 事件 -> 結束事件的映射
-    _STREAM_END_EVENTS = {
-        EventType.TEXT_MESSAGE_END: (EventType.TEXT_MESSAGE_CONTENT, "_TEXT"),
-        EventType.THINKING_TEXT_MESSAGE_END: (EventType.THINKING_TEXT_MESSAGE_CONTENT, "_THINKING"),
-        EventType.TOOL_CALL_END: (EventType.TOOL_CALL_ARGS, "_TOOL"),
-    }
-    
-    async def save_agui_event(self, run_id: str, event: AGUIEvent) -> Optional[AGUIEventLog]:
-        """存儲 AG-UI 事件（流式事件聚合優化）
-        
-        對於流式 delta 事件（TEXT_MESSAGE_CONTENT, THINKING_TEXT_MESSAGE_CONTENT, TOOL_CALL_ARGS），
-        在內存中累積，等 *_END 事件時聚合為單條記錄寫入，減少數據庫寫入量。
-        
-        Args:
-            run_id: 運行 ID
-            event: AG-UI 事件對象
-            
-        Returns:
-            AGUIEventLog: 存儲的事件日誌記錄（流式 delta 事件返回 None）
-        """
-        # round 已終態時，丟棄所有遲到事件，避免 abort 後舊 run 汙染回放。
-        # 常見場景：abort 接口已將 round 標記 cancelled 並補發 RUN_FINISHED，
-        # 舊 worker 遲到事件（TEXT/TOOL/RUN_FINISHED）不應再入庫。
-        checked_db_terminal = False
-        is_terminal = run_id in self._terminal_runs
-        if not is_terminal:
-            is_terminal = self.is_round_terminal(run_id)
-            checked_db_terminal = True
-        if is_terminal:
-            if checked_db_terminal:
-                self.db.commit()
-            self._terminal_runs.add(run_id)
-            logger.info(
-                "Run %s 已終態，丟棄遲到事件: %s",
-                run_id,
-                event.type.value if hasattr(event.type, "value") else str(event.type),
-            )
-            return None
+    @property
+    def last_terminal_event(self) -> StoredEvent | None:
+        return self._last_terminal_event
 
-        # 初始化緩衝區
-        if run_id not in self._stream_buffers:
-            self._stream_buffers[run_id] = {}
-        
-        # === 流式 delta 事件：累積到緩衝區，不寫入數據庫 ===
-        if event.type in self._STREAM_DELTA_EVENTS:
-            buffer_key = self._get_buffer_key(event)
-            if buffer_key:
-                delta = getattr(event, 'delta', '')
-                if buffer_key not in self._stream_buffers[run_id]:
-                    self._stream_buffers[run_id][buffer_key] = ""
-                self._stream_buffers[run_id][buffer_key] += delta
-            # 释放可能挂起的只读事务（PG idle-in-transaction 防护）
-            if checked_db_terminal:
-                self.db.commit()
-            return None  # 不寫入數據庫
-        
-        # === *_END 事件：先寫入合成的 CONTENT 事件，再寫入乾淨的 END 事件 ===
-        if event.type in self._STREAM_END_EVENTS:
-            content_event_type, _suffix = self._STREAM_END_EVENTS[event.type]
-            buffer_key = self._get_buffer_key(event)
-            if buffer_key and buffer_key in self._stream_buffers.get(run_id, {}):
-                accumulated_content = self._stream_buffers[run_id].pop(buffer_key, "")
-                if accumulated_content:
-                    # 構建標準 AG-UI CONTENT 事件 payload
-                    synthetic_payload = {
-                        "type": content_event_type.value if hasattr(content_event_type, 'value') else str(content_event_type),
-                        "delta": accumulated_content,
-                    }
-                    # 根據事件類型添加 messageId 或 toolCallId
-                    msg_id = getattr(event, 'message_id', None)
-                    tool_id = getattr(event, 'tool_call_id', None)
-                    if msg_id:
-                        synthetic_payload["messageId"] = msg_id
-                    if tool_id:
-                        synthetic_payload["toolCallId"] = tool_id
-                    
-                    # 先寫入合成的 CONTENT 事件（標準 AG-UI 協議格式）
-                    await self._write_synthetic_event_to_db(
-                        run_id=run_id,
-                        event_type_str=content_event_type.value if hasattr(content_event_type, 'value') else str(content_event_type),
-                        payload_dict=synthetic_payload,
-                        message_id=msg_id,
-                        tool_call_id=tool_id,
-                    )
-        
-        # === END 事件和其他事件：正常寫入（END 事件不帶 fullContent）===
-        return await self._write_event_to_db(run_id, event)
-    
-    def _get_buffer_key(self, event: AGUIEvent) -> Optional[str]:
-        """根據事件類型獲取緩衝區 key"""
-        message_id = getattr(event, 'message_id', None)
-        tool_call_id = getattr(event, 'tool_call_id', None)
-        
-        if event.type in {EventType.TEXT_MESSAGE_CONTENT, EventType.TEXT_MESSAGE_END}:
-            return f"{message_id}_TEXT" if message_id else None
-        elif event.type in {EventType.THINKING_TEXT_MESSAGE_CONTENT, EventType.THINKING_TEXT_MESSAGE_END}:
-            return f"{message_id}_THINKING" if message_id else None
-        elif event.type in {EventType.TOOL_CALL_ARGS, EventType.TOOL_CALL_END}:
-            return f"{tool_call_id}_TOOL" if tool_call_id else None
-        return None
-    
-    async def _write_synthetic_event_to_db(
-        self,
-        run_id: str,
-        event_type_str: str,
-        payload_dict: dict,
-        message_id: str = None,
-        tool_call_id: str = None,
-    ) -> AGUIEventLog:
-        """寫入合成事件到數據庫（用於流式聚合後的 CONTENT 事件）
-        
-        在 *_END 事件之前插入一條標準的 CONTENT/ARGS 事件，
-        使 DB 中的事件序列符合 AG-UI 協議（START → CONTENT → END）。
-        """
-        if run_id not in self._event_sequences:
-            self._event_sequences[run_id] = 0
-        self._event_sequences[run_id] += 1
-        sequence = self._event_sequences[run_id]
-        
-        event_log = AGUIEventLog(
-            run_id=run_id,
-            event_type=event_type_str,
-            message_id=message_id,
-            tool_call_id=tool_call_id,
-            timestamp=None,
-            payload=json.dumps(payload_dict, ensure_ascii=False),
-            sequence=sequence,
-        )
-        self.db.add(event_log)
-        # 不單獨 commit，跟隨後面的 END 事件一起提交
-        return event_log
-    
-    async def _write_event_to_db(self, run_id: str, event: AGUIEvent, payload_override: str = None) -> AGUIEventLog:
-        """實際寫入事件到數據庫"""
-        # 獲取下一個序列號
-        if run_id not in self._event_sequences:
-            self._event_sequences[run_id] = 0
-        self._event_sequences[run_id] += 1
-        sequence = self._event_sequences[run_id]
-        
-        # 提取可選字段
-        message_id = getattr(event, 'message_id', None)
-        tool_call_id = getattr(event, 'tool_call_id', None)
-        timestamp = getattr(event, 'timestamp', None)
-        
-        # 創建事件日誌記錄
-        event_log = AGUIEventLog(
-            run_id=run_id,
-            event_type=event.type.value if hasattr(event.type, 'value') else str(event.type),
-            message_id=message_id,
-            tool_call_id=tool_call_id,
-            timestamp=timestamp,  # 🔥 修復：提取 event.timestamp
-            payload=payload_override or event.model_dump_json(by_alias=True),
-            sequence=sequence,
-        )
-        
-        self.db.add(event_log)
-        
-        self.db.commit()
-        
-        return event_log
-    
-    def flush_agui_events(self, run_id: str):
-        """刷新未提交的事件到數據庫
-        
-        Args:
-            run_id: 運行 ID
-        """
-        self.db.commit()
-        # 清理序列號追蹤
-        if run_id in self._event_sequences:
-            del self._event_sequences[run_id]
-        # 清理流式緩衝區
-        if run_id in self._stream_buffers:
-            del self._stream_buffers[run_id]
+    async def save_agui_event(self, run_id: str, event: AGUIEvent) -> Optional[StoredEvent]:
+        """Store one non-terminal AG-UI event via AguiEventBus."""
+        event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+        if event_type in (EventType.RUN_FINISHED.value, EventType.RUN_ERROR.value):
+            if self.is_round_terminal(run_id):
+                logger.info("Run %s 已终态，丢弃迟到 terminal 事件: %s", run_id, event_type)
+                return None
+            raise ValueError("terminal events must be written via complete_round/RunCompletionService")
+        return await AguiEventBus(self.db).publish(run_id, event)
     
     def get_run_events(self, run_id: str) -> List[Dict]:
         """獲取某次運行的所有事件（按序號排序）
@@ -737,7 +614,7 @@ class HistoryService:
         for event_log in events:
             try:
                 event_data = json.loads(event_log.payload)
-                # 不注入 _sequence，保持 AG-UI 协议一致性
+                event_data["sequence"] = event_log.sequence
                 result.append(event_data)
             except json.JSONDecodeError as e:
                 print(f"⚠️ 解析事件失败: {e} (run_id={run_id}, id={event_log.id})")
@@ -793,12 +670,15 @@ class HistoryService:
         Returns:
             精簡歷史列表，每項包含 role 和 content
         """
+        subagent_child_round_ids = self._get_subagent_child_round_ids(session_id)
         rounds = (
             self.db.query(Round)
             .filter(Round.session_id == session_id, Round.status == "completed")
             .order_by(Round.created_at)
             .all()
         )
+        if subagent_child_round_ids:
+            rounds = [round_obj for round_obj in rounds if round_obj.id not in subagent_child_round_ids]
         
         history = []
         for round_obj in rounds:

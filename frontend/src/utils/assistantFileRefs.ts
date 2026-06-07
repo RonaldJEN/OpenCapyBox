@@ -1,10 +1,6 @@
 import type { FileInfo } from '../types';
 import { normalizeFileType } from './fileUtils';
 
-export type AssistantContentBlock =
-  | { type: 'markdown'; content: string }
-  | { type: 'file'; file: FileInfo; originalLine: string };
-
 const FILE_HINT_LINE_RE = /^\s*(?:[-*]\s*)?(?:\*\*)?\s*(?:文件位置|文件路径|保存位置|已保存到|输出文件|生成文件|文件)\s*(?:[:：]\s*)?(?:\*\*)?\s*(?:[:：]\s*)?(.+?)\s*$/;
 const INLINE_CODE_RE = /`([^`]+)`/;
 const INLINE_FILE_REF_RE = /`([^`\n]+)`/g;
@@ -18,69 +14,49 @@ const FILE_PREVIEW_EXTS = new Set([
   'jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp', 'pdf',
 ]);
 
-export function extractAssistantContentBlocks(content: string, sessionId?: string): AssistantContentBlock[] {
+/**
+ * 从助手回复文本中解析出被提及的文件，按 path 去重后返回（保留首次出现顺序）。
+ * 正文本身不再被拆分，文件卡片统一在消息底部展示。
+ */
+export function extractAssistantFiles(content: string, sessionId?: string): FileInfo[] {
   if (!sessionId) {
-    return [{ type: 'markdown', content }];
+    return [];
   }
 
-  const blocks: AssistantContentBlock[] = [];
-  const markdownLines: string[] = [];
+  const files: FileInfo[] = [];
   const seenPaths = new Set<string>();
   let inFence = false;
 
-  const flushMarkdown = () => {
-    const markdown = markdownLines.join('\n').trimEnd();
-    markdownLines.length = 0;
-    if (markdown) {
-      blocks.push({ type: 'markdown', content: markdown });
+  const pushFile = (file: FileInfo) => {
+    if (seenPaths.has(file.path)) {
+      return;
     }
+    seenPaths.add(file.path);
+    files.push(file);
   };
 
   for (const line of content.split('\n')) {
     if (line.trimStart().startsWith('```')) {
       inFence = !inFence;
-      markdownLines.push(line);
       continue;
     }
 
     if (inFence) {
-      markdownLines.push(line);
       continue;
     }
 
-    const file = parseFileHintLine(line, sessionId);
-    if (file) {
-      if (seenPaths.has(file.path)) {
-        continue;
-      }
-
-      flushMarkdown();
-      seenPaths.add(file.path);
-      blocks.push({ type: 'file', file, originalLine: line });
+    const hintFile = parseFileHintLine(line, sessionId);
+    if (hintFile) {
+      pushFile(hintFile);
       continue;
     }
 
-    const inlineFiles = parseInlineFileRefs(line, sessionId);
-    if (inlineFiles.length === 0) {
-      markdownLines.push(line);
-      continue;
-    }
-
-    let cursor = 0;
-    for (const inlineFile of inlineFiles) {
-      markdownLines.push(line.slice(cursor, inlineFile.start));
-      flushMarkdown();
-      blocks.push({ type: 'file', file: inlineFile.file, originalLine: line });
-      cursor = inlineFile.end;
-    }
-    const tail = line.slice(cursor);
-    if (!isOnlyPunctuation(tail)) {
-      markdownLines.push(tail);
+    for (const inlineFile of parseInlineFileRefs(line, sessionId)) {
+      pushFile(inlineFile.file);
     }
   }
 
-  flushMarkdown();
-  return blocks.length > 0 ? blocks : [{ type: 'markdown', content }];
+  return files;
 }
 
 function parseFileHintLine(line: string, sessionId: string): FileInfo | null {
@@ -175,10 +151,6 @@ function normalizeAssistantFilePath(candidate: string, sessionId: string): strin
   }
 
   return segments.join('/');
-}
-
-function isOnlyPunctuation(value: string): boolean {
-  return /^[\s。。，，；;、,.!?！？:：]*$/.test(value);
 }
 
 function isInlinePathCandidate(raw: string): boolean {

@@ -171,6 +171,19 @@ class TimeoutTool(SlowTool):
         return ToolResult(success=True, content="done")
 
 
+class NoTimeoutTool(SlowTool):
+    """模拟显式关闭 Agent 单工具超时的工具"""
+
+    execute_timeout = 0
+
+    @property
+    def name(self) -> str:
+        return "no_timeout_tool"
+
+    async def execute(self, **kwargs):
+        return ToolResult(success=True, content="no-timeout-done")
+
+
 @pytest.mark.asyncio
 async def test_tool_execution_timeout():
     """工具执行超时后返回错误结果，Agent 继续运行"""
@@ -254,3 +267,45 @@ async def test_tool_with_custom_execute_timeout():
     tool_results = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
     assert len(tool_results) >= 1
     assert "timed out" in tool_results[0].content.lower()
+
+
+@pytest.mark.asyncio
+async def test_tool_execute_timeout_zero_disables_agent_tool_timeout(monkeypatch):
+    """execute_timeout=0 表示不套 Agent 单工具超时"""
+    no_timeout_tool = NoTimeoutTool()
+    agent, llm = _make_agent(tools=[no_timeout_tool])
+    agent.tool_timeout = 1
+
+    tool_call = ToolCall(
+        id="tc-no-timeout",
+        type="function",
+        function=FunctionCall(name="no_timeout_tool", arguments={"msg": "hi"}),
+    )
+    response1 = LLMResponse(content="", tool_calls=[tool_call], finish_reason="tool_calls")
+    response2 = LLMResponse(content="OK", tool_calls=[], finish_reason="stop")
+
+    call_count = 0
+
+    async def _fake_stream(messages, tools, on_content=None, on_thinking=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return response1
+        if on_content:
+            await on_content("OK")
+        return response2
+
+    async def _fail_wait_for(awaitable, timeout):
+        awaitable.close()
+        raise AssertionError("execute_timeout=0 should not call asyncio.wait_for")
+
+    llm.generate_stream = _fake_stream
+    monkeypatch.setattr(asyncio, "wait_for", _fail_wait_for)
+
+    events = []
+    async for event in agent.run_agui("thread-1", "run-no-timeout"):
+        events.append(event)
+
+    tool_results = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
+    assert len(tool_results) >= 1
+    assert tool_results[0].content == "no-timeout-done"

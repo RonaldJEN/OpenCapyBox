@@ -18,6 +18,7 @@ from src.api.config import Settings, get_settings
 from src.api.models.agui_event import AGUIEventLog
 from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
+from src.api.models.channel_session_binding import ChannelSessionBinding
 from src.api.models.conversation_message import ConversationMessage
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
@@ -25,6 +26,7 @@ from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.round import Round
 from src.api.models.run_cancel_request import RunCancelRequest
 from src.api.models.session import Session
+from src.api.models.subagent_run import SubagentRun
 from src.api.models.user_memory import CronJobRun, MemoryEmbedding, UserMemory, UserSkillConfig
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_sandbox import UserSandbox
@@ -417,6 +419,8 @@ def _purge_user_owned_data(db: DBSession, *, user_id: str) -> None:
 
     db.query(RunCancelRequest).filter(RunCancelRequest.user_id == user_id).delete(synchronize_session=False)
     db.query(UserRunLock).filter(UserRunLock.user_id == user_id).delete(synchronize_session=False)
+    db.query(ChannelSessionBinding).filter(ChannelSessionBinding.user_id == user_id).delete(synchronize_session=False)
+    db.query(SubagentRun).filter(SubagentRun.user_id == user_id).delete(synchronize_session=False)
 
     session_ids = [row[0] for row in db.query(Session.id).filter(Session.user_id == user_id).all()]
     if session_ids:

@@ -29,6 +29,7 @@
 
 default_model: mimo
 cron_default_model: glm  # Cron 任务默认模型（不配置思考）
+subagent_default_model: mimo  # Subagent 默认模型（不配置时继承 default_model）
 
 models:
 

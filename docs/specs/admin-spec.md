@@ -99,7 +99,7 @@
 ### DELETE /api/admin/users/{user_id}
 
 - 响应：`{user_id: str, deleted: true}`
-- 语义：不可恢复地删除 `auth_users` 账号记录，并清理该 `user_id` 归属的 session、round、conversation message、AG-UI event、LLM 调用记录、cron job / fire / run、memory、embedding、skill 配置、运行锁、取消请求、user_sandboxes 绑定与 sandbox 文件。
+- 语义：不可恢复地删除 `auth_users` 账号记录，并清理该 `user_id` 归属的 session、round、conversation message、AG-UI event、LLM 调用记录、subagent graph edge、channel session binding、cron job / fire / run、memory、embedding、skill 配置、运行锁、取消请求、user_sandboxes 绑定与 sandbox 文件。
 - 同名 `user_id` 删除后可以重新创建；新账号不得看到旧用户数据。
 - 约束：管理员不能删除当前登录账号；存在新鲜 `user_run_locks.updated_at` 心跳代表的运行中用户任务或运行中的 cron run 时返回 409；sandbox 清理失败时返回 409 且不得删除用户。
 

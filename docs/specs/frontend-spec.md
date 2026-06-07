@@ -106,6 +106,13 @@
 - 用户写操作成功提示必须是短暂 toast，不占用表格上方常驻空间。
 - `ldap` 用户密码入口必须显示为 LDAP 认证，不提供本地密码重置控件。
 
+### 4.7 管理后台 Session 监控
+
+- `AdminConsole` 的 Session 监控页必须通过 `services/adminApi.ts` 调用 `/admin/rounds-tree` 与 `/admin/rounds/{round_id}/steps/{step_number}`。
+- 管理后台是审计视图，可以展示 `sub_agent` child round；但每个 round 必须明确展示 `主Agent` / `子Agent`，并在子 Agent 行展示父 run 与 subagent 类型/描述。
+- 主聊天历史隐藏 child round 是聊天视图契约；管理后台不得为了复用聊天历史过滤逻辑而丢失 child round 审计记录。
+- Step 详情中的 LLM 请求、工具参数、工具返回如果是 JSON 字符串嵌套 JSON，前端必须递归解析并解码 `\uXXXX` 转义，避免把 `sub_agent` 的 prompt/arguments 展示成不可读的原始转义文本。
+
 ## 5. 设计体系（Claude 暖色调文档流）
 
 ### 5.1 风格定位
@@ -189,6 +196,7 @@
 
 - 工具描述、摘要、技术术语：**英文**（"Read src/app.py"、"Edited 2 files"、"Done"）。
 - UI 标签、提示、按钮：**中文**（"正在思考"、"已完成思考 3s"、"正在分析请求..."、"输入"、"输出"）。
+- 例外：`sub_agent` 面向业务理解长耗时委派执行，工具摘要使用中文 `委派子任务`，并在活动抽屉中以专用胶囊展示任务标题、类型与耗时。
 
 ### 5.11 交互微动效
 

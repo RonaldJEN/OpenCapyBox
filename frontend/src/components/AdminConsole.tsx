@@ -88,11 +88,12 @@ function formatNumber(value: number): string {
 
 function formatDetailText(value: unknown): string {
   if (value === null || value === undefined || value === '') return '-';
-  if (typeof value === 'string') return value;
+  const readableValue = parseNestedJsonLike(value);
+  if (typeof readableValue === 'string') return decodeEscapedUnicode(readableValue);
   try {
-    return JSON.stringify(value, null, 2);
+    return JSON.stringify(readableValue, null, 2);
   } catch {
-    return String(value);
+    return String(readableValue);
   }
 }
 
@@ -113,6 +114,31 @@ function parseJsonLike(value: unknown): unknown {
   } catch {
     return value;
   }
+}
+
+function parseNestedJsonLike(value: unknown, depth: number = 0): unknown {
+  if (depth > 12) return value;
+  const parsed = parseJsonLike(value);
+  if (parsed !== value) {
+    return parseNestedJsonLike(parsed, depth + 1);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => parseNestedJsonLike(item, depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+      out[key] = parseNestedJsonLike(child, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
+function decodeEscapedUnicode(value: string): string {
+  return value.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => (
+    String.fromCharCode(parseInt(hex, 16))
+  ));
 }
 
 function normalizeText(value: unknown, maxLen: number = 140): string {
@@ -150,6 +176,32 @@ function formatFinishReason(reason: string | null): string {
   return reason;
 }
 
+function getRoundDisplayTitle(round: {
+  run_kind?: string;
+  user_message_preview: string;
+  subagent_description?: string | null;
+  subagent_prompt_preview?: string | null;
+}): string {
+  if (isSubagentRoundLike(round)) {
+    return round.subagent_description || round.subagent_prompt_preview || '子 Agent 任务';
+  }
+  return round.user_message_preview || '无用户消息';
+}
+
+function isSubagentRoundLike(round: {
+  run_kind?: string;
+  parent_run_id?: string | null;
+  user_message_preview?: string | null;
+}): boolean {
+  if (round.run_kind === 'subagent') return true;
+  const preview = round.user_message_preview || '';
+  return preview.startsWith('You are a child agent run spawned by a parent OpenCapyBox agent.');
+}
+
+function getRoundKindLabel(round: { run_kind?: string; parent_run_id?: string | null; user_message_preview?: string | null }): string {
+  return isSubagentRoundLike(round) ? '子Agent' : '主Agent';
+}
+
 function hasStepRawPayload(step: AdminRoundStepItem): boolean {
   const hasValue = (value: unknown): boolean => {
     if (value === null || value === undefined) return false;
@@ -179,11 +231,11 @@ function buildStepAnalysis(step: AdminRoundStepItem): {
   suggestedReview: '没问题' | '建议复核' | '有问题';
   findings: string[];
 } {
-  const parsedRequestMessages = parseJsonLike(step.request_messages);
-  const parsedRequestTools = parseJsonLike(step.request_tools);
-  const parsedResponseToolCalls = parseJsonLike(step.response_tool_calls);
-  const parsedResponseContent = parseJsonLike(step.response_content);
-  const parsedResponseThinking = parseJsonLike(step.response_thinking);
+  const parsedRequestMessages = parseNestedJsonLike(step.request_messages);
+  const parsedRequestTools = parseNestedJsonLike(step.request_tools);
+  const parsedResponseToolCalls = parseNestedJsonLike(step.response_tool_calls);
+  const parsedResponseContent = parseNestedJsonLike(step.response_content);
+  const parsedResponseThinking = parseNestedJsonLike(step.response_thinking);
 
   let provider = '-';
   let model = '-';
@@ -270,7 +322,8 @@ function buildStepAnalysis(step: AdminRoundStepItem): {
 }
 
 function statusClass(status: string): string {
-  if (status === 'running' || status === 'resumed') return 'running';
+  if (status === 'running') return 'running';
+  if (status === 'resumed') return 'paused';
   if (status === 'ok' || status === 'active' || status === 'completed' || status === 'success') return 'ok';
   if (status === 'failed' || status === 'error' || status === 'cancelled') return 'error';
   if (status === 'admin' || status === 'user') return status;
@@ -964,15 +1017,30 @@ function RoundsPanel({
                             {session.rounds.map((round) => {
                               const roundExpanded = !!expandedRounds[round.round_id];
                               const RoundChevron = roundExpanded ? ChevronDown : ChevronRight;
+                              const isSubagentRound = isSubagentRoundLike(round);
                               return (
                                 <Fragment key={round.round_id}>
-                                  <tr className="admin-round-row">
+                                  <tr className={`admin-round-row ${isSubagentRound ? 'subagent' : 'main-agent'}`}>
                                     <td>
-                                      <button className="admin-tree-toggle" onClick={() => toggleRound(round.round_id)}>
-                                        <RoundChevron size={14} />
-                                        <span>{round.user_message_preview || '无用户消息'}</span>
-                                      </button>
-                                      <div className="admin-subline">{round.round_id}</div>
+                                      <div className="admin-round-title-line">
+                                        <button className="admin-tree-toggle" onClick={() => toggleRound(round.round_id)}>
+                                          <RoundChevron size={14} />
+                                          <span>{getRoundDisplayTitle(round)}</span>
+                                        </button>
+                                        <span className={`admin-run-kind ${isSubagentRound ? 'subagent' : 'main'}`}>
+                                          {getRoundKindLabel(round)}
+                                        </span>
+                                        {round.subagent_type ? (
+                                          <span className="admin-run-kind muted">{round.subagent_type}</span>
+                                        ) : null}
+                                        {!isSubagentRound && round.subagent_child_count > 0 ? (
+                                          <span className="admin-run-kind muted">派生 {round.subagent_child_count}</span>
+                                        ) : null}
+                                      </div>
+                                      <div className="admin-subline">
+                                        {round.round_id}
+                                        {isSubagentRound && round.parent_run_id ? ` · parent ${round.parent_run_id}` : ''}
+                                      </div>
                                     </td>
                                     <td>
                                       <span className={`admin-status ${statusClass(round.status)}`}>{round.status}</span>
@@ -992,6 +1060,7 @@ function RoundsPanel({
                                           <thead>
                                             <tr>
                                               <th>Step</th>
+                                              <th>详情</th>
                                               <th>消息数</th>
                                               <th>Prompt</th>
                                               <th>Completion</th>
@@ -1002,7 +1071,6 @@ function RoundsPanel({
                                               <th>压缩</th>
                                               <th>审阅</th>
                                               <th>时间</th>
-                                              <th>详情</th>
                                             </tr>
                                           </thead>
                                           <tbody>
@@ -1021,6 +1089,17 @@ function RoundsPanel({
                                                 <Fragment key={step.llm_record_id}>
                                                   <tr>
                                                     <td>{step.step_index}</td>
+                                                    <td>
+                                                      <button
+                                                        className="admin-link-button"
+                                                        disabled={!!stepLoadingIds[step.llm_record_id]}
+                                                        onClick={() => {
+                                                          void toggleStepDetail(step);
+                                                        }}
+                                                      >
+                                                        {stepLoadingIds[step.llm_record_id] ? '加载中...' : detailExpanded ? '收起' : '详情'}
+                                                      </button>
+                                                    </td>
                                                     <td>{step.request_message_count}</td>
                                                     <td>{formatNumber(step.usage_prompt_tokens)}</td>
                                                     <td>{formatNumber(step.usage_completion_tokens)}</td>
@@ -1043,17 +1122,6 @@ function RoundsPanel({
                                                       </select>
                                                     </td>
                                                     <td>{formatDateTime(step.created_at)}</td>
-                                                    <td>
-                                                      <button
-                                                        className="admin-link-button"
-                                                        disabled={!!stepLoadingIds[step.llm_record_id]}
-                                                        onClick={() => {
-                                                          void toggleStepDetail(step);
-                                                        }}
-                                                      >
-                                                        {stepLoadingIds[step.llm_record_id] ? '加载中...' : detailExpanded ? '收起' : '详情'}
-                                                      </button>
-                                                    </td>
                                                   </tr>
 
                                                   {detailExpanded ? (

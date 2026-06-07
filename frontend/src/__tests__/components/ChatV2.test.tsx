@@ -25,7 +25,12 @@ vi.mock('../../services/api', () => ({
 // Mock 子组件
 vi.mock('../../components/Round', () => ({
   Round: ({ round, isStreaming }: any) => (
-    <div data-testid="round">
+    <div
+      data-testid="round"
+      data-assistant={round.final_response}
+      data-steps={JSON.stringify(round.steps)}
+      data-status={round.status}
+    >
       <span>Round: {round.round_id}</span>
       <span>Streaming: {String(isStreaming)}</span>
       <span>User: {round.user_message}</span>
@@ -750,10 +755,102 @@ describe('ChatV2 组件', () => {
       expect(apiService.subscribeToRound).toHaveBeenCalledWith(
         'session-init',
         'round-ready',
-        expect.any(Object)
+        expect.any(Object),
+        0,
       );
     }, { timeout: 3000 });
     expect(apiService.getRunningSessions).not.toHaveBeenCalled();
+  });
+
+  it('running history 订阅应从 last_event_sequence 后续接', async () => {
+    const runningRound: RoundData = {
+      round_id: 'round-sequenced',
+      user_message: '运行中',
+      final_response: '',
+      steps: [],
+      step_count: 0,
+      status: 'running',
+      created_at: new Date().toISOString(),
+      last_event_sequence: 7,
+    };
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [runningRound],
+      session_id: 'test-session',
+      total: 1,
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(apiService.subscribeToRound).toHaveBeenCalledWith(
+        'test-session',
+        'round-sequenced',
+        expect.any(Object),
+        7,
+      );
+    });
+  });
+
+  it('running history 收到终态时应清理临时 assistant_content', async () => {
+    const runningRound: RoundData = {
+      round_id: 'round-live-final',
+      user_message: '运行中',
+      final_response: '',
+      steps: [
+        {
+          step_number: 1,
+          thinking: '',
+          assistant_content: '临时正文',
+          tool_calls: [],
+          tool_results: [],
+          status: 'running',
+        },
+      ],
+      step_count: 1,
+      status: 'running',
+      created_at: new Date().toISOString(),
+      last_event_sequence: 4,
+    };
+
+    let subscribeCallbacks: any = null;
+    vi.mocked(apiService.subscribeToRound).mockImplementation((_sid, _rid, callbacks: any) => {
+      subscribeCallbacks = callbacks;
+      return {
+        abort: vi.fn(),
+        promise: new Promise(() => {}),
+      } as any;
+    });
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [runningRound],
+      session_id: 'test-session',
+      total: 1,
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(apiService.subscribeToRound).toHaveBeenCalled();
+    });
+
+    await act(async () => {
+      subscribeCallbacks.onRunFinished(
+        'test-session',
+        'round-live-final',
+        { finalResponse: '最终结果' },
+        'success',
+        undefined,
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('round')).toHaveAttribute('data-assistant', '最终结果');
+    });
+
+    const steps = JSON.parse(screen.getByTestId('round').getAttribute('data-steps') || '[]');
+    expect(steps[0].assistant_content).toBe('');
+    expect(steps[0].status).toBe('completed');
   });
 
   it('StrictMode 下并发历史加载只应保留最新 running 订阅', async () => {
@@ -824,7 +921,8 @@ describe('ChatV2 组件', () => {
     expect(apiService.subscribeToRound).toHaveBeenCalledWith(
       'test-session',
       'round-strict-running',
-      expect.any(Object)
+      expect.any(Object),
+      0,
     );
   });
 
@@ -896,6 +994,7 @@ describe('ChatV2 组件', () => {
 
     // UI 应该在 abort HTTP 返回前立即更新 — 不再显示停止按钮，输入框可用
     expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
+    expect(screen.getByTestId('round')).toHaveAttribute('data-status', 'cancelled');
 
     const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
     expect(textarea).not.toBeDisabled();
@@ -966,6 +1065,50 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('test-session');
     });
+
+    expect(screen.getByTestId('round')).toHaveAttribute('data-status', 'cancelled');
+  });
+
+  it('只收到 RUN_FINISHED 时也应收敛临时 round 并展示最终结果', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'test-session',
+      total: 0,
+    });
+
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
+      callbacks.onStreamAccepted?.();
+      callbacks.onRunFinished?.(
+        'test-session',
+        'restored-run-1',
+        { finalResponse: '最终结果已生成' },
+        'success',
+        undefined
+      );
+    });
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: '触发最终结果恢复' } });
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Round: restored-run-1')).toBeInTheDocument();
+      expect(screen.getByTestId('round')).toHaveAttribute('data-assistant', '最终结果已生成');
+    });
+    expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('test-session');
   });
 
   it('abort 时应清理残留的 pendingInterrupt（QuestionCard 不应残留）', async () => {

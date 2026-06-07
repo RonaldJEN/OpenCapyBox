@@ -419,6 +419,110 @@ class TestSessionsRouter:
             ],
         }
 
+    def test_get_running_sessions_uses_parent_round_when_subagent_child_is_running(self, sessions_client):
+        from src.api.models.subagent_run import SubagentRun
+
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "session-subagent-running")
+            self._add_user_run_lock(db, "session-subagent-running", lock_id="lock-sub", slot=0)
+            self._add_running_round(db, "session-subagent-running", round_id="parent-run")
+            self._add_running_round(db, "session-subagent-running", round_id="child-run")
+            db.add(SubagentRun(
+                user_id="user-1",
+                session_id="session-subagent-running",
+                root_run_id="parent-run",
+                parent_run_id="parent-run",
+                child_run_id="child-run",
+                agent_type="general-purpose",
+                model_id="sonnet",
+                prompt="child internal prompt",
+                status=SubagentRun.RUNNING,
+            ))
+            db.commit()
+
+        response = sessions_client.get("/sessions/running-sessions")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "running_sessions": [
+                {"session_id": "session-subagent-running", "round_id": "parent-run"},
+            ],
+        }
+
+    def test_main_running_round_helper_excludes_subagent_child_rounds(self, sessions_client):
+        from src.api.models.subagent_run import SubagentRun
+        from src.api.services.running_rounds import get_main_running_round
+
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "session-abort-target")
+            self._add_running_round(db, "session-abort-target", round_id="child-run")
+            self._add_running_round(db, "session-abort-target", round_id="parent-run")
+            db.add(SubagentRun(
+                user_id="user-1",
+                session_id="session-abort-target",
+                root_run_id="parent-run",
+                parent_run_id="parent-run",
+                child_run_id="child-run",
+                agent_type="general-purpose",
+                model_id="sonnet",
+                prompt="child internal prompt",
+                status=SubagentRun.RUNNING,
+            ))
+            db.commit()
+
+            running_round = get_main_running_round(db, session_id="session-abort-target")
+
+        assert running_round is not None
+        assert running_round.id == "parent-run"
+
+    def test_history_v2_excludes_subagent_child_rounds(self, sessions_client):
+        from src.api.models.auth_user import AuthUser
+        from src.api.models.subagent_run import SubagentRun
+
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            db.add(AuthUser(
+                user_id="user-1",
+                username="user-1",
+                auth_type="simple",
+                password_hash="hash",
+                enabled=True,
+            ))
+            self._add_session(db, "session-subagent")
+            self._add_round(
+                db,
+                "session-subagent",
+                round_id="parent-run",
+                user_message="delegate this",
+                final_response="parent done",
+            )
+            self._add_round(
+                db,
+                "session-subagent",
+                round_id="child-run",
+                user_message="child internal prompt",
+                final_response="child internal answer",
+            )
+            db.add(SubagentRun(
+                user_id="user-1",
+                session_id="session-subagent",
+                root_run_id="parent-run",
+                parent_run_id="parent-run",
+                child_run_id="child-run",
+                agent_type="general-purpose",
+                model_id="sonnet",
+                prompt="child internal prompt",
+                status=SubagentRun.COMPLETED,
+            ))
+            db.commit()
+
+        response = sessions_client.get("/sessions/session-subagent/history/v2")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 1
+        assert [item["round_id"] for item in payload["rounds"]] == ["parent-run"]
+        assert "child internal answer" not in json.dumps(payload, ensure_ascii=False)
+
     def test_get_running_sessions_includes_init_window_lock_without_round(self, sessions_client):
         with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
             self._add_session(db, "session-init")
@@ -1392,6 +1496,12 @@ class TestSandboxListDir:
 class TestAbortEndpoint:
     """Abort 端點測試"""
 
+    @staticmethod
+    def _cancel_result(request_id: str):
+        from src.api.schemas.turn import CancelResult
+
+        return CancelResult(request_id=request_id, state="acked")
+
     @pytest.fixture(autouse=True)
     def _mock_cross_session_abort_helpers(self):
         with patch(
@@ -1490,7 +1600,11 @@ class TestAbortEndpoint:
         mock_pool.get.return_value = mock_agent_service
         mock_pool_fn.return_value = mock_pool
 
-        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-1"):
+        with patch(
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=self._cancel_result("req-1"),
+        ):
             response = client.post("/chat/session-1/abort")
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
@@ -1539,7 +1653,11 @@ class TestAbortEndpoint:
         mock_pool.get.return_value = None
         mock_pool_fn.return_value = mock_pool
 
-        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-lock-failed"), patch(
+        with patch(
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=self._cancel_result("req-lock-failed"),
+        ), patch(
             "src.api.routes.chat._release_user_run_lock_in_new_session",
             new_callable=AsyncMock,
             return_value=False,
@@ -1612,7 +1730,11 @@ class TestAbortEndpoint:
 
         mock_runner = DummyRunner()
 
-        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-force"), patch.dict(
+        with patch(
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=self._cancel_result("req-force"),
+        ), patch.dict(
             chat_mod._active_runners,
             {"session-1": mock_runner},
             clear=True,
@@ -1621,14 +1743,14 @@ class TestAbortEndpoint:
 
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
-        assert response.json()["reason"] == "force_stopped"
+        assert response.json()["reason"] == "force_aborted"
         assert response.json()["request_id"] == "req-force"
-        assert mock_runner.cancel_count == 1
+        assert mock_runner.cancel_count == 0
         assert mock_agent_service.cancel_token.is_set()
 
     @patch("src.api.routes.chat.get_agent_pool")
-    def test_abort_with_local_runner_uses_short_wait_budget(self, mock_pool_fn, client):
-        """本地 runner 的同步等待预算应保持短窗口，避免暂停响应变慢。"""
+    def test_abort_with_local_runner_does_not_force_cancel_task(self, mock_pool_fn, client):
+        """P2 后本地 runner 只通过 cancel_token/终态检查退出，不再 task.cancel。"""
         import asyncio
         from src.api.models.session import Session as SessionModel
         from src.api.models.round import Round as RoundModel
@@ -1687,7 +1809,11 @@ class TestAbortEndpoint:
             observed_timeout["value"] = timeout
             raise asyncio.TimeoutError()
 
-        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-short"), patch(
+        with patch(
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=self._cancel_result("req-short"),
+        ), patch(
             "src.api.routes.chat.asyncio.wait_for",
             new=AsyncMock(side_effect=fake_wait_for),
         ), patch.dict(
@@ -1700,8 +1826,7 @@ class TestAbortEndpoint:
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
         assert response.json()["reason"] == "force_aborted"
-        assert observed_timeout["value"] == chat_mod._LOCAL_RUNNER_ABORT_WAIT_SECONDS
-        assert observed_timeout["value"] == 0.2
+        assert observed_timeout == {}
 
     @patch("src.api.routes.chat.get_agent_pool")
     def test_abort_uses_id_snapshots_after_commit_to_avoid_deleted_object_crash(self, mock_pool_fn, client):
@@ -1771,9 +1896,11 @@ class TestAbortEndpoint:
         mock_pool.get.return_value = None
         mock_pool_fn.return_value = mock_pool
 
-        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-snapshot"), patch(
-            "src.api.routes.chat._broadcast_to_subscribers", new_callable=AsyncMock
-        ) as mock_broadcast, patch(
+        with patch(
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=self._cancel_result("req-snapshot"),
+        ), patch(
             "src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock
         ) as mock_release, patch(
             "src.api.routes.chat._complete_cancel_request_in_new_session", new_callable=AsyncMock
@@ -1783,8 +1910,6 @@ class TestAbortEndpoint:
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
         assert response.json()["reason"] == "force_aborted"
-        mock_broadcast.assert_awaited_once()
-        assert mock_broadcast.await_args.args[0] == "round-1"
         mock_release.assert_awaited_once_with(
             user_id="testuser",
             lock_id="lock-1",
@@ -1832,7 +1957,9 @@ class TestAbortEndpoint:
         mock_settings.sse_subscribe_timeout = 300
 
         with patch("src.api.routes.chat.get_settings", return_value=mock_settings), patch(
-            "src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-init-window"
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=self._cancel_result("req-init-window"),
         ):
             response = client.post("/chat/session-1/abort")
 
@@ -1886,7 +2013,9 @@ class TestAbortEndpoint:
         mock_settings.sse_subscribe_timeout = 300
 
         with patch("src.api.routes.chat.get_settings", return_value=mock_settings), patch(
-            "src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-worker-dead"
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=self._cancel_result("req-worker-dead"),
         ):
             response = client.post("/chat/session-1/abort")
 
@@ -1935,7 +2064,11 @@ class TestAbortEndpoint:
         mock_pool.get.return_value = mock_agent_service
         mock_pool_fn.return_value = mock_pool
 
-        with patch("src.api.routes.chat._upsert_cancel_request", new_callable=AsyncMock, return_value="req-2"):
+        with patch(
+            "src.api.routes.chat._turn_orchestrator.cancel_turn",
+            new_callable=AsyncMock,
+            return_value=self._cancel_result("req-2"),
+        ):
             response = client.post("/chat/session-1/abort")
 
         assert response.status_code == 200
@@ -1976,7 +2109,7 @@ class TestAbortEndpoint:
             if model is SessionModel:
                 chain.filter.return_value.first.return_value = mock_session
             elif model is RunCancelRequestModel:
-                chain.filter.return_value.first.return_value = mock_cancel
+                chain.filter.return_value.order_by.return_value.first.return_value = mock_cancel
             elif model is RoundModel:
                 chain.filter.return_value.first.return_value = mock_running_round
             return chain
@@ -2011,7 +2144,7 @@ class TestAbortEndpoint:
             if model is SessionModel:
                 chain.filter.return_value.first.return_value = mock_session
             elif model is RunCancelRequestModel:
-                chain.filter.return_value.first.return_value = None
+                chain.filter.return_value.order_by.return_value.first.return_value = None
             elif model is RoundModel:
                 chain.filter.return_value.first.return_value = None
             return chain
@@ -2030,36 +2163,3 @@ class TestAbortEndpoint:
         assert payload["completed_at"] is None
         assert payload["running"] is False
         assert payload["running_round_id"] is None
-
-
-class TestAbortEpochHelpers:
-    """abort-epoch 判定辅助函数测试。"""
-
-    def test_cancel_row_touched_after_detects_newer_completed_at(self):
-        """completed_at 晚于 run 启动时间时，应视为发生过较新 cancel 活动。"""
-        from datetime import timedelta
-        from src.api.routes.chat import _cancel_row_touched_after
-        from src.api.utils.timezone import now_naive
-
-        started_at = now_naive()
-        row = MagicMock()
-        row.requested_at = None
-        row.acked_at = None
-        row.completed_at = started_at + timedelta(seconds=1)
-
-        assert _cancel_row_touched_after(row=row, started_at=started_at) is True
-
-    def test_cancel_row_touched_after_ignores_older_timestamps(self):
-        """所有时间戳早于 run 启动时间时，不应误判为较新 cancel 活动。"""
-        from datetime import timedelta
-        from src.api.routes.chat import _cancel_row_touched_after
-        from src.api.utils.timezone import now_naive
-
-        started_at = now_naive()
-        older = started_at - timedelta(seconds=1)
-        row = MagicMock()
-        row.requested_at = older
-        row.acked_at = older
-        row.completed_at = older
-
-        assert _cancel_row_touched_after(row=row, started_at=started_at) is False

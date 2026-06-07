@@ -306,6 +306,14 @@ describe('AdminConsole 组件', () => {
               session_id: 'session-1',
               user_id: 'admin',
               session_title: '会话A',
+              run_kind: 'main',
+              parent_run_id: null,
+              root_run_id: 'round-1',
+              subagent_edge_id: null,
+              subagent_type: null,
+              subagent_description: null,
+              subagent_prompt_preview: null,
+              subagent_child_count: 0,
               status: 'completed',
               step_count: 1,
               started_at: '2026-04-26T10:00:00',
@@ -322,7 +330,19 @@ describe('AdminConsole 组件', () => {
                   llm_record_id: 101,
                   step_index: 1,
                   request_message_count: 3,
-                  request_messages: '[{"role":"user","content":"hi"}]',
+                  request_messages: JSON.stringify([
+                    {
+                      role: 'assistant',
+                      tool_calls: [
+                        {
+                          function: {
+                            name: 'sub_agent',
+                            arguments: '{"description":"vlog\\u5b8c\\u6574\\u5236\\u4f5c\\u65b9\\u6848","prompt":"\\u4f60\\u597d"}',
+                          },
+                        },
+                      ],
+                    },
+                  ]),
                   request_tools: '[]',
                   finish_reason: 'stop',
                   response_error: null,
@@ -375,6 +395,7 @@ describe('AdminConsole 组件', () => {
       expect(screen.getByText('管理员分析摘要')).toBeInTheDocument();
       expect(screen.getByText(/建议审阅结论：没问题/)).toBeInTheDocument();
       expect(screen.getByText(/request_messages/)).toBeInTheDocument();
+      expect(screen.getByText(/vlog完整制作方案/)).toBeInTheDocument();
       expect(screen.getByText(/compaction_pre_tokens/)).toBeInTheDocument();
     });
 
@@ -383,6 +404,105 @@ describe('AdminConsole 组件', () => {
     await waitFor(() => {
       expect(updateAdminLLMCallReview).toHaveBeenCalledWith(101, '有问题');
     });
+  });
+
+  it('Session监控应区分主Agent和子Agent Round', async () => {
+    vi.mocked(getAdminRoundsTree).mockResolvedValue({
+      total_sessions: 1,
+      offset: 0,
+      limit: 20,
+      sessions: [
+        {
+          session_id: 'session-subagent',
+          user_id: 'admin',
+          session_title: '请求提问',
+          rounds_count: 2,
+          last_round_at: '2026-06-05T10:00:00',
+          sum_step_count: 3,
+          total_tokens: 1000,
+          llm_calls: 3,
+          error_calls: 0,
+          compaction_steps: 0,
+          total_duration_s: 10,
+          status: 'completed',
+          rounds: [
+            {
+              round_id: 'parent-run',
+              session_id: 'session-subagent',
+              user_id: 'admin',
+              session_title: '请求提问',
+              run_kind: 'main',
+              parent_run_id: null,
+              root_run_id: 'parent-run',
+              subagent_edge_id: null,
+              subagent_type: null,
+              subagent_description: null,
+              subagent_prompt_preview: null,
+              subagent_child_count: 1,
+              status: 'completed',
+              step_count: 2,
+              started_at: '2026-06-05T10:00:00',
+              completed_at: '2026-06-05T10:00:05',
+              duration_s: 5,
+              user_message_preview: '你能不能给她派生长一点的任务',
+              final_response_preview: 'done',
+              total_tokens: 600,
+              llm_calls: 2,
+              error_calls: 0,
+              compaction_steps: 0,
+              steps: [],
+            },
+            {
+              round_id: 'child-run',
+              session_id: 'session-subagent',
+              user_id: 'admin',
+              session_title: '请求提问',
+              run_kind: 'main',
+              parent_run_id: 'parent-run',
+              root_run_id: 'parent-run',
+              subagent_edge_id: 'edge-1',
+              subagent_type: 'general-purpose',
+              subagent_description: 'vlog完整制作方案+分镜脚本+爆款标题',
+              subagent_prompt_preview: 'You are a child agent run spawned by a parent OpenCapyBox agent.',
+              subagent_child_count: 0,
+              status: 'completed',
+              step_count: 1,
+              started_at: '2026-06-05T10:00:01',
+              completed_at: '2026-06-05T10:00:06',
+              duration_s: 5,
+              user_message_preview: 'You are a child agent run spawned by a parent OpenCapyBox agent.',
+              final_response_preview: 'child done',
+              total_tokens: 400,
+              llm_calls: 1,
+              error_calls: 0,
+              compaction_steps: 0,
+              steps: [],
+            },
+          ],
+        },
+      ],
+    });
+
+    render(<AdminConsole />);
+
+    await waitFor(() => {
+      expect(getAdminOverview).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Session监控/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('请求提问')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /请求提问/ }));
+
+    expect(screen.getByText('主Agent')).toBeInTheDocument();
+    expect(screen.getByText('子Agent')).toBeInTheDocument();
+    expect(screen.getByText('派生 1')).toBeInTheDocument();
+    expect(screen.getByText('general-purpose')).toBeInTheDocument();
+    expect(screen.getByText('vlog完整制作方案+分镜脚本+爆款标题')).toBeInTheDocument();
+    expect(screen.getByText(/parent parent-run/)).toBeInTheDocument();
   });
 
   it('用户管理页可创建 simple 用户', async () => {
@@ -463,7 +583,7 @@ describe('AdminConsole 组件', () => {
     });
     const originalCreateObjectURL = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');
     const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL');
-    const createObjectURLMock = vi.fn((_: Blob) => 'blob:users-csv');
+    const createObjectURLMock = vi.fn<[Blob], string>(() => 'blob:users-csv');
     const revokeObjectURLMock = vi.fn();
     const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, writable: true, value: createObjectURLMock });
@@ -725,6 +845,14 @@ describe('AdminConsole 组件', () => {
               session_id: 'session-obj',
               user_id: 'admin',
               session_title: '对象字段会话',
+              run_kind: 'main',
+              parent_run_id: null,
+              root_run_id: 'round-obj',
+              subagent_edge_id: null,
+              subagent_type: null,
+              subagent_description: null,
+              subagent_prompt_preview: null,
+              subagent_child_count: 0,
               status: 'completed',
               step_count: 1,
               started_at: '2026-04-26T10:00:00',
@@ -822,6 +950,14 @@ describe('AdminConsole 组件', () => {
               session_id: 'session-404',
               user_id: 'admin',
               session_title: '写回404会话',
+              run_kind: 'main',
+              parent_run_id: null,
+              root_run_id: 'round-404',
+              subagent_edge_id: null,
+              subagent_type: null,
+              subagent_description: null,
+              subagent_prompt_preview: null,
+              subagent_child_count: 0,
               status: 'completed',
               step_count: 1,
               started_at: '2026-04-26T10:00:00',

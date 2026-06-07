@@ -74,7 +74,10 @@ CREATE EXTENSION IF NOT EXISTS vector;
 | `AGENT_USER_CONCURRENCY_LIMIT` | 否 | `1` | 同一用户允许同时运行的不同会话数 |
 | `SSE_HEARTBEAT_INTERVAL` | 否 | `15` | SSE 心跳间隔（秒） |
 | `SSE_SUBSCRIBE_TIMEOUT` | 否 | `300` | SSE 订阅超时（秒） |
+| `AGUI_REPAIR_TERMINAL_SINCE_HOURS` | 否 | `24` | `scripts/repair_terminal_runs.py` 默认扫描窗口（小时） |
 | `TIMEZONE_OFFSET` | 否 | `8` | UTC 偏移小时数（中国大陆常用 8） |
+
+> 第一版 Agent runtime 依赖进程内 `AguiEventBus`、subscriber registry 和 per-run cancel token，正确性假设为单 worker。生产入口、容器和进程管理应按 `UVICORN_WORKERS=1` 部署；恢复多 worker 前必须引入外部 bus/lease 或 durable command queue。
 
 ## 超时体系说明
 
@@ -101,7 +104,7 @@ Agent 逻辑层
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `UVICORN_WORKERS` | 否 | `2` | Uvicorn worker 数（Docker/K8s 部署时生效） |
+| `UVICORN_WORKERS` | 否 | `1` | Uvicorn worker 数（Docker/K8s 部署时生效）；第一版必须保持单 worker |
 | `LOG_LEVEL` | 否 | `info` | 日志级别 |
 
 ## 搜索与 Embedding

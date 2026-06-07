@@ -22,6 +22,7 @@ vi.mock('../../services/api', () => ({
     getModels: vi.fn().mockResolvedValue({
       models: [{ id: 'test-model', name: 'Test Model' }],
       default_model: 'test-model',
+      subagent_default_model: 'test-model',
     }),
     createSession: vi.fn().mockResolvedValue({
       session_id: 'new-session',

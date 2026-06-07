@@ -15,7 +15,7 @@ import tiktoken
 from .llm import LLMClient
 from .logger import AgentLogger
 from .schema import Message
-from .tools.base import Tool, ToolResult
+from .tools.base import Tool, ToolResult, ToolRuntimeContext
 from .tools.ask_user_tool import ASK_USER_TOOL_NAME
 from .utils import calculate_display_width
 from .utils.token_utils import truncate_text_by_tokens
@@ -1640,7 +1640,16 @@ Rules:
                         start_time = time.time()
                         try:
                             tool = self.tools[function_name]
-                            timeout = tool.execute_timeout or self.tool_timeout
+                            tool.set_runtime_context(
+                                ToolRuntimeContext(
+                                    thread_id=thread_id,
+                                    run_id=run_id,
+                                    tool_call_id=tool_call_id,
+                                    tool_name=function_name,
+                                    cancel_token=cancel_token,
+                                )
+                            )
+                            timeout = self.tool_timeout if tool.execute_timeout is None else tool.execute_timeout
                             if timeout > 0:
                                 result = await asyncio.wait_for(
                                     tool.execute(**arguments),
@@ -1649,7 +1658,7 @@ Rules:
                             else:
                                 result = await tool.execute(**arguments)
                         except asyncio.TimeoutError:
-                            timeout_used = tool.execute_timeout or self.tool_timeout
+                            timeout_used = self.tool_timeout if tool.execute_timeout is None else tool.execute_timeout
                             result = ToolResult(
                                 success=False,
                                 content="",
@@ -1665,6 +1674,11 @@ Rules:
                                 error=f"Tool execution failed: {error_detail}\n\nTraceback:\n{error_trace}",
                             )
                         finally:
+                            if "tool" in locals():
+                                try:
+                                    tool.clear_runtime_context()
+                                except Exception:
+                                    logger.debug("工具清理 runtime context 失败: %s", function_name, exc_info=True)
                             end_time = time.time()
                             execution_time_ms = int((end_time - start_time) * 1000)
                     

@@ -5,6 +5,23 @@ import json
 import asyncio
 
 from tests.helpers import make_mock_round
+from src.api.services.agui_event_bus import get_agui_event_bus
+
+
+def _event_subscribers():
+    return get_agui_event_bus().subscribers
+
+
+def _event_subscribers_lock():
+    return get_agui_event_bus().subscribers_lock
+
+
+async def _publish_ephemeral(round_id: str, event):
+    await get_agui_event_bus().publish_ephemeral(round_id, event)
+
+
+def _cleanup_event_subscribers(round_id: str):
+    get_agui_event_bus().cleanup_subscribers(round_id)
 
 
 class TestRequestDbReadTransactions:
@@ -29,35 +46,33 @@ class TestRequestDbReadTransactions:
 class TestRoundSubscribersManagement:
     """轮次订阅者管理测试"""
 
-    def test_round_subscribers_initialization(self):
+    def test_event_subscribers_initialization(self):
         """测试订阅者字典初始化"""
-        from src.api.routes.chat import _round_subscribers
 
-        assert isinstance(_round_subscribers, dict)
+        assert isinstance(_event_subscribers(), dict)
 
-    def test_round_subscribers_operations(self):
+    def test_event_subscribers_operations(self):
         """测试订阅者字典操作"""
-        from src.api.routes.chat import _round_subscribers
 
         # 保存原始状态
-        original_keys = list(_round_subscribers.keys())
+        original_keys = list(_event_subscribers().keys())
 
         # 添加测试条目
         test_round_id = "test-round-12345"
-        _round_subscribers[test_round_id] = []
+        _event_subscribers()[test_round_id] = []
 
-        assert test_round_id in _round_subscribers
+        assert test_round_id in _event_subscribers()
 
         # 添加订阅者队列
         queue = asyncio.Queue()
-        _round_subscribers[test_round_id].append(queue)
+        _event_subscribers()[test_round_id].append(queue)
 
-        assert len(_round_subscribers[test_round_id]) == 1
+        assert len(_event_subscribers()[test_round_id]) == 1
 
         # 清理
-        del _round_subscribers[test_round_id]
+        del _event_subscribers()[test_round_id]
 
-        assert test_round_id not in _round_subscribers
+        assert test_round_id not in _event_subscribers()
 
 
 class TestBroadcastToSubscribers:
@@ -66,22 +81,20 @@ class TestBroadcastToSubscribers:
     @pytest.mark.asyncio
     async def test_broadcast_no_subscribers(self):
         """测试无订阅者时广播"""
-        from src.api.routes.chat import _broadcast_to_subscribers, _round_subscribers
 
         test_round_id = "broadcast-test-no-subs"
         event = {"type": "test", "data": "hello"}
 
         # 确保没有订阅者
-        if test_round_id in _round_subscribers:
-            del _round_subscribers[test_round_id]
+        if test_round_id in _event_subscribers():
+            del _event_subscribers()[test_round_id]
 
         # 不应抛出异常
-        await _broadcast_to_subscribers(test_round_id, event)
+        await _publish_ephemeral(test_round_id, event)
 
     @pytest.mark.asyncio
     async def test_broadcast_with_subscribers(self):
         """测试有订阅者时广播"""
-        from src.api.routes.chat import _broadcast_to_subscribers, _round_subscribers
 
         test_round_id = "broadcast-test-with-subs"
         event = {"type": "step", "round_id": test_round_id, "data": "test"}
@@ -90,11 +103,11 @@ class TestBroadcastToSubscribers:
         queue1 = asyncio.Queue()
         queue2 = asyncio.Queue()
 
-        _round_subscribers[test_round_id] = [queue1, queue2]
+        _event_subscribers()[test_round_id] = [queue1, queue2]
 
         try:
             # 广播事件
-            await _broadcast_to_subscribers(test_round_id, event)
+            await _publish_ephemeral(test_round_id, event)
 
             # 验证两个队列都收到了事件
             event1 = await asyncio.wait_for(queue1.get(), timeout=1.0)
@@ -104,13 +117,12 @@ class TestBroadcastToSubscribers:
             assert event2 == event
         finally:
             # 清理
-            if test_round_id in _round_subscribers:
-                del _round_subscribers[test_round_id]
+            if test_round_id in _event_subscribers():
+                del _event_subscribers()[test_round_id]
 
     @pytest.mark.asyncio
     async def test_broadcast_handles_queue_error(self):
         """测试广播处理队列错误"""
-        from src.api.routes.chat import _broadcast_to_subscribers, _round_subscribers
 
         test_round_id = "broadcast-error-test"
         event = {"type": "test"}
@@ -121,18 +133,18 @@ class TestBroadcastToSubscribers:
 
         good_queue = asyncio.Queue()
 
-        _round_subscribers[test_round_id] = [bad_queue, good_queue]
+        _event_subscribers()[test_round_id] = [bad_queue, good_queue]
 
         try:
             # 不应抛出异常，即使一个队列出错
-            await _broadcast_to_subscribers(test_round_id, event)
+            await _publish_ephemeral(test_round_id, event)
 
             # 好的队列仍应收到事件
             event_received = await asyncio.wait_for(good_queue.get(), timeout=1.0)
             assert event_received == event
         finally:
-            if test_round_id in _round_subscribers:
-                del _round_subscribers[test_round_id]
+            if test_round_id in _event_subscribers():
+                del _event_subscribers()[test_round_id]
 
 
 class TestCleanupSubscribers:
@@ -140,29 +152,27 @@ class TestCleanupSubscribers:
 
     def test_cleanup_existing_round(self):
         """测试清理已存在的轮次订阅者"""
-        from src.api.routes.chat import _cleanup_subscribers, _round_subscribers
 
         test_round_id = "cleanup-test-existing"
-        _round_subscribers[test_round_id] = [asyncio.Queue()]
+        _event_subscribers()[test_round_id] = [asyncio.Queue()]
 
-        _cleanup_subscribers(test_round_id)
+        _cleanup_event_subscribers(test_round_id)
 
-        assert test_round_id not in _round_subscribers
+        assert test_round_id not in _event_subscribers()
 
     def test_cleanup_nonexistent_round(self):
         """测试清理不存在的轮次"""
-        from src.api.routes.chat import _cleanup_subscribers, _round_subscribers
 
         test_round_id = "cleanup-test-nonexistent"
 
         # 确保不存在
-        if test_round_id in _round_subscribers:
-            del _round_subscribers[test_round_id]
+        if test_round_id in _event_subscribers():
+            del _event_subscribers()[test_round_id]
 
         # 不应抛出异常
-        _cleanup_subscribers(test_round_id)
+        _cleanup_event_subscribers(test_round_id)
 
-        assert test_round_id not in _round_subscribers
+        assert test_round_id not in _event_subscribers()
 
 
 class TestSubscribeEventTypes:
@@ -439,42 +449,40 @@ class TestSubscribeAsyncOperations:
     @pytest.mark.asyncio
     async def test_subscriber_queue_registration(self):
         """测试订阅者队列注册"""
-        from src.api.routes.chat import _round_subscribers
 
         test_round_id = "async-test-registration"
         subscriber_queue = asyncio.Queue()
 
         # 注册订阅者
-        if test_round_id not in _round_subscribers:
-            _round_subscribers[test_round_id] = []
-        _round_subscribers[test_round_id].append(subscriber_queue)
+        if test_round_id not in _event_subscribers():
+            _event_subscribers()[test_round_id] = []
+        _event_subscribers()[test_round_id].append(subscriber_queue)
 
         try:
-            assert test_round_id in _round_subscribers
-            assert subscriber_queue in _round_subscribers[test_round_id]
-            assert len(_round_subscribers[test_round_id]) == 1
+            assert test_round_id in _event_subscribers()
+            assert subscriber_queue in _event_subscribers()[test_round_id]
+            assert len(_event_subscribers()[test_round_id]) == 1
         finally:
-            del _round_subscribers[test_round_id]
+            del _event_subscribers()[test_round_id]
 
     @pytest.mark.asyncio
     async def test_subscriber_queue_removal(self):
         """测试订阅者队列移除"""
-        from src.api.routes.chat import _round_subscribers
 
         test_round_id = "async-test-removal"
         subscriber_queue = asyncio.Queue()
 
-        _round_subscribers[test_round_id] = [subscriber_queue]
+        _event_subscribers()[test_round_id] = [subscriber_queue]
 
         try:
             # 移除订阅者
-            _round_subscribers[test_round_id].remove(subscriber_queue)
+            _event_subscribers()[test_round_id].remove(subscriber_queue)
 
-            assert subscriber_queue not in _round_subscribers[test_round_id]
-            assert len(_round_subscribers[test_round_id]) == 0
+            assert subscriber_queue not in _event_subscribers()[test_round_id]
+            assert len(_event_subscribers()[test_round_id]) == 0
         finally:
-            if test_round_id in _round_subscribers:
-                del _round_subscribers[test_round_id]
+            if test_round_id in _event_subscribers():
+                del _event_subscribers()[test_round_id]
 
     @pytest.mark.asyncio
     async def test_queue_wait_for_timeout(self):
@@ -599,7 +607,6 @@ class TestSubscribeEndToEnd:
     @pytest.mark.asyncio
     async def test_complete_flow_for_running_round(self):
         """测试运行中轮次的完整流程：注册订阅 → 广播事件 → 接收"""
-        from src.api.routes.chat import _round_subscribers, _broadcast_to_subscribers
 
         round_id = "test-running-flow"
         round_status = "running"
@@ -609,19 +616,19 @@ class TestSubscribeEndToEnd:
 
         # 注册订阅者
         subscriber_queue = asyncio.Queue()
-        _round_subscribers[round_id] = [subscriber_queue]
+        _event_subscribers()[round_id] = [subscriber_queue]
 
         try:
             # 模拟 AG-UI 事件广播
             new_event = {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": "hello"}
-            await _broadcast_to_subscribers(round_id, new_event)
+            await _publish_ephemeral(round_id, new_event)
 
             received = await asyncio.wait_for(subscriber_queue.get(), timeout=1.0)
             assert received["type"] == "TEXT_MESSAGE_CONTENT"
             assert received["delta"] == "hello"
         finally:
-            if round_id in _round_subscribers:
-                del _round_subscribers[round_id]
+            if round_id in _event_subscribers():
+                del _event_subscribers()[round_id]
 
     def test_resumed_round_emits_interrupt_not_success(self):
         """测试 resumed 轮次应发 outcome=interrupt 而非 success
@@ -744,23 +751,20 @@ class TestSseDetachedProducer:
     @pytest.mark.asyncio
     async def test_producer_broadcasts_events(self):
         """producer 在迭代 event_source 时广播事件给订阅者"""
-        from src.api.routes.chat import (
-            _round_subscribers, _broadcast_to_subscribers,
-        )
 
         round_id = "test-producer-broadcast"
         subscriber_queue = asyncio.Queue()
-        _round_subscribers[round_id] = [subscriber_queue]
+        _event_subscribers()[round_id] = [subscriber_queue]
 
         try:
             test_event = {"type": "TEXT_MESSAGE_CONTENT", "delta": "hi"}
-            await _broadcast_to_subscribers(round_id, test_event)
+            await _publish_ephemeral(round_id, test_event)
 
             received = await asyncio.wait_for(subscriber_queue.get(), timeout=1.0)
             assert received["type"] == "TEXT_MESSAGE_CONTENT"
             assert received["delta"] == "hi"
         finally:
-            _round_subscribers.pop(round_id, None)
+            _event_subscribers().pop(round_id, None)
 
     @pytest.mark.asyncio
     async def test_producer_continues_after_consumer_stops(self):
@@ -840,6 +844,118 @@ class TestSseDetachedProducer:
         mock_history.complete_round.assert_called_once()
         call_kwargs = mock_history.complete_round.call_args
         assert call_kwargs.kwargs.get("status") == "failed" or call_kwargs[1].get("status") == "failed"
+
+    @pytest.mark.asyncio
+    async def test_run_round_stream_finally_fans_out_fallback_terminal(self):
+        """异常兜底写入 terminal 后应广播给本地订阅者。"""
+        from unittest.mock import MagicMock, AsyncMock
+        from src.api.services.agent_service import AgentService
+        from src.api.services.agui_event_bus import StoredEvent, get_agui_event_bus
+        from src.agent.schema.agui_events import RunStartedEvent
+
+        run_id = "test-run-fallback-fanout"
+        terminal_payload = {
+            "type": "RUN_ERROR",
+            "message": "Failed",
+            "code": "RUN_FAILED",
+            "sequence": 2,
+        }
+        mock_history = MagicMock()
+        mock_history.reset_session = MagicMock()
+        mock_history.is_round_terminal = MagicMock(return_value=False)
+        mock_history.save_agui_event = AsyncMock(side_effect=RuntimeError("event write failed"))
+        mock_history.complete_round = MagicMock()
+        mock_history.last_terminal_event = StoredEvent(run_id, 2, terminal_payload)
+
+        service = object.__new__(AgentService)
+        service.history_service = mock_history
+        service.session_id = "test-session"
+        service.cancel_token = None
+        service._active_run_count = 0
+        service.agent = MagicMock()
+
+        async def fake_run_agui(**kwargs):
+            yield RunStartedEvent(threadId="test-session", runId=run_id)
+
+        service.agent.run_agui = fake_run_agui
+
+        bus = get_agui_event_bus()
+        queue = asyncio.Queue()
+        with bus.subscribers_lock:
+            bus.subscribers[run_id] = [queue]
+
+        try:
+            with pytest.raises(RuntimeError, match="event write failed"):
+                async for _event in service._run_round_stream(
+                    run_id=run_id,
+                    user_message="test",
+                ):
+                    pass
+
+            received = await asyncio.wait_for(queue.get(), timeout=1.0)
+            assert received == terminal_payload
+        finally:
+            with bus.subscribers_lock:
+                bus.subscribers.pop(run_id, None)
+
+    @pytest.mark.asyncio
+    async def test_run_round_stream_yields_durable_terminal_when_externally_terminated(self):
+        """abort 已持久化终态时，原始 stream 仍应收到 durable RUN_FINISHED。"""
+        from unittest.mock import MagicMock, patch
+        from src.api.services.agent_service import AgentService
+        from src.api.services.agui_event_bus import StoredEvent
+        from src.agent.schema.agui_events import RunStartedEvent
+
+        run_id = "test-run-external-terminal"
+        terminal_payload = {
+            "type": "RUN_FINISHED",
+            "threadId": "test-session",
+            "runId": run_id,
+            "outcome": "interrupt",
+            "result": {"reason": "user_cancelled"},
+            "sequence": 2,
+        }
+        mock_history = MagicMock()
+        mock_history.db = MagicMock()
+        mock_history.is_round_terminal = MagicMock(return_value=True)
+        mock_history.get_round_status = MagicMock(return_value="cancelled")
+        mock_history.reset_session = MagicMock()
+        mock_history.complete_round = MagicMock()
+
+        service = object.__new__(AgentService)
+        service.history_service = mock_history
+        service.session_id = "test-session"
+        service.cancel_token = asyncio.Event()
+        service._active_run_count = 0
+        service.agent = MagicMock()
+
+        async def fake_run_agui(**kwargs):
+            yield RunStartedEvent(threadId="test-session", runId=run_id)
+
+        service.agent.run_agui = fake_run_agui
+
+        mock_completion = MagicMock()
+        mock_completion.ensure_terminal_sync.return_value = StoredEvent(
+            run_id=run_id,
+            sequence=2,
+            event=terminal_payload,
+        )
+
+        with patch(
+            "src.api.services.agent_service.RunCompletionService",
+            return_value=mock_completion,
+        ):
+            events = [
+                event
+                async for event in service._run_round_stream(
+                    run_id=run_id,
+                    user_message="test",
+                )
+            ]
+
+        assert events == [terminal_payload]
+        mock_completion.ensure_terminal_sync.assert_called_once_with(run_id)
+        mock_history.complete_round.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_run_round_stream_rolls_back_before_failed_round_update_after_db_error(self):
@@ -986,14 +1102,61 @@ class TestSseDetachedProducer:
         assert second_call.kwargs.get("status") == "failed" or second_call[1].get("status") == "failed"
 
 
-class TestCrossWorkerCancelFlow:
-    """跨 worker cancel 请求链路集成测试。"""
+class TestRunCancelRegistryFlow:
+    """单 worker cancel registry + append-only audit 链路测试。"""
+
+    def test_requested_after_does_not_cancel_newer_current_run(self):
+        """旧 cancel epoch 不应误伤同 session 后续新 run。"""
+        from datetime import timedelta
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from src.api.models.database import Base
+        from src.api.models.run_cancel_request import RunCancelRequest
+        from src.api.services.run_cancel_service import RunCancelService
+        from src.api.utils.timezone import now_naive
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+
+        service = RunCancelService()
+        cancel_token = asyncio.Event()
+        requested_after = now_naive()
+        service.register(
+            session_id="session-1",
+            run_id="new-run",
+            cancel_token=cancel_token,
+            started_at=requested_after + timedelta(seconds=1),
+        )
+
+        try:
+            with TestingSessionLocal() as db:
+                result = service.request_cancel(
+                    db,
+                    user_id="user-1",
+                    session_id="session-1",
+                    requested_after=requested_after,
+                )
+
+                row = db.query(RunCancelRequest).filter_by(request_id=result.request_id).one()
+                assert result.local_hit is False
+                assert result.target_run_id == "new-run"
+                assert row.state == "requested"
+                assert row.acked_at is None
+                assert not cancel_token.is_set()
+        finally:
+            Base.metadata.drop_all(bind=engine)
+            engine.dispose()
 
     @pytest.mark.asyncio
     async def test_cancel_request_requested_to_ack_to_completed_and_release_lock(self):
-        """模拟 A worker 执行、B worker 取消，最终应 ack+completed 且释放用户锁。"""
-        import os
-        from pathlib import Path
+        """abort 审计行 append；命中 Orchestrator registry 后 token 立即 set，结束后 completed。"""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
         from sqlalchemy.pool import StaticPool
@@ -1001,27 +1164,26 @@ class TestCrossWorkerCancelFlow:
         from src.api.models.database import Base
         from src.api.models.run_cancel_request import RunCancelRequest
         from src.api.models.user_run_lock import UserRunLock
-        from src.api.routes import chat as chat_routes
+        from src.api.schemas.chat import TextContentBlock
+        from src.api.schemas.turn import NormalizedInboundTurn, TurnCancelTarget, WebReplyRoute
+        from src.api.services.agent_service import PreparedAgentRun
+        from src.api.services.run_cancel_service import RunCancelService
+        from src.api.services.run_coordinator import RunCoordinator
+        from src.api.services.turn_orchestrator import TurnOrchestrator
+        from src.api.utils.timezone import now_naive
         from src.agent.schema.agui_events import RunStartedEvent, RunFinishedEvent
-        from tests.db_safety import create_all_for_test_engine, ensure_safe_test_database_url, load_dotenv_database_url
 
-        test_db_url = os.environ.get("TEST_DATABASE_URL", "")
-        if test_db_url.startswith("postgresql"):
-            ensure_safe_test_database_url(test_db_url, load_dotenv_database_url(Path(__file__).parent.parent))
-            engine = create_engine(test_db_url)
-        else:
-            engine = create_engine(
-                "sqlite://",
-                connect_args={"check_same_thread": False},
-                poolclass=StaticPool,
-            )
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
         TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        create_all_for_test_engine(engine, Base.metadata)
+        Base.metadata.create_all(bind=engine)
 
         user_id = "user-1"
         session_id = "session-1"
         lock_id = "lock-1"
-        cancel_token = asyncio.Event()
 
         try:
             # A worker 已持有用户锁并开始执行
@@ -1034,40 +1196,64 @@ class TestCrossWorkerCancelFlow:
                     )
                 )
                 setup_db.commit()
-                # B worker 发起 abort，写入跨 worker 可见 requested
-                await chat_routes._upsert_cancel_request(
-                    setup_db,
-                    user_id=user_id,
-                    session_id=session_id,
-                )
 
-            async def fake_event_source():
-                yield RunStartedEvent(threadId=session_id, runId="run-1")
-                # 等待 watcher 读取 requested 并触发 cancel_token
-                for _ in range(120):
-                    if cancel_token.is_set():
-                        break
-                    await asyncio.sleep(0.02)
-                assert cancel_token.is_set()
-                yield RunFinishedEvent(
-                    threadId=session_id,
-                    runId="run-1",
-                    outcome="interrupt",
-                    result={"reason": "user_cancelled"},
-                )
+            cancel_service = RunCancelService()
+            orchestrator = TurnOrchestrator(
+                cancel_service=cancel_service,
+                run_coordinator=RunCoordinator(session_factory=TestingSessionLocal),
+            )
 
-            with patch("src.api.routes.chat.SessionLocal", TestingSessionLocal):
-                chunks = []
-                async for chunk in chat_routes._sse_with_heartbeat(
-                    fake_event_source(),
-                    session_id=session_id,
-                    user_id=user_id,
+            class FakeAgentService:
+                cancel_token: asyncio.Event | None = None
+
+                async def prepare_chat_round(self, *, user_content, idempotency_key=None):
+                    return PreparedAgentRun(run_id="run-1", user_message="hello")
+
+                async def run_prepared_round(self, prepared, *, error_label):
+                    yield RunStartedEvent(threadId=session_id, runId=prepared.run_id)
+                    with TestingSessionLocal() as cancel_db:
+                        await orchestrator.cancel_turn(
+                            TurnCancelTarget(
+                                user_id=user_id,
+                                session_id=session_id,
+                                round_id=prepared.run_id,
+                            ),
+                            db=cancel_db,
+                        )
+                    for _ in range(120):
+                        if self.cancel_token and self.cancel_token.is_set():
+                            break
+                        await asyncio.sleep(0.02)
+                    assert self.cancel_token is not None
+                    assert self.cancel_token.is_set()
+                    yield RunFinishedEvent(
+                        threadId=session_id,
+                        runId=prepared.run_id,
+                        outcome="interrupt",
+                        result={"reason": "user_cancelled"},
+                    )
+
+            turn = NormalizedInboundTurn(
+                channel="web",
+                user_id=user_id,
+                peer_kind="web",
+                peer_id=session_id,
+                content=[TextContentBlock(type="text", text="hello")],
+                reply_route=WebReplyRoute(session_id=session_id),
+            )
+
+            with patch("src.api.services.turn_orchestrator.SessionLocal", TestingSessionLocal):
+                execution = await orchestrator.submit_turn(
+                    turn,
+                    agent_service=FakeAgentService(),
                     lock_id=lock_id,
-                    cancel_token=cancel_token,
-                ):
-                    chunks.append(chunk)
+                    run_started_at=now_naive(),
+                )
+                events = [event async for event in execution.event_source]
+                if execution.task:
+                    await execution.task
 
-            assert any("RUN_FINISHED" in chunk for chunk in chunks)
+            assert any(getattr(event, "type", None) == "RUN_FINISHED" for event in events)
 
             with TestingSessionLocal() as verify_db:
                 cancel_row = (
@@ -1082,6 +1268,7 @@ class TestCrossWorkerCancelFlow:
                 assert cancel_row.state == "completed"
                 assert cancel_row.acked_at is not None
                 assert cancel_row.completed_at is not None
+                assert cancel_row.target_run_id == "run-1"
 
                 lock_row = (
                     verify_db.query(UserRunLock)
@@ -1090,108 +1277,232 @@ class TestCrossWorkerCancelFlow:
                 )
                 assert lock_row is None
         finally:
-            if test_db_url.startswith("postgresql"):
-                with engine.begin() as conn:
-                    table_names = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
-                    from sqlalchemy import text as _text
-                    conn.execute(_text(f"TRUNCATE TABLE {table_names} CASCADE"))
-            else:
-                Base.metadata.drop_all(bind=engine)
+            Base.metadata.drop_all(bind=engine)
             engine.dispose()
 
 
-class TestSubscribeCrossWorkerPolling:
-    """subscribe 端点跨 worker 持久化轮询回归测试。"""
+class TestSubscribePersistedPolling:
+    """subscribe 端点与 EventBus replay/fanout 回归测试。"""
 
     @pytest.mark.asyncio
     async def test_subscribe_receives_persisted_terminal_event_without_local_broadcast(self):
-        """无本地广播事件时，subscribe 应通过持久化轮询拿到 RUN_FINISHED。"""
+        """无本地广播事件时，subscribe 应通过 EventBus replay 拿到 RUN_FINISHED。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from src.api.models.agui_event import AGUIEventLog
+        from src.api.models.database import Base
+        from src.api.models.round import Round
+        from src.api.models.session import Session
         from src.api.routes import chat as chat_routes
-        from src.api.models.session import Session as SessionModel
-        from src.api.models.round import Round as RoundModel
-        from src.api.models.agui_event import AGUIEventLog as AGUIEventModel
-
-        mock_db = MagicMock()
-        mock_db.refresh = MagicMock()
-
-        mock_session = MagicMock()
-        mock_session.id = "session-1"
-        mock_session.user_id = "testuser"
-
-        mock_round = MagicMock()
-        mock_round.id = "round-1"
-        mock_round.session_id = "session-1"
-        mock_round.status = "running"
-
-        # 请求级 DB：初始 replay 为空，模拟“当前 worker 没有本地广播事件”。
-        def request_db_query_side_effect(model):
-            chain = MagicMock()
-            if model is SessionModel:
-                chain.filter.return_value.first.return_value = mock_session
-            elif model is RoundModel:
-                chain.filter.return_value.first.return_value = mock_round
-            elif model is AGUIEventModel:
-                chain.filter.return_value.order_by.return_value.all.return_value = []
-            return chain
-
-        mock_db.query.side_effect = request_db_query_side_effect
-
-        # 轮询 DB：首次返回 RUN_FINISHED，后续为空。
-        replay_db = MagicMock()
-        replay_calls = {"count": 0}
-
-        event_row = MagicMock()
-        event_row.payload = json.dumps({
-            "type": "RUN_FINISHED",
-            "threadId": "session-1",
-            "runId": "round-1",
-            "outcome": "interrupt",
-            "result": {"reason": "user_cancelled"},
-        })
-        event_row.sequence = 1
-        event_row.id = 1
-
-        def replay_db_query_side_effect(_model):
-            chain = MagicMock()
-            rows = [event_row] if replay_calls["count"] == 0 else []
-            replay_calls["count"] += 1
-            chain.filter.return_value.order_by.return_value.all.return_value = rows
-            return chain
-
-        replay_db.query.side_effect = replay_db_query_side_effect
-
-        session_local_cm = MagicMock()
-        session_local_cm.__enter__.return_value = replay_db
-        session_local_cm.__exit__.return_value = False
 
         mock_settings = MagicMock()
-        mock_settings.sse_heartbeat_interval = 0.01
+        mock_settings.sse_heartbeat_interval = 60
         mock_settings.sse_subscribe_timeout = 1
         mock_settings.cancel_watcher_interval_seconds = 0.01
 
-        with patch("src.api.routes.chat.get_settings", return_value=mock_settings), patch(
-            "src.api.routes.chat.SessionLocal", return_value=session_local_cm
-        ):
-            response = await chat_routes.subscribe_to_round(
-                chat_session_id="session-1",
-                round_id="round-1",
-                last_step=0,
-                last_sequence=0,
-                user_id="testuser",
-                db=mock_db,
-            )
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        try:
+            with TestSL() as setup_db:
+                setup_db.add(Session(id="session-1", user_id="testuser", status="active"))
+                setup_db.add(
+                    Round(
+                        id="round-1",
+                        session_id="session-1",
+                        thread_id="session-1",
+                        user_message="hello",
+                        status="completed",
+                    )
+                )
+                setup_db.add(
+                    AGUIEventLog(
+                        run_id="round-1",
+                        event_type="RUN_FINISHED",
+                        payload=json.dumps({
+                            "type": "RUN_FINISHED",
+                            "threadId": "session-1",
+                            "runId": "round-1",
+                            "outcome": "interrupt",
+                            "result": {"reason": "user_cancelled"},
+                            "sequence": 1,
+                        }),
+                        sequence=1,
+                    )
+                )
+                setup_db.commit()
 
-            chunks = []
-            async for chunk in response.body_iterator:
-                chunks.append(chunk)
-                if "RUN_FINISHED" in chunk:
-                    break
-                if len(chunks) > 50:
-                    break
+            with TestSL() as request_db, patch(
+                "src.api.routes.chat.get_settings", return_value=mock_settings
+            ), patch("src.api.routes.chat.SessionLocal", TestSL):
+                response = await chat_routes.subscribe_to_round(
+                    chat_session_id="session-1",
+                    round_id="round-1",
+                    last_step=0,
+                    last_sequence=0,
+                    user_id="testuser",
+                    db=request_db,
+                )
+
+                chunks = []
+                async for chunk in response.body_iterator:
+                    chunks.append(chunk)
+                    if "RUN_FINISHED" in chunk:
+                        break
+        finally:
+            Base.metadata.drop_all(bind=engine)
+            engine.dispose()
 
         assert any("RUN_FINISHED" in c for c in chunks)
-        assert replay_calls["count"] >= 1
-        mock_db.rollback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_subscribe_catchup_skips_aggregate_when_live_raw_delta_is_queued(self):
+        """同一 EventBus 订阅连接已接收 live raw delta 时，聚合 CONTENT 不应重复输出。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from src.agent.schema.agui_events import TextMessageContentEvent, TextMessageEndEvent
+        from src.api.models.database import Base
+        from src.api.models.round import Round
+        from src.api.models.session import Session
+        from src.api.services.agui_event_bus import AguiEventBus
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        run_id = "round-raw-vs-aggregate"
+        try:
+            with TestSL() as setup_db:
+                setup_db.add(Session(id="session-1", user_id="testuser", status="active"))
+                setup_db.add(
+                    Round(
+                        id=run_id,
+                        session_id="session-1",
+                        thread_id="session-1",
+                        user_message="hello",
+                        status="running",
+                    )
+                )
+                setup_db.commit()
+
+            bus = AguiEventBus(TestSL)
+            iterator = bus.subscribe(run_id, after_sequence=0).__aiter__()
+            first_event_task = asyncio.create_task(iterator.__anext__())
+            try:
+                for _ in range(50):
+                    with bus.subscribers_lock:
+                        if bus.subscribers.get(run_id):
+                            break
+                    await asyncio.sleep(0.01)
+
+                await bus.publish(run_id, TextMessageContentEvent(messageId="msg-1", delta="he"))
+                first = await asyncio.wait_for(first_event_task, timeout=1.0)
+                assert first["type"] == "TEXT_MESSAGE_CONTENT"
+                assert first["delta"] == "he"
+                assert "sequence" not in first
+
+                second_event_task = asyncio.create_task(iterator.__anext__())
+                await bus.publish(run_id, TextMessageEndEvent(messageId="msg-1"))
+                second = await asyncio.wait_for(second_event_task, timeout=1.0)
+
+                assert second["type"] == "TEXT_MESSAGE_END"
+                assert second["sequence"] == 2
+            finally:
+                await iterator.aclose()
+                with bus.subscribers_lock:
+                    bus.subscribers.pop(run_id, None)
+        finally:
+            Base.metadata.drop_all(bind=engine)
+            engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_late_subscriber_suppresses_raw_suffix_and_receives_aggregate(self):
+        """中途订阅者错过 live-only 前缀时，应等聚合 CONTENT 补全整段内容。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from src.agent.schema.agui_events import (
+            TextMessageContentEvent,
+            TextMessageEndEvent,
+            TextMessageStartEvent,
+        )
+        from src.api.models.database import Base
+        from src.api.models.round import Round
+        from src.api.models.session import Session
+        from src.api.services.agui_event_bus import AguiEventBus
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        run_id = "round-late-aggregate"
+        try:
+            with TestSL() as setup_db:
+                setup_db.add(Session(id="session-1", user_id="testuser", status="active"))
+                setup_db.add(
+                    Round(
+                        id=run_id,
+                        session_id="session-1",
+                        thread_id="session-1",
+                        user_message="hello",
+                        status="running",
+                    )
+                )
+                setup_db.commit()
+
+            bus = AguiEventBus(TestSL)
+            await bus.publish(run_id, TextMessageStartEvent(messageId="msg-1", role="assistant"))
+            await bus.publish(run_id, TextMessageContentEvent(messageId="msg-1", delta="he"))
+
+            iterator = bus.subscribe(run_id, after_sequence=0).__aiter__()
+            try:
+                first = await asyncio.wait_for(iterator.__anext__(), timeout=1.0)
+                assert first["type"] == "TEXT_MESSAGE_START"
+                assert first["sequence"] == 1
+
+                next_event_task = asyncio.create_task(iterator.__anext__())
+                for _ in range(50):
+                    with bus.subscribers_lock:
+                        if bus.subscribers.get(run_id):
+                            break
+                    await asyncio.sleep(0.01)
+
+                await bus.publish(run_id, TextMessageContentEvent(messageId="msg-1", delta="llo"))
+                await asyncio.sleep(0.05)
+                assert not next_event_task.done()
+
+                await bus.publish(run_id, TextMessageEndEvent(messageId="msg-1"))
+                aggregate = await asyncio.wait_for(next_event_task, timeout=1.0)
+                assert aggregate["type"] == "TEXT_MESSAGE_CONTENT"
+                assert aggregate["delta"] == "hello"
+                assert aggregate["sequence"] == 2
+
+                end = await asyncio.wait_for(iterator.__anext__(), timeout=1.0)
+                assert end["type"] == "TEXT_MESSAGE_END"
+                assert end["sequence"] == 3
+            finally:
+                await iterator.aclose()
+                with bus.subscribers_lock:
+                    bus.subscribers.pop(run_id, None)
+                bus._stream_buffers.pop(run_id, None)
+        finally:
+            Base.metadata.drop_all(bind=engine)
+            engine.dispose()
 
 
 class TestSubscriberAbortScenarios:
@@ -1200,46 +1511,44 @@ class TestSubscriberAbortScenarios:
     @pytest.mark.asyncio
     async def test_subscriber_removed_on_disconnect(self):
         """测试订阅者断开连接时被正确移除"""
-        from src.api.routes.chat import _round_subscribers
 
         round_id = "abort-test-disconnect"
         subscriber_queue = asyncio.Queue()
 
         # 注册订阅者
-        _round_subscribers[round_id] = [subscriber_queue]
-        initial_count = len(_round_subscribers[round_id])
+        _event_subscribers()[round_id] = [subscriber_queue]
+        initial_count = len(_event_subscribers()[round_id])
 
         try:
             # 模拟客户端断开 - 移除订阅者
-            _round_subscribers[round_id].remove(subscriber_queue)
+            _event_subscribers()[round_id].remove(subscriber_queue)
 
-            assert len(_round_subscribers[round_id]) == initial_count - 1
-            assert subscriber_queue not in _round_subscribers[round_id]
+            assert len(_event_subscribers()[round_id]) == initial_count - 1
+            assert subscriber_queue not in _event_subscribers()[round_id]
         finally:
-            if round_id in _round_subscribers:
-                del _round_subscribers[round_id]
+            if round_id in _event_subscribers():
+                del _event_subscribers()[round_id]
 
     @pytest.mark.asyncio
     async def test_multiple_subscribers_one_disconnects(self):
         """测试多个订阅者中一个断开连接"""
-        from src.api.routes.chat import _round_subscribers, _broadcast_to_subscribers
 
         round_id = "abort-test-multi"
         queue1 = asyncio.Queue()
         queue2 = asyncio.Queue()
 
-        _round_subscribers[round_id] = [queue1, queue2]
+        _event_subscribers()[round_id] = [queue1, queue2]
 
         try:
             # 模拟第一个订阅者断开
-            _round_subscribers[round_id].remove(queue1)
+            _event_subscribers()[round_id].remove(queue1)
 
-            assert len(_round_subscribers[round_id]) == 1
-            assert queue2 in _round_subscribers[round_id]
+            assert len(_event_subscribers()[round_id]) == 1
+            assert queue2 in _event_subscribers()[round_id]
 
             # 广播事件应该只发送给剩余订阅者
             event = {"type": "test", "data": "after disconnect"}
-            await _broadcast_to_subscribers(round_id, event)
+            await _publish_ephemeral(round_id, event)
 
             # 只有 queue2 收到事件
             received = await asyncio.wait_for(queue2.get(), timeout=1.0)
@@ -1248,64 +1557,61 @@ class TestSubscriberAbortScenarios:
             # queue1 不应该收到（已断开）
             assert queue1.empty()
         finally:
-            if round_id in _round_subscribers:
-                del _round_subscribers[round_id]
+            if round_id in _event_subscribers():
+                del _event_subscribers()[round_id]
 
     @pytest.mark.asyncio
     async def test_subscriber_count_tracking(self):
         """测试订阅者计数追踪"""
-        from src.api.routes.chat import _round_subscribers
 
         round_id = "count-test"
         queues = [asyncio.Queue() for _ in range(3)]
 
-        _round_subscribers[round_id] = []
+        _event_subscribers()[round_id] = []
 
         try:
             # 逐个添加订阅者
             for i, queue in enumerate(queues):
-                _round_subscribers[round_id].append(queue)
-                assert len(_round_subscribers[round_id]) == i + 1
+                _event_subscribers()[round_id].append(queue)
+                assert len(_event_subscribers()[round_id]) == i + 1
 
             # 逐个移除订阅者（模拟切换会话）
             for i, queue in enumerate(queues):
-                _round_subscribers[round_id].remove(queue)
-                assert len(_round_subscribers[round_id]) == len(queues) - i - 1
+                _event_subscribers()[round_id].remove(queue)
+                assert len(_event_subscribers()[round_id]) == len(queues) - i - 1
         finally:
-            if round_id in _round_subscribers:
-                del _round_subscribers[round_id]
+            if round_id in _event_subscribers():
+                del _event_subscribers()[round_id]
 
     @pytest.mark.asyncio
     async def test_cleanup_on_last_subscriber_disconnect(self):
         """测试最后一个订阅者断开时的清理"""
-        from src.api.routes.chat import _round_subscribers, _cleanup_subscribers
 
         round_id = "cleanup-last-test"
         subscriber_queue = asyncio.Queue()
 
-        _round_subscribers[round_id] = [subscriber_queue]
+        _event_subscribers()[round_id] = [subscriber_queue]
 
         try:
             # 移除唯一的订阅者
-            _round_subscribers[round_id].remove(subscriber_queue)
+            _event_subscribers()[round_id].remove(subscriber_queue)
 
             # 列表为空但 key 仍存在
-            assert len(_round_subscribers[round_id]) == 0
-            assert round_id in _round_subscribers
+            assert len(_event_subscribers()[round_id]) == 0
+            assert round_id in _event_subscribers()
 
             # 调用清理
-            _cleanup_subscribers(round_id)
+            _cleanup_event_subscribers(round_id)
 
             # key 被移除
-            assert round_id not in _round_subscribers
+            assert round_id not in _event_subscribers()
         finally:
-            if round_id in _round_subscribers:
-                del _round_subscribers[round_id]
+            if round_id in _event_subscribers():
+                del _event_subscribers()[round_id]
 
     @pytest.mark.asyncio
     async def test_rapid_subscribe_unsubscribe(self):
         """测试快速订阅和取消订阅（模拟用户快速切换会话）"""
-        from src.api.routes.chat import _round_subscribers
 
         round_id = "rapid-test"
 
@@ -1314,22 +1620,22 @@ class TestSubscriberAbortScenarios:
             for i in range(5):
                 queue = asyncio.Queue()
 
-                if round_id not in _round_subscribers:
-                    _round_subscribers[round_id] = []
+                if round_id not in _event_subscribers():
+                    _event_subscribers()[round_id] = []
 
-                _round_subscribers[round_id].append(queue)
-                assert queue in _round_subscribers[round_id]
+                _event_subscribers()[round_id].append(queue)
+                assert queue in _event_subscribers()[round_id]
 
                 # 立即取消
-                _round_subscribers[round_id].remove(queue)
-                assert queue not in _round_subscribers[round_id]
+                _event_subscribers()[round_id].remove(queue)
+                assert queue not in _event_subscribers()[round_id]
 
             # 最终应该是空列表
-            if round_id in _round_subscribers:
-                assert len(_round_subscribers[round_id]) == 0
+            if round_id in _event_subscribers():
+                assert len(_event_subscribers()[round_id]) == 0
         finally:
-            if round_id in _round_subscribers:
-                del _round_subscribers[round_id]
+            if round_id in _event_subscribers():
+                del _event_subscribers()[round_id]
 
 
 class TestSubscribeEdgeCases:
@@ -1378,18 +1684,17 @@ class TestSubscribeEdgeCases:
     @pytest.mark.asyncio
     async def test_multiple_subscribers_same_round(self):
         """测试同一轮次多个订阅者"""
-        from src.api.routes.chat import _round_subscribers, _broadcast_to_subscribers
 
         round_id = "multi-sub-test"
         queue1 = asyncio.Queue()
         queue2 = asyncio.Queue()
         queue3 = asyncio.Queue()
 
-        _round_subscribers[round_id] = [queue1, queue2, queue3]
+        _event_subscribers()[round_id] = [queue1, queue2, queue3]
 
         try:
             event = {"type": "test", "data": "broadcast"}
-            await _broadcast_to_subscribers(round_id, event)
+            await _publish_ephemeral(round_id, event)
 
             # 所有订阅者都应收到
             r1 = await asyncio.wait_for(queue1.get(), timeout=1.0)
@@ -1398,8 +1703,8 @@ class TestSubscribeEdgeCases:
 
             assert r1 == r2 == r3 == event
         finally:
-            if round_id in _round_subscribers:
-                del _round_subscribers[round_id]
+            if round_id in _event_subscribers():
+                del _event_subscribers()[round_id]
 
 
 class TestAbortCancellation:
@@ -1407,80 +1712,97 @@ class TestAbortCancellation:
 
     回归：触发取消后 SSE consumer 未收到 RUN_FINISHED，导致前端 UI 不刷新，
     需要刷新浏览器才能看到 Cancelled 状态。
-    修复：producer 的 CancelledError 路径现在补发 RUN_FINISHED(outcome=interrupt)。
+    修复：producer 的 CancelledError 路径现在通过 terminal 单入口收敛并发送 RUN_FINISHED(outcome=interrupt)。
     """
 
     @pytest.mark.asyncio
     async def test_producer_cancelled_delivers_run_finished(self):
-        """producer task 被取消时，SSE consumer 应收到 RUN_FINISHED(outcome=interrupt)
+        """producer task 被取消时，orchestrated event stream 应收到 RUN_FINISHED(outcome=interrupt)。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
 
-        模拟 abort_chat 调用 runner.cancel() 的完整路径：
-        1. producer task 被外部取消 → CancelledError        2. except CancelledError 补发 RunFinishedEvent 到队列
-        3. SSE consumer 收到 RUN_FINISHED → 前端 UI 立即更新
-        """
-        from unittest.mock import patch, MagicMock
-        from src.api.routes.chat import _sse_with_heartbeat, _active_runners
+        from src.api.models.database import Base
+        from src.api.models.round import Round
+        from src.api.models.session import Session
+        from src.api.schemas.chat import TextContentBlock
+        from src.api.schemas.turn import NormalizedInboundTurn, WebReplyRoute
+        from src.api.services.agent_service import PreparedAgentRun
+        from src.api.services.turn_orchestrator import TurnOrchestrator
         from src.agent.schema.agui_events import RunStartedEvent
 
         session_id = "abort-run-finished-regression"
         run_id = "abort-run-id-regression"
-        _active_runners.pop(session_id, None)
-
-        async def slow_source():
-            yield RunStartedEvent(threadId=session_id, runId=run_id)
-            await asyncio.sleep(100)  # 永不结束，等待被取消
-
-        mock_settings = MagicMock()
-        mock_settings.sse_heartbeat_interval = 60
-
-        with patch("src.api.routes.chat.get_settings", return_value=mock_settings):
-            generator = _sse_with_heartbeat(
-                slow_source(),
-                session_id=session_id,
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        with TestSL() as setup_db:
+            setup_db.add(Session(id=session_id, user_id="testuser", status="active"))
+            setup_db.add(
+                Round(
+                    id=run_id,
+                    session_id=session_id,
+                    thread_id=session_id,
+                    user_message="hello",
+                    status="running",
+                )
             )
+            setup_db.commit()
 
-            events_received = []
+        class SlowAgentService:
+            cancel_token = None
 
-            async def consume():
-                async for chunk in generator:
-                    for line in chunk.split("\n"):
-                        if line.startswith("data: "):
-                            try:
-                                data = json.loads(line[6:])
-                                events_received.append(data)
-                            except Exception:
-                                pass
-                    # 收到 RUN_FINISHED 可停止
-                    if any(e.get("type") == "RUN_FINISHED" for e in events_received):
-                        return
+            async def prepare_chat_round(self, *, user_content, idempotency_key=None):
+                return PreparedAgentRun(run_id=run_id, user_message="hello")
 
-            consume_task = asyncio.create_task(consume())
+            async def run_prepared_round(self, prepared, *, error_label):
+                yield RunStartedEvent(threadId=session_id, runId=prepared.run_id)
+                await asyncio.sleep(100)
 
-            # 等待 producer 注册到 _active_runners（最多 500ms）
-            for _ in range(50):
-                if session_id in _active_runners:
-                    break
-                await asyncio.sleep(0.01)
+        turn = NormalizedInboundTurn(
+            channel="web",
+            user_id="testuser",
+            peer_kind="web",
+            peer_id=session_id,
+            content=[TextContentBlock(type="text", text="hello")],
+            reply_route=WebReplyRoute(session_id=session_id),
+        )
+        orchestrator = TurnOrchestrator()
 
-            producer_task = _active_runners.get(session_id)
-            assert producer_task is not None, "producer_task 应已注册到 _active_runners"
+        try:
+            with patch("src.api.services.turn_orchestrator.SessionLocal", TestSL):
+                execution = await orchestrator.submit_turn(
+                    turn,
+                    agent_service=SlowAgentService(),
+                )
+                first_event = await asyncio.wait_for(execution.event_source.__anext__(), timeout=1.0)
+                assert first_event.run_id == run_id
 
-            # 模拟 abort_chat runner.cancel()
-            producer_task.cancel()
+                assert execution.task is not None
+                execution.task.cancel()
+                events_received = [first_event]
+                events_received.extend([event async for event in execution.event_source])
+                with pytest.raises(asyncio.CancelledError):
+                    await execution.task
+        finally:
+            Base.metadata.drop_all(bind=engine)
+            engine.dispose()
 
-            await asyncio.wait_for(consume_task, timeout=3.0)
-
-        # 验证：consumer 收到了 RUN_FINISHED(outcome=interrupt, reason=user_cancelled)
-        run_finished = [e for e in events_received if e.get("type") == "RUN_FINISHED"]
+        run_finished = [
+            e if isinstance(e, dict) else e.model_dump(by_alias=True)
+            for e in events_received
+            if (e.get("type") if isinstance(e, dict) else getattr(e, "type", None)) == "RUN_FINISHED"
+        ]
         assert len(run_finished) >= 1, (
-            f"应该有 RUN_FINISHED 事件，实际收到: {[e.get('type') for e in events_received]}"
+            f"应该有 RUN_FINISHED 事件，实际收到: {events_received}"
         )
-        assert run_finished[0]["outcome"] == "interrupt", (
-            "abort 后的 RUN_FINISHED 应为 outcome=interrupt"
-        )
+        assert run_finished[0]["outcome"] == "interrupt"
+        assert run_finished[0]["sequence"] == 1
         assert run_finished[0].get("result", {}).get("reason") == "user_cancelled"
-
-        _active_runners.pop(session_id, None)
 
     def test_cancelled_round_in_terminal_status_set(self):
         """cancelled 状态应在 subscribe_to_round 的终态检查集合中
@@ -1518,66 +1840,86 @@ class TestAbortCancellation:
 
     @pytest.mark.asyncio
     async def test_producer_cancelled_broadcasts_to_subscribers(self):
-        """producer 被 cancel 时，已注册的 subscriber 队列必须收到 RUN_FINISHED
+        """orchestrated producer 被 cancel 时，subscriber 应收到已持久化并带 sequence 的 terminal。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
 
-        回归测试：旧实现用 asyncio.create_task(_broadcast_to_subscribers(...))
-        在 CancelledError handler 中做 fire-and-forget 广播，但 finally 中
-        _cleanup_subscribers 同步删除了订阅者列表，导致广播 task 执行时订阅者
-        已空，subscribe 客户端永远收不到 RUN_FINISHED，前端一直转圈。
-        修复：改为同步 put_nowait 直接写入订阅者队列。
-        """
-        from src.api.routes.chat import (
-            _sse_with_heartbeat,
-            _active_runners,
-            _round_subscribers,
-            _round_subscribers_lock,
-        )
+        from src.api.models.agui_event import AGUIEventLog
+        from src.api.models.database import Base
+        from src.api.models.round import Round
+        from src.api.models.session import Session
+        from src.api.schemas.chat import TextContentBlock
+        from src.api.schemas.turn import NormalizedInboundTurn, WebReplyRoute
+        from src.api.services.agent_service import PreparedAgentRun
+        from src.api.services.turn_orchestrator import TurnOrchestrator
         from src.agent.schema.agui_events import RunStartedEvent
 
         session_id = "abort-subscriber-broadcast-test"
         run_id = "abort-subscriber-run-id"
-        _active_runners.pop(session_id, None)
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        with TestSL() as setup_db:
+            setup_db.add(Session(id=session_id, user_id="testuser", status="active"))
+            setup_db.add(
+                Round(
+                    id=run_id,
+                    session_id=session_id,
+                    thread_id=session_id,
+                    user_message="hello",
+                    status="running",
+                )
+            )
+            setup_db.commit()
 
         # 模拟一个 subscriber（代表 subscribe 端点的客户端）
         subscriber_queue = asyncio.Queue()
-        with _round_subscribers_lock:
-            _round_subscribers[run_id] = [subscriber_queue]
+        with _event_subscribers_lock():
+            _event_subscribers()[run_id] = [subscriber_queue]
 
-        async def slow_source():
-            yield RunStartedEvent(threadId=session_id, runId=run_id)
-            await asyncio.sleep(100)
+        class SlowAgentService:
+            cancel_token = None
 
-        mock_settings = MagicMock()
-        mock_settings.sse_heartbeat_interval = 60
+            async def prepare_chat_round(self, *, user_content, idempotency_key=None):
+                return PreparedAgentRun(run_id=run_id, user_message="hello")
 
-        with patch("src.api.routes.chat.get_settings", return_value=mock_settings):
-            generator = _sse_with_heartbeat(
-                slow_source(),
-                session_id=session_id,
-            )
+            async def run_prepared_round(self, prepared, *, error_label):
+                yield RunStartedEvent(threadId=session_id, runId=prepared.run_id)
+                await asyncio.sleep(100)
 
-            # 启动 consumer
-            async def consume():
-                async for _ in generator:
-                    pass
+        turn = NormalizedInboundTurn(
+            channel="web",
+            user_id="testuser",
+            peer_kind="web",
+            peer_id=session_id,
+            content=[TextContentBlock(type="text", text="hello")],
+            reply_route=WebReplyRoute(session_id=session_id),
+        )
+        orchestrator = TurnOrchestrator()
 
-            consume_task = asyncio.create_task(consume())
+        try:
+            with patch("src.api.services.turn_orchestrator.SessionLocal", TestSL):
+                execution = await orchestrator.submit_turn(
+                    turn,
+                    agent_service=SlowAgentService(),
+                )
+                first_event = await asyncio.wait_for(execution.event_source.__anext__(), timeout=1.0)
+                assert first_event.run_id == run_id
 
-            # 等待 producer 注册
-            for _ in range(50):
-                if session_id in _active_runners:
-                    break
-                await asyncio.sleep(0.01)
+                assert execution.task is not None
+                execution.task.cancel()
+                _ = [event async for event in execution.event_source]
+                with pytest.raises(asyncio.CancelledError):
+                    await execution.task
+        finally:
+            pass
 
-            producer_task = _active_runners.get(session_id)
-            assert producer_task is not None
-
-            # 模拟 abort_chat: cancel producer
-            producer_task.cancel()
-
-            await asyncio.wait_for(consume_task, timeout=3.0)
-
-        # 核心断言：subscriber 队列必须收到 RUN_FINISHED
+        # 核心断言：subscriber 队列必须收到 durable RUN_FINISHED
         received_events = []
         while not subscriber_queue.empty():
             received_events.append(subscriber_queue.get_nowait())
@@ -1589,203 +1931,26 @@ class TestAbortCancellation:
         assert len(run_finished_events) >= 1, (
             f"subscriber 队列应收到 RUN_FINISHED，实际收到: {received_events}"
         )
+        assert run_finished_events[0]["sequence"] == 1
         assert run_finished_events[0]["outcome"] == "interrupt"
         assert run_finished_events[0].get("result", {}).get("reason") == "user_cancelled"
 
-        # 清理
-        _active_runners.pop(session_id, None)
-        with _round_subscribers_lock:
-            _round_subscribers.pop(run_id, None)
-
-
-class TestWatcherSurvivesDisconnect:
-    """回归：SSE 断线后 cancel_watch_task 必须继续运行。"""
-
-    @pytest.mark.asyncio
-    async def test_watcher_continues_after_sse_disconnect_and_abort_still_acked(self):
-        """客户端断线 → Agent 后台继续 → 从其他 worker abort → watcher 仍能 ack。"""
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from sqlalchemy.pool import StaticPool
-
-        from src.api.models.database import Base
-        from src.api.models.run_cancel_request import RunCancelRequest
-        from src.api.models.user_run_lock import UserRunLock
-        from src.api.routes import chat as chat_routes
-        from src.agent.schema.agui_events import RunStartedEvent, RunFinishedEvent
-
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        Base.metadata.create_all(bind=engine)
-
-        user_id = "user-disconnect"
-        session_id = "session-disconnect"
-        lock_id = "lock-disconnect"
-        cancel_token = asyncio.Event()
-
-        try:
-            with TestSL() as setup_db:
-                setup_db.add(
-                    UserRunLock(
-                        user_id=user_id,
-                        session_id=session_id,
-                        lock_id=lock_id,
-                    )
+        with TestSL() as verify_db:
+            terminal = (
+                verify_db.query(AGUIEventLog)
+                .filter(
+                    AGUIEventLog.run_id == run_id,
+                    AGUIEventLog.event_type == "RUN_FINISHED",
                 )
-                setup_db.commit()
-
-            # Agent 会在 cancel_token 被设置后结束
-            agent_started = asyncio.Event()
-
-            async def slow_agent():
-                yield RunStartedEvent(threadId=session_id, runId="run-d1")
-                agent_started.set()
-                # 模拟长时间运行，等待取消
-                for _ in range(300):
-                    if cancel_token.is_set():
-                        break
-                    await asyncio.sleep(0.01)
-                yield RunFinishedEvent(
-                    threadId=session_id,
-                    runId="run-d1",
-                    outcome="interrupt",
-                    result={"reason": "user_cancelled"},
-                )
-
-            with patch("src.api.routes.chat.SessionLocal", TestSL):
-                gen = chat_routes._sse_with_heartbeat(
-                    slow_agent(),
-                    session_id=session_id,
-                    user_id=user_id,
-                    lock_id=lock_id,
-                    cancel_token=cancel_token,
-                )
-
-                # 只消费 RUN_STARTED 就 "断线"（关闭 generator）
-                first_chunk = await gen.__anext__()
-                assert "RUN_STARTED" in first_chunk
-                await gen.aclose()
-
-                # 断线后等待 agent 开始运行
-                await asyncio.wait_for(agent_started.wait(), timeout=2.0)
-                await asyncio.sleep(0.05)
-
-                # 模拟 B worker 发起 abort（写入 DB cancel request）
-                with TestSL() as abort_db:
-                    await chat_routes._upsert_cancel_request(
-                        abort_db,
-                        user_id=user_id,
-                        session_id=session_id,
-                    )
-
-                # 给 watcher 时间去 ack（watcher 默认 3s interval，但测试里可能更快）
-                # 注意：watcher 每轮独立创建 Session，patch 必须覆盖到 ack 完成
-                for _ in range(200):
-                    if cancel_token.is_set():
-                        break
-                    await asyncio.sleep(0.05)
-
-                assert cancel_token.is_set(), "cancel_token 应该被 watcher 设置"
-
-                # 验证 cancel request 被 acked
-                with TestSL() as verify_db:
-                    row = (
-                        verify_db.query(RunCancelRequest)
-                        .filter(RunCancelRequest.session_id == session_id)
-                        .first()
-                    )
-                    assert row is not None
-                    assert row.state in ("acked", "completed"), (
-                        f"cancel request 应为 acked/completed，实际: {row.state}"
-                    )
-        finally:
-            engine.dispose()
-
-
-class TestWatcherConnectionLifecycle:
-    """回归：cancel watcher 每轮使用独立短生命周期 Session，
-    不会长期独占 DB 连接（防止 QueuePool 耗尽导致整体死锁）。"""
-
-    @pytest.mark.asyncio
-    async def test_watcher_opens_new_session_each_iteration(self):
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from sqlalchemy.pool import StaticPool
-
-        from src.api.models.database import Base
-        from src.api.models.user_run_lock import UserRunLock
-        from src.api.routes import chat as chat_routes
-
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        Base.metadata.create_all(bind=engine)
-
-        user_id = "user-conn"
-        session_id = "session-conn"
-        lock_id = "lock-conn"
-        cancel_token = asyncio.Event()
-
-        try:
-            with TestSL() as setup_db:
-                setup_db.add(
-                    UserRunLock(
-                        user_id=user_id,
-                        session_id=session_id,
-                        lock_id=lock_id,
-                    )
-                )
-                setup_db.commit()
-
-            # 统计 SessionLocal() 被调用次数 —— 若仍是旧实现只会调一次
-            call_count = {"n": 0}
-            real_sessionmaker = TestSL
-
-            def counting_sessionlocal(*args, **kwargs):
-                call_count["n"] += 1
-                return real_sessionmaker(*args, **kwargs)
-
-            with patch("src.api.routes.chat.SessionLocal", counting_sessionlocal), \
-                 patch("src.api.routes.chat.get_settings") as mock_settings:
-                # check_interval / heartbeat 内部会被 clamp 到 >= 0.5s
-                mock_settings.return_value.cancel_watcher_interval_seconds = 0.5
-                mock_settings.return_value.sse_heartbeat_interval = 0.5
-
-                watcher_task = asyncio.create_task(
-                    chat_routes._cancel_request_watcher(
-                        user_id=user_id,
-                        session_id=session_id,
-                        cancel_token=cancel_token,
-                        lock_id=lock_id,
-                    )
-                )
-
-                # 跑 ~2s，应完成多轮循环（每轮至少一次 check session + 偶尔 heartbeat session）
-                await asyncio.sleep(2.0)
-
-                # 触发 watcher 退出
-                cancel_token.set()
-                try:
-                    await asyncio.wait_for(watcher_task, timeout=1.0)
-                except asyncio.TimeoutError:
-                    watcher_task.cancel()
-                    with pytest.raises((asyncio.CancelledError, Exception)):
-                        await watcher_task
-
-            # 旧实现整个生命周期只会调一次 SessionLocal()。
-            # 新实现每轮独立创建：2s / 0.5s ≈ 4 轮 → check session + heartbeat session ≥ 4 次。
-            assert call_count["n"] >= 4, (
-                f"watcher 应每轮独立创建 Session，实际调用次数: {call_count['n']}"
+                .one()
             )
-        finally:
-            engine.dispose()
+            assert terminal.sequence == 1
+
+        # 清理
+        with _event_subscribers_lock():
+            _event_subscribers().pop(run_id, None)
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
 
 
 class TestUserCancelledRoundStatus:

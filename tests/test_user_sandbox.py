@@ -280,6 +280,55 @@ class TestAgentPoolServiceUserSessions:
         mock_sandbox_service.renew.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_get_or_create_detaches_running_cached_agent_before_new_run(self):
+        """abort 后旧 runner 未退出时，新 run 不应复用同一个 AgentService。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        old_agent = MagicMock()
+        old_agent.is_running = True
+        old_agent.close = MagicMock()
+        new_agent = MagicMock()
+        _inject_pool_session(
+            pool,
+            "session-A",
+            "user-1",
+            mock_agent=old_agent,
+            sandbox_id="sbx-current",
+        )
+        pool._last_renew["user-1"] = time.time()
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = "sbx-current"
+
+        async def create_agent(**_kwargs):
+            _inject_pool_session(
+                pool,
+                "session-A",
+                "user-1",
+                mock_agent=new_agent,
+                sandbox_id="sbx-current",
+            )
+            return new_agent
+
+        pool._create_agent_instance = AsyncMock(side_effect=create_agent)
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-A",
+                db=MagicMock(),
+                sandbox_id="sbx-current",
+            )
+
+        assert result is new_agent
+        assert pool._cache["session-A"] is new_agent
+        old_agent.close.assert_not_called()
+        pool._create_agent_instance.assert_awaited_once()
+        mock_sandbox_service.renew.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_get_or_create_cache_hit_does_not_rebind_history_service_db(self):
         """缓存命中不应将共享 Agent 重新绑定到请求级 DB。"""
         from src.api.services.agent_pool_service import AgentPoolService

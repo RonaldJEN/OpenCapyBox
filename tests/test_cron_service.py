@@ -90,6 +90,48 @@ class TestCronTask:
         assert d["enabled"] is True
 
 
+class TestCronChannelAdapter:
+    """Cron typed channel boundary tests."""
+
+    def test_normalizes_no_reply_turn_and_preserves_agent_prompt(self):
+        from src.api.schemas.turn import NoReplyRoute
+        from src.api.services.cron_channel_adapter import CronChannelAdapter
+
+        adapter = CronChannelAdapter()
+        turn = adapter.normalize_run(
+            user_id="user-1",
+            session_id="session-1",
+            job_name="daily-digest",
+            run_id="run-1",
+            prompt="整理今天的重点",
+            cron_expr="0 9 * * *",
+            source="scheduled",
+        )
+
+        assert turn.channel == "cron"
+        assert turn.user_id == "user-1"
+        assert turn.metadata["session_id"] == "session-1"
+        assert turn.peer_kind == "cron"
+        assert turn.peer_id == "daily-digest"
+        assert isinstance(turn.reply_route, NoReplyRoute)
+        assert turn.idempotency_key == "cron:run-1"
+        assert turn.metadata == {
+            "session_id": "session-1",
+            "job_name": "daily-digest",
+            "run_id": "run-1",
+            "cron_expr": "0 9 * * *",
+            "source": "scheduled",
+        }
+        assert turn.content[0].text == "整理今天的重点"
+
+        assert adapter.render_agent_prompt(turn) == (
+            "你是一个定时任务执行器。请执行以下任务：\n\n"
+            "任务名：daily-digest\n"
+            "描述：整理今天的重点\n\n"
+            "请执行任务并给出简洁的结果摘要。"
+        )
+
+
 class TestCronServiceDB:
     """CronService 数据库操作测试"""
 
@@ -531,6 +573,7 @@ class TestCronAgentConstruction:
             mock_job = MagicMock()
             mock_job.name = "test-job"
             mock_job.description = "desc"
+            mock_job.content = ""
             mock_job.cron_expr = "0 * * * *"
             mock_job.enabled = True
             mock_run_record = MagicMock()
@@ -571,24 +614,56 @@ class TestCronAgentConstruction:
 
     @pytest.mark.asyncio
     async def test_registry_agent_uses_model_config_values(self):
-        """model registry 可用时，Agent 参数来自 model_config（不允许硬编码）。"""
+        """model registry 可用时，orchestrated Agent 参数来自 model_config。"""
         mock_model_config = MagicMock()
+        mock_model_config.id = "cron-model"
         mock_model_config.context_window = 200000
         mock_model_config.max_tokens = 32768
         mock_model_config.compute_token_limit.return_value = 164232
 
         mock_registry = MagicMock()
         mock_registry.get_cron_default.return_value = mock_model_config
+        mock_registry.get_or_raise.return_value = mock_model_config
+        mock_registry.list_models.return_value = [mock_model_config]
+
+        captured = {}
+
+        async def _fake_events():
+            yield {"type": "TEXT_MESSAGE_CONTENT", "delta": "summary"}
+            yield {"type": "TEXT_MESSAGE_END"}
+            yield {"type": "TEXT_MESSAGE_CONTENT", "delta": "done"}
+            yield {"type": "TEXT_MESSAGE_END"}
+            yield {
+                "type": "RUN_FINISHED",
+                "outcome": "success",
+                "result": {"finalResponse": "done"},
+            }
+
+        class FakeExecution:
+            task = None
+            event_source = _fake_events()
+
+        class FakeOrchestrator:
+            async def submit_turn(self, turn, *, agent_service):
+                captured["turn"] = turn
+                captured["agent_service"] = agent_service
+                return FakeExecution()
 
         with (
             patch("src.api.model_registry.get_model_registry", return_value=mock_registry),
-            patch("src.agent.llm.LLMClient") as MockLLM,
             patch("src.api.models.database.SessionLocal") as mock_session_local,
             patch("src.api.services.sandbox_service.get_sandbox_service") as mock_svc,
             patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/mnt"),
-            patch("src.api.services.tool_factory.create_agent_tools", new_callable=AsyncMock, return_value=([], None)),
+            patch("src.api.services.cron_service._ensure_cron_session"),
+            patch("src.api.services.turn_orchestrator.get_turn_orchestrator", return_value=FakeOrchestrator()),
             patch("src.api.services.cron_service._scan_run_artifacts", new_callable=AsyncMock, return_value=None),
-            patch("src.agent.agent.Agent") as MockAgent,
+            patch("src.api.services.agent_service.get_model_registry", return_value=mock_registry),
+            patch("src.api.services.agent_service.get_sandbox_mount_path", return_value="/mnt"),
+            patch("src.api.services.agent_service.create_agent_tools", new_callable=AsyncMock, return_value=([], None)),
+            patch("src.api.services.agent_service.AgentService._provision_default_files_if_needed"),
+            patch("src.api.services.agent_service.AgentService._restore_history"),
+            patch("src.api.services.agent_service.LLMClient") as MockLLM,
+            patch("src.api.services.agent_service.Agent") as MockAgent,
         ):
             MockLLM.from_model_config.return_value = MagicMock()
 
@@ -599,6 +674,7 @@ class TestCronAgentConstruction:
             mock_job = MagicMock()
             mock_job.name = "test-job"
             mock_job.description = "desc"
+            mock_job.content = ""
             mock_job.cron_expr = "0 * * * *"
             mock_job.enabled = True
             mock_run_record = MagicMock()
@@ -626,9 +702,20 @@ class TestCronAgentConstruction:
 
             from src.api.services.cron_service import run_cron_job
 
-            await run_cron_job("user-1", "test-job")
+            await run_cron_job("user-1", "test-job", run_id="run-1")
 
             call_kwargs = MockAgent.call_args[1]
             assert call_kwargs["token_limit"] == 164232
             assert call_kwargs["context_window"] == 200000
             assert call_kwargs["max_output_tokens"] == 32768
+            assert call_kwargs["workspace_dir"] == "/mnt/cron/runs/run-1"
+            assert captured["agent_service"].model_id == "cron-model"
+            assert captured["turn"].metadata["session_id"] == "run-1"
+            assert captured["turn"].content[0].text == (
+                "你是一个定时任务执行器。请执行以下任务：\n\n"
+                "任务名：test-job\n"
+                "描述：desc\n\n"
+                "请执行任务并给出简洁的结果摘要。"
+            )
+            assert mock_run_record.status == "success"
+            assert mock_run_record.output == "summary\n\ndone"

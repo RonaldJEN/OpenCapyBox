@@ -41,8 +41,18 @@
 - `list_models() -> list[ModelConfig]`
 - `get_default_model() -> str`
 - `cron_default_model` 支持
+- `get_cron_default() -> ModelConfig`
+- `get_subagent_default() -> ModelConfig`
 
 ## 3. API 契约
+
+### `models.yaml` 顶层默认模型
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `default_model` | 是 | 普通会话默认模型 |
+| `cron_default_model` | 否 | Cron 任务默认模型；不配置时继承 `default_model` |
+| `subagent_default_model` | 否 | `sub_agent` child Agent 与 Subagent graph 默认模型；不配置时继承 `default_model` |
 
 **无需鉴权（公开端点）**
 
@@ -61,7 +71,8 @@
         "tags": ["..."]
       }
     ],
-    "default_model": "model-id"
+    "default_model": "model-id",
+    "subagent_default_model": "model-id"
   }
   ```
 - 排除敏感字段（api_key, api_base）
@@ -79,6 +90,16 @@
 - 所有模型行为由 `models.yaml` 中的 `ModelConfig` 描述
 - 代码中无模型名判断分支
 - LLMClient 根据 `provider` 自动选择 AnthropicClient 或 OpenAIClient
+
+### 默认模型消费方
+
+| 字段 | 消费方 | 说明 |
+|------|--------|------|
+| `default_model` | 普通 Web 会话、未指定模型的新 Session | 用户对话主 Agent 的默认模型 |
+| `cron_default_model` | Cron worker 创建的临时 Agent | 定时任务无人值守执行的默认模型；不通过 `/api/models` 暴露 |
+| `subagent_default_model` | `AgentService` 的 subagent runner、`SubagentGraphService.create_edge()` | `sub_agent` child Agent run 和 graph 边的默认模型 |
+
+`sub_agent` 创建 child Agent 时使用 `get_subagent_default()`，不继承父会话当前选择的模型，避免主 Agent 与子任务的模型职责混在一起。child Agent 的 LLM fallback 仍按 `AgentService.initialize_agent()` 的普通 Agent 初始化规则，从 registry 中其他启用模型构造 one-shot fallback 链。
 
 ### Fallback 机制
 

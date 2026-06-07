@@ -331,6 +331,7 @@ export interface ModelInfo {
 export interface ModelsResponse {
   models: ModelInfo[];
   default_model: string;
+  subagent_default_model: string;
 }
 
 // 会话类型
@@ -421,6 +422,8 @@ export interface AttachmentInfo {
 export interface RoundData {
   round_id: string;
   parent_run_id?: string | null;
+  idempotency_key?: string | null;
+  last_event_sequence?: number;
   user_message: string;
   user_attachments?: AttachmentInfo[];
   final_response: string;
@@ -474,6 +477,11 @@ export interface RunningSessionsResponse {
 // SSE 回调类型 (AG-UI 协议)
 // =============================================================================
 
+export interface StreamDeltaMeta {
+  sequence?: number;
+  isAggregate?: boolean;
+}
+
 // 流式消息回调 (sendMessageStreamV2)
 export interface StreamCallbacks {
   // 生命周期事件
@@ -486,17 +494,17 @@ export interface StreamCallbacks {
 
   // 文本消息事件
   onTextMessageStart?: (messageId: string, role: string) => void;
-  onTextMessageContent?: (messageId: string, delta: string) => void;
+  onTextMessageContent?: (messageId: string, delta: string, meta?: StreamDeltaMeta) => void;
   onTextMessageEnd?: (messageId: string) => void;
 
   // 思考过程事件
   onThinkingStart?: (messageId: string, timestamp?: number) => void;
-  onThinkingContent?: (messageId: string, delta: string) => void;
+  onThinkingContent?: (messageId: string, delta: string, meta?: StreamDeltaMeta) => void;
   onThinkingEnd?: (messageId: string, timestamp?: number) => void;
 
   // 工具调用事件
   onToolCallStart?: (toolCallId: string, toolName: string, parentMessageId?: string, timestamp?: number) => void;
-  onToolCallArgs?: (toolCallId: string, delta: string) => void;
+  onToolCallArgs?: (toolCallId: string, delta: string, meta?: StreamDeltaMeta) => void;
   onToolCallEnd?: (toolCallId: string, timestamp?: number) => void;
   onToolCallResult?: (messageId: string, toolCallId: string, content: string, timestamp?: number, executionTimeMs?: number) => void;
 
@@ -524,13 +532,13 @@ export interface SubscribeCallbacks {
   
   // 🆕 流式事件回调（用于刷新后恢复实时更新）
   onTextMessageStart?: (messageId: string, role: string) => void;
-  onTextMessageContent?: (messageId: string, delta: string) => void;
+  onTextMessageContent?: (messageId: string, delta: string, meta?: StreamDeltaMeta) => void;
   onTextMessageEnd?: (messageId: string) => void;
   onThinkingStart?: (messageId: string, timestamp?: number) => void;
-  onThinkingContent?: (messageId: string, delta: string) => void;
+  onThinkingContent?: (messageId: string, delta: string, meta?: StreamDeltaMeta) => void;
   onThinkingEnd?: (messageId: string, timestamp?: number) => void;
   onToolCallStart?: (toolCallId: string, toolName: string, parentMessageId?: string, timestamp?: number) => void;
-  onToolCallArgs?: (toolCallId: string, delta: string) => void;
+  onToolCallArgs?: (toolCallId: string, delta: string, meta?: StreamDeltaMeta) => void;
   onToolCallEnd?: (toolCallId: string, timestamp?: number) => void;
   onToolCallResult?: (messageId: string, toolCallId: string, content: string, timestamp?: number, executionTimeMs?: number) => void;
   onStepStarted?: (stepName: string, timestamp?: number) => void;

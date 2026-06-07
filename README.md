@@ -122,7 +122,7 @@ Define Cron jobs via the `manage_cron` tool, and your AI assistant runs them aut
 | 🔍 Web Search | GLMSearch / BatchSearch | Bocha search engine, parallel batch search |
 | 🧠 Memory | RecordDailyLog / SearchMemory | Layered persistent memory + hybrid retrieval |
 | 📝 Session Notes | SessionNote / RecallNote | Cross-turn context preservation |
-| ⏰ Cron | ManageCron | DB-driven decentralized cron worker |
+| ⏰ Cron | ManageCron | DB-backed cron worker |
 | 🎒 Skills | GetSkill | 40+ dynamically loadable professional skills |
 | 🔌 MCP | MCP Tools | Model Context Protocol tool integration |
 
@@ -284,8 +284,8 @@ OpenCapyBox uses **AG-UI (Agent User Interaction Protocol)** for frontend-backen
 ├──────────────┬───────────────────────────────────────────────────┤
 │              │  REST API + SSE (AG-UI Event Protocol)            │
 ├──────────────▼───────────────────────────────────────────────────┤
-│  Backend — FastAPI + SQLAlchemy + PostgreSQL                     │
-│  JWT Auth · Agent Pool · Memory Service · Cron Scheduler · SSE  │
+│  Backend — FastAPI + SQLAlchemy + PostgreSQL + pgvector         │
+│  JWT Auth · Turn Orchestration · Agent Pool · Memory · Cron     │
 ├──────────────┬───────────────────────────────────────────────────┤
 │              │  Agent ↔ LLM Provider / OpenSandbox               │
 ├──────────────▼───────────────────────────────────────────────────┤
@@ -298,6 +298,48 @@ OpenCapyBox uses **AG-UI (Agent User Interaction Protocol)** for frontend-backen
 │  DeepSeek / MiniMax           One Sandbox Per User               │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+### Turn Orchestration
+
+The chat backend splits each conversational turn into three responsibilities: the **gateway** only translates protocol, the **orchestrator** owns the full lifecycle, and the **runtime** guarantees consistency. Each layer does exactly one thing and never crosses boundaries, with PostgreSQL as the single source of truth.
+
+```mermaid
+flowchart TB
+    Client["Frontend / future external channels"]
+
+    subgraph Gateway["① Gateway + Adapter (thin translation)"]
+        G["HTTP/SSE encode · auth · heartbeat keepalive"]
+        A["Web Adapter: normalize requests from any channel into one Turn contract"]
+    end
+
+    subgraph Orchestrator["② TurnOrchestrator (lifecycle brain)"]
+        O["create/resume Round · run lock · cancel token<br/>background producer: execution decoupled from connection"]
+    end
+
+    subgraph Runtime["③ In-process runtime (consistency)"]
+        BUS["EventBus<br/>event persistence + replay/subscribe"]
+        RCS["CompletionService<br/>single terminal entry"]
+        CANCEL["CancelService<br/>precise cancellation"]
+    end
+
+    DB[("PostgreSQL · single source of truth")]
+
+    Client --> Gateway
+    Gateway --> Orchestrator
+    Orchestrator --> Runtime
+    Runtime --> DB
+    Orchestrator -.->|execution independent of connection| Client
+```
+
+**What each layer buys you**
+
+| Layer | Problem it solves | Benefit |
+| --- | --- | --- |
+| ① Gateway + Adapter | Protocol details (HTTP/SSE, auth, field formats) tangled with business logic | Business layer is transport-agnostic; adding a new channel (WeChat, Slack, etc.) means writing one adapter — zero changes to the orchestrator |
+| ② TurnOrchestrator | Round creation, locks, cancellation, background tasks scattered across routes | Lifecycle is centralized; **execution is decoupled from the SSE connection** — the run keeps going when the browser disconnects, and reconnects resume losslessly |
+| ③ Runtime trio | Event interleaving, duplicate terminal commits, mis-targeted cancels under concurrency | EventBus guarantees replay consistency; CompletionService makes terminals single-entry; CancelService hits exactly the current run and never kills a new one |
+
+> 📐 Detailed contracts and failure modes at [docs/specs/chat-spec.md](docs/specs/chat-spec.md)
 
 ### Project Structure
 
@@ -437,6 +479,7 @@ AUTH_SECRET_KEY=                        # Auto-derived if not set
 AUTH_TOKEN_EXPIRE_MINUTES=720
 
 # === Agent ===
+UVICORN_WORKERS=1
 AGENT_MAX_STEPS=100
 AGENT_TOKEN_LIMIT=200000
 AGENT_USER_CONCURRENCY_LIMIT=1
@@ -468,6 +511,7 @@ Each module has a standalone spec covering data models, API contracts, behavior 
 | [sandbox-spec.md](docs/specs/sandbox-spec.md) | Sandbox interaction |
 | [models-spec.md](docs/specs/models-spec.md) | Model registry & switching |
 | [config-spec.md](docs/specs/config-spec.md) | Agent config & skills |
+| [subagent-run-graph-spec.md](docs/specs/subagent-run-graph-spec.md) | Subagent run graph |
 | [frontend-spec.md](docs/specs/frontend-spec.md) | Frontend overview & design system |
 | [frontend-chat-spec.md](docs/specs/frontend-chat-spec.md) | Frontend chat / SSE / reasoning panel |
 | [frontend-session-spec.md](docs/specs/frontend-session-spec.md) | Frontend session list & switching |
@@ -557,14 +601,30 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 
 ## 🗺️ Roadmap
 
+### ⚡ Performance & Scalability
+
+- [ ] **Parallel subagent execution** — subagents run serially today; plan to schedule multiple child tasks concurrently
+- [ ] **Multi-worker deployment + Redis sync** — introduce Redis for cross-worker event fanout / cancel registry / run locks, lifting the single-worker assumption
+- [ ] Pluggable EventBus: upgrade the in-process bus to a backend choice (in-process / Redis Pub-Sub)
+- [ ] Caching layer for session & memory retrieval
+
+### 🔌 Channels & Integrations
+
+- [ ] External channel adapters (WeChat / DingTalk / Slack, etc.) — reusing the TurnOrchestrator layer
+- [ ] WebSocket bidirectional communication
+- [ ] More model providers (Gemini, Claude direct, etc.)
+
+### 🎒 Skills & Ecosystem
+
 - [ ] Skill ZIP package upload & install
+- [ ] Skill marketplace
+- [ ] Agent workflow orchestration
+
+### 👥 Collaboration & Multi-tenancy
+
 - [ ] Multi-tenant permission system
 - [ ] Session sharing & collaboration
-- [ ] Skill marketplace
-- [ ] WebSocket bidirectional communication
 - [ ] Multi-language UI
-- [ ] Agent workflow orchestration
-- [ ] More model providers (Gemini, Claude direct, etc.)
 
 ---
 

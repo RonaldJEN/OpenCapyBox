@@ -113,6 +113,7 @@ OpenCapyBox 是一个前后端分离的 Web 智能体平台，核心能力包括
 | `docs/specs/models-spec.md`           | 模型注册与切换             |
 | `docs/specs/config-spec.md`           | Agent 配置与技能           |
 | `docs/specs/admin-spec.md`           | 管理后台聚合接口           |
+| `docs/specs/subagent-run-graph-spec.md` | Subagent 运行图            |
 | `docs/specs/frontend-spec.md`         | 前端总规范与设计体系       |
 | `docs/specs/frontend-chat-spec.md`    | 前端聊天 / SSE / 推理面板  |
 | `docs/specs/frontend-session-spec.md` | 前端会话列表与切换         |
@@ -208,6 +209,7 @@ DATABASE_URL=postgresql://user:password@localhost:5432/open_capy_box
 AUTH_SECRET_KEY=replace-with-random-secret
 
 # Agent/SSE
+UVICORN_WORKERS=1
 AGENT_MAX_STEPS=100
 AGENT_MAX_HISTORY_MESSAGES=120
 SSE_HEARTBEAT_INTERVAL=15

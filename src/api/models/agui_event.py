@@ -14,7 +14,7 @@ AG-UI 事件類型（EventType）：
 3. 消息追蹤 - 通過 message_id 關聯消息
 4. 工具調用追蹤 - 通過 tool_call_id 關聯工具調用
 """
-from sqlalchemy import Column, String, Text, DateTime, Integer, BigInteger, ForeignKey, Index
+from sqlalchemy import Column, String, Text, DateTime, Integer, BigInteger, ForeignKey, Index, UniqueConstraint
 from .database import Base
 from src.api.utils.timezone import now_naive
 
@@ -77,6 +77,7 @@ class AGUIEventLog(Base):
     
     # === 索引定義 ===
     __table_args__ = (
+        UniqueConstraint('run_id', 'sequence', name='uq_agui_events_run_sequence'),
         # 按運行查詢所有事件
         Index('idx_agui_events_run_id', 'run_id'),
         # 按事件類型過濾

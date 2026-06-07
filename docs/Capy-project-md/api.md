@@ -235,6 +235,8 @@ Authorization: Bearer <access_token>
   "rounds": [
     {
       "round_id": "round-001",
+      "idempotency_key": "550e8400-e29b-41d4-a716-446655440000",
+      "last_event_sequence": 8,
       "user_message": "帮我创建一个 Python 文件",
       "user_attachments": [
         {
@@ -589,7 +591,7 @@ Content-Type: application/json
 | 字段             | 类型     | 必填 | 说明 |
 | ---------------- | -------- | ---- | ---- |
 | content          | array    | 是   | 内容块数组（见上方类型说明） |
-| idempotency_key  | string   | 否   | 幂等键（UUID），多 worker 下防止同一请求被重复处理。前端自动生成 |
+| idempotency_key  | string   | 否   | 幂等键（UUID），防止同一请求被重复处理。前端自动生成 |
 
 **模型能力限制**
 
@@ -621,13 +623,13 @@ RUN_STARTED → STATE_SNAPSHOT → THINKING_TEXT_MESSAGE_START → THINKING_TEXT
 
 - 同一用户同一时刻最多允许 `AGENT_USER_CONCURRENCY_LIMIT` 个不同 session 运行，默认 1
 - 同一 session 同一时刻仍只允许一个运行中的任务
-- 并发限制基于数据库 slot 锁 `UserRunLock` 实现（跨 worker 生效），执行期间通过心跳保活
+- 并发限制基于数据库 slot 锁 `UserRunLock` 实现，执行期间通过心跳保活
 - 心跳超过 `sse_subscribe_timeout` 未更新时，锁被视为陈旧并自动回收
 - 当存在运行中的任务时，接口返回 `429 Too Many Requests`
 
 **幂等冲突（SSE 事件）**
 
-当 `idempotency_key` 对应的 Round 已被另一个 worker 创建时，不返回 HTTP 错误，而是通过 SSE 推送 `RUN_ERROR` 事件：
+当 `idempotency_key` 对应的 Round 已存在时，不返回 HTTP 错误，而是通过 SSE 推送 `RUN_ERROR` 事件：
 
 ```json
 {
@@ -726,11 +728,54 @@ abortSubscription();
 
 ---
 
+### 查询 Subagent Run Graph
+
+查询某个 run 所属的 subagent graph。`round_id` 可以是 root run，也可以是任意 descendant run。
+
+当前 `sub_agent` 工具会创建同步 child Agent run：父 Agent 等待 child 完成，child transcript 作为独立 Round 持久化，并通过 `subagent_runs` 与父 run 相连。本接口查询这些持久化 graph 边。
+
+**请求**
+
+```
+GET /api/chat/{chat_session_id}/round/{round_id}/subagent-graph
+Authorization: Bearer <access_token>
+```
+
+**响应** `200 OK`
+
+```json
+{
+  "session_id": "session-1",
+  "root_run_id": "root-run",
+  "requested_run_id": "child-run",
+  "nodes": [
+    {"run_id": "root-run", "kind": "root", "status": "completed"},
+    {"run_id": "child-run", "kind": "subagent", "status": "completed"}
+  ],
+  "edges": [
+    {
+      "edge_id": "edge-id",
+      "parent_run_id": "root-run",
+      "child_run_id": "child-run",
+      "tool_call_id": "tc-agent-1",
+      "agent_type": "research",
+      "status": "completed",
+      "prompt": "Read docs and summarize"
+    }
+  ]
+}
+```
+
+`idempotency_key` 用于客户端在 `/message/stream` 已被接受但尚未收到 `runId` 时，通过 history/v2 精确恢复同一次请求对应的 round。
+`last_event_sequence` 用于 running round 的 SSE 订阅续接；前端已用 history 展示过的事件不应再从 `last_sequence=0` 重放。
+
+---
+
 ### 中止 Agent 执行
 
 中止正在进行的 Agent 执行。
 
-在多 worker 部署下，该接口会先写入跨 worker 可见的取消请求（`requested`），随后由实际执行该任务的 worker 感知并触发本地取消令牌。Agent 会在下一个检查点（step 开始 / 工具执行前）退出，并通过 SSE 连接推送 `RUN_FINISHED(outcome=interrupt)`。
+第一版按单 worker 部署。该接口会写入 append-only 取消审计行，并通过进程内 run registry 命中当前 run 的取消令牌；接口同时将 running round 立即收敛为 `cancelled` 并释放会话锁，允许用户马上重发。
 
 取消成功时，`RUN_FINISHED.result.reason` 为 `user_cancelled`，用于前端区分“用户取消”与“ask_user 中断”。
 
@@ -752,8 +797,9 @@ Authorization: Bearer <access_token>
 
 ```json
 {
-  "status": "cancellation_requested",
-  "request_id": "uuid"
+  "status": "cancelled",
+  "request_id": "uuid",
+  "reason": "force_aborted"
 }
 ```
 
@@ -775,9 +821,9 @@ Authorization: Bearer <access_token>
 | 409    | 该会话没有正在进行的执行（无 running round 且锁不存在或已过期） |
 | 503    | 取消请求写入失败（数据库繁忙等） |
 
-### 查询取消请求状态（多 worker 可观测）
+### 查询取消请求状态
 
-用于排查“取消是否已被执行 worker 感知”。接口返回取消请求状态机与当前运行态，便于控制台或运维面板展示。
+用于排查取消审计记录与当前运行态。第一版取消投递依赖单 worker 进程内 registry；DB 行只做审计与诊断。
 
 **请求**
 
@@ -806,8 +852,8 @@ Authorization: Bearer <access_token>
 | 值        | 说明 |
 | --------- | ---- |
 | `none`      | 尚未记录取消请求 |
-| `requested` | 已收到取消请求，等待执行 worker 感知 |
-| `acked`     | 执行 worker 已确认并触发本地取消 |
+| `requested` | 已收到取消请求，但未命中本进程 registry |
+| `acked`     | 已命中本进程 registry 并触发本地取消 |
 | `completed` | 该次运行已结束并完成收敛 |
 
 **错误**
@@ -1199,7 +1245,8 @@ GET /api/models
       "tags": ["thinking"]
     }
   ],
-  "default_model": "glm-5"
+  "default_model": "glm-5",
+  "subagent_default_model": "mimo"
 }
 ```
 
@@ -1303,7 +1350,7 @@ GET /api/models/{model_id}
 
 ### UserRunLock（用户运行锁）
 
-跨 worker 用户级运行 slot。每个用户最多持有 `AGENT_USER_CONCURRENCY_LIMIT` 个不同 session 的运行 slot；同一 session 同一时刻只能持有一个 slot。执行 worker 通过定时刷新 `updated_at` 实现心跳保活。
+用户级运行 slot。每个用户最多持有 `AGENT_USER_CONCURRENCY_LIMIT` 个不同 session 的运行 slot；同一 session 同一时刻只能持有一个 slot。执行 worker 通过定时刷新 `updated_at` 实现心跳保活。
 
 | 字段       | 类型     | 说明                            |
 | ---------- | -------- | ------------------------------- |
@@ -1316,21 +1363,83 @@ GET /api/models/{model_id}
 
 **约束**：`lock_id` 为主键；`Unique(user_id, slot)` 限制用户并发配额；`Unique(user_id, session_id)` 保证同一会话不可重入。
 
-**心跳与过期**：`_cancel_request_watcher` 每 15s 刷新 `updated_at`。当 `updated_at` 超过 `sse_subscribe_timeout` 秒未更新时，slot 被视为陈旧，新请求可回收并清理该 session 关联的孤儿 Round。
+**心跳与过期**：`TurnOrchestrator` 的 lock heartbeat guard 每 15s 刷新 `updated_at`。当 `updated_at` 超过 `sse_subscribe_timeout` 秒未更新时，slot 被视为陈旧，新请求可回收并清理该 session 关联的孤儿 Round。
 
-### RunCancelRequest（跨 worker 取消请求）
+### RunCancelRequest（取消审计）
 
-跨 worker 可见的取消请求状态机（`requested → acked → completed`）。每个会话最多一条记录（主键 `session_id`），新 abort 会覆盖旧记录。
+取消请求 append-only 审计表（`requested → acked → completed`）。第一版运行时按单 worker 部署，取消投递由进程内 `RunCancelService` registry + per-run cancel token 完成；DB 行只做审计与诊断，不承担跨 worker command delivery。
 
-| 字段         | 类型     | 说明                             |
-| ------------ | -------- | -------------------------------- |
-| session_id   | string   | 会话 ID（主键）                  |
-| user_id      | string   | 用户 ID                          |
-| request_id   | string   | 请求 UUID                        |
-| state        | string   | requested / acked / completed    |
-| requested_at | datetime | 请求时间                         |
-| acked_at     | datetime | 执行 worker 确认时间（可选）     |
-| completed_at | datetime | 运行结束时间（可选）             |
+| 字段            | 类型     | 说明                                      |
+| --------------- | -------- | ----------------------------------------- |
+| request_id      | string   | 请求 UUID（主键）                         |
+| session_id      | string   | 会话 ID                                   |
+| user_id         | string   | 用户 ID                                   |
+| target_run_id   | string   | 精确取消目标 run（可选）                  |
+| root_run_id     | string   | 根 run（可选）                            |
+| requested_after | datetime | 防误杀守卫，避免 abort 后新建 run 被串扰 |
+| state           | string   | requested / acked / completed             |
+| requested_at    | datetime | 请求时间                                  |
+| acked_at        | datetime | 本地 registry 命中确认时间（可选）        |
+| completed_at    | datetime | 运行结束时间（可选）                      |
+
+### ChannelSessionBinding（Channel 会话绑定）
+
+外部 channel peer 到内部 session 的绑定表。当前 Web SSE 路径仍以
+`session_id` 为入口；该表提供 typed turn/channel 边界中的持久化 binding。
+`NormalizedInboundTurn` / `ReplyRoute` / `DeliveryIntent` 等 turn contract 给
+Web adapter、Cron adapter 和未来外部 channel adapter 复用，未来外部 channel
+adapter 可用本表将 peer 映射到 session。
+
+| 字段               | 类型     | 说明                                      |
+| ------------------ | -------- | ----------------------------------------- |
+| id                 | string   | 绑定 UUID（主键）                         |
+| user_id            | string   | 用户 ID                                   |
+| session_id         | string   | 内部会话 ID                               |
+| channel            | string   | 渠道标识，如 web / cron / 未来外部 channel |
+| account_id         | string   | 渠道账号或 bot 实例（可选）               |
+| peer_kind          | string   | web / direct / group / thread / cron / webhook |
+| peer_id            | string   | 渠道内对端标识                            |
+| external_thread_id | string   | 渠道线程标识（可选）                      |
+| binding_key        | string   | 规范化 channel peer 后的 SHA-256          |
+| reply_route_json   | string   | `ReplyRoute` 快照（可选）                 |
+| metadata_json      | string   | adapter 元数据（可选）                    |
+| created_at         | datetime | 创建时间                                  |
+| updated_at         | datetime | 最后更新时间                              |
+
+**约束**：`Unique(user_id, binding_key)`；删除用户或 session 时级联清理。
+当前 `DeliveryService` 是 no-op 边界，外部网络消息发送不属于本阶段能力。
+
+### SubagentRun（Subagent 图边）
+
+父 run 到子 agent run 的有向边。`sub_agent` 工具触发时，服务层会创建 `subagent_runs` edge、创建 child `Round(parent_run_id=parent_run_id)`，并在 child run 结束后更新 edge 状态、输出或错误。
+
+`sub_agent` 工具参数为：
+
+| 字段          | 类型   | 必填 | 说明                                      |
+| ------------- | ------ | ---- | ----------------------------------------- |
+| prompt        | string | 是   | 完整委托任务提示                          |
+| subagent_type | string | 否   | 子 agent profile，默认 `general`（可选 `research`/`write`/`general`） |
+| description   | string | 否   | 人类可读的任务摘要                        |
+
+运行边界：聊天 Agent 默认注册该工具；父 Agent 可以在同一步发起多个 `sub_agent` tool call，但后端按 tool call 顺序逐个同步执行，不并行。`subagent_type` 解析为 profile（见 `src/agent/subagent_profiles.py`），决定子 Agent 的系统提示与工具集；子 Agent **不继承**父 Agent 记忆，而是加载 profile 自带的精简系统提示。legacy 值映射：plan/review/explore→research，code/debug→write，未知/空→general。Cron Agent 与 child Agent 均排除该工具，避免无人值守递归和 subagent 自递归；三个 profile 也统一排除 `manage_cron`。child Agent 使用 `models.yaml` 的 `subagent_default_model`，默认不提供 `ask_user` / `sub_agent`。`SubAgentTool.execute_timeout = 0`：child Round 由自身步数上限管控，不受父 Agent 单次工具超时（`agent_tool_timeout`）拦截。child AG-UI events 写入 child round，不转发到父 SSE；父 Agent 只收到一个包含 child run id、edge id、状态和最终输出的工具结果。
+
+| 字段          | 类型     | 说明                                      |
+| ------------- | -------- | ----------------------------------------- |
+| id            | string   | Edge UUID（主键）                         |
+| user_id       | string   | 用户 ID                                   |
+| session_id    | string   | 会话 ID                                   |
+| root_run_id   | string   | 图的顶层 run                              |
+| parent_run_id | string   | 触发 subagent 的父 run                    |
+| child_run_id  | string   | 子 agent 对应的 Round（可选，唯一）       |
+| tool_call_id  | string   | 父 run 中触发 subagent 的 tool call（可选） |
+| agent_name    | string   | 子 agent 名称（可选）                     |
+| agent_type    | string   | 子 agent 类型（可选）                     |
+| model_id      | string   | 子 agent 模型（可选；不传则使用 `models.yaml` 的 `subagent_default_model`） |
+| description   | string   | 任务摘要（可选）                          |
+| prompt        | string   | 完整任务提示                              |
+| status        | string   | requested / running / completed / failed / cancelled |
+| output        | string   | 子 agent 最终输出（可选）                 |
+| error         | string   | 子 agent 错误（可选）                     |
 
 ### FileInfo（文件信息）
 

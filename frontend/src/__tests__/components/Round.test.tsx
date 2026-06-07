@@ -94,6 +94,29 @@ describe('Round 组件', () => {
     expect(screen.getByText('Completed: true')).toBeInTheDocument();
   });
 
+  it('终态 round 即使父级仍传入 isStreaming 也不应继续按流式渲染', () => {
+    const round = createMockRound({
+      status: 'completed',
+      final_response: '最终响应',
+      steps: [
+        {
+          step_number: 1,
+          thinking: '',
+          assistant_content: '临时正文',
+          tool_calls: [],
+          tool_results: [],
+          status: 'completed',
+        },
+      ],
+    });
+
+    render(<Round round={round} isStreaming={true} />);
+
+    expect(screen.getByText('Streaming: false')).toBeInTheDocument();
+    expect(screen.getByText('Completed: true')).toBeInTheDocument();
+    expect(screen.getByText('最终响应')).toBeInTheDocument();
+  });
+
   it('没有步骤时不应该渲染 ReasoningPanel', () => {
     const round = createMockRound({ steps: [] });
 
@@ -296,7 +319,7 @@ describe('Round 组件', () => {
 
     expect(screen.getByText('quick_sort.py')).toBeInTheDocument();
     expect(screen.getByText('包含两个版本：')).toBeInTheDocument();
-    expect(screen.queryByText(/\/home\/user\/sessions\/s1/)).not.toBeInTheDocument();
+    expect(screen.getByText('/home/user/sessions/s1/quick_sort.py')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '查看 quick_sort.py' }));
 

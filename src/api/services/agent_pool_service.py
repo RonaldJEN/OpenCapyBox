@@ -203,6 +203,25 @@ class AgentPoolService:
         active_count = getattr(agent_service, "_active_run_count", 0)
         return isinstance(active_count, int) and active_count > 0
 
+    def _detach_running_agent(self, chat_session_id: str) -> AgentService | None:
+        """Remove a still-running Agent from the hot cache without closing it.
+
+        Abort releases the DB run lock before the old runner has necessarily
+        reached its next cancellation checkpoint.  A fresh run for the same
+        chat_session_id must not reuse that mutable Agent runtime, but closing
+        it would break the old runner's in-flight cleanup.
+        """
+        agent_service = self._cache.pop(chat_session_id, None)
+        if agent_service is None:
+            return None
+        self._last_access.pop(chat_session_id, None)
+        self._agent_sandbox_ids.pop(chat_session_id, None)
+        logger.warning(
+            "Agent 仍在退出，已从热缓存摘出以隔离新 run: session=%s",
+            chat_session_id,
+        )
+        return agent_service
+
     def _running_session_ids_for_user(self, user_id: str) -> set[str]:
         """Best-effort 查询当前仍持有运行 slot 的 session。"""
         from src.api.models.user_run_lock import UserRunLock
@@ -399,6 +418,8 @@ class AgentPoolService:
                 )
                 sandbox_cache_invalidated = True
                 self.remove(chat_session_id)
+            elif self._cached_agent_is_running(chat_session_id):
+                self._detach_running_agent(chat_session_id)
             else:
                 self._touch(chat_session_id)
                 # 節流：每300秒才續租一次沙箱
@@ -447,6 +468,8 @@ class AgentPoolService:
                     )
                     sandbox_cache_invalidated = True
                     self._evict_agent(chat_session_id, drop_lock=False)
+                elif self._cached_agent_is_running(chat_session_id):
+                    self._detach_running_agent(chat_session_id)
                 else:
                     self._touch(chat_session_id)
                     return self._cache[chat_session_id]

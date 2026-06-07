@@ -19,6 +19,7 @@ from src.api.models.database import Base, get_db
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.round import Round
 from src.api.models.session import Session
+from src.api.models.subagent_run import SubagentRun
 from src.api.models.user_run_lock import UserRunLock
 from src.api.routes import admin as admin_routes
 from src.api.utils.timezone import now_naive
@@ -252,6 +253,104 @@ def test_rounds_tree_step_list_is_lightweight_and_detail_is_full(admin_integrati
     detail_data = detail.json()
     assert detail_data["request_messages"] == heavy_request
     assert detail_data["response_content"] == heavy_response
+
+
+def test_rounds_tree_marks_subagent_child_rounds(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    now = now_naive()
+    db = SessionLocal()
+    db.add(AuthUser(
+        user_id="admin",
+        username="admin",
+        auth_type="simple",
+        enabled=True,
+        is_admin=True,
+    ))
+    db.flush()
+    _insert_round_with_step(
+        db,
+        session_id="s-subagent",
+        user_id="admin",
+        title="SubagentSession",
+        round_id="parent-run",
+        status="completed",
+        created_at=now,
+        user_message="你能不能给她派生长一点的任务",
+        final_response="parent done",
+        request_messages=json.dumps([{"role": "user", "content": "parent"}], ensure_ascii=False),
+        response_content="parent response",
+    )
+    child_round = Round(
+        id="child-run",
+        thread_id="s-subagent",
+        session_id="s-subagent",
+        parent_run_id="parent-run",
+        user_message="You are a child agent run spawned by a parent OpenCapyBox agent.",
+        final_response="child done",
+        step_count=1,
+        status="completed",
+        created_at=now + timedelta(seconds=1),
+        completed_at=now + timedelta(seconds=6),
+    )
+    db.add(child_round)
+    db.flush()
+    db.add(SubagentRun(
+        user_id="admin",
+        session_id="s-subagent",
+        root_run_id="parent-run",
+        parent_run_id="parent-run",
+        child_run_id="child-run",
+        agent_type="general-purpose",
+        model_id="sonnet",
+        description="vlog完整制作方案+分镜脚本+爆款标题",
+        prompt="child prompt",
+        status=SubagentRun.COMPLETED,
+    ))
+    db.commit()
+    db.close()
+
+    response = client.get("/admin/rounds-tree", params={"limit": 5, "offset": 0, "status": "all"})
+
+    assert response.status_code == 200
+    rounds = response.json()["sessions"][0]["rounds"]
+    by_id = {item["round_id"]: item for item in rounds}
+    assert by_id["parent-run"]["run_kind"] == "main"
+    assert by_id["parent-run"]["subagent_child_count"] == 1
+    assert by_id["child-run"]["run_kind"] == "subagent"
+    assert by_id["child-run"]["parent_run_id"] == "parent-run"
+    assert by_id["child-run"]["subagent_type"] == "general-purpose"
+    assert by_id["child-run"]["subagent_description"] == "vlog完整制作方案+分镜脚本+爆款标题"
+
+
+def test_rounds_tree_resumed_round_does_not_make_session_running(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    now = now_naive()
+    db = SessionLocal()
+    _insert_round_with_step(
+        db,
+        session_id="s-resumed",
+        user_id="admin",
+        title="ResumedSession",
+        round_id="round-resumed",
+        status="resumed",
+        created_at=now,
+        user_message="你用subagent解决下问题",
+        final_response="resumed by follow-up",
+        request_messages=json.dumps([{"role": "user", "content": "resume"}], ensure_ascii=False),
+        response_content="resume response",
+    )
+    db.commit()
+    db.close()
+
+    response = client.get("/admin/rounds-tree", params={"limit": 5, "offset": 0, "status": "all"})
+
+    assert response.status_code == 200
+    session = response.json()["sessions"][0]
+    assert session["session_id"] == "s-resumed"
+    assert session["status"] == "completed"
+    assert session["rounds"][0]["status"] == "resumed"
 
 
 def test_users_payload_counts_recent_user_run_lock_as_running(admin_integration_client):

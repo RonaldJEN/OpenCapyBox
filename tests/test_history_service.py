@@ -333,13 +333,16 @@ class TestHistoryServiceGetSessionRounds:
         mock_event.event_type = "STEP_STARTED"
         mock_event.payload = json.dumps({"type": "STEP_STARTED"})
         mock_event.created_at = datetime.now()
+        mock_event.sequence = 1
         
         mock_event_end = MagicMock()
         mock_event_end.event_type = "STEP_FINISHED"
         mock_event_end.payload = json.dumps({"type": "STEP_FINISHED"})
         mock_event_end.created_at = datetime.now()
+        mock_event_end.sequence = 2
         
-        # 設置查詢返回：rounds 查詢 和 events 查詢
+        # 設置查詢返回：subagent child id 查詢、rounds 查詢 和 events 查詢
+        mock_db.query.return_value.filter.return_value.all.return_value = []
         mock_db.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
             [mock_round],  # rounds 查詢
             [mock_event, mock_event_end],  # events 查詢（用於重建 steps）
@@ -350,6 +353,7 @@ class TestHistoryServiceGetSessionRounds:
         assert len(rounds) == 1
         assert rounds[0]["round_id"] == "round-1"
         assert rounds[0]["parent_run_id"] == "round-parent"
+        assert rounds[0]["last_event_sequence"] == 2
         assert rounds[0]["user_message"] == "Hello"
         # steps 從事件重建
         assert "steps" in rounds[0]

@@ -17,6 +17,8 @@ from .llm_call_record import LLMCallRecord
 from .interrupt_resolution import InterruptResolution
 from .user_run_lock import UserRunLock
 from .run_cancel_request import RunCancelRequest
+from .channel_session_binding import ChannelSessionBinding
+from .subagent_run import SubagentRun
 from .auth_user import AuthUser
 from .auth_login_event import AuthLoginEvent
 
@@ -34,6 +36,8 @@ __all__ = [
     "InterruptResolution",
     "UserRunLock",
     "RunCancelRequest",
+    "ChannelSessionBinding",
+    "SubagentRun",
     "AuthUser",
     "AuthLoginEvent",
     
