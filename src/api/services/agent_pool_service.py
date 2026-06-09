@@ -277,27 +277,39 @@ class AgentPoolService:
 
     async def _sync_memory_to_sandbox(self, *, user_id: str, sandbox, force: bool = False) -> int:
         """Sync memory using short DB sessions so sandbox awaits do not hold request DB state."""
-        from src.api.services.memory_service import FILE_TYPE_TO_FILENAME, MemoryService
+        from src.api.services.memory_service import (
+            DB_BACKED_FILE_TYPES,
+            FILE_TYPE_TO_FILENAME,
+            MemoryService,
+        )
         from src.api.services.sandbox_service import get_sandbox_mount_path
 
         with SessionLocal() as db:
-            records = MemoryService(db).get_all_memory_files(user_id)
+            memory_svc = MemoryService(db)
+            records = memory_svc.get_all_memory_files(user_id)
+            agents_template = memory_svc.get_agents_template_content()
             db.rollback()
 
-        if not records:
+        if not records and not agents_template.strip():
             return 0
 
         mount = get_sandbox_mount_path()
         sync_items = []
         for file_type, db_content in records.items():
+            if file_type not in DB_BACKED_FILE_TYPES:
+                continue
             filename = FILE_TYPE_TO_FILENAME.get(file_type)
             if not filename:
                 continue
             sync_items.append((file_type, filename, f"{mount}/{filename}", db_content))
 
+        template_item = None
+        if agents_template.strip():
+            template_item = ("agents_md", "AGENTS.md", f"{mount}/AGENTS.md", agents_template)
+
         write_items = sync_items
 
-        if not force:
+        if not force and sync_items:
             read_results = await asyncio.gather(
                 *(sandbox.files.read_file(path) for _, _, path, _ in sync_items),
                 return_exceptions=True,
@@ -337,6 +349,9 @@ class AgentPoolService:
                     continue
 
                 write_items.append((file_type, filename, path, db_content))
+
+        if template_item is not None:
+            write_items.append(template_item)
 
         write_results = await asyncio.gather(
             *(sandbox.files.write_file(path, db_content) for _, _, path, db_content in write_items),

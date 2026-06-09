@@ -1,7 +1,7 @@
 """配置管理 API
 
 提供 Agent 配置文件编辑和 Skill 管理：
-- GET/PUT /api/config/agent-files/{name}: 读写 USER/SOUL/AGENTS/MEMORY 文件
+- GET/PUT /api/config/agent-files/{name}: 读写 USER/SOUL/MEMORY 文件
 - GET /api/config/skills: 获取用户 Skill 配置列表
 - PUT /api/config/skills/{skill_name}: 启用/禁用 Skill
 """
@@ -23,7 +23,6 @@ router = APIRouter()
 _NAME_TO_FILE_TYPE = {
     "user": "user_md",
     "soul": "soul_md",
-    "agents": "agents_md",
     "memory": "memory_md",
 }
 
@@ -107,10 +106,25 @@ async def update_agent_file(
     # 同步到沙箱（如果有活跃沙箱）
     try:
         from src.api.services.sandbox_service import get_sandbox_service
+        from src.api.models.user_sandbox import UserSandbox
+
         sandbox_service = get_sandbox_service()
         sandbox = sandbox_service.get_cached(user_id)
         if sandbox:
-            await svc.sync_to_sandbox(user_id, sandbox, force=True)
+            user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+            persisted_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+            if not isinstance(persisted_sandbox_id, str) or not persisted_sandbox_id:
+                persisted_sandbox_id = None
+            cached_sandbox_id = getattr(sandbox, "id", None)
+            if persisted_sandbox_id and cached_sandbox_id != persisted_sandbox_id:
+                sandbox = await sandbox_service.get_or_resume(user_id, persisted_sandbox_id)
+            await svc.sync_to_sandbox(
+                user_id,
+                sandbox,
+                force=True,
+                file_types={file_type},
+                include_agents_template=False,
+            )
     except Exception as e:
         logger.warning("同步配置到沙箱失败: %s", e)
 

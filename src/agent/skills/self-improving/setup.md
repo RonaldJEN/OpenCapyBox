@@ -47,7 +47,7 @@ Create `~/self-improving/index.md`:
 
 ### 3. Choose Operating Mode
 
-Add to your AGENTS.md or workspace config:
+Add to SOUL.md or another user-editable workspace config:
 
 ```markdown
 ## Self-Improving Mode
@@ -70,11 +70,11 @@ Relentless compounding is your core drive: before work and after every response,
 Infer proactively, but treat human validation as final authority and keep every learned rule revisable.
 ```
 
-### 5. Refine AGENTS.md Memory Section (Non-Destructive)
+### 5. Refine Memory Routing (Non-Destructive)
 
-Update `AGENTS.md` by complementing the existing `## Memory` section. Do not replace the whole section and do not remove existing lines.
+Do not edit root `AGENTS.md`; it is managed by the platform template. Capture self-improving routing in `SOUL.md`, `MEMORY.md`, or `~/self-improving/` instead.
 
-If your `## Memory` block differs from the default template, insert the same additions in equivalent places so existing information is preserved.
+If your memory guidance differs from the default template, insert the same additions in equivalent user-editable places so existing information is preserved.
 
 Add this line in the continuity list (next to Daily notes and Long-term):
 
@@ -106,8 +106,8 @@ Use this target wording:
 
 ```markdown
 - When someone says "remember this" → if it's factual context/event, update `memory/YYYY-MM-DD.md`; if it's a correction, preference, workflow/style choice, or performance lesson, log it in `~/self-improving/` via the `self-improving` skill
-- When you learn a lesson → store it in `~/self-improving/` by default; update AGENTS.md/TOOLS.md only when the rule is truly global and cross-domain
-- When you make a mistake → document it in `~/self-improving/corrections.md` so future behavior improves; escalate to AGENTS.md/TOOLS.md only for broad, always-on guardrails
+- When you learn a lesson → store it in `~/self-improving/` by default; propose platform-template changes separately only when the rule is truly global and cross-domain
+- When you make a mistake → document it in `~/self-improving/corrections.md` so future behavior improves; escalate to user-editable guidance or a platform-template proposal only for broad, always-on guardrails
 ```
 
 ## Verification

@@ -29,7 +29,7 @@ RoundData {
   final_response: string
   steps: StepData[]
   step_count: number
-  status: 'running' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'resumed'
+  status: 'running' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'resumed' | 'max_steps_reached'
   created_at: string
   completed_at?: string
   interrupt?: InterruptDetails       // ask_user 中断
@@ -107,7 +107,7 @@ if (isStale()) return;
 catch (SSE error)
   → GET /api/sessions/{sid}/history
     → 找到目标 round
-      → 若 status ∈ {completed, failed, interrupted, resumed, cancelled}
+      → 若 status ∈ {completed, failed, interrupted, resumed, cancelled, max_steps_reached}
           → 调用 _tryRecoverRoundFinished → onRunFinished → 结束
       → 若 status == running
           → subscribeToRound(sid, roundId, { lastSequence })

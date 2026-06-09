@@ -214,6 +214,34 @@ class TestGetOrResume:
         mock_sandbox.is_healthy.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_cache_hit_with_different_persisted_id_invalidates_and_connects(
+        self, service, mock_sandbox
+    ):
+        """持久化 sandbox_id 與快取不一致時，不得返回舊快取。"""
+        stale_sandbox = make_mock_sandbox(sandbox_id="sbx-old")
+        service._cache["session-1"] = stale_sandbox
+        service._pushed_skills["session-1"] = {"example-skill"}
+
+        with (
+            patch.object(
+                service,
+                "_query_sandbox_state",
+                new=AsyncMock(return_value="running"),
+            ) as query_state,
+            patch("src.api.services.sandbox_service.Sandbox") as MockSandbox,
+        ):
+            MockSandbox.connect = AsyncMock(return_value=mock_sandbox)
+
+            result = await service.get_or_resume("session-1", "sbx-test-123")
+
+        assert result is mock_sandbox
+        stale_sandbox.is_healthy.assert_not_awaited()
+        query_state.assert_awaited_once_with("sbx-test-123")
+        MockSandbox.connect.assert_awaited_once()
+        assert service.get_cached("session-1") is mock_sandbox
+        assert service._pushed_skills["session-1"] == set()
+
+    @pytest.mark.asyncio
     async def test_cache_hit_unhealthy_falls_to_connect(self, service, mock_sandbox):
         """測試快取命中但不健康 -> 優先嘗試 connect"""
         unhealthy = AsyncMock()

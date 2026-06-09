@@ -191,6 +191,12 @@ def test_mark_status_sets_output_and_completed_at():
         engine.dispose()
 
 
+def test_status_from_child_round_maps_max_steps_to_failed_edge():
+    round_obj = SimpleNamespace(status="max_steps_reached")
+
+    assert SubagentGraphService._status_from_child_round(round_obj) == SubagentRun.FAILED
+
+
 def test_subagent_graph_route_returns_graph():
     from tests.helpers import make_test_client
     from src.api.routes import chat as chat_routes

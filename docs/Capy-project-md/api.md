@@ -599,7 +599,7 @@ Content-Type: application/json
 - `image_url` 数量不能超过模型 `max_images`
 - 不支持图片/超限时返回 4xx 错误
 - **图片大小限制**：单张图片 Data URL 上限 20MB，所有图片 Data URL 总量上限 50MB。超过时返回 `400` 错误
-- **前端自动压缩**：图片在发送前会经过 Canvas 压缩（≤500KB JPEG），上传至沙箱的原始文件不受影响
+- **前端发送原图 Data URL**：图片发送给视觉模型时保留原始 Data URL，避免截图/OCR 场景因 JPEG 压缩降质；体积保护由上述后端大小限制负责
 
 **响应** `200 OK`
 
@@ -681,7 +681,7 @@ Connection: keep-alive
 
 **行为说明**
 
-1. **已终态轮次**（`completed` / `failed` / `interrupted` / `resumed` / `cancelled`）：立即返回补齐事件并关闭连接
+1. **已终态轮次**（`completed` / `failed` / `interrupted` / `resumed` / `cancelled` / `max_steps_reached`）：立即返回补齐事件并关闭连接
 2. **运行中的轮次**：
    - 先从 `agui_events` 表重放 `last_sequence` 之后的所有已持久化事件
    - 然后注册为订阅者接收后续实时事件
@@ -1317,7 +1317,7 @@ GET /api/models/{model_id}
 | final_response | string | 最终响应                                     |
 | steps          | Step[] | 执行步骤列表                                 |
 | step_count     | int    | 步骤数量                                     |
-| status         | string | 状态：pending / running / completed / failed / cancelled / interrupted / resumed |
+| status         | string | 状态：pending / running / completed / failed / cancelled / interrupted / resumed / max_steps_reached |
 | created_at     | string | 创建时间                                     |
 | completed_at   | string | 完成时间                                     |
 
@@ -1421,7 +1421,7 @@ adapter 可用本表将 peer 映射到 session。
 | subagent_type | string | 否   | 子 agent profile，默认 `general`（可选 `research`/`write`/`general`） |
 | description   | string | 否   | 人类可读的任务摘要                        |
 
-运行边界：聊天 Agent 默认注册该工具；父 Agent 可以在同一步发起多个 `sub_agent` tool call，但后端按 tool call 顺序逐个同步执行，不并行。`subagent_type` 解析为 profile（见 `src/agent/subagent_profiles.py`），决定子 Agent 的系统提示与工具集；子 Agent **不继承**父 Agent 记忆，而是加载 profile 自带的精简系统提示。legacy 值映射：plan/review/explore→research，code/debug→write，未知/空→general。Cron Agent 与 child Agent 均排除该工具，避免无人值守递归和 subagent 自递归；三个 profile 也统一排除 `manage_cron`。child Agent 使用 `models.yaml` 的 `subagent_default_model`，默认不提供 `ask_user` / `sub_agent`。`SubAgentTool.execute_timeout = 0`：child Round 由自身步数上限管控，不受父 Agent 单次工具超时（`agent_tool_timeout`）拦截。child AG-UI events 写入 child round，不转发到父 SSE；父 Agent 只收到一个包含 child run id、edge id、状态和最终输出的工具结果。
+运行边界：聊天 Agent 默认注册该工具；父 Agent 可以在同一步发起多个 `sub_agent` tool call，连续的 `sub_agent` 调用会按 `AGENT_SUBAGENT_MAX_PARALLEL` 做有界并行执行，父 Agent 写回消息历史和父 SSE 的工具结果仍保持原始 tool call 顺序。`subagent_type` 解析为 profile（见 `src/agent/subagent_profiles.py`），决定子 Agent 的系统提示与工具集；子 Agent **不继承**父 Agent 记忆，而是加载 profile 自带的精简系统提示。legacy 值映射：plan/review/explore→research，code/debug→write，未知/空→general。Cron Agent 与 child Agent 均排除该工具，避免无人值守递归和 subagent 自递归；三个 profile 也统一排除 `manage_cron`。child Agent 使用 `models.yaml` 的 `subagent_default_model`，默认不提供 `ask_user` / `sub_agent`。`SubAgentTool.execute_timeout = 0`：child Round 由自身步数上限管控，不受父 Agent 单次工具超时（`agent_tool_timeout`）拦截。child AG-UI events 写入 child round，不转发到父 SSE；父 Agent 只收到一个包含 child run id、edge id、状态和最终输出的工具结果。
 
 | 字段          | 类型     | 说明                                      |
 | ------------- | -------- | ----------------------------------------- |
@@ -1462,7 +1462,9 @@ GET /api/config/agent-files/{name}
 Authorization: Bearer <access_token>
 ```
 
-**Path 参数**: `name` — user / soul / agents / memory
+**Path 参数**: `name` — user / soul / memory
+
+`AGENTS.md` 由平台模板统一管理，不通过用户配置 API 暴露；请求 `agents` 会返回 400。
 
 **Response**:
 ```json

@@ -411,13 +411,13 @@ OpenCapyBox's layered memory makes your AI assistant understand you better over 
 │  MEMORY.md  — What have we discussed?       │
 │               (Long-term Memory)            │
 ├─────────────────────────────────────────────┤
-│  AGENTS.md  — Team collaboration rules      │
+│  AGENTS.md  — Platform behavior template    │
 └─────────────────────────────────────────────┘
 ```
 
 **Retrieval**: BM25 keyword + Embedding vector + RRF fusion + time decay. Automatically falls back to keyword-only search when Embedding is not configured.
 
-All config files can be edited directly in the frontend **Agent Config Panel**.
+The frontend **Agent Config Panel** can edit SOUL.md / USER.md / MEMORY.md. AGENTS.md is managed by the platform template and is not exposed as a user-editable config file.
 
 ## 🚢 Deployment Guide
 

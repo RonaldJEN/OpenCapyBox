@@ -973,7 +973,10 @@ async def get_admin_overview(
 async def get_admin_rounds_tree(
     limit: int = Query(30, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    status: str = Query("all", description="all|running|completed|failed|interrupted|resumed|cancelled"),
+    status: str = Query(
+        "all",
+        description="all|running|completed|failed|interrupted|resumed|cancelled|max_steps_reached",
+    ),
     user_id: str | None = Query(None),
     search: str | None = Query(None),
     _: str = Depends(get_current_admin_user),

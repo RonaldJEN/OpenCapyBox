@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import os
@@ -25,6 +26,17 @@ from .schema.agui_events import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ExecutedToolCall:
+    index: int
+    tool_call_id: str
+    function_name: str
+    arguments: Any
+    result: ToolResult
+    result_content: str
+    execution_time_ms: int
 
 
 # ANSI color codes
@@ -68,6 +80,7 @@ class Agent:
         context_window: int = 128000,  # 模型總上下文窗口大小
         max_output_tokens: int = 16384,  # 單次輸出上限（output tokens）
         tool_timeout: int = 300,  # 单次工具执行超时（秒），0 表示不限
+        subagent_max_parallel: int = 1,  # 同一 step 内最多并行执行的 sub_agent 数
     ):
         self.llm = llm_client
         self.tools = {tool.name: tool for tool in tools}
@@ -91,6 +104,7 @@ class Agent:
         self._last_compaction_stats = self._empty_compaction_stats()
         self.max_steps = max_steps
         self.tool_timeout = tool_timeout
+        self.subagent_max_parallel = max(1, int(subagent_max_parallel or 1))
         self.token_limit = token_limit
         self.context_window = context_window
         self.max_output_tokens = max_output_tokens
@@ -1058,6 +1072,239 @@ Rules:
     # 請使用 run_agui() 方法獲取 AG-UI 協議兼容的事件流
     # =========================================================================
 
+    @staticmethod
+    def _tool_call_identity(tool_call: Any) -> tuple[str, str, Any]:
+        tool_call_id = str(getattr(tool_call, "id", "") or "")
+        function = getattr(tool_call, "function", None)
+        function_name = getattr(function, "name", "") if function is not None else ""
+        arguments = getattr(function, "arguments", {}) if function is not None else {}
+        if not isinstance(function_name, str) or not function_name.strip():
+            function_name = ""
+        return tool_call_id, function_name, arguments
+
+    @staticmethod
+    def _tool_call_events(
+        emitter: AGUIEventEmitter,
+        *,
+        tool_call_id: str,
+        function_name: str,
+        arguments: Any,
+    ) -> list[AGUIEvent]:
+        events = [
+            emitter.tool_call_start(
+                tool_call_id=tool_call_id,
+                tool_name=function_name,
+            )
+        ]
+        args_json = json.dumps(arguments, ensure_ascii=False)
+        args_event = emitter.tool_call_args(tool_call_id, args_json)
+        if args_event:
+            events.append(args_event)
+        events.append(emitter.tool_call_end(tool_call_id))
+        return events
+
+    @staticmethod
+    def _print_tool_call(function_name: str, arguments: Any) -> None:
+        print(f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}")
+        print(f"{Colors.DIM}   Arguments:{Colors.RESET}")
+        truncated_args = {}
+        if isinstance(arguments, dict):
+            for key, value in arguments.items():
+                value_str = str(value)
+                if len(value_str) > 200:
+                    truncated_args[key] = value_str[:200] + "..."
+                else:
+                    truncated_args[key] = value
+        else:
+            truncated_args = {"_raw": str(arguments)}
+        args_display = json.dumps(truncated_args, indent=2, ensure_ascii=False)
+        for line in args_display.split("\n"):
+            print(f"   {Colors.DIM}{line}{Colors.RESET}")
+
+    async def _execute_tool_call_for_record(
+        self,
+        *,
+        index: int,
+        thread_id: str,
+        run_id: str,
+        tool_call_id: str,
+        function_name: str,
+        arguments: Any,
+        cancel_token: Optional[asyncio.Event],
+    ) -> _ExecutedToolCall:
+        execution_time_ms = 0
+        validation_error = self._validate_tool_arguments(function_name, arguments)
+        if validation_error:
+            result = ToolResult(
+                success=False,
+                content="",
+                error=validation_error,
+            )
+        else:
+            start_time = perf_counter()
+            tool = self.tools[function_name]
+            try:
+                context = ToolRuntimeContext(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=function_name,
+                    cancel_token=cancel_token,
+                )
+                timeout = self.tool_timeout if tool.execute_timeout is None else tool.execute_timeout
+                if function_name == "sub_agent" and hasattr(tool, "execute_with_context"):
+                    execute_coro = tool.execute_with_context(context, **arguments)
+                    if timeout > 0:
+                        result = await asyncio.wait_for(execute_coro, timeout=timeout)
+                    else:
+                        result = await execute_coro
+                else:
+                    tool.set_runtime_context(context)
+                    try:
+                        execute_coro = tool.execute(**arguments)
+                        if timeout > 0:
+                            result = await asyncio.wait_for(execute_coro, timeout=timeout)
+                        else:
+                            result = await execute_coro
+                    finally:
+                        try:
+                            tool.clear_runtime_context()
+                        except Exception:
+                            logger.debug("工具清理 runtime context 失败: %s", function_name, exc_info=True)
+            except asyncio.TimeoutError:
+                timeout_used = self.tool_timeout if tool.execute_timeout is None else tool.execute_timeout
+                result = ToolResult(
+                    success=False,
+                    content="",
+                    error=f"Tool execution timed out after {timeout_used}s",
+                )
+            except Exception as e:
+                import traceback
+                error_detail = f"{type(e).__name__}: {str(e)}"
+                error_trace = traceback.format_exc()
+                result = ToolResult(
+                    success=False,
+                    content="",
+                    error=f"Tool execution failed: {error_detail}\n\nTraceback:\n{error_trace}",
+                )
+            finally:
+                execution_time_ms = int((perf_counter() - start_time) * 1000)
+
+        result_content = self._tool_result_content(function_name, result)
+        return _ExecutedToolCall(
+            index=index,
+            tool_call_id=tool_call_id,
+            function_name=function_name,
+            arguments=arguments,
+            result=result,
+            result_content=result_content,
+            execution_time_ms=execution_time_ms,
+        )
+
+    def _tool_result_content(self, function_name: str, result: ToolResult) -> str:
+        result_content = result.content if result.success else f"Error: {result.error}"
+        tool_obj = self.tools.get(function_name)
+        budget = getattr(tool_obj, 'max_result_tokens', 8000) if tool_obj else 8000
+        return truncate_text_by_tokens(result_content, budget)
+
+    def _record_tool_result(self, record: _ExecutedToolCall) -> None:
+        if record.result.success:
+            result_text = record.result.content
+            if len(result_text) > 500:
+                result_text = result_text[:500] + f"{Colors.DIM}...{Colors.RESET}"
+            print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result_text}")
+        else:
+            print(f"{Colors.BRIGHT_RED}✗ Error:{Colors.RESET} {Colors.RED}{record.result.error}{Colors.RESET}")
+
+        self.logger.log_tool_result(
+            tool_name=record.function_name,
+            arguments=record.arguments,
+            result_success=record.result.success,
+            result_content=record.result.content if record.result.success else None,
+            result_error=record.result.error if not record.result.success else None,
+        )
+
+        tool_msg = Message(
+            role="tool",
+            content=record.result_content,
+            tool_call_id=record.tool_call_id,
+            name=record.function_name,
+        )
+        self.messages.append(tool_msg)
+
+    def _exception_tool_record(
+        self,
+        *,
+        index: int,
+        tool_call_id: str,
+        function_name: str,
+        arguments: Any,
+        exc: BaseException,
+    ) -> _ExecutedToolCall:
+        result = ToolResult(
+            success=False,
+            content="",
+            error=f"Tool execution failed: {type(exc).__name__}: {exc}",
+        )
+        return _ExecutedToolCall(
+            index=index,
+            tool_call_id=tool_call_id,
+            function_name=function_name,
+            arguments=arguments,
+            result=result,
+            result_content=self._tool_result_content(function_name, result),
+            execution_time_ms=0,
+        )
+
+    async def _execute_parallel_subagent_batch(
+        self,
+        batch: list[tuple[int, Any]],
+        *,
+        thread_id: str,
+        run_id: str,
+        cancel_token: Optional[asyncio.Event],
+    ) -> list[_ExecutedToolCall]:
+        semaphore = asyncio.Semaphore(self.subagent_max_parallel)
+
+        async def _run_one(index: int, tool_call: Any) -> _ExecutedToolCall:
+            tool_call_id, function_name, arguments = self._tool_call_identity(tool_call)
+            async with semaphore:
+                return await self._execute_tool_call_for_record(
+                    index=index,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    function_name=function_name,
+                    arguments=arguments,
+                    cancel_token=cancel_token,
+                )
+
+        tasks = [asyncio.create_task(_run_one(index, tool_call)) for index, tool_call in batch]
+        try:
+            raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        records: list[_ExecutedToolCall] = []
+        for (index, tool_call), raw in zip(batch, raw_results):
+            if isinstance(raw, BaseException):
+                tool_call_id, function_name, arguments = self._tool_call_identity(tool_call)
+                records.append(
+                    self._exception_tool_record(
+                        index=index,
+                        tool_call_id=tool_call_id,
+                        function_name=function_name,
+                        arguments=arguments,
+                        exc=raw,
+                    )
+                )
+            else:
+                records.append(raw)
+        return sorted(records, key=lambda item: item.index)
+
     async def run_agui(
         self, 
         thread_id: str,
@@ -1465,51 +1712,127 @@ Rules:
                     return
 
                 # 發射工具調用事件並執行工具
-                for tool_call in response.tool_calls:
-                    tool_call_id = tool_call.id
-                    function_name = tool_call.function.name
-                    arguments = tool_call.function.arguments
+                tool_calls = response.tool_calls
+                tool_call_index = 0
+                while tool_call_index < len(tool_calls):
+                    tool_call = tool_calls[tool_call_index]
+                    tool_call_id, function_name, arguments = self._tool_call_identity(tool_call)
 
-                    if not isinstance(function_name, str) or not function_name.strip():
-                        function_name = ""
-                    
-                    # TOOL_CALL_START
-                    yield emitter.tool_call_start(
-                        tool_call_id=tool_call_id,
-                        tool_name=function_name,
-                    )
-                    
-                    # TOOL_CALL_ARGS
-                    args_json = json.dumps(arguments, ensure_ascii=False)
-                    event = emitter.tool_call_args(tool_call_id, args_json)
-                    if event:
-                        yield event
-                    
-                    # TOOL_CALL_END
-                    yield emitter.tool_call_end(tool_call_id)
-                    
-                    # 打印工具調用
-                    print(f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}")
-                    print(f"{Colors.DIM}   Arguments:{Colors.RESET}")
-                    truncated_args = {}
-                    if isinstance(arguments, dict):
-                        for key, value in arguments.items():
-                            value_str = str(value)
-                            if len(value_str) > 200:
-                                truncated_args[key] = value_str[:200] + "..."
-                            else:
-                                truncated_args[key] = value
-                    else:
-                        truncated_args = {"_raw": str(arguments)}
-                    args_display = json.dumps(truncated_args, indent=2, ensure_ascii=False)
-                    for line in args_display.split("\n"):
-                        print(f"   {Colors.DIM}{line}{Colors.RESET}")
-                    
-                    # 執行工具
                     # 🛑 取消檢查點 3: 每個工具執行前
                     if cancel_token and cancel_token.is_set():
                         print(f"\n{Colors.BRIGHT_YELLOW}⏹️  用戶取消了執行 (跳過工具 {function_name}){Colors.RESET}")
-                        # 補充已跳過的工具結果（避免 tool_call 無 result 的協議不一致）
+                        for remaining_tc in tool_calls[tool_call_index:]:
+                            remaining_id, remaining_name, _remaining_args = self._tool_call_identity(remaining_tc)
+                            yield emitter.tool_call_start(
+                                tool_call_id=remaining_id,
+                                tool_name=remaining_name,
+                            )
+                            yield emitter.tool_call_end(remaining_id)
+                            yield emitter.tool_call_result(
+                                tool_call_id=remaining_id,
+                                content="Cancelled by user",
+                                execution_time_ms=0,
+                            )
+                            cancel_msg = Message(
+                                role="tool",
+                                content="Cancelled by user",
+                                tool_call_id=remaining_id,
+                                name=remaining_name,
+                            )
+                            self.messages.append(cancel_msg)
+                        yield emitter.step_finished(step_name)
+                        yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
+                        return
+
+                    if function_name == "sub_agent" and self.subagent_max_parallel > 1:
+                        batch: list[tuple[int, Any]] = [(tool_call_index, tool_call)]
+                        next_index = tool_call_index + 1
+                        while next_index < len(tool_calls):
+                            _next_id, next_name, _next_args = self._tool_call_identity(tool_calls[next_index])
+                            if next_name != "sub_agent":
+                                break
+                            batch.append((next_index, tool_calls[next_index]))
+                            next_index += 1
+
+                        if len(batch) > 1:
+                            for _index, batch_tool_call in batch:
+                                batch_id, batch_name, batch_args = self._tool_call_identity(batch_tool_call)
+                                for event in self._tool_call_events(
+                                    emitter,
+                                    tool_call_id=batch_id,
+                                    function_name=batch_name,
+                                    arguments=batch_args,
+                                ):
+                                    yield event
+                                self._print_tool_call(batch_name, batch_args)
+
+                            if cancel_token and cancel_token.is_set():
+                                print(f"\n{Colors.BRIGHT_YELLOW}⏹️  用戶取消了執行 (跳過 sub_agent batch){Colors.RESET}")
+                                for _index, batch_tool_call in batch:
+                                    batch_id, batch_name, _batch_args = self._tool_call_identity(batch_tool_call)
+                                    yield emitter.tool_call_result(
+                                        tool_call_id=batch_id,
+                                        content="Cancelled by user",
+                                        execution_time_ms=0,
+                                    )
+                                    cancel_msg = Message(
+                                        role="tool",
+                                        content="Cancelled by user",
+                                        tool_call_id=batch_id,
+                                        name=batch_name,
+                                    )
+                                    self.messages.append(cancel_msg)
+                                for remaining_tc in tool_calls[next_index:]:
+                                    remaining_id, remaining_name, _remaining_args = self._tool_call_identity(remaining_tc)
+                                    yield emitter.tool_call_start(
+                                        tool_call_id=remaining_id,
+                                        tool_name=remaining_name,
+                                    )
+                                    yield emitter.tool_call_end(remaining_id)
+                                    yield emitter.tool_call_result(
+                                        tool_call_id=remaining_id,
+                                        content="Cancelled by user",
+                                        execution_time_ms=0,
+                                    )
+                                    cancel_msg = Message(
+                                        role="tool",
+                                        content="Cancelled by user",
+                                        tool_call_id=remaining_id,
+                                        name=remaining_name,
+                                    )
+                                    self.messages.append(cancel_msg)
+                                yield emitter.step_finished(step_name)
+                                yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
+                                return
+
+                            records = await self._execute_parallel_subagent_batch(
+                                batch,
+                                thread_id=thread_id,
+                                run_id=run_id,
+                                cancel_token=cancel_token,
+                            )
+                            for record in records:
+                                yield emitter.tool_call_result(
+                                    tool_call_id=record.tool_call_id,
+                                    content=record.result_content,
+                                    execution_time_ms=record.execution_time_ms,
+                                )
+                                self._record_tool_result(record)
+
+                            tool_call_index = next_index
+                            continue
+
+                    for event in self._tool_call_events(
+                        emitter,
+                        tool_call_id=tool_call_id,
+                        function_name=function_name,
+                        arguments=arguments,
+                    ):
+                        yield event
+                    self._print_tool_call(function_name, arguments)
+
+                    if cancel_token and cancel_token.is_set():
+                        print(f"\n{Colors.BRIGHT_YELLOW}⏹️  用戶取消了執行 (跳過工具 {function_name}){Colors.RESET}")
                         yield emitter.tool_call_result(
                             tool_call_id=tool_call_id,
                             content="Cancelled by user",
@@ -1522,24 +1845,23 @@ Rules:
                             name=function_name,
                         )
                         self.messages.append(tool_msg)
-                        # 對剩餘的 tool_calls 也補充 cancelled result
-                        remaining_idx = response.tool_calls.index(tool_call) + 1
-                        for remaining_tc in response.tool_calls[remaining_idx:]:
+                        for remaining_tc in tool_calls[tool_call_index + 1:]:
+                            remaining_id, remaining_name, _remaining_args = self._tool_call_identity(remaining_tc)
                             yield emitter.tool_call_start(
-                                tool_call_id=remaining_tc.id,
-                                tool_name=remaining_tc.function.name,
+                                tool_call_id=remaining_id,
+                                tool_name=remaining_name,
                             )
-                            yield emitter.tool_call_end(remaining_tc.id)
+                            yield emitter.tool_call_end(remaining_id)
                             yield emitter.tool_call_result(
-                                tool_call_id=remaining_tc.id,
+                                tool_call_id=remaining_id,
                                 content="Cancelled by user",
                                 execution_time_ms=0,
                             )
                             cancel_msg = Message(
                                 role="tool",
                                 content="Cancelled by user",
-                                tool_call_id=remaining_tc.id,
-                                name=remaining_tc.function.name,
+                                tool_call_id=remaining_id,
+                                name=remaining_name,
                             )
                             self.messages.append(cancel_msg)
                         yield emitter.step_finished(step_name)
@@ -1565,6 +1887,7 @@ Rules:
                                 name=function_name,
                             )
                             self.messages.append(error_result_msg)
+                            tool_call_index += 1
                             continue
 
                         interrupt_id = str(uuid.uuid4())
@@ -1586,23 +1909,23 @@ Rules:
                         self.messages.append(placeholder_msg)
 
                         # 为剩余未处理的 tool_calls 注入 skipped 结果
-                        remaining_idx = response.tool_calls.index(tool_call) + 1
-                        for remaining_tc in response.tool_calls[remaining_idx:]:
+                        for remaining_tc in tool_calls[tool_call_index + 1:]:
+                            remaining_id, remaining_name, _remaining_args = self._tool_call_identity(remaining_tc)
                             yield emitter.tool_call_start(
-                                tool_call_id=remaining_tc.id,
-                                tool_name=remaining_tc.function.name,
+                                tool_call_id=remaining_id,
+                                tool_name=remaining_name,
                             )
-                            yield emitter.tool_call_end(remaining_tc.id)
+                            yield emitter.tool_call_end(remaining_id)
                             yield emitter.tool_call_result(
-                                tool_call_id=remaining_tc.id,
+                                tool_call_id=remaining_id,
                                 content="[Skipped: user question pending]",
                                 execution_time_ms=0,
                             )
                             skip_msg = Message(
                                 role="tool",
                                 content="[Skipped: user question pending]",
-                                tool_call_id=remaining_tc.id,
-                                name=remaining_tc.function.name,
+                                tool_call_id=remaining_id,
+                                name=remaining_name,
                             )
                             self.messages.append(skip_msg)
 
@@ -1627,100 +1950,22 @@ Rules:
                         )
                         return
 
-                    execution_time_ms = None
-                    validation_error = self._validate_tool_arguments(function_name, arguments)
-                    if validation_error:
-                        result = ToolResult(
-                            success=False,
-                            content="",
-                            error=validation_error,
-                        )
-                    else:
-                        import time
-                        start_time = time.time()
-                        try:
-                            tool = self.tools[function_name]
-                            tool.set_runtime_context(
-                                ToolRuntimeContext(
-                                    thread_id=thread_id,
-                                    run_id=run_id,
-                                    tool_call_id=tool_call_id,
-                                    tool_name=function_name,
-                                    cancel_token=cancel_token,
-                                )
-                            )
-                            timeout = self.tool_timeout if tool.execute_timeout is None else tool.execute_timeout
-                            if timeout > 0:
-                                result = await asyncio.wait_for(
-                                    tool.execute(**arguments),
-                                    timeout=timeout,
-                                )
-                            else:
-                                result = await tool.execute(**arguments)
-                        except asyncio.TimeoutError:
-                            timeout_used = self.tool_timeout if tool.execute_timeout is None else tool.execute_timeout
-                            result = ToolResult(
-                                success=False,
-                                content="",
-                                error=f"Tool execution timed out after {timeout_used}s",
-                            )
-                        except Exception as e:
-                            import traceback
-                            error_detail = f"{type(e).__name__}: {str(e)}"
-                            error_trace = traceback.format_exc()
-                            result = ToolResult(
-                                success=False,
-                                content="",
-                                error=f"Tool execution failed: {error_detail}\n\nTraceback:\n{error_trace}",
-                            )
-                        finally:
-                            if "tool" in locals():
-                                try:
-                                    tool.clear_runtime_context()
-                                except Exception:
-                                    logger.debug("工具清理 runtime context 失败: %s", function_name, exc_info=True)
-                            end_time = time.time()
-                            execution_time_ms = int((end_time - start_time) * 1000)
-                    
-                    # TOOL_CALL_RESULT
-                    # Level 1 壓縮：截斷過大的 tool result，防止 context 膨脹
-                    result_content = result.content if result.success else f"Error: {result.error}"
-                    tool_obj = self.tools.get(function_name)
-                    budget = getattr(tool_obj, 'max_result_tokens', 8000) if tool_obj else 8000
-                    result_content = truncate_text_by_tokens(result_content, budget)
-
-                    yield emitter.tool_call_result(
+                    record = await self._execute_tool_call_for_record(
+                        index=tool_call_index,
+                        thread_id=thread_id,
+                        run_id=run_id,
                         tool_call_id=tool_call_id,
-                        content=result_content,
-                        execution_time_ms=execution_time_ms,
-                    )
-                    
-                    # 打印結果
-                    if result.success:
-                        result_text = result.content
-                        if len(result_text) > 500:
-                            result_text = result_text[:500] + f"{Colors.DIM}...{Colors.RESET}"
-                        print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result_text}")
-                    else:
-                        print(f"{Colors.BRIGHT_RED}✗ Error:{Colors.RESET} {Colors.RED}{result.error}{Colors.RESET}")
-                    
-                    # 記錄工具結果
-                    self.logger.log_tool_result(
-                        tool_name=function_name,
+                        function_name=function_name,
                         arguments=arguments,
-                        result_success=result.success,
-                        result_content=result.content if result.success else None,
-                        result_error=result.error if not result.success else None,
+                        cancel_token=cancel_token,
                     )
-                    
-                    # 添加工具消息（使用截斷後的 result_content，與前端事件一致）
-                    tool_msg = Message(
-                        role="tool",
-                        content=result_content,
-                        tool_call_id=tool_call_id,
-                        name=function_name,
+                    yield emitter.tool_call_result(
+                        tool_call_id=record.tool_call_id,
+                        content=record.result_content,
+                        execution_time_ms=record.execution_time_ms,
                     )
-                    self.messages.append(tool_msg)
+                    self._record_tool_result(record)
+                    tool_call_index += 1
 
                 # Tool call 成功執行後重置空響應標記，允許下次空回覆時再 nudge
                 empty_response_nudged = False
@@ -1740,7 +1985,13 @@ Rules:
                 # 達到最大步數
                 error_msg = f"任務在 {self.max_steps} 步後未能完成。"
                 print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
-                yield emitter.run_finished(outcome="interrupt", result={"reason": "max_steps_reached"})
+                yield emitter.run_finished(
+                    outcome="interrupt",
+                    result={
+                        "reason": "max_steps_reached",
+                        "finalResponse": f"已达到最大步数限制（{self.max_steps} 步），本轮执行被自动中止。你可以继续发送补充指令让我基于当前进度接着处理。",
+                    },
+                )
             else:
                 # 正常完成
                 yield emitter.run_finished(outcome="success", result={"final_response": final_response})

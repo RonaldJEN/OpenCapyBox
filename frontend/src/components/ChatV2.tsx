@@ -14,7 +14,7 @@ import {
   StreamCallbacks,
   StepData,
 } from '../types';
-import { compressImage } from '../utils/imageUtils';
+import { readFileAsDataUrl } from '../utils/imageUtils';
 import { toFileInfo, isImageFile } from '../utils/fileUtils';
 import { Round } from './Round';
 import { ArtifactsPanel } from './ArtifactsPanel';
@@ -84,6 +84,7 @@ interface StreamCallbacksFactoryOptions {
 const isUserCancelledOutcome = (outcome: string, interrupt: any, result?: any): boolean => {
   if (outcome !== 'interrupt') return false;
   if (result?.reason === 'user_cancelled') return true;
+  if (result?.reason === 'max_steps_reached') return false;
   // fallback: outcome=interrupt 但无 interrupt 对象且无 reason，保守返回 false 以暴露问题
   if (!interrupt) {
     console.warn('RUN_FINISHED outcome=interrupt without interrupt details or user_cancelled reason, not treating as cancelled');
@@ -91,15 +92,19 @@ const isUserCancelledOutcome = (outcome: string, interrupt: any, result?: any): 
   return false;
 };
 
-const getRunFinishedRoundStatus = (outcome: string, isUserCancelled: boolean): string => {
+const getRunFinishedRoundStatus = (outcome: string, isUserCancelled: boolean, result?: any): string => {
   if (isUserCancelled) return 'cancelled';
+  if (outcome === 'interrupt' && result?.reason === 'max_steps_reached') return 'max_steps_reached';
   if (outcome === 'interrupt') return 'interrupted';
   if (outcome === 'success') return 'completed';
   return outcome;
 };
 
-const getRunFinishedCompletedAt = (outcome: string, isUserCancelled: boolean): string | undefined => {
-  return outcome === 'interrupt' && !isUserCancelled ? undefined : new Date().toISOString();
+const getRunFinishedCompletedAt = (outcome: string, isUserCancelled: boolean, result?: any): string | undefined => {
+  if (outcome === 'interrupt' && !isUserCancelled && result?.reason !== 'max_steps_reached') {
+    return undefined;
+  }
+  return new Date().toISOString();
 };
 
 const finalizeStepsForTerminal = (steps: StepData[], hasFinalResponse: boolean): StepData[] =>
@@ -212,7 +217,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     activeSlotSessionIdsRef.current = activeSlotSessionIds;
   }, [activeSlotSessionIds]);
 
-  // readFileAsDataUrl / compressImage 已从 utils/imageUtils 导入
+  // readFileAsDataUrl 已从 utils/imageUtils 导入
 
   const clearInitWindowPoll = () => {
     if (initWindowPollTimeoutRef.current) {
@@ -773,8 +778,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
                         ...round,
                         steps: finalizeStepsForTerminal(round.steps, !!finalResponse),
                         final_response: finalResponse,
-                        status: getRunFinishedRoundStatus(outcome, isUserCancelled),
-                        completed_at: getRunFinishedCompletedAt(outcome, isUserCancelled),
+                        status: getRunFinishedRoundStatus(outcome, isUserCancelled, result),
+                        completed_at: getRunFinishedCompletedAt(outcome, isUserCancelled, result),
                       };
                     })()
                   : round
@@ -913,13 +918,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
           fileInfo.type = file.type;
         }
         if (isImageFile(fileInfo)) {
-          // 壓縮圖片至 ≤500KB JPEG（小圖不壓縮），降低 LLM token 消耗
-          fileInfo.data_url = await compressImage(file, {
-            maxWidth: 2048,
-            maxHeight: 2048,
-            quality: 0.8,
-            maxSizeKB: 500,
-          });
+          // 给视觉模型发送原始图片 Data URL，避免截图/OCR 场景因 JPEG 压缩降质。
+          fileInfo.data_url = await readFileAsDataUrl(file);
         }
         uploadedFiles.push(fileInfo);
       }
@@ -1204,8 +1204,8 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
               round_id: targetRunId,
               steps: finalizeStepsForTerminal(round.steps, !!finalResponse),
               final_response: finalResponse,
-              status: getRunFinishedRoundStatus(outcome, isUserCancelled),
-              completed_at: getRunFinishedCompletedAt(outcome, isUserCancelled),
+              status: getRunFinishedRoundStatus(outcome, isUserCancelled, result),
+              completed_at: getRunFinishedCompletedAt(outcome, isUserCancelled, result),
             };
           }
           return round;

@@ -300,7 +300,8 @@ def _set_session_match(
 def _get_user_sandbox_id(db: DBSession, user_id: str) -> str | None:
     """從 UserSandbox 表查詢用戶的 sandbox_id。"""
     user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
-    return user_sandbox.sandbox_id if user_sandbox else None
+    sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+    return sandbox_id if isinstance(sandbox_id, str) and sandbox_id else None
 
 
 def _upsert_user_sandbox(db: DBSession, user_id: str, sandbox_service) -> None:
@@ -337,11 +338,22 @@ async def _ensure_sandbox(sandbox_service, user_id: str, db: DBSession, *, force
     if force_refresh:
         sandbox_service.invalidate_cache(user_id)
 
+    persisted_sandbox_id = _get_user_sandbox_id(db, user_id)
     sandbox = sandbox_service.get_cached(user_id)
     if sandbox:
-        return sandbox
+        cached_sandbox_id = getattr(sandbox, "id", None)
+        if persisted_sandbox_id and cached_sandbox_id != persisted_sandbox_id:
+            logger.warning(
+                "沙箱快取與 DB 綁定不一致，移除快取 (user=%s, cached=%s, persisted=%s)",
+                user_id,
+                cached_sandbox_id,
+                persisted_sandbox_id,
+            )
+            sandbox_service.invalidate_cache(user_id)
+        else:
+            return sandbox
 
-    sandbox = await sandbox_service.get_or_resume(user_id, _get_user_sandbox_id(db, user_id))
+    sandbox = await sandbox_service.get_or_resume(user_id, persisted_sandbox_id)
     # 可能創建了新沙箱，持久化到 DB
     _upsert_user_sandbox(db, user_id, sandbox_service)
     return sandbox
@@ -748,6 +760,13 @@ async def delete_session(
     sandbox_service = get_sandbox_service()
     sandbox = sandbox_service.get_cached(user_id)
     if sandbox:
+        try:
+            sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
+        except Exception as e:
+            logger.warning("無法連接沙箱清理 session 子目錄: %s", e)
+            sandbox = None
+
+    if sandbox:
         from src.api.services.sandbox_service import get_sandbox_mount_path
         import shlex as _shlex
         session_dir = f"{get_sandbox_mount_path()}/sessions/{chat_session_id}"
@@ -807,15 +826,11 @@ async def get_session_files(
     if target_dir != session_root and not target_dir.startswith(session_root + "/"):
         raise HTTPException(status_code=403, detail="路径越界")
 
-    sandbox = sandbox_service.get_cached(user_id)
-
-    if not sandbox:
-        # 嘗試從 UserSandbox 表恢復沙箱
-        try:
-            sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
-        except Exception as e:
-            logger.warning("無法連接沙箱獲取文件列表: %s", e)
-            return FileListResponse(files=[], total=0)
+    try:
+        sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
+    except Exception as e:
+        logger.warning("無法連接沙箱獲取文件列表: %s", e)
+        return FileListResponse(files=[], total=0)
 
     try:
         files = await _sandbox_list_dir(sandbox, target_dir, session_root)

@@ -484,6 +484,70 @@ describe('APIService', () => {
       expect(callbacks.onRunError).not.toHaveBeenCalled();
     });
 
+    it('sendMessageStreamV2 已完成恢复 max_steps_reached 时应保留 interrupt reason', async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal('crypto', {
+        randomUUID: vi.fn(() => 'idempotency-max-steps'),
+      });
+
+      const reader = {
+        read: vi.fn().mockResolvedValueOnce({ done: true, value: undefined }),
+      };
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        body: {
+          getReader: () => reader,
+        },
+      }));
+
+      vi.spyOn(apiService, 'getSessionHistoryV2').mockResolvedValue({
+        session_id: 'session-1',
+        total: 1,
+        rounds: [
+          {
+            round_id: 'run-max-steps',
+            idempotency_key: 'idempotency-max-steps',
+            user_message: 'loop forever',
+            final_response: '已达到最大步数限制',
+            steps: [],
+            step_count: 3,
+            status: 'max_steps_reached',
+            created_at: new Date().toISOString(),
+          },
+        ],
+      });
+
+      const callbacks = {
+        onStreamAccepted: vi.fn(),
+        onRunFinished: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      const requestPromise = apiService.sendMessageStreamV2(
+        'session-1',
+        [{ type: 'text', text: 'loop forever' }],
+        callbacks,
+      );
+
+      await vi.runAllTimersAsync();
+      await requestPromise;
+
+      expect(callbacks.onStreamAccepted).toHaveBeenCalledOnce();
+      expect(callbacks.onRunFinished).toHaveBeenCalledWith(
+        'session-1',
+        'run-max-steps',
+        {
+          finalResponse: '已达到最大步数限制',
+          stepCount: 3,
+          reason: 'max_steps_reached',
+        },
+        'interrupt',
+        undefined,
+      );
+      expect(callbacks.onRunError).not.toHaveBeenCalled();
+    });
+
     it('sendMessageStreamV2 accepted 后不应按时间窗误恢复旧 round', async () => {
       vi.useFakeTimers();
       vi.stubGlobal('crypto', {

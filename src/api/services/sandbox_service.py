@@ -9,7 +9,7 @@
 
 架构（一用户一沙箱）：
   user_id → sandbox（持久化工作空間 /home/user）
-    ├── USER.md / SOUL.md / AGENTS.md / MEMORY.md
+    ├── USER.md / SOUL.md / MEMORY.md / AGENTS.md（平台模板）
     └── sessions/{session_id}/   ← 各對話隔離子目錄
 
   Agent Server (本機) ←→ OpenSandbox Server (遠端)
@@ -310,28 +310,40 @@ class SandboxSessionService:
         Returns:
             可用的 Sandbox 實例
         """
+        sandbox_id = sandbox_id if isinstance(sandbox_id, str) and sandbox_id else None
+
         # 1. 先從記憶體快取獲取
         if user_id in self._cache:
             sandbox = self._cache[user_id]
-            try:
-                # 驗證沙箱是否仍然健康
-                is_healthy = False
-                if hasattr(sandbox, "is_healthy"):
-                    is_healthy = await sandbox.is_healthy()
-                else:
-                    info = await sandbox.get_info()
-                    state = getattr(getattr(info, "status", None), "state", "")
-                    is_healthy = str(state).lower() in {"running", "pending"}
+            cached_sandbox_id = self._sandbox_id_from_instance(sandbox)
+            if sandbox_id and cached_sandbox_id != sandbox_id:
+                logger.warning(
+                    "沙箱快取與持久化 ID 不一致，移除快取 (user=%s, cached=%s, persisted=%s)",
+                    user_id,
+                    cached_sandbox_id,
+                    sandbox_id,
+                )
+                self.invalidate_cache(user_id)
+            else:
+                try:
+                    # 驗證沙箱是否仍然健康
+                    is_healthy = False
+                    if hasattr(sandbox, "is_healthy"):
+                        is_healthy = await sandbox.is_healthy()
+                    else:
+                        info = await sandbox.get_info()
+                        state = getattr(getattr(info, "status", None), "state", "")
+                        is_healthy = str(state).lower() in {"running", "pending"}
 
-                if is_healthy:
-                    logger.debug("沙箱命中快取 (user=%s)", user_id)
-                    return sandbox
-                else:
-                    logger.warning("快取中的沙箱不健康，嘗試 resume (user=%s)", user_id)
-                    del self._cache[user_id]
-            except Exception:
-                logger.warning("沙箱健康檢查失敗，移除快取 (user=%s)", user_id)
-                del self._cache[user_id]
+                    if is_healthy:
+                        logger.debug("沙箱命中快取 (user=%s)", user_id)
+                        return sandbox
+                    else:
+                        logger.warning("快取中的沙箱不健康，嘗試 resume (user=%s)", user_id)
+                        self.invalidate_cache(user_id)
+                except Exception:
+                    logger.warning("沙箱健康檢查失敗，移除快取 (user=%s)", user_id)
+                    self.invalidate_cache(user_id)
 
         # 2. 有 sandbox_id → 先查狀態，再決定走 connect 還是 resume
         if sandbox_id:

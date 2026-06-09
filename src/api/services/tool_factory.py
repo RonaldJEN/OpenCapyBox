@@ -5,6 +5,7 @@
 """
 
 import logging
+import posixpath
 from pathlib import Path
 from typing import List, Optional, Callable, Set
 
@@ -101,6 +102,7 @@ async def create_agent_tools(
         db_session_factory=db_session_factory,
         mount=mount,
     )
+    read_only_paths = {posixpath.join(mount, "AGENTS.md")}
 
     # 全量候选工具（类名 -> 工厂函数），延迟构造：只有不在 exclude 中的才会被实例化
     _candidates: List[tuple[str, Callable[[], object]]] = [
@@ -110,11 +112,13 @@ async def create_agent_tools(
             sandbox=sandbox,
             workspace_dir=workspace_dir,
             agent_config_sync=agent_config_sync,
+            read_only_paths=read_only_paths,
         )),
         ("SandboxEditTool", lambda: SandboxEditTool(
             sandbox=sandbox,
             workspace_dir=workspace_dir,
             agent_config_sync=agent_config_sync,
+            read_only_paths=read_only_paths,
         )),
         # 沙箱 Bash 工具（共享 tracker）
         ("SandboxBashTool", lambda: SandboxBashTool(sandbox=sandbox, workspace_dir=workspace_dir, tracker=bg_tracker)),

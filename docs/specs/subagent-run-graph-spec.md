@@ -113,8 +113,10 @@ Runtime behavior:
   child `Round(parent_run_id=parent_run_id)`, attaches the child run to the edge,
   then consumes the child `Agent.run_agui` stream until terminal.
 - If the parent LLM emits multiple `sub_agent` tool calls in one step, the
-  parent Agent executes them in tool-call order. Each call creates one child
-  Round and one graph edge; this is sequential fan-out, not parallel execution.
+  parent Agent executes consecutive `sub_agent` calls as a bounded parallel
+  batch, limited by `AGENT_SUBAGENT_MAX_PARALLEL`. Each call creates one child
+  Round and one graph edge. Parent tool results are appended back to the parent
+  message history in the original tool-call order.
 - Child AG-UI events and LLM call snapshots are persisted under the child
   `round_id`; they are not forwarded into the parent SSE stream.
 - The parent receives one `TOOL_CALL_RESULT` for display and LLM context. The

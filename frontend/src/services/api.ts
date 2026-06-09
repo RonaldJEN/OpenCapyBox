@@ -39,7 +39,7 @@ class HttpError extends Error {
  * 后端 round 终态集合（与后端 Round.SUBSCRIBE_TERMINAL_STATUSES 保持一致）。
  * SSE 断连恢复时，检查 round 是否已结束。
  */
-const _ROUND_TERMINAL_STATUSES = new Set(['completed', 'failed', 'interrupted', 'resumed', 'cancelled']);
+const _ROUND_TERMINAL_STATUSES = new Set(['completed', 'failed', 'interrupted', 'resumed', 'cancelled', 'max_steps_reached']);
 
 /**
  * 从 history API 恢复 round 终态并触发回调。
@@ -58,13 +58,19 @@ function _tryRecoverRoundFinished(
   }
   const outcome = round.status === 'completed'
     ? 'success'
-    : (round.status === 'interrupted' || round.status === 'cancelled' || round.status === 'resumed')
+    : (
+        round.status === 'interrupted'
+        || round.status === 'cancelled'
+        || round.status === 'resumed'
+        || round.status === 'max_steps_reached'
+      )
       ? 'interrupt'
       : 'error';
   callbacks.onRunFinished?.(threadId, runId, {
     finalResponse: round.final_response || '',
     stepCount: round.step_count || 0,
     ...(round.status === 'cancelled' ? { reason: 'user_cancelled' } : {}),
+    ...(round.status === 'max_steps_reached' ? { reason: 'max_steps_reached' } : {}),
   }, outcome, round.interrupt);
   return true;
 }

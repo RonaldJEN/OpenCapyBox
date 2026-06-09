@@ -979,10 +979,39 @@ class TestEnsureSandbox:
         sandbox_service = MagicMock()
         sandbox_service.get_cached.return_value = mock_sandbox
 
-        result = await _ensure_sandbox(sandbox_service, "user-1", MagicMock())
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+
+        result = await _ensure_sandbox(sandbox_service, "user-1", mock_db)
 
         assert result is mock_sandbox
         sandbox_service.get_or_resume.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_sandbox_invalidates_cache_when_db_sandbox_id_differs(self):
+        """DB 綁定新沙箱時，舊快取必須失效並按 DB sandbox_id 恢復。"""
+        from src.api.routes.sessions import _ensure_sandbox
+
+        cached_sandbox = AsyncMock()
+        cached_sandbox.id = "sbx-old"
+        fresh_sandbox = AsyncMock()
+        fresh_sandbox.id = "sbx-new"
+
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = cached_sandbox
+        sandbox_service.get_or_resume = AsyncMock(return_value=fresh_sandbox)
+        sandbox_service.get_sandbox_id.return_value = "sbx-new"
+
+        user_sandbox = MagicMock()
+        user_sandbox.sandbox_id = "sbx-new"
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = user_sandbox
+
+        result = await _ensure_sandbox(sandbox_service, "user-1", mock_db)
+
+        assert result is fresh_sandbox
+        sandbox_service.invalidate_cache.assert_called_once_with("user-1")
+        sandbox_service.get_or_resume.assert_awaited_once_with("user-1", "sbx-new")
 
     @pytest.mark.asyncio
     async def test_ensure_sandbox_falls_back_to_get_or_resume(self):

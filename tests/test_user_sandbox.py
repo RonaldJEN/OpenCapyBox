@@ -1124,8 +1124,8 @@ class TestAgentServicePostRoundTasks:
             with patch("src.api.services.memory_service.MemoryService", return_value=mock_mem_svc):
                 await svc._sync_memory_to_db()
 
-        # 应对所有 4 个 file_type 各调用一次 sync_from_sandbox
-        assert mock_mem_svc.sync_from_sandbox.call_count == 4
+        # 应对 3 个 DB-backed file_type 各调用一次 sync_from_sandbox
+        assert mock_mem_svc.sync_from_sandbox.call_count == 3
         # 仅 user_md 和 memory_md 需要 rebuild_embeddings
         assert mock_mem_svc.rebuild_embeddings.call_count == 2
         mock_db.close.assert_called_once()
@@ -1145,7 +1145,7 @@ class TestAgentServicePostRoundTasks:
             with patch("src.api.services.memory_service.MemoryService", return_value=mock_mem_svc):
                 await svc._sync_memory_to_db()
 
-        assert mock_mem_svc.sync_from_sandbox.call_count == 4
+        assert mock_mem_svc.sync_from_sandbox.call_count == 3
         mock_mem_svc.rebuild_embeddings.assert_not_awaited()
         mock_db.close.assert_called_once()
 

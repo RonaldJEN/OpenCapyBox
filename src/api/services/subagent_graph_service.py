@@ -222,6 +222,8 @@ class SubagentGraphService:
             return SubagentRun.CANCELLED
         if status == "completed":
             return SubagentRun.COMPLETED
+        if status == "max_steps_reached":
+            return SubagentRun.FAILED
         return SubagentRun.RUNNING
 
     @staticmethod

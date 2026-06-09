@@ -7,11 +7,10 @@ import {
 const FILE_LABELS: Record<string, { label: string; icon: string; desc: string }> = {
   user: { label: 'User', icon: '👤', desc: '用户画像/偏好 (USER.md)' },
   soul: { label: 'Soul', icon: '🧠', desc: 'Agent 人格/风格 (SOUL.md)' },
-  agents: { label: 'Agents', icon: '📋', desc: '行为规则/任务指南 (AGENTS.md)' },
   memory: { label: 'Memory', icon: '💾', desc: '长期记忆/共识 (MEMORY.md)' },
 };
 
-const TABS = ['user', 'soul', 'agents', 'memory'] as const;
+const TABS = ['user', 'soul', 'memory'] as const;
 
 interface Props {
   onClose?: () => void;

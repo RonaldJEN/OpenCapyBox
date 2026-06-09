@@ -94,7 +94,15 @@ class RunHandle(StrictModel):
 class RoundData(StrictModel):
     round_id: str
     parent_run_id: str | None = None
-    status: Literal["running", "completed", "failed", "interrupted", "cancelled", "resumed"]
+    status: Literal[
+        "running",
+        "completed",
+        "failed",
+        "interrupted",
+        "cancelled",
+        "resumed",
+        "max_steps_reached",
+    ]
 
 
 class MessageTarget(StrictModel):

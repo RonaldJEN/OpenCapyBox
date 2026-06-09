@@ -221,6 +221,34 @@ class TestAgentServiceChatAgui:
         assert complete_kwargs["terminal_event"].type == EventType.RUN_FINISHED
 
     @pytest.mark.asyncio
+    async def test_chat_agui_max_steps_reached_is_terminal_status(self, service):
+        final_text = "已达到最大步数限制（3 步），本轮执行被自动中止。"
+
+        async def _run_agui(**kwargs):
+            yield StepFinishedEvent(stepName="step-1")
+            yield RunFinishedEvent(
+                threadId="session-123",
+                runId=kwargs["run_id"],
+                outcome="interrupt",
+                result={
+                    "reason": "max_steps_reached",
+                    "finalResponse": final_text,
+                },
+            )
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+
+        async for _event in service.chat_agui([
+            {"type": "text", "text": "loop forever"},
+        ]):
+            pass
+
+        complete_kwargs = service.history_service.complete_round.call_args.kwargs
+        assert complete_kwargs["status"] == "max_steps_reached"
+        assert complete_kwargs["final_response"] == final_text
+        assert complete_kwargs["terminal_event"].result["reason"] == "max_steps_reached"
+
+    @pytest.mark.asyncio
     async def test_chat_agui_persists_llm_call_record(self, service):
         class HookAwareAgent:
             def __init__(self):
@@ -752,12 +780,19 @@ class TestWriteFileDirtyMemoryDetection:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("filename", ["SOUL.md", "AGENTS.md"])
-    async def test_write_file_to_other_agent_files_sets_dirty(self, filename):
-        """write_file 写入 SOUL.md/AGENTS.md 应触发同步"""
+    async def test_write_file_to_soul_md_sets_dirty(self):
+        """write_file 写入 SOUL.md 应触发同步"""
         await self._run_dirty_test(
-            args_deltas=[f'{{"path": "/home/user/{filename}", "content": "# Updated"}}'],
+            args_deltas=['{"path": "/home/user/SOUL.md", "content": "# Updated"}'],
             expected_sync=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_write_file_to_agents_md_does_not_set_dirty(self):
+        """AGENTS.md 由平台模板管理，不从沙箱回写 DB"""
+        await self._run_dirty_test(
+            args_deltas=['{"path": "/home/user/AGENTS.md", "content": "# Updated"}'],
+            expected_sync=False,
         )
 
 

@@ -45,6 +45,10 @@ def _resolve_workspace_path(path: str, workspace_dir: str) -> str:
     return posixpath.normpath(posixpath.join(workspace_dir, path))
 
 
+def _normalize_read_only_paths(paths: set[str] | None) -> set[str]:
+    return {posixpath.normpath(path) for path in (paths or set()) if path}
+
+
 def _extract_exit_code(execution: Any) -> int:
     exit_code = getattr(execution, "exit_code", None)
     if isinstance(exit_code, int):
@@ -308,10 +312,12 @@ class SandboxWriteTool(Tool):
         sandbox: Sandbox,
         workspace_dir: str = "/home/user",
         agent_config_sync: AgentConfigSync | None = None,
+        read_only_paths: set[str] | None = None,
     ):
         self._sandbox = sandbox
         self._workspace_dir = _normalize_workspace_dir(workspace_dir)
         self._agent_config_sync = agent_config_sync
+        self._read_only_paths = _normalize_read_only_paths(read_only_paths)
 
     @property
     def name(self) -> str:
@@ -349,6 +355,12 @@ class SandboxWriteTool(Tool):
         """在沙箱中寫入文件"""
         try:
             full_path = _resolve_workspace_path(path, self._workspace_dir)
+            if full_path in self._read_only_paths:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=f"{full_path} is managed by the platform template and cannot be edited.",
+                )
 
             # 確保父目錄存在（透過 bash 命令）
             import posixpath
@@ -374,10 +386,12 @@ class SandboxEditTool(Tool):
         sandbox: Sandbox,
         workspace_dir: str = "/home/user",
         agent_config_sync: AgentConfigSync | None = None,
+        read_only_paths: set[str] | None = None,
     ):
         self._sandbox = sandbox
         self._workspace_dir = _normalize_workspace_dir(workspace_dir)
         self._agent_config_sync = agent_config_sync
+        self._read_only_paths = _normalize_read_only_paths(read_only_paths)
 
     @property
     def name(self) -> str:
@@ -416,6 +430,12 @@ class SandboxEditTool(Tool):
         """在沙箱中編輯文件"""
         try:
             full_path = _resolve_workspace_path(path, self._workspace_dir)
+            if full_path in self._read_only_paths:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=f"{full_path} is managed by the platform template and cannot be edited.",
+                )
 
             # 讀取當前內容
             content = await _sandbox_read_text(self._sandbox, full_path)

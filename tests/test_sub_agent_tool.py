@@ -1,3 +1,6 @@
+import asyncio
+from time import perf_counter
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -117,6 +120,46 @@ class _FakeLLM:
         return LLMResponse(content="done", finish_reason="stop", tool_calls=[])
 
 
+class _ParallelFakeLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate_stream(self, messages, tools, on_content=None, on_thinking=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-sub-1",
+                        type="function",
+                        function=FunctionCall(
+                            name="sub_agent",
+                            arguments={
+                                "prompt": "research part one",
+                                "subagent_type": "research",
+                                "description": "part one",
+                            },
+                        ),
+                    ),
+                    ToolCall(
+                        id="tc-sub-2",
+                        type="function",
+                        function=FunctionCall(
+                            name="sub_agent",
+                            arguments={
+                                "prompt": "research part two",
+                                "subagent_type": "research",
+                                "description": "part two",
+                            },
+                        ),
+                    ),
+                ],
+            )
+        return LLMResponse(content="done", finish_reason="stop", tool_calls=[])
+
+
 @pytest.mark.asyncio
 async def test_agent_supplies_runtime_context_to_sub_agent_tool():
     calls = []
@@ -150,6 +193,44 @@ async def test_agent_supplies_runtime_context_to_sub_agent_tool():
     assert events[-1].type.value == "RUN_FINISHED"
 
 
+@pytest.mark.asyncio
+async def test_agent_executes_same_step_sub_agents_in_parallel():
+    calls = []
+
+    async def runner(**kwargs):
+        calls.append(kwargs)
+        await asyncio.sleep(0.2)
+        tool_call_id = kwargs["context"].tool_call_id
+        return ToolResult(success=True, content=f"child result for {tool_call_id}")
+
+    agent = Agent(
+        llm_client=_ParallelFakeLLM(),
+        system_prompt="system",
+        tools=[SubAgentTool(runner=runner)],
+        max_steps=3,
+        subagent_max_parallel=2,
+    )
+    agent.add_user_message("start")
+
+    started_at = perf_counter()
+    events = [
+        event
+        async for event in agent.run_agui(
+            thread_id="session-1",
+            run_id="parent-run",
+        )
+    ]
+    elapsed = perf_counter() - started_at
+
+    assert elapsed < 0.35
+    assert [call["context"].tool_call_id for call in calls] == ["tc-sub-1", "tc-sub-2"]
+    tool_messages = [msg for msg in agent.messages if msg.role == "tool" and msg.name == "sub_agent"]
+    assert [msg.tool_call_id for msg in tool_messages] == ["tc-sub-1", "tc-sub-2"]
+    assert "child result for tc-sub-1" in tool_messages[0].content
+    assert "child result for tc-sub-2" in tool_messages[1].content
+    assert events[-1].type.value == "RUN_FINISHED"
+
+
 def _make_db():
     engine = create_engine(
         "sqlite://",
@@ -178,6 +259,19 @@ class _ChildAgent:
         yield TextMessageContentEvent(messageId="child-msg", delta="child answer")
         yield TextMessageEndEvent(messageId="child-msg")
         yield RunFinishedEvent(threadId=thread_id, runId=run_id, outcome="success")
+
+
+class _MaxStepsChildAgent(_ChildAgent):
+    async def run_agui(self, *, thread_id, run_id, cancel_token=None):
+        yield RunFinishedEvent(
+            threadId=thread_id,
+            runId=run_id,
+            outcome="interrupt",
+            result={
+                "reason": "max_steps_reached",
+                "finalResponse": "child hit max steps",
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -259,6 +353,77 @@ async def test_agent_service_sub_agent_creates_child_round_and_graph_edge():
         assert {"SandboxWriteTool", "SandboxEditTool", "ManageCronTool"}.issubset(research_exclude)
         # 子 agent 使用 profile 精简 system prompt，而非父记忆
         assert child_prompt_overrides == [resolve_profile("review").system_prompt]
+    finally:
+        service.close()
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_service_sub_agent_maps_child_max_steps_to_failed_edge():
+    engine, session_factory = _make_db()
+    db = session_factory()
+    try:
+        db.add(
+            AuthUser(
+                user_id="u1",
+                username="u1",
+                auth_type="simple",
+                password_hash="hash",
+                enabled=True,
+            )
+        )
+        db.add(Session(id="s1", user_id="u1", status="active"))
+        db.add(Round(id="parent-run", session_id="s1", user_message="parent", status="running"))
+        db.commit()
+
+        service = AgentService(
+            sandbox=make_mock_sandbox(),
+            history_service=HistoryService(session_factory),
+            session_id="s1",
+            user_id="u1",
+        )
+        fake_registry = type(
+            "Registry",
+            (),
+            {"get_subagent_default": lambda self: type("Model", (), {"id": "sub-model"})()},
+        )()
+
+        async def fake_initialize_agent(self):
+            self.agent = _MaxStepsChildAgent()
+
+        with (
+            patch("src.api.services.agent_service.get_model_registry", return_value=fake_registry),
+            patch.object(AgentService, "initialize_agent", fake_initialize_agent),
+        ):
+            result = await service._run_subagent_invocation(
+                prompt="research until max steps",
+                subagent_type="research",
+                description="long research",
+                context=ToolRuntimeContext(
+                    thread_id="s1",
+                    run_id="parent-run",
+                    tool_call_id="tc-sub",
+                    tool_name="sub_agent",
+                ),
+            )
+
+        assert result.success is False
+        assert result.error == "child hit max steps"
+
+        child_round = (
+            db.query(Round)
+            .filter(Round.session_id == "s1", Round.parent_run_id == "parent-run")
+            .one()
+        )
+        edge = db.query(SubagentRun).filter(SubagentRun.child_run_id == child_round.id).one()
+
+        assert child_round.status == "max_steps_reached"
+        assert child_round.final_response == "child hit max steps"
+        assert edge.status == SubagentRun.FAILED
+        assert edge.error == "child hit max steps"
+        assert "unsupported status" not in (edge.error or "")
     finally:
         service.close()
         db.close()

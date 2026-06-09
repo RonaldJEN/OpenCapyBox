@@ -180,7 +180,7 @@ class TestListRunFiles:
         assert resp.status_code == 200
         assert resp.json()["files"] == []
 
-    def test_scan_prefers_cached_sandbox(self):
+    def test_scan_uses_persisted_sandbox_id(self):
         client, mock_db = _make_client()
         run = _make_run_record(artifacts=None, run_workspace="/home/user/cron/runs/run-1")
         user_sandbox = MagicMock()
@@ -189,8 +189,7 @@ class TestListRunFiles:
 
         sandbox = MagicMock()
         sandbox_service = MagicMock()
-        sandbox_service.get_cached.return_value = sandbox
-        sandbox_service.get_or_resume = AsyncMock()
+        sandbox_service.get_or_resume = AsyncMock(return_value=sandbox)
         sandbox_service.get_sandbox_id.return_value = "sandbox-1"
 
         artifacts_json = json.dumps([
@@ -206,8 +205,7 @@ class TestListRunFiles:
 
         assert resp.status_code == 200
         assert resp.json()["files"][0]["name"] == "cached.md"
-        sandbox_service.get_cached.assert_called_once_with("testuser")
-        sandbox_service.get_or_resume.assert_not_called()
+        sandbox_service.get_or_resume.assert_awaited_once_with("testuser", "sandbox-1")
 
 
 class TestDownloadRunFile:
@@ -256,7 +254,7 @@ class TestDownloadRunFile:
         resp = client.get("/cron/runs/run-1/files/test.txt")
         assert resp.status_code == 401
 
-    def test_download_prefers_cached_sandbox(self):
+    def test_download_uses_persisted_sandbox_id(self):
         client, mock_db = _make_client()
         run = _make_run_record()
         user_sandbox = MagicMock()
@@ -267,8 +265,7 @@ class TestDownloadRunFile:
         sandbox.files.read_bytes = AsyncMock(return_value=b"hello")
 
         sandbox_service = MagicMock()
-        sandbox_service.get_cached.return_value = sandbox
-        sandbox_service.get_or_resume = AsyncMock()
+        sandbox_service.get_or_resume = AsyncMock(return_value=sandbox)
         sandbox_service.get_sandbox_id.return_value = "sandbox-1"
 
         with patch("src.api.routes.cron.verify_access_token", return_value="testuser"), patch(
@@ -279,8 +276,7 @@ class TestDownloadRunFile:
 
         assert resp.status_code == 200
         assert resp.content == b"hello"
-        sandbox_service.get_cached.assert_called_once_with("testuser")
-        sandbox_service.get_or_resume.assert_not_called()
+        sandbox_service.get_or_resume.assert_awaited_once_with("testuser", "sandbox-1")
         sandbox.files.read_bytes.assert_awaited_once()
 
 

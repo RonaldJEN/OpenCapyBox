@@ -14,6 +14,7 @@ def _make_memory_service(records: dict[str, str]):
     svc = MemoryService(db)
     svc.get_all_memory_files = MagicMock(return_value=records)
     svc.upsert_memory_file = MagicMock()
+    svc.get_agents_template_content = MagicMock(return_value="template agents")
     return svc
 
 
@@ -43,9 +44,9 @@ async def test_sandbox_first_when_not_forced():
     with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
         count = await svc.sync_to_sandbox("user-1", sandbox, force=False)
 
-    # 不应写入沙箱
-    assert count == 0
-    sandbox.files.write_file.assert_not_called()
+    # 不应覆盖 SOUL.md；AGENTS.md 仍由平台模板覆盖
+    assert count == 1
+    sandbox.files.write_file.assert_awaited_once_with("/home/user/AGENTS.md", "template agents")
     # 应回写 DB
     svc.upsert_memory_file.assert_called_once_with(
         "user-1", "soul_md", "rich 263-line content from agent"
@@ -62,8 +63,8 @@ async def test_sandbox_first_skip_writeback_when_identical():
     with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
         count = await svc.sync_to_sandbox("user-1", sandbox, force=False)
 
-    assert count == 0
-    sandbox.files.write_file.assert_not_called()
+    assert count == 1
+    sandbox.files.write_file.assert_awaited_once_with("/home/user/AGENTS.md", "template agents")
     svc.upsert_memory_file.assert_not_called()
 
 
@@ -76,11 +77,10 @@ async def test_writes_db_content_when_sandbox_empty():
     with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
         count = await svc.sync_to_sandbox("user-1", sandbox, force=False)
 
-    assert count == 1
-    sandbox.files.write_file.assert_called_once()
-    call_args = sandbox.files.write_file.call_args[0]
-    assert "SOUL.md" in call_args[0]
-    assert call_args[1] == "default template"
+    assert count == 2
+    writes = {call.args[0]: call.args[1] for call in sandbox.files.write_file.await_args_list}
+    assert writes["/home/user/SOUL.md"] == "default template"
+    assert writes["/home/user/AGENTS.md"] == "template agents"
 
 
 @pytest.mark.asyncio
@@ -92,12 +92,36 @@ async def test_force_overwrites_sandbox():
     with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
         count = await svc.sync_to_sandbox("user-1", sandbox, force=True)
 
-    assert count == 1
-    sandbox.files.write_file.assert_called_once()
-    call_args = sandbox.files.write_file.call_args[0]
-    assert call_args[1] == "user edited content"
+    assert count == 2
+    writes = {call.args[0]: call.args[1] for call in sandbox.files.write_file.await_args_list}
+    assert writes["/home/user/SOUL.md"] == "user edited content"
+    assert writes["/home/user/AGENTS.md"] == "template agents"
     # force 模式不回写 DB
     svc.upsert_memory_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_selective_force_sync_skips_agents_template():
+    """配置面板保存单文件时，只同步该 DB-backed 文件，不重传 AGENTS.md。"""
+    svc = _make_memory_service({
+        "soul_md": "new soul",
+        "memory_md": "long memory",
+    })
+    sandbox = _make_sandbox({})
+
+    with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
+        count = await svc.sync_to_sandbox(
+            "user-1",
+            sandbox,
+            force=True,
+            file_types={"soul_md"},
+            include_agents_template=False,
+        )
+
+    assert count == 1
+    sandbox.files.read_file.assert_not_called()
+    sandbox.files.write_file.assert_awaited_once_with("/home/user/SOUL.md", "new soul")
+    svc.get_agents_template_content.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -113,9 +137,9 @@ async def test_network_error_skips_file_instead_of_overwriting():
     with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
         count = await svc.sync_to_sandbox("user-1", sandbox, force=False)
 
-    # 不应写入沙箱（跳过），也不应回写 DB
-    assert count == 0
-    sandbox.files.write_file.assert_not_called()
+    # 不应覆盖 SOUL.md（跳过），但 AGENTS.md 仍由平台模板覆盖
+    assert count == 1
+    sandbox.files.write_file.assert_awaited_once_with("/home/user/AGENTS.md", "template agents")
     svc.upsert_memory_file.assert_not_called()
 
 
@@ -128,18 +152,20 @@ async def test_sandbox_whitespace_only_treated_as_empty():
     with patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/home/user"):
         count = await svc.sync_to_sandbox("user-1", sandbox, force=False)
 
-    assert count == 1
-    sandbox.files.write_file.assert_called_once()
+    assert count == 2
+    writes = {call.args[0]: call.args[1] for call in sandbox.files.write_file.await_args_list}
+    assert writes["/home/user/SOUL.md"] == "real content"
+    assert writes["/home/user/AGENTS.md"] == "template agents"
 
 
 def test_agent_config_path_matches_only_mount_root():
-    """仅沙箱根目录四个配置文件会映射为 agent 配置"""
+    """仅沙箱根目录 DB-backed 配置文件会映射为 agent 配置"""
     from src.api.services.memory_service import get_agent_config_file_type_for_path
 
     assert get_agent_config_file_type_for_path("/home/user/USER.md", "/home/user") == "user_md"
     assert get_agent_config_file_type_for_path("/home/user/MEMORY.md", "/home/user") == "memory_md"
     assert get_agent_config_file_type_for_path("/home/user/SOUL.md", "/home/user") == "soul_md"
-    assert get_agent_config_file_type_for_path("/home/user/AGENTS.md", "/home/user") == "agents_md"
+    assert get_agent_config_file_type_for_path("/home/user/AGENTS.md", "/home/user") is None
     assert get_agent_config_file_type_for_path("/home/user/sessions/run-1/AGENTS.md", "/home/user") is None
     assert get_agent_config_file_type_for_path("/home/user/project/AGENTS.md", "/home/user") is None
 
@@ -247,8 +273,9 @@ async def test_tool_factory_agent_config_sync_filters_and_persists_root_file():
         )
 
         await sync("/home/user/AGENTS.md", "root rules")
+        await sync("/home/user/USER.md", "root user")
         await sync("/home/user/sessions/run-1/AGENTS.md", "session rules")
 
-    svc.sync_agent_config_content.assert_awaited_once_with("user-1", "agents_md", "root rules")
+    svc.sync_agent_config_content.assert_awaited_once_with("user-1", "user_md", "root user")
     db_session_factory.assert_called_once()
     db.close.assert_called_once()

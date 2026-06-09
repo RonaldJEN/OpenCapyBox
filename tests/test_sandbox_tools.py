@@ -683,6 +683,22 @@ class TestSandboxWriteTool:
         assert result.success is True
         sync.assert_awaited_once_with("/home/user/USER.md", "")
 
+    @pytest.mark.asyncio
+    async def test_write_file_blocks_read_only_path(self, mock_sandbox):
+        """write_file 不應修改平台模板管理的根 AGENTS.md"""
+        sync = AsyncMock()
+        tool = SandboxWriteTool(
+            mock_sandbox,
+            agent_config_sync=sync,
+            read_only_paths={"/home/user/AGENTS.md"},
+        )
+
+        result = await tool.execute(path="/home/user/AGENTS.md", content="new rules")
+
+        assert result.success is False
+        mock_sandbox.files.write_file.assert_not_awaited()
+        sync.assert_not_awaited()
+
 
 # ============== SandboxEditTool ==============
 
@@ -752,13 +768,34 @@ class TestSandboxEditTool:
 
         tool = SandboxEditTool(mock_sandbox, agent_config_sync=sync)
         result = await tool.execute(
-            path="/home/user/AGENTS.md",
+            path="/home/user/SOUL.md",
             old_str="beta",
             new_str="gamma",
         )
 
         assert result.success is True
-        sync.assert_awaited_once_with("/home/user/AGENTS.md", "alpha gamma")
+        sync.assert_awaited_once_with("/home/user/SOUL.md", "alpha gamma")
+
+    @pytest.mark.asyncio
+    async def test_edit_file_blocks_read_only_path(self, mock_sandbox):
+        """edit_file 不應修改平台模板管理的根 AGENTS.md"""
+        sync = AsyncMock()
+        tool = SandboxEditTool(
+            mock_sandbox,
+            agent_config_sync=sync,
+            read_only_paths={"/home/user/AGENTS.md"},
+        )
+
+        result = await tool.execute(
+            path="/home/user/AGENTS.md",
+            old_str="old",
+            new_str="new",
+        )
+
+        assert result.success is False
+        mock_sandbox.files.read_file.assert_not_awaited()
+        mock_sandbox.files.write_file.assert_not_awaited()
+        sync.assert_not_awaited()
 
 
 # ============== SandboxSessionNoteTool ==============

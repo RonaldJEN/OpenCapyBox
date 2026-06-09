@@ -86,16 +86,31 @@ class SubAgentTool(Tool):
         subagent_type: str = "general",
         description: str = "",
     ) -> ToolResult:
+        return await self.execute_with_context(
+            self._runtime_context,
+            prompt=prompt,
+            subagent_type=subagent_type,
+            description=description,
+        )
+
+    async def execute_with_context(
+        self,
+        context: ToolRuntimeContext | None,
+        *,
+        prompt: str,
+        subagent_type: str = "general",
+        description: str = "",
+    ) -> ToolResult:
         if not isinstance(prompt, str) or not prompt.strip():
             return ToolResult(success=False, error="prompt is required")
         if self._runner is None:
             return ToolResult(success=False, error="sub_agent runner is not configured")
-        if self._runtime_context is None:
+        if context is None:
             return ToolResult(success=False, error="sub_agent runtime context is unavailable")
 
         return await self._runner(
             prompt=prompt.strip(),
             subagent_type=(subagent_type or "general").strip() or "general",
             description=(description or "").strip(),
-            context=self._runtime_context,
+            context=context,
         )

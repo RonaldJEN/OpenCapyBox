@@ -81,7 +81,13 @@ class RunCompletionService:
         interrupt_payload: str | None = None,
         terminal_event: AGUIEvent | dict[str, Any] | None = None,
     ) -> StoredEvent | None:
-        if status not in {"completed", "failed", "cancelled", "interrupted"}:
+        if status not in {
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "max_steps_reached",
+        }:
             raise ValueError(f"Unsupported terminal status: {status}")
 
         with self._session_scope() as db:
@@ -280,6 +286,8 @@ class RunCompletionService:
         }
         if status == "cancelled":
             result["reason"] = "user_cancelled"
+        elif status == "max_steps_reached":
+            result["reason"] = "max_steps_reached"
         elif status == "interrupted" and round_obj.status == "resumed":
             result["reason"] = "resumed_by_new_run"
 

@@ -2,8 +2,8 @@
 
 ## 1. 模块职责边界
 
-- 4 层记忆文件管理（SOUL / USER / AGENTS / MEMORY）
-- 记忆文件 CRUD（DB 为权威源）
+- 用户记忆文件管理（SOUL / USER / MEMORY）与平台规则模板（AGENTS）
+- 用户记忆文件 CRUD（DB 为权威源）；AGENTS.md 以平台模板为权威源
 - 双写同步（DB <-> 沙箱）
 - 嵌入向量生成与混合检索（BM25 + 向量 + RRF）
 - 对话轮索引
@@ -20,7 +20,7 @@
 |---|---|---|
 | id | Integer | PK, autoincrement |
 | user_id | String(100) | NOT NULL, indexed |
-| file_type | String(20) | NOT NULL. 取值: `user_md`, `memory_md`, `soul_md`, `agents_md` |
+| file_type | String(20) | NOT NULL. 取值: `user_md`, `memory_md`, `soul_md`；`agents_md` 仅兼容旧数据，不再新写入 |
 | content | Text | NOT NULL |
 | version | Integer | default=1, NOT NULL（乐观锁） |
 | updated_at | DateTime | default=now, onupdate=now |
@@ -55,7 +55,7 @@
 
 ### GET /api/config/agent-files/{name}
 
-- `name` 取值范围：`user` | `soul` | `agents` | `memory`
+- `name` 取值范围：`user` | `soul` | `memory`
 - 成功响应 200：
 
 ```json
@@ -67,6 +67,7 @@
 }
 ```
 
+- `AGENTS.md` 不属于用户配置 API；它由平台模板内部注入 system prompt 与沙箱。
 - 错误 400：`"无效的文件名"`
 
 ### PUT /api/config/agent-files/{name}
@@ -140,14 +141,16 @@
 | Agent 运行时修改 | sandbox -> DB | 受控工具写入成功后即时同步；dirty flag 在 round 结束后兜底校验 |
 | 前端编辑 | DB -> sandbox (force) | 覆写沙箱内容 |
 | 新 Session Agent 创建 | sandbox-first | 沙箱有内容 -> 写回 DB；空则 DB -> sandbox |
+| AGENTS.md | template -> sandbox / system prompt | 平台模板覆盖沙箱，不从沙箱或用户 DB 反向同步 |
 
 ### Dirty Flag 检测与兜底
 
 - **工具名匹配**：`record_memory`、`update_long_term_memory`、`update_user`
 - **文件操作嗅探**：`write_file` / `edit_file` 目标为记忆文件
-- **即时同步**：受控工具成功写入根目录 USER / MEMORY / SOUL / AGENTS 后，立即调用 DB 同步；USER / MEMORY 内容变化时同步重建 embedding
-- **兜底同步**：每 round 结束后若 dirty -> 从 sandbox 读回 DB；仅内容实际变化时更新版本并重建 USER / MEMORY embedding
-- **盲区**：bash 修改记忆文件不可检测（AGENTS.md 中禁止此行为）
+- **即时同步**：受控工具成功写入根目录 USER / MEMORY / SOUL 后，立即调用 DB 同步；USER / MEMORY 内容变化时同步重建 embedding
+- **AGENTS 保护**：根目录 AGENTS.md 由平台模板管理，受控文件工具拒绝写入，后台同步也不回写 DB
+- **兜底同步**：每 round 结束后若 dirty -> 从 sandbox 读回 DB-backed 文件；仅内容实际变化时更新版本并重建 USER / MEMORY embedding
+- **盲区**：bash 修改记忆文件不可检测（AGENTS.md 中禁止此行为，且后续模板同步会覆盖根 AGENTS.md）
 
 ### 乐观锁
 
@@ -176,7 +179,7 @@
 
 ### System Prompt 构建
 
-- 从 SOUL / USER / AGENTS / MEMORY 文件拼接
+- 从 SOUL / USER / MEMORY 用户 DB 文件与平台 AGENTS.md 模板拼接
 - Token 预算：`token_limit` 的 15%
 - 低优先级记忆使用二分查找截断
 

@@ -27,12 +27,14 @@ class Round(Base):
     # complete_round 終態：一旦進入，不允許被覆寫（防止跨 worker 狀態矛盾）。
     # 注意 interrupted 不在此集合——它是「暫停等待用戶輸入」的中間態，
     # resume 後 Agent 會繼續執行並最終 complete_round 為 completed/failed。
-    COMPLETE_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+    COMPLETE_TERMINAL_STATUSES: frozenset[str] = frozenset(
+        {"completed", "failed", "cancelled", "max_steps_reached"}
+    )
 
     # subscribe 終態：subscribe_to_round 視為「不再產生新事件」的狀態集合。
     # 比 COMPLETE 多了 interrupted 和 resumed——這些 round 不會再有事件推送。
     SUBSCRIBE_TERMINAL_STATUSES: frozenset[str] = frozenset(
-        {"completed", "failed", "interrupted", "resumed", "cancelled"}
+        {"completed", "failed", "interrupted", "resumed", "cancelled", "max_steps_reached"}
     )
 
     __tablename__ = "rounds"
@@ -82,6 +84,7 @@ class Round(Base):
     # "completed" = 已完成
     # "failed" = 執行失敗
     # "interrupted" = 已中斷（等待人工介入）
+    # "max_steps_reached" = 步數耗盡自動停止（不可恢復終態）
     status = Column(String(20), default="running")
 
     # AG-UI InterruptDetails（JSON 字符串，僅 status="interrupted" 時有值）

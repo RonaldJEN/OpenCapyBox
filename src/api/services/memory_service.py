@@ -1,12 +1,13 @@
 """记忆服务 — 分层记忆的 CRUD、Embedding 索引与混合检索
 
 职责：
-- UserMemory 表的读写（USER.md / MEMORY.md / SOUL.md / AGENTS.md）
+- UserMemory 表的读写（USER.md / MEMORY.md / SOUL.md）
+- AGENTS.md 由平台模板管理，不写入用户 DB
 - 乐观锁版本控制（防止并发写冲突）
 - Embedding 分块 + 写入 MemoryEmbedding 表
 - 混合检索：BM25 关键词 + 向量语义 + RRF 融合 + 时间衰减
 - 沙箱文件同步（DB → sandbox）
-- 新用户默认注入文件（SOUL.md / AGENTS.md / MEMORY.md / USER.md）
+- 新用户默认注入文件（SOUL.md / MEMORY.md / USER.md）
 """
 
 import logging
@@ -29,8 +30,11 @@ from src.api.utils.embedding_vector import normalize_embedding_vector, serialize
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# 有效的 file_type 枚举
+# 有效的 file_type 枚举。agents_md 保留为兼容旧数据/旧接口识别，
+# 但不再作为用户 DB 可写配置。
 VALID_FILE_TYPES = {"user_md", "memory_md", "soul_md", "agents_md"}
+DB_BACKED_FILE_TYPES = {"user_md", "memory_md", "soul_md"}
+TEMPLATE_MANAGED_FILE_TYPES = {"agents_md"}
 
 # file_type → 沙箱文件名映射
 FILE_TYPE_TO_FILENAME = {
@@ -46,10 +50,10 @@ _TEMPLATE_DIR = Path(__file__).parent.parent.parent.parent / "docs" / "sandbox_t
 # file_type → 模板文件名映射
 _TEMPLATE_FILES: dict[str, str] = {
     "soul_md": "SOUL.md",
-    "agents_md": "AGENTS.md",
     "memory_md": "MEMORY.md",
     "user_md": "USER.md",
 }
+_AGENTS_TEMPLATE_FILE = "AGENTS.md"
 
 
 def get_agent_config_file_type_for_path(path: str, mount_path: str | None = None) -> str | None:
@@ -66,6 +70,8 @@ def get_agent_config_file_type_for_path(path: str, mount_path: str | None = None
     normalized_mount = posixpath.normpath(mount_path)
 
     for file_type, filename in FILE_TYPE_TO_FILENAME.items():
+        if file_type not in DB_BACKED_FILE_TYPES:
+            continue
         if normalized_path == posixpath.join(normalized_mount, filename):
             return file_type
     return None
@@ -85,6 +91,8 @@ class MemoryService:
         """读取指定类型的记忆文件"""
         if file_type not in VALID_FILE_TYPES:
             raise ValueError(f"无效的 file_type: {file_type}")
+        if file_type in TEMPLATE_MANAGED_FILE_TYPES:
+            return None
         return (
             self.db.query(UserMemory)
             .filter(UserMemory.user_id == user_id, UserMemory.file_type == file_type)
@@ -93,6 +101,8 @@ class MemoryService:
 
     def get_memory_content(self, user_id: str, file_type: str) -> str:
         """读取记忆内容（不存在则返回空字符串）"""
+        if file_type == "agents_md":
+            return self.get_agents_template_content()
         record = self.get_memory_file(user_id, file_type)
         return record.content if record else ""
 
@@ -120,6 +130,8 @@ class MemoryService:
         """
         if file_type not in VALID_FILE_TYPES:
             raise ValueError(f"无效的 file_type: {file_type}")
+        if file_type in TEMPLATE_MANAGED_FILE_TYPES:
+            raise ValueError("AGENTS.md 由平台模板管理，不能写入用户 DB")
 
         record = (
             self.db.query(UserMemory)
@@ -177,19 +189,25 @@ class MemoryService:
         return record, changed
 
     def get_all_memory_files(self, user_id: str) -> dict[str, str]:
-        """获取用户所有记忆文件的内容"""
+        """获取用户 DB-backed 记忆文件的内容（不含模板管理的 AGENTS.md）"""
         records = (
             self.db.query(UserMemory)
-            .filter(UserMemory.user_id == user_id)
+            .filter(
+                UserMemory.user_id == user_id,
+                UserMemory.file_type.in_(tuple(DB_BACKED_FILE_TYPES)),
+            )
             .all()
         )
         return {r.file_type: r.content for r in records}
 
     def is_new_user(self, user_id: str) -> bool:
-        """判断用户是否为新用户（DB 中无任何记忆文件）"""
+        """判断用户是否为新用户（DB 中无任何 DB-backed 记忆文件）"""
         count = (
             self.db.query(UserMemory)
-            .filter(UserMemory.user_id == user_id)
+            .filter(
+                UserMemory.user_id == user_id,
+                UserMemory.file_type.in_(tuple(DB_BACKED_FILE_TYPES)),
+            )
             .count()
         )
         return count == 0
@@ -198,7 +216,8 @@ class MemoryService:
         """为新用户写入默认注入文件模板（从 docs/ 目录读取）
 
         仅在用户 DB 中无任何记忆文件时执行（幂等）。
-        写入 SOUL.md / AGENTS.md / MEMORY.md / USER.md(PROFILE) 到 DB。
+        写入 SOUL.md / MEMORY.md / USER.md(PROFILE) 到 DB。
+        AGENTS.md 始终从平台模板读取，不写入用户 DB。
 
         Args:
             user_id: 用户 ID
@@ -228,6 +247,15 @@ class MemoryService:
 
         logger.info("新用户默认文件初始化完成: user=%s, count=%d", user_id, count)
         return count
+
+    def get_agents_template_content(self) -> str:
+        """读取平台级 AGENTS.md 模板内容，去除 frontmatter。"""
+        template_path = _TEMPLATE_DIR / _AGENTS_TEMPLATE_FILE
+        if not template_path.exists():
+            logger.warning("AGENTS.md 平台模板不存在: %s", template_path)
+            return ""
+        content = template_path.read_text(encoding="utf-8")
+        return self._strip_frontmatter(content)
 
     @staticmethod
     def _strip_frontmatter(text: str) -> str:
@@ -613,27 +641,54 @@ class MemoryService:
     # 沙箱同步
     # ------------------------------------------------------------------
 
-    async def sync_to_sandbox(self, user_id: str, sandbox, *, force: bool = False) -> int:
-        """将 DB 中的记忆文件同步到沙箱
+    async def sync_to_sandbox(
+        self,
+        user_id: str,
+        sandbox,
+        *,
+        force: bool = False,
+        file_types: set[str] | None = None,
+        include_agents_template: bool = True,
+    ) -> int:
+        """将记忆文件同步到沙箱。
+
+        USER/MEMORY/SOUL 以用户 DB 为源；AGENTS.md 始终以平台模板为源。
 
         Args:
             user_id: 用户 ID
             sandbox: OpenSandbox 实例
             force: True = 无条件 DB→沙箱推送（用户前端主动保存）;
                    False = 沙箱优先，沙箱有内容则读回 DB 而非覆盖
+            file_types: 可选，仅同步指定 DB-backed file_type（USER/MEMORY/SOUL）
+            include_agents_template: 是否同步平台 AGENTS.md 模板
 
         Returns:
             写入沙箱的文件数量（不含回写 DB 的文件）
         """
         from src.api.services.sandbox_service import get_sandbox_mount_path
 
+        selected_file_types = set(file_types) if file_types is not None else None
+        if selected_file_types is not None:
+            invalid = selected_file_types - DB_BACKED_FILE_TYPES
+            if invalid:
+                raise ValueError(f"无效的 DB-backed file_type: {sorted(invalid)}")
+
         records = self.get_all_memory_files(user_id)
-        if not records:
+        if selected_file_types is not None:
+            records = {
+                file_type: content
+                for file_type, content in records.items()
+                if file_type in selected_file_types
+            }
+        agents_template = self.get_agents_template_content() if include_agents_template else ""
+        if not records and not agents_template.strip():
             return 0
 
         mount = get_sandbox_mount_path()
         synced = 0
         for file_type, db_content in records.items():
+            if file_type not in DB_BACKED_FILE_TYPES:
+                continue
             filename = FILE_TYPE_TO_FILENAME.get(file_type)
             if not filename:
                 continue
@@ -673,6 +728,14 @@ class MemoryService:
             except Exception as e:
                 logger.warning("同步记忆到沙箱失败 (%s): %s", filename, e)
 
+        if agents_template.strip():
+            path = f"{mount}/{_AGENTS_TEMPLATE_FILE}"
+            try:
+                await sandbox.files.write_file(path, agents_template)
+                synced += 1
+            except Exception as e:
+                logger.warning("同步平台 AGENTS.md 模板到沙箱失败: %s", e)
+
         return synced
 
     async def sync_from_sandbox(self, user_id: str, sandbox, file_type: str) -> tuple[str, bool] | None:
@@ -681,6 +744,9 @@ class MemoryService:
         Returns:
             (读取到的内容, 内容是否变更)，读取失败返回 None
         """
+        if file_type in TEMPLATE_MANAGED_FILE_TYPES:
+            return None
+
         from src.api.services.sandbox_service import get_sandbox_mount_path
 
         filename = FILE_TYPE_TO_FILENAME.get(file_type)

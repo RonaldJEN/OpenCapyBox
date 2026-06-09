@@ -6,7 +6,7 @@
 - MemoryService._strip_frontmatter: YAML frontmatter 去除
 - AgentService._provision_default_files_if_needed: Agent 初始化时的默认文件注入
 """
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -199,6 +199,17 @@ class TestConfigRouteAutoProvision:
         data = response.json()
         assert data["content"] == "soul content"
 
+    def test_get_agents_file_not_exposed(self, client):
+        """AGENTS.md 不作为用户可配置文件暴露"""
+        with patch("src.api.routes.config.MemoryService") as MockMemSvc:
+            mock_instance = MockMemSvc.return_value
+            mock_instance.provision_default_files.return_value = 3
+
+            response = client.get("/config/agent-files/agents", params={"user_id": "new-user"})
+
+        assert response.status_code == 400
+        MockMemSvc.assert_not_called()
+
     def test_update_agent_file_invalidates_agent_cache(self, client):
         """PUT /agent-files/{name} 更新后应失效该用户 Agent 缓存"""
         with (
@@ -215,10 +226,66 @@ class TestConfigRouteAutoProvision:
             mock_get_pool.return_value = mock_pool
 
             response = client.put(
-                "/config/agent-files/agents",
+                "/config/agent-files/soul",
                 params={"user_id": "new-user"},
-                json={"content": "new rules"},
+                json={"content": "new soul"},
             )
 
         assert response.status_code == 200
         mock_pool.invalidate_user.assert_called_once_with("new-user")
+
+    def test_update_agent_file_syncs_persisted_sandbox_when_cache_exists(self, client):
+        """配置同步时应使用 DB 当前沙箱，避免写入旧缓存沙箱。"""
+        user_sandbox = MagicMock()
+        user_sandbox.sandbox_id = "sbx-new"
+        client.mock_db.query.return_value.filter.return_value.first.return_value = user_sandbox
+
+        with (
+            patch("src.api.routes.config.MemoryService") as MockMemSvc,
+            patch("src.api.services.agent_pool_service.get_agent_pool") as mock_get_pool,
+            patch("src.api.services.sandbox_service.get_sandbox_service") as mock_get_sandbox_service,
+        ):
+            mock_instance = MockMemSvc.return_value
+            record = MagicMock()
+            record.version = 2
+            mock_instance.upsert_memory_file.return_value = record
+            mock_instance.sync_to_sandbox = AsyncMock()
+
+            mock_pool = MagicMock()
+            mock_pool.invalidate_user.return_value = 0
+            mock_get_pool.return_value = mock_pool
+
+            stale_sandbox = MagicMock()
+            stale_sandbox.id = "sbx-old"
+            fresh_sandbox = MagicMock()
+            fresh_sandbox.id = "sbx-new"
+            sandbox_service = MagicMock()
+            sandbox_service.get_cached.return_value = stale_sandbox
+            sandbox_service.get_or_resume = AsyncMock(return_value=fresh_sandbox)
+            mock_get_sandbox_service.return_value = sandbox_service
+
+            response = client.put(
+                "/config/agent-files/soul",
+                params={"user_id": "new-user"},
+                json={"content": "new soul"},
+            )
+
+        assert response.status_code == 200
+        sandbox_service.get_or_resume.assert_awaited_once_with("new-user", "sbx-new")
+        mock_instance.sync_to_sandbox.assert_awaited_once_with(
+            "new-user",
+            fresh_sandbox,
+            force=True,
+            file_types={"soul_md"},
+            include_agents_template=False,
+        )
+
+    def test_update_agents_file_not_exposed(self, client):
+        """AGENTS.md 不作为用户可配置文件暴露"""
+        response = client.put(
+            "/config/agent-files/agents",
+            params={"user_id": "new-user"},
+            json={"content": "new rules"},
+        )
+
+        assert response.status_code == 400

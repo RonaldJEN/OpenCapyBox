@@ -164,6 +164,7 @@ class AgentService:
             context_window=model_config.context_window,
             max_output_tokens=model_config.max_tokens,  # output token limit, not context
             tool_timeout=settings.agent_tool_timeout,
+            subagent_max_parallel=settings.agent_subagent_max_parallel,
         )
 
         # 从数据库恢复历史
@@ -352,6 +353,9 @@ class AgentService:
             elif round_status == "failed":
                 child_status = SubagentRun.FAILED
                 child_error = child_output or "sub-agent failed"
+            elif round_status == "max_steps_reached":
+                child_status = SubagentRun.FAILED
+                child_error = child_output or "sub-agent reached max steps"
             else:
                 child_status = SubagentRun.FAILED
                 child_error = f"sub-agent ended in unsupported status: {round_status}"
@@ -408,7 +412,7 @@ class AgentService:
 
     def _load_system_prompt(self) -> str:
         """从 DB 记忆文件组装 
-        SOUL.md / AGENTS.md 已包含全部指令（身份、工具规则、记忆管理等），
+        SOUL.md / 平台 AGENTS.md 模板已包含全部指令（身份、工具规则、记忆管理等），
         仅当 DB 中无任何记忆文件时，使用极简 fallback。
         """
         memory_context = self._build_memory_context()
@@ -421,7 +425,7 @@ class AgentService:
         """为新用户写入默认注入文件模板（幂等）
 
         检查 DB 中是否存在用户记忆文件，如果不存在则从 docs/ 模板写入默认值。
-        包括：SOUL.md, AGENTS.md, MEMORY.md, USER.md(PROFILE)
+        包括：SOUL.md, MEMORY.md, USER.md(PROFILE)。AGENTS.md 由平台模板直接注入。
         """
         try:
             from src.api.services.memory_service import MemoryService
@@ -437,7 +441,10 @@ class AgentService:
             self.history_service.reset_session()
 
     def _build_memory_context(self) -> str:
-        """从 DB 读取 SOUL/USER/AGENTS/MEMORY 并按优先级组装 system prompt 前缀"""
+        """组装 system prompt 前缀。
+
+        SOUL/USER/MEMORY 来自用户 DB；AGENTS.md 始终来自平台模板。
+        """
         try:
             from src.api.services.memory_service import MemoryService
             import tiktoken
@@ -445,8 +452,9 @@ class AgentService:
             db = self.history_service.db
             mem_svc = MemoryService(db)
             all_files = mem_svc.get_all_memory_files(self.user_id)
+            agents = mem_svc.get_agents_template_content()
 
-            if not all_files:
+            if not all_files and not agents.strip():
                 return ""
 
             try:
@@ -471,7 +479,6 @@ class AgentService:
                 parts.append(f"## 用户画像\n{user}\n")
                 used_tokens += count_tokens(user)
 
-            agents = all_files.get("agents_md", "")
             if agents:
                 parts.append(f"## 行为规则\n{agents}\n")
                 used_tokens += count_tokens(agents)
@@ -1675,7 +1682,7 @@ class AgentService:
         _interrupt_json: str | None = None
         _dirty_memory = False
         _memory_write_tools = {"record_memory", "update_long_term_memory", "update_user"}
-        _memory_filenames = {"USER.md", "MEMORY.md", "SOUL.md", "AGENTS.md"}
+        _memory_filenames = {"USER.md", "MEMORY.md", "SOUL.md"}
         _file_op_tracking: set[str] = set()
         _round_finished = False  # 追蹤 round 是否已正常完成
         _final_status: str | None = None  # except 路徑填充
@@ -1790,19 +1797,27 @@ class AgentService:
                 elif event.type == EventType.STEP_FINISHED:
                     step_count += 1
                 elif event.type == EventType.RUN_FINISHED:
+                    _result = event.result
+                    if isinstance(_result, dict):
+                        terminal_text = (
+                            _result.get("finalResponse")
+                            or _result.get("final_response")
+                        )
+                        if terminal_text:
+                            final_response = terminal_text
+
                     if event.outcome == "success":
                         status = "completed"
                     elif event.outcome == "interrupt":
-                        # 區分用戶主動取消和 ask_user 中斷：
+                        # 區分用戶主動取消、步數耗盡和 ask_user 中斷：
                         # - user_cancelled → cancelled（終態）
+                        # - max_steps_reached → max_steps_reached（終態）
                         # - ask_user 問答中斷 → interrupted（中間態，可恢復）
-                        _result = event.result
-                        _is_user_cancel = (
-                            isinstance(_result, dict)
-                            and _result.get("reason") == "user_cancelled"
-                        )
-                        if _is_user_cancel:
+                        reason = _result.get("reason") if isinstance(_result, dict) else None
+                        if reason == "user_cancelled":
                             status = "cancelled"
+                        elif reason == "max_steps_reached":
+                            status = "max_steps_reached"
                         else:
                             status = "interrupted"
                             if event.interrupt:
@@ -1939,8 +1954,9 @@ class AgentService:
             db = SessionLocal()
             try:
                 mem_svc = MemoryService(db)
-                # 同步所有 agent 配置文件（USER/MEMORY/SOUL/AGENTS）
-                for ft in FILE_TYPE_TO_FILENAME:
+                # 同步用户 DB-backed 配置文件（USER/MEMORY/SOUL）。
+                # AGENTS.md 由平台模板管理，不从沙箱回写 DB。
+                for ft in ("user_md", "memory_md", "soul_md"):
                     sync_result = await mem_svc.sync_from_sandbox(
                         self.user_id, self.sandbox, ft
                     )

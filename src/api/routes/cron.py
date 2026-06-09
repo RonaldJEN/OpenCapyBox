@@ -332,14 +332,12 @@ async def list_run_files(
             return {"files": []}
 
         sandbox_service = get_sandbox_service()
-        sandbox = sandbox_service.get_cached(user_id)
-        if sandbox is None:
-            sandbox = await sandbox_service.get_or_resume(user_id, user_sandbox.sandbox_id)
-            latest_sandbox_id = sandbox_service.get_sandbox_id(user_id)
-            if latest_sandbox_id and latest_sandbox_id != user_sandbox.sandbox_id:
-                user_sandbox.sandbox_id = latest_sandbox_id
-                user_sandbox.status = "active"
-                db.commit()
+        sandbox = await sandbox_service.get_or_resume(user_id, user_sandbox.sandbox_id)
+        latest_sandbox_id = sandbox_service.get_sandbox_id(user_id)
+        if latest_sandbox_id and latest_sandbox_id != user_sandbox.sandbox_id:
+            user_sandbox.sandbox_id = latest_sandbox_id
+            user_sandbox.status = "active"
+            db.commit()
 
         from src.api.services.cron_service import _scan_run_artifacts
         artifacts_json = await _scan_run_artifacts(sandbox, run.run_workspace)
@@ -399,23 +397,15 @@ async def download_run_file(
         raise HTTPException(status_code=404, detail="无沙箱信息")
 
     sandbox_service = get_sandbox_service()
-    sandbox = sandbox_service.get_cached(user_id)
-    if sandbox is not None:
+    try:
+        sandbox = await sandbox_service.get_or_resume(user_id, user_sandbox.sandbox_id)
         latest_sandbox_id = sandbox_service.get_sandbox_id(user_id)
         if latest_sandbox_id and latest_sandbox_id != user_sandbox.sandbox_id:
             user_sandbox.sandbox_id = latest_sandbox_id
             user_sandbox.status = "active"
             db.commit()
-    else:
-        try:
-            sandbox = await sandbox_service.get_or_resume(user_id, user_sandbox.sandbox_id)
-            latest_sandbox_id = sandbox_service.get_sandbox_id(user_id)
-            if latest_sandbox_id and latest_sandbox_id != user_sandbox.sandbox_id:
-                user_sandbox.sandbox_id = latest_sandbox_id
-                user_sandbox.status = "active"
-                db.commit()
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"沙箱连接失败: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"沙箱连接失败: {e}")
 
     # 读取文件内容（SDK → base64 命令回退）
     file_bytes = None

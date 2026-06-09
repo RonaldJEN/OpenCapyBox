@@ -410,13 +410,13 @@ OpenCapyBox 的分层记忆让你的 AI 助手越用越懂你：
 ├─────────────────────────────────────────┤
 │  MEMORY.md  — 我们聊过什么？（长期记忆）   │
 ├─────────────────────────────────────────┤
-│  AGENTS.md  — 团队协作规则                │
+│  AGENTS.md  — 平台行为规则模板（只读）      │
 └─────────────────────────────────────────┘
 ```
 
 **检索机制**：BM25 关键词 + Embedding 向量 + RRF 融合 + 时间衰减。未配置 Embedding 时自动降级为纯关键词搜索。
 
-所有配置文件都可以在前端 **Agent 配置面板** 直接编辑。
+前端 **Agent 配置面板** 可直接编辑 SOUL.md / USER.md / MEMORY.md；AGENTS.md 由平台模板统一管理，不作为用户配置入口暴露。
 
 ## 🚢 部署指南
 
@@ -602,7 +602,7 @@ docs(api): 更新 Cron API 文档
 
 ### ⚡ 性能与扩展性
 
-- [ ] **多 Subagent 并行执行** —— 当前 Subagent 串行，计划改为多个子任务同时调度
+- [x] **多 Subagent 并行执行** —— 同一步连续 `sub_agent` 调用已支持按 `AGENT_SUBAGENT_MAX_PARALLEL` 有界并行
 - [ ] **多 Worker 部署 + Redis 同步** —— 引入 Redis 做跨 worker 的事件 fanout / cancel registry / 运行锁，打破单 worker 假设
 - [ ] EventBus 抽象化：进程内 bus 升级为可插拔（进程内 / Redis Pub-Sub）
 - [ ] 会话 / 记忆检索的缓存层

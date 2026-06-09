@@ -192,7 +192,7 @@ All require Bearer auth.
 
 - Cron Agent 不提供 `record_memory` / `update_long_term_memory` / `search_memory` / `read_user` / `update_user`，避免定时执行器默认具备对话记忆检索、整理和专用写入能力。
 - Cron Agent 不提供 `ask_user` 或 `sub_agent`：定时任务无人值守，不能等待用户输入，也不能递归创建子 Agent run。
-- Cron Agent 复用共享的受控文件工具。若 `write_file` / `edit_file` 成功写入根目录 `{mount}/USER.md`、`{mount}/MEMORY.md`、`{mount}/SOUL.md`、`{mount}/AGENTS.md`，则按 [memory-spec.md](./memory-spec.md) 的「受控工具即时同步」语义同步回 DB；`USER.md` / `MEMORY.md` 内容变化时同步重建 embedding。
+- Cron Agent 复用共享的受控文件工具。若 `write_file` / `edit_file` 成功写入根目录 `{mount}/USER.md`、`{mount}/MEMORY.md`、`{mount}/SOUL.md`，则按 [memory-spec.md](./memory-spec.md) 的「受控工具即时同步」语义同步回 DB；`USER.md` / `MEMORY.md` 内容变化时同步重建 embedding。`{mount}/AGENTS.md` 由平台模板统一管理，只读且不回写用户 DB。
 - 上述根目录配置写入只用于任务明确要求更新用户画像、长期记忆或 Agent 配置的场景；普通执行产物仍必须保存在 run workspace，并只作为 cron artifacts 扫描和展示。
 
 ### 未读语义（is_read × status）

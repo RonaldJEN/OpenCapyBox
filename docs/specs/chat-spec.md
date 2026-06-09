@@ -93,8 +93,8 @@
 
 | 集合名称 | 包含状态 | 用途 |
 |----------|----------|------|
-| `COMPLETE_TERMINAL` | `completed`, `failed`, `cancelled` | 判断 Round 是否已彻底结束（不可恢复） |
-| `SUBSCRIBE_TERMINAL` | `completed`, `failed`, `interrupted`, `resumed`, `cancelled` | 判断 SSE 订阅是否应关闭连接 |
+| `COMPLETE_TERMINAL` | `completed`, `failed`, `cancelled`, `max_steps_reached` | 判断 Round 是否已彻底结束（不可恢复） |
+| `SUBSCRIBE_TERMINAL` | `completed`, `failed`, `interrupted`, `resumed`, `cancelled`, `max_steps_reached` | 判断 SSE 订阅是否应关闭连接 |
 
 > **设计决策**: `interrupted` 和 `resumed` 被纳入 `SUBSCRIBE_TERMINAL` 但不在 `COMPLETE_TERMINAL` 中——中断态的 Round 虽然暂停了 SSE 推送，但仍可通过 resume 恢复执行。`resumed` 表示该 Round 已由后续 Round 接替，其 SSE 订阅也应关闭。
 
@@ -636,7 +636,7 @@ Agent 执行循环中有 **3 个取消检查点**:
 #### Max Steps 处理
 
 - 倒数第 2 步（step == max_steps - 1）时，注入一条**合成提醒消息**（`is_synthetic=True`），告知 Agent 即将达到步数上限
-- max_steps 耗尽时，发射 `RUN_FINISHED` 事件，`outcome="interrupt"`，附带 `max_steps_reached` 标记
+- max_steps 耗尽时，发射 `RUN_FINISHED` 事件，`outcome="interrupt"`，附带 `result.reason="max_steps_reached"` 和可持久化的 `finalResponse`；后端 Round 状态落为 `max_steps_reached`
 
 #### AgentPool 缓存与 runtime messages 一致性
 

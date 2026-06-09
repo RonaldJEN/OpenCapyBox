@@ -1,7 +1,7 @@
 """用户记忆与人格相关数据模型
 
 包含：
-- UserMemory：Markdown 记忆文件持久化（USER.md / MEMORY.md / SOUL.md / AGENTS.md）
+- UserMemory：Markdown 记忆文件持久化（USER.md / MEMORY.md / SOUL.md）
 - MemoryEmbedding：向量索引（PostgreSQL pgvector vector(2560)）
 - CronJobRun：定时任务执行历史
 - UserSkillConfig：Skill 启用/禁用状态
@@ -53,7 +53,7 @@ class UserMemory(Base):
     - user_md       → USER.md（用户画像/偏好，Agent 对话中自动提炼，用户可编辑）
     - memory_md     → MEMORY.md（长期共识/知识）
     - soul_md       → SOUL.md（Agent 沟通风格/人格）
-    - agents_md     → AGENTS.md（行为规则/任务指南）
+    - agents_md     → 兼容旧数据；AGENTS.md 当前由平台模板管理，不再作为用户 DB 配置写入
     """
 
     __tablename__ = "user_memory"
