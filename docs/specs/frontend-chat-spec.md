@@ -224,7 +224,7 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 
 ## 8. 附件上传
 
-- 图片：前端用 `imageUtils.compressImage` 压缩后再发（阈值 1MB）。
+- 图片：前端用 `readFileAsDataUrl` 读取原始 Data URL 后发送，避免截图/OCR 场景因压缩降质；体积保护由后端单张 20MB、总量 50MB 限制负责。
 - 其他文件：通过 `apiService.uploadFile` 上传到沙箱，返回 `AttachmentInfo`。
 - 消息体：附件以 `ChatContentBlock[]` 形式发送（`image_url` / `file` 等类型）。
 
