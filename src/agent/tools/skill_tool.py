@@ -4,6 +4,7 @@ Skill Tool - Tool for Agent to load Skills on-demand
 Implements Progressive Disclosure (Level 2): Load full skill content when needed
 """
 
+from collections.abc import Awaitable, Callable
 from typing import Any, Dict, List, Optional
 
 from .base import Tool, ToolResult
@@ -13,10 +14,17 @@ from .skill_loader import SkillLoader
 class GetSkillTool(Tool):
     """Tool to get detailed information about a specific skill"""
 
-    def __init__(self, skill_loader: SkillLoader, ensure_skill_ready=None, read_sandbox_skill=None):
+    def __init__(
+        self,
+        skill_loader: SkillLoader,
+        ensure_skill_ready: Callable[[str], Awaitable[bool]] | None = None,
+        read_sandbox_skill: Callable[[str], Awaitable[str | None]] | None = None,
+        refresh_sandbox_skills: Callable[[], Awaitable[None]] | None = None,
+    ):
         self.skill_loader = skill_loader
         self.ensure_skill_ready = ensure_skill_ready
         self.read_sandbox_skill = read_sandbox_skill
+        self.refresh_sandbox_skills = refresh_sandbox_skills
 
     @property
     def name(self) -> str:
@@ -41,9 +49,24 @@ class GetSkillTool(Tool):
 
     async def execute(self, skill_name: str) -> ToolResult:
         """Get detailed information about specified skill"""
+        refreshed_sandbox_skills = False
+
         if callable(self.ensure_skill_ready):
             is_ready = await self.ensure_skill_ready(skill_name)
+            if not is_ready and callable(self.refresh_sandbox_skills):
+                await self.refresh_sandbox_skills()
+                refreshed_sandbox_skills = True
+                is_ready = await self.ensure_skill_ready(skill_name)
             if not is_ready:
+                skill = self.skill_loader.get_skill(skill_name)
+                if not skill:
+                    available = ", ".join(self.skill_loader.list_skills())
+                    refreshed = " after refreshing sandbox skill index" if refreshed_sandbox_skills else ""
+                    return ToolResult(
+                        success=False,
+                        content="",
+                        error=f"Skill '{skill_name}' does not exist{refreshed}. Available skills: {available}",
+                    )
                 return ToolResult(
                     success=False,
                     content="",
@@ -51,6 +74,9 @@ class GetSkillTool(Tool):
                 )
 
         skill = self.skill_loader.get_skill(skill_name)
+        if not skill and callable(self.refresh_sandbox_skills) and not refreshed_sandbox_skills:
+            await self.refresh_sandbox_skills()
+            skill = self.skill_loader.get_skill(skill_name)
 
         if not skill:
             available = ", ".join(self.skill_loader.list_skills())

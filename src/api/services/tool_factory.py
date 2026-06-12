@@ -29,7 +29,7 @@ from src.agent.tools.memory_tools import (
 from src.agent.tools.cron_tool import ManageCronTool
 from src.agent.tools.ask_user_tool import AskUserQuestionTool
 from src.agent.tools.sub_agent_tool import SubAgentTool
-from src.agent.tools.skill_loader import SkillLoader
+from src.agent.tools.skill_loader import Skill, SkillLoader
 from src.agent.tools.skill_tool import GetSkillTool
 
 from src.api.services.sandbox_service import get_sandbox_service
@@ -71,6 +71,18 @@ def _auto_locate_skills_dir(setting_value: str) -> Path:
     if setting_value:
         return Path(setting_value).resolve()
     return (Path(__file__).parent.parent.parent / "agent" / "skills").resolve()
+
+
+def _register_sandbox_skill_infos(skill_loader: SkillLoader, sandbox_skill_infos: list[dict]) -> None:
+    for info in sandbox_skill_infos:
+        user_skill = Skill(
+            name=info["name"],
+            description=info["description"],
+            content="",
+            source="user",
+            sandbox_skill_dir=info["sandbox_skill_dir"],
+        )
+        skill_loader.register_sandbox_skill(user_skill)
 
 
 async def create_agent_tools(
@@ -215,16 +227,7 @@ async def create_agent_tools(
                 sandbox_skill_infos = await sandbox_service.discover_sandbox_skills(
                     user_id, official_names,
                 )
-                from src.agent.tools.skill_loader import Skill as _Skill
-                for info in sandbox_skill_infos:
-                    user_skill = _Skill(
-                        name=info["name"],
-                        description=info["description"],
-                        content="",
-                        source="user",
-                        sandbox_skill_dir=info["sandbox_skill_dir"],
-                    )
-                    skill_loader.register_sandbox_skill(user_skill)
+                _register_sandbox_skill_infos(skill_loader, sandbox_skill_infos)
                 if sandbox_skill_infos:
                     logger.info(
                         "已发现 %d 个用户沙箱 Skills: %s",
@@ -241,6 +244,18 @@ async def create_agent_tools(
                 svc = get_sandbox_service()
                 return await svc.push_skill(user_id, str(skills_dir), skill_name)
 
+            async def _refresh_sandbox_skills() -> None:
+                svc = get_sandbox_service()
+                official_names = set(skill_loader.loaded_skills.keys())
+                sandbox_skill_infos = await svc.discover_sandbox_skills(
+                    user_id, official_names,
+                )
+                before_names = set(skill_loader.sandbox_skills.keys())
+                _register_sandbox_skill_infos(skill_loader, sandbox_skill_infos)
+                new_names = set(skill_loader.sandbox_skills.keys()) - before_names
+                if new_names:
+                    logger.info("get_skill miss 后刷新发现用户沙箱 Skills: %s", sorted(new_names))
+
             async def _read_sandbox_skill(skill_name: str) -> str | None:
                 skill = skill_loader.get_skill(skill_name)
                 if not skill or skill.source != "user" or not skill.sandbox_skill_dir:
@@ -252,6 +267,7 @@ async def create_agent_tools(
                 skill_loader,
                 ensure_skill_ready=_ensure_skill_ready,
                 read_sandbox_skill=_read_sandbox_skill,
+                refresh_sandbox_skills=_refresh_sandbox_skills,
             ))
             skill_loader_ref = skill_loader
             skill_count = len(skill_loader.list_skills())
