@@ -3,10 +3,15 @@
 測試 SandboxBashTool / SandboxFileTools / SandboxNoteTool
 全部使用 mock Sandbox，不依賴真實遠程沙箱。
 """
+import asyncio
 import base64
 import json
-import pytest
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from opensandbox.models.execd import CommandStatus
+
 from src.agent.tools.sandbox_bash_tool import (
     SandboxBashTool,
     SandboxBashOutputTool,
@@ -169,6 +174,32 @@ class TestSandboxBashTool:
         assert len(result.bash_id) > 0
         # 確認追蹤器中有記錄
         assert bg_tracker.get(result.bash_id) is not None
+
+        opts = mock_sandbox.commands.run.call_args.kwargs["opts"]
+        assert getattr(opts, "timeout", None) == timedelta(seconds=21600)
+
+    @pytest.mark.asyncio
+    async def test_background_command_timeout_can_be_disabled(self, mock_sandbox, bg_tracker):
+        """background_timeout_seconds=0 時不設置服務端 timeout"""
+        execution = MagicMock()
+        execution.id = "cmd-no-timeout"
+        mock_sandbox.commands.run = AsyncMock(return_value=execution)
+
+        tool = SandboxBashTool(
+            mock_sandbox,
+            tracker=bg_tracker,
+            background_timeout_seconds=0,
+        )
+        result = await tool.execute(command="sleep 100", run_in_background=True)
+
+        assert result.success is True
+        opts = mock_sandbox.commands.run.call_args.kwargs["opts"]
+        assert getattr(opts, "timeout", None) is None
+
+    def test_background_command_timeout_rejects_negative(self, mock_sandbox):
+        """负数 timeout 是错误配置，不应静默变成禁用 timeout。"""
+        with pytest.raises(ValueError, match="background_timeout_seconds must be >= 0"):
+            SandboxBashTool(mock_sandbox, background_timeout_seconds=-1)
 
     @pytest.mark.asyncio
     async def test_timeout_clamped(self, mock_sandbox):
@@ -432,6 +463,76 @@ class TestBackgroundCommandTracker:
         """移除不存在的 key 不報錯"""
         tracker = _BackgroundCommandTracker()
         tracker.remove("bg-nope")  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_interrupt_by_sandbox_interrupts_running_command(self, mock_sandbox):
+        tracker = _BackgroundCommandTracker()
+        tracker.add("bg-run", mock_sandbox, "cmd-run")
+        status = CommandStatus(running=True, exit_code=None)
+        mock_sandbox.commands.get_command_status = AsyncMock(return_value=status)
+        mock_sandbox.commands.interrupt = AsyncMock()
+
+        stats = await tracker.interrupt_by_sandbox(mock_sandbox)
+
+        assert stats == {"matched": 1, "interrupted": 1, "skipped": 0, "failed": 0}
+        mock_sandbox.commands.interrupt.assert_awaited_once_with("cmd-run")
+        assert tracker.get("bg-run") is None
+
+    @pytest.mark.asyncio
+    async def test_interrupt_by_sandbox_skips_finished_command(self, mock_sandbox):
+        tracker = _BackgroundCommandTracker()
+        tracker.add("bg-done", mock_sandbox, "cmd-done")
+        status = CommandStatus(running=False, exit_code=None)
+        mock_sandbox.commands.get_command_status = AsyncMock(return_value=status)
+        mock_sandbox.commands.interrupt = AsyncMock()
+
+        stats = await tracker.interrupt_by_sandbox(mock_sandbox)
+
+        assert stats == {"matched": 1, "interrupted": 0, "skipped": 1, "failed": 0}
+        mock_sandbox.commands.interrupt.assert_not_awaited()
+        assert tracker.get("bg-done") is None
+
+    @pytest.mark.asyncio
+    async def test_interrupt_by_sandbox_status_failure_best_effort_interrupt(self, mock_sandbox):
+        tracker = _BackgroundCommandTracker()
+        tracker.add("bg-err", mock_sandbox, "cmd-err")
+        mock_sandbox.commands.get_command_status = AsyncMock(side_effect=RuntimeError("status down"))
+        mock_sandbox.commands.interrupt = AsyncMock(side_effect=RuntimeError("interrupt down"))
+
+        stats = await tracker.interrupt_by_sandbox(mock_sandbox)
+
+        assert stats == {"matched": 1, "interrupted": 0, "skipped": 0, "failed": 1}
+        mock_sandbox.commands.interrupt.assert_awaited_once_with("cmd-err")
+        assert tracker.get("bg-err") is None
+
+    @pytest.mark.asyncio
+    async def test_interrupt_by_sandbox_status_never_returns_falls_back_to_interrupt(
+        self, mock_sandbox, monkeypatch
+    ):
+        """状态查询永远不返回时，应被 wait_for 超时打断并 best-effort interrupt，而非永久挂起。"""
+        import src.agent.tools.sandbox_bash_tool as sandbox_bash_tool
+
+        monkeypatch.setattr(
+            sandbox_bash_tool, "BACKGROUND_STATUS_TIMEOUT_SECONDS", 0.05
+        )
+
+        tracker = _BackgroundCommandTracker()
+        tracker.add("bg-hang", mock_sandbox, "cmd-hang")
+
+        async def _never_returns(_command_id):
+            await asyncio.Event().wait()
+
+        mock_sandbox.commands.get_command_status = AsyncMock(side_effect=_never_returns)
+        mock_sandbox.commands.interrupt = AsyncMock()
+
+        stats = await asyncio.wait_for(
+            tracker.interrupt_by_sandbox(mock_sandbox), timeout=2
+        )
+
+        assert stats == {"matched": 1, "interrupted": 1, "skipped": 0, "failed": 0}
+        mock_sandbox.commands.interrupt.assert_awaited_once_with("cmd-hang")
+        assert tracker.get("bg-hang") is None
+
 
 
 # ============== SandboxReadTool ==============

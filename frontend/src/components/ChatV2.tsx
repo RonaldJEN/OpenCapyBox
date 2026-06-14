@@ -16,6 +16,7 @@ import {
 } from '../types';
 import { readFileAsDataUrl } from '../utils/imageUtils';
 import { toFileInfo, isImageFile } from '../utils/fileUtils';
+import { extractAssistantFiles } from '../utils/assistantFileRefs';
 import { Round } from './Round';
 import { ArtifactsPanel } from './ArtifactsPanel';
 import { FilePreview } from './FilePreview';
@@ -161,6 +162,10 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   // Apple 风格 UI 状态
   const [isFilesOpen, setIsFilesOpen] = useState(false);
   const [filePanelTarget, setFilePanelTarget] = useState<{ file: FileInfo; nonce: number } | null>(null);
+  const [assistantFileMatches, setAssistantFileMatches] = useState<Record<string, FileInfo | null>>({});
+  const assistantFileMatchesRef = useRef<Record<string, FileInfo | null>>({});
+  const assistantFileMissRoundCountsRef = useRef<Record<string, number>>({});
+  const pendingAssistantFileRoundCountsRef = useRef<Record<string, number>>({});
 
   // 监听面板状态变化并通知父组件
   useEffect(() => {
@@ -212,6 +217,13 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
   const historyLoadedRef = useRef(false); // 标记 loadHistory 是否已完成
   const historyRequestIdRef = useRef(0); // 标记最新 loadHistory 请求，丢弃过期响应
   const selectedModel = availableModels.find((m) => m.id === selectedModelId);
+
+  const resetAssistantFileMatches = () => {
+    assistantFileMatchesRef.current = {};
+    assistantFileMissRoundCountsRef.current = {};
+    pendingAssistantFileRoundCountsRef.current = {};
+    setAssistantFileMatches({});
+  };
 
   useEffect(() => {
     activeSlotSessionIdsRef.current = activeSlotSessionIds;
@@ -334,6 +346,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       setPreviewSessionId('');
       setIsFilesOpen(false);
       setFilePanelTarget(null);
+      resetAssistantFileMatches();
       setIsDragging(false);
       setLoading(false);
       setDisableInitialMotion(false);
@@ -370,6 +383,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     roundElementRefs.current = {};
     setHighlightedRoundId(null);
     setFilePanelTarget(null);
+    resetAssistantFileMatches();
     setIsAtBottom(false); // 避免会话切换瞬间误触发 smooth scroll
     historyLoadedRef.current = false; // 重置历史加载标记
     prevRoundsLengthRef.current = 0;
@@ -395,6 +409,117 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       clearInitWindowPoll();
     };
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || sending || resuming) {
+      return;
+    }
+
+    const pendingRoundCounts = pendingAssistantFileRoundCountsRef.current;
+    const verificationRoundCount = rounds.length;
+    const candidates = collectAssistantFileCandidates(rounds, sessionId).filter((file) => {
+      const cachedMatch = assistantFileMatchesRef.current[file.path];
+      if (cachedMatch) {
+        return false;
+      }
+
+      const pendingRoundCount = pendingRoundCounts[file.path];
+      if (pendingRoundCount !== undefined && pendingRoundCount >= verificationRoundCount) {
+        return false;
+      }
+
+      const lastMissRoundCount = assistantFileMissRoundCountsRef.current[file.path];
+      return lastMissRoundCount === undefined || lastMissRoundCount < verificationRoundCount;
+    });
+    if (candidates.length === 0) {
+      return;
+    }
+
+    const groupedByParent = new Map<string, FileInfo[]>();
+    const staleMissingPaths: string[] = [];
+    for (const file of candidates) {
+      pendingRoundCounts[file.path] = verificationRoundCount;
+      if (assistantFileMatchesRef.current[file.path] === null) {
+        staleMissingPaths.push(file.path);
+      }
+      const targetPath = normalizeAssistantTargetPath(file.path);
+      const parentPath = getAssistantTargetParentPath(targetPath);
+      const group = groupedByParent.get(parentPath) || [];
+      group.push(file);
+      groupedByParent.set(parentPath, group);
+    }
+
+    if (staleMissingPaths.length > 0) {
+      const nextMatches = { ...assistantFileMatchesRef.current };
+      for (const path of staleMissingPaths) {
+        delete nextMatches[path];
+      }
+      assistantFileMatchesRef.current = nextMatches;
+      setAssistantFileMatches(nextMatches);
+    }
+
+    const targetSessionId = sessionId;
+
+    void Promise.all(Array.from(groupedByParent.entries()).map(async ([parentPath, files]) => {
+      let updates: Record<string, FileInfo | null>;
+      try {
+        const list = await apiService.getSessionFiles(targetSessionId, parentPath || undefined);
+        updates = buildAssistantFileMatchUpdates(files, list.files, targetSessionId);
+      } catch (err) {
+        console.warn('Failed to verify assistant file references:', err);
+        // A failed directory listing is "unknown", not proof that the file is missing.
+        // Leave the reference unverified so the card stays visible and click-time
+        // verification can still handle transient sandbox/API failures.
+        updates = {};
+      }
+
+      if (sessionIdRef.current !== targetSessionId) {
+        for (const file of files) {
+          if (pendingRoundCounts[file.path] === verificationRoundCount) {
+            delete pendingRoundCounts[file.path];
+          }
+        }
+        return;
+      }
+
+      const currentPaths = new Set(
+        files
+          .filter((file) => pendingRoundCounts[file.path] === verificationRoundCount)
+          .map((file) => file.path),
+      );
+      for (const file of files) {
+        if (pendingRoundCounts[file.path] === verificationRoundCount) {
+          delete pendingRoundCounts[file.path];
+        }
+      }
+
+      const currentUpdates = Object.fromEntries(
+        Object.entries(updates).filter(([path]) => currentPaths.has(path)),
+      );
+      if (Object.keys(currentUpdates).length === 0) {
+        return;
+      }
+
+      const nextMissRoundCounts = { ...assistantFileMissRoundCountsRef.current };
+      for (const [path, match] of Object.entries(currentUpdates)) {
+        if (match) {
+          delete nextMissRoundCounts[path];
+        } else {
+          nextMissRoundCounts[path] = verificationRoundCount;
+        }
+      }
+      assistantFileMissRoundCountsRef.current = nextMissRoundCounts;
+
+      assistantFileMatchesRef.current = {
+        ...assistantFileMatchesRef.current,
+        ...currentUpdates,
+      };
+      setAssistantFileMatches((prev) => ({
+        ...prev,
+        ...currentUpdates,
+      }));
+    }));
+  }, [rounds, sessionId, sending, resuming]);
 
   useEffect(() => {
     return () => {
@@ -1903,6 +2028,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
                     round={round}
                     userAttachments={round.user_attachments || []}
                     sessionId={sessionId}
+                    assistantFileMatches={assistantFileMatches}
                     onPreviewAttachment={handlePreviewAttachment}
                     onOpenFileInPanel={handleOpenAssistantFile}
                     isStreaming={(sending || resuming) && index === rounds.length - 1}
@@ -2022,4 +2148,58 @@ function getAssistantTargetParentPath(path: string): string {
   return normalizedPath.includes('/')
     ? normalizedPath.substring(0, normalizedPath.lastIndexOf('/'))
     : '';
+}
+
+function collectAssistantFileCandidates(rounds: RoundData[], sessionId: string): FileInfo[] {
+  const byPath = new Map<string, FileInfo>();
+
+  for (const round of rounds) {
+    const assistantContent = getRoundAssistantContent(round);
+    if (!assistantContent) {
+      continue;
+    }
+
+    for (const file of extractAssistantFiles(assistantContent, sessionId)) {
+      if (!byPath.has(file.path)) {
+        byPath.set(file.path, file);
+      }
+    }
+  }
+
+  return Array.from(byPath.values());
+}
+
+function getRoundAssistantContent(round: RoundData): string {
+  if (round.final_response) {
+    return round.final_response;
+  }
+
+  return [...round.steps].reverse().find((step) => step.assistant_content)?.assistant_content || '';
+}
+
+function buildAssistantFileMatchUpdates(
+  candidates: FileInfo[],
+  listedFiles: FileInfo[],
+  sessionId: string,
+): Record<string, FileInfo | null> {
+  const listedByPath = new Map(
+    listedFiles
+      .filter((file) => !file.is_directory)
+      .map((file) => [normalizeAssistantTargetPath(file.path), file]),
+  );
+
+  return Object.fromEntries(candidates.map((candidate) => {
+    const targetPath = normalizeAssistantTargetPath(candidate.path);
+    const matched = listedByPath.get(targetPath);
+    return [
+      candidate.path,
+      matched
+        ? {
+            ...matched,
+            path: targetPath,
+            session_id: sessionId,
+          }
+        : null,
+    ];
+  }));
 }

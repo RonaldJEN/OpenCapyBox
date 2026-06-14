@@ -97,7 +97,7 @@ async def update_agent_file(
     # 配置更新后使该用户缓存中的 Agent 失效，确保后续请求读取最新 system prompt
     try:
         from src.api.services.agent_pool_service import get_agent_pool
-        removed = get_agent_pool().invalidate_user(user_id)
+        removed = await get_agent_pool().invalidate_user_async(user_id)
         if removed > 0:
             logger.info("Agent 配置更新后已失效缓存: user=%s, removed=%d", user_id, removed)
     except Exception as e:

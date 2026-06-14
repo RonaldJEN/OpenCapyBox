@@ -71,9 +71,20 @@ get_or_resume 的恢复链：
 - 当前用户级 `sandbox_id` 判定必须同时比较 `SandboxSessionService.get_sandbox_id(user_id)` 与调用方从 `user_sandboxes` 读出的 `sandbox_id`；当 DB 中的持久化 id 与进程内缓存冲突时，DB id 用于触发旧 Agent 失效，并清理本地旧 sandbox 缓存后重建。
 - 热缓存命中时，若 cached Agent 的 `sandbox_id` 与当前用户级 sandbox 不一致，不得返回旧 Agent；必须移除该 session 缓存并重建。
 - 用户级 sandbox fallback create 或跨 worker 持久化为新 `sandbox_id` 后，同用户旧 Agent 必须懒失效或主动失效，避免工具继续请求 OpenSandbox 已不存在的旧 sandbox。
+- AgentPool 普通失效（配置更新、renew 失败、sandbox 代际切换等）必须区分 running / idle：
+  - idle Agent 可以立即 evict；evict 时优先 interrupt 该 Agent tracker 中仍在运行的后台 bash 命令，再释放 AgentService 本地资源。
+  - running Agent 不得被 close / interrupt；只能从热缓存 detach，或标记懒失效，等待当前 run 自然退出后再重建。
 - 该约束不表示同用户 Agent run 串行化；`AGENT_USER_CONCURRENCY_LIMIT` 仍只限制同时运行的不同 session 数。处在额度内、且绑定当前 `sandbox_id` 的多个 Agent 可以并发运行。
 - 若同用户 cached Agent 数超过 `AGENT_USER_CONCURRENCY_LIMIT` 形成资源压力，只能优先失效旧且 idle 的 Agent；不得为了缓存收敛移除仍在运行的 session。
 - `renew(user_id)` 失败时应失效该用户全部已缓存 Agent；一用户一 sandbox 架构下，其他 session 大概率也持有同一失效 sandbox 对象。正在创建但尚未进入 Agent 缓存的 session 占位不得被删除。
+- AgentPool TTL cleanup 不得移除仍在运行的 Agent；运行中的过期 session 保留到运行结束后的下一次安全清理。
+
+### 后台 bash 命令生命周期
+
+- `SandboxBashTool(run_in_background=True)` 必须把 OpenSandbox command id 记录到 session 级 `_BackgroundCommandTracker`，供 `bash_output` / `bash_kill` 使用。
+- 后台命令默认带服务端运行上限 `SANDBOX_BACKGROUND_COMMAND_TIMEOUT_SECONDS=21600` 秒；`0` 表示不设置服务端 timeout，负数配置启动即失败。
+- Agent idle eviction / session 删除 / 用户删除等明确清理路径应 best-effort interrupt tracker 中仍在运行的后台命令，避免失去 tracker 后形成孤儿进程。
+- 普通配置失效不得为了清理 tracker 中断正在执行的 Agent run；running Agent 只能懒失效。
 
 ### 暂停策略
 

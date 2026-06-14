@@ -377,6 +377,30 @@ class TestSessionsRouter:
             updated_at=timestamp,
         ))
 
+    def test_delete_session_awaits_agent_pool_remove_async(self, sessions_client):
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            self._add_session(db, "delete-me")
+            db.commit()
+
+        mock_pool = MagicMock()
+        mock_pool.remove_async = AsyncMock(return_value=True)
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_cached.return_value = None
+
+        with (
+            patch("src.api.routes.sessions.get_agent_pool", return_value=mock_pool),
+            patch("src.api.routes.sessions.get_sandbox_service", return_value=mock_sandbox_service),
+        ):
+            response = sessions_client.delete("/sessions/delete-me")
+
+        assert response.status_code == 200
+        assert response.json() == {"message": "会话已删除"}
+        mock_pool.remove_async.assert_awaited_once_with("delete-me")
+
+        with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
+            from src.api.models.session import Session as SessionModel
+            assert db.query(SessionModel).filter(SessionModel.id == "delete-me").count() == 0
+
     def test_get_running_sessions_returns_all_user_slots(self, sessions_client):
         from src.api.utils.timezone import now_naive
 

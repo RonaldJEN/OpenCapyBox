@@ -60,6 +60,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 | `SANDBOX_USE_SERVER_PROXY` | 否 | `true` | 是否使用服务器代理模式 |
 | `SANDBOX_TIMEOUT_MINUTES` | 否 | `60` | 沙箱容器空闲超时（分钟），超时后容器被回收 |
 | `SANDBOX_READY_TIMEOUT_SECONDS` | 否 | `120` | 等待沙箱容器启动就绪的最大时间（秒） |
+| `SANDBOX_BACKGROUND_COMMAND_TIMEOUT_SECONDS` | 否 | `21600` | 后台 bash 命令服务端最大运行时间（秒）；`0` 表示不设置服务端 timeout，负数非法 |
 | `SANDBOX_PERSISTENT_STORAGE_ENABLED` | 否 | `true` | 是否启用持久化存储挂载 |
 | `SANDBOX_HOST_STORAGE_ROOT` | 否 | `/tmp/sandbox` | 宿主机持久化存储根路径 |
 | `SANDBOX_STORAGE_MOUNT_PATH` | 否 | `/home/user` | 容器内挂载路径 |
@@ -86,8 +87,10 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 ```
 基础设施层
-├── SANDBOX_TIMEOUT_MINUTES (60min)    沙箱容器空闲超时，超时后容器被回收
-└── SANDBOX_READY_TIMEOUT_SECONDS (120s) 沙箱启动就绪等待
+├── SANDBOX_TIMEOUT_MINUTES (60min)      沙箱容器空闲超时，超时后容器被回收
+├── SANDBOX_READY_TIMEOUT_SECONDS (120s) 沙箱启动就绪等待
+└── SANDBOX_BACKGROUND_COMMAND_TIMEOUT_SECONDS (21600s)
+                                           后台 bash 命令服务端运行上限，0 表示不设置
 
 网络传输层
 ├── SSE_HEARTBEAT_INTERVAL (15s)       SSE 心跳，防止连接被中间件/nginx 判定空闲

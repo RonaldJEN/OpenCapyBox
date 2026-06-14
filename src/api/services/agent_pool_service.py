@@ -65,6 +65,7 @@ class AgentPoolService:
         self._last_renew: dict[str, float] = {}             # user_id → last renew timestamp
         self._create_locks: dict[str, asyncio.Lock] = {}    # chat_session_id → Lock
         self._user_creating: set[str] = set()               # 正在創建 Agent 的 user_id 集合
+        self._invalidated_sessions: set[str] = set()
         self._ttl = ttl
         self._initialized = True
 
@@ -145,7 +146,124 @@ class AgentPoolService:
 
         return True, cached_sandbox_id, current_sandbox_id
 
-    def _invalidate_user_agents_with_different_sandbox(
+    def _cached_agent_needs_rebuild(
+        self,
+        *,
+        user_id: str,
+        chat_session_id: str,
+        sandbox_service,
+        db_sandbox_id: str | None,
+    ) -> tuple[bool, str, str | None, str | None]:
+        stale, cached_sandbox_id, current_sandbox_id = self._cached_agent_is_stale(
+            user_id=user_id,
+            chat_session_id=chat_session_id,
+            sandbox_service=sandbox_service,
+            db_sandbox_id=db_sandbox_id,
+        )
+        if chat_session_id in self._invalidated_sessions:
+            return True, "marked_invalid", cached_sandbox_id, current_sandbox_id
+        if stale:
+            return True, "sandbox_stale", cached_sandbox_id, current_sandbox_id
+        return False, "", cached_sandbox_id, current_sandbox_id
+
+    @staticmethod
+    def _background_trackers_from_agent(agent_service) -> list:
+        agent = getattr(agent_service, "agent", None)
+        tools = getattr(agent, "tools", {}) or {}
+        tool_values = tools.values() if hasattr(tools, "values") else tools
+
+        trackers = []
+        seen: set[int] = set()
+        for tool in tool_values:
+            tracker = getattr(tool, "_tracker", None)
+            if tracker is None:
+                continue
+            tracker_id = id(tracker)
+            if tracker_id in seen:
+                continue
+            if hasattr(tracker, "interrupt_by_sandbox") or hasattr(tracker, "cleanup_by_sandbox"):
+                trackers.append(tracker)
+                seen.add(tracker_id)
+        return trackers
+
+    @staticmethod
+    def _empty_background_cleanup_stats() -> dict[str, int]:
+        return {"matched": 0, "interrupted": 0, "skipped": 0, "failed": 0}
+
+    @staticmethod
+    def _merge_background_cleanup_stats(
+        total: dict[str, int],
+        stats: dict[str, int],
+    ) -> dict[str, int]:
+        for key in ("matched", "interrupted", "skipped", "failed"):
+            total[key] = total.get(key, 0) + int(stats.get(key, 0))
+        return total
+
+    def _log_background_cleanup_stats(
+        self,
+        chat_session_id: str,
+        stats: dict[str, int],
+    ) -> None:
+        if not any(stats.values()):
+            return
+
+        msg = (
+            "Agent evict 后台命令清理%s: session=%s, matched=%d, "
+            "interrupted=%d, skipped=%d, failed=%d"
+        )
+        args = (
+            "完成",
+            chat_session_id,
+            stats.get("matched", 0),
+            stats.get("interrupted", 0),
+            stats.get("skipped", 0),
+            stats.get("failed", 0),
+        )
+        if stats.get("failed", 0):
+            logger.warning(msg, *args)
+        else:
+            logger.info(msg, *args)
+
+    async def _interrupt_background_commands_for_agent(
+        self,
+        chat_session_id: str,
+        agent_service,
+    ) -> dict[str, int]:
+        stats = self._empty_background_cleanup_stats()
+        sandbox = getattr(agent_service, "sandbox", None)
+        if sandbox is None:
+            return stats
+
+        for tracker in self._background_trackers_from_agent(agent_service):
+            if hasattr(tracker, "interrupt_by_sandbox"):
+                try:
+                    tracker_stats = await tracker.interrupt_by_sandbox(sandbox)
+                except Exception:
+                    logger.warning(
+                        "Agent evict 后台命令 interrupt 清理异常: session=%s",
+                        chat_session_id,
+                        exc_info=True,
+                    )
+                    tracker_stats = {"matched": 0, "interrupted": 0, "skipped": 0, "failed": 1}
+            elif hasattr(tracker, "cleanup_by_sandbox"):
+                try:
+                    matched = tracker.cleanup_by_sandbox(sandbox)
+                    tracker_stats = {"matched": matched, "interrupted": 0, "skipped": 0, "failed": 0}
+                except Exception:
+                    logger.warning(
+                        "Agent evict 后台命令 fallback 清理异常: session=%s",
+                        chat_session_id,
+                        exc_info=True,
+                    )
+                    tracker_stats = {"matched": 0, "interrupted": 0, "skipped": 0, "failed": 1}
+            else:
+                tracker_stats = {}
+            self._merge_background_cleanup_stats(stats, tracker_stats)
+
+        self._log_background_cleanup_stats(chat_session_id, stats)
+        return stats
+
+    async def _invalidate_user_agents_with_different_sandbox_async(
         self,
         *,
         user_id: str,
@@ -171,12 +289,12 @@ class AgentPoolService:
                 ):
                     skipped_running += 1
                     continue
-                if self.remove(session_id):
+                if await self.remove_async(session_id):
                     removed += 1
 
         if removed:
             logger.warning(
-                "用戶沙箱已切換，已失效同用戶舊 Agent 快取 (user=%s, sandbox_id=%s, sessions=%d)",
+                "用戶沙箱已切換，已异步失效同用戶舊 Agent 快取 (user=%s, sandbox_id=%s, sessions=%d)",
                 user_id,
                 new_sandbox_id,
                 removed,
@@ -411,30 +529,34 @@ class AgentPoolService:
 
         # 先嘗試從緩存獲取（無鎖快速路徑）
         if chat_session_id in self._cache:
-            stale, cached_sandbox_id, current_sandbox_id = self._cached_agent_is_stale(
-                user_id=user_id,
-                chat_session_id=chat_session_id,
-                sandbox_service=sandbox_service,
-                db_sandbox_id=sandbox_id,
+            needs_rebuild, rebuild_reason, cached_sandbox_id, current_sandbox_id = (
+                self._cached_agent_needs_rebuild(
+                    user_id=user_id,
+                    chat_session_id=chat_session_id,
+                    sandbox_service=sandbox_service,
+                    db_sandbox_id=sandbox_id,
+                )
             )
-            if stale:
+            if self._cached_agent_is_running(chat_session_id):
+                self._detach_running_agent(chat_session_id)
+            elif needs_rebuild:
                 logger.warning(
-                    "Agent 快取 sandbox_id 已過期，移除並重建 "
-                    "(user=%s, session=%s, cached=%s, current=%s)",
+                    "Agent 快取需要重建，移除舊實例 "
+                    "(reason=%s, user=%s, session=%s, cached=%s, current=%s)",
+                    rebuild_reason,
                     user_id,
                     chat_session_id,
                     cached_sandbox_id,
                     current_sandbox_id,
                 )
-                self._invalidate_sandbox_cache_if_stale(
-                    sandbox_service=sandbox_service,
-                    user_id=user_id,
-                    current_sandbox_id=current_sandbox_id,
-                )
-                sandbox_cache_invalidated = True
-                self.remove(chat_session_id)
-            elif self._cached_agent_is_running(chat_session_id):
-                self._detach_running_agent(chat_session_id)
+                if rebuild_reason == "sandbox_stale":
+                    self._invalidate_sandbox_cache_if_stale(
+                        sandbox_service=sandbox_service,
+                        user_id=user_id,
+                        current_sandbox_id=current_sandbox_id,
+                    )
+                    sandbox_cache_invalidated = True
+                await self.remove_async(chat_session_id)
             else:
                 self._touch(chat_session_id)
                 # 節流：每300秒才續租一次沙箱
@@ -446,7 +568,7 @@ class AgentPoolService:
                             user_id,
                             chat_session_id,
                         )
-                        self.invalidate_user(user_id)
+                        await self.invalidate_user_async(user_id)
                     else:
                         self._last_renew[user_id] = now
                         if chat_session_id in self._cache:
@@ -461,30 +583,34 @@ class AgentPoolService:
         async with lock:
             # Double-check：取得鎖後再次確認緩存
             if chat_session_id in self._cache:
-                stale, cached_sandbox_id, current_sandbox_id = self._cached_agent_is_stale(
-                    user_id=user_id,
-                    chat_session_id=chat_session_id,
-                    sandbox_service=sandbox_service,
-                    db_sandbox_id=sandbox_id,
+                needs_rebuild, rebuild_reason, cached_sandbox_id, current_sandbox_id = (
+                    self._cached_agent_needs_rebuild(
+                        user_id=user_id,
+                        chat_session_id=chat_session_id,
+                        sandbox_service=sandbox_service,
+                        db_sandbox_id=sandbox_id,
+                    )
                 )
-                if stale:
+                if self._cached_agent_is_running(chat_session_id):
+                    self._detach_running_agent(chat_session_id)
+                elif needs_rebuild:
                     logger.warning(
-                        "Agent 快取 sandbox_id 已過期，鎖內移除並重建 "
-                        "(user=%s, session=%s, cached=%s, current=%s)",
+                        "Agent 快取需要重建，鎖內移除舊實例 "
+                        "(reason=%s, user=%s, session=%s, cached=%s, current=%s)",
+                        rebuild_reason,
                         user_id,
                         chat_session_id,
                         cached_sandbox_id,
                         current_sandbox_id,
                     )
-                    self._invalidate_sandbox_cache_if_stale(
-                        sandbox_service=sandbox_service,
-                        user_id=user_id,
-                        current_sandbox_id=current_sandbox_id,
-                    )
-                    sandbox_cache_invalidated = True
-                    self._evict_agent(chat_session_id, drop_lock=False)
-                elif self._cached_agent_is_running(chat_session_id):
-                    self._detach_running_agent(chat_session_id)
+                    if rebuild_reason == "sandbox_stale":
+                        self._invalidate_sandbox_cache_if_stale(
+                            sandbox_service=sandbox_service,
+                            user_id=user_id,
+                            current_sandbox_id=current_sandbox_id,
+                        )
+                        sandbox_cache_invalidated = True
+                    await self._evict_agent_async(chat_session_id, drop_lock=False)
                 else:
                     self._touch(chat_session_id)
                     return self._cache[chat_session_id]
@@ -565,7 +691,7 @@ class AgentPoolService:
         # 不再从 mutable sandbox_service cache 二次读取，避免并发初始化错绑。
         new_sandbox_id = self._normalize_sandbox_id(new_sandbox_id)
         if new_sandbox_id:
-            self._invalidate_user_agents_with_different_sandbox(
+            await self._invalidate_user_agents_with_different_sandbox_async(
                 user_id=user_id,
                 new_sandbox_id=new_sandbox_id,
                 keep_session_id=chat_session_id,
@@ -608,6 +734,7 @@ class AgentPoolService:
 
         # 存入緩存（session 映射已在 _create_agent_instance 提前注冊）
         self._cache[chat_session_id] = agent_service
+        self._invalidated_sessions.discard(chat_session_id)
         if new_sandbox_id:
             self._agent_sandbox_ids[chat_session_id] = new_sandbox_id
         else:
@@ -616,31 +743,10 @@ class AgentPoolService:
 
         return agent_service
 
-    def _evict_agent(self, chat_session_id: str, *, drop_lock: bool = True) -> bool:
-        removed = False
-        if chat_session_id in self._cache:
-            agent_svc = self._cache[chat_session_id]
-            # 清理該 Agent 實例持有的後台命令追蹤
-            try:
-                for tool in getattr(agent_svc.agent, 'tools', {}).values():
-                    tracker = getattr(tool, '_tracker', None)
-                    if tracker and hasattr(tracker, 'cleanup_by_sandbox'):
-                        tracker.cleanup_by_sandbox(agent_svc.sandbox)
-                        break  # 三個 bash 工具共享同一個 tracker，清理一次即可
-            except Exception:
-                pass
-            try:
-                agent_svc.close()
-            except Exception:
-                pass
-            del self._cache[chat_session_id]
-            removed = True
-            logger.info("已移除 Agent 緩存: %s", chat_session_id)
-
-        if chat_session_id in self._last_access:
-            del self._last_access[chat_session_id]
-
+    def _drop_session_metadata(self, chat_session_id: str, *, drop_lock: bool = True) -> None:
+        self._last_access.pop(chat_session_id, None)
         self._agent_sandbox_ids.pop(chat_session_id, None)
+        self._invalidated_sessions.discard(chat_session_id)
 
         if drop_lock:
             self._create_locks.pop(chat_session_id, None)
@@ -653,40 +759,28 @@ class AgentPoolService:
                 del self._user_sessions[user_id]
                 self._last_renew.pop(user_id, None)
 
+    async def _evict_agent_async(self, chat_session_id: str, *, drop_lock: bool = True) -> bool:
+        removed = False
+        agent_svc = self._cache.pop(chat_session_id, None)
+        if agent_svc is not None:
+            self._drop_session_metadata(chat_session_id, drop_lock=drop_lock)
+            removed = True
+            logger.info("已从 Agent 热缓存摘除，开始异步清理: %s", chat_session_id)
+
+            await self._interrupt_background_commands_for_agent(chat_session_id, agent_svc)
+
+            try:
+                agent_svc.close()
+            except Exception:
+                pass
+            logger.info("已异步移除 Agent 緩存: %s", chat_session_id)
+        else:
+            self._drop_session_metadata(chat_session_id, drop_lock=drop_lock)
         return removed
 
-    def remove(self, chat_session_id: str) -> bool:
-        """移除 Agent 實例
-
-        Args:
-            chat_session_id: 對話會話 ID
-
-        Returns:
-            是否成功移除
-        """
-        return self._evict_agent(chat_session_id)
-
-    def cleanup_expired(self) -> list[str]:
-        """清理過期的 Agent 實例（同步版本，標記待清理）
-
-        注意：沙箱 pause 是異步操作，這裡只做同步清理。
-        實際的沙箱 pause 需要在異步上下文中調用 cleanup_expired_async()。
-
-        Returns:
-            被清理的 session ID 列表
-        """
-        current_time = time.time()
-        expired_sessions = [
-            session_id
-            for session_id, last_access in self._last_access.items()
-            if current_time - last_access > self._ttl
-        ]
-
-        for session_id in expired_sessions:
-            self.remove(session_id)
-            logger.info("清理過期 Agent 緩存: %s", session_id)
-
-        return expired_sessions
+    async def remove_async(self, chat_session_id: str) -> bool:
+        """异步移除 Agent 实例，优先 interrupt 其后台 bash 命令。"""
+        return await self._evict_agent_async(chat_session_id)
 
     async def cleanup_expired_async(self) -> list[str]:
         """異步清理過期的 Agent 實例（含沙箱 pause）
@@ -705,11 +799,16 @@ class AgentPoolService:
             for session_id, last_access in self._last_access.items()
             if current_time - last_access > self._ttl
         ]
+        sessions_to_remove = [
+            session_id
+            for session_id in expired_sessions
+            if not self._cached_agent_is_running(session_id)
+        ]
 
         # 統計哪些用戶的所有 session 均已過期（需要 pause 沙箱）
         expired_set = set(expired_sessions)
         users_to_pause: set[str] = set()
-        for session_id in expired_sessions:
+        for session_id in sessions_to_remove:
             user_id = self._session_user.get(session_id)
             if user_id:
                 user_active_sessions = self._user_sessions.get(user_id, set())
@@ -717,9 +816,13 @@ class AgentPoolService:
                     users_to_pause.add(user_id)
 
         sandbox_service = get_sandbox_service()
-        for session_id in expired_sessions:
-            self.remove(session_id)
+        for session_id in sessions_to_remove:
+            await self.remove_async(session_id)
             logger.info("清理過期 Agent 緩存: %s", session_id)
+
+        skipped_running = len(expired_sessions) - len(sessions_to_remove)
+        if skipped_running:
+            logger.info("跳過仍在运行的過期 Agent 緩存: sessions=%d", skipped_running)
 
         for user_id in users_to_pause:
             # ★ 再次檢查：在 await 間隙可能有新 session 被注冊
@@ -736,52 +839,27 @@ class AgentPoolService:
             await sandbox_service.pause(user_id)
             logger.info("用戶所有 session 均過期，暫停沙箱: user=%s", user_id)
 
-        return expired_sessions
+        return sessions_to_remove
 
-    def clear_all(self) -> int:
-        """清空所有 Agent 緩存
+    async def invalidate_user_async(self, user_id: str, *, preserve_running: bool = True) -> int:
+        """异步移除某个用户的 idle Agent 缓存，优先 interrupt 后台 bash。
 
-        Returns:
-            清理的 Agent 數量
-        """
-        count = len(self._cache)
-        for session_id in list(self._cache.keys()):
-            self._evict_agent(session_id)
-
-        # 兜底清理尚未進入 cache 的占位 / metadata。
-        self._cache.clear()
-        self._last_access.clear()
-        self._session_user.clear()
-        self._user_sessions.clear()
-        self._agent_sandbox_ids.clear()
-        self._last_renew.clear()
-        self._create_locks.clear()
-        self._user_creating.clear()
-        logger.info("已清空所有 Agent 緩存（共 %d 個）", count)
-        return count
-
-    def invalidate_user(self, user_id: str) -> int:
-        """移除某个用户的所有 Agent 缓存。
-
-        用于用户更新 AGENTS/SOUL/USER 等配置后，确保下一次请求
-        会重新初始化 Agent 并加载最新 system prompt。
-
-        Args:
-            user_id: 用户 ID
-
-        Returns:
-            实际移除的 session 数量
+        preserve_running=True 时，运行中的 Agent 只标记懒失效；下一次
+        get_or_create 会在其不再运行后重建，避免误杀正在执行的后台命令。
         """
         session_ids = list(self._user_sessions.get(user_id, set()))
         removed = 0
         for session_id in session_ids:
             if session_id not in self._cache:
                 continue
-            if self.remove(session_id):
+            if preserve_running and self._cached_agent_is_running(session_id):
+                self._invalidated_sessions.add(session_id)
+                continue
+            if await self.remove_async(session_id):
                 removed += 1
 
         if removed:
-            logger.info("已失效用户 Agent 缓存: user=%s, sessions=%d", user_id, removed)
+            logger.info("已异步失效用户 Agent 缓存: user=%s, sessions=%d", user_id, removed)
         return removed
 
     def get_stats(self) -> dict:

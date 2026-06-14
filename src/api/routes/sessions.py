@@ -752,7 +752,7 @@ async def delete_session(
 
     # 使用 AgentPoolService 清理 agent 缓存
     agent_pool = get_agent_pool()
-    agent_pool.remove(chat_session_id)
+    await agent_pool.remove_async(chat_session_id)
     logger.info("已清理 Agent 缓存: %s", chat_session_id)
 
     # 沙箱屬於用戶，刪除 session 時不 kill 沙箱，只清理 session 子目錄

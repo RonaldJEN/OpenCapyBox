@@ -4,7 +4,7 @@ from datetime import timedelta
 import json
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -565,12 +565,16 @@ def test_delete_user_allows_stale_run_lock(admin_integration_client):
     sandbox_service = MagicMock()
     sandbox_service.get_cached.return_value = None
     with patch("src.api.routes.admin.get_agent_pool") as pool_mock:
+        pool_mock.return_value.invalidate_user_async = AsyncMock(return_value=0)
         with patch("src.api.routes.admin.SandboxSessionService", return_value=sandbox_service):
             resp = client.delete("/admin/users/demo")
 
     assert resp.status_code == 200
     assert resp.json() == {"user_id": "demo", "deleted": True}
-    pool_mock.return_value.invalidate_user.assert_called_once_with("demo")
+    pool_mock.return_value.invalidate_user_async.assert_awaited_once_with(
+        "demo",
+        preserve_running=False,
+    )
     sandbox_service.kill.assert_not_called()
     verify_db = SessionLocal()
     try:

@@ -350,13 +350,17 @@ class TestAdminRouter:
         sandbox_service.get_cached.return_value = None
 
         with patch("src.api.routes.admin.get_agent_pool") as pool_mock:
+            pool_mock.return_value.invalidate_user_async = AsyncMock(return_value=0)
             with patch("src.api.routes.admin.SandboxSessionService", return_value=sandbox_service):
                 with patch("src.api.routes.admin.delete_auth_user", return_value="demo") as delete_mock:
                     resp = client.delete("/admin/users/demo")
 
         assert resp.status_code == 200
         assert resp.json() == {"user_id": "demo", "deleted": True}
-        pool_mock.return_value.invalidate_user.assert_called_once_with("demo")
+        pool_mock.return_value.invalidate_user_async.assert_awaited_once_with(
+            "demo",
+            preserve_running=False,
+        )
         sandbox_service.kill.assert_not_called()
         assert delete_mock.call_args.kwargs["user_id"] == "demo"
 
@@ -372,7 +376,8 @@ class TestAdminRouter:
         sandbox_service.get_cached.return_value = None
         sandbox_service.kill = AsyncMock(return_value=True)
 
-        with patch("src.api.routes.admin.get_agent_pool"):
+        with patch("src.api.routes.admin.get_agent_pool") as pool_mock:
+            pool_mock.return_value.invalidate_user_async = AsyncMock(return_value=0)
             with patch("src.api.routes.admin.SandboxSessionService", return_value=sandbox_service):
                 with patch("src.api.routes.admin.delete_auth_user", return_value="demo") as delete_mock:
                     resp = client.delete("/admin/users/demo")
@@ -393,7 +398,8 @@ class TestAdminRouter:
         sandbox_service.get_cached.return_value = None
         sandbox_service.kill = AsyncMock(return_value=False)
 
-        with patch("src.api.routes.admin.get_agent_pool"):
+        with patch("src.api.routes.admin.get_agent_pool") as pool_mock:
+            pool_mock.return_value.invalidate_user_async = AsyncMock(return_value=0)
             with patch("src.api.routes.admin.SandboxSessionService", return_value=sandbox_service):
                 with patch("src.api.routes.admin.delete_auth_user") as delete_mock:
                     resp = client.delete("/admin/users/demo")

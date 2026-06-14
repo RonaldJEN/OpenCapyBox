@@ -651,6 +651,8 @@ Agent 执行循环中有 **3 个取消检查点**:
 
 因此，即使重启后命中本地 AgentPool 热缓存，LLM request 也必须基于 DB 中最新 conversation history 构造。`llm_call_records.request_messages` 应能审计到刷新后的输入快照：上一轮已落库的用户纠错/确认信息不得因为 stale hot cache 缺失。
 
+AgentPool 缓存失效不得中断仍在运行的 AgentService：配置更新、sandbox 代际切换、renew 失败或 TTL cleanup 遇到 running Agent 时，只能 detach 或标记懒失效；idle 后的下一次 `get_or_create` 再重建。这样可以保证新 run 不复用旧 system prompt，同时不误杀旧 run 正在执行的后台 bash 命令。
+
 ### 4.2 幂等性保证
 
 #### 机制

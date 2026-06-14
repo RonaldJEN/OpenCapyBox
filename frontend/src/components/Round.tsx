@@ -16,6 +16,7 @@ interface RoundProps {
   disableMotion?: boolean;
   userAttachments?: AttachmentInfo[];
   sessionId?: string;
+  assistantFileMatches?: Record<string, FileInfo | null | undefined>;
   onPreviewAttachment?: (file: FileInfo) => void;
   onOpenFileInPanel?: (file: FileInfo) => void;
 }
@@ -167,7 +168,7 @@ function formatAssistantFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function Round({ round, isStreaming = false, disableMotion = false, userAttachments = [], sessionId, onPreviewAttachment, onOpenFileInPanel }: RoundProps) {
+export function Round({ round, isStreaming = false, disableMotion = false, userAttachments = [], sessionId, assistantFileMatches, onPreviewAttachment, onOpenFileInPanel }: RoundProps) {
   // 解析用户消息，提取附件信息
   const { attachments, cleanContent } = parseMessageContent(round.user_message);
 
@@ -181,6 +182,15 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
   const assistantFiles = assistantContent
     ? extractAssistantFiles(assistantContent, sessionId)
     : [];
+  const visibleAssistantFiles = assistantFileMatches
+    ? assistantFiles.flatMap((file) => {
+        if (!Object.prototype.hasOwnProperty.call(assistantFileMatches, file.path)) {
+          return [file];
+        }
+        const matched = assistantFileMatches[file.path];
+        return matched ? [{ ...file, ...matched, path: matched.path.replace(/^\/+/, '') }] : [];
+      })
+    : assistantFiles;
 
   return (
     <div className={`space-y-6 ${disableMotion ? '' : 'animate-fade-in'}`}>
@@ -278,9 +288,9 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
                 <span className="inline-block w-0.5 h-5 bg-claude-muted ml-0.5 animate-blink align-middle" />
               )}
               {/* 底部文件卡片（去重） */}
-              {assistantFiles.length > 0 && (
+              {visibleAssistantFiles.length > 0 && (
                 <div className="not-prose mt-4 flex flex-col gap-2">
-                  {assistantFiles.map((file) => (
+                  {visibleAssistantFiles.map((file) => (
                     <AssistantFileCard
                       key={`file-${file.path}`}
                       file={file}

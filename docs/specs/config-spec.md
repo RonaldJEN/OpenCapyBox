@@ -80,6 +80,7 @@
 
 - SandboxBash / BashOutput / BashKill 共享 `_BackgroundCommandTracker` 实例
 - 跟踪后台进程 ID / 状态
+- 后台 bash 命令默认设置服务端最大运行时间 `SANDBOX_BACKGROUND_COMMAND_TIMEOUT_SECONDS=21600` 秒；`0` 表示不设置服务端 timeout，负数为非法配置
 
 ### 前端编辑记忆文件的副作用链
 
@@ -88,6 +89,11 @@
 1. DB upsert（乐观锁）
 2. Force push to sandbox
 3. Invalidate AgentPool cache（下次请求重建 Agent with 新 system prompt）
+
+失效语义：
+
+- idle Agent 立即从 AgentPool 移除；若其 tracker 中仍有后台 bash 命令，按 AgentPool eviction 规则做清理。
+- running Agent 不得被 close / interrupt。配置更新只标记该 session 懒失效；当前 run 自然结束后，下一次 `get_or_create` 必须重建 Agent，避免继续使用旧 system prompt。
 
 ### 子 Agent Profile（sub_agent）
 

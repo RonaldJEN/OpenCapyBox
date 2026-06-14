@@ -1166,7 +1166,7 @@ async def delete_admin_auth_user(
     if running_cron:
         raise HTTPException(status_code=409, detail="用户当前有正在运行的定时任务，无法删除")
 
-    get_agent_pool().invalidate_user(user_id)
+    await get_agent_pool().invalidate_user_async(user_id, preserve_running=False)
 
     sandbox_service = SandboxSessionService()
     user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()

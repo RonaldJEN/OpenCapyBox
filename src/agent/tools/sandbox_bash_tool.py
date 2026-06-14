@@ -9,6 +9,7 @@
 - SandboxBashKillTool: 終止後台命令
 """
 
+import asyncio
 import logging
 import posixpath
 import uuid
@@ -21,6 +22,10 @@ from opensandbox.models.execd import RunCommandOpts
 from .base import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_BACKGROUND_COMMAND_TIMEOUT_SECONDS = 21600
+BACKGROUND_INTERRUPT_TIMEOUT_SECONDS = 5
+BACKGROUND_STATUS_TIMEOUT_SECONDS = 5
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: OpenSandbox SDK 的 EventNode / EventNodeError 存在多个
@@ -196,6 +201,115 @@ class _BackgroundCommandTracker:
             del self._commands[bid]
         return len(to_remove)
 
+    @staticmethod
+    def _status_is_running(command_status: Any) -> bool:
+        running = getattr(command_status, "running", None)
+        if isinstance(running, bool):
+            return running
+
+        status_text = (
+            getattr(command_status, "status", None)
+            or getattr(command_status, "state", None)
+            or getattr(command_status, "phase", None)
+            or ""
+        )
+        status_text = str(status_text).lower()
+
+        terminal_statuses = {
+            "completed",
+            "complete",
+            "done",
+            "exited",
+            "failed",
+            "finished",
+            "interrupted",
+            "killed",
+            "stopped",
+            "succeeded",
+            "success",
+            "terminated",
+            "timeout",
+            "timed_out",
+            "cancelled",
+            "canceled",
+        }
+        running_statuses = {
+            "created",
+            "pending",
+            "queued",
+            "running",
+            "started",
+            "starting",
+        }
+        if status_text in terminal_statuses:
+            return False
+        if status_text in running_statuses:
+            return True
+
+        exit_code = getattr(command_status, "exit_code", None)
+        if isinstance(exit_code, int):
+            return False
+        if getattr(command_status, "error", None):
+            return False
+
+        # Unknown status shape: prefer interrupting to avoid leaking a live process.
+        return True
+
+    async def interrupt_by_sandbox(self, sandbox: Sandbox) -> dict[str, int]:
+        """Interrupt tracked background commands for a sandbox, then clear local state."""
+        matched = [
+            (bash_id, command_id)
+            for bash_id, (sbx, command_id) in self._commands.items()
+            if sbx is sandbox
+        ]
+        stats = {
+            "matched": len(matched),
+            "interrupted": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
+
+        for bash_id, command_id in matched:
+            should_interrupt = True
+            try:
+                command_status = await asyncio.wait_for(
+                    sandbox.commands.get_command_status(command_id),
+                    timeout=BACKGROUND_STATUS_TIMEOUT_SECONDS,
+                )
+                should_interrupt = self._status_is_running(command_status)
+            except Exception as e:
+                logger.warning(
+                    "查询后台命令状态失败，将尝试 best-effort interrupt "
+                    "(bash_id=%s, command_id=%s): %s",
+                    bash_id,
+                    command_id,
+                    e,
+                )
+
+            if not should_interrupt:
+                stats["skipped"] += 1
+                continue
+
+            try:
+                await asyncio.wait_for(
+                    sandbox.commands.interrupt(command_id),
+                    timeout=BACKGROUND_INTERRUPT_TIMEOUT_SECONDS,
+                )
+                stats["interrupted"] += 1
+            except Exception as e:
+                stats["failed"] += 1
+                logger.warning(
+                    "interrupt 后台命令失败 (bash_id=%s, command_id=%s): %s",
+                    bash_id,
+                    command_id,
+                    e,
+                )
+
+        for bash_id, _ in matched:
+            self._commands.pop(bash_id, None)
+
+        return stats
+
 
 class SandboxBashTool(Tool):
     """在遠端沙箱中執行 shell 命令
@@ -207,16 +321,30 @@ class SandboxBashTool(Tool):
     max_result_tokens = 16000  # bash 輸出可能較長，給 16K token 預算
     execute_timeout = 660  # SDK 层最大 600s，留 60s 余量
 
-    def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user", tracker: '_BackgroundCommandTracker | None' = None):
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        workspace_dir: str = "/home/user",
+        tracker: '_BackgroundCommandTracker | None' = None,
+        background_timeout_seconds: int | None = DEFAULT_BACKGROUND_COMMAND_TIMEOUT_SECONDS,
+    ):
         """初始化
 
         Args:
             sandbox: 已連接的 OpenSandbox 實例
             tracker: 後台命令追蹤器（可選，用於跨工具共享同一會話的後台命令）
+            background_timeout_seconds: 後台命令服務端超時秒數，0 表示不設置
         """
         self._sandbox = sandbox
         self._workspace_dir = _normalize_workspace_dir(workspace_dir)
         self._tracker = tracker or _BackgroundCommandTracker()
+        self._background_timeout_seconds = int(
+            background_timeout_seconds
+            if background_timeout_seconds is not None
+            else DEFAULT_BACKGROUND_COMMAND_TIMEOUT_SECONDS
+        )
+        if self._background_timeout_seconds < 0:
+            raise ValueError("background_timeout_seconds must be >= 0")
 
     @property
     def name(self) -> str:
@@ -236,6 +364,7 @@ Parameters:
   - command (required): Bash command to execute
   - timeout (optional): Timeout in seconds (default: 10, max: 600) for foreground commands
   - run_in_background (optional): Set true for long-running commands (servers, etc.)
+    Background commands are still bounded by a system-configured maximum runtime.
 
 Tips:
   - This is a Linux environment (not Windows)
@@ -243,7 +372,8 @@ Tips:
     - Skills are available at <workspace_root>/skills/
   - You can install any package: pip install xxx, npm install xxx
   - Chain commands with &&: cd project && python app.py
-  - For background commands, monitor with bash_output and terminate with bash_kill
+  - For background commands, monitor with bash_output and terminate with bash_kill.
+    Do not assume background commands can run forever.
 
 Examples:
   - pip install pandas matplotlib
@@ -267,7 +397,7 @@ Examples:
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Set to true for long-running commands. Monitor with bash_output.",
+                    "description": "Set to true for long-running commands. Monitor with bash_output. Background commands have a system-configured maximum runtime.",
                     "default": False,
                 },
             },
@@ -405,7 +535,13 @@ Examples:
         bash_id = str(uuid.uuid4())[:8]
         logger.debug("沙箱後台命令: %s (bash_id=%s)", command, bash_id)
 
-        opts = RunCommandOpts(background=True, working_directory=self._workspace_dir)
+        opts_kwargs: dict[str, Any] = {
+            "background": True,
+            "working_directory": self._workspace_dir,
+        }
+        if self._background_timeout_seconds > 0:
+            opts_kwargs["timeout"] = timedelta(seconds=self._background_timeout_seconds)
+        opts = RunCommandOpts(**opts_kwargs)
         execution = await self._sandbox.commands.run(command, opts=opts)
 
         if execution is None:
@@ -421,6 +557,12 @@ Examples:
         # 追蹤後台命令
         command_id = execution.id if hasattr(execution, 'id') else bash_id
         self._tracker.add(bash_id, self._sandbox, command_id)
+        logger.info(
+            "沙箱后台命令已启动: bash_id=%s, command_id=%s, timeout_seconds=%s",
+            bash_id,
+            command_id,
+            self._background_timeout_seconds,
+        )
         return SandboxBashOutputResult(
             success=True,
             stdout=f"Background command started with ID: {bash_id}",

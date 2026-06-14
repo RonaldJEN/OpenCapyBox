@@ -7,11 +7,13 @@
 - AgentService（user_id 参数，workspace_dir 按 session，conversation_messages 恢复）
 - database.py 表注册
 """
+import asyncio
 import hashlib
 import json
 import re
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,6 +40,30 @@ def _inject_pool_session(pool, session_id, user_id, mock_agent=None, *, timestam
     pool._session_user[session_id] = user_id
     pool._user_sessions.setdefault(user_id, set()).add(session_id)
     return mock_agent
+
+
+def _make_agent_with_background_tracker(*, events=None, stats=None):
+    """构造带共享后台命令 tracker 的 AgentService mock。"""
+    events = events if events is not None else []
+    stats = stats or {"matched": 1, "interrupted": 1, "skipped": 0, "failed": 0}
+    sandbox = MagicMock()
+    tracker = MagicMock()
+
+    async def _interrupt(sbx):
+        assert sbx is sandbox
+        events.append("interrupt")
+        return stats
+
+    tracker.interrupt_by_sandbox = AsyncMock(side_effect=_interrupt)
+    tracker.cleanup_by_sandbox = MagicMock(return_value=1)
+    tool = MagicMock()
+    tool._tracker = tracker
+
+    mock_agent = MagicMock()
+    mock_agent.sandbox = sandbox
+    mock_agent.agent.tools = {"bash": tool}
+    mock_agent.close.side_effect = lambda: events.append("close")
+    return mock_agent, tracker
 
 
 # ============================================================
@@ -723,31 +749,90 @@ class TestAgentPoolServiceUserSessions:
         assert "session-C" in pool._cache
         mock_sandbox_service.renew.assert_awaited_once_with("user-1")
 
-    def test_remove_cleans_user_sessions_mapping(self):
-        """remove() 应从 _user_sessions 中移除 session"""
+    @pytest.mark.asyncio
+    async def test_remove_async_interrupts_background_before_close(self):
+        """remove_async() 应先 interrupt tracked background commands，再 close AgentService"""
         from src.api.services.agent_pool_service import AgentPoolService
 
         pool = AgentPoolService(ttl=3600)
-        _inject_pool_session(pool, "session-A", "user-1", sandbox_id="sbx-current")
+        events = []
+        mock_agent, tracker = _make_agent_with_background_tracker(events=events)
+        _inject_pool_session(pool, "session-A", "user-1", mock_agent=mock_agent)
 
-        pool.remove("session-A")
+        removed = await pool.remove_async("session-A")
+
+        assert removed is True
+        assert events == ["interrupt", "close"]
+        tracker.interrupt_by_sandbox.assert_awaited_once_with(mock_agent.sandbox)
+        assert "session-A" not in pool._cache
+        assert "user-1" not in pool._user_sessions
+
+    @pytest.mark.asyncio
+    async def test_remove_async_drops_hot_cache_before_interrupt_finishes(self):
+        """remove_async() 等待远端清理时，不应继续暴露旧 Agent 缓存。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        entered_interrupt = asyncio.Event()
+        release_interrupt = asyncio.Event()
+        events = []
+        sandbox = MagicMock()
+
+        async def _interrupt(sbx):
+            assert sbx is sandbox
+            events.append("interrupt-start")
+            entered_interrupt.set()
+            await release_interrupt.wait()
+            events.append("interrupt-end")
+            return {"matched": 1, "interrupted": 1, "skipped": 0, "failed": 0}
+
+        tracker = MagicMock()
+        tracker.interrupt_by_sandbox = AsyncMock(side_effect=_interrupt)
+        tracker.cleanup_by_sandbox = MagicMock(return_value=1)
+        tool = MagicMock()
+        tool._tracker = tracker
+
+        mock_agent = MagicMock()
+        mock_agent.sandbox = sandbox
+        mock_agent.agent.tools = {"bash": tool}
+        mock_agent.close.side_effect = lambda: events.append("close")
+        _inject_pool_session(pool, "session-A", "user-1", mock_agent=mock_agent)
+
+        task = asyncio.create_task(pool.remove_async("session-A"))
+        await asyncio.wait_for(entered_interrupt.wait(), timeout=1)
 
         assert "session-A" not in pool._cache
-        assert "session-A" not in pool._agent_sandbox_ids
-        assert "user-1" not in pool._user_sessions  # 集合清空后键也应被删除
+        assert "session-A" not in pool._last_access
+        assert "user-1" not in pool._user_sessions
+        mock_agent.close.assert_not_called()
 
-    def test_remove_keeps_user_if_other_sessions_exist(self):
-        """remove() 某 session 时，若用户还有其他 session，不应删除用户映射"""
+        release_interrupt.set()
+        removed = await task
+
+        assert removed is True
+        assert events == ["interrupt-start", "interrupt-end", "close"]
+
+    @pytest.mark.asyncio
+    async def test_remove_async_closes_agent_when_fallback_cleanup_fails(self):
+        """legacy cleanup_by_sandbox 失败时也应继续 close AgentService。"""
         from src.api.services.agent_pool_service import AgentPoolService
 
         pool = AgentPoolService(ttl=3600)
-        _inject_pool_session(pool, "session-A", "user-1")
-        _inject_pool_session(pool, "session-B", "user-1")
+        sandbox = MagicMock()
+        tracker = SimpleNamespace(
+            cleanup_by_sandbox=MagicMock(side_effect=RuntimeError("cleanup down"))
+        )
+        tool = SimpleNamespace(_tracker=tracker)
+        mock_agent = MagicMock()
+        mock_agent.sandbox = sandbox
+        mock_agent.agent.tools = {"bash": tool}
+        _inject_pool_session(pool, "session-A", "user-1", mock_agent=mock_agent)
 
-        pool.remove("session-A")
+        removed = await pool.remove_async("session-A")
 
-        assert "user-1" in pool._user_sessions
-        assert "session-B" in pool._user_sessions["user-1"]
+        assert removed is True
+        tracker.cleanup_by_sandbox.assert_called_once_with(sandbox)
+        mock_agent.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_cleanup_expired_only_pauses_when_all_sessions_expired(self):
@@ -793,6 +878,73 @@ class TestAgentPoolServiceUserSessions:
 
         assert "session-A" in expired
         mock_sandbox_service.pause.assert_called_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_cleanup_expired_async_evicts_background_before_pause(self):
+        """cleanup_expired_async() 应先 async evict，再按原逻辑 pause 用户 sandbox"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=1)
+        events = []
+        expired_time = time.time() - 10
+        mock_agent, tracker = _make_agent_with_background_tracker(events=events)
+        _inject_pool_session(
+            pool,
+            "session-A",
+            "user-1",
+            mock_agent=mock_agent,
+            timestamp=expired_time,
+        )
+
+        mock_sandbox_service = AsyncMock()
+
+        async def _pause(user_id):
+            events.append("pause")
+            return True
+
+        mock_sandbox_service.pause = AsyncMock(side_effect=_pause)
+
+        with (
+            patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service),
+            patch.object(AgentPoolService, "_user_has_fresh_run_lock", return_value=False),
+        ):
+            expired = await pool.cleanup_expired_async()
+
+        assert expired == ["session-A"]
+        assert events == ["interrupt", "close", "pause"]
+        tracker.interrupt_by_sandbox.assert_awaited_once_with(mock_agent.sandbox)
+        mock_sandbox_service.pause.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_cleanup_expired_async_skips_running_agent(self):
+        """TTL 清理不能移除仍在运行的 Agent。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=1)
+        events = []
+        expired_time = time.time() - 10
+        running_agent, tracker = _make_agent_with_background_tracker(events=events)
+        running_agent.is_running = True
+        _inject_pool_session(
+            pool,
+            "session-A",
+            "user-1",
+            mock_agent=running_agent,
+            timestamp=expired_time,
+        )
+
+        mock_sandbox_service = AsyncMock()
+        mock_sandbox_service.pause = AsyncMock(return_value=True)
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            expired = await pool.cleanup_expired_async()
+
+        assert expired == []
+        assert "session-A" in pool._cache
+        tracker.interrupt_by_sandbox.assert_not_awaited()
+        running_agent.close.assert_not_called()
+        mock_sandbox_service.pause.assert_not_called()
+        assert events == []
 
     @pytest.mark.asyncio
     async def test_cleanup_skips_pause_when_other_worker_has_fresh_lock(self):
@@ -850,26 +1002,89 @@ class TestAgentPoolServiceUserSessions:
         assert stats["sessions"]["session-X"]["user_id"] == "user-42"
         assert stats["sessions"]["session-X"]["sandbox_id"] == "sbx-visible"
 
-    def test_invalidate_user_removes_all_sessions(self):
-        """invalidate_user() 应移除该用户的全部 session 缓存"""
+    @pytest.mark.asyncio
+    async def test_invalidate_user_async_interrupts_multiple_sessions(self):
+        """invalidate_user_async() 应清理该用户多个 session 的后台命令"""
         from src.api.services.agent_pool_service import AgentPoolService
 
         pool = AgentPoolService(ttl=3600)
-        _inject_pool_session(pool, "session-A", "user-1")
-        _inject_pool_session(pool, "session-B", "user-1")
+        events = []
+        agent_a, tracker_a = _make_agent_with_background_tracker(events=events)
+        agent_b, tracker_b = _make_agent_with_background_tracker(events=events)
+        _inject_pool_session(pool, "session-A", "user-1", mock_agent=agent_a)
+        _inject_pool_session(pool, "session-B", "user-1", mock_agent=agent_b)
         _inject_pool_session(pool, "session-C", "user-2")
 
-        removed = pool.invalidate_user("user-1")
+        removed = await pool.invalidate_user_async("user-1")
 
         assert removed == 2
+        assert events.count("interrupt") == 2
+        assert events.count("close") == 2
+        tracker_a.interrupt_by_sandbox.assert_awaited_once_with(agent_a.sandbox)
+        tracker_b.interrupt_by_sandbox.assert_awaited_once_with(agent_b.sandbox)
         assert "session-A" not in pool._cache
         assert "session-B" not in pool._cache
         assert "session-C" in pool._cache
-        assert "user-1" not in pool._user_sessions
-        assert "user-2" in pool._user_sessions
 
-    def test_invalidate_user_keeps_inflight_session_placeholder(self):
-        """invalidate_user() 不应删除正在创建的 session 占位。"""
+    @pytest.mark.asyncio
+    async def test_invalidate_user_async_marks_running_session_without_interrupt(self):
+        """配置失效遇到 running Agent 时只标记懒失效，不 interrupt 当前后台命令。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        events = []
+        running_agent, tracker = _make_agent_with_background_tracker(events=events)
+        running_agent.is_running = True
+        _inject_pool_session(pool, "session-A", "user-1", mock_agent=running_agent)
+
+        removed = await pool.invalidate_user_async("user-1")
+
+        assert removed == 0
+        assert "session-A" in pool._cache
+        assert "session-A" in pool._invalidated_sessions
+        tracker.interrupt_by_sandbox.assert_not_awaited()
+        running_agent.close.assert_not_called()
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_detaches_running_marked_invalid_without_interrupt(self):
+        """被标记失效的 running Agent 不能被 evict，只能 detach 后让新 run 重建。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        events = []
+        running_agent, tracker = _make_agent_with_background_tracker(events=events)
+        running_agent.is_running = True
+        rebuilt_agent = MagicMock()
+        _inject_pool_session(pool, "session-A", "user-1", mock_agent=running_agent)
+        pool._invalidated_sessions.add("session-A")
+
+        async def create_agent(**_kwargs):
+            _inject_pool_session(pool, "session-A", "user-1", mock_agent=rebuilt_agent)
+            pool._invalidated_sessions.discard("session-A")
+            return rebuilt_agent
+
+        pool._create_agent_instance = AsyncMock(side_effect=create_agent)
+
+        mock_sandbox_service = MagicMock()
+        mock_sandbox_service.get_sandbox_id.return_value = None
+
+        with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
+            result = await pool.get_or_create(
+                user_id="user-1",
+                session_id="user-1",
+                chat_session_id="session-A",
+                db=MagicMock(),
+            )
+
+        assert result is rebuilt_agent
+        tracker.interrupt_by_sandbox.assert_not_awaited()
+        running_agent.close.assert_not_called()
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_invalidate_user_async_keeps_inflight_session_placeholder(self):
+        """invalidate_user_async() 不应删除正在创建的 session 占位。"""
         from src.api.services.agent_pool_service import AgentPoolService
 
         pool = AgentPoolService(ttl=3600)
@@ -879,7 +1094,7 @@ class TestAgentPoolServiceUserSessions:
         pool._user_sessions.setdefault("user-1", set()).add("session-inflight")
         pool._create_locks["session-inflight"] = object()
 
-        removed = pool.invalidate_user("user-1")
+        removed = await pool.invalidate_user_async("user-1")
 
         assert removed == 1
         assert "session-cached" not in pool._cache
@@ -928,50 +1143,22 @@ class TestAgentPoolServiceUserSessions:
 
         mock_sandbox_service.pause = AsyncMock(side_effect=pause_side_effect)
 
-        # 在 remove 执行后、pause 执行前插入新 session
-        original_remove = pool.remove
+        # 在 remove_async 执行后、pause 执行前插入新 session
+        original_remove_async = pool.remove_async
 
-        def patched_remove(sid):
-            result = original_remove(sid)
+        async def patched_remove_async(sid):
+            result = await original_remove_async(sid)
             # 模拟在 remove 和 pause 之间有新 session 注册
             _inject_pool_session(pool, "session-B", "user-1")
             return result
 
-        pool.remove = patched_remove
+        pool.remove_async = patched_remove_async
 
         with patch("src.api.services.agent_pool_service.get_sandbox_service", return_value=mock_sandbox_service):
             await pool.cleanup_expired_async()
 
         # 因为 user-1 已有新 session-B，pause 不应被调用
         mock_sandbox_service.pause.assert_not_called()
-
-    def test_user_creating_cleared_on_clear_all(self):
-        """clear_all 应清理 _user_creating"""
-        from src.api.services.agent_pool_service import AgentPoolService
-
-        pool = AgentPoolService(ttl=3600)
-        pool._user_creating.add("user-1")
-        pool.clear_all()
-        assert len(pool._user_creating) == 0
-
-    def test_clear_all_evicts_agents_before_clearing_metadata(self):
-        """clear_all 应复用 evict 路径，释放 AgentService 持有的资源。"""
-        from src.api.services.agent_pool_service import AgentPoolService
-
-        pool = AgentPoolService(ttl=3600)
-        agent_a = MagicMock()
-        agent_a.agent.tools = {}
-        agent_b = MagicMock()
-        agent_b.agent.tools = {}
-        _inject_pool_session(pool, "session-A", "user-1", mock_agent=agent_a, sandbox_id="sbx-1")
-        _inject_pool_session(pool, "session-B", "user-2", mock_agent=agent_b, sandbox_id="sbx-2")
-
-        assert pool.clear_all() == 2
-
-        agent_a.close.assert_called_once()
-        agent_b.close.assert_called_once()
-        assert pool._cache == {}
-        assert pool._agent_sandbox_ids == {}
 
 
 # ============================================================

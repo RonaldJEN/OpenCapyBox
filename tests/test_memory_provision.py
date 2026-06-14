@@ -222,7 +222,7 @@ class TestConfigRouteAutoProvision:
             mock_instance.upsert_memory_file.return_value = record
 
             mock_pool = MagicMock()
-            mock_pool.invalidate_user.return_value = 1
+            mock_pool.invalidate_user_async = AsyncMock(return_value=1)
             mock_get_pool.return_value = mock_pool
 
             response = client.put(
@@ -232,7 +232,7 @@ class TestConfigRouteAutoProvision:
             )
 
         assert response.status_code == 200
-        mock_pool.invalidate_user.assert_called_once_with("new-user")
+        mock_pool.invalidate_user_async.assert_awaited_once_with("new-user")
 
     def test_update_agent_file_syncs_persisted_sandbox_when_cache_exists(self, client):
         """配置同步时应使用 DB 当前沙箱，避免写入旧缓存沙箱。"""
@@ -252,7 +252,7 @@ class TestConfigRouteAutoProvision:
             mock_instance.sync_to_sandbox = AsyncMock()
 
             mock_pool = MagicMock()
-            mock_pool.invalidate_user.return_value = 0
+            mock_pool.invalidate_user_async = AsyncMock(return_value=0)
             mock_get_pool.return_value = mock_pool
 
             stale_sandbox = MagicMock()

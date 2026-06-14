@@ -2,6 +2,7 @@
 import hashlib
 import logging
 import secrets
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 from typing import List
@@ -56,6 +57,7 @@ class Settings(BaseSettings):
     sandbox_persistent_storage_enabled: bool = True  # 啟用 session 持久化存儲掛載
     sandbox_host_storage_root: str = "/tmp/sandbox"  # OpenSandbox 宿主機持久化根路徑
     sandbox_storage_mount_path: str = "/home/user"  # 容器內掛載路徑
+    sandbox_background_command_timeout_seconds: int = 21600  # 后台 bash 命令服务端超时（秒），0 表示禁用
 
     # Agent 配置
     agent_max_steps: int = 100
@@ -86,6 +88,13 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         extra = "ignore"  # 忽略额外字段，避免验证错误
+
+    @field_validator("sandbox_background_command_timeout_seconds")
+    @classmethod
+    def validate_sandbox_background_command_timeout_seconds(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("sandbox_background_command_timeout_seconds must be >= 0")
+        return value
 
     def get_auth_users(self) -> dict[str, str]:
         """解析简单认证用户列表"""

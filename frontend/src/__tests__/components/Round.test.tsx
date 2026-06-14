@@ -331,6 +331,76 @@ describe('Round 组件', () => {
     }));
   });
 
+  it('传入 session 文件校验结果时只渲染匹配文件卡片', () => {
+    const round = createMockRound({
+      final_response: [
+        '生成结果如下：',
+        '',
+        '文件位置： `scripts/batch_find_similar.py`',
+        '文件位置： `references/db_schema.md`',
+      ].join('\n'),
+      steps: [],
+    });
+    const onOpenFileInPanel = vi.fn();
+
+    render(
+      <Round
+        round={round}
+        isStreaming={false}
+        sessionId="s1"
+        assistantFileMatches={{
+          'scripts/batch_find_similar.py': null,
+          'references/db_schema.md': {
+            name: 'db_schema.md',
+            path: 'references/db_schema.md',
+            size: 42,
+            modified: '2026-06-12T10:00:00Z',
+            type: 'md',
+            is_directory: false,
+            session_id: 's1',
+          },
+        }}
+        onOpenFileInPanel={onOpenFileInPanel}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: '查看 batch_find_similar.py' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '查看 db_schema.md' }));
+
+    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'db_schema.md',
+      path: 'references/db_schema.md',
+      size: 42,
+      session_id: 's1',
+    }));
+  });
+
+  it('传入空校验结果时仍渲染未确认的文件卡片', () => {
+    const round = createMockRound({
+      final_response: '文件位置： `scripts/pending.py`',
+      steps: [],
+    });
+    const onOpenFileInPanel = vi.fn();
+
+    render(
+      <Round
+        round={round}
+        isStreaming={false}
+        sessionId="s1"
+        assistantFileMatches={{}}
+        onOpenFileInPanel={onOpenFileInPanel}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '查看 pending.py' }));
+
+    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'pending.py',
+      path: 'scripts/pending.py',
+      session_id: 's1',
+    }));
+  });
+
   it('助手回复句子里的 docx 文件名也应该渲染为文件卡片', () => {
     const round = createMockRound({
       final_response: '搞定！ `DeepSeek_V4_解读.docx` 已生成，22KB。',

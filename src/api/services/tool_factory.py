@@ -133,7 +133,12 @@ async def create_agent_tools(
             read_only_paths=read_only_paths,
         )),
         # 沙箱 Bash 工具（共享 tracker）
-        ("SandboxBashTool", lambda: SandboxBashTool(sandbox=sandbox, workspace_dir=workspace_dir, tracker=bg_tracker)),
+        ("SandboxBashTool", lambda: SandboxBashTool(
+            sandbox=sandbox,
+            workspace_dir=workspace_dir,
+            tracker=bg_tracker,
+            background_timeout_seconds=settings.sandbox_background_command_timeout_seconds,
+        )),
         ("SandboxBashOutputTool", lambda: SandboxBashOutputTool(tracker=bg_tracker)),
         ("SandboxBashKillTool", lambda: SandboxBashKillTool(tracker=bg_tracker)),
         # 沙箱会话笔记工具
