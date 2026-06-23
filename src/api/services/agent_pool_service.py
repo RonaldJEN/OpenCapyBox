@@ -62,6 +62,8 @@ class AgentPoolService:
         self._session_user: dict[str, str] = {}             # chat_session_id → user_id
         self._user_sessions: dict[str, set[str]] = {}       # user_id → {chat_session_id}
         self._agent_sandbox_ids: dict[str, str] = {}        # chat_session_id → sandbox_id
+        self._agent_sandbox_profile_ids: dict[str, str] = {}  # chat_session_id → profile_id
+        self._agent_sandbox_profile_versions: dict[str, int] = {}  # chat_session_id → profile.version
         self._last_renew: dict[str, float] = {}             # user_id → last renew timestamp
         self._create_locks: dict[str, asyncio.Lock] = {}    # chat_session_id → Lock
         self._user_creating: set[str] = set()               # 正在創建 Agent 的 user_id 集合
@@ -146,6 +148,23 @@ class AgentPoolService:
 
         return True, cached_sandbox_id, current_sandbox_id
 
+    def _cached_agent_profile_is_stale(
+        self,
+        *,
+        user_id: str,
+        chat_session_id: str,
+        sandbox_service,
+    ) -> bool:
+        cached_profile_id = self._agent_sandbox_profile_ids.get(chat_session_id)
+        cached_profile_version = self._agent_sandbox_profile_versions.get(chat_session_id)
+        if not cached_profile_id or cached_profile_version is None:
+            return False
+        current_profile_id, current_profile_version = sandbox_service.get_current_profile_fingerprint(user_id)
+        return (
+            cached_profile_id != current_profile_id
+            or cached_profile_version != current_profile_version
+        )
+
     def _cached_agent_needs_rebuild(
         self,
         *,
@@ -162,6 +181,12 @@ class AgentPoolService:
         )
         if chat_session_id in self._invalidated_sessions:
             return True, "marked_invalid", cached_sandbox_id, current_sandbox_id
+        if self._cached_agent_profile_is_stale(
+            user_id=user_id,
+            chat_session_id=chat_session_id,
+            sandbox_service=sandbox_service,
+        ):
+            return True, "profile_stale", cached_sandbox_id, current_sandbox_id
         if stale:
             return True, "sandbox_stale", cached_sandbox_id, current_sandbox_id
         return False, "", cached_sandbox_id, current_sandbox_id
@@ -400,7 +425,7 @@ class AgentPoolService:
             FILE_TYPE_TO_FILENAME,
             MemoryService,
         )
-        from src.api.services.sandbox_service import get_sandbox_mount_path
+        from src.api.services.sandbox_service import get_sandbox_service
 
         with SessionLocal() as db:
             memory_svc = MemoryService(db)
@@ -411,7 +436,7 @@ class AgentPoolService:
         if not records and not agents_template.strip():
             return 0
 
-        mount = get_sandbox_mount_path()
+        mount = get_sandbox_service().get_mount_path(user_id)
         sync_items = []
         for file_type, db_content in records.items():
             if file_type not in DB_BACKED_FILE_TYPES:
@@ -549,7 +574,7 @@ class AgentPoolService:
                     cached_sandbox_id,
                     current_sandbox_id,
                 )
-                if rebuild_reason == "sandbox_stale":
+                if rebuild_reason in {"sandbox_stale", "profile_stale"}:
                     self._invalidate_sandbox_cache_if_stale(
                         sandbox_service=sandbox_service,
                         user_id=user_id,
@@ -603,7 +628,7 @@ class AgentPoolService:
                         cached_sandbox_id,
                         current_sandbox_id,
                     )
-                    if rebuild_reason == "sandbox_stale":
+                    if rebuild_reason in {"sandbox_stale", "profile_stale"}:
                         self._invalidate_sandbox_cache_if_stale(
                             sandbox_service=sandbox_service,
                             user_id=user_id,
@@ -664,6 +689,8 @@ class AgentPoolService:
             self._last_access.pop(chat_session_id, None)
             self._session_user.pop(chat_session_id, None)
             self._agent_sandbox_ids.pop(chat_session_id, None)
+            self._agent_sandbox_profile_ids.pop(chat_session_id, None)
+            self._agent_sandbox_profile_versions.pop(chat_session_id, None)
             if user_id in self._user_sessions:
                 self._user_sessions[user_id].discard(chat_session_id)
                 if not self._user_sessions[user_id]:
@@ -700,8 +727,7 @@ class AgentPoolService:
         history_service = HistoryService(SessionLocal)
 
         # 在沙箱中創建會話工作目錄（bash 的 working_directory 依賴此目錄存在）
-        from src.api.services.sandbox_service import get_sandbox_mount_path
-        session_workspace = f"{get_sandbox_mount_path()}/sessions/{chat_session_id}"
+        session_workspace = f"{sandbox_service.get_mount_path(user_id)}/sessions/{chat_session_id}"
         try:
             await sandbox.commands.run(f"mkdir -p {session_workspace}")
         except Exception as e:
@@ -739,6 +765,22 @@ class AgentPoolService:
             self._agent_sandbox_ids[chat_session_id] = new_sandbox_id
         else:
             self._agent_sandbox_ids.pop(chat_session_id, None)
+        profile_id: str | None = None
+        profile_version: int | None = None
+        get_profile_fingerprint = getattr(sandbox_service, "get_cached_profile_fingerprint", None)
+        if callable(get_profile_fingerprint):
+            try:
+                fingerprint = get_profile_fingerprint(user_id)
+                if isinstance(fingerprint, tuple) and len(fingerprint) == 2:
+                    profile_id, profile_version = fingerprint
+            except Exception:
+                logger.debug("讀取沙箱 profile 快取指紋失敗 (user=%s)", user_id, exc_info=True)
+        if profile_id and profile_version is not None:
+            self._agent_sandbox_profile_ids[chat_session_id] = profile_id
+            self._agent_sandbox_profile_versions[chat_session_id] = profile_version
+        else:
+            self._agent_sandbox_profile_ids.pop(chat_session_id, None)
+            self._agent_sandbox_profile_versions.pop(chat_session_id, None)
         self._touch(chat_session_id)
 
         return agent_service
@@ -746,6 +788,8 @@ class AgentPoolService:
     def _drop_session_metadata(self, chat_session_id: str, *, drop_lock: bool = True) -> None:
         self._last_access.pop(chat_session_id, None)
         self._agent_sandbox_ids.pop(chat_session_id, None)
+        self._agent_sandbox_profile_ids.pop(chat_session_id, None)
+        self._agent_sandbox_profile_versions.pop(chat_session_id, None)
         self._invalidated_sessions.discard(chat_session_id)
 
         if drop_lock:

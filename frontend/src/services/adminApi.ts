@@ -110,6 +110,8 @@ export interface AdminRoundTreeResponse {
   sessions: AdminRoundSessionItem[];
 }
 
+export type AdminSandboxProfileSource = 'explicit' | 'default' | 'missing' | 'disabled';
+
 export interface AdminUserItem {
   user_id: string;
   username: string;
@@ -132,6 +134,13 @@ export interface AdminUserItem {
   last_active_at: string | null;
   last_login_at: string | null;
   last_login_ip: string | null;
+  sandbox_profile_id?: string | null;
+  sandbox_profile_name?: string | null;
+  sandbox_profile_source?: AdminSandboxProfileSource;
+  sandbox_profile_error?: string | null;
+  sandbox_id?: string | null;
+  sandbox_status?: string;
+  sandbox_needs_recreate?: boolean;
   created_by: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -239,6 +248,7 @@ export interface AdminCreateSimpleUserRequest {
   is_admin: boolean;
   token_limit_per_week: number | null;
   token_limit_per_month: number | null;
+  sandbox_profile_id?: string | null;
 }
 
 export interface AdminCreateLdapUserRequest {
@@ -248,6 +258,7 @@ export interface AdminCreateLdapUserRequest {
   is_admin: boolean;
   token_limit_per_week: number | null;
   token_limit_per_month: number | null;
+  sandbox_profile_id?: string | null;
 }
 
 export interface AdminTokenLimitsUpdateRequest {
@@ -273,6 +284,52 @@ export interface AdminAuthUserResponse {
   created_by: string | null;
   created_at: string | null;
   updated_at: string | null;
+}
+
+export interface AdminSandboxProfile {
+  id: string;
+  name: string;
+  description: string | null;
+  department: string | null;
+  domain: string;
+  protocol: 'http' | 'https';
+  api_key_set: boolean;
+  use_server_proxy: boolean;
+  is_default: boolean;
+  enabled: boolean;
+  version: number;
+  bound_users: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AdminSandboxProfilesResponse {
+  profiles: AdminSandboxProfile[];
+}
+
+export interface AdminSandboxProfilePayload {
+  name: string;
+  description: string | null;
+  department: string | null;
+  domain: string;
+  protocol: 'http' | 'https';
+  api_key?: string;
+  use_server_proxy: boolean;
+  enabled?: boolean;
+}
+
+export interface AdminUserSandboxProfileResponse {
+  sandbox_profile_id: string | null;
+  sandbox_profile_name: string | null;
+  sandbox_profile_source: AdminSandboxProfileSource;
+  sandbox_profile_error: string | null;
+  sandbox_id: string | null;
+  sandbox_status: string;
+  sandbox_active_profile_id: string | null;
+  sandbox_active_profile_version: number | null;
+  sandbox_desired_profile_id: string | null;
+  sandbox_desired_profile_version: number | null;
+  sandbox_needs_recreate: boolean;
 }
 
 export async function createAdminSimpleUser(payload: AdminCreateSimpleUserRequest): Promise<AdminAuthUserResponse> {
@@ -310,6 +367,55 @@ export async function resetAdminSimpleUserPassword(userId: string, password: str
 
 export async function deleteAdminUser(userId: string): Promise<AdminDeleteUserResponse> {
   const resp = await client.delete<AdminDeleteUserResponse>(`/admin/users/${encodeURIComponent(userId)}`);
+  return resp.data;
+}
+
+export async function getAdminSandboxProfiles(): Promise<AdminSandboxProfilesResponse> {
+  const resp = await client.get<AdminSandboxProfilesResponse>('/admin/sandbox-profiles');
+  return resp.data;
+}
+
+export async function createAdminSandboxProfile(payload: AdminSandboxProfilePayload): Promise<AdminSandboxProfile> {
+  const resp = await client.post<AdminSandboxProfile>('/admin/sandbox-profiles', payload);
+  return resp.data;
+}
+
+export async function updateAdminSandboxProfile(
+  profileId: string,
+  payload: Partial<AdminSandboxProfilePayload>,
+): Promise<AdminSandboxProfile> {
+  const resp = await client.patch<AdminSandboxProfile>(
+    `/admin/sandbox-profiles/${encodeURIComponent(profileId)}`,
+    payload,
+  );
+  return resp.data;
+}
+
+export async function setAdminSandboxProfileDefault(profileId: string): Promise<AdminSandboxProfile> {
+  const resp = await client.patch<AdminSandboxProfile>(
+    `/admin/sandbox-profiles/${encodeURIComponent(profileId)}/default`,
+    {},
+  );
+  return resp.data;
+}
+
+export async function setAdminSandboxProfileEnabled(profileId: string, enabled: boolean): Promise<AdminSandboxProfile> {
+  const resp = await client.patch<AdminSandboxProfile>(
+    `/admin/sandbox-profiles/${encodeURIComponent(profileId)}/enabled`,
+    { enabled },
+  );
+  return resp.data;
+}
+
+export async function updateAdminUserSandboxProfile(
+  userId: string,
+  sandboxProfileId: string | null,
+  forceRecreate: boolean = false,
+): Promise<AdminUserSandboxProfileResponse> {
+  const resp = await client.patch<AdminUserSandboxProfileResponse>(
+    `/admin/users/${encodeURIComponent(userId)}/sandbox-profile`,
+    { sandbox_profile_id: sandboxProfileId, force_recreate: forceRecreate },
+  );
   return resp.data;
 }
 

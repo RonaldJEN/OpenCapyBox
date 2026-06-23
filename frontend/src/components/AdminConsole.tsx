@@ -16,6 +16,7 @@ import {
   RefreshCw,
   Save,
   Search,
+  Server,
   ShieldCheck,
   Trash2,
   Users,
@@ -25,20 +26,30 @@ import {
 import { apiService } from '../services/api';
 import {
   createAdminLdapUser,
+  createAdminSandboxProfile,
   createAdminSimpleUser,
   deleteAdminUser,
   getAdminLLMCallRecordDetail,
   getAdminOverview,
   getAdminRoundsTree,
+  getAdminSandboxProfiles,
   getAdminSystem,
   getAdminUserLoginEvents,
   getAdminUsers,
   resetAdminSimpleUserPassword,
+  setAdminSandboxProfileDefault,
+  setAdminSandboxProfileEnabled,
+  updateAdminSandboxProfile,
   updateAdminUserAdmin,
   updateAdminUserEnabled,
+  updateAdminUserSandboxProfile,
   updateAdminUserTokenLimits,
   updateAdminLLMCallReview,
   type AdminCreateLdapUserRequest,
+  type AdminSandboxProfileSource,
+  type AdminSandboxProfile,
+  type AdminSandboxProfilePayload,
+  type AdminSandboxProfilesResponse,
   type AdminCreateSimpleUserRequest,
   type AdminOverview,
   type AdminRoundStepItem,
@@ -51,7 +62,7 @@ import {
 } from '../services/adminApi';
 import './AdminConsole.css';
 
-type AdminTab = 'overview' | 'rounds' | 'users' | 'system';
+type AdminTab = 'overview' | 'rounds' | 'users' | 'sandboxes' | 'system';
 type UserCreateMode = 'simple' | 'ldap';
 type UserStatusFilter = 'all' | 'enabled' | 'disabled';
 type UserRoleFilter = 'all' | 'admin' | 'user';
@@ -67,12 +78,14 @@ interface UserCreateFormValues {
   isAdmin: boolean;
   weeklyLimit: string;
   monthlyLimit: string;
+  sandboxProfileId: string;
 }
 
 const NAV_ITEMS: Array<{ id: AdminTab; label: string; icon: ComponentType<{ size?: string | number }> }> = [
   { id: 'overview', label: '概览', icon: LayoutDashboard },
   { id: 'rounds', label: 'Session监控', icon: BarChart3 },
   { id: 'users', label: '用户管理', icon: Users },
+  { id: 'sandboxes', label: '沙箱管理', icon: Server },
   { id: 'system', label: '系统监控', icon: Gauge },
 ];
 
@@ -330,6 +343,25 @@ function statusClass(status: string): string {
   return 'paused';
 }
 
+function sandboxSourceLabel(source?: AdminSandboxProfileSource): string {
+  if (source === 'explicit') return '固定绑定';
+  if (source === 'missing') return '缺失';
+  if (source === 'disabled') return '禁用';
+  return '跟随默认';
+}
+
+function sandboxProfileOptionLabel(profile: AdminSandboxProfile): string {
+  const suffix = profile.is_default ? '（当前默认）' : '';
+  return `${profile.name}${suffix}`;
+}
+
+function assignableSandboxProfiles(
+  profiles: AdminSandboxProfile[],
+  currentProfileId?: string,
+): AdminSandboxProfile[] {
+  return profiles.filter((profile) => !profile.is_default || profile.id === currentProfileId);
+}
+
 function formatLimit(value: number | null): string {
   return value === null ? '不限' : formatNumber(value);
 }
@@ -349,16 +381,25 @@ function userAvatarTone(user: AdminUserItem): string {
 }
 
 function userSearchText(user: AdminUserItem): string {
-  return `${user.user_id} ${user.username} ${user.auth_type} ${user.created_by || ''}`.toLowerCase();
+  return `${user.user_id} ${user.username} ${user.auth_type} ${user.created_by || ''} ${user.sandbox_profile_name || ''} ${user.sandbox_profile_error || ''}`.toLowerCase();
 }
 
 function tokenPercent(used: number, limit: number | null): number {
   return limit === null || limit === 0 ? 0 : Math.min(100, Math.round((used / limit) * 100));
 }
 
-function escapeCsvCell(value: string | number | boolean | null): string {
-  const text = value === null ? '' : String(value);
+function escapeCsvCell(value: string | number | boolean | null | undefined): string {
+  const text = value === null || value === undefined ? '' : String(value);
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function apiErrorStatus(error: unknown): number | undefined {
+  return (error as { response?: { status?: number } })?.response?.status;
+}
+
+function apiErrorDetail(error: unknown): string {
+  const detail = (error as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  return typeof detail === 'string' ? detail : '';
 }
 
 function buildUsersCsv(users: AdminUserItem[]): string {
@@ -377,6 +418,12 @@ function buildUsersCsv(users: AdminUserItem[]): string {
     'monthly_tokens_used',
     'token_limit_per_week',
     'token_limit_per_month',
+    'sandbox_profile_name',
+    'sandbox_profile_source',
+    'sandbox_profile_error',
+    'sandbox_id',
+    'sandbox_status',
+    'sandbox_needs_recreate',
     'last_active_at',
     'last_login_at',
     'last_login_ip',
@@ -396,6 +443,12 @@ function buildUsersCsv(users: AdminUserItem[]): string {
     user.monthly_tokens_used,
     user.token_limit_per_week,
     user.token_limit_per_month,
+    user.sandbox_profile_name,
+    user.sandbox_profile_source,
+    user.sandbox_profile_error,
+    user.sandbox_id,
+    user.sandbox_status,
+    user.sandbox_needs_recreate,
     user.last_active_at,
     user.last_login_at,
     user.last_login_ip,
@@ -426,6 +479,7 @@ export default function AdminConsole() {
   const [overview, setOverview] = useState<AdminOverview | null>(null);
   const [rounds, setRounds] = useState<AdminRoundTreeResponse | null>(null);
   const [users, setUsers] = useState<AdminUsersResponse | null>(null);
+  const [sandboxProfiles, setSandboxProfiles] = useState<AdminSandboxProfilesResponse | null>(null);
   const [systemData, setSystemData] = useState<AdminSystemResponse | null>(null);
 
   const [roundStatus, setRoundStatus] = useState('all');
@@ -439,6 +493,9 @@ export default function AdminConsole() {
   const [userActionError, setUserActionError] = useState('');
   const [userActionMessage, setUserActionMessage] = useState('');
   const [userUpdatingKeys, setUserUpdatingKeys] = useState<Record<string, boolean>>({});
+  const [sandboxActionError, setSandboxActionError] = useState('');
+  const [sandboxActionMessage, setSandboxActionMessage] = useState('');
+  const [sandboxUpdatingKeys, setSandboxUpdatingKeys] = useState<Record<string, boolean>>({});
   const currentUser = useMemo(() => apiService.getUserId() || '-', []);
 
   const handleLogout = () => {
@@ -560,23 +617,64 @@ export default function AdminConsole() {
 
   const runUserAction = useCallback(async (
     busyKey: string,
-    action: () => Promise<void>,
+    action: () => Promise<void | boolean>,
     successMessage: string,
   ): Promise<boolean> => {
     setUserActionError('');
     setUserActionMessage('');
     setUserUpdatingKeys((prev) => ({ ...prev, [busyKey]: true }));
     try {
-      await action();
-      setUsers(await getAdminUsers());
+      const result = await action();
+      if (result === false) {
+        return false;
+      }
+      try {
+        setUsers(await getAdminUsers());
+      } catch (refreshErr) {
+        console.error('Admin user action succeeded but user list refresh failed:', refreshErr);
+        setUserActionError(`${successMessage}，但用户列表刷新失败，请手动刷新`);
+        return true;
+      }
       setUserActionMessage(successMessage);
       return true;
     } catch (err) {
       console.error('Failed to update admin user:', err);
-      setUserActionError('用户操作失败，请稍后重试');
+      setUserActionError(apiErrorDetail(err) || '用户操作失败，请稍后重试');
       return false;
     } finally {
       setUserUpdatingKeys((prev) => {
+        const next = { ...prev };
+        delete next[busyKey];
+        return next;
+      });
+    }
+  }, []);
+
+  const runSandboxAction = useCallback(async (
+    busyKey: string,
+    action: () => Promise<void>,
+    successMessage: string,
+  ): Promise<boolean> => {
+    setSandboxActionError('');
+    setSandboxActionMessage('');
+    setSandboxUpdatingKeys((prev) => ({ ...prev, [busyKey]: true }));
+    try {
+      await action();
+      try {
+        setSandboxProfiles(await getAdminSandboxProfiles());
+      } catch (refreshErr) {
+        console.error('Sandbox action succeeded but profile list refresh failed:', refreshErr);
+        setSandboxActionError(`${successMessage}，但沙箱后端列表刷新失败，请手动刷新`);
+        return true;
+      }
+      setSandboxActionMessage(successMessage);
+      return true;
+    } catch (err) {
+      console.error('Failed to update sandbox profiles:', err);
+      setSandboxActionError(apiErrorDetail(err) || '沙箱配置操作失败，请稍后重试');
+      return false;
+    } finally {
+      setSandboxUpdatingKeys((prev) => {
         const next = { ...prev };
         delete next[busyKey];
         return next;
@@ -592,6 +690,14 @@ export default function AdminConsole() {
     return () => window.clearTimeout(timer);
   }, [userActionMessage]);
 
+  useEffect(() => {
+    if (!sandboxActionMessage) return;
+    const timer = window.setTimeout(() => {
+      setSandboxActionMessage('');
+    }, 2400);
+    return () => window.clearTimeout(timer);
+  }, [sandboxActionMessage]);
+
   const handleCreateUser = useCallback(async (values: UserCreateFormValues) => {
     return runUserAction('create-user', async () => {
       if (values.authType === 'simple') {
@@ -602,6 +708,7 @@ export default function AdminConsole() {
           is_admin: values.isAdmin,
           token_limit_per_week: parseLimitInput(values.weeklyLimit),
           token_limit_per_month: parseLimitInput(values.monthlyLimit),
+          sandbox_profile_id: values.sandboxProfileId || null,
         };
         await createAdminSimpleUser(payload);
       } else {
@@ -612,6 +719,7 @@ export default function AdminConsole() {
           is_admin: values.isAdmin,
           token_limit_per_week: parseLimitInput(values.weeklyLimit),
           token_limit_per_month: parseLimitInput(values.monthlyLimit),
+          sandbox_profile_id: values.sandboxProfileId || null,
         };
         await createAdminLdapUser(payload);
       }
@@ -655,6 +763,86 @@ export default function AdminConsole() {
     }, '用户已删除');
   }, [currentUser, runUserAction]);
 
+  const handleUpdateUserSandboxProfile = useCallback(async (
+    user: AdminUserItem,
+    sandboxProfileId: string | null,
+    forceRecreate: boolean,
+  ) => {
+    if (forceRecreate) {
+      const confirmed = window.confirm(
+        `确认失效用户 ${user.user_id} 当前 Agent/Sandbox，并在下次使用时按当前沙箱后端配置创建新 sandbox？`,
+      );
+      if (!confirmed) return;
+    }
+    await runUserAction(`sandbox-${user.user_id}`, async () => {
+      try {
+        await updateAdminUserSandboxProfile(user.user_id, sandboxProfileId, forceRecreate);
+      } catch (err) {
+        if (!forceRecreate && apiErrorStatus(err) === 409) {
+          const detail = apiErrorDetail(err) || '用户当前可能有正在运行的任务。';
+          const confirmed = window.confirm(`${detail}\n\n是否强制失效该用户当前 Agent/Sandbox 并切换沙箱后端？`);
+          if (!confirmed) return false;
+          await updateAdminUserSandboxProfile(user.user_id, sandboxProfileId, true);
+        } else {
+          throw err;
+        }
+      }
+      try {
+        setSandboxProfiles(await getAdminSandboxProfiles());
+      } catch (refreshErr) {
+        console.error('User sandbox profile updated but profile list refresh failed:', refreshErr);
+        setUserActionError('用户沙箱后端已更新，但沙箱后端列表刷新失败，请手动刷新');
+      }
+    }, '用户沙箱后端已更新');
+  }, [runUserAction]);
+
+  const handleSaveSandboxProfile = useCallback(async (
+    profileId: string | null,
+    payload: AdminSandboxProfilePayload,
+  ) => {
+    const successMessage = profileId ? '沙箱后端已更新' : '沙箱后端已创建';
+    return runSandboxAction(profileId ? `profile-${profileId}` : 'profile-create', async () => {
+      if (profileId) {
+        await updateAdminSandboxProfile(profileId, payload);
+      } else {
+        await createAdminSandboxProfile(payload);
+      }
+      try {
+        setUsers(await getAdminUsers());
+      } catch (refreshErr) {
+        console.error('Sandbox profile saved but user list refresh failed:', refreshErr);
+        setSandboxActionError(`${successMessage}，但用户列表刷新失败，请手动刷新`);
+      }
+    }, successMessage);
+  }, [runSandboxAction]);
+
+  const handleSetSandboxProfileDefault = useCallback(async (profile: AdminSandboxProfile) => {
+    if (profile.is_default) return;
+    const successMessage = '默认沙箱后端已更新';
+    await runSandboxAction(`default-${profile.id}`, async () => {
+      await setAdminSandboxProfileDefault(profile.id);
+      try {
+        setUsers(await getAdminUsers());
+      } catch (refreshErr) {
+        console.error('Default sandbox profile updated but user list refresh failed:', refreshErr);
+        setSandboxActionError(`${successMessage}，但用户列表刷新失败，请手动刷新`);
+      }
+    }, successMessage);
+  }, [runSandboxAction]);
+
+  const handleToggleSandboxProfileEnabled = useCallback(async (profile: AdminSandboxProfile) => {
+    const successMessage = profile.enabled ? '沙箱后端已禁用' : '沙箱后端已启用';
+    await runSandboxAction(`enabled-${profile.id}`, async () => {
+      await setAdminSandboxProfileEnabled(profile.id, !profile.enabled);
+      try {
+        setUsers(await getAdminUsers());
+      } catch (refreshErr) {
+        console.error('Sandbox profile enabled state updated but user list refresh failed:', refreshErr);
+        setSandboxActionError(`${successMessage}，但用户列表刷新失败，请手动刷新`);
+      }
+    }, successMessage);
+  }, [runSandboxAction]);
+
   const refreshActiveTab = useCallback(async () => {
     setLoading(true);
     setError('');
@@ -671,7 +859,20 @@ export default function AdminConsole() {
         }));
       }
       if (activeTab === 'users') {
-        setUsers(await getAdminUsers());
+        const [usersData, profilesData] = await Promise.all([
+          getAdminUsers(),
+          getAdminSandboxProfiles(),
+        ]);
+        setUsers(usersData);
+        setSandboxProfiles(profilesData);
+      }
+      if (activeTab === 'sandboxes') {
+        const [profilesData, usersData] = await Promise.all([
+          getAdminSandboxProfiles(),
+          getAdminUsers(),
+        ]);
+        setSandboxProfiles(profilesData);
+        setUsers(usersData);
       }
       if (activeTab === 'system') {
         setSystemData(await getAdminSystem(24));
@@ -793,6 +994,7 @@ export default function AdminConsole() {
           {!loading && !error && activeTab === 'users' ? (
             <UsersPanel
               data={users}
+              sandboxProfiles={sandboxProfiles?.profiles || []}
               actionError={userActionError}
               actionMessage={userActionMessage}
               updatingKeys={userUpdatingKeys}
@@ -802,7 +1004,20 @@ export default function AdminConsole() {
               onUpdateTokenLimits={handleUpdateTokenLimits}
               onResetPassword={handleResetPassword}
               onDeleteUser={handleDeleteUser}
+              onUpdateSandboxProfile={handleUpdateUserSandboxProfile}
               currentUserId={currentUser}
+            />
+          ) : null}
+
+          {!loading && !error && activeTab === 'sandboxes' ? (
+            <SandboxesPanel
+              data={sandboxProfiles}
+              actionError={sandboxActionError}
+              actionMessage={sandboxActionMessage}
+              updatingKeys={sandboxUpdatingKeys}
+              onSaveProfile={handleSaveSandboxProfile}
+              onSetDefault={handleSetSandboxProfileDefault}
+              onToggleEnabled={handleToggleSandboxProfileEnabled}
             />
           ) : null}
 
@@ -1257,6 +1472,7 @@ function RoundsPanel({
 
 function UsersPanel({
   data,
+  sandboxProfiles,
   actionError,
   actionMessage,
   updatingKeys,
@@ -1266,9 +1482,11 @@ function UsersPanel({
   onUpdateTokenLimits,
   onResetPassword,
   onDeleteUser,
+  onUpdateSandboxProfile,
   currentUserId,
 }: {
   data: AdminUsersResponse | null;
+  sandboxProfiles: AdminSandboxProfile[];
   actionError: string;
   actionMessage: string;
   updatingKeys: Record<string, boolean>;
@@ -1278,6 +1496,7 @@ function UsersPanel({
   onUpdateTokenLimits: (userId: string, payload: AdminTokenLimitsUpdateRequest) => Promise<void>;
   onResetPassword: (userId: string, password: string) => Promise<void>;
   onDeleteUser: (user: AdminUserItem) => Promise<void>;
+  onUpdateSandboxProfile: (user: AdminUserItem, sandboxProfileId: string | null, forceRecreate: boolean) => Promise<void>;
   currentUserId: string;
 }) {
   const defaultCreateForm: UserCreateFormValues = {
@@ -1289,6 +1508,7 @@ function UsersPanel({
     isAdmin: false,
     weeklyLimit: '',
     monthlyLimit: '',
+    sandboxProfileId: '',
   };
   const [createForm, setCreateForm] = useState<UserCreateFormValues>({
     ...defaultCreateForm,
@@ -1296,6 +1516,7 @@ function UsersPanel({
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [tokenDrafts, setTokenDrafts] = useState<Record<string, { weeklyLimit: string; monthlyLimit: string }>>({});
   const [roleDrafts, setRoleDrafts] = useState<Record<string, 'admin' | 'user'>>({});
+  const [sandboxDrafts, setSandboxDrafts] = useState<Record<string, string>>({});
   const [passwordDrafts, setPasswordDrafts] = useState<Record<string, string>>({});
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<UserStatusFilter>('all');
@@ -1311,18 +1532,25 @@ function UsersPanel({
   useEffect(() => {
     const nextDrafts: Record<string, { weeklyLimit: string; monthlyLimit: string }> = {};
     const nextRoleDrafts: Record<string, 'admin' | 'user'> = {};
+    const nextSandboxDrafts: Record<string, string> = {};
     for (const user of data?.users || []) {
       nextDrafts[user.user_id] = {
         weeklyLimit: user.token_limit_per_week === null ? '' : String(user.token_limit_per_week),
         monthlyLimit: user.token_limit_per_month === null ? '' : String(user.token_limit_per_month),
       };
       nextRoleDrafts[user.user_id] = user.is_admin ? 'admin' : 'user';
+      nextSandboxDrafts[user.user_id] = user.sandbox_profile_id || '';
     }
     setTokenDrafts(nextDrafts);
     setRoleDrafts(nextRoleDrafts);
+    setSandboxDrafts(nextSandboxDrafts);
   }, [data]);
 
-  const users = data?.users || [];
+  const users = useMemo(() => data?.users || [], [data]);
+  const createSandboxProfiles = useMemo(
+    () => assignableSandboxProfiles(sandboxProfiles),
+    [sandboxProfiles],
+  );
   const ldapCount = users.filter((user) => user.auth_type === 'ldap').length;
   const simpleCount = users.filter((user) => user.auth_type === 'simple').length;
   const visibleUsers = useMemo(() => {
@@ -1471,6 +1699,7 @@ function UsersPanel({
               <col className="admin-users-col-user" />
               <col className="admin-users-col-status" />
               <col className="admin-users-col-role" />
+              <col className="admin-users-col-sandbox" />
               <col className="admin-users-col-token" />
               <col className="admin-users-col-runtime" />
               <col className="admin-users-col-recent" />
@@ -1481,6 +1710,7 @@ function UsersPanel({
                 <th>用户</th>
                 <th>状态</th>
                 <th>权限</th>
+                <th>沙箱后端</th>
                 <th>Token 用量与限额</th>
                 <th>运行指标</th>
                 <th>最近活动</th>
@@ -1492,6 +1722,8 @@ function UsersPanel({
                 const draft = tokenDrafts[item.user_id] || { weeklyLimit: '', monthlyLimit: '' };
                 const roleDraft = roleDrafts[item.user_id] || (item.is_admin ? 'admin' : 'user');
                 const currentRole = item.is_admin ? 'admin' : 'user';
+                const sandboxDraft = sandboxDrafts[item.user_id] ?? (item.sandbox_profile_id || '');
+                const rowSandboxProfiles = assignableSandboxProfiles(sandboxProfiles, sandboxDraft || undefined);
                 const passwordDraft = passwordDrafts[item.user_id] || '';
                 const isCurrentUser = item.user_id === currentUserId;
                 return (
@@ -1546,6 +1778,72 @@ function UsersPanel({
                         >
                           <Save size={14} />
                         </button>
+                      </div>
+                    </td>
+                    <td>
+                      <div className="admin-sandbox-cell">
+                        <div className="admin-role-editor">
+                          <select
+                            className="admin-select admin-role-select"
+                            aria-label={`${item.user_id} 沙箱后端`}
+                            value={sandboxDraft}
+                            disabled={!!updatingKeys[`sandbox-${item.user_id}`]}
+                            onChange={(event) => {
+                              setSandboxDrafts((prev) => ({
+                                ...prev,
+                                [item.user_id]: event.target.value,
+                              }));
+                            }}
+                          >
+                            <option value="">跟随全局默认</option>
+                            {item.sandbox_profile_source === 'missing' && item.sandbox_profile_id ? (
+                              <option value={item.sandbox_profile_id}>已删除：{item.sandbox_profile_id}</option>
+                            ) : null}
+                            {rowSandboxProfiles.map((profile) => (
+                              <option key={profile.id} value={profile.id} disabled={!profile.enabled}>
+                                {sandboxProfileOptionLabel(profile)}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            className="admin-button admin-icon-button admin-icon-only-button"
+                            aria-label={`保存 ${item.user_id} 沙箱后端`}
+                            title="保存沙箱后端"
+                            disabled={(sandboxDraft || '') === (item.sandbox_profile_id || '') || !!updatingKeys[`sandbox-${item.user_id}`]}
+                            onClick={() => {
+                              void onUpdateSandboxProfile(item, sandboxDraft || null, false);
+                            }}
+                          >
+                            <Save size={14} />
+                          </button>
+                        </div>
+                        <div className="admin-token-stack">
+                          <span>
+                            {item.sandbox_profile_name || (item.sandbox_profile_source === 'missing' ? '已删除沙箱后端' : '默认沙箱')}
+                            {' · '}
+                            {sandboxSourceLabel(item.sandbox_profile_source)}
+                          </span>
+                          <span>ID {item.sandbox_id || '-'}</span>
+                          {item.sandbox_profile_error ? (
+                            <span className="admin-status error">{item.sandbox_profile_error}</span>
+                          ) : null}
+                          <span className={`admin-status ${item.sandbox_profile_error ? 'error' : item.sandbox_needs_recreate ? 'paused' : statusClass(item.sandbox_status || 'none')}`}>
+                            {item.sandbox_profile_error ? '配置异常' : item.sandbox_needs_recreate ? '需重建' : (item.sandbox_status || 'none')}
+                          </span>
+                          {item.sandbox_needs_recreate && !item.sandbox_profile_error ? (
+                            <button
+                              className="admin-button admin-icon-button admin-sandbox-apply-button"
+                              type="button"
+                              disabled={!!updatingKeys[`sandbox-${item.user_id}`]}
+                              onClick={() => {
+                                void onUpdateSandboxProfile(item, item.sandbox_profile_id || null, true);
+                              }}
+                            >
+                              <RefreshCw size={13} />
+                              应用新配置
+                            </button>
+                          ) : null}
+                        </div>
                       </div>
                     </td>
                     <td>
@@ -1769,6 +2067,23 @@ function UsersPanel({
                 </label>
               ) : null}
 
+              <label className="admin-field">
+                <span>沙箱后端</span>
+                <select
+                  className="admin-select"
+                  aria-label="沙箱后端"
+                  value={createForm.sandboxProfileId}
+                  onChange={(event) => updateCreateField('sandboxProfileId', event.target.value)}
+                >
+                  <option value="">跟随全局默认沙箱</option>
+                  {createSandboxProfiles.map((profile) => (
+                    <option key={profile.id} value={profile.id} disabled={!profile.enabled}>
+                      {sandboxProfileOptionLabel(profile)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
               <div className="admin-drawer-section">
                 <div className="admin-drawer-section-title">权限</div>
                 <div className="admin-role-card-grid">
@@ -1912,6 +2227,262 @@ function TokenUsageBar({ label, used, limit }: { label: string; used: number; li
         <span style={{ width: `${percent}%` }} />
       </div>
     </div>
+  );
+}
+
+interface SandboxProfileFormValues {
+  name: string;
+  description: string;
+  department: string;
+  domain: string;
+  protocol: 'http' | 'https';
+  apiKey: string;
+  useServerProxy: boolean;
+  enabled: boolean;
+}
+
+function defaultSandboxProfileForm(): SandboxProfileFormValues {
+  return {
+    name: '',
+    description: '',
+    department: '',
+    domain: '',
+    protocol: 'http',
+    apiKey: '',
+    useServerProxy: true,
+    enabled: true,
+  };
+}
+
+function formFromSandboxProfile(profile: AdminSandboxProfile): SandboxProfileFormValues {
+  return {
+    name: profile.name,
+    description: profile.description || '',
+    department: profile.department || '',
+    domain: profile.domain,
+    protocol: profile.protocol,
+    apiKey: '',
+    useServerProxy: profile.use_server_proxy,
+    enabled: profile.enabled,
+  };
+}
+
+function payloadFromSandboxProfileForm(
+  form: SandboxProfileFormValues,
+  editing: boolean,
+): AdminSandboxProfilePayload {
+  const payload: AdminSandboxProfilePayload = {
+    name: form.name.trim(),
+    description: form.description.trim() || null,
+    department: form.department.trim() || null,
+    domain: form.domain.trim(),
+    protocol: form.protocol,
+    use_server_proxy: form.useServerProxy,
+  };
+  const apiKey = form.apiKey.trim();
+  if (!editing) {
+    payload.enabled = form.enabled;
+    payload.api_key = apiKey;
+  } else if (apiKey) {
+    payload.api_key = apiKey;
+  }
+  return payload;
+}
+
+function SandboxesPanel({
+  data,
+  actionError,
+  actionMessage,
+  updatingKeys,
+  onSaveProfile,
+  onSetDefault,
+  onToggleEnabled,
+}: {
+  data: AdminSandboxProfilesResponse | null;
+  actionError: string;
+  actionMessage: string;
+  updatingKeys: Record<string, boolean>;
+  onSaveProfile: (profileId: string | null, payload: AdminSandboxProfilePayload) => Promise<boolean>;
+  onSetDefault: (profile: AdminSandboxProfile) => Promise<void>;
+  onToggleEnabled: (profile: AdminSandboxProfile) => Promise<void>;
+}) {
+  const profiles = data?.profiles || [];
+  const [editingProfileId, setEditingProfileId] = useState<string | null>(null);
+  const [form, setForm] = useState<SandboxProfileFormValues>(() => defaultSandboxProfileForm());
+
+  const updateForm = <Key extends keyof SandboxProfileFormValues>(key: Key, value: SandboxProfileFormValues[Key]) => {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleEdit = (profile: AdminSandboxProfile) => {
+    setEditingProfileId(profile.id);
+    setForm(formFromSandboxProfile(profile));
+  };
+
+  const handleReset = () => {
+    setEditingProfileId(null);
+    setForm(defaultSandboxProfileForm());
+  };
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const saved = await onSaveProfile(
+      editingProfileId,
+      payloadFromSandboxProfileForm(form, Boolean(editingProfileId)),
+    );
+    if (saved) handleReset();
+  };
+
+  const enabledCount = profiles.filter((profile) => profile.enabled).length;
+
+  return (
+    <>
+      <div className="admin-grid-3">
+        <MetricCard label="沙箱后端" value={formatNumber(profiles.length)} hint={`${enabledCount} 个启用`} />
+        <MetricCard label="默认后端" value={profiles.find((profile) => profile.is_default)?.name || '-'} />
+        <MetricCard label="需关注" value={formatNumber(profiles.filter((profile) => !profile.enabled).length)} hint="已禁用后端" />
+      </div>
+
+      {actionError ? <div className="admin-error admin-inline-message">{actionError}</div> : null}
+      {actionMessage ? <div className="admin-toast" role="status">{actionMessage}</div> : null}
+
+      <div className="admin-card">
+        <div className="admin-card-header">
+          <div>
+            <h3 className="admin-card-header-title">{editingProfileId ? '编辑沙箱后端' : '注册沙箱后端'}</h3>
+            <div className="admin-card-header-sub">保存连接信息会使绑定用户的旧 sandbox 在下次使用时重建</div>
+          </div>
+          {editingProfileId ? (
+            <button className="admin-button" type="button" onClick={handleReset}>
+              取消编辑
+            </button>
+          ) : null}
+        </div>
+        <form className="admin-sandbox-form" onSubmit={handleSubmit}>
+          <label className="admin-field">
+            <span>名称</span>
+            <input className="admin-input" value={form.name} onChange={(event) => updateForm('name', event.target.value)} required />
+          </label>
+          <label className="admin-field">
+            <span>部门</span>
+            <input className="admin-input" value={form.department} onChange={(event) => updateForm('department', event.target.value)} placeholder="交易 / 投研 / IT" />
+          </label>
+          <label className="admin-field">
+            <span>Domain</span>
+            <input className="admin-input" value={form.domain} onChange={(event) => updateForm('domain', event.target.value)} placeholder="10.0.0.10:8080" required />
+          </label>
+          <label className="admin-field">
+            <span>协议</span>
+            <select className="admin-select" value={form.protocol} onChange={(event) => updateForm('protocol', event.target.value as 'http' | 'https')}>
+              <option value="http">http</option>
+              <option value="https">https</option>
+            </select>
+          </label>
+          <label className="admin-field">
+            <span>API Key</span>
+            <input className="admin-input" value={form.apiKey} onChange={(event) => updateForm('apiKey', event.target.value)} placeholder={editingProfileId ? '留空保持不变' : '必填'} required={!editingProfileId} />
+          </label>
+          <label className="admin-checkbox-field">
+            <input type="checkbox" checked={form.useServerProxy} onChange={(event) => updateForm('useServerProxy', event.target.checked)} />
+            Server Proxy
+          </label>
+          {!editingProfileId ? (
+            <label className="admin-checkbox-field">
+              <input type="checkbox" checked={form.enabled} onChange={(event) => updateForm('enabled', event.target.checked)} />
+              启用
+            </label>
+          ) : null}
+          <label className="admin-field admin-sandbox-description-field">
+            <span>备注</span>
+            <input className="admin-input" value={form.description} onChange={(event) => updateForm('description', event.target.value)} />
+          </label>
+          <button className="admin-button admin-primary-button" type="submit" disabled={!!updatingKeys[editingProfileId ? `profile-${editingProfileId}` : 'profile-create']}>
+            <Save size={14} />
+            {editingProfileId ? '保存后端' : '创建后端'}
+          </button>
+        </form>
+      </div>
+
+      <div className="admin-card">
+        <div className="admin-card-header">
+          <div>
+            <h3 className="admin-card-header-title">沙箱后端列表</h3>
+            <div className="admin-card-header-sub">状态来自数据库配置，不实时查询 OpenSandbox</div>
+          </div>
+        </div>
+        <div className="admin-table-wrap">
+          <table className="admin-table admin-sandbox-table">
+            <thead>
+              <tr>
+                <th>后端</th>
+                <th>连接</th>
+                <th>绑定</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {profiles.map((profile) => (
+                <tr key={profile.id}>
+                  <td>
+                    <strong>{profile.name}</strong>
+                    <div className="admin-subline">{profile.department || '-'} · v{profile.version}</div>
+                  </td>
+                  <td>
+                    <div className="admin-token-stack">
+                      <span>{profile.protocol}://{profile.domain}</span>
+                      <span>API Key {profile.api_key_set ? '已设置' : '未设置'}</span>
+                      <span>{profile.use_server_proxy ? 'Server Proxy' : 'Direct'}</span>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="admin-runtime-grid">
+                      <span><b>{profile.bound_users}</b> 绑定用户</span>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="admin-token-stack">
+                      <span className={`admin-status ${profile.enabled ? 'ok' : 'disabled'}`}>{profile.enabled ? '启用' : '禁用'}</span>
+                      {profile.is_default ? <span className="admin-status admin">默认</span> : null}
+                    </div>
+                  </td>
+                  <td>
+                    <div className="admin-row-actions">
+                      <button className="admin-button admin-icon-button" type="button" onClick={() => handleEdit(profile)}>
+                        编辑
+                      </button>
+                      <button
+                        className="admin-button admin-icon-button"
+                        type="button"
+                        disabled={profile.is_default || !profile.enabled || !!updatingKeys[`default-${profile.id}`]}
+                        onClick={() => { void onSetDefault(profile); }}
+                      >
+                        设为默认
+                      </button>
+                      <button
+                        className={`admin-button admin-icon-button ${profile.enabled ? '' : 'admin-danger-button'}`}
+                        type="button"
+                        disabled={(profile.is_default && profile.enabled) || !!updatingKeys[`enabled-${profile.id}`]}
+                        onClick={() => { void onToggleEnabled(profile); }}
+                      >
+                        {profile.enabled ? '禁用' : '启用'}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {profiles.length === 0 ? (
+                <tr>
+                  <td colSpan={5}>
+                    <div className="admin-loading">暂无沙箱后端</div>
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
   );
 }
 

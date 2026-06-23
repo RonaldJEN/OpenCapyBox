@@ -7,12 +7,14 @@
 - 系统监控
 """
 
+import logging
 from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.config import get_settings
@@ -20,10 +22,12 @@ from src.api.deps import get_current_admin_user
 from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
 from src.api.models.database import get_db
+from src.api.models.sandbox_profile import SandboxProfile
 from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.cron_job import CronJob
 from src.api.models.user_sandbox import UserSandbox
+from src.api.models.user_sandbox_config import UserSandboxConfig
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_memory import CronJobRun
 from src.api.models.llm_call_record import LLMCallRecord
@@ -40,9 +44,18 @@ from src.api.services.auth_service import (
     update_user_token_limits,
 )
 from src.api.services.sandbox_service import SandboxSessionService
+from src.api.services.sandbox_profile_service import (
+    RUNTIME_RECREATE_FIELDS,
+    assign_user_sandbox_profile,
+    ensure_default_sandbox_profile,
+    get_user_sandbox_config_payload,
+    sandbox_profile_to_payload,
+    set_default_sandbox_profile,
+)
 from src.api.utils.timezone import now_naive
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class ManualReviewUpdatePayload(BaseModel):
@@ -56,6 +69,7 @@ class AdminCreateSimpleUserPayload(BaseModel):
     is_admin: bool = False
     token_limit_per_week: int | None = Field(default=None, ge=0)
     token_limit_per_month: int | None = Field(default=None, ge=0)
+    sandbox_profile_id: str | None = Field(default=None, max_length=36)
 
     @field_validator("username", mode="before")
     @classmethod
@@ -77,6 +91,7 @@ class AdminCreateLdapUserPayload(BaseModel):
     is_admin: bool = False
     token_limit_per_week: int | None = Field(default=None, ge=0)
     token_limit_per_month: int | None = Field(default=None, ge=0)
+    sandbox_profile_id: str | None = Field(default=None, max_length=36)
 
     @field_validator("user_id", "username", mode="before")
     @classmethod
@@ -95,6 +110,60 @@ class AdminFlagUpdatePayload(BaseModel):
 class AdminTokenLimitsUpdatePayload(BaseModel):
     token_limit_per_week: int | None = Field(default=None, ge=0)
     token_limit_per_month: int | None = Field(default=None, ge=0)
+
+
+class AdminSandboxProfilePayload(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str | None = None
+    department: str | None = Field(default=None, max_length=100)
+    domain: str = Field(..., min_length=1, max_length=255)
+    protocol: str = Field(default="http", pattern="^(http|https)$")
+    api_key: str = Field(..., min_length=1)
+    use_server_proxy: bool = True
+    enabled: bool = True
+
+    @field_validator("name", "domain", "protocol", "api_key", mode="before")
+    @classmethod
+    def _strip_required_strings(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("description", "department", mode="before")
+    @classmethod
+    def _strip_optional_strings(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+class AdminSandboxProfilePatchPayload(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = None
+    department: str | None = Field(default=None, max_length=100)
+    domain: str | None = Field(default=None, min_length=1, max_length=255)
+    protocol: str | None = Field(default=None, pattern="^(http|https)$")
+    api_key: str | None = None
+    use_server_proxy: bool | None = None
+
+    @field_validator("name", "domain", "protocol", mode="before")
+    @classmethod
+    def _strip_required_strings(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("description", "department", "api_key", mode="before")
+    @classmethod
+    def _strip_optional_strings(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+class AdminSandboxProfileEnabledPayload(BaseModel):
+    enabled: bool
+
+
+class AdminUserSandboxProfilePayload(BaseModel):
+    sandbox_profile_id: str | None = Field(default=None, max_length=36)
+    force_recreate: bool = False
 
 
 class AdminResetPasswordPayload(BaseModel):
@@ -122,6 +191,194 @@ def _auth_login_event_to_payload(event: AuthLoginEvent) -> dict[str, Any]:
         "user_agent": event.user_agent,
         "login_at": _iso(event.login_at),
     }
+
+
+def _sandbox_profile_bound_counts(db: DBSession) -> dict[str, int]:
+    profiles = db.query(SandboxProfile).all()
+    total_users = int(db.query(func.count(AuthUser.id)).scalar() or 0)
+    explicit_rows = (
+        db.query(UserSandboxConfig.sandbox_profile_id, func.count(UserSandboxConfig.user_id))
+        .filter(UserSandboxConfig.sandbox_profile_id.isnot(None))
+        .group_by(UserSandboxConfig.sandbox_profile_id)
+        .all()
+    )
+    explicit_counts = {row[0]: int(row[1]) for row in explicit_rows if row[0]}
+    explicit_total = sum(explicit_counts.values())
+    counts = {profile.id: explicit_counts.get(profile.id, 0) for profile in profiles}
+    default_profile = next((profile for profile in profiles if profile.is_default), None)
+    if default_profile:
+        counts[default_profile.id] = counts.get(default_profile.id, 0) + max(total_users - explicit_total, 0)
+    return counts
+
+
+def _profile_or_404(db: DBSession, profile_id: str) -> SandboxProfile:
+    profile = db.query(SandboxProfile).filter(SandboxProfile.id == profile_id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="沙箱后端不存在")
+    return profile
+
+
+def _ensure_profile_assignable(db: DBSession, profile_id: str) -> SandboxProfile:
+    profile = _profile_or_404(db, profile_id)
+    if not profile.enabled:
+        raise HTTPException(status_code=400, detail="禁用的沙箱后端不能分配")
+    return profile
+
+
+def _runtime_field_changed(profile: SandboxProfile, field_name: str, next_value) -> bool:
+    current_value = getattr(profile, field_name)
+    return current_value != next_value
+
+
+def _sandbox_profile_list_payload(db: DBSession) -> dict[str, Any]:
+    counts = _sandbox_profile_bound_counts(db)
+    profiles = db.query(SandboxProfile).order_by(SandboxProfile.is_default.desc(), SandboxProfile.name.asc()).all()
+    return {
+        "profiles": [
+            sandbox_profile_to_payload(profile, bound_users=counts.get(profile.id, 0))
+            for profile in profiles
+        ],
+    }
+
+
+def _create_sandbox_profile(db: DBSession, payload: AdminSandboxProfilePayload) -> SandboxProfile:
+    import uuid
+
+    profile = SandboxProfile(
+        id=str(uuid.uuid4()),
+        name=payload.name,
+        description=payload.description,
+        department=payload.department,
+        domain=payload.domain,
+        protocol=payload.protocol,
+        api_key=payload.api_key,
+        use_server_proxy=payload.use_server_proxy,
+        enabled=payload.enabled,
+        is_default=False,
+        version=1,
+    )
+    db.add(profile)
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="沙箱后端名称已存在") from e
+    db.refresh(profile)
+    return profile
+
+
+def _update_sandbox_profile(
+    db: DBSession,
+    profile_id: str,
+    payload: AdminSandboxProfilePatchPayload,
+) -> SandboxProfile:
+    profile = _profile_or_404(db, profile_id)
+    data = payload.model_dump(exclude_unset=True)
+    if data.get("api_key") is None:
+        data.pop("api_key", None)
+    runtime_changed = False
+    for field_name, value in data.items():
+        if field_name in RUNTIME_RECREATE_FIELDS and _runtime_field_changed(profile, field_name, value):
+            runtime_changed = True
+        setattr(profile, field_name, value)
+    if runtime_changed:
+        profile.version = int(profile.version or 1) + 1
+    profile.updated_at = now_naive()
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="沙箱后端名称已存在") from e
+    db.refresh(profile)
+    return profile
+
+
+def _set_sandbox_profile_enabled(
+    db: DBSession,
+    profile_id: str,
+    enabled: bool,
+) -> SandboxProfile:
+    profile = _profile_or_404(db, profile_id)
+    if profile.is_default and not enabled:
+        raise HTTPException(status_code=400, detail="默认沙箱后端不能禁用")
+    profile.enabled = enabled
+    profile.updated_at = now_naive()
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+def _user_has_running_work(db: DBSession, user_id: str) -> bool:
+    lock_cutoff = now_naive() - timedelta(seconds=get_settings().sse_subscribe_timeout)
+    active_lock = (
+        db.query(UserRunLock)
+        .filter(UserRunLock.user_id == user_id, UserRunLock.updated_at >= lock_cutoff)
+        .first()
+    )
+    if active_lock:
+        return True
+    running_cron = (
+        db.query(CronJobRun)
+        .filter(CronJobRun.user_id == user_id, CronJobRun.status == "running")
+        .first()
+    )
+    return running_cron is not None
+
+
+def _normalize_profile_assignment(db: DBSession, profile_id: str | None) -> str | None:
+    if isinstance(profile_id, str):
+        profile_id = profile_id.strip()
+    if not profile_id:
+        return None
+    profile = _ensure_profile_assignable(db, profile_id)
+    return None if profile.is_default else profile.id
+
+
+def _get_user_assigned_profile_id(db: DBSession, user_id: str) -> str | None:
+    config = db.query(UserSandboxConfig).filter(UserSandboxConfig.user_id == user_id).first()
+    return config.sandbox_profile_id if config and config.sandbox_profile_id else None
+
+
+def _user_sandbox_profile_stale(db: DBSession, *, user_id: str, desired_profile_id: str | None) -> bool:
+    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+    if not user_sandbox or not user_sandbox.sandbox_id:
+        return False
+
+    profile = (
+        db.query(SandboxProfile).filter(SandboxProfile.id == desired_profile_id).first()
+        if desired_profile_id
+        else ensure_default_sandbox_profile(db)
+    )
+    if profile is None:
+        return True
+    return (
+        user_sandbox.active_profile_id != profile.id
+        or int(user_sandbox.active_profile_version or 0) != int(profile.version or 1)
+    )
+
+
+async def _clear_user_sandbox_binding_after_kill(
+    db: DBSession,
+    *,
+    user_id: str,
+    sandbox_service: SandboxSessionService,
+) -> None:
+    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+    sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+    if sandbox_id or sandbox_service.get_cached(user_id):
+        sandbox_deleted = await sandbox_service.kill(user_id, sandbox_id)
+        if not sandbox_deleted:
+            logger.warning(
+                "用户沙箱清理失败，仍继续切换沙箱配置 (user=%s, sandbox_id=%s)",
+                user_id,
+                sandbox_id,
+            )
+    if user_sandbox:
+        user_sandbox.sandbox_id = None
+        user_sandbox.active_profile_id = None
+        user_sandbox.active_profile_version = None
+        user_sandbox.status = "active"
+        db.commit()
 
 
 def _percentile(values: list[float], p: float) -> float | None:
@@ -802,6 +1059,7 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
             status = "idle"
 
         is_admin = bool(auth_user.is_admin)
+        sandbox_info = get_user_sandbox_config_payload(db, user_id)
         users.append(
             {
                 "user_id": user_id,
@@ -825,6 +1083,13 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
                 "last_active_at": _iso(last_active),
                 "last_login_at": _iso(auth_user.last_login_at),
                 "last_login_ip": latest_login_map.get(user_id, {}).get("ip_address"),
+                "sandbox_profile_id": sandbox_info["sandbox_profile_id"],
+                "sandbox_profile_name": sandbox_info["sandbox_profile_name"],
+                "sandbox_profile_source": sandbox_info["sandbox_profile_source"],
+                "sandbox_profile_error": sandbox_info["sandbox_profile_error"],
+                "sandbox_id": sandbox_info["sandbox_id"],
+                "sandbox_status": sandbox_info["sandbox_status"],
+                "sandbox_needs_recreate": sandbox_info["sandbox_needs_recreate"],
                 "created_by": auth_user.created_by,
                 "created_at": _iso(auth_user.created_at),
                 "updated_at": _iso(auth_user.updated_at),
@@ -1027,6 +1292,107 @@ async def get_admin_users(
     return _build_users_payload(db)
 
 
+@router.get("/sandbox-profiles")
+async def get_admin_sandbox_profiles(
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """列出管理员注册的 OpenSandbox 后端配置（不做实时状态查询）。"""
+    return _sandbox_profile_list_payload(db)
+
+
+@router.post("/sandbox-profiles")
+async def create_admin_sandbox_profile(
+    payload: AdminSandboxProfilePayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """注册一个新的 OpenSandbox 后端。"""
+    profile = _create_sandbox_profile(db, payload)
+    return sandbox_profile_to_payload(profile, bound_users=0)
+
+
+@router.patch("/sandbox-profiles/{profile_id}")
+async def update_admin_sandbox_profile(
+    profile_id: str,
+    payload: AdminSandboxProfilePatchPayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """更新 OpenSandbox 后端配置；运行参数变更会递增 version。"""
+    profile = _update_sandbox_profile(db, profile_id, payload)
+    counts = _sandbox_profile_bound_counts(db)
+    return sandbox_profile_to_payload(profile, bound_users=counts.get(profile.id, 0))
+
+
+@router.patch("/sandbox-profiles/{profile_id}/default")
+async def set_admin_sandbox_profile_default(
+    profile_id: str,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """设置全局默认 OpenSandbox 后端。"""
+    profile = set_default_sandbox_profile(db, profile_id)
+    counts = _sandbox_profile_bound_counts(db)
+    return sandbox_profile_to_payload(profile, bound_users=counts.get(profile.id, 0))
+
+
+@router.patch("/sandbox-profiles/{profile_id}/enabled")
+async def set_admin_sandbox_profile_enabled(
+    profile_id: str,
+    payload: AdminSandboxProfileEnabledPayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """启用或禁用 OpenSandbox 后端。禁用不做实时 kill。"""
+    profile = _set_sandbox_profile_enabled(db, profile_id, payload.enabled)
+    counts = _sandbox_profile_bound_counts(db)
+    return sandbox_profile_to_payload(profile, bound_users=counts.get(profile.id, 0))
+
+
+@router.patch("/users/{user_id}/sandbox-profile")
+async def update_admin_user_sandbox_profile(
+    user_id: str,
+    payload: AdminUserSandboxProfilePayload,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """分配用户所属沙箱后端；切换时清理旧 sandbox，首期不迁移文件。"""
+    target_user = db.query(AuthUser).filter(AuthUser.user_id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    desired_profile_id = _normalize_profile_assignment(db, payload.sandbox_profile_id)
+    current_profile_id = _get_user_assigned_profile_id(db, user_id)
+    assignment_changed = current_profile_id != desired_profile_id
+    active_profile_stale = _user_sandbox_profile_stale(
+        db,
+        user_id=user_id,
+        desired_profile_id=desired_profile_id,
+    )
+    needs_recreate = bool(payload.force_recreate or assignment_changed or active_profile_stale)
+    if not needs_recreate:
+        return get_user_sandbox_config_payload(db, user_id)
+
+    if _user_has_running_work(db, user_id) and not payload.force_recreate:
+        raise HTTPException(status_code=409, detail="用户当前有正在运行的任务，无法切换沙箱后端")
+
+    sandbox_service = SandboxSessionService()
+    await get_agent_pool().invalidate_user_async(user_id, preserve_running=False)
+
+    await _clear_user_sandbox_binding_after_kill(
+        db,
+        user_id=user_id,
+        sandbox_service=sandbox_service,
+    )
+    assign_user_sandbox_profile(
+        db,
+        user_id=user_id,
+        sandbox_profile_id=desired_profile_id,
+        updated_by=admin_user_id,
+    )
+    return get_user_sandbox_config_payload(db, user_id)
+
+
 @router.get("/users/{user_id}/login-events")
 async def get_admin_user_login_events(
     user_id: str,
@@ -1045,6 +1411,7 @@ async def create_admin_simple_user(
     db: DBSession = Depends(get_db),
 ):
     """创建本地 simple 用户。"""
+    sandbox_profile_id = _normalize_profile_assignment(db, payload.sandbox_profile_id)
     user = create_simple_user(
         db,
         username=payload.username,
@@ -1055,6 +1422,13 @@ async def create_admin_simple_user(
         token_limit_per_month=payload.token_limit_per_month,
         created_by=admin_user_id,
     )
+    if sandbox_profile_id:
+        assign_user_sandbox_profile(
+            db,
+            user_id=user.user_id,
+            sandbox_profile_id=sandbox_profile_id,
+            updated_by=admin_user_id,
+        )
     return auth_user_to_payload(user)
 
 
@@ -1065,6 +1439,7 @@ async def create_admin_ldap_user(
     db: DBSession = Depends(get_db),
 ):
     """创建 LDAP 目录账号用户。"""
+    sandbox_profile_id = _normalize_profile_assignment(db, payload.sandbox_profile_id)
     user = create_ldap_user(
         db,
         user_id=payload.user_id,
@@ -1075,6 +1450,13 @@ async def create_admin_ldap_user(
         token_limit_per_month=payload.token_limit_per_month,
         created_by=admin_user_id,
     )
+    if sandbox_profile_id:
+        assign_user_sandbox_profile(
+            db,
+            user_id=user.user_id,
+            sandbox_profile_id=sandbox_profile_id,
+            updated_by=admin_user_id,
+        )
     return auth_user_to_payload(user)
 
 

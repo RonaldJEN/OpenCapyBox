@@ -54,7 +54,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `SANDBOX_DOMAIN` | 按需 | — | OpenSandbox 服务地址，如 `localhost:8080` |
-| `SANDBOX_API_KEY` | 按需 | — | OpenSandbox API Key |
+| `SANDBOX_API_KEY` | 是 | — | OpenSandbox API Key；生产环境必须配置 |
 | `SANDBOX_IMAGE` | 否 | `code-interpreter-agent:v1.1.0` | 沙箱容器镜像 |
 | `SANDBOX_PROTOCOL` | 否 | `http` | OpenSandbox 协议（http/https） |
 | `SANDBOX_USE_SERVER_PROXY` | 否 | `true` | 是否使用服务器代理模式 |
@@ -64,6 +64,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 | `SANDBOX_PERSISTENT_STORAGE_ENABLED` | 否 | `true` | 是否启用持久化存储挂载 |
 | `SANDBOX_HOST_STORAGE_ROOT` | 否 | `/tmp/sandbox` | 宿主机持久化存储根路径 |
 | `SANDBOX_STORAGE_MOUNT_PATH` | 否 | `/home/user` | 容器内挂载路径 |
+
+启动时系统会根据上述 OpenSandbox 连接环境变量创建一个默认 Sandbox Profile。之后管理员可在后台维护多个 Profile，并为用户显式分配；未分配用户继续使用默认 Profile。镜像、持久化存储根路径和容器挂载路径仍使用全局配置，不按 Profile 单独配置。
 
 ## Agent / SSE
 

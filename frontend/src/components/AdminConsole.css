@@ -141,6 +141,12 @@
   gap: 10px;
 }
 
+.admin-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .admin-card {
   border: 1px solid #e5dfcd;
   background: #ffffff;
@@ -748,11 +754,15 @@
 }
 
 .admin-users-col-role {
-  width: 12%;
+  width: 10%;
+}
+
+.admin-users-col-sandbox {
+  width: 18%;
 }
 
 .admin-users-col-token {
-  width: 30%;
+  width: 24%;
 }
 
 .admin-users-col-runtime {
@@ -1058,6 +1068,39 @@
   font-weight: 600;
 }
 
+.admin-sandbox-cell {
+  display: grid;
+  gap: 6px;
+}
+
+.admin-sandbox-apply-button {
+  justify-self: start;
+  height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.admin-sandbox-form {
+  padding: 12px 14px 14px;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+.admin-sandbox-form .admin-field,
+.admin-sandbox-form .admin-checkbox-field {
+  min-width: 0;
+}
+
+.admin-sandbox-description-field {
+  grid-column: span 2;
+}
+
+.admin-sandbox-table {
+  min-width: 780px;
+}
+
 .admin-limit-editor,
 .admin-password-reset {
   display: grid;
@@ -1353,7 +1396,8 @@
 }
 
 @media (max-width: 1080px) {
-  .admin-grid-4 {
+  .admin-grid-4,
+  .admin-grid-3 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -1393,6 +1437,10 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .admin-sandbox-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .admin-user-create-modal-form,
   .admin-form-row-2 {
     grid-template-columns: 1fr;
@@ -1400,7 +1448,19 @@
 }
 
 @media (max-width: 560px) {
+  .admin-grid-3 {
+    grid-template-columns: 1fr;
+  }
+
   .admin-user-create-form {
     grid-template-columns: 1fr;
+  }
+
+  .admin-sandbox-form {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-sandbox-description-field {
+    grid-column: auto;
   }
 }

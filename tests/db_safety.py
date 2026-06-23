@@ -83,7 +83,14 @@ def _ensure_test_engine_postgres_extensions(conn) -> None:
 
 
 def create_all_for_test_engine(engine, metadata) -> None:
+    should_run_migrations = False
     if engine.url.get_backend_name() == "postgresql":
         with engine.begin() as conn:
             _ensure_test_engine_postgres_extensions(conn)
+            should_run_migrations = hasattr(conn, "execute")
     metadata.create_all(bind=engine)
+
+    if should_run_migrations:
+        from src.api.models.database import _migrate_add_columns
+
+        _migrate_add_columns(engine)

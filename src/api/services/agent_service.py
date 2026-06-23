@@ -19,7 +19,7 @@ from src.agent.schema.agui_events import AGUIEvent, EventType
 from src.api.services.history_service import HistoryService
 from src.api.services.agui_event_bus import SequencedAGUIEvent, StoredEvent, get_agui_event_bus
 from src.api.services.run_completion_service import RunCompletionService
-from src.api.services.sandbox_service import get_sandbox_service, get_sandbox_mount_path
+from src.api.services.sandbox_service import get_sandbox_service
 from src.api.services.subagent_graph_service import get_subagent_graph_service
 from src.api.services.tool_factory import create_agent_tools
 from src.api.config import get_settings
@@ -47,6 +47,11 @@ class PreparedAgentRun:
 
 
 settings = get_settings()
+
+
+def get_sandbox_mount_path(user_id: str | None = None) -> str:
+    """Compatibility wrapper around the profile-aware sandbox service mount path."""
+    return get_sandbox_service().get_mount_path(user_id)
 
 
 class AgentService:
@@ -78,7 +83,7 @@ class AgentService:
         self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
         self._active_run_count = 0
         # 每個 session 使用沙箱內的隔離子目錄
-        mount = get_sandbox_mount_path()
+        mount = get_sandbox_mount_path(user_id)
         self._workspace_dir = workspace_dir or (f"{mount}/sessions/{session_id}" if session_id else mount)
 
     @property
@@ -138,7 +143,7 @@ class AgentService:
         tools, self.skill_loader = await create_agent_tools(
             sandbox=self.sandbox,
             workspace_dir=self._workspace_dir,
-            mount=get_sandbox_mount_path(),
+            mount=get_sandbox_mount_path(self.user_id),
             user_id=self.user_id,
             db_session_factory=self._get_db_session_factory(),
             subagent_runner=self._run_subagent_invocation,

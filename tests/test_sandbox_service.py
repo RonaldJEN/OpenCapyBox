@@ -48,8 +48,21 @@ def mock_settings():
 @pytest.fixture
 def service(mock_settings):
     """創建 SandboxSessionService 實例"""
-    from src.api.services.sandbox_service import SandboxSessionService
-    return SandboxSessionService()
+    from src.api.services.sandbox_service import SandboxSessionService, _runtime_config_from_settings
+    with patch.object(
+        SandboxSessionService,
+        "_resolve_runtime_config",
+        side_effect=lambda user_id: _runtime_config_from_settings(),
+    ), patch.object(
+        SandboxSessionService,
+        "_resolve_runtime_for_existing_sandbox",
+        side_effect=lambda user_id, sandbox_id: _runtime_config_from_settings(),
+    ), patch.object(
+        SandboxSessionService,
+        "_persisted_profile_matches_runtime",
+        side_effect=lambda user_id, sandbox_id, runtime_config: bool(sandbox_id),
+    ):
+        yield SandboxSessionService()
 
 
 @pytest.fixture
@@ -267,6 +280,24 @@ class TestGetOrResume:
             MockSandbox.connect.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_stale_profile_fingerprint_skips_connect_and_creates_new(self, service, mock_sandbox):
+        """Profile 指紋過期時不得復用舊 sandbox_id。"""
+        from src.api.services.sandbox_service import SandboxSessionService
+
+        with patch.object(SandboxSessionService, "_persisted_profile_matches_runtime", return_value=False):
+            with patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+                MockSandbox.connect = AsyncMock()
+                MockSandbox.resume = AsyncMock()
+                MockSandbox.create = AsyncMock(return_value=mock_sandbox)
+
+                result = await service.get_or_resume("session-1", "sbx-old-id")
+
+                assert result is mock_sandbox
+                MockSandbox.connect.assert_not_awaited()
+                MockSandbox.resume.assert_not_awaited()
+                MockSandbox.create.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_connect_failure_falls_to_resume(self, service, mock_sandbox):
         """測試 connect 失敗 -> fallback 到 resume"""
         with patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
@@ -390,6 +421,25 @@ class TestKill:
             assert result is False
 
     @pytest.mark.asyncio
+    async def test_kill_by_sandbox_id_returns_false_when_profile_unresolvable(self, service):
+        """既有 sandbox 的 active profile 无法解析时不得回退到当前配置。"""
+        from src.api.services.sandbox_service import SandboxSessionService
+
+        with patch.object(
+            SandboxSessionService,
+            "_resolve_runtime_for_existing_sandbox",
+            side_effect=RuntimeError("profile missing"),
+        ), patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.connect = AsyncMock()
+            MockSandbox.resume = AsyncMock()
+
+            result = await service.kill("session-1", "sbx-profile-missing")
+
+        assert result is False
+        MockSandbox.connect.assert_not_called()
+        MockSandbox.resume.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_kill_connect_fails_resume_succeeds(self, service, mock_sandbox):
         """測試 connect 失敗後 resume 成功，仍能清理文件並銷毀"""
         with patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
@@ -430,6 +480,83 @@ class TestKill:
         assert result is False
         mock_sandbox.kill.assert_not_awaited()
         mock_sandbox.close.assert_awaited_once()
+
+
+class TestResolveRuntimeForExistingSandbox:
+    class _FakeQuery:
+        def __init__(self, result):
+            self.result = result
+
+        def filter(self, *args):
+            return self
+
+        def first(self):
+            return self.result
+
+    class _FakeDB:
+        def __init__(self, user_sandbox=None, profile=None):
+            self.user_sandbox = user_sandbox
+            self.profile = profile
+
+        def query(self, model):
+            if model.__name__ == "UserSandbox":
+                return TestResolveRuntimeForExistingSandbox._FakeQuery(self.user_sandbox)
+            if model.__name__ == "SandboxProfile":
+                return TestResolveRuntimeForExistingSandbox._FakeQuery(self.profile)
+            raise AssertionError(f"unexpected model: {model}")
+
+    class _FakeSessionLocal:
+        def __init__(self, db):
+            self.db = db
+
+        def __call__(self):
+            return self
+
+        def __enter__(self):
+            return self.db
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def test_missing_active_profile_does_not_fallback_to_current_profile(self, mock_settings):
+        from src.api.services.sandbox_service import SandboxSessionService
+
+        fake_db = self._FakeDB(
+            user_sandbox=SimpleNamespace(
+                sandbox_id="sbx-1",
+                active_profile_id="missing-profile",
+                active_profile_version=1,
+            ),
+            profile=None,
+        )
+        with patch("src.api.models.database.SessionLocal", self._FakeSessionLocal(fake_db)), patch.object(
+            SandboxSessionService,
+            "_resolve_runtime_config",
+        ) as fallback:
+            with pytest.raises(RuntimeError):
+                SandboxSessionService._resolve_runtime_for_existing_sandbox("user-1", "sbx-1")
+
+        fallback.assert_not_called()
+
+    def test_active_profile_version_mismatch_is_not_cleanable(self, mock_settings):
+        from src.api.services.sandbox_service import SandboxSessionService
+
+        fake_db = self._FakeDB(
+            user_sandbox=SimpleNamespace(
+                sandbox_id="sbx-1",
+                active_profile_id="profile-a",
+                active_profile_version=1,
+            ),
+            profile=SimpleNamespace(id="profile-a", version=2),
+        )
+        with patch("src.api.models.database.SessionLocal", self._FakeSessionLocal(fake_db)), patch.object(
+            SandboxSessionService,
+            "_resolve_runtime_config",
+        ) as fallback:
+            with pytest.raises(RuntimeError):
+                SandboxSessionService._resolve_runtime_for_existing_sandbox("user-1", "sbx-1")
+
+        fallback.assert_not_called()
 
 
 # ============== renew ==============

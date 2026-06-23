@@ -18,8 +18,11 @@ from src.api.models.auth_user import AuthUser
 from src.api.models.database import Base, get_db
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.round import Round
+from src.api.models.sandbox_profile import SandboxProfile
 from src.api.models.session import Session
 from src.api.models.subagent_run import SubagentRun
+from src.api.models.user_sandbox import UserSandbox
+from src.api.models.user_sandbox_config import UserSandboxConfig
 from src.api.models.user_run_lock import UserRunLock
 from src.api.routes import admin as admin_routes
 from src.api.utils.timezone import now_naive
@@ -133,6 +136,329 @@ def _insert_round_with_step(
         compaction_emergency_truncate_dropped_rounds=0,
     )
     db.add(llm_row)
+
+
+def test_sandbox_profile_patch_empty_api_key_keeps_existing_secret(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    create_resp = client.post("/admin/sandbox-profiles", json={
+        "name": "profile-a",
+        "domain": "10.0.0.1:8080",
+        "api_key": "secret-a",
+    })
+    assert create_resp.status_code == 200
+    profile_id = create_resp.json()["id"]
+    assert create_resp.json()["api_key_set"] is True
+
+    patch_resp = client.patch(
+        f"/admin/sandbox-profiles/{profile_id}",
+        json={"description": "keep key", "api_key": ""},
+    )
+    assert patch_resp.status_code == 200
+    patched = patch_resp.json()
+    assert patched["api_key_set"] is True
+    assert patched["version"] == 1
+
+    db = SessionLocal()
+    try:
+        profile = db.query(SandboxProfile).filter(SandboxProfile.id == profile_id).one()
+        assert profile.api_key == "secret-a"
+        assert profile.description == "keep key"
+    finally:
+        db.close()
+
+
+def test_sandbox_profile_create_requires_api_key(admin_integration_client):
+    client, _ = admin_integration_client
+
+    response = client.post("/admin/sandbox-profiles", json={
+        "name": "profile-no-key",
+        "domain": "10.0.0.9:8080",
+    })
+
+    assert response.status_code == 422
+
+
+def test_sandbox_profile_set_default_is_idempotent(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        db.add(SandboxProfile(
+            id="default-idempotent-profile",
+            name="default-idempotent-profile",
+            domain="10.0.0.8:8080",
+            api_key="secret-default",
+            is_default=True,
+            enabled=True,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    first = client.patch("/admin/sandbox-profiles/default-idempotent-profile/default")
+    second = client.patch("/admin/sandbox-profiles/default-idempotent-profile/default")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["is_default"] is True
+
+    db = SessionLocal()
+    try:
+        defaults = db.query(SandboxProfile).filter(SandboxProfile.is_default.is_(True)).all()
+        assert [profile.id for profile in defaults] == ["default-idempotent-profile"]
+    finally:
+        db.close()
+
+
+def test_default_sandbox_profile_assignment_is_normalized_to_null(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        db.add(AuthUser(
+            user_id="default-normalized-user",
+            username="default-normalized-user",
+            auth_type="simple",
+            enabled=True,
+        ))
+        db.add(SandboxProfile(
+            id="default-normalized-profile",
+            name="default-normalized-profile",
+            domain="10.0.0.12:8080",
+            api_key="secret-default-normalized",
+            is_default=True,
+            enabled=True,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    with patch(
+        "src.api.routes.admin.get_agent_pool",
+        side_effect=AssertionError("default profile id should normalize to no-op"),
+    ), patch(
+        "src.api.routes.admin.SandboxSessionService",
+        side_effect=AssertionError("default profile id should not trigger sandbox cleanup"),
+    ):
+        response = client.patch(
+            "/admin/users/default-normalized-user/sandbox-profile",
+            json={"sandbox_profile_id": "default-normalized-profile"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sandbox_profile_id"] is None
+    assert payload["sandbox_profile_name"] == "default-normalized-profile"
+    assert payload["sandbox_profile_source"] == "default"
+
+    db = SessionLocal()
+    try:
+        config = db.query(UserSandboxConfig).filter(UserSandboxConfig.user_id == "default-normalized-user").first()
+        assert config is None or config.sandbox_profile_id is None
+    finally:
+        db.close()
+
+
+def test_create_user_validates_sandbox_profile_before_persisting_user(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    missing_resp = client.post("/admin/users/simple", json={
+        "username": "profile-missing-user",
+        "password": "pw",
+        "sandbox_profile_id": "missing-profile",
+    })
+    assert missing_resp.status_code == 404
+
+    db = SessionLocal()
+    try:
+        assert db.query(AuthUser).filter(AuthUser.user_id == "profile-missing-user").first() is None
+        db.add(SandboxProfile(
+            id="disabled-profile",
+            name="disabled-profile",
+            domain="10.0.0.2:8080",
+            api_key="secret-disabled",
+            enabled=False,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    disabled_resp = client.post("/admin/users/simple", json={
+        "username": "profile-disabled-user",
+        "password": "pw",
+        "sandbox_profile_id": "disabled-profile",
+    })
+    assert disabled_resp.status_code == 400
+
+    db = SessionLocal()
+    try:
+        assert db.query(AuthUser).filter(AuthUser.user_id == "profile-disabled-user").first() is None
+    finally:
+        db.close()
+
+
+def test_sandbox_profile_payload_is_connection_only(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    response = client.post("/admin/sandbox-profiles", json={
+        "name": "profile-connection-only",
+        "domain": "10.0.0.3:8080",
+        "api_key": "secret-connection",
+        "protocol": "http",
+    })
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["api_key_set"] is True
+    assert "image" not in payload
+    assert "cpu_limit" not in payload
+    assert "memory_limit" not in payload
+    assert "storage_root" not in payload
+
+    db = SessionLocal()
+    try:
+        profile = db.query(SandboxProfile).filter(SandboxProfile.id == payload["id"]).one()
+        assert profile.domain == "10.0.0.3:8080"
+    finally:
+        db.close()
+
+
+def test_user_sandbox_profile_patch_same_active_profile_is_noop(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        db.add(AuthUser(
+            user_id="sandbox-noop-user",
+            username="sandbox-noop-user",
+            auth_type="simple",
+            enabled=True,
+        ))
+        db.add(SandboxProfile(
+            id="sandbox-noop-profile",
+            name="sandbox-noop-profile",
+            domain="10.0.0.4:8080",
+            api_key="secret-noop",
+            enabled=True,
+            version=3,
+        ))
+        db.add(UserSandboxConfig(
+            id="sandbox-noop-config",
+            user_id="sandbox-noop-user",
+            sandbox_profile_id="sandbox-noop-profile",
+            updated_by="admin",
+        ))
+        db.add(UserSandbox(
+            id="sandbox-noop-binding",
+            user_id="sandbox-noop-user",
+            sandbox_id="sbx-noop",
+            active_profile_id="sandbox-noop-profile",
+            active_profile_version=3,
+            status="active",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    with patch("src.api.routes.admin.get_agent_pool") as get_agent_pool_mock, \
+         patch("src.api.routes.admin.SandboxSessionService") as sandbox_service_cls:
+        response = client.patch(
+            "/admin/users/sandbox-noop-user/sandbox-profile",
+            json={"sandbox_profile_id": "sandbox-noop-profile"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sandbox_profile_id"] == "sandbox-noop-profile"
+    assert payload["sandbox_needs_recreate"] is False
+    get_agent_pool_mock.assert_not_called()
+    sandbox_service_cls.assert_not_called()
+
+    db = SessionLocal()
+    try:
+        user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == "sandbox-noop-user").one()
+        assert user_sandbox.sandbox_id == "sbx-noop"
+        assert user_sandbox.active_profile_id == "sandbox-noop-profile"
+        assert user_sandbox.active_profile_version == 3
+    finally:
+        db.close()
+
+
+def test_users_payload_exposes_missing_explicit_sandbox_profile(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        db.add(AuthUser(
+            user_id="sandbox-missing-profile-user",
+            username="sandbox-missing-profile-user",
+            auth_type="simple",
+            enabled=True,
+        ))
+        db.add(UserSandboxConfig(
+            id="sandbox-missing-profile-config",
+            user_id="sandbox-missing-profile-user",
+            sandbox_profile_id="deleted-profile",
+            updated_by="admin",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/admin/users")
+
+    assert response.status_code == 200
+    user = next(item for item in response.json()["users"] if item["user_id"] == "sandbox-missing-profile-user")
+    assert user["sandbox_profile_id"] == "deleted-profile"
+    assert user["sandbox_profile_name"] is None
+    assert user["sandbox_profile_source"] == "missing"
+    assert user["sandbox_profile_error"] == "用户绑定的沙箱后端不存在"
+
+
+def test_admin_read_paths_do_not_bootstrap_default_sandbox_profile(admin_integration_client):
+    """Users + sandbox profile list are loaded concurrently by the frontend.
+
+    These read paths must not take the default-profile advisory bootstrap lock,
+    otherwise one request can hold the lock while another blocks the async server
+    event loop waiting for it.
+    """
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        db.add(AuthUser(
+            user_id="admin-read-user",
+            username="admin-read-user",
+            auth_type="simple",
+            enabled=True,
+        ))
+        db.add(SandboxProfile(
+            id="admin-read-default-profile",
+            name="admin-read-default-profile",
+            domain="10.0.0.11:8080",
+            api_key="secret-read",
+            is_default=True,
+            enabled=True,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    with patch(
+        "src.api.routes.admin.ensure_default_sandbox_profile",
+        side_effect=AssertionError("read path should not bootstrap default profile"),
+    ), patch(
+        "src.api.services.sandbox_profile_service._lock_default_profile_bootstrap",
+        side_effect=AssertionError("read path should not take advisory bootstrap lock"),
+    ):
+        profiles_resp = client.get("/admin/sandbox-profiles")
+        users_resp = client.get("/admin/users")
+
+    assert profiles_resp.status_code == 200
+    assert users_resp.status_code == 200
+    user = next(item for item in users_resp.json()["users"] if item["user_id"] == "admin-read-user")
+    assert user["sandbox_profile_source"] == "default"
 
 
 def test_rounds_tree_real_sql_supports_limit_offset_status_search(admin_integration_client):

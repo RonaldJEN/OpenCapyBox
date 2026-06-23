@@ -1,5 +1,6 @@
 """数据库配置测试 — 验证 database.py 正确读取 Settings.database_url"""
 import pytest
+import uuid
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -124,6 +125,48 @@ class TestDatabaseConfig:
 class TestDatabaseMigration:
     """测试数据库迁移逻辑"""
 
+    def test_sandbox_profile_migration_includes_current_schema_columns(self):
+        """存量 sandbox_profiles 表应补齐当前模型依赖的新列。"""
+        from src.api.models.database import _PENDING_COLUMNS
+
+        pending = {(table_name, column_name) for table_name, column_name, _ in _PENDING_COLUMNS}
+        required_columns = {
+            "description",
+            "department",
+            "domain",
+            "protocol",
+            "api_key",
+            "use_server_proxy",
+            "is_default",
+            "enabled",
+            "version",
+            "created_at",
+            "updated_at",
+        }
+
+        missing = {
+            column_name
+            for column_name in required_columns
+            if ("sandbox_profiles", column_name) not in pending
+        }
+        assert missing == set()
+
+    def test_sandbox_profile_backfill_respects_use_server_proxy_setting(self):
+        """存量 Profile 回填应继承环境连接模式，而不是固定写 TRUE。"""
+        from src.api.models import database as database_module
+
+        fake_settings = MagicMock()
+        fake_settings.sandbox_use_server_proxy = False
+        fake_conn = MagicMock()
+
+        with patch.object(database_module, "_settings", fake_settings):
+            database_module._backfill_sandbox_profiles(fake_conn, {"use_server_proxy"})
+
+        fake_conn.execute.assert_called_once()
+        sql, params = fake_conn.execute.call_args.args
+        assert "use_server_proxy = :use_server_proxy" in str(sql)
+        assert params == {"use_server_proxy": False}
+
     def test_migrate_add_columns_is_idempotent(self):
         """验证 _migrate_add_columns 可以重复调用（幂等）"""
         from src.api.models.database import init_db
@@ -131,6 +174,95 @@ class TestDatabaseMigration:
         # 调用两次不应报错
         init_db()
         init_db()
+
+    def test_default_sandbox_profile_backfills_legacy_user_sandboxes(self):
+        """存量 user_sandboxes 应回填默认 Profile 指纹，避免升级后误判 stale。"""
+        from src.api.models.database import SessionLocal, init_db, _ensure_default_sandbox_profile
+        from src.api.models.sandbox_profile import SandboxProfile
+        from src.api.models.user_sandbox import UserSandbox
+
+        init_db()
+        user_id = "legacy-profile-backfill-user"
+        db = SessionLocal()
+        try:
+            db.query(UserSandbox).filter(UserSandbox.user_id == user_id).delete()
+            db.add(UserSandbox(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                sandbox_id="sbx-legacy-profile",
+                status="active",
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        _ensure_default_sandbox_profile()
+
+        db = SessionLocal()
+        try:
+            default_profile = (
+                db.query(SandboxProfile)
+                .filter(SandboxProfile.is_default.is_(True))
+                .order_by(SandboxProfile.created_at.asc())
+                .first()
+            )
+            user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).one()
+            assert default_profile is not None
+            assert user_sandbox.active_profile_id == default_profile.id
+            assert user_sandbox.active_profile_version == int(default_profile.version or 1)
+        finally:
+            db.query(UserSandbox).filter(UserSandbox.user_id == user_id).delete()
+            db.commit()
+            db.close()
+
+    def test_ensure_default_sandbox_profile_repairs_multiple_defaults(self):
+        """默认 Profile bootstrap 应修复异常多默认状态。"""
+        from src.api.models.database import SessionLocal, init_db
+        from src.api.models.sandbox_profile import SandboxProfile
+        from src.api.services.sandbox_profile_service import ensure_default_sandbox_profile
+
+        init_db()
+        profile_a_id = str(uuid.uuid4())
+        profile_b_id = str(uuid.uuid4())
+        db = SessionLocal()
+        try:
+            db.add_all([
+                SandboxProfile(
+                    id=profile_a_id,
+                    name=f"default-repair-a-{profile_a_id}",
+                    domain="10.0.1.1:8080",
+                    api_key="secret-a",
+                    is_default=True,
+                    enabled=True,
+                ),
+                SandboxProfile(
+                    id=profile_b_id,
+                    name=f"default-repair-b-{profile_b_id}",
+                    domain="10.0.1.2:8080",
+                    api_key="secret-b",
+                    is_default=True,
+                    enabled=True,
+                ),
+            ])
+            db.commit()
+
+            default_profile = ensure_default_sandbox_profile(db)
+            defaults = (
+                db.query(SandboxProfile)
+                .filter(SandboxProfile.is_default.is_(True))
+                .all()
+            )
+
+            assert len(defaults) == 1
+            assert defaults[0].id == default_profile.id
+            assert default_profile.enabled is True
+        finally:
+            db.query(SandboxProfile).filter(SandboxProfile.id.in_([profile_a_id, profile_b_id])).delete(
+                synchronize_session=False
+            )
+            db.commit()
+            ensure_default_sandbox_profile(db)
+            db.close()
 
     def test_sync_postgres_sequence_handles_uncalled_sequence_at_max_id(self):
         from src.api.models import database as database_module

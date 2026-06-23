@@ -603,7 +603,8 @@ docs(api): 更新 Cron API 文档
 ### ⚡ 性能与扩展性
 
 - [x] **多 Subagent 并行执行** —— 同一步连续 `sub_agent` 调用已支持按 `AGENT_SUBAGENT_MAX_PARALLEL` 有界并行
-- [ ] **多 Worker 部署 + Redis 同步** —— 引入 Redis 做跨 worker 的事件 fanout / cancel registry / 运行锁，打破单 worker 假设
+- [ ] **多 Worker 部署 + Redis 同步** —— 引入 Redis 做跨 worker 的事件 fanout / cancel registry / 运行锁 / sandbox-profile 缓存失效广播，打破单 worker 假设
+- [ ] **跨 Profile 数据迁移** —— 设计 OpenSandbox 后端之间的 sandbox 文件、cron 产物、用户生成文件、第三方 skill 的导出导入、校验、回滚与审计流程
 - [ ] EventBus 抽象化：进程内 bus 升级为可插拔（进程内 / Redis Pub-Sub）
 - [ ] 会话 / 记忆检索的缓存层
 

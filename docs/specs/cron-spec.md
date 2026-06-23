@@ -132,7 +132,7 @@ All require Bearer auth.
 ### GET /api/cron/runs/{run_id}/files
 
 - Response 200: `{files: [...]}` — 从 DB artifacts 字段或实时沙箱扫描
-- Error 404
+- Error 404, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）
 
 ### GET /api/cron/runs/{run_id}/files/{path:path}
 
@@ -140,7 +140,7 @@ All require Bearer auth.
 - 鉴权双通道：
   - `Authorization: Bearer <token>`（标准方式，优先生效）
   - `?token=<access_token>`（兜底，用于浏览器 `<a>` 直链下载，access log / Referer 会记录 token，仅在受控环境使用；缺失任何一种均返回 401）
-- Error 401（未提供 token）, 404, 403 ("路径越界"), 503
+- Error 401（未提供 token）, 404, 403 ("路径越界"), 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 503
 
 ### POST /api/cron/jobs/{job_name}/run
 

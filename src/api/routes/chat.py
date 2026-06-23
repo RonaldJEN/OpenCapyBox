@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session as DBSession
+import inspect
 from src.api.models.database import get_db
 from src.api.deps import get_current_user
 from src.api.models.session import Session
@@ -430,9 +431,11 @@ def _start_agent_init(
     global _last_cleanup_time
     now = time.time()
     if now - _last_cleanup_time > 3600:
-        _cleanup_task = asyncio.create_task(agent_pool.cleanup_expired_async())
-        _cleanup_task.add_done_callback(lambda t: logger.error("Agent 清理異常: %s", t.exception()) if not t.cancelled() and t.exception() else None)
-        _last_cleanup_time = now
+        cleanup_result = agent_pool.cleanup_expired_async()
+        if inspect.isawaitable(cleanup_result):
+            _cleanup_task = asyncio.create_task(cleanup_result)
+            _cleanup_task.add_done_callback(lambda t: logger.error("Agent 清理異常: %s", t.exception()) if not t.cancelled() and t.exception() else None)
+            _last_cleanup_time = now
 
     return asyncio.create_task(agent_pool.get_or_create(
         user_id=user_id,

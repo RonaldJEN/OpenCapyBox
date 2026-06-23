@@ -334,9 +334,13 @@ async def list_run_files(
         sandbox_service = get_sandbox_service()
         sandbox = await sandbox_service.get_or_resume(user_id, user_sandbox.sandbox_id)
         latest_sandbox_id = sandbox_service.get_sandbox_id(user_id)
-        if latest_sandbox_id and latest_sandbox_id != user_sandbox.sandbox_id:
+        if isinstance(latest_sandbox_id, str) and latest_sandbox_id and latest_sandbox_id != user_sandbox.sandbox_id:
             user_sandbox.sandbox_id = latest_sandbox_id
             user_sandbox.status = "active"
+            runtime_config = sandbox_service.get_cached_runtime_config(user_id)
+            if runtime_config:
+                user_sandbox.active_profile_id = runtime_config.profile_id
+                user_sandbox.active_profile_version = runtime_config.profile_version
             db.commit()
 
         from src.api.services.cron_service import _scan_run_artifacts
@@ -347,6 +351,8 @@ async def list_run_files(
             run.artifacts = artifacts_json
             db.commit()
             return {"files": files}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning("实时扫描产物失败 (run_id=%s): %s", run_id, e)
 
@@ -400,10 +406,16 @@ async def download_run_file(
     try:
         sandbox = await sandbox_service.get_or_resume(user_id, user_sandbox.sandbox_id)
         latest_sandbox_id = sandbox_service.get_sandbox_id(user_id)
-        if latest_sandbox_id and latest_sandbox_id != user_sandbox.sandbox_id:
+        if isinstance(latest_sandbox_id, str) and latest_sandbox_id and latest_sandbox_id != user_sandbox.sandbox_id:
             user_sandbox.sandbox_id = latest_sandbox_id
             user_sandbox.status = "active"
+            runtime_config = sandbox_service.get_cached_runtime_config(user_id)
+            if runtime_config:
+                user_sandbox.active_profile_id = runtime_config.profile_id
+                user_sandbox.active_profile_version = runtime_config.profile_version
             db.commit()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"沙箱连接失败: {e}")
 

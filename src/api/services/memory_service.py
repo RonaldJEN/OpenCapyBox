@@ -684,7 +684,9 @@ class MemoryService:
         if not records and not agents_template.strip():
             return 0
 
-        mount = get_sandbox_mount_path()
+        from src.api.services.sandbox_service import get_sandbox_service
+
+        mount = get_sandbox_service().get_mount_path(user_id)
         synced = 0
         for file_type, db_content in records.items():
             if file_type not in DB_BACKED_FILE_TYPES:
@@ -747,13 +749,13 @@ class MemoryService:
         if file_type in TEMPLATE_MANAGED_FILE_TYPES:
             return None
 
-        from src.api.services.sandbox_service import get_sandbox_mount_path
+        from src.api.services.sandbox_service import get_sandbox_service
 
         filename = FILE_TYPE_TO_FILENAME.get(file_type)
         if not filename:
             return None
 
-        mount = get_sandbox_mount_path()
+        mount = get_sandbox_service().get_mount_path(user_id)
         path = f"{mount}/{filename}"
         try:
             read_file = getattr(sandbox.files, "read_file", None)

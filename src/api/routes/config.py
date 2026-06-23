@@ -116,7 +116,13 @@ async def update_agent_file(
             if not isinstance(persisted_sandbox_id, str) or not persisted_sandbox_id:
                 persisted_sandbox_id = None
             cached_sandbox_id = getattr(sandbox, "id", None)
-            if persisted_sandbox_id and cached_sandbox_id != persisted_sandbox_id:
+            cached_current = not persisted_sandbox_id or cached_sandbox_id == persisted_sandbox_id
+            cached_is_current = getattr(sandbox_service, "cached_is_current", None)
+            if callable(cached_is_current):
+                current_result = cached_is_current(user_id, persisted_sandbox_id)
+                if isinstance(current_result, bool):
+                    cached_current = current_result
+            if not cached_current:
                 sandbox = await sandbox_service.get_or_resume(user_id, persisted_sandbox_id)
             await svc.sync_to_sandbox(
                 user_id,

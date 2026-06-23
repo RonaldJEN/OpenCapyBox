@@ -60,3 +60,4 @@ opensandbox>=0.1.0
 
 # 调度
 apscheduler>=3.10.0
+socksio>=1.0.0

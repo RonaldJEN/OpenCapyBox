@@ -1,6 +1,6 @@
 """数据库配置"""
 import logging
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text, inspect, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import OperationalError
@@ -21,6 +21,8 @@ def _import_models():
     from src.api.models import subagent_run as _  # noqa: F401
     from src.api.models.auth_user import AuthUser as _  # noqa: F401
     from src.api.models.auth_login_event import AuthLoginEvent as _  # noqa: F401
+    from src.api.models.sandbox_profile import SandboxProfile as _  # noqa: F401
+    from src.api.models.user_sandbox_config import UserSandboxConfig as _  # noqa: F401
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
     from src.api.models.conversation_message import ConversationMessage as _  # noqa: F401
     from src.api.models.interrupt_resolution import InterruptResolution as _  # noqa: F401
@@ -80,6 +82,7 @@ def init_db():
     _migrate_user_run_locks_schema()
     _migrate_run_cancel_requests_schema()
     _migrate_add_columns()
+    _ensure_default_sandbox_profile()
 
 
 def _configure_postgres_extensions():
@@ -271,6 +274,20 @@ _PENDING_COLUMNS = [
     ("cron_jobs", "content", "TEXT NOT NULL DEFAULT ''"),
     # auth_users: JWT 凭据代次
     ("auth_users", "token_generation", "INTEGER NOT NULL DEFAULT 0"),
+    # sandbox profile routing
+    ("sandbox_profiles", "description", "TEXT"),
+    ("sandbox_profiles", "department", "VARCHAR(100)"),
+    ("sandbox_profiles", "domain", "VARCHAR(255)"),
+    ("sandbox_profiles", "protocol", "VARCHAR(10) DEFAULT 'http'"),
+    ("sandbox_profiles", "api_key", "TEXT"),
+    ("sandbox_profiles", "use_server_proxy", f"BOOLEAN DEFAULT {_BOOL_TRUE}"),
+    ("sandbox_profiles", "is_default", f"BOOLEAN DEFAULT {_BOOL_FALSE}"),
+    ("sandbox_profiles", "enabled", f"BOOLEAN DEFAULT {_BOOL_TRUE}"),
+    ("sandbox_profiles", "version", "INTEGER DEFAULT 1"),
+    ("sandbox_profiles", "created_at", "TIMESTAMP DEFAULT NOW()"),
+    ("sandbox_profiles", "updated_at", "TIMESTAMP DEFAULT NOW()"),
+    ("user_sandboxes", "active_profile_id", "VARCHAR(36)"),
+    ("user_sandboxes", "active_profile_version", "INTEGER"),
 ]
 
 
@@ -279,14 +296,89 @@ _PENDING_COLUMNS = [
 # 注意：值均為可信硬編碼常量，直接用於 DDL 語句拼接
 _PENDING_UNIQUE_CONSTRAINTS = [
     ("rounds", "uq_round_session_idempkey", ["session_id", "idempotency_key"]),
+    ("sandbox_profiles", "uq_sandbox_profiles_name", ["name"]),
     ("user_sandboxes", "uq_user_sandboxes_user_id", ["user_id"]),
+    ("user_sandbox_configs", "uq_user_sandbox_configs_user_id", ["user_id"]),
 ]
 
 
-def _migrate_add_columns():
+_DEPRECATED_COLUMNS = [
+    ("sandbox_profiles", "image"),
+    ("sandbox_profiles", "cpu_limit"),
+    ("sandbox_profiles", "memory_limit"),
+    ("sandbox_profiles", "storage_root"),
+    ("sandbox_profiles", "mount_path"),
+]
+
+
+def _backfill_sandbox_profiles(conn, columns: set[str]) -> None:
+    """Backfill rows created by the legacy sandbox_profiles schema."""
+    if "domain" in columns:
+        conn.execute(
+            text("UPDATE sandbox_profiles SET domain = :domain WHERE domain IS NULL OR domain = ''"),
+            {"domain": _settings.sandbox_domain},
+        )
+    if "protocol" in columns:
+        conn.execute(
+            text("UPDATE sandbox_profiles SET protocol = :protocol WHERE protocol IS NULL OR protocol = ''"),
+            {"protocol": _settings.sandbox_protocol or "http"},
+        )
+    if "api_key" in columns:
+        conn.execute(
+            text("UPDATE sandbox_profiles SET api_key = :api_key WHERE api_key IS NULL"),
+            {"api_key": _settings.sandbox_api_key},
+        )
+    if "use_server_proxy" in columns:
+        conn.execute(
+            text("UPDATE sandbox_profiles SET use_server_proxy = :use_server_proxy WHERE use_server_proxy IS NULL"),
+            {"use_server_proxy": bool(_settings.sandbox_use_server_proxy)},
+        )
+    if "is_default" in columns:
+        conn.execute(text(f"UPDATE sandbox_profiles SET is_default = {_BOOL_FALSE} WHERE is_default IS NULL"))
+    if "enabled" in columns:
+        conn.execute(text(f"UPDATE sandbox_profiles SET enabled = {_BOOL_TRUE} WHERE enabled IS NULL"))
+    if "version" in columns:
+        conn.execute(text("UPDATE sandbox_profiles SET version = 1 WHERE version IS NULL OR version < 1"))
+    if "created_at" in columns:
+        conn.execute(text("UPDATE sandbox_profiles SET created_at = NOW() WHERE created_at IS NULL"))
+    if "updated_at" in columns:
+        conn.execute(text("UPDATE sandbox_profiles SET updated_at = NOW() WHERE updated_at IS NULL"))
+
+
+def _ensure_default_sandbox_profile() -> None:
+    """Bootstrap a default sandbox profile from legacy environment settings."""
+    from src.api.services.sandbox_profile_service import ensure_default_sandbox_profile
+    from src.api.models.user_sandbox import UserSandbox
+
+    with SessionLocal() as db:
+        default_profile = ensure_default_sandbox_profile(db)
+        updated = (
+            db.query(UserSandbox)
+            .filter(UserSandbox.sandbox_id.isnot(None))
+            .filter(
+                or_(
+                    UserSandbox.active_profile_id.is_(None),
+                    UserSandbox.active_profile_version.is_(None),
+                )
+            )
+            .update(
+                {
+                    UserSandbox.active_profile_id: default_profile.id,
+                    UserSandbox.active_profile_version: int(default_profile.version or 1),
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated:
+            db.commit()
+            logger.info("DB 迁移: 已回填 %s 条 user_sandboxes 默认 profile 指纹", updated)
+
+
+def _migrate_add_columns(target_engine=None):
     """检查并添加缺失的列和约束（幂等，仅在不存在时执行）"""
-    inspector = inspect(engine)
-    with engine.begin() as conn:
+    bind_engine = target_engine or engine
+    inspector = inspect(bind_engine)
+    with bind_engine.begin() as conn:
         table_columns_cache: dict[str, set[str] | None] = {}
 
         for table_name, column_name, column_type in _PENDING_COLUMNS:
@@ -304,6 +396,18 @@ def _migrate_add_columns():
                 conn.execute(text(stmt))
                 existing_columns.add(column_name)
                 logger.info("DB 迁移: %s 表新增列 %s (%s)", table_name, column_name, column_type)
+
+        for table_name, column_name in _DEPRECATED_COLUMNS:
+            if not inspector.has_table(table_name):
+                continue
+            existing_columns = {col["name"] for col in inspector.get_columns(table_name)}
+            if column_name in existing_columns:
+                conn.execute(text(f"ALTER TABLE {table_name} DROP COLUMN {column_name}"))
+                logger.info("DB 迁移: %s 表删除废弃列 %s", table_name, column_name)
+
+        sandbox_profile_columns = table_columns_cache.get("sandbox_profiles")
+        if sandbox_profile_columns:
+            _backfill_sandbox_profiles(conn, sandbox_profile_columns)
 
         _ensure_agui_events_run_sequence_unique(conn, inspector)
 

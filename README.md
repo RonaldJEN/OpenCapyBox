@@ -604,7 +604,8 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 ### ⚡ Performance & Scalability
 
 - [ ] **Parallel subagent execution** — subagents run serially today; plan to schedule multiple child tasks concurrently
-- [ ] **Multi-worker deployment + Redis sync** — introduce Redis for cross-worker event fanout / cancel registry / run locks, lifting the single-worker assumption
+- [ ] **Multi-worker deployment + Redis sync** — introduce Redis for cross-worker event fanout / cancel registry / run locks / sandbox-profile cache invalidation, lifting the single-worker assumption
+- [ ] **Cross-profile data migration** — design export/import, validation, rollback, and audit for moving sandbox files, cron artifacts, user-generated files, and third-party skills between OpenSandbox backends
 - [ ] Pluggable EventBus: upgrade the in-process bus to a backend choice (in-process / Redis Pub-Sub)
 - [ ] Caching layer for session & memory retrieval
 

@@ -2,7 +2,7 @@
 
 一个用户对应一个持久化沙箱，所有对话共享同一工作空间。
 """
-from sqlalchemy import Column, String, DateTime
+from sqlalchemy import Column, DateTime, Integer, String
 from .database import Base
 from src.api.utils.timezone import now_naive
 
@@ -21,6 +21,11 @@ class UserSandbox(Base):
     id = Column(String(36), primary_key=True)
     user_id = Column(String(100), nullable=False, unique=True, index=True)
     sandbox_id = Column(String(100), nullable=True)
+    # Profile actually used to create/resume this sandbox. It may differ from
+    # the user's desired config after an admin reassignment until the sandbox is
+    # recreated.
+    active_profile_id = Column(String(36), nullable=True, index=True)
+    active_profile_version = Column(Integer, nullable=True)
     # active / paused
     status = Column(String(20), default="active")
     created_at = Column(DateTime, default=now_naive)

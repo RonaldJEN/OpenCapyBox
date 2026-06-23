@@ -478,10 +478,31 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
             user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
             sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
 
-        if not sandbox_id:
-            raise RuntimeError(f"用户 {user_id} 无沙箱")
-
         sandbox = await sandbox_service.get_or_resume(user_id, sandbox_id)
+        latest_sandbox_id = sandbox_service.get_sandbox_id(user_id)
+        if isinstance(latest_sandbox_id, str) and latest_sandbox_id:
+            with SessionLocal() as db:
+                user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+                runtime_config = sandbox_service.get_cached_runtime_config(user_id)
+                if user_sandbox:
+                    user_sandbox.sandbox_id = latest_sandbox_id
+                    user_sandbox.status = "active"
+                    if runtime_config:
+                        user_sandbox.active_profile_id = runtime_config.profile_id
+                        user_sandbox.active_profile_version = runtime_config.profile_version
+                else:
+                    import uuid
+
+                    user_sandbox = UserSandbox(
+                        id=str(uuid.uuid4()),
+                        user_id=user_id,
+                        sandbox_id=latest_sandbox_id,
+                        active_profile_id=runtime_config.profile_id if runtime_config else None,
+                        active_profile_version=runtime_config.profile_version if runtime_config else None,
+                        status="active",
+                    )
+                    db.add(user_sandbox)
+                db.commit()
 
         try:
             from src.api.model_registry import get_model_registry
@@ -499,9 +520,11 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
             ) from e
 
         # 创建与聊天 Agent 同源的工具集，但排除无人值守场景不应具备的交互、记忆、Cron 管理和 sub_agent 工具。
-        from src.api.services.sandbox_service import get_sandbox_mount_path
+        mount = sandbox_service.get_mount_path(user_id)
+        if not isinstance(mount, str):
+            from src.api.services.sandbox_service import get_sandbox_mount_path
 
-        mount = get_sandbox_mount_path()
+            mount = get_sandbox_mount_path()
         run_workspace = f"{mount}/cron/runs/{run_id}"
         # mount 均来自配置、run_id 为 UUID，但这里一律走 shlex.quote，
         # 避免未来 mount 含空格/特殊字符时静默断裂，与 cron-spec.md 明令保持一致。

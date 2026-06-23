@@ -150,7 +150,7 @@
 - Query: `path: str = ""`（相对子目录）
 - Response 200: `{files: [{name, path, size, modified, type, is_directory}], total}`
 - `modified` 为带显式时区偏移的 ISO 8601 时间字符串，当前统一返回 UTC（如 `2026-05-08T02:30:00+00:00`）。
-- Error 404, 403（"路径越界"）
+- Error 404, 403（"路径越界"）, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）
 - 当 `sandbox_use_server_proxy=True` 时使用 `find` 命令替代 SDK
 
 ### GET /api/sessions/{id}/files/{path:path}
@@ -158,7 +158,7 @@
 - Query: `preview: bool = False`
 - Response: 文件字节流，`Content-Disposition` = attachment（下载）或 inline（预览）
 - 可预览类型：text/\*、image/\*、PDF、JSON、XML
-- Error 404, 400（"文件路径不合法"）, 503（"沙箱不可用"）
+- Error 404, 400（"文件路径不合法"）, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 503（"沙箱不可用"）
 
 ### GET /api/sessions/running-sessions
 
@@ -172,7 +172,7 @@
 - Body: multipart file
 - Response 200: `{name, path, size, modified, type}`
 - `modified` 为带显式时区偏移的 ISO 8601 时间字符串，当前统一返回 UTC（如 `2026-05-08T02:30:00+00:00`）。
-- Error 400（"未选择文件"）, 404, 503, 500
+- Error 400（"未选择文件"）, 404, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 503, 500
 - 重复文件名自动重命名（如 `document_1.pdf`）
 
 ## 4. 行为语义与不变量
@@ -185,7 +185,7 @@
 
 ## 5. 失败模式与错误处理
 
-- 沙箱不可用时文件操作返回 503
+- 沙箱 Profile 配置冲突（如绑定后端不存在/禁用）时文件操作保留服务层 409；普通沙箱连接不可用时文件操作返回 503
 - 沙箱过期时删除会话：DB 记录正常删除，沙箱文件可能残留（日志记录）
 - 文件读取支持 fallback（SDK → base64 命令）
 - Session 不属于当前用户时返回 404（不暴露是否存在）

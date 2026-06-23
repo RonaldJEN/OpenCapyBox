@@ -3,20 +3,27 @@ import { act, fireEvent, render, screen, waitFor } from '../utils/test-utils';
 import AdminConsole from '../../components/AdminConsole';
 import { apiService } from '../../services/api';
 import {
+  createAdminSandboxProfile,
   createAdminLdapUser,
   createAdminSimpleUser,
   deleteAdminUser,
   getAdminLLMCallRecordDetail,
   getAdminOverview,
   getAdminRoundsTree,
+  getAdminSandboxProfiles,
   getAdminSystem,
   getAdminUserLoginEvents,
   getAdminUsers,
   resetAdminSimpleUserPassword,
+  setAdminSandboxProfileDefault,
+  setAdminSandboxProfileEnabled,
+  updateAdminSandboxProfile,
   updateAdminUserAdmin,
   updateAdminUserEnabled,
+  updateAdminUserSandboxProfile,
   updateAdminUserTokenLimits,
   updateAdminLLMCallReview,
+  type AdminSandboxProfile,
   type AdminUserItem,
 } from '../../services/adminApi';
 
@@ -29,6 +36,7 @@ vi.mock('../../services/api', () => ({
 }));
 
 vi.mock('../../services/adminApi', () => ({
+  createAdminSandboxProfile: vi.fn(),
   createAdminSimpleUser: vi.fn(),
   createAdminLdapUser: vi.fn(),
   deleteAdminUser: vi.fn(),
@@ -36,8 +44,13 @@ vi.mock('../../services/adminApi', () => ({
   getAdminRoundsTree: vi.fn(),
   getAdminLLMCallRecordDetail: vi.fn(),
   getAdminUsers: vi.fn(),
+  getAdminSandboxProfiles: vi.fn(),
   getAdminSystem: vi.fn(),
   getAdminUserLoginEvents: vi.fn(),
+  updateAdminSandboxProfile: vi.fn(),
+  setAdminSandboxProfileDefault: vi.fn(),
+  setAdminSandboxProfileEnabled: vi.fn(),
+  updateAdminUserSandboxProfile: vi.fn(),
   updateAdminUserEnabled: vi.fn(),
   updateAdminUserAdmin: vi.fn(),
   updateAdminUserTokenLimits: vi.fn(),
@@ -78,6 +91,26 @@ function makeAdminUser(overrides: Partial<AdminUserItem> = {}): AdminUserItem {
     last_login_at: '2026-05-10T09:00:00',
     last_login_ip: '198.51.100.7',
     created_by: 'admin',
+    created_at: '2026-05-01T08:00:00',
+    updated_at: '2026-05-10T09:00:00',
+    ...overrides,
+  };
+}
+
+function makeSandboxProfile(overrides: Partial<AdminSandboxProfile> = {}): AdminSandboxProfile {
+  return {
+    id: 'default-profile',
+    name: '默认沙箱',
+    description: null,
+    department: '默认',
+    domain: '127.0.0.1:8080',
+    protocol: 'http',
+    api_key_set: true,
+    use_server_proxy: true,
+    is_default: true,
+    enabled: true,
+    version: 1,
+    bound_users: 1,
     created_at: '2026-05-01T08:00:00',
     updated_at: '2026-05-10T09:00:00',
     ...overrides,
@@ -162,6 +195,10 @@ describe('AdminConsole 组件', () => {
       users: [],
     });
 
+    vi.mocked(getAdminSandboxProfiles).mockResolvedValue({
+      profiles: [makeSandboxProfile()],
+    });
+
     vi.mocked(getAdminSystem).mockResolvedValue({
       window_hours: 24,
       summary: {
@@ -210,6 +247,23 @@ describe('AdminConsole 组件', () => {
     vi.mocked(updateAdminUserTokenLimits).mockResolvedValue(userPayload);
     vi.mocked(resetAdminSimpleUserPassword).mockResolvedValue(userPayload);
     vi.mocked(deleteAdminUser).mockResolvedValue({ user_id: 'demo', deleted: true });
+    vi.mocked(createAdminSandboxProfile).mockResolvedValue(makeSandboxProfile());
+    vi.mocked(updateAdminSandboxProfile).mockResolvedValue(makeSandboxProfile());
+    vi.mocked(setAdminSandboxProfileDefault).mockResolvedValue(makeSandboxProfile());
+    vi.mocked(setAdminSandboxProfileEnabled).mockResolvedValue(makeSandboxProfile());
+    vi.mocked(updateAdminUserSandboxProfile).mockResolvedValue({
+      sandbox_profile_id: 'default-profile',
+      sandbox_profile_name: '默认沙箱',
+      sandbox_profile_source: 'default',
+      sandbox_profile_error: null,
+      sandbox_id: null,
+      sandbox_status: 'none',
+      sandbox_active_profile_id: null,
+      sandbox_active_profile_version: null,
+      sandbox_desired_profile_id: 'default-profile',
+      sandbox_desired_profile_version: 1,
+      sandbox_needs_recreate: false,
+    });
   });
 
   it('导航中应显示 Session监控 文案', async () => {
@@ -536,6 +590,7 @@ describe('AdminConsole 组件', () => {
         is_admin: true,
         token_limit_per_week: 1000,
         token_limit_per_month: null,
+        sandbox_profile_id: null,
       });
     });
   });
@@ -567,8 +622,44 @@ describe('AdminConsole 组件', () => {
         is_admin: false,
         token_limit_per_week: null,
         token_limit_per_month: null,
+        sandbox_profile_id: null,
       });
     });
+  });
+
+  it('沙箱配置保存成功但用户列表刷新失败时应提示刷新失败', async () => {
+    vi.mocked(getAdminUsers)
+      .mockResolvedValueOnce({
+        summary: {
+          users_total: 1,
+          admins_total: 1,
+          active_total: 1,
+          running_total: 0,
+        },
+        users: [],
+      })
+      .mockRejectedValueOnce(new Error('refresh users failed'));
+
+    render(<AdminConsole />);
+
+    await waitFor(() => {
+      expect(getAdminOverview).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /沙箱管理/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('沙箱后端列表')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    fireEvent.click(screen.getByRole('button', { name: /保存后端/ }));
+
+    await waitFor(() => {
+      expect(updateAdminSandboxProfile).toHaveBeenCalled();
+      expect(screen.getByText('沙箱后端已更新，但用户列表刷新失败，请手动刷新')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('沙箱配置操作失败，请稍后重试')).not.toBeInTheDocument();
   });
 
   it('用户管理页导出当前可见用户为 CSV', async () => {

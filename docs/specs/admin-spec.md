@@ -3,7 +3,7 @@
 ## 1. 模块职责边界
 
 - 为管理员提供跨用户的全局运维视图。
-- 提供概览、Session 监控、用户管理、系统监控等聚合接口。
+- 提供概览、Session 监控、用户管理、沙箱管理、系统监控等聚合接口。
 - 不负责业务执行（不创建会话、不驱动对话执行），仅做读侧聚合查询。
 
 ## 2. 鉴权与权限
@@ -61,20 +61,75 @@
 
 - 响应：
   - `summary`: 用户总数、管理员数、活跃用户数、运行中用户数
-  - `users`: 每个账号的 `user_id`、`username`、`auth_type`、`enabled`、角色（`admin/user`）、状态（`active/idle/running`）、会话/round/token/cron 指标、周/月 token 限额与用量
+  - `users`: 每个账号的 `user_id`、`username`、`auth_type`、`enabled`、角色（`admin/user`）、状态（`active/idle/running`）、会话/round/token/cron 指标、周/月 token 限额与用量、沙箱 Profile 与 DB 状态
 - 语义：`status=running`、`running_rounds` 与 `summary.running_total` 同时参考 `rounds.status='running'` 和新鲜的 `user_run_locks.updated_at` 心跳；Agent 已持有用户运行锁但尚未写入 running round 时也必须显示为运行中。
+- 沙箱字段：
+  - `sandbox_profile_id`: 用户显式绑定的 Profile ID；`null` 表示走默认 Profile。
+  - `sandbox_profile_name`: 当前期望 Profile 名称。
+  - `sandbox_profile_source`: `explicit` / `default` / `missing` / `disabled`。
+  - `sandbox_profile_error`: 显式绑定缺失或已禁用时返回错误说明；正常配置为 `null`。
+  - `sandbox_id`: DB 记录的当前用户 sandbox id。
+  - `sandbox_status`: DB 记录状态，非实时 OpenSandbox 探活。
+  - `sandbox_needs_recreate`: active Profile 指纹与当前期望 Profile 不一致时为 `true`。
 
 ### POST /api/admin/users/simple
 
-- Body: `{username, password, enabled?, is_admin?, token_limit_per_week?, token_limit_per_month?}`
+- Body: `{username, password, enabled?, is_admin?, token_limit_per_week?, token_limit_per_month?, sandbox_profile_id?}`
 - 响应：创建后的用户基础信息。
-- 语义：创建本地 simple 用户，密码只保存 hash。
+- 语义：创建本地 simple 用户，密码只保存 hash；传入 `sandbox_profile_id` 时同时建立显式沙箱 Profile 绑定。
 
 ### POST /api/admin/users/ldap
 
-- Body: `{user_id, username?, enabled?, is_admin?, token_limit_per_week?, token_limit_per_month?}`
+- Body: `{user_id, username?, enabled?, is_admin?, token_limit_per_week?, token_limit_per_month?, sandbox_profile_id?}`
 - 响应：创建后的用户基础信息。
-- 语义：创建 LDAP 用户，不保存密码；统一登录时通过 `user_id` 匹配并使用目录密码验证。
+- 语义：创建 LDAP 用户，不保存密码；统一登录时通过 `user_id` 匹配并使用目录密码验证；传入 `sandbox_profile_id` 时同时建立显式沙箱 Profile 绑定。
+
+### GET /api/admin/sandbox-profiles
+
+- 响应：`{profiles: AdminSandboxProfile[]}`。
+- 字段：
+  - `id`、`name`、`description`、`department`
+  - `domain`、`protocol`、`api_key_set`、`use_server_proxy`
+  - `is_default`、`enabled`、`version`
+  - `bound_users`
+  - `created_at`、`updated_at`
+- 语义：列表状态来自 DB，不实时查询 OpenSandbox VM。
+
+### POST /api/admin/sandbox-profiles
+
+- Body: `{name, description?, department?, domain, api_key, protocol?, use_server_proxy?, enabled?}`
+- 响应：创建后的 Profile。
+- 约束：`name` 唯一；`api_key` 必填且不能为空；`protocol` 仅支持 `http` / `https`。镜像、资源限制、宿主存储根与容器挂载路径均使用全局配置，不按 Profile 自定义。MVP 仅保存 Profile 当前值和 `created_at` / `updated_at`，不保存配置变更审计历史。
+
+### PATCH /api/admin/sandbox-profiles/{profile_id}
+
+- Body: `{name?, description?, department?, domain?, protocol?, api_key?, use_server_proxy?}`。
+- 响应：更新后的 Profile。
+- 语义：修改连接字段会使 `version + 1`，后续用户 sandbox/Agent 会按新版本重建。MVP 不主动迁移文件或跨 OpenSandbox 后端清理旧 sandbox，旧 sandbox 依赖 OpenSandbox TTL 回收；后续和数据迁移方案一起设计主动清理、连接快照或 Profile revision history。空 `api_key` 表示不改现有密钥；不支持清空密钥；管理端不回显明文密钥，只返回 `api_key_set`。
+- 记录：当前仅更新 Profile 行的 `updated_at` 与 `version`，不记录修改人、字段 diff 或历史连接配置。若要切换到新的 OpenSandbox 后端，建议新建 Profile 并重新分配用户，而不是原地修改既有 Profile 的 runtime 连接字段。
+
+### PATCH /api/admin/sandbox-profiles/{profile_id}/default
+
+- 响应：更新后的 Profile。
+- 语义：将指定 Profile 设为全局默认；未显式绑定 Profile 的用户下次使用该默认 Profile。禁用 Profile 不能设为默认。
+
+### PATCH /api/admin/sandbox-profiles/{profile_id}/enabled
+
+- Body: `{enabled: bool}`
+- 响应：更新后的 Profile。
+- 语义：启用/禁用 Profile。默认 Profile 不能禁用。禁用已绑定 Profile 后，相关用户启动新任务会返回 409，管理员应重新分配。
+
+### PATCH /api/admin/users/{user_id}/sandbox-profile
+
+- Body: `{sandbox_profile_id: string|null, force_recreate?: bool}`
+- 响应：用户最新沙箱 Profile 摘要。
+- 语义：管理员为用户显式绑定非默认 Profile，或传 `null` 恢复使用默认 Profile；传入当前默认 Profile ID 时按 `null` 归一化处理。
+- 约束：
+  - 目标 Profile 必须存在且启用；默认 Profile 不作为显式绑定保存。
+  - 用户有新鲜运行锁或 running cron run 且 `force_recreate=false` 时返回 409；`force_recreate=true` 表示管理员确认强制失效该用户 Agent/Sandbox 并切换。
+  - 更新绑定前会失效该用户 AgentPool 缓存，并 best-effort kill 旧 sandbox / 清除旧 `user_sandboxes` 绑定；kill 失败只记录 warning，不阻断配置切换。旧 sandbox 若无法按 active Profile 指纹重新连接，不回退到新 Profile 或 `.env` 连接；容器依赖 OpenSandbox 空闲 TTL 回收，TTL 由 `SANDBOX_TIMEOUT_MINUTES` 控制，默认 60 分钟。
+  - MVP 不做 sandbox 文件迁移；DB-backed 记忆文件会在新 sandbox 中重新同步。
+- 记录：用户 Profile 分配记录保存在 `user_sandbox_configs`，包含 `updated_by`、`created_at`、`updated_at`，但不保存多版本分配历史。
 
 ### PATCH /api/admin/users/{user_id}/enabled
 
@@ -101,7 +156,7 @@
 - 响应：`{user_id: str, deleted: true}`
 - 语义：不可恢复地删除 `auth_users` 账号记录，并清理该 `user_id` 归属的 session、round、conversation message、AG-UI event、LLM 调用记录、subagent graph edge、channel session binding、cron job / fire / run、memory、embedding、skill 配置、运行锁、取消请求、user_sandboxes 绑定与 sandbox 文件。
 - 同名 `user_id` 删除后可以重新创建；新账号不得看到旧用户数据。
-- 约束：管理员不能删除当前登录账号；存在新鲜 `user_run_locks.updated_at` 心跳代表的运行中用户任务或运行中的 cron run 时返回 409；sandbox 清理失败时返回 409 且不得删除用户。
+- 约束：管理员不能删除当前登录账号；存在新鲜 `user_run_locks.updated_at` 心跳代表的运行中用户任务或运行中的 cron run 时返回 409；sandbox 清理失败时返回 409 且不得删除用户。若待清理 sandbox 已在进程内缓存，可直接使用 live sandbox 对象清理；若需要按 `sandbox_id` 重新连接/恢复，而 active Profile 指纹无法解析或版本不匹配，则视为 sandbox 清理失败。删除用户比切换 Profile 更严格，因为同名 `user_id` 未来可重建，必须避免新账号继承旧持久化文件。
 
 ### GET /api/admin/system
 

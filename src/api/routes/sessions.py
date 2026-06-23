@@ -309,10 +309,25 @@ def _upsert_user_sandbox(db: DBSession, user_id: str, sandbox_service) -> None:
     new_id = sandbox_service.get_sandbox_id(user_id)
     if not new_id:
         return
+    runtime_config = None
+    if hasattr(sandbox_service, "get_cached_runtime_config"):
+        runtime_config = sandbox_service.get_cached_runtime_config(user_id)
     user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
     if user_sandbox:
-        if user_sandbox.sandbox_id != new_id:
+        if (
+            user_sandbox.sandbox_id != new_id
+            or (
+                runtime_config
+                and (
+                    user_sandbox.active_profile_id != runtime_config.profile_id
+                    or int(user_sandbox.active_profile_version or 0) != runtime_config.profile_version
+                )
+            )
+        ):
             user_sandbox.sandbox_id = new_id
+            if runtime_config:
+                user_sandbox.active_profile_id = runtime_config.profile_id
+                user_sandbox.active_profile_version = runtime_config.profile_version
             user_sandbox.status = "active"
             db.commit()
     else:
@@ -320,6 +335,8 @@ def _upsert_user_sandbox(db: DBSession, user_id: str, sandbox_service) -> None:
             id=str(uuid.uuid4()),
             user_id=user_id,
             sandbox_id=new_id,
+            active_profile_id=runtime_config.profile_id if runtime_config else None,
+            active_profile_version=runtime_config.profile_version if runtime_config else None,
             status="active",
         )
         db.add(user_sandbox)
@@ -342,9 +359,15 @@ async def _ensure_sandbox(sandbox_service, user_id: str, db: DBSession, *, force
     sandbox = sandbox_service.get_cached(user_id)
     if sandbox:
         cached_sandbox_id = getattr(sandbox, "id", None)
-        if persisted_sandbox_id and cached_sandbox_id != persisted_sandbox_id:
+        cached_current = not persisted_sandbox_id or cached_sandbox_id == persisted_sandbox_id
+        cached_is_current = getattr(sandbox_service, "cached_is_current", None)
+        if callable(cached_is_current):
+            current_result = cached_is_current(user_id, persisted_sandbox_id)
+            if isinstance(current_result, bool):
+                cached_current = current_result
+        if not cached_current:
             logger.warning(
-                "沙箱快取與 DB 綁定不一致，移除快取 (user=%s, cached=%s, persisted=%s)",
+                "沙箱快取與 DB/profile 綁定不一致，移除快取 (user=%s, cached=%s, persisted=%s)",
                 user_id,
                 cached_sandbox_id,
                 persisted_sandbox_id,
@@ -767,9 +790,8 @@ async def delete_session(
             sandbox = None
 
     if sandbox:
-        from src.api.services.sandbox_service import get_sandbox_mount_path
         import shlex as _shlex
-        session_dir = f"{get_sandbox_mount_path()}/sessions/{chat_session_id}"
+        session_dir = f"{sandbox_service.get_mount_path(user_id)}/sessions/{chat_session_id}"
         try:
             await sandbox.commands.run(
                 f"rm -rf {_shlex.quote(session_dir)} 2>/dev/null || true"
@@ -814,7 +836,7 @@ async def get_session_files(
     # 從用戶沙箱獲取 session 子目錄的文件列表
     user_id = session.user_id
     sandbox_service = get_sandbox_service()
-    mount_path = sandbox_service.get_mount_path()
+    mount_path = sandbox_service.get_mount_path(user_id)
     session_root = f"{mount_path}/sessions/{chat_session_id}"
 
     # 構建目標目錄並校驗路徑安全
@@ -828,6 +850,8 @@ async def get_session_files(
 
     try:
         sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning("無法連接沙箱獲取文件列表: %s", e)
         return FileListResponse(files=[], total=0)
@@ -842,6 +866,8 @@ async def get_session_files(
             sandbox = await _ensure_sandbox(sandbox_service, user_id, db, force_refresh=True)
             files = await _sandbox_list_dir(sandbox, target_dir, session_root)
             return FileListResponse(files=files, total=len(files))
+        except HTTPException:
+            raise
         except Exception:
             return FileListResponse(files=[], total=0)
 
@@ -875,11 +901,13 @@ async def download_file(
     # 獲取用戶沙箱，文件路徑基於 session 子目錄
     user_id = session.user_id
     sandbox_service = get_sandbox_service()
-    mount_path = sandbox_service.get_mount_path()
+    mount_path = sandbox_service.get_mount_path(user_id)
     session_root = f"{mount_path}/sessions/{chat_session_id}"
 
     try:
         sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning("無法連接沙箱下載文件: %s", e)
         raise HTTPException(status_code=503, detail="沙箱不可用")
@@ -1024,7 +1052,7 @@ async def upload_file(
     # 獲取用戶沙箱，文件上傳到 session 子目錄
     user_id = session.user_id
     sandbox_service = get_sandbox_service()
-    mount_path = sandbox_service.get_mount_path()
+    mount_path = sandbox_service.get_mount_path(user_id)
     session_root = f"{mount_path}/sessions/{chat_session_id}"
 
     # 提前讀取文件內容（重試時不可重複讀取 UploadFile）
@@ -1040,6 +1068,8 @@ async def upload_file(
             sandbox = await _ensure_sandbox(
                 sandbox_service, user_id, db, force_refresh=(attempt > 0),
             )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.warning("無法連接沙箱上傳文件: %s", e)
             raise HTTPException(status_code=503, detail="沙箱不可用")

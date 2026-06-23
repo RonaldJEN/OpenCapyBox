@@ -30,6 +30,7 @@ from src.api.models.subagent_run import SubagentRun
 from src.api.models.user_memory import CronJobRun, MemoryEmbedding, UserMemory, UserSkillConfig
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_sandbox import UserSandbox
+from src.api.models.user_sandbox_config import UserSandboxConfig
 from src.api.utils.timezone import now_naive
 
 
@@ -435,6 +436,7 @@ def _purge_user_owned_data(db: DBSession, *, user_id: str) -> None:
         db.query(Session).filter(Session.id.in_(session_ids)).delete(synchronize_session=False)
 
     db.query(UserSandbox).filter(UserSandbox.user_id == user_id).delete(synchronize_session=False)
+    db.query(UserSandboxConfig).filter(UserSandboxConfig.user_id == user_id).delete(synchronize_session=False)
 
 
 def _validate_simple_username(username: str) -> None:
