@@ -8,7 +8,8 @@ import mammoth from 'mammoth';
 import DOMPurify from 'dompurify';
 import { FileInfo } from '../types';
 import { apiService } from '../services/api';
-import { getFileExtLabel } from '../utils/fileUtils';
+import { formatDownloadError } from '../utils/errorMessages';
+import { buildSandboxFileUrl, getFileExtLabel, normalizeFileType } from '../utils/fileUtils';
 
 interface FilePreviewProps {
   file: FileInfo | null;
@@ -73,7 +74,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
   const getPreviewApiUrl = () => {
     if (!file) return '';
     if (previewUrlBuilder) return previewUrlBuilder(file);
-    return `/api/sessions/${sessionId}/files/${encodeURIComponent(file.path)}?preview=true`;
+    return buildSandboxFileUrl(sessionId, file.path, true);
   };
 
   const getPreviewCacheKey = () => {
@@ -115,15 +116,16 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
       return '';
     });
 
-    if (isTextFile(file.type) || isMarkdownFile(file.type) || isHtmlFile(file.type) || isCodeFile(file.type)) {
+    const fileType = normalizeFileType(file.name, file.type);
+    if (isTextFile(fileType) || isMarkdownFile(fileType) || isHtmlFile(fileType) || isCodeFile(fileType)) {
       void loadTextContent(currentRequestId);
-    } else if (isDocxFile(file.type)) {
+    } else if (isDocxFile(fileType)) {
       void loadDocxContent(currentRequestId);
-    } else if (isCsvFile(file.type)) {
+    } else if (isCsvFile(fileType)) {
       void loadCsvContent(currentRequestId);
-    } else if (isExcelFile(file.type)) {
+    } else if (isExcelFile(fileType)) {
       void loadSpreadsheetContent(currentRequestId);
-    } else if (isImageFile(file.type) || isPdfFile(file.type)) {
+    } else if (isImageFile(fileType) || isPdfFile(fileType)) {
       void loadBinaryPreview(currentRequestId);
     }
   }, [file]);
@@ -160,7 +162,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
       if (cached && cached.kind === 'text') {
         if (requestId !== requestIdRef.current) return;
         setTextContent(cached.text);
-        if (file && isHtmlFile(file.type)) {
+        if (file && isHtmlFile(normalizeFileType(file.name, file.type))) {
           setHtmlPreviewFromText(cached.text);
         }
         return;
@@ -173,7 +175,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
       if (cacheKey) {
         writePreviewCache(cacheKey, { kind: 'text', text });
       }
-      if (file && isHtmlFile(file.type)) {
+      if (file && isHtmlFile(normalizeFileType(file.name, file.type))) {
         setHtmlPreviewFromText(text);
       }
     } catch (err) {
@@ -385,11 +387,12 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
       }
     } catch (err) {
       console.error('Failed to download file:', err);
-      setError('下载文件失败');
+      setError(formatDownloadError(err));
     }
   };
 
   if (!file) return null;
+  const fileType = normalizeFileType(file.name, file.type);
 
   const cardClassName = inline
     ? 'h-full flex flex-col bg-white'
@@ -444,7 +447,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
       >
         <div className="flex items-center space-x-4">
           <div className="w-10 h-10 bg-claude-surface rounded-xl flex items-center justify-center text-claude-accent">
-            {getFileIcon(file.type, 20)}
+            {getFileIcon(fileType, 20)}
           </div>
           <div>
             <h2 className="text-[15px] font-semibold tracking-tight text-claude-text">{file.name}</h2>
@@ -455,7 +458,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
         </div>
         <div className="flex items-center space-x-2">
           {/* HTML/MD 视图切换 */}
-          {(isHtmlFile(file.type) || isMarkdownFile(file.type)) && (
+          {(isHtmlFile(fileType) || isMarkdownFile(fileType)) && (
             <div className="flex bg-claude-surface rounded-xl p-1 mr-2">
               <button
                 onClick={() => setViewMode('rendered')}
@@ -513,7 +516,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
               ))}
             </div>
           </div>
-        ) : isImageFile(file.type) ? (
+        ) : isImageFile(fileType) ? (
           <div className="h-full flex items-center justify-center">
             <div className="w-full max-w-2xl bg-white border border-black/[0.05] rounded-3xl shadow-xl p-4">
               <img
@@ -524,7 +527,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
               />
             </div>
           </div>
-        ) : isPdfFile(file.type) ? (
+        ) : isPdfFile(fileType) ? (
           <div className="w-full h-full bg-white rounded-2xl overflow-hidden shadow-lg">
             <iframe
               src={binaryPreviewUrl}
@@ -533,7 +536,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
               onError={() => setError('PDF 加载失败')}
             />
           </div>
-        ) : isMarkdownFile(file.type) ? (
+        ) : isMarkdownFile(fileType) ? (
           viewMode === 'rendered' ? (
             <div className="max-w-2xl mx-auto bg-white p-12 rounded-2xl shadow-sm border border-black/[0.03]">
               <div className="prose max-w-none">
@@ -552,7 +555,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
               </SyntaxHighlighter>
             </div>
           )
-        ) : isHtmlFile(file.type) ? (
+        ) : isHtmlFile(fileType) ? (
           viewMode === 'rendered' ? (
             <div className="relative w-full h-full bg-white rounded-2xl overflow-hidden shadow-lg">
               {htmlFrameLoading && (
@@ -587,22 +590,22 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
               </SyntaxHighlighter>
             </div>
           )
-        ) : isCodeFile(file.type) ? (
+        ) : isCodeFile(fileType) ? (
           <div className="bg-[#1C1C1E] rounded-2xl shadow-2xl ring-1 ring-white/10 overflow-hidden">
-            <SyntaxHighlighter language={getLanguage(file.type)} style={vscDarkPlus} showLineNumbers customStyle={{ margin: 0, borderRadius: 0, fontSize: '13px', background: 'transparent' }}>
+            <SyntaxHighlighter language={getLanguage(fileType)} style={vscDarkPlus} showLineNumbers customStyle={{ margin: 0, borderRadius: 0, fontSize: '13px', background: 'transparent' }}>
               {textContent}
             </SyntaxHighlighter>
           </div>
-        ) : isTextFile(file.type) ? (
+        ) : isTextFile(fileType) ? (
           <div className="max-w-2xl mx-auto bg-white p-8 rounded-2xl shadow-sm border border-black/[0.03]">
             <pre className="text-[13px] font-mono text-claude-text whitespace-pre-wrap break-words">{textContent}</pre>
           </div>
-        ) : isDocxFile(file.type) ? (
+        ) : isDocxFile(fileType) ? (
           <div className="max-w-2xl mx-auto bg-white p-12 rounded-2xl shadow-sm border border-black/[0.03]">
             <div className="prose max-w-none" dangerouslySetInnerHTML={{ __html: docxHtml }} />
           </div>
-        ) : isSpreadsheetFile(file.type) ? (
-          isCsvFile(file.type) ? (
+        ) : isSpreadsheetFile(fileType) ? (
+          isCsvFile(fileType) ? (
             renderTablePreview(tableData)
           ) : (
             <div className="space-y-3">
@@ -629,7 +632,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
               {renderTablePreview(activeSpreadsheetSheet?.rows || [])}
             </div>
           )
-        ) : isPptxFile(file.type) ? (
+        ) : isPptxFile(fileType) ? (
           <div className="flex flex-col items-center justify-center py-12 px-6">
             <div className="mb-6 p-6 bg-[#FF9500]/10 rounded-full">
               <Presentation className="w-16 h-16 text-[#FF9500]" />

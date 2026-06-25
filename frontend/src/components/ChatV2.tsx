@@ -17,6 +17,12 @@ import {
 import { readFileAsDataUrl } from '../utils/imageUtils';
 import { toFileInfo, isImageFile } from '../utils/fileUtils';
 import { extractAssistantFiles } from '../utils/assistantFileRefs';
+import {
+  MAX_TEXT_BLOCK_CHARS,
+  formatSendError,
+  formatUploadError,
+  messageTooLongText,
+} from '../utils/errorMessages';
 import { Round } from './Round';
 import { ArtifactsPanel } from './ArtifactsPanel';
 import { FilePreview } from './FilePreview';
@@ -278,6 +284,10 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     const trimmed = text.trim();
     const toMimeType = (value?: string) => (value && value.includes('/') ? value : undefined);
     if (trimmed) {
+      const textLength = [...trimmed].length;
+      if (textLength > MAX_TEXT_BLOCK_CHARS) {
+        throw new Error(messageTooLongText(textLength));
+      }
       blocks.push({ type: 'text', text: trimmed });
     }
 
@@ -1053,7 +1063,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
       console.log(`✅ 上传成功: ${uploadedFiles.length} 个文件`);
     } catch (err) {
       console.error('Failed to upload files:', err);
-      setError('文件上传失败');
+      setError(formatUploadError(err));
     } finally {
       setUploading(false);
       setCreatingSession(false);
@@ -1748,10 +1758,7 @@ export function ChatV2({ sessionId, onTitleUpdated, onExecutionStart, onExecutio
     } catch (err: any) {
       console.error('Failed to send message:', err);
 
-      let errorMessage = '发送消息失败';
-      if (err.message) {
-        errorMessage = err.message;
-      }
+      const errorMessage = formatSendError(err);
 
       setError(errorMessage);
       setSending(false);

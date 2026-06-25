@@ -14,6 +14,8 @@ import type {
   SubscribeCallbacks,
   SubscriptionResult,
 } from '../types';
+import { buildSandboxFileUrl } from '../utils/fileUtils';
+import { formatHttpErrorMessage } from '../utils/errorMessages';
 
 /**
  * 幂等衝突：服務端已有對應 Round，客戶端應走 subscribe 路徑
@@ -360,14 +362,7 @@ class APIService {
           .then(async (response) => {
             if (!response.ok) {
               const errorText = await response.text();
-              // 尝试从 JSON 响应中提取 detail 字段
-              let friendlyMsg = `HTTP ${response.status}: ${errorText}`;
-              try {
-                const parsed = JSON.parse(errorText);
-                if (parsed.detail) {
-                  friendlyMsg = parsed.detail;
-                }
-              } catch { /* not JSON, use raw text */ }
+              const friendlyMsg = formatHttpErrorMessage(response.status, errorText);
               throw new HttpError(response.status, friendlyMsg);
             }
 
@@ -756,7 +751,7 @@ class APIService {
         .then(async (response) => {
           if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errorText}`);
+            throw new HttpError(response.status, formatHttpErrorMessage(response.status, errorText));
           }
 
           const reader = response.body?.getReader();
@@ -975,7 +970,7 @@ class APIService {
         .then(async (response) => {
           if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errorText}`);
+            throw new HttpError(response.status, formatHttpErrorMessage(response.status, errorText));
           }
 
           callbacks.onStreamAccepted?.();
@@ -1067,7 +1062,7 @@ class APIService {
    * 🆕 下载会话中的文件
    */
   async downloadFile(chatSessionId: string, filePath: string): Promise<void> {
-    const url = `/api/sessions/${chatSessionId}/files/${filePath}`;
+    const url = buildSandboxFileUrl(chatSessionId, filePath, false);
     const response = await fetch(url, {
       method: 'GET',
       headers: {
@@ -1076,7 +1071,8 @@ class APIService {
     });
 
     if (!response.ok) {
-      throw new Error(`下载失败: HTTP ${response.status}`);
+      const errorText = await response.text();
+      throw new HttpError(response.status, formatHttpErrorMessage(response.status, errorText));
     }
 
     const blob = await response.blob();

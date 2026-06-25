@@ -12,6 +12,7 @@ class ToolResult(BaseModel):
     success: bool
     content: str = ""
     error: str | None = None
+    content_blocks: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)

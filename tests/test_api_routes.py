@@ -1115,6 +1115,10 @@ class TestEnsureSandbox:
         stale_sandbox.files.write = AsyncMock(side_effect=Exception("404 Not Found"))
 
         fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-fresh")
+        fresh_sandbox.commands.run = AsyncMock(side_effect=[
+            make_fake_execution(stdout_text=""),
+            make_fake_execution(stdout_text="NOT_EXISTS"),
+        ])
 
         sandbox_service = MagicMock()
         # 第一次 get_cached 返回陳舊沙箱，第二次（force_refresh 後）返回 None
@@ -1152,11 +1156,174 @@ class TestEnsureSandbox:
                 db=mock_db,
             )
 
-        # 重試成功：fresh_sandbox 的 write 被調用
-        fresh_sandbox.files.write.assert_awaited_once()
+        # 重試成功：fresh_sandbox 直接寫入清洗後的文件名
+        assert fresh_sandbox.files.write.await_count == 1
+        assert fresh_sandbox.files.write.await_args.args[0] == "/home/user/sessions/session-1/test.txt"
         assert result.name == "test.txt"
+        assert result.path == "test.txt"
         assert result.size == 5
+        assert result.type == "txt"
         assert datetime.fromisoformat(result.modified).tzinfo == timezone.utc
+
+    @pytest.mark.asyncio
+    async def test_upload_sanitizes_special_chars_preserving_chinese(self):
+        """上传中文/空格/括号文件名时直接使用清洗后的会话内路径。"""
+        from src.api.routes.sessions import upload_file
+        from src.api.models.session import Session
+        from src.api.models.user_sandbox import UserSandbox
+        from tests.helpers import make_mock_sandbox
+
+        sandbox = make_mock_sandbox(sandbox_id="sbx-upload")
+        sandbox.commands.run = AsyncMock(side_effect=[
+            make_fake_execution(stdout_text=""),
+            make_fake_execution(stdout_text="NOT_EXISTS"),
+        ])
+
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = sandbox
+        sandbox_service.get_mount_path.return_value = "/home/user"
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "user-1"
+
+        def query_side_effect(model):
+            q = MagicMock()
+            if model is Session:
+                q.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                q.filter.return_value.first.return_value = None
+            return q
+
+        mock_db = MagicMock()
+        mock_db.query.side_effect = query_side_effect
+
+        mock_file = AsyncMock()
+        mock_file.filename = "報告(最終版).docx"
+        mock_file.read = AsyncMock(return_value=b"hello")
+        mock_file.content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+        with patch("src.api.routes.sessions.get_sandbox_service", return_value=sandbox_service):
+            result = await upload_file(
+                chat_session_id="session-1",
+                file=mock_file,
+                user_id="user-1",
+                db=mock_db,
+            )
+
+        assert result.name == "報告_最終版.docx"
+        assert result.path == "報告_最終版.docx"
+        assert result.type == "docx"
+        assert result.size == 5
+        assert sandbox.files.write.await_count == 1
+        assert sandbox.files.write.await_args.args[0] == "/home/user/sessions/session-1/報告_最終版.docx"
+
+    @pytest.mark.asyncio
+    async def test_upload_renames_existing_sanitized_file(self):
+        """清洗后的文件名已存在时追加序号，避免覆盖用户文件。"""
+        from src.api.routes.sessions import upload_file
+        from src.api.models.session import Session
+        from src.api.models.user_sandbox import UserSandbox
+        from tests.helpers import make_mock_sandbox
+
+        sandbox = make_mock_sandbox(sandbox_id="sbx-upload")
+        sandbox.commands.run = AsyncMock(side_effect=[
+            make_fake_execution(stdout_text=""),
+            make_fake_execution(stdout_text="EXISTS"),
+            make_fake_execution(stdout_text="NOT_EXISTS"),
+        ])
+
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = sandbox
+        sandbox_service.get_mount_path.return_value = "/home/user"
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "user-1"
+
+        def query_side_effect(model):
+            q = MagicMock()
+            if model is Session:
+                q.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                q.filter.return_value.first.return_value = None
+            return q
+
+        mock_db = MagicMock()
+        mock_db.query.side_effect = query_side_effect
+
+        mock_file = AsyncMock()
+        mock_file.filename = "report (1).txt"
+        mock_file.read = AsyncMock(return_value=b"hello")
+        mock_file.content_type = "text/plain"
+
+        with patch("src.api.routes.sessions.get_sandbox_service", return_value=sandbox_service):
+            result = await upload_file(
+                chat_session_id="session-1",
+                file=mock_file,
+                user_id="user-1",
+                db=mock_db,
+            )
+
+        assert result.name == "report_1_1.txt"
+        assert result.path == "report_1_1.txt"
+        assert result.type == "txt"
+        assert sandbox.files.write.await_args.args[0] == "/home/user/sessions/session-1/report_1_1.txt"
+
+    @pytest.mark.asyncio
+    async def test_upload_does_not_write_when_existence_check_fails(self):
+        """无法确认目标是否已存在时应失败关闭，不能继续覆盖写入。"""
+        from fastapi import HTTPException
+        from src.api.routes.sessions import upload_file
+        from src.api.models.session import Session
+        from src.api.models.user_sandbox import UserSandbox
+        from tests.helpers import make_mock_sandbox
+
+        sandbox = make_mock_sandbox(sandbox_id="sbx-upload")
+        sandbox.commands.run = AsyncMock(side_effect=[
+            make_fake_execution(stdout_text=""),
+            RuntimeError("stat failed"),
+            make_fake_execution(stdout_text=""),
+            RuntimeError("stat failed again"),
+        ])
+
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = sandbox
+        sandbox_service.get_mount_path.return_value = "/home/user"
+
+        mock_session = MagicMock()
+        mock_session.id = "session-1"
+        mock_session.user_id = "user-1"
+
+        def query_side_effect(model):
+            q = MagicMock()
+            if model is Session:
+                q.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                q.filter.return_value.first.return_value = None
+            return q
+
+        mock_db = MagicMock()
+        mock_db.query.side_effect = query_side_effect
+
+        mock_file = AsyncMock()
+        mock_file.filename = "report.txt"
+        mock_file.read = AsyncMock(return_value=b"hello")
+        mock_file.content_type = "text/plain"
+
+        with patch("src.api.routes.sessions.get_sandbox_service", return_value=sandbox_service):
+            with pytest.raises(HTTPException) as exc:
+                await upload_file(
+                    chat_session_id="session-1",
+                    file=mock_file,
+                    user_id="user-1",
+                    db=mock_db,
+                )
+
+        assert exc.value.status_code == 500
+        assert "无法确认上传目标是否存在" in exc.value.detail
+        assert "stat failed again" in exc.value.detail
+        sandbox.files.write.assert_not_awaited()
 
 
 class TestExtractExitCode:
@@ -1544,7 +1711,6 @@ class TestSandboxListDir:
 
         assert len(items) == 1
         assert items[0].name == "visible.txt"
-
 
 class TestAbortEndpoint:
     """Abort 端點測試"""

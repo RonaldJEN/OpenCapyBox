@@ -36,27 +36,31 @@ start_uvicorn_backend() {
     fi
 }
 
-# Python 运行方式检测：uv > conda(agentskill) > system python
+# Python 运行方式检测：active conda > project .venv > uv > system python
 PYTHON_CMD=""
 USE_UV=false
 
 detect_python() {
-    # 优先使用项目 .venv（跨平台最可靠）
-    if [ -f "$PROJECT_ROOT/.venv/bin/python" ]; then
+    # PowerShell/conda 激活后再进入 bash 时，优先尊重当前环境。
+    # Windows 下直接调用 .venv/Scripts/python.exe 可能因 shell/ACL 组合触发 Permission denied。
+    if [ -n "$CONDA_PREFIX" ] && command -v python &> /dev/null; then
+        conda_env_name="$(basename "$CONDA_PREFIX")"
+        if [ "$conda_env_name" = "agentskill" ] || [[ "$CONDA_PREFIX" == *"agentskill" ]]; then
+            PYTHON_CMD="python"
+            info "使用已激活的 conda agentskill 环境"
+        else
+            PYTHON_CMD="python"
+            info "使用已激活的 conda 环境: $conda_env_name"
+        fi
+    elif [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
         PYTHON_CMD="$PROJECT_ROOT/.venv/bin/python"
         info "使用项目 .venv 环境"
-    elif [ -f "$PROJECT_ROOT/.venv/Scripts/python.exe" ]; then
+    elif [ -x "$PROJECT_ROOT/.venv/Scripts/python.exe" ]; then
         PYTHON_CMD="$PROJECT_ROOT/.venv/Scripts/python.exe"
         info "使用项目 .venv 环境 (Windows)"
-    elif [ -n "$CONDA_PREFIX" ] && [ "$(basename $CONDA_PREFIX)" = "agentskill" ]; then
-        PYTHON_CMD="python"
-        info "使用已激活的 conda agentskill 环境"
     elif [ -f "$HOME/miniconda3/envs/agentskill/bin/python" ]; then
         PYTHON_CMD="$HOME/miniconda3/envs/agentskill/bin/python"
         info "使用 conda agentskill 环境"
-    elif [ -n "$CONDA_PREFIX" ] && command -v python &> /dev/null; then
-        PYTHON_CMD="python"
-        info "使用 conda 环境: $(basename $CONDA_PREFIX)"
     elif command -v uv &> /dev/null; then
         USE_UV=true
         PYTHON_CMD="uv run python"

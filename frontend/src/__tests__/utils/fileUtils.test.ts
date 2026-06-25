@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isImageFile, getFileIcon, inferFileType, getFileExtLabel, getFileBadgeClass, getFileIconClass } from '../../utils/fileUtils';
+import { isImageFile, getFileIcon, inferFileType, getFileExtLabel, getFileBadgeClass, getFileIconClass, normalizeFileType } from '../../utils/fileUtils';
 import { FileImage, FileText } from 'lucide-react';
 
 describe('fileUtils.isImageFile', () => {
@@ -37,6 +37,16 @@ describe('fileUtils.inferFileType', () => {
 
   it('無 MIME 時從副檔名推斷', () => {
     expect(inferFileType('archive.tar.gz')).toBe('gz');
+  });
+});
+
+describe('fileUtils.normalizeFileType', () => {
+  it('無副檔名時應從 MIME 類型推斷', () => {
+    expect(normalizeFileType('screenshot', 'image/png')).toBe('png');
+  });
+
+  it('有副檔名時優先使用副檔名', () => {
+    expect(normalizeFileType('report.docx', 'application/octet-stream')).toBe('docx');
   });
 });
 

@@ -46,6 +46,7 @@ router = APIRouter()
 
 _SESSION_SEARCH_RESULT_LIMIT = 50
 
+
 # 使用 AgentPoolService 管理 Agent 實例
 from src.api.services.agent_pool_service import get_agent_pool
 
@@ -67,7 +68,8 @@ def encode_filename_header(filename: str, disposition: str = "attachment") -> st
 
     # 使用 RFC 5987 格式：filename*=UTF-8''encoded_name
     # 同时提供 ASCII fallback
-    ascii_filename = filename.encode('ascii', 'ignore').decode('ascii') or 'download'
+    ascii_filename = filename.encode('ascii', 'ignore').decode('ascii')
+    ascii_filename = _re.sub(r'[\r\n"\\]', "_", ascii_filename).strip() or 'download'
 
     return f'{disposition}; filename="{ascii_filename}"; filename*=UTF-8\'\'{encoded_filename}'
 
@@ -80,6 +82,21 @@ def _command_stdout_text(execution) -> str:
     from src.api.utils.sandbox_helpers import extract_command_stdout
     text = extract_command_stdout(execution)
     return text.strip()
+
+
+def _upload_path_exists(check_result, sandbox_path: str) -> bool:
+    """Return whether an upload target exists; fail closed on unknown output."""
+    exit_code = _extract_exit_code(check_result)
+    stdout = _command_stdout_text(check_result)
+    if exit_code != 0:
+        raise RuntimeError(
+            f"无法确认上传目标是否存在: {sandbox_path} (exit={exit_code}, stdout={stdout!r})"
+        )
+    if stdout == "EXISTS":
+        return True
+    if stdout == "NOT_EXISTS":
+        return False
+    raise RuntimeError(f"无法确认上传目标是否存在: {sandbox_path} (stdout={stdout!r})")
 
 
 def _extract_exit_code(execution) -> int:
@@ -1058,7 +1075,7 @@ async def upload_file(
     # 提前讀取文件內容（重試時不可重複讀取 UploadFile）
     content = await file.read()
 
-    # 安全的文件名處理（防止路径遍历 + 清洗特殊字符）
+    # 安全的文件名处理（防止路径遍历 + 清洗特殊字符，保留中文）。
     raw_filename = os.path.basename(file.filename or "uploaded_file")
     safe_filename = _sanitize_filename(raw_filename)
 
@@ -1078,28 +1095,23 @@ async def upload_file(
             # 確保 session 子目錄存在
             await sandbox.commands.run(f"mkdir -p {shlex.quote(session_root)}")
 
-            # 檢查是否已存在同名文件，若存在則加序號
+            # 檢查是否已存在同名路径，若存在則加序號；无法确认时 fail closed，避免覆盖。
             sandbox_path = resolve_sandbox_path(safe_filename, session_root)
             final_filename = safe_filename
-            try:
-                check_result = await sandbox.commands.run(
-                    f"test -f {shlex.quote(sandbox_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
-                )
-                if _command_stdout_text(check_result) == "EXISTS":
-                    base_name, ext = posixpath.splitext(safe_filename)
-                    counter = 1
-                    while True:
-                        new_name = f"{base_name}_{counter}{ext}"
-                        sandbox_path = resolve_sandbox_path(new_name, session_root)
-                        check_result = await sandbox.commands.run(
-                            f"test -f {shlex.quote(sandbox_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
-                        )
-                        if _command_stdout_text(check_result) != "EXISTS":
-                            final_filename = new_name
-                            break
-                        counter += 1
-            except Exception:
-                pass  # 如果檢查失敗，直接覆蓋
+            base_name, ext = posixpath.splitext(safe_filename)
+            counter = 0
+            while True:
+                try:
+                    check_result = await sandbox.commands.run(
+                        f"test -e {shlex.quote(sandbox_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"无法确认上传目标是否存在: {sandbox_path} ({e})") from e
+                if not _upload_path_exists(check_result, sandbox_path):
+                    break
+                counter += 1
+                final_filename = f"{base_name}_{counter}{ext}"
+                sandbox_path = resolve_sandbox_path(final_filename, session_root)
 
             # 寫入沙箱
             write = getattr(sandbox.files, "write", None)
@@ -1113,7 +1125,7 @@ async def upload_file(
                 path=final_filename,  # 相對路徑
                 size=len(content),
                 modified=datetime.now(timezone.utc).isoformat(),
-                type=file.content_type or "application/octet-stream",
+                type=posixpath.splitext(final_filename)[1].lstrip(".").lower() or "file",
             )
 
             logger.info(f"文件上傳至沙箱成功: {final_filename} ({len(content)} bytes)")

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { fireEvent, render, screen } from '../utils/test-utils';
+import { fireEvent, render, screen, waitFor } from '../utils/test-utils';
 import { Round } from '../../components/Round';
 import { RoundData } from '../../types';
 
@@ -66,6 +66,36 @@ describe('Round 组件', () => {
     render(<Round round={round} isStreaming={false} />);
 
     expect(screen.getByText('这是我的分析结果...')).toBeInTheDocument();
+  });
+
+  it('点击复制回复应复制助手回复内容', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText },
+      configurable: true,
+    });
+    const round = createMockRound({
+      final_response: '这是要复制的回复\n\n```ts\nconst ok = true;\n```',
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '复制回复' }));
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(round.final_response);
+      expect(screen.getByRole('button', { name: '复制回复' })).toHaveAttribute('title', '已复制');
+    });
+  });
+
+  it('助手回复操作区包含复制图标', () => {
+    const round = createMockRound({ steps: [] });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    expect(screen.getByRole('button', { name: '复制回复' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '复制回复' }).parentElement).not.toHaveClass('opacity-0');
   });
 
   it('应该渲染 ReasoningPanel 组件', () => {
@@ -437,5 +467,74 @@ describe('Round 组件', () => {
 
     expect(screen.queryByRole('button', { name: '查看 quick_sort.py' })).not.toBeInTheDocument();
     expect(screen.getByText(/文件位置： quick_sort.py/)).toBeInTheDocument();
+  });
+
+  it('助手 Markdown 中的沙箱图片路径不会渲染成破图', () => {
+    const round = createMockRound({
+      final_response: '![chart](/home/user/sessions/s1/reports/chart.png)',
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} sessionId="s1" />);
+
+    expect(screen.queryByTestId('auth-image')).not.toBeInTheDocument();
+    expect(screen.queryByAltText('chart')).not.toBeInTheDocument();
+  });
+
+  it('助手 Markdown 中相对图片路径不会渲染成破图', () => {
+    const round = createMockRound({
+      final_response: '![风景插画](docx_images/image1.png)',
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} sessionId="s1" />);
+
+    expect(screen.queryByTestId('auth-image')).not.toBeInTheDocument();
+    expect(screen.queryByAltText('风景插画')).not.toBeInTheDocument();
+  });
+
+  it('助手图片文件卡片应显示预览图', () => {
+    const round = createMockRound({
+      final_response: '图片文件在 `docx_images/image1.png`。',
+      steps: [],
+    });
+
+    render(
+      <Round
+        round={round}
+        isStreaming={false}
+        sessionId="s1"
+        assistantFileMatches={{
+          'docx_images/image1.png': {
+            name: 'image1.png',
+            path: 'docx_images/image1.png',
+            session_id: 's1',
+            size: 22323,
+            modified: '2026-06-25T10:00:00+00:00',
+            type: 'png',
+            is_directory: false,
+          },
+        }}
+      />,
+    );
+
+    const authImg = screen.getByTestId('auth-image');
+    expect(authImg).toHaveAttribute(
+      'src',
+      '/api/sessions/s1/files/docx_images/image1.png?preview=true',
+    );
+    expect(authImg).toHaveAttribute('alt', 'image1.png');
+  });
+
+  it('助手 Markdown 中跨 session 的沙箱图片路径不会转换', () => {
+    const round = createMockRound({
+      final_response: '![chart](/home/user/sessions/other/reports/chart.png)',
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} sessionId="s1" />);
+
+    expect(screen.queryByTestId('auth-image')).not.toBeInTheDocument();
+    expect(screen.queryByAltText('chart')).not.toBeInTheDocument();
   });
 });

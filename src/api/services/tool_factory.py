@@ -11,7 +11,12 @@ from typing import List, Optional, Callable, Set
 
 from opensandbox import Sandbox
 
-from src.agent.tools.sandbox_file_tools import SandboxReadTool, SandboxWriteTool, SandboxEditTool
+from src.agent.tools.sandbox_file_tools import (
+    SandboxReadTool,
+    SandboxReadImageTool,
+    SandboxWriteTool,
+    SandboxEditTool,
+)
 from src.agent.tools.sandbox_bash_tool import (
     SandboxBashTool,
     SandboxBashOutputTool,
@@ -94,6 +99,8 @@ async def create_agent_tools(
     db_session_factory: Callable,
     subagent_runner: Callable | None = None,
     exclude: Optional[Set[str]] = None,
+    supports_image: bool = False,
+    max_images: int = 0,
 ) -> tuple[List, Optional[SkillLoader]]:
     """创建标准 Agent 工具列表。
 
@@ -120,6 +127,12 @@ async def create_agent_tools(
     _candidates: List[tuple[str, Callable[[], object]]] = [
         # 沙箱文件工具
         ("SandboxReadTool", lambda: SandboxReadTool(sandbox=sandbox, workspace_dir=workspace_dir)),
+        ("SandboxReadImageTool", lambda: SandboxReadImageTool(
+            sandbox=sandbox,
+            workspace_dir=workspace_dir,
+            supports_image=supports_image,
+            max_images=max_images,
+        )),
         ("SandboxWriteTool", lambda: SandboxWriteTool(
             sandbox=sandbox,
             workspace_dir=workspace_dir,

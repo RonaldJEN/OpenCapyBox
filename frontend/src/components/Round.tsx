@@ -1,5 +1,6 @@
 import { RoundData, FileInfo, AttachmentInfo } from '../types';
-import { ExternalLink, User } from 'lucide-react';
+import { useState } from 'react';
+import { Check, Copy, ExternalLink, User } from 'lucide-react';
 import { ReasoningPanel } from './ReasoningPanel';
 import { FileAttachment } from './FileAttachment';
 import { CodeBlock } from './CodeBlock';
@@ -19,6 +20,26 @@ interface RoundProps {
   assistantFileMatches?: Record<string, FileInfo | null | undefined>;
   onPreviewAttachment?: (file: FileInfo) => void;
   onOpenFileInPanel?: (file: FileInfo) => void;
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    document.execCommand('copy');
+  } finally {
+    document.body.removeChild(textarea);
+  }
 }
 
 function AssistantMarkdown({ content }: { content: string }) {
@@ -60,7 +81,10 @@ function AssistantMarkdown({ content }: { content: string }) {
           );
         },
         img: ({ src: imgSrc, alt: imgAlt, ...imgRest }: any) => {
-          if (imgSrc && imgSrc.startsWith('/api/')) {
+          if (typeof imgSrc !== 'string') {
+            return null;
+          }
+          if (imgSrc.startsWith('/api/')) {
             return (
               <AuthenticatedImage
                 src={imgSrc}
@@ -70,7 +94,10 @@ function AssistantMarkdown({ content }: { content: string }) {
               />
             );
           }
-          return <img src={imgSrc} alt={imgAlt || ''} className="max-w-full rounded-lg my-2" {...imgRest} />;
+          if (/^(https?:|data:image\/|blob:)/i.test(imgSrc)) {
+            return <img src={imgSrc} alt={imgAlt || ''} className="max-w-full rounded-lg my-2" {...imgRest} />;
+          }
+          return null;
         },
         a: ({ children, ...props }: any) => (
           <a
@@ -129,8 +156,38 @@ function AssistantMarkdown({ content }: { content: string }) {
   );
 }
 
+function AssistantActions({ content }: { content: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await copyTextToClipboard(content);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch (error) {
+      console.error('Failed to copy assistant reply:', error);
+    }
+  };
+
+  return (
+    <div className="not-prose -ml-1 mt-2 flex items-center gap-1">
+      <button
+        type="button"
+        onClick={handleCopy}
+        className="inline-flex h-7 w-7 items-center justify-center rounded-md text-claude-muted transition-colors hover:bg-claude-surface hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/35"
+        title={copied ? '已复制' : '复制回复'}
+        aria-label="复制回复"
+      >
+        {copied ? <Check size={16} className="text-claude-success" /> : <Copy size={16} />}
+      </button>
+    </div>
+  );
+}
+
 function AssistantFileCard({ file, onOpen }: { file: FileInfo; onOpen?: (file: FileInfo) => void }) {
   const Icon = getFileIcon(file);
+  const previewSessionId = file.session_id;
+  const showImagePreview = isImageFile(file) && (file.data_url || (previewSessionId && file.path));
   const meta = file.size > 0
     ? `${getFileCategoryLabel(file)} · ${getFileExtLabel(file)} · ${formatAssistantFileSize(file.size)}`
     : `${getFileCategoryLabel(file)} · ${getFileExtLabel(file)}`;
@@ -143,8 +200,17 @@ function AssistantFileCard({ file, onOpen }: { file: FileInfo; onOpen?: (file: F
       aria-label={`查看 ${file.name}`}
       title={`查看 ${file.name}`}
     >
-      <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-claude-surface">
-        <Icon className={`h-5 w-5 ${getFileIconClass(file)}`} />
+      <span className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-claude-surface">
+        {showImagePreview ? (
+          <AuthenticatedImage
+            src={file.data_url || buildSandboxFileUrl(previewSessionId!, file.path, true)}
+            alt={file.name}
+            className="h-full w-full object-cover transition-transform group-hover:scale-105"
+            fallback={<Icon className={`h-5 w-5 ${getFileIconClass(file)}`} />}
+          />
+        ) : (
+          <Icon className={`h-5 w-5 ${getFileIconClass(file)}`} />
+        )}
       </span>
       <span className="min-w-0 flex-1">
         <span className="block truncate text-[15px] font-semibold leading-tight text-claude-text">
@@ -199,7 +265,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
         <div className="w-7 h-7 rounded-full bg-claude-surface flex items-center justify-center flex-shrink-0 mt-0.5">
           <User size={14} className="text-claude-secondary" />
         </div>
-        <div className="flex-1 min-w-0 pt-0.5">
+        <div className="group/reply flex-1 min-w-0 pt-0.5">
           <p className="text-xs font-medium text-claude-secondary mb-1.5">你</p>
           <div className="text-[15px] text-claude-text leading-relaxed whitespace-pre-wrap break-words">
             {cleanContent}
@@ -299,6 +365,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
                   ))}
                 </div>
               )}
+              <AssistantActions content={assistantContent} />
             </div>
           )}
 

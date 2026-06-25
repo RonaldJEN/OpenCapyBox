@@ -109,10 +109,16 @@ class AgentService:
                 model_config.model_name, model_config.provider, model_config.api_base,
             )
 
-            # 收集 fallback 模型（排除當前主模型，按 YAML 順序）
+            # 收集 fallback 模型（排除當前主模型，按 YAML 順序），并保持多模态能力不降级。
+            registry_models = (
+                registry.list_models(enabled_only=True)
+                if hasattr(registry, "list_models")
+                else [model_config]
+            )
             fallback_configs = [
-                m for m in registry.list_models(enabled_only=True)
+                m for m in registry_models
                 if m.id != model_config.id
+                and self._is_fallback_model_compatible(model_config, m)
             ]
             llm_client = LLMClient.from_model_config(
                 model_config,
@@ -148,6 +154,8 @@ class AgentService:
             db_session_factory=self._get_db_session_factory(),
             subagent_runner=self._run_subagent_invocation,
             exclude=self.tool_exclude,
+            supports_image=model_config.supports_image,
+            max_images=model_config.max_images,
         )
 
         # 注入技能元数据到系统提示符（Progressive Disclosure - Level 1）
@@ -174,6 +182,74 @@ class AgentService:
 
         # 从数据库恢复历史
         self._restore_history()
+
+    @staticmethod
+    def _is_fallback_model_compatible(primary_config, fallback_config) -> bool:
+        """Fallback must preserve multimodal capability promised by the primary model."""
+        if getattr(primary_config, "supports_image", False):
+            if not getattr(fallback_config, "supports_image", False):
+                return False
+            if int(getattr(fallback_config, "max_images", 0) or 0) < int(getattr(primary_config, "max_images", 0) or 0):
+                return False
+        if getattr(primary_config, "supports_video", False):
+            if not getattr(fallback_config, "supports_video", False):
+                return False
+            if int(getattr(fallback_config, "max_videos", 0) or 0) < int(getattr(primary_config, "max_videos", 0) or 0):
+                return False
+        return True
+
+    @staticmethod
+    def _has_synthetic_user_content(content: Any) -> bool:
+        return content not in (None, "", [])
+
+    @staticmethod
+    def _synthetic_user_content_marker(content: Any) -> dict[str, Any]:
+        """Return a lightweight AG-UI marker for backend-only synthetic content."""
+        marker: dict[str, Any] = {
+            "schema": "synthetic_user_message_ref.v1",
+            "contentRef": "conversation_messages",
+        }
+        if isinstance(content, list):
+            image_count = sum(
+                1
+                for block in content
+                if isinstance(block, dict)
+                and (block.get("type") == "image_url" or "image_url" in block)
+            )
+            marker.update({
+                "contentKind": "blocks",
+                "blockCount": len(content),
+                "imageCount": image_count,
+            })
+        elif isinstance(content, str):
+            marker.update({
+                "contentKind": "text",
+                "charCount": len(content),
+            })
+        elif isinstance(content, dict):
+            marker.update({
+                "contentKind": "object",
+                "fieldCount": len(content),
+            })
+        else:
+            marker["contentKind"] = type(content).__name__
+        return marker
+
+    @staticmethod
+    def _synthetic_user_content_from_event(event: AGUIEvent) -> Any | None:
+        value = getattr(event, "value", None)
+        if not isinstance(value, dict):
+            return None
+        return value.get("content")
+
+    @staticmethod
+    def _lightweight_synthetic_user_event(event: AGUIEvent, content: Any) -> AGUIEvent:
+        marker = AgentService._synthetic_user_content_marker(content)
+        if hasattr(event, "model_copy"):
+            return event.model_copy(update={"value": marker})
+        event_copy = copy.copy(event)
+        setattr(event_copy, "value", marker)
+        return event_copy
 
     def _get_db_session_factory(self):
         """返回 DB session 工厂函数（供 memory_tools 延迟获取 DB session）"""
@@ -729,22 +805,46 @@ class AgentService:
         # 5. 逐 round 重建
         messages: list[AgentMessage] = []
 
+        def _round_has_synthetic_user_custom(round_events: list) -> bool:
+            for evt in round_events:
+                try:
+                    payload = evt.payload if isinstance(evt.payload, dict) else json.loads(evt.payload)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("type") == "CUSTOM"
+                    and payload.get("name") == "synthetic_user_message"
+                ):
+                    return True
+            return False
+
         for rnd in rounds:
+            round_events = events_by_round.get(rnd.id, [])
+            has_synthetic_user_custom = _round_has_synthetic_user_custom(round_events)
+
             # 4a. User 消息（從 conversation_messages 取，保留多模態塊）
             user_records = user_msgs_by_round.get(rnd.id, [])
             resume_resolution = resolution_by_resume_round_id.get(rnd.id)
             skip_resume_user = rnd.id in stitched_resume_round_ids
             skipped_resume_user = False
+            synthetic_user_contents: list[Any] = []
+            has_real_user_record = False
             if user_records:
                 for um in user_records:
                     try:
                         content = json.loads(um.content)
                     except (json.JSONDecodeError, TypeError):
                         content = um.content
+                    raw_is_synthetic = getattr(um, "is_synthetic", False)
+                    is_synthetic = bool(raw_is_synthetic) if isinstance(raw_is_synthetic, (bool, int)) else False
+                    if is_synthetic:
+                        synthetic_user_contents.append(content)
+                        continue
+                    has_real_user_record = True
                     if (
                         skip_resume_user
                         and not skipped_resume_user
-                        and not bool(getattr(um, "is_synthetic", False))
                         and resume_resolution
                         and content == resume_resolution.resume_user_message
                     ):
@@ -754,10 +854,10 @@ class AgentService:
                         AgentMessage(
                             role="user",
                             content=content,
-                            is_synthetic=bool(getattr(um, "is_synthetic", False)),
+                            is_synthetic=is_synthetic,
                         )
                     )
-            elif rnd.user_message:
+            if not has_real_user_record and rnd.user_message:
                 if (
                     skip_resume_user
                     and resume_resolution
@@ -771,7 +871,7 @@ class AgentService:
                         rnd.id, self.session_id,
                     )
                     messages.append(AgentMessage(role="user", content=rnd.user_message))
-            else:
+            elif not has_real_user_record:
                 if skip_resume_user:
                     skipped_resume_user = True
                 else:
@@ -783,8 +883,11 @@ class AgentService:
                     continue
 
             # 4b. Agent 輸出（從預載的 agui_events 重建 assistant + tool 消息）
-            round_events = events_by_round.get(rnd.id, [])
-            round_messages = self._events_to_messages(round_events, round_id=rnd.id)
+            round_messages = self._events_to_messages(
+                round_events,
+                round_id=rnd.id,
+                synthetic_user_contents=synthetic_user_contents if has_synthetic_user_custom else None,
+            )
 
             _has_asst_text = any(
                 msg.role == "assistant" and isinstance(msg.content, str) and msg.content
@@ -949,7 +1052,11 @@ class AgentService:
         logger.info("保存摘要錨點 (session=%s, round=%s)", self.session_id, round_id)
 
     @staticmethod
-    def _events_to_messages(events, round_id: str | None = None) -> list[AgentMessage]:
+    def _events_to_messages(
+        events,
+        round_id: str | None = None,
+        synthetic_user_contents: list[Any] | None = None,
+    ) -> list[AgentMessage]:
         """將一個 round 的 agui_events 序列轉換為 LLM messages。
 
         解析事件流，重建 assistant（含 tool_calls）和 tool result 消息。
@@ -963,6 +1070,26 @@ class AgentService:
         step_tool_results: list[dict] = []
         tc_id_to_name: dict[str, str] = {}
         _skipped = 0
+        synthetic_content_iter = iter(synthetic_user_contents or [])
+
+        def flush_step_messages() -> None:
+            nonlocal step_text, step_tool_calls, step_tool_results
+            if step_text or step_tool_calls:
+                messages.append(AgentMessage(
+                    role="assistant",
+                    content=step_text,
+                    tool_calls=step_tool_calls if step_tool_calls else None,
+                ))
+            for tr in step_tool_results:
+                messages.append(AgentMessage(
+                    role="tool",
+                    content=tr["content"],
+                    tool_call_id=tr["tool_call_id"],
+                    name=tr["name"],
+                ))
+            step_text = ""
+            step_tool_calls = []
+            step_tool_results = []
 
         for evt in events:
             if isinstance(evt.payload, dict):
@@ -1018,37 +1145,18 @@ class AgentService:
 
             elif evt_type == "STEP_FINISHED":
                 # Flush step：生成 assistant + tool messages
-                if step_text or step_tool_calls:
-                    messages.append(AgentMessage(
-                        role="assistant",
-                        content=step_text,
-                        tool_calls=step_tool_calls if step_tool_calls else None,
-                    ))
-                for tr in step_tool_results:
-                    messages.append(AgentMessage(
-                        role="tool",
-                        content=tr["content"],
-                        tool_call_id=tr["tool_call_id"],
-                        name=tr["name"],
-                    ))
-                step_text = ""
-                step_tool_calls = []
-                step_tool_results = []
+                flush_step_messages()
+
+            elif evt_type == "CUSTOM" and payload.get("name") == "synthetic_user_message":
+                content = next(synthetic_content_iter, None) if synthetic_user_contents is not None else None
+                if AgentService._has_synthetic_user_content(content):
+                    # Synthetic user messages are emitted after the assistant/tool
+                    # messages they react to. Preserve that ordering on cold restore.
+                    flush_step_messages()
+                    messages.append(AgentMessage(role="user", content=content, is_synthetic=True))
 
         # Flush 殘留（round 異常中斷無 STEP_FINISHED 時）
-        if step_text or step_tool_calls:
-            messages.append(AgentMessage(
-                role="assistant",
-                content=step_text,
-                tool_calls=step_tool_calls if step_tool_calls else None,
-            ))
-        for tr in step_tool_results:
-            messages.append(AgentMessage(
-                role="tool",
-                content=tr["content"],
-                tool_call_id=tr["tool_call_id"],
-                name=tr["name"],
-            ))
+        flush_step_messages()
 
         if _skipped:
             logger.warning(
@@ -1247,7 +1355,8 @@ class AgentService:
         token_count: int | None = None,
         is_synthetic: bool = False,
         is_summary: bool = False,
-    ) -> None:
+        raise_on_error: bool = False,
+    ) -> bool:
         """向 conversation_messages 表持久化一條消息。
 
         用於 Agent 上下文恢復，與 agui_events 互相獨立。
@@ -1296,9 +1405,13 @@ class AgentService:
                 },
             )
             db.commit()
+            return True
         except Exception as e:
             db.rollback()
             logger.warning("保存 conversation_message 失敗: %s", e)
+            if raise_on_error:
+                raise
+            return False
 
     async def chat_agui(
         self,
@@ -1764,9 +1877,31 @@ class AgentService:
                         yield stored_terminal.event
                     break
 
+                event_to_store = event
+                event_to_yield = event
+                synthetic_user_content = None
+                if (
+                    event.type == EventType.CUSTOM
+                    and getattr(event, "name", "") == "synthetic_user_message"
+                ):
+                    synthetic_user_content = self._synthetic_user_content_from_event(event)
+                    if self._has_synthetic_user_content(synthetic_user_content):
+                        self._save_conversation_message(
+                            "user",
+                            synthetic_user_content,
+                            round_id=run_id,
+                            is_synthetic=True,
+                            raise_on_error=True,
+                        )
+                        event_to_store = self._lightweight_synthetic_user_event(
+                            event,
+                            synthetic_user_content,
+                        )
+                        event_to_yield = event_to_store
+
                 stored_event = None
-                if event.type not in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
-                    stored_event = await self.history_service.save_agui_event(run_id, event)
+                if event_to_store.type not in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
+                    stored_event = await self.history_service.save_agui_event(run_id, event_to_store)
 
                 if event.type == EventType.TEXT_MESSAGE_CONTENT:
                     accumulated_content += event.delta
@@ -1842,14 +1977,6 @@ class AgentService:
                 elif event.type == EventType.RUN_ERROR:
                     status = "failed"
                     final_response = getattr(event, "message", None) or final_response
-                elif event.type == EventType.CUSTOM:
-                    # 合成 user message 持久化（truncation retry / empty nudge / step reminder）
-                    if getattr(event, "name", "") == "synthetic_user_message":
-                        syn_content = getattr(event, "value", {}).get("content", "")
-                        if syn_content:
-                            self._save_conversation_message(
-                                "user", syn_content, round_id=run_id, is_synthetic=True,
-                            )
 
                 if event.type in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
                     self.history_service.complete_round(
@@ -1865,7 +1992,7 @@ class AgentService:
                         await get_agui_event_bus().publish_committed(run_id, stored_event.event)
                     _round_finished = True
 
-                yield SequencedAGUIEvent(event, stored_event) if stored_event else event
+                yield SequencedAGUIEvent(event_to_yield, stored_event) if stored_event else event_to_yield
 
             if _externally_terminated:
                 return

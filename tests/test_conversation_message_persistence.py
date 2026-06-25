@@ -75,6 +75,44 @@ class TestEventsToMessages:
         assert msgs[1].tool_call_id == "tc1"
         assert msgs[1].name == "bash"
 
+    def test_synthetic_user_custom_flushes_pending_tool_step(self):
+        """工具后的 synthetic user 必须恢复在 assistant/tool 之后。"""
+        from src.api.services.agent_service import AgentService
+
+        image_content = [
+            {"type": "text", "text": "tool image context"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,Zm9v"}},
+        ]
+        events = [
+            self._evt("TOOL_CALL_START", {"toolCallId": "tc1", "toolCallName": "read_image_file"}, 1),
+            self._evt("TOOL_CALL_ARGS", {"toolCallId": "tc1", "delta": '{"paths":["chart.png"]}'}, 2),
+            self._evt("TOOL_CALL_END", {"toolCallId": "tc1"}, 3),
+            self._evt("TOOL_CALL_RESULT", {"toolCallId": "tc1", "content": "image loaded", "messageId": "m1"}, 4),
+            self._evt("CUSTOM", {
+                "name": "synthetic_user_message",
+                "value": {
+                    "schema": "synthetic_user_message_ref.v1",
+                    "contentRef": "conversation_messages",
+                    "contentKind": "blocks",
+                    "blockCount": 2,
+                    "imageCount": 1,
+                },
+            }, 5),
+            self._evt("STEP_FINISHED", {"stepName": "step-1"}, 6),
+            self._evt("TEXT_MESSAGE_CONTENT", {"delta": "I can see the chart."}, 7),
+            self._evt("TEXT_MESSAGE_END", {"messageId": "m2"}, 8),
+            self._evt("STEP_FINISHED", {"stepName": "step-2"}, 9),
+        ]
+
+        msgs = AgentService._events_to_messages(events, synthetic_user_contents=[image_content])
+
+        assert [msg.role for msg in msgs] == ["assistant", "tool", "user", "assistant"]
+        assert msgs[0].tool_calls[0].function.name == "read_image_file"
+        assert msgs[1].tool_call_id == "tc1"
+        assert msgs[2].is_synthetic is True
+        assert msgs[2].content == image_content
+        assert msgs[3].content == "I can see the chart."
+
     def test_text_plus_tool_call_step(self):
         """assistant 先输出文本再调工具"""
         from src.api.services.agent_service import AgentService
@@ -331,6 +369,81 @@ class TestRebuildMessagesFromEvents:
         assert messages[2].content == "a.txt"
         assert messages[3].role == "assistant"
         assert messages[3].content == "Found a.txt"
+
+    def test_synthetic_user_custom_restores_in_event_order_without_duplicate(self):
+        """冷恢复顺序应与热运行一致：tool result 后插入 synthetic image context。"""
+        image_content = [
+            {"type": "text", "text": "tool image context"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,Zm9v"}},
+        ]
+        rounds = [self._make_round("r1", "s1", "inspect chart")]
+        user_msgs = [
+            self._make_conv_msg("user", "inspect chart", "r1", 1),
+            self._make_conv_msg("user", image_content, "r1", 2, is_synthetic=True),
+        ]
+        events = {
+            "r1": [
+                self._make_evt("TOOL_CALL_START", {"toolCallId": "tc1", "toolCallName": "read_image_file"}, 1),
+                self._make_evt("TOOL_CALL_ARGS", {"toolCallId": "tc1", "delta": '{"paths":["chart.png"]}'}, 2),
+                self._make_evt("TOOL_CALL_END", {"toolCallId": "tc1"}, 3),
+                self._make_evt("TOOL_CALL_RESULT", {"toolCallId": "tc1", "content": "image loaded", "messageId": "m1"}, 4),
+                self._make_evt("CUSTOM", {
+                    "name": "synthetic_user_message",
+                    "value": {
+                        "schema": "synthetic_user_message_ref.v1",
+                        "contentRef": "conversation_messages",
+                        "contentKind": "blocks",
+                        "blockCount": 2,
+                        "imageCount": 1,
+                    },
+                }, 5),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 6),
+                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "The chart trends upward."}, 7),
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m2"}, 8),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-2"}, 9),
+            ],
+        }
+
+        mock_db = self._setup_db(rounds, user_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        assert [msg.role for msg in messages] == ["user", "assistant", "tool", "user", "assistant"]
+        assert messages[0].content == "inspect chart"
+        assert messages[1].tool_calls[0].function.name == "read_image_file"
+        assert messages[2].content == "image loaded"
+        assert messages[3].is_synthetic is True
+        assert messages[3].content == image_content
+        assert messages[4].content == "The chart trends upward."
+
+    def test_synthetic_user_without_custom_marker_is_not_rebuilt(self):
+        """没有 CUSTOM marker 时，不兜底插入无序 synthetic user 消息。"""
+        rounds = [self._make_round("r1", "s1", "hello")]
+        user_msgs = [
+            self._make_conv_msg("user", "hello", "r1", 1),
+            self._make_conv_msg("user", "synthetic nudge", "r1", 2, is_synthetic=True),
+        ]
+        events = {
+            "r1": [
+                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "answer"}, 1),
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m1"}, 2),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 3),
+            ],
+        }
+
+        mock_db = self._setup_db(rounds, user_msgs, events)
+        history_service = MagicMock()
+        history_service.db = mock_db
+
+        service = make_agent_service(history_service=history_service, session_id="s1")
+        messages = service._rebuild_messages_from_events()
+
+        assert [msg.role for msg in messages] == ["user", "assistant"]
+        assert messages[0].content == "hello"
+        assert messages[1].content == "answer"
 
     def test_fallback_to_round_user_message(self):
         """conversation_messages 无 user 记录时 fallback 到 rounds.user_message"""
@@ -1003,8 +1116,8 @@ class TestSyntheticMessagePersistenceOnRestore:
         mock_db.query = MagicMock(side_effect=_query)
         return mock_db
 
-    def test_synthetic_user_messages_included_in_rebuild(self):
-        """合成 user 消息（如 empty nudge）在重建時自動被包含"""
+    def test_synthetic_user_messages_rebuild_at_custom_marker(self):
+        """合成 user 消息必须通过 CUSTOM marker 恢复到事件顺序位置。"""
         rounds = [self._make_round("r1", "s1", "hello")]
         # 一條真實 user + 一條合成 user（empty nudge）
         user_msgs = [
@@ -1020,10 +1133,19 @@ class TestSyntheticMessagePersistenceOnRestore:
                 self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": ""}, 1),
                 self._make_evt("TEXT_MESSAGE_END", {"messageId": "m1"}, 2),
                 self._make_evt("STEP_FINISHED", {"stepName": "step-1"}, 3),
+                self._make_evt("CUSTOM", {
+                    "name": "synthetic_user_message",
+                    "value": {
+                        "schema": "synthetic_user_message_ref.v1",
+                        "contentRef": "conversation_messages",
+                        "contentKind": "text",
+                        "charCount": 113,
+                    },
+                }, 4),
                 # Step 2: 正常回復
-                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "Here is my answer."}, 4),
-                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m2"}, 5),
-                self._make_evt("STEP_FINISHED", {"stepName": "step-2"}, 6),
+                self._make_evt("TEXT_MESSAGE_CONTENT", {"delta": "Here is my answer."}, 5),
+                self._make_evt("TEXT_MESSAGE_END", {"messageId": "m2"}, 6),
+                self._make_evt("STEP_FINISHED", {"stepName": "step-2"}, 7),
             ],
         }
 
@@ -1262,6 +1384,23 @@ class TestSaveConversationMessageAtomicInsert:
         service = make_agent_service(history_service=history, session_id="s-err")
         # 不應拋異常
         service._save_conversation_message("user", "boom")
+        mock_db.rollback.assert_called_once()
+
+    def test_save_error_can_raise_for_required_messages(self):
+        """关键上下文消息可选择强制失败，避免后续锚点先落库。"""
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = RuntimeError("disk full")
+
+        history = MagicMock()
+        history.db = mock_db
+
+        service = make_agent_service(history_service=history, session_id="s-err")
+        with pytest.raises(RuntimeError, match="disk full"):
+            service._save_conversation_message(
+                "user",
+                "boom",
+                raise_on_error=True,
+            )
         mock_db.rollback.assert_called_once()
 
 

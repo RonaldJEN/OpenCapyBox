@@ -170,10 +170,10 @@
 ### POST /api/sessions/{id}/upload
 
 - Body: multipart file
-- Response 200: `{name, path, size, modified, type}`
+- Response 200: `{name, path, size, modified, type, is_directory}`
 - `modified` 为带显式时区偏移的 ISO 8601 时间字符串，当前统一返回 UTC（如 `2026-05-08T02:30:00+00:00`）。
 - Error 400（"未选择文件"）, 404, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 503, 500
-- 重复文件名自动重命名（如 `document_1.pdf`）
+- 上传文件落盘在 session 根目录，文件名经过 `_sanitize_filename` 清洗：主文件名部分保留 Unicode 字母/数字（含中文）、下划线、连字符、点号；空格、括号等特殊字符替换为下划线并合并连续下划线；扩展名部分保留原样。若清洗后同名文件已存在，追加 `_1`、`_2` 等序号，避免覆盖。
 
 ## 4. 行为语义与不变量
 

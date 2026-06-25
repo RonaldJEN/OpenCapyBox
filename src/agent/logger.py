@@ -9,6 +9,24 @@ from typing import Any
 from .schema import Message, ToolCall
 
 
+def _redact_multimodal_data_urls(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_redact_multimodal_data_urls(item) for item in value]
+    if isinstance(value, dict):
+        redacted = {
+            key: _redact_multimodal_data_urls(item)
+            for key, item in value.items()
+        }
+        if redacted.get("type") == "image_url" and isinstance(redacted.get("image_url"), dict):
+            image_url = dict(redacted["image_url"])
+            url = image_url.get("url")
+            if isinstance(url, str) and url.startswith("data:image/"):
+                image_url["url"] = f"[redacted image data URL: {len(url)} chars]"
+                redacted["image_url"] = image_url
+        return redacted
+    return value
+
+
 class AgentLogger:
     """Agent run logger
 
@@ -60,7 +78,7 @@ class AgentLogger:
         for msg in messages:
             msg_dict = {
                 "role": msg.role,
-                "content": msg.content,
+                "content": _redact_multimodal_data_urls(msg.content),
             }
             if msg.thinking:
                 msg_dict["thinking"] = msg.thinking
@@ -150,6 +168,8 @@ class AgentLogger:
             tool_result_data["result"] = result_content
         else:
             tool_result_data["error"] = result_error
+            if result_content:
+                tool_result_data["result"] = result_content
 
         # Format as JSON
         content = "Tool Execution:\n\n"

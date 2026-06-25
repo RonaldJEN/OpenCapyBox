@@ -118,7 +118,7 @@ useEffect(() => {
 
 ### 3.4 文件操作
 
-- **下载**：`GET /api/sessions/{sid}/files/download?path={p}`，使用 blob 触发浏览器下载。
+- **下载**：`GET /api/sessions/{sid}/files/{path}`，使用 blob 触发浏览器下载；`path` 按路径段 encode，浏览器保存名使用返回路径的 basename。
 - **预览**：走 FilePreview，文本/Markdown/图片/PDF/HTML/CSV/XLS/XLSX 内联渲染；HTML 使用 `Blob URL + <iframe sandbox="allow-scripts">`，支持渲染/源码切换，不提供外部浏览器打开入口。
 - **上传**：当前版本**不支持**通过面板上传，文件通过聊天附件上传到沙箱。
 

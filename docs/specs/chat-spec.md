@@ -102,6 +102,8 @@
 
 持久化所有 AG-UI 事件，用于 SSE 重放（断线重连、订阅历史 Round）。
 
+`CUSTOM synthetic_user_message` 事件只作为冷恢复顺序锚点；完整合成消息内容（尤其是 `read_image_file` 产生的 Data URL 图片上下文）必须先写入 `conversation_messages(is_synthetic=True)`，成功后才允许提交轻量 marker 到 `agui_events.payload`。
+
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
 | `id` | Integer | PK, autoincrement | 自增主键 |
@@ -324,6 +326,7 @@ Content-Type: application/json
 - 单张图片大小上限：20MB
 - 总图片大小上限：50MB
 - 单次消息图片数量上限：由模型配置 `max_images` 决定
+- `read_image_file` 工具从沙箱读取图片后注入的视觉上下文必须遵守同一数量与 Data URL 大小上限。
 
 #### 响应
 

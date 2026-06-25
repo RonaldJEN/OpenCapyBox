@@ -627,6 +627,74 @@ describe('APIService', () => {
       expect(callbacks.onRunError).toHaveBeenCalledWith('当前有正在运行的任务', 'USER_BUSY');
     });
 
+    it('sendMessageStreamV2 应把 FastAPI 422 detail 数组转成明确长文本提示', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: false,
+        status: 422,
+        text: vi.fn().mockResolvedValue(JSON.stringify({
+          detail: [
+            {
+              type: 'string_too_long',
+              loc: ['body', 'content', 0, 'text'],
+              msg: 'String should have at most 10000 characters',
+              ctx: { max_length: 10000 },
+            },
+          ],
+        })),
+      }));
+
+      const callbacks = {
+        onStreamAccepted: vi.fn(),
+        onRunError: vi.fn(),
+      };
+
+      await apiService.sendMessageStreamV2(
+        'session-1',
+        [{ type: 'text', text: 'hello' }],
+        callbacks,
+      );
+
+      expect(callbacks.onStreamAccepted).not.toHaveBeenCalled();
+      expect(callbacks.onRunError).toHaveBeenCalledWith(
+        '消息太长，当前最多支持 10000 字。请拆成多条发送，或保存为文件后上传。',
+        'HTTP_CLIENT_ERROR',
+      );
+    });
+
+    it('subscribeToRound HTTP 错误应解析 JSON detail', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        text: vi.fn().mockResolvedValue('{"detail":"轮次不存在"}'),
+      }));
+      vi.spyOn(apiService, 'getSessionHistoryV2').mockResolvedValue({
+        session_id: 'session-1',
+        total: 0,
+        rounds: [],
+      });
+
+      const callbacks = {
+        onRunError: vi.fn(),
+      };
+
+      const subscription = apiService.subscribeToRound('session-1', 'missing-run', callbacks);
+      await expect(subscription.promise).rejects.toThrow('轮次不存在');
+
+      expect(callbacks.onRunError).toHaveBeenCalledWith('轮次不存在');
+    });
+
+    it('downloadFile HTTP 错误应解析 JSON detail', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        text: vi.fn().mockResolvedValue('{"detail":"文件不存在或尚未生成"}'),
+      }));
+
+      await expect(apiService.downloadFile('session-1', 'missing.txt')).rejects.toThrow(
+        '文件不存在或尚未生成',
+      );
+    });
+
     it('resumeStream 在未收到终态事件时应 reject', async () => {
       const encoder = new TextEncoder();
       const reader = {

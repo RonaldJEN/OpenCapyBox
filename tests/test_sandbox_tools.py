@@ -21,6 +21,7 @@ from src.agent.tools.sandbox_bash_tool import (
 )
 from src.agent.tools.sandbox_file_tools import (
     SandboxReadTool,
+    SandboxReadImageTool,
     SandboxWriteTool,
     SandboxEditTool,
 )
@@ -28,6 +29,7 @@ from src.agent.tools.sandbox_note_tool import (
     SandboxSessionNoteTool,
     SandboxRecallNoteTool,
 )
+from tests.helpers import make_fake_execution
 
 
 # ============== Fixtures ==============
@@ -718,6 +720,97 @@ class TestSandboxReadTool:
         assert result.success is True
         assert "=== FILE: /home/user/empty.txt | All 0 lines | COMPLETE ===" in result.content
         assert "=== END OF FILE ===" in result.content
+
+
+class TestSandboxReadImageTool:
+    """SandboxReadImageTool 測試"""
+
+    def test_properties(self, mock_sandbox):
+        tool = SandboxReadImageTool(mock_sandbox, supports_image=True, max_images=5)
+        assert tool.name == "read_image_file"
+        assert "paths" in tool.parameters.get("properties", {})
+
+    @pytest.mark.asyncio
+    async def test_read_image_success_returns_content_blocks(self, mock_sandbox):
+        raw = b"\x89PNG\r\n\x1a\n"
+        payload = json.dumps({
+            "size": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+        })
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=payload))
+
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=True,
+            max_images=5,
+        )
+        result = await tool.execute(paths=["chart.png"])
+
+        assert result.success is True
+        assert result.content_blocks is not None
+        assert result.content_blocks[0]["type"] == "image_url"
+        assert result.content_blocks[0]["image_url"]["url"].startswith("data:image/png;base64,")
+        assert result.content_blocks[0]["file"]["path"] == "chart.png"
+
+    @pytest.mark.asyncio
+    async def test_read_image_non_visual_model(self, mock_sandbox):
+        tool = SandboxReadImageTool(mock_sandbox, supports_image=False, max_images=0)
+        result = await tool.execute(paths=["chart.png"])
+
+        assert result.success is False
+        assert "不支持图片输入" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_read_image_rejects_unsupported_extension(self, mock_sandbox):
+        tool = SandboxReadImageTool(mock_sandbox, supports_image=True, max_images=5)
+        result = await tool.execute(paths=["notes.txt"])
+
+        assert result.success is False
+        assert "Unsupported image format" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_read_image_rejects_too_many(self, mock_sandbox):
+        tool = SandboxReadImageTool(mock_sandbox, supports_image=True, max_images=1)
+        result = await tool.execute(paths=["a.png", "b.png"])
+
+        assert result.success is False
+        assert "最多读取 1 张图片" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_read_image_rejects_data_url_over_single_limit(self, mock_sandbox):
+        raw = b"x" * 80
+        payload = json.dumps({
+            "size": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+        })
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=payload))
+
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=True,
+            max_images=5,
+            max_single_image_bytes=64,
+            max_total_image_bytes=1024,
+        )
+        result = await tool.execute(paths=["chart.png"])
+
+        assert result.success is False
+        assert "Data URL" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_read_image_rejects_outside_workspace(self, mock_sandbox):
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=True,
+            max_images=5,
+        )
+        result = await tool.execute(paths=["../other/a.png"])
+
+        assert result.success is False
+        assert "outside workspace" in (result.error or "")
 
 
 # ============== SandboxWriteTool ==============

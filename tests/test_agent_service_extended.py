@@ -2,11 +2,13 @@
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 from src.agent.schema.agui_events import (
     TextMessageContentEvent,
     TextMessageEndEvent,
     StepFinishedEvent,
     RunFinishedEvent,
+    CustomEvent,
     ToolCallStartEvent,
     ToolCallArgsEvent,
     ToolCallEndEvent,
@@ -53,6 +55,7 @@ class TestAgentServiceCreateTools:
 
         tool_names = [t.name for t in tools]
         assert "read_file" in tool_names
+        assert "read_image_file" in tool_names
         assert "write_file" in tool_names
         assert "edit_file" in tool_names
         assert "bash" in tool_names
@@ -60,6 +63,27 @@ class TestAgentServiceCreateTools:
         assert "bash_kill" in tool_names
         assert "sub_agent" in tool_names
         assert "record_note" in tool_names
+
+    @pytest.mark.asyncio
+    async def test_create_tools_passes_image_capability(self, service):
+        with patch("src.api.services.tool_factory.settings") as mock_settings:
+            mock_settings.bocha_search_appcode = None
+            mock_settings.skills_dir = ""
+            from src.api.services.tool_factory import create_agent_tools
+            from src.api.services.sandbox_service import get_sandbox_mount_path
+            tools, _ = await create_agent_tools(
+                sandbox=service.sandbox,
+                workspace_dir=service._workspace_dir,
+                mount=get_sandbox_mount_path(),
+                user_id=service.user_id,
+                db_session_factory=service._get_db_session_factory(),
+                supports_image=True,
+                max_images=3,
+            )
+
+        image_tool = next(t for t in tools if t.name == "read_image_file")
+        assert image_tool._supports_image is True
+        assert image_tool._model_max_images == 3
 
 
 class TestAgentServiceRestoreHistory:
@@ -219,6 +243,105 @@ class TestAgentServiceChatAgui:
         assert service.history_service.save_agui_event.await_count == 3
         complete_kwargs = service.history_service.complete_round.call_args.kwargs
         assert complete_kwargs["terminal_event"].type == EventType.RUN_FINISHED
+
+    @pytest.mark.asyncio
+    async def test_run_round_stream_synthetic_user_event_is_lightweight(self):
+        data_url = "data:image/png;base64," + "A" * 1024
+        image_content = [
+            {"type": "text", "text": "tool image context"},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]
+        history_service = MagicMock()
+        history_service.is_round_terminal = MagicMock(return_value=False)
+        history_service.save_agui_event = AsyncMock(return_value=None)
+        history_service.complete_round = MagicMock()
+        history_service.reset_session = MagicMock()
+        history_service.last_terminal_event = None
+
+        service = make_agent_service(history_service=history_service)
+        service._save_conversation_message = MagicMock()
+
+        async def _run_agui(**kwargs):
+            yield CustomEvent(
+                name="synthetic_user_message",
+                value={"content": image_content},
+            )
+            yield RunFinishedEvent(
+                threadId="session-123",
+                runId=kwargs["run_id"],
+                outcome="interrupt",
+                result={"reason": "max_steps_reached"},
+            )
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+
+        events = []
+        async for event in service._run_round_stream(
+            run_id="round-synthetic",
+            user_message="inspect image",
+        ):
+            events.append(event)
+
+        saved_custom_event = history_service.save_agui_event.await_args.args[1]
+        assert saved_custom_event.type == EventType.CUSTOM
+        assert saved_custom_event.value["contentRef"] == "conversation_messages"
+        assert saved_custom_event.value["contentKind"] == "blocks"
+        assert saved_custom_event.value["imageCount"] == 1
+        assert "content" not in saved_custom_event.value
+        assert data_url not in str(saved_custom_event.value)
+
+        yielded_custom_event = events[0]
+        assert yielded_custom_event.value == saved_custom_event.value
+        service._save_conversation_message.assert_called_once_with(
+            "user",
+            image_content,
+            round_id="round-synthetic",
+            is_synthetic=True,
+            raise_on_error=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_round_stream_synthetic_content_failure_skips_marker(self):
+        image_content = [
+            {"type": "text", "text": "tool image context"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        ]
+        history_service = MagicMock()
+        history_service.is_round_terminal = MagicMock(return_value=False)
+        history_service.save_agui_event = AsyncMock(return_value=None)
+        history_service.complete_round = MagicMock()
+        history_service.reset_session = MagicMock()
+        history_service.last_terminal_event = None
+
+        service = make_agent_service(history_service=history_service)
+        service._save_conversation_message = MagicMock(
+            side_effect=RuntimeError("conversation write failed"),
+        )
+
+        async def _run_agui(**kwargs):
+            yield CustomEvent(
+                name="synthetic_user_message",
+                value={"content": image_content},
+            )
+            yield RunFinishedEvent(
+                threadId="session-123",
+                runId=kwargs["run_id"],
+                outcome="interrupt",
+                result={"reason": "max_steps_reached"},
+            )
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+
+        with pytest.raises(RuntimeError, match="conversation write failed"):
+            async for _event in service._run_round_stream(
+                run_id="round-synthetic-fail",
+                user_message="inspect image",
+            ):
+                pass
+
+        history_service.save_agui_event.assert_not_awaited()
+        complete_kwargs = history_service.complete_round.call_args.kwargs
+        assert complete_kwargs["status"] == "failed"
 
     @pytest.mark.asyncio
     async def test_chat_agui_max_steps_reached_is_terminal_status(self, service):
@@ -660,6 +783,47 @@ class TestAgentServiceInitializeAgent:
                     MockAgent.return_value = MagicMock()
                     await service.initialize_agent()
                     assert service.agent is not None
+
+    @pytest.mark.asyncio
+    async def test_initialize_agent_filters_multimodal_incompatible_fallbacks(self, service):
+        def cfg(model_id: str, *, supports_image=False, max_images=0, supports_video=False, max_videos=0):
+            return SimpleNamespace(
+                id=model_id,
+                model_name=model_id,
+                provider="openai",
+                api_base="https://api.example.com",
+                supports_image=supports_image,
+                max_images=max_images,
+                supports_video=supports_video,
+                max_videos=max_videos,
+                context_window=128000,
+                max_tokens=4096,
+                compute_token_limit=lambda: 50000,
+            )
+
+        primary = cfg("primary-vision", supports_image=True, max_images=3)
+        compatible = cfg("compatible-vision", supports_image=True, max_images=3)
+        too_small = cfg("small-vision", supports_image=True, max_images=1)
+        no_image = cfg("text-only", supports_image=False, max_images=0)
+
+        registry = MagicMock()
+        registry.get_or_raise.return_value = primary
+        registry.get_default.return_value = primary
+        registry.list_models.return_value = [primary, no_image, too_small, compatible]
+
+        with patch("src.api.services.agent_service.get_model_registry", return_value=registry):
+            with patch("src.api.services.agent_service.create_agent_tools", new_callable=AsyncMock, return_value=([], None)):
+                with patch("src.api.services.agent_service.LLMClient") as MockLLM:
+                    MockLLM.from_model_config.return_value = MagicMock()
+                    with patch("src.api.services.agent_service.Agent") as MockAgent:
+                        MockAgent.return_value = MagicMock()
+                        service._provision_default_files_if_needed = MagicMock()
+                        service._load_system_prompt = MagicMock(return_value="system")
+
+                        await service.initialize_agent()
+
+        fallback_configs = MockLLM.from_model_config.call_args.kwargs["fallback_configs"]
+        assert [item.id for item in fallback_configs] == ["compatible-vision"]
 
     @pytest.mark.asyncio
     async def test_initialize_agent_fail_fast_when_registry_unavailable(self, service):

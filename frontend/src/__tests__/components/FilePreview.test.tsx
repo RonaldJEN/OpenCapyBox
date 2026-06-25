@@ -133,6 +133,33 @@ describe('FilePreview custom source', () => {
     });
   });
 
+  it('shows specific download failure detail', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve('# hello preview'),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { apiService } = await import('../../services/api');
+    vi.mocked(apiService.downloadFile).mockRejectedValueOnce(new Error('文件不存在或尚未生成'));
+
+    render(
+      <FilePreview
+        file={markdownFile}
+        sessionId="session-1"
+        onClose={() => {}}
+      />,
+    );
+
+    expect(await screen.findByText('hello preview')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('下载文件'));
+
+    await waitFor(() => {
+      expect(screen.getByText('下载文件失败：文件不存在或尚未生成')).toBeInTheDocument();
+    });
+  });
+
   it('renders HTML with blob iframe sandbox', async () => {
     const htmlFile: FileInfo = {
       name: 'preview.html',
@@ -172,6 +199,40 @@ describe('FilePreview custom source', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('html-iframe-loading')).not.toBeInTheDocument();
     });
+  });
+
+  it('loads image preview through segmented encoded sandbox URL', async () => {
+    const imageFile: FileInfo = {
+      name: '中文 图.png',
+      path: '中文 图.png',
+      size: 256,
+      modified: '2026-06-24T10:00:00Z',
+      type: 'image/png',
+      is_directory: false,
+    };
+    const { createObjectURLMock } = mockObjectUrlApis('blob:image-preview');
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      blob: () => Promise.resolve(new Blob(['png'], { type: 'image/png' })),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      <FilePreview
+        file={imageFile}
+        sessionId="session-1"
+        onClose={() => {}}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('/api/sessions/session-1/files/%E4%B8%AD%E6%96%87%20%E5%9B%BE.png?preview=true', {
+        headers: { Authorization: 'Bearer test-token' },
+      });
+      expect(createObjectURLMock).toHaveBeenCalledTimes(1);
+    });
+
+    expect(screen.getByAltText('中文 图.png')).toHaveAttribute('src', 'blob:image-preview');
   });
 
   it('revokes HTML blob URLs when switching files and unmounting', async () => {

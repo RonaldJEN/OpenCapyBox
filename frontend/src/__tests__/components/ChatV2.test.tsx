@@ -320,6 +320,68 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('输入文本超过上限时应提示明确且不发送', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'test-session',
+      total: 0,
+    });
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    const longText = 'a'.repeat(10001);
+    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: longText } });
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
+    expect(textarea.value).toBe(longText);
+    expect(screen.getByText(/消息太长（10001 字）/)).toBeInTheDocument();
+    expect(screen.getByText(/当前最多支持 10000 字/)).toBeInTheDocument();
+  });
+
+  it('上传目标状态无法确认时应显示避免覆盖的明确提示', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'test-session',
+      total: 0,
+    });
+    vi.mocked(apiService.uploadFile).mockRejectedValue({
+      response: {
+        data: {
+          detail: '文件保存失败: 无法确认上传目标是否存在: /home/user/sessions/test-session/report.txt',
+        },
+      },
+    });
+
+    const { container } = render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(['hello'], 'report.txt', { type: 'text/plain' });
+
+    await act(async () => {
+      fireEvent.change(fileInput, { target: { files: [file] } });
+    });
+
+    expect(await screen.findByText('文件上传失败：无法确认目标文件是否已存在。为避免覆盖已有文件，本次上传已取消，请稍后重试。')).toBeInTheDocument();
+  });
+
   it('应该显示底部版权信息', async () => {
     render(
       <ChatV2

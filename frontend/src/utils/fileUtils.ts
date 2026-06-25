@@ -38,16 +38,14 @@ export function inferFileType(filename: string, mime?: string): string {
  */
 export function normalizeFileType(filename: string, mimeOrType?: string): string {
   const raw = mimeOrType || '';
+  const dotIndex = filename.lastIndexOf('.');
+  const filenameExt = dotIndex >= 0 ? filename.slice(dotIndex + 1).toLowerCase() : '';
   if (raw.includes('/')) {
-    // MIME 格式：取擴展名 > MIME 子類型
-    return (
-      filename.split('.').pop()?.toLowerCase() ||
-      raw.split('/').pop()?.toLowerCase() ||
-      'unknown'
-    );
+    // MIME 格式：取有效擴展名 > MIME 子類型
+    return filenameExt || raw.split('/').pop()?.toLowerCase() || 'unknown';
   }
   // 非 MIME 格式：原樣或從文件名推斷
-  return raw || filename.split('.').pop()?.toLowerCase() || 'unknown';
+  return raw || filenameExt || 'unknown';
 }
 
 // ─── 文件圖標映射 ────────────────────────────────────────────────
@@ -233,5 +231,6 @@ export function buildSandboxFileUrl(
   if (preview) {
     params.set('preview', 'true');
   }
-  return `${base}?${params.toString()}`;
+  const query = params.toString();
+  return query ? `${base}?${query}` : base;
 }
