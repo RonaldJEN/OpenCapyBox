@@ -245,6 +245,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
     ? [...round.steps].reverse().find((step) => step.assistant_content)?.assistant_content
     : undefined;
   const assistantContent = round.final_response || latestStreamingContent;
+  const canCopyAssistantContent = round.status === 'completed' && !!round.final_response;
   const assistantFiles = assistantContent
     ? extractAssistantFiles(assistantContent, sessionId)
     : [];
@@ -365,7 +366,9 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
                   ))}
                 </div>
               )}
-              <AssistantActions content={assistantContent} />
+              {canCopyAssistantContent && (
+                <AssistantActions content={round.final_response} />
+              )}
             </div>
           )}
 

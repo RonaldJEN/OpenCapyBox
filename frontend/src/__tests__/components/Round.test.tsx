@@ -98,6 +98,19 @@ describe('Round 组件', () => {
     expect(screen.getByRole('button', { name: '复制回复' }).parentElement).not.toHaveClass('opacity-0');
   });
 
+  it('中断态即使有响应内容也不应显示复制按钮', () => {
+    const round = createMockRound({
+      status: 'interrupted',
+      final_response: '这是一段未完成的响应',
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    expect(screen.getByText('这是一段未完成的响应')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
+  });
+
   it('应该渲染 ReasoningPanel 组件', () => {
     const round = createMockRound();
 
@@ -202,6 +215,7 @@ describe('Round 组件', () => {
     render(<Round round={round} isStreaming={true} />);
 
     expect(screen.getByText('正文已经开始流式输出。')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
   });
 
   it('用户消息包含附件标记时应该显示附件', () => {
