@@ -54,8 +54,25 @@ Constraints:
   produce deliverables.
 - Do not ask the user questions. If information is missing, state the assumption
   and proceed.
-- Report concrete findings with sources. Keep the final answer focused on what
-  the parent agent asked for.
+- Report concrete findings with traceable evidence. Keep the final answer
+  focused on what the parent agent asked for.
+
+Reporting contract:
+- Return a compact evidence report with sections: Findings, Evidence,
+  Uncertainty, and Candidate comparison when relevant.
+- Distinguish confirmed facts, inferences, and hypotheses. Do not present a
+  hypothesis as fact.
+- For each important claim, include a source marker with a source_type such as
+  search_result_snippet, workspace_file, shell_output, fetched_page, or other.
+  Include the URL, file path, command summary, or other locator needed for the
+  parent agent to verify it.
+- If a claim is supported only by a search-result snippet and you did not open
+  or otherwise fetch the page body, mark it as snippet_only / not opened. Do not
+  imply that you inspected the full page.
+- When sources conflict or evidence is weak, say so plainly and explain what is
+  still unresolved.
+- If multiple candidates were investigated, compare them side by side and state
+  why each was kept or rejected.
 """
 
 

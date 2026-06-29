@@ -85,3 +85,23 @@ def test_each_profile_has_distinct_system_prompt():
     assert len(set(prompts.values())) == 3
     assert "research" in prompts["research"].lower()
     assert "deliverable" in prompts["write"].lower()
+
+
+def test_research_prompt_requires_traceable_evidence_report():
+    prompt = resolve_profile("research").system_prompt
+
+    assert "Reporting contract" in prompt
+    assert "Findings" in prompt
+    assert "Evidence" in prompt
+    assert "Uncertainty" in prompt
+    assert "Candidate comparison" in prompt
+    assert "source_type" in prompt
+
+
+def test_research_prompt_marks_search_snippets_as_weak_evidence():
+    prompt = resolve_profile("research").system_prompt
+
+    assert "search_result_snippet" in prompt
+    assert "snippet_only" in prompt
+    assert "not opened" in prompt
+    assert "imply that you inspected the full page" in prompt
