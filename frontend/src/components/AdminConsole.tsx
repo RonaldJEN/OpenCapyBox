@@ -68,6 +68,7 @@ type UserStatusFilter = 'all' | 'enabled' | 'disabled';
 type UserRoleFilter = 'all' | 'admin' | 'user';
 type UserAuthFilter = 'all' | 'simple' | 'ldap';
 type UserSortKey = 'recent' | 'name' | 'tokens';
+type OverviewDays = 7 | 14 | 30;
 
 interface UserCreateFormValues {
   authType: UserCreateMode;
@@ -486,6 +487,7 @@ export default function AdminConsole() {
   const [roundSearch, setRoundSearch] = useState('');
   const [roundPage, setRoundPage] = useState(1);
   const [roundPageSize, setRoundPageSize] = useState(5);
+  const [overviewDays, setOverviewDays] = useState<OverviewDays>(7);
   const [reviewUpdatingIds, setReviewUpdatingIds] = useState<Record<number, boolean>>({});
   const [stepLoadingIds, setStepLoadingIds] = useState<Record<number, boolean>>({});
   const [reviewError, setReviewError] = useState('');
@@ -848,7 +850,7 @@ export default function AdminConsole() {
     setError('');
     try {
       if (activeTab === 'overview') {
-        setOverview(await getAdminOverview(7));
+        setOverview(await getAdminOverview(overviewDays));
       }
       if (activeTab === 'rounds') {
         setRounds(await getAdminRoundsTree({
@@ -883,7 +885,7 @@ export default function AdminConsole() {
     } finally {
       setLoading(false);
     }
-  }, [activeTab, roundPage, roundPageSize, roundSearch, roundStatus]);
+  }, [activeTab, overviewDays, roundPage, roundPageSize, roundSearch, roundStatus]);
 
   useEffect(() => {
     setRoundPage(1);
@@ -965,7 +967,11 @@ export default function AdminConsole() {
           {loading ? <div className="admin-loading">加载中...</div> : null}
 
           {!loading && !error && activeTab === 'overview' && overview ? (
-            <OverviewPanel data={overview} />
+            <OverviewPanel
+              data={overview}
+              selectedDays={overviewDays}
+              onDaysChange={setOverviewDays}
+            />
           ) : null}
 
           {!loading && !error && activeTab === 'rounds' ? (
@@ -1030,7 +1036,15 @@ export default function AdminConsole() {
   );
 }
 
-function OverviewPanel({ data }: { data: AdminOverview }) {
+function OverviewPanel({
+  data,
+  selectedDays,
+  onDaysChange,
+}: {
+  data: AdminOverview;
+  selectedDays: OverviewDays;
+  onDaysChange: (days: OverviewDays) => void;
+}) {
   return (
     <>
       <div className="admin-grid-4">
@@ -1044,36 +1058,166 @@ function OverviewPanel({ data }: { data: AdminOverview }) {
         />
       </div>
 
+      <div className="admin-overview-toolbar">
+        <div>
+          <div className="admin-overview-toolbar-title">趋势范围</div>
+          <div className="admin-card-header-sub">折线图按完成日期聚合</div>
+        </div>
+        <label className="admin-filter-pill admin-overview-range">
+          日期
+          <select
+            aria-label="概览趋势范围"
+            value={selectedDays}
+            onChange={(event) => onDaysChange(Number(event.target.value) as OverviewDays)}
+          >
+            <option value={7}>近 7 天</option>
+            <option value={14}>近 14 天</option>
+            <option value={30}>近 30 天</option>
+          </select>
+        </label>
+      </div>
+
       <div className="admin-trend-grid">
         <div className="admin-card">
           <div className="admin-card-header">
-            <h3 className="admin-card-header-title">近 {data.window_days} 天 Rounds 趋势</h3>
+            <div>
+              <h3 className="admin-card-header-title">近 {data.window_days} 天 Rounds 趋势</h3>
+              <div className="admin-card-header-sub">按完成日期聚合</div>
+            </div>
           </div>
-          <div className="admin-card-body admin-trend-list">
-            {data.trends.map((item) => (
-              <div className="admin-trend-row" key={item.date}>
-                <span>{item.date}</span>
-                <strong>{formatNumber(item.rounds)}</strong>
-              </div>
-            ))}
+          <div className="admin-card-body admin-trend-body">
+            <TrendLineChart
+              data={data.trends}
+              metric="rounds"
+              label="Rounds"
+              accent="#244f46"
+              gradientId="overview-rounds-trend"
+            />
+            <div className="admin-trend-list">
+              {data.trends.map((item) => (
+                <div className="admin-trend-row" key={item.date}>
+                  <span>{item.date}</span>
+                  <strong>{formatNumber(item.rounds)}</strong>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
 
         <div className="admin-card">
           <div className="admin-card-header">
-            <h3 className="admin-card-header-title">近 {data.window_days} 天 Token 趋势</h3>
+            <div>
+              <h3 className="admin-card-header-title">近 {data.window_days} 天 Token 趋势</h3>
+              <div className="admin-card-header-sub">按完成日期聚合</div>
+            </div>
           </div>
-          <div className="admin-card-body admin-trend-list">
-            {data.trends.map((item) => (
-              <div className="admin-trend-row" key={item.date}>
-                <span>{item.date}</span>
-                <strong>{formatNumber(item.tokens)}</strong>
-              </div>
-            ))}
+          <div className="admin-card-body admin-trend-body">
+            <TrendLineChart
+              data={data.trends}
+              metric="tokens"
+              label="Tokens"
+              accent="#576f9f"
+              gradientId="overview-tokens-trend"
+            />
+            <div className="admin-trend-list">
+              {data.trends.map((item) => (
+                <div className="admin-trend-row" key={item.date}>
+                  <span>{item.date}</span>
+                  <strong>{formatNumber(item.tokens)}</strong>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       </div>
     </>
+  );
+}
+
+function TrendLineChart({
+  data,
+  metric,
+  label,
+  accent,
+  gradientId,
+}: {
+  data: AdminOverview['trends'];
+  metric: 'rounds' | 'tokens';
+  label: string;
+  accent: string;
+  gradientId: string;
+}) {
+  const width = 640;
+  const height = 190;
+  const padding = { top: 18, right: 18, bottom: 34, left: 42 };
+  const chartWidth = width - padding.left - padding.right;
+  const chartHeight = height - padding.top - padding.bottom;
+  const values = data.map((item) => item[metric]);
+  const maxValue = Math.max(...values, 0);
+  const yMax = maxValue > 0 ? maxValue : 1;
+  const bottomY = padding.top + chartHeight;
+  const points = data.map((item, index) => {
+    const x = padding.left + (data.length <= 1 ? chartWidth / 2 : (chartWidth / (data.length - 1)) * index);
+    const y = bottomY - (item[metric] / yMax) * chartHeight;
+    return { x, y, value: item[metric], date: item.date };
+  });
+  const linePath = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(' ');
+  const areaPath = points.length > 0
+    ? `M ${points[0].x.toFixed(2)} ${bottomY.toFixed(2)} L ${linePath.slice(2)} L ${points[points.length - 1].x.toFixed(2)} ${bottomY.toFixed(2)} Z`
+    : '';
+  const firstDate = data[0]?.date || '-';
+  const lastDate = data[data.length - 1]?.date || '-';
+  const latestValue = values[values.length - 1] ?? 0;
+
+  return (
+    <div
+      className="admin-line-chart"
+      role="img"
+      aria-label={`${label} 趋势，最新 ${formatNumber(latestValue)}，峰值 ${formatNumber(maxValue)}`}
+    >
+      <div className="admin-line-chart-meta">
+        <span>峰值 {formatNumber(maxValue)}</span>
+        <strong>最新 {formatNumber(latestValue)}</strong>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`}>
+        <defs>
+          <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor={accent} stopOpacity="0.18" />
+            <stop offset="100%" stopColor={accent} stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+          const y = padding.top + chartHeight * ratio;
+          return (
+            <line
+              key={ratio}
+              className="admin-line-chart-grid"
+              x1={padding.left}
+              x2={width - padding.right}
+              y1={y}
+              y2={y}
+            />
+          );
+        })}
+        <text className="admin-line-chart-axis" x={padding.left} y={padding.top + 2}>{formatNumber(yMax)}</text>
+        <text className="admin-line-chart-axis" x={padding.left} y={bottomY + 18}>0</text>
+        <text className="admin-line-chart-date" x={padding.left} y={height - 8}>{firstDate.slice(5)}</text>
+        <text className="admin-line-chart-date" x={width - padding.right} y={height - 8} textAnchor="end">{lastDate.slice(5)}</text>
+        {areaPath ? <path d={areaPath} fill={`url(#${gradientId})`} /> : null}
+        {linePath ? <path className="admin-line-chart-line" d={linePath} stroke={accent} /> : null}
+        {points.map((point) => (
+          <circle
+            key={`${point.date}-${point.value}`}
+            className="admin-line-chart-point"
+            cx={point.x}
+            cy={point.y}
+            r={point.value === maxValue && maxValue > 0 ? 4.2 : 3.2}
+            fill={point.value === maxValue && maxValue > 0 ? accent : '#fffef9'}
+            stroke={accent}
+          />
+        ))}
+      </svg>
+    </div>
   );
 }
 
@@ -1628,7 +1772,7 @@ function UsersPanel({
       {actionError ? <div className="admin-error admin-inline-message">{actionError}</div> : null}
       {actionMessage ? <div className="admin-toast" role="status">{actionMessage}</div> : null}
 
-      <div className="admin-card">
+      <div className="admin-card admin-users-card">
         <div className="admin-card-header">
           <div>
             <h3 className="admin-card-header-title">用户目录</h3>
@@ -1697,23 +1841,19 @@ function UsersPanel({
           <table className="admin-table admin-users-table">
             <colgroup>
               <col className="admin-users-col-user" />
-              <col className="admin-users-col-status" />
-              <col className="admin-users-col-role" />
+              <col className="admin-users-col-access" />
               <col className="admin-users-col-sandbox" />
               <col className="admin-users-col-token" />
-              <col className="admin-users-col-runtime" />
-              <col className="admin-users-col-recent" />
+              <col className="admin-users-col-activity" />
               <col className="admin-users-col-actions" />
             </colgroup>
             <thead>
               <tr>
                 <th>用户</th>
-                <th>状态</th>
-                <th>权限</th>
+                <th>状态 / 权限</th>
                 <th>沙箱后端</th>
-                <th>Token 用量与限额</th>
-                <th>运行指标</th>
-                <th>最近活动</th>
+                <th>Token</th>
+                <th>活动</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -1727,57 +1867,60 @@ function UsersPanel({
                 const passwordDraft = passwordDrafts[item.user_id] || '';
                 const isCurrentUser = item.user_id === currentUserId;
                 return (
-                  <tr key={item.user_id}>
+                  <tr
+                    key={item.user_id}
+                    className={`${isCurrentUser ? 'is-current-user' : ''} ${!item.enabled ? 'is-disabled-user' : ''}`}
+                  >
                     <td>
                       <div className="admin-user-identity">
                         <div className={`admin-user-avatar ${userAvatarTone(item)}`}>{userInitial(item)}</div>
-                        <div>
+                        <div className="admin-user-main">
                           <div className="admin-user-name-line">
                             <strong>{item.username}</strong>
                             {isCurrentUser ? <span className="admin-current-badge">当前账号</span> : null}
                           </div>
                           <div className="admin-subline">@{item.user_id}</div>
                         </div>
-                        <span className={`admin-status ${item.auth_type === 'ldap' ? 'running' : 'user'}`}>{item.auth_type}</span>
+                        <span className={`admin-auth-chip ${item.auth_type === 'ldap' ? 'ldap' : 'simple'}`}>{item.auth_type}</span>
                       </div>
                       <div className="admin-subline">创建：{item.created_by || '-'}</div>
                     </td>
                     <td>
-                      <button
-                        className={`admin-switch-button ${item.enabled ? 'on' : ''}`}
-                        disabled={isCurrentUser || !!updatingKeys[`enabled-${item.user_id}`]}
-                        onClick={() => { void onToggleEnabled(item); }}
-                      >
-                        <span />
-                        {item.enabled ? '已启用' : '已停用'}
-                      </button>
-                    </td>
-                    <td>
-                      <div className="admin-role-editor">
-                        <select
-                          className="admin-select admin-role-select"
-                          aria-label={`${item.user_id} 管理员权限`}
-                          value={roleDraft}
-                          disabled={isCurrentUser || !!updatingKeys[`admin-${item.user_id}`]}
-                          onChange={(event) => {
-                            setRoleDrafts((prev) => ({
-                              ...prev,
-                              [item.user_id]: event.target.value as 'admin' | 'user',
-                            }));
-                          }}
-                        >
-                          <option value="user">普通用户</option>
-                          <option value="admin">管理员</option>
-                        </select>
+                      <div className="admin-access-cell">
                         <button
-                          className="admin-button admin-icon-button admin-icon-only-button"
-                          aria-label={`保存 ${item.user_id} 权限`}
-                          title="保存权限"
-                          disabled={isCurrentUser || roleDraft === currentRole || !!updatingKeys[`admin-${item.user_id}`]}
-                          onClick={() => { void onUpdateAdmin(item, roleDraft === 'admin'); }}
+                          className={`admin-switch-button ${item.enabled ? 'on' : ''}`}
+                          disabled={isCurrentUser || !!updatingKeys[`enabled-${item.user_id}`]}
+                          onClick={() => { void onToggleEnabled(item); }}
                         >
-                          <Save size={14} />
+                          <span />
+                          {item.enabled ? '已启用' : '已停用'}
                         </button>
+                        <div className="admin-role-editor">
+                          <select
+                            className="admin-select admin-role-select"
+                            aria-label={`${item.user_id} 管理员权限`}
+                            value={roleDraft}
+                            disabled={isCurrentUser || !!updatingKeys[`admin-${item.user_id}`]}
+                            onChange={(event) => {
+                              setRoleDrafts((prev) => ({
+                                ...prev,
+                                [item.user_id]: event.target.value as 'admin' | 'user',
+                              }));
+                            }}
+                          >
+                            <option value="user">普通用户</option>
+                            <option value="admin">管理员</option>
+                          </select>
+                          <button
+                            className="admin-button admin-icon-button admin-icon-only-button"
+                            aria-label={`保存 ${item.user_id} 权限`}
+                            title="保存权限"
+                            disabled={isCurrentUser || roleDraft === currentRole || !!updatingKeys[`admin-${item.user_id}`]}
+                            onClick={() => { void onUpdateAdmin(item, roleDraft === 'admin'); }}
+                          >
+                            <Save size={14} />
+                          </button>
+                        </div>
                       </div>
                     </td>
                     <td>
@@ -1817,13 +1960,13 @@ function UsersPanel({
                             <Save size={14} />
                           </button>
                         </div>
-                        <div className="admin-token-stack">
-                          <span>
+                        <div className="admin-token-stack admin-sandbox-summary">
+                          <span className="admin-sandbox-title">
                             {item.sandbox_profile_name || (item.sandbox_profile_source === 'missing' ? '已删除沙箱后端' : '默认沙箱')}
                             {' · '}
                             {sandboxSourceLabel(item.sandbox_profile_source)}
                           </span>
-                          <span>ID {item.sandbox_id || '-'}</span>
+                          <span className="admin-mono-line">ID {item.sandbox_id || '-'}</span>
                           {item.sandbox_profile_error ? (
                             <span className="admin-status error">{item.sandbox_profile_error}</span>
                           ) : null}
@@ -1851,34 +1994,40 @@ function UsersPanel({
                         <TokenUsageBar label="本周" used={item.weekly_tokens_used} limit={item.token_limit_per_week} />
                         <TokenUsageBar label="本月" used={item.monthly_tokens_used} limit={item.token_limit_per_month} />
                         <div className="admin-limit-editor">
-                          <input
-                            className="admin-input admin-limit-input"
-                            aria-label={`${item.user_id} 周限额`}
-                            type="number"
-                            min="0"
-                            value={draft.weeklyLimit}
-                            onChange={(event) => {
-                              setTokenDrafts((prev) => ({
-                                ...prev,
-                                [item.user_id]: { ...draft, weeklyLimit: event.target.value },
-                              }));
-                            }}
-                            placeholder={formatLimit(item.token_limit_per_week)}
-                          />
-                          <input
-                            className="admin-input admin-limit-input"
-                            aria-label={`${item.user_id} 月限额`}
-                            type="number"
-                            min="0"
-                            value={draft.monthlyLimit}
-                            onChange={(event) => {
-                              setTokenDrafts((prev) => ({
-                                ...prev,
-                                [item.user_id]: { ...draft, monthlyLimit: event.target.value },
-                              }));
-                            }}
-                            placeholder={formatLimit(item.token_limit_per_month)}
-                          />
+                          <label className="admin-limit-field">
+                            <span>周限额</span>
+                            <input
+                              className="admin-input admin-limit-input"
+                              aria-label={`${item.user_id} 周限额`}
+                              type="number"
+                              min="0"
+                              value={draft.weeklyLimit}
+                              onChange={(event) => {
+                                setTokenDrafts((prev) => ({
+                                  ...prev,
+                                  [item.user_id]: { ...draft, weeklyLimit: event.target.value },
+                                }));
+                              }}
+                              placeholder={formatLimit(item.token_limit_per_week)}
+                            />
+                          </label>
+                          <label className="admin-limit-field">
+                            <span>月限额</span>
+                            <input
+                              className="admin-input admin-limit-input"
+                              aria-label={`${item.user_id} 月限额`}
+                              type="number"
+                              min="0"
+                              value={draft.monthlyLimit}
+                              onChange={(event) => {
+                                setTokenDrafts((prev) => ({
+                                  ...prev,
+                                  [item.user_id]: { ...draft, monthlyLimit: event.target.value },
+                                }));
+                              }}
+                              placeholder={formatLimit(item.token_limit_per_month)}
+                            />
+                          </label>
                           <button
                             className="admin-button admin-icon-button admin-icon-only-button"
                             aria-label={`保存 ${item.user_id} 限额`}
@@ -1897,18 +2046,18 @@ function UsersPanel({
                       </div>
                     </td>
                     <td>
-                      <div className="admin-runtime-grid">
-                        <span><b>{item.sessions_count}</b> Sessions</span>
-                        <span><b>{item.rounds_count}</b> Rounds</span>
-                        <span><b>{item.running_rounds}</b> 运行中</span>
-                        <span><b>{item.cron_jobs_enabled}/{item.cron_jobs_total}</b> Cron</span>
-                      </div>
-                    </td>
-                    <td>
-                      <div className="admin-token-stack">
-                        <span>活跃 {formatDateTime(item.last_active_at)}</span>
-                        <span>登录 {formatDateTime(item.last_login_at)}</span>
-                        <span>IP {item.last_login_ip || '-'}</span>
+                      <div className="admin-activity-cell">
+                        <div className="admin-runtime-grid">
+                          <span><b>{item.sessions_count}</b> Sessions</span>
+                          <span><b>{item.rounds_count}</b> Rounds</span>
+                          <span><b>{item.running_rounds}</b> 运行中</span>
+                          <span><b>{item.cron_jobs_enabled}/{item.cron_jobs_total}</b> Cron</span>
+                        </div>
+                        <div className="admin-token-stack admin-recent-stack">
+                          <span>活跃 {formatDateTime(item.last_active_at)}</span>
+                          <span>登录 {formatDateTime(item.last_login_at)}</span>
+                          <span>IP {item.last_login_ip || '-'}</span>
+                        </div>
                       </div>
                     </td>
                     <td>
