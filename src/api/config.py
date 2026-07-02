@@ -36,6 +36,10 @@ class Settings(BaseSettings):
 
     # 数据库配置（仅支持 PostgreSQL，必须在 .env 中配置 DATABASE_URL）
     database_url: str = "postgresql://postgres:postgres@localhost:5432/open_capy_box"
+    database_pool_size: int = 10
+    database_max_overflow: int = 20
+    database_pool_timeout_seconds: int = 5
+    database_pool_recycle_seconds: int = 1800
 
     # LLM API 配置（仅作为 Model Registry 不可用时的 fallback）
     llm_api_key: str = ""  # API 密钥（必须在 .env 中配置 LLM_API_KEY）
@@ -94,6 +98,24 @@ class Settings(BaseSettings):
     def validate_sandbox_background_command_timeout_seconds(cls, value: int) -> int:
         if value < 0:
             raise ValueError("sandbox_background_command_timeout_seconds must be >= 0")
+        return value
+
+    @field_validator(
+        "database_pool_size",
+        "database_pool_timeout_seconds",
+        "database_pool_recycle_seconds",
+    )
+    @classmethod
+    def validate_positive_database_pool_settings(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("database pool settings must be > 0")
+        return value
+
+    @field_validator("database_max_overflow")
+    @classmethod
+    def validate_database_max_overflow(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("database_max_overflow must be >= 0")
         return value
 
     def get_auth_users(self) -> dict[str, str]:

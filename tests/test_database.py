@@ -35,6 +35,25 @@ class TestDatabaseConfig:
             # PostgreSQL: 验证 engine url 包含数据库名
             assert engine.url.database is not None
 
+    def test_database_pool_settings_are_configurable(self):
+        """连接池参数应从 Settings 暴露，便于生产环境按并发量调优。"""
+        from src.api.config import get_settings
+
+        settings = get_settings()
+        assert settings.database_pool_size > 0
+        assert settings.database_max_overflow >= 0
+        assert settings.database_pool_timeout_seconds > 0
+        assert settings.database_pool_recycle_seconds > 0
+
+    def test_engine_pool_diagnostics_includes_live_status(self):
+        """诊断信息应包含连接池配置与实时状态。"""
+        from src.api.models.database import get_engine_pool_diagnostics
+
+        diagnostics = get_engine_pool_diagnostics()
+        assert "status" in diagnostics
+        assert diagnostics["configured"]["pool_size"] > 0
+        assert diagnostics["configured"]["pool_timeout_seconds"] > 0
+
     def test_session_local_bound_to_engine(self):
         """验证 SessionLocal 绑定到正确的 engine"""
         from src.api.models.database import SessionLocal, engine

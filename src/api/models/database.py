@@ -53,11 +53,15 @@ if not DATABASE_URL.startswith(("postgresql", "postgres")):
     )
 
 # 创建引擎：PostgreSQL 使用 QueuePool + pool_pre_ping 保证连接活性。
+# pool_timeout 默认较短，避免连接池耗尽时同步 SQLAlchemy checkout 长时间阻塞
+# asyncio 事件循环，表现为整个服务不响应。
 engine = create_engine(
     DATABASE_URL,
     echo=False,
-    pool_size=5,
-    max_overflow=10,
+    pool_size=_settings.database_pool_size,
+    max_overflow=_settings.database_max_overflow,
+    pool_timeout=_settings.database_pool_timeout_seconds,
+    pool_recycle=_settings.database_pool_recycle_seconds,
     pool_pre_ping=True,
 )
 
@@ -75,9 +79,43 @@ def get_db():
         yield db
     finally:
         try:
+            db.rollback()
+        except OperationalError:
+            logger.warning("回滚数据库会话时连接已断开", exc_info=True)
+        try:
             db.close()
         except OperationalError:
             logger.warning("关闭数据库会话时连接已断开", exc_info=True)
+
+
+def get_engine_pool_diagnostics() -> dict[str, object]:
+    """Return SQLAlchemy pool settings and live counters for admin diagnostics."""
+    pool = engine.pool
+
+    def _maybe_call(name: str):
+        value = getattr(pool, name, None)
+        if not callable(value):
+            return None
+        try:
+            return value()
+        except Exception:
+            return None
+
+    return {
+        "url_database": engine.url.database,
+        "pool_class": type(pool).__name__,
+        "status": pool.status(),
+        "size": _maybe_call("size"),
+        "checked_in": _maybe_call("checkedin"),
+        "checked_out": _maybe_call("checkedout"),
+        "overflow": _maybe_call("overflow"),
+        "configured": {
+            "pool_size": _settings.database_pool_size,
+            "max_overflow": _settings.database_max_overflow,
+            "pool_timeout_seconds": _settings.database_pool_timeout_seconds,
+            "pool_recycle_seconds": _settings.database_pool_recycle_seconds,
+        },
+    }
 
 
 def init_db():

@@ -102,6 +102,16 @@ function formatNumber(value: number): string {
   return value.toLocaleString('zh-CN');
 }
 
+function formatOptionalNumber(value: number | null | undefined): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+  return formatNumber(value);
+}
+
+function formatPoolOverflow(value: number | null | undefined): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+  return formatNumber(Math.max(0, value));
+}
+
 function formatDetailText(value: unknown): string {
   if (value === null || value === undefined || value === '') return '-';
   const readableValue = parseNestedJsonLike(value);
@@ -2673,6 +2683,10 @@ function SystemPanel({ data }: { data: AdminSystemResponse | null }) {
   }
 
   const summary = data.summary;
+  const database = data.database;
+  const pool = database?.pool;
+  const activityRows = database?.activity || [];
+  const longQueries = database?.long_queries || [];
   const compactionRatio = summary.llm_calls > 0
     ? `${((summary.compaction_calls / summary.llm_calls) * 100).toFixed(1)}%`
     : '0%';
@@ -2743,7 +2757,149 @@ function SystemPanel({ data }: { data: AdminSystemResponse | null }) {
           )}
         </div>
       </div>
+
+      <div className="admin-card">
+        <div className="admin-card-header">
+          <div>
+            <h3 className="admin-card-header-title">数据库运行态</h3>
+            {pool ? (
+              <div className="admin-card-header-sub">
+                {pool.url_database || '-'} · {pool.pool_class}
+              </div>
+            ) : null}
+          </div>
+          {database?.error ? (
+            <span className="admin-status error">诊断失败</span>
+          ) : pool ? (
+            <span className="admin-status ok">已连接</span>
+          ) : null}
+        </div>
+        <div className="admin-card-body admin-db-body">
+          {!pool ? (
+            <div className="admin-loading">暂无数据库诊断数据</div>
+          ) : (
+            <>
+              <div className="admin-db-metric-grid">
+                <DatabaseMetric
+                  label="Pool Size"
+                  value={formatOptionalNumber(pool.size)}
+                  hint={`配置 ${formatNumber(pool.configured.pool_size)} / 溢出 ${formatNumber(pool.configured.max_overflow)}`}
+                />
+                <DatabaseMetric label="Checked In" value={formatOptionalNumber(pool.checked_in)} />
+                <DatabaseMetric label="Checked Out" value={formatOptionalNumber(pool.checked_out)} />
+                <DatabaseMetric
+                  label="Blocked Locks"
+                  value={formatOptionalNumber(database?.blocked_locks)}
+                  tone={database?.blocked_locks ? 'warn' : 'ok'}
+                />
+              </div>
+
+              <div className="admin-db-config-grid">
+                <div><span>Pool Timeout</span><strong>{formatNumber(pool.configured.pool_timeout_seconds)}s</strong></div>
+                <div><span>Pool Recycle</span><strong>{formatNumber(pool.configured.pool_recycle_seconds)}s</strong></div>
+                <div><span>Active Overflow</span><strong>{formatPoolOverflow(pool.overflow)}</strong></div>
+                <div><span>Database</span><strong>{pool.url_database || '-'}</strong></div>
+              </div>
+
+              <div className="admin-db-status-line">
+                <span>Pool Status</span>
+                <code>{pool.status}</code>
+              </div>
+
+              {database?.error ? (
+                <div className="admin-inline-message admin-db-error">{database.error}</div>
+              ) : null}
+
+              <div className="admin-db-tables">
+                <div className="admin-db-section">
+                  <div className="admin-db-section-title">连接活动</div>
+                  <div className="admin-table-wrap">
+                    <table className="admin-table admin-db-table">
+                      <thead>
+                        <tr>
+                          <th>State</th>
+                          <th>Wait Type</th>
+                          <th>Wait Event</th>
+                          <th>Count</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {activityRows.map((row) => (
+                          <tr key={`${row.state || 'none'}-${row.wait_event_type}-${row.wait_event}`}>
+                            <td>{row.state || 'none'}</td>
+                            <td>{row.wait_event_type}</td>
+                            <td>{row.wait_event}</td>
+                            <td>{formatNumber(row.count)}</td>
+                          </tr>
+                        ))}
+                        {activityRows.length === 0 ? (
+                          <tr>
+                            <td colSpan={4}>暂无活动数据</td>
+                          </tr>
+                        ) : null}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div className="admin-db-section">
+                  <div className="admin-db-section-title">长查询</div>
+                  <div className="admin-table-wrap">
+                    <table className="admin-table admin-db-table admin-db-query-table">
+                      <thead>
+                        <tr>
+                          <th>PID</th>
+                          <th>State</th>
+                          <th>Wait</th>
+                          <th>Age</th>
+                          <th>Query</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {longQueries.map((query) => (
+                          <tr key={`${query.pid}-${query.age_seconds}`}>
+                            <td>{query.pid}</td>
+                            <td>{query.state || 'none'}</td>
+                            <td>{query.wait_event_type}/{query.wait_event}</td>
+                            <td>{formatNumber(query.age_seconds)}s</td>
+                            <td className="admin-db-query-sample">{query.query_sample || '-'}</td>
+                          </tr>
+                        ))}
+                        {longQueries.length === 0 ? (
+                          <tr>
+                            <td colSpan={5}>暂无超过 30 秒的活动查询</td>
+                          </tr>
+                        ) : null}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
     </>
+  );
+}
+
+function DatabaseMetric({
+  label,
+  value,
+  hint,
+  tone,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+  tone?: 'ok' | 'warn';
+}) {
+  return (
+    <div className={`admin-db-metric ${tone || ''}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+      {hint ? <small>{hint}</small> : null}
+    </div>
   );
 }
 

@@ -217,6 +217,33 @@ describe('AdminConsole 组件', () => {
         compaction_emergency_drops: 0,
         llm_response_errors: 0,
       },
+      database: {
+        pool: {
+          url_database: 'open_capy_box',
+          pool_class: 'QueuePool',
+          status: 'Pool size: 10  Connections in pool: 8 Current Overflow: 0 Current Checked out connections: 2',
+          size: 10,
+          checked_in: 8,
+          checked_out: 2,
+          overflow: -7,
+          configured: {
+            pool_size: 10,
+            max_overflow: 20,
+            pool_timeout_seconds: 5,
+            pool_recycle_seconds: 1800,
+          },
+        },
+        activity: [
+          {
+            state: 'active',
+            wait_event_type: 'none',
+            wait_event: 'none',
+            count: 1,
+          },
+        ],
+        blocked_locks: 0,
+        long_queries: [],
+      },
     });
 
     vi.mocked(getAdminUserLoginEvents).mockResolvedValue({
@@ -274,6 +301,28 @@ describe('AdminConsole 组件', () => {
     });
 
     expect(screen.getByRole('button', { name: /Session监控/ })).toBeInTheDocument();
+  });
+
+  it('系统监控应展示数据库运行态诊断', async () => {
+    render(<AdminConsole />);
+
+    await waitFor(() => {
+      expect(getAdminOverview).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /系统监控/ }));
+
+    await waitFor(() => {
+      expect(getAdminSystem).toHaveBeenCalledWith(24);
+      expect(screen.getByText('数据库运行态')).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/QueuePool/)).toBeInTheDocument();
+    expect(screen.getByText('Checked Out')).toBeInTheDocument();
+    expect(screen.getByText('Pool Timeout')).toBeInTheDocument();
+    expect(screen.getByText('Active Overflow')).toBeInTheDocument();
+    expect(screen.getByText('连接活动')).toBeInTheDocument();
+    expect(screen.getByText('暂无超过 30 秒的活动查询')).toBeInTheDocument();
   });
 
   it('点击退出登录应清理登录状态并跳转登录页', async () => {

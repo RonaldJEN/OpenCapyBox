@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import case, func, or_
+from sqlalchemy import case, func, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 
@@ -22,7 +22,7 @@ from src.api.config import get_settings
 from src.api.deps import get_current_admin_user
 from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
-from src.api.models.database import get_db
+from src.api.models.database import get_db, get_engine_pool_diagnostics
 from src.api.models.llm_model import LLMModel, LLMModelSettings
 from src.api.models.model_permission import ModelPermissionGroup, ModelPermissionGroupModel, UserModelPermissionGroup
 from src.api.models.sandbox_profile import SandboxProfile
@@ -1474,6 +1474,61 @@ def _build_user_login_events_payload(db: DBSession, *, user_id: str, limit: int)
     }
 
 
+def _build_database_runtime_payload(db: DBSession) -> dict[str, Any]:
+    """Expose DB pool and wait-state data for production stall diagnostics."""
+    payload: dict[str, Any] = {"pool": get_engine_pool_diagnostics()}
+
+    try:
+        activity_rows = db.execute(text("""
+            SELECT
+                state,
+                COALESCE(wait_event_type, 'none') AS wait_event_type,
+                COALESCE(wait_event, 'none') AS wait_event,
+                COUNT(*) AS count
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+            GROUP BY state, wait_event_type, wait_event
+            ORDER BY count DESC
+        """)).mappings().all()
+        payload["activity"] = [dict(row) for row in activity_rows]
+
+        blocked_locks = db.execute(text("""
+            SELECT COUNT(*)
+            FROM pg_locks l
+            JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE NOT l.granted
+              AND a.datname = current_database()
+        """)).scalar()
+        payload["blocked_locks"] = int(blocked_locks or 0)
+
+        long_queries = db.execute(text("""
+            SELECT
+                pid,
+                state,
+                COALESCE(wait_event_type, 'none') AS wait_event_type,
+                COALESCE(wait_event, 'none') AS wait_event,
+                EXTRACT(EPOCH FROM (now() - query_start))::INT AS age_seconds,
+                LEFT(query, 240) AS query_sample
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND state = 'active'
+              AND query_start IS NOT NULL
+              AND now() - query_start > interval '30 seconds'
+            ORDER BY query_start ASC
+            LIMIT 20
+        """)).mappings().all()
+        payload["long_queries"] = [dict(row) for row in long_queries]
+    except Exception as exc:
+        logger.warning("构建数据库运行态诊断失败", exc_info=True)
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    return payload
+
+
 def _build_system_payload(db: DBSession, hours: int) -> dict[str, Any]:
     now = now_naive()
     since = now - timedelta(hours=hours)
@@ -1571,6 +1626,7 @@ def _build_system_payload(db: DBSession, hours: int) -> dict[str, Any]:
             "compaction_emergency_drops": int(compaction_agg.emergency_drops),
             "llm_response_errors": int(compaction_agg.response_errors),
         },
+        "database": _build_database_runtime_payload(db),
     }
 
 

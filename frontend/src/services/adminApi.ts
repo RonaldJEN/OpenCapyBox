@@ -177,6 +177,39 @@ export interface AdminSystemResponse {
     compaction_emergency_drops: number;
     llm_response_errors: number;
   };
+  database?: {
+    pool: {
+      url_database: string | null;
+      pool_class: string;
+      status: string;
+      size: number | null;
+      checked_in: number | null;
+      checked_out: number | null;
+      overflow: number | null;
+      configured: {
+        pool_size: number;
+        max_overflow: number;
+        pool_timeout_seconds: number;
+        pool_recycle_seconds: number;
+      };
+    };
+    activity?: Array<{
+      state: string | null;
+      wait_event_type: string;
+      wait_event: string;
+      count: number;
+    }>;
+    blocked_locks?: number;
+    long_queries?: Array<{
+      pid: number;
+      state: string | null;
+      wait_event_type: string;
+      wait_event: string;
+      age_seconds: number;
+      query_sample: string;
+    }>;
+    error?: string;
+  };
 }
 
 export async function getAdminOverview(days: number = 7): Promise<AdminOverview> {
