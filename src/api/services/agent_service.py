@@ -96,11 +96,49 @@ class AgentService:
         # === 從 Model Registry 創建 LLM 客戶端 ===
         try:
             registry = get_model_registry()
-            if self.model_id:
+            if getattr(registry, "source", "") == "db":
+                from src.api.models.database import SessionLocal
+                from src.api.services.model_access_service import (
+                    assert_user_can_access_model,
+                    list_accessible_model_configs,
+                    resolve_default_model_for_user,
+                )
+
+                with SessionLocal() as access_db:
+                    if self.model_id:
+                        model_config = assert_user_can_access_model(
+                            access_db,
+                            self.user_id,
+                            self.model_id,
+                            registry,
+                        )
+                    else:
+                        model_config = resolve_default_model_for_user(
+                            access_db,
+                            self.user_id,
+                            registry=registry,
+                        )
+                        self.model_id = model_config.id
+                    registry_models = list_accessible_model_configs(
+                        access_db,
+                        self.user_id,
+                        registry,
+                    )
+            elif self.model_id:
                 model_config = registry.get_or_raise(self.model_id)
+                registry_models = (
+                    registry.list_models(enabled_only=True)
+                    if hasattr(registry, "list_models")
+                    else [model_config]
+                )
             else:
                 model_config = registry.get_default()
                 self.model_id = model_config.id
+                registry_models = (
+                    registry.list_models(enabled_only=True)
+                    if hasattr(registry, "list_models")
+                    else [model_config]
+                )
 
             self._token_limit = model_config.compute_token_limit()
 
@@ -110,11 +148,6 @@ class AgentService:
             )
 
             # 收集 fallback 模型（排除當前主模型，按 YAML 順序），并保持多模态能力不降级。
-            registry_models = (
-                registry.list_models(enabled_only=True)
-                if hasattr(registry, "list_models")
-                else [model_config]
-            )
             fallback_configs = [
                 m for m in registry_models
                 if m.id != model_config.id
@@ -334,7 +367,17 @@ class AgentService:
 
         try:
             registry = get_model_registry()
-            subagent_model = registry.get_subagent_default()
+            if getattr(registry, "source", "") == "db":
+                from src.api.services.model_access_service import resolve_default_model_for_user
+
+                subagent_model = resolve_default_model_for_user(
+                    graph_db,
+                    self.user_id,
+                    kind="subagent",
+                    registry=registry,
+                )
+            else:
+                subagent_model = registry.get_subagent_default()
             model_id = subagent_model.id
 
             graph_service = get_subagent_graph_service()

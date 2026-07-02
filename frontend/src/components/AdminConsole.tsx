@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 
 import { apiService } from '../services/api';
+import AdminModelAccessPanel from './AdminModelAccessPanel';
 import {
   createAdminLdapUser,
   createAdminSandboxProfile,
@@ -62,7 +63,7 @@ import {
 } from '../services/adminApi';
 import './AdminConsole.css';
 
-type AdminTab = 'overview' | 'rounds' | 'users' | 'sandboxes' | 'system';
+type AdminTab = 'overview' | 'rounds' | 'users' | 'sandboxes' | 'models' | 'system';
 type UserCreateMode = 'simple' | 'ldap';
 type UserStatusFilter = 'all' | 'enabled' | 'disabled';
 type UserRoleFilter = 'all' | 'admin' | 'user';
@@ -87,6 +88,7 @@ const NAV_ITEMS: Array<{ id: AdminTab; label: string; icon: ComponentType<{ size
   { id: 'rounds', label: 'Session监控', icon: BarChart3 },
   { id: 'users', label: '用户管理', icon: Users },
   { id: 'sandboxes', label: '沙箱管理', icon: Server },
+  { id: 'models', label: '模型权限', icon: KeyRound },
   { id: 'system', label: '系统监控', icon: Gauge },
 ];
 
@@ -382,7 +384,7 @@ function userAvatarTone(user: AdminUserItem): string {
 }
 
 function userSearchText(user: AdminUserItem): string {
-  return `${user.user_id} ${user.username} ${user.auth_type} ${user.created_by || ''} ${user.sandbox_profile_name || ''} ${user.sandbox_profile_error || ''}`.toLowerCase();
+  return `${user.user_id} ${user.username} ${user.auth_type} ${user.created_by || ''} ${user.sandbox_profile_name || ''} ${user.sandbox_profile_error || ''} ${(user.model_permission_group_names || []).join(' ')}`.toLowerCase();
 }
 
 function tokenPercent(used: number, limit: number | null): number {
@@ -482,6 +484,7 @@ export default function AdminConsole() {
   const [users, setUsers] = useState<AdminUsersResponse | null>(null);
   const [sandboxProfiles, setSandboxProfiles] = useState<AdminSandboxProfilesResponse | null>(null);
   const [systemData, setSystemData] = useState<AdminSystemResponse | null>(null);
+  const [modelRefreshToken, setModelRefreshToken] = useState(0);
 
   const [roundStatus, setRoundStatus] = useState('all');
   const [roundSearch, setRoundSearch] = useState('');
@@ -876,6 +879,9 @@ export default function AdminConsole() {
         setSandboxProfiles(profilesData);
         setUsers(usersData);
       }
+      if (activeTab === 'models') {
+        setModelRefreshToken((prev) => prev + 1);
+      }
       if (activeTab === 'system') {
         setSystemData(await getAdminSystem(24));
       }
@@ -1025,6 +1031,10 @@ export default function AdminConsole() {
               onSetDefault={handleSetSandboxProfileDefault}
               onToggleEnabled={handleToggleSandboxProfileEnabled}
             />
+          ) : null}
+
+          {!loading && !error && activeTab === 'models' ? (
+            <AdminModelAccessPanel apiErrorDetail={apiErrorDetail} refreshToken={modelRefreshToken} />
           ) : null}
 
           {!loading && !error && activeTab === 'system' ? (
@@ -1842,6 +1852,7 @@ function UsersPanel({
             <colgroup>
               <col className="admin-users-col-user" />
               <col className="admin-users-col-access" />
+              <col className="admin-users-col-models" />
               <col className="admin-users-col-sandbox" />
               <col className="admin-users-col-token" />
               <col className="admin-users-col-activity" />
@@ -1851,6 +1862,7 @@ function UsersPanel({
               <tr>
                 <th>用户</th>
                 <th>状态 / 权限</th>
+                <th>模型包</th>
                 <th>沙箱后端</th>
                 <th>Token</th>
                 <th>活动</th>
@@ -1921,6 +1933,26 @@ function UsersPanel({
                             <Save size={14} />
                           </button>
                         </div>
+                      </div>
+                    </td>
+                    <td>
+                      <div className="admin-model-packages-cell">
+                        {item.is_admin ? (
+                          <span className="admin-status completed">全部模型</span>
+                        ) : (
+                          <>
+                            <strong>{item.model_permission_default_group_name || '默认'}</strong>
+                            {(item.model_permission_group_names || []).length > 0 ? (
+                              <div className="admin-model-package-tags">
+                                {(item.model_permission_group_names || []).map((name) => (
+                                  <span key={name}>{name}</span>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="admin-subline">无额外业务包</div>
+                            )}
+                          </>
+                        )}
                       </div>
                     </td>
                     <td>

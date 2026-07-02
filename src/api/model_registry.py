@@ -260,6 +260,7 @@ class ModelRegistry:
         default_embedding_model_id: str = "",
         cron_default_model_id: str = "",
         subagent_default_model_id: str = "",
+        source: str = "yaml",
     ):
         self._models = models
         self._default_model_id = default_model_id
@@ -267,9 +268,32 @@ class ModelRegistry:
         self._default_embedding_model_id = default_embedding_model_id
         self._cron_default_model_id = cron_default_model_id or default_model_id
         self._subagent_default_model_id = subagent_default_model_id or default_model_id
+        self.source = source
 
     @classmethod
     def load(cls, yaml_path: str | Path | None = None) -> "ModelRegistry":
+        """Load model registry.
+
+        Explicit ``yaml_path`` keeps the historical YAML behavior for tests and
+        tooling. Runtime calls without a path prefer the DB catalog seeded from
+        models.yaml during startup.
+        """
+        if yaml_path is None:
+            try:
+                from src.api.models.database import SessionLocal
+                from src.api.services.model_access_service import load_registry_from_db
+
+                with SessionLocal() as db:
+                    registry = load_registry_from_db(db)
+                    if registry.list_models(enabled_only=False):
+                        return registry
+                    logger.warning("DB 模型目录为空，回退到 models.yaml")
+            except Exception as e:
+                logger.warning("DB 模型目录不可用，回退到 models.yaml: %s", e)
+        return cls.load_yaml(yaml_path)
+
+    @classmethod
+    def load_yaml(cls, yaml_path: str | Path | None = None) -> "ModelRegistry":
         """從 YAML 文件加載模型配置
 
         Args:
@@ -381,6 +405,7 @@ class ModelRegistry:
             default_embedding_model_id=default_embedding_model_id,
             cron_default_model_id=cron_default_model_id,
             subagent_default_model_id=subagent_default_model_id,
+            source="yaml",
         )
         registry.validate_on_startup()
         return registry

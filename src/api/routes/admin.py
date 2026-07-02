@@ -8,6 +8,7 @@
 """
 
 import logging
+import json
 from datetime import timedelta
 from typing import Any
 
@@ -22,6 +23,8 @@ from src.api.deps import get_current_admin_user
 from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
 from src.api.models.database import get_db
+from src.api.models.llm_model import LLMModel, LLMModelSettings
+from src.api.models.model_permission import ModelPermissionGroup, ModelPermissionGroupModel, UserModelPermissionGroup
 from src.api.models.sandbox_profile import SandboxProfile
 from src.api.models.session import Session
 from src.api.models.round import Round
@@ -51,6 +54,16 @@ from src.api.services.sandbox_profile_service import (
     get_user_sandbox_config_payload,
     sandbox_profile_to_payload,
     set_default_sandbox_profile,
+)
+from src.api.model_registry import ModelConfig, VALID_PROVIDERS, VALID_REASONING_FORMATS, reload_model_registry
+from src.api.services.model_access_service import (
+    admin_model_payload,
+    get_or_create_default_group,
+    group_to_payload,
+    list_permission_groups_payload,
+    set_group_models,
+    set_user_groups,
+    user_model_groups_payload,
 )
 from src.api.utils.timezone import now_naive
 
@@ -166,6 +179,138 @@ class AdminUserSandboxProfilePayload(BaseModel):
     force_recreate: bool = False
 
 
+class AdminModelPayload(BaseModel):
+    model_id: str = Field(..., min_length=1, max_length=100)
+    display_name: str = Field(..., min_length=1, max_length=255)
+    provider: str = Field(..., min_length=1, max_length=20)
+    api_base: str = Field(..., min_length=1)
+    api_key: str = Field(..., min_length=1)
+    model_name: str = Field(..., min_length=1, max_length=255)
+    max_tokens: int = Field(default=16384, gt=0)
+    context_window: int = Field(default=128000, gt=0)
+    reasoning_format: str = "none"
+    reasoning_split: bool = False
+    enable_thinking: bool = False
+    supports_image: bool = False
+    max_images: int = Field(default=0, ge=0)
+    supports_video: bool = False
+    max_videos: int = Field(default=0, ge=0)
+    enabled: bool = True
+    tags: list[str] = Field(default_factory=list)
+
+    @field_validator("model_id", "display_name", "provider", "api_base", "api_key", "model_name", "reasoning_format", mode="before")
+    @classmethod
+    def _strip_model_strings(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("provider")
+    @classmethod
+    def _valid_provider(cls, value: str) -> str:
+        if value not in VALID_PROVIDERS:
+            raise ValueError(f"provider 必须是 {sorted(VALID_PROVIDERS)}")
+        return value
+
+    @field_validator("reasoning_format")
+    @classmethod
+    def _valid_reasoning_format(cls, value: str) -> str:
+        if value not in VALID_REASONING_FORMATS:
+            raise ValueError(f"reasoning_format 必须是 {sorted(VALID_REASONING_FORMATS)}")
+        return value
+
+
+class AdminModelPatchPayload(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=255)
+    provider: str | None = Field(default=None, min_length=1, max_length=20)
+    api_base: str | None = Field(default=None, min_length=1)
+    api_key: str | None = None
+    model_name: str | None = Field(default=None, min_length=1, max_length=255)
+    max_tokens: int | None = Field(default=None, gt=0)
+    context_window: int | None = Field(default=None, gt=0)
+    reasoning_format: str | None = None
+    reasoning_split: bool | None = None
+    enable_thinking: bool | None = None
+    supports_image: bool | None = None
+    max_images: int | None = Field(default=None, ge=0)
+    supports_video: bool | None = None
+    max_videos: int | None = Field(default=None, ge=0)
+    enabled: bool | None = None
+    tags: list[str] | None = None
+
+    @field_validator("display_name", "provider", "api_base", "api_key", "model_name", "reasoning_format", mode="before")
+    @classmethod
+    def _strip_optional_model_strings(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+    @field_validator("provider")
+    @classmethod
+    def _valid_optional_provider(cls, value: str | None) -> str | None:
+        if value is not None and value not in VALID_PROVIDERS:
+            raise ValueError(f"provider 必须是 {sorted(VALID_PROVIDERS)}")
+        return value
+
+    @field_validator("reasoning_format")
+    @classmethod
+    def _valid_optional_reasoning_format(cls, value: str | None) -> str | None:
+        if value is not None and value not in VALID_REASONING_FORMATS:
+            raise ValueError(f"reasoning_format 必须是 {sorted(VALID_REASONING_FORMATS)}")
+        return value
+
+
+class AdminModelSettingsPayload(BaseModel):
+    default_model_id: str = Field(..., min_length=1, max_length=100)
+    cron_default_model_id: str | None = Field(default=None, max_length=100)
+    subagent_default_model_id: str | None = Field(default=None, max_length=100)
+
+    @field_validator("default_model_id", "cron_default_model_id", "subagent_default_model_id", mode="before")
+    @classmethod
+    def _strip_settings_ids(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+
+class AdminPermissionGroupPayload(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str | None = None
+
+    @field_validator("name", "description", mode="before")
+    @classmethod
+    def _strip_group_strings(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+
+class AdminPermissionGroupPatchPayload(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = None
+
+    @field_validator("name", "description", mode="before")
+    @classmethod
+    def _strip_group_patch_strings(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+
+class AdminModelIdsPayload(BaseModel):
+    model_ids: list[str] = Field(default_factory=list)
+
+
+class AdminGroupIdsPayload(BaseModel):
+    group_ids: list[str] = Field(default_factory=list)
+
+
+class AdminUserIdsPayload(BaseModel):
+    user_ids: list[str] = Field(default_factory=list)
+
+
 class AdminResetPasswordPayload(BaseModel):
     password: str = Field(..., min_length=1, max_length=1024)
 
@@ -179,6 +324,206 @@ class AdminResetPasswordPayload(BaseModel):
 
 def _iso(dt) -> str | None:
     return dt.isoformat() if dt else None
+
+
+def _tags_json(tags: list[str] | None) -> str:
+    normalized = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+    return json.dumps(list(dict.fromkeys(normalized)), ensure_ascii=False)
+
+
+def _settings_payload(db: DBSession) -> dict[str, Any]:
+    settings = db.query(LLMModelSettings).filter(LLMModelSettings.id == 1).first()
+    if not settings:
+        return {
+            "default_model_id": None,
+            "cron_default_model_id": None,
+            "subagent_default_model_id": None,
+        }
+    return {
+        "default_model_id": settings.default_model_id,
+        "cron_default_model_id": settings.cron_default_model_id,
+        "subagent_default_model_id": settings.subagent_default_model_id,
+    }
+
+
+def _ensure_model_ids_exist(db: DBSession, model_ids: list[str], *, enabled_only: bool = False) -> None:
+    normalized = [mid for mid in model_ids if mid]
+    if not normalized:
+        return
+    existing = {
+        row.model_id: bool(row.enabled)
+        for row in (
+            db.query(LLMModel.model_id, LLMModel.enabled)
+            .filter(LLMModel.model_id.in_(normalized))
+            .all()
+        )
+    }
+    missing = [mid for mid in normalized if mid not in existing]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"模型不存在: {missing}")
+    if enabled_only:
+        disabled = [mid for mid in normalized if not existing[mid]]
+        if disabled:
+            raise HTTPException(status_code=400, detail=f"停用模型不能作为默认模型: {disabled}")
+
+
+def _validate_model_config_values(data: dict[str, Any]) -> None:
+    try:
+        ModelConfig(
+            id=data["model_id"],
+            display_name=data["display_name"],
+            provider=data["provider"],
+            api_base=data["api_base"],
+            api_key=data["api_key"],
+            model_name=data["model_name"],
+            max_tokens=data["max_tokens"],
+            context_window=data["context_window"],
+            reasoning_format=data["reasoning_format"],
+            reasoning_split=data["reasoning_split"],
+            enable_thinking=data["enable_thinking"],
+            supports_image=data["supports_image"],
+            max_images=data["max_images"],
+            supports_video=data["supports_video"],
+            max_videos=data["max_videos"],
+            enabled=data["enabled"],
+            tags=data.get("tags") or [],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _build_admin_models_payload(db: DBSession) -> dict[str, Any]:
+    models = db.query(LLMModel).order_by(LLMModel.created_at.asc(), LLMModel.model_id.asc()).all()
+    return {
+        "models": [admin_model_payload(db, model) for model in models],
+        "settings": _settings_payload(db),
+    }
+
+
+def _create_admin_model(db: DBSession, payload: AdminModelPayload) -> dict[str, Any]:
+    _validate_model_config_values(payload.model_dump())
+    model = LLMModel(
+        model_id=payload.model_id,
+        display_name=payload.display_name,
+        provider=payload.provider,
+        api_base=payload.api_base,
+        api_key=payload.api_key,
+        model_name=payload.model_name,
+        max_tokens=payload.max_tokens,
+        context_window=payload.context_window,
+        reasoning_format=payload.reasoning_format,
+        reasoning_split=payload.reasoning_split,
+        enable_thinking=payload.enable_thinking,
+        supports_image=payload.supports_image,
+        max_images=payload.max_images,
+        supports_video=payload.supports_video,
+        max_videos=payload.max_videos,
+        enabled=payload.enabled,
+        tags_json=_tags_json(payload.tags),
+    )
+    db.add(model)
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="模型 ID 已存在") from e
+    db.refresh(model)
+    reload_model_registry()
+    return admin_model_payload(db, model)
+
+
+def _update_admin_model(db: DBSession, model_id: str, payload: AdminModelPatchPayload) -> dict[str, Any]:
+    model = db.query(LLMModel).filter(LLMModel.model_id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    data = payload.model_dump(exclude_unset=True)
+    if data.get("api_key") is None:
+        data.pop("api_key", None)
+    if "tags" in data:
+        model.tags_json = _tags_json(data.pop("tags"))
+    for field_name, value in data.items():
+        setattr(model, field_name, value)
+    _validate_model_config_values({
+        "model_id": model.model_id,
+        "display_name": model.display_name,
+        "provider": model.provider,
+        "api_base": model.api_base,
+        "api_key": model.api_key,
+        "model_name": model.model_name,
+        "max_tokens": model.max_tokens,
+        "context_window": model.context_window,
+        "reasoning_format": model.reasoning_format,
+        "reasoning_split": model.reasoning_split,
+        "enable_thinking": model.enable_thinking,
+        "supports_image": model.supports_image,
+        "max_images": model.max_images,
+        "supports_video": model.supports_video,
+        "max_videos": model.max_videos,
+        "enabled": model.enabled,
+        "tags": json.loads(model.tags_json or "[]"),
+    })
+    if data.get("enabled") is False:
+        db.query(ModelPermissionGroupModel).filter(
+            ModelPermissionGroupModel.model_id == model.model_id
+        ).delete(synchronize_session=False)
+    model.updated_at = now_naive()
+    db.commit()
+    db.refresh(model)
+    reload_model_registry()
+    return admin_model_payload(db, model)
+
+
+def _update_model_settings(db: DBSession, payload: AdminModelSettingsPayload) -> dict[str, Any]:
+    cron_id = payload.cron_default_model_id or payload.default_model_id
+    subagent_id = payload.subagent_default_model_id or payload.default_model_id
+    _ensure_model_ids_exist(db, [payload.default_model_id, cron_id, subagent_id], enabled_only=True)
+    settings = db.query(LLMModelSettings).filter(LLMModelSettings.id == 1).first()
+    if not settings:
+        settings = LLMModelSettings(id=1)
+        db.add(settings)
+    settings.default_model_id = payload.default_model_id
+    settings.cron_default_model_id = cron_id
+    settings.subagent_default_model_id = subagent_id
+    settings.updated_at = now_naive()
+    db.commit()
+    reload_model_registry()
+    return _settings_payload(db)
+
+
+def _create_permission_group(db: DBSession, payload: AdminPermissionGroupPayload, admin_user_id: str) -> dict[str, Any]:
+    group = ModelPermissionGroup(
+        name=payload.name,
+        description=payload.description,
+        is_default=False,
+        created_by=admin_user_id,
+    )
+    db.add(group)
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="模型权限包名称已存在") from e
+    db.refresh(group)
+    return group_to_payload(db, group)
+
+
+def _update_permission_group(db: DBSession, group_id: str, payload: AdminPermissionGroupPatchPayload) -> dict[str, Any]:
+    group = db.query(ModelPermissionGroup).filter(ModelPermissionGroup.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="模型权限包不存在")
+    data = payload.model_dump(exclude_unset=True)
+    if group.is_default and data.get("name") and data["name"] != group.name:
+        raise HTTPException(status_code=400, detail="默认权限包不能重命名")
+    for field_name, value in data.items():
+        setattr(group, field_name, value)
+    group.updated_at = now_naive()
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="模型权限包名称已存在") from e
+    db.refresh(group)
+    return group_to_payload(db, group)
 
 
 def _auth_login_event_to_payload(event: AuthLoginEvent) -> dict[str, Any]:
@@ -1060,6 +1405,7 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
 
         is_admin = bool(auth_user.is_admin)
         sandbox_info = get_user_sandbox_config_payload(db, user_id)
+        model_groups = user_model_groups_payload(db, user_id)
         users.append(
             {
                 "user_id": user_id,
@@ -1090,6 +1436,9 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
                 "sandbox_id": sandbox_info["sandbox_id"],
                 "sandbox_status": sandbox_info["sandbox_status"],
                 "sandbox_needs_recreate": sandbox_info["sandbox_needs_recreate"],
+                "model_permission_group_ids": model_groups["group_ids"],
+                "model_permission_group_names": model_groups["group_names"],
+                "model_permission_default_group_name": model_groups["default_group"]["name"],
                 "created_by": auth_user.created_by,
                 "created_at": _iso(auth_user.created_at),
                 "updated_at": _iso(auth_user.updated_at),
@@ -1404,6 +1753,123 @@ async def get_admin_user_login_events(
     return _build_user_login_events_payload(db, user_id=user_id, limit=limit)
 
 
+@router.get("/models")
+async def get_admin_models(
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """列出 DB 模型目录和默认模型设置。"""
+    get_or_create_default_group(db)
+    return _build_admin_models_payload(db)
+
+
+@router.post("/models")
+async def create_admin_model(
+    payload: AdminModelPayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """新增一个模型到 DB 模型目录。"""
+    return _create_admin_model(db, payload)
+
+
+@router.patch("/models/settings")
+async def update_admin_model_settings(
+    payload: AdminModelSettingsPayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """更新普通/Cron/Subagent 默认模型。"""
+    return _update_model_settings(db, payload)
+
+
+@router.patch("/models/{model_id}")
+async def update_admin_model(
+    model_id: str,
+    payload: AdminModelPatchPayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """更新模型配置；api_key 留空表示不修改。"""
+    return _update_admin_model(db, model_id, payload)
+
+
+@router.get("/model-permission-groups")
+async def get_admin_model_permission_groups(
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """列出模型权限包。"""
+    return list_permission_groups_payload(db)
+
+
+@router.post("/model-permission-groups")
+async def create_admin_model_permission_group(
+    payload: AdminPermissionGroupPayload,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """创建业务模型权限包。"""
+    return _create_permission_group(db, payload, admin_user_id)
+
+
+@router.patch("/model-permission-groups/{group_id}")
+async def update_admin_model_permission_group(
+    group_id: str,
+    payload: AdminPermissionGroupPatchPayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """更新模型权限包名称或描述。默认包不能重命名。"""
+    return _update_permission_group(db, group_id, payload)
+
+
+@router.put("/model-permission-groups/{group_id}/models")
+async def update_admin_model_permission_group_models(
+    group_id: str,
+    payload: AdminModelIdsPayload,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """设置某个权限包包含的模型。"""
+    return set_group_models(
+        db,
+        group_id=group_id,
+        model_ids=payload.model_ids,
+        admin_user_id=admin_user_id,
+    )
+
+
+@router.put("/model-permission-groups/{group_id}/users")
+async def update_admin_model_permission_group_users(
+    group_id: str,
+    payload: AdminUserIdsPayload,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """从权限包视角设置绑定用户。默认权限包自动应用全体用户，不能手动绑定。"""
+    group = db.query(ModelPermissionGroup).filter(ModelPermissionGroup.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="模型权限包不存在")
+    if group.is_default:
+        raise HTTPException(status_code=400, detail="默认权限包自动应用给所有用户，不能手动绑定")
+    normalized = list(dict.fromkeys(uid.strip() for uid in payload.user_ids if uid and uid.strip()))
+    existing_users = {
+        row[0]
+        for row in db.query(AuthUser.user_id).filter(AuthUser.user_id.in_(normalized)).all()
+    } if normalized else set()
+    missing = [uid for uid in normalized if uid not in existing_users]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"用户不存在: {missing}")
+    db.query(UserModelPermissionGroup).filter(UserModelPermissionGroup.group_id == group.id).delete(synchronize_session=False)
+    for user_id in normalized:
+        db.add(UserModelPermissionGroup(user_id=user_id, group_id=group.id, created_by=admin_user_id))
+    group.updated_at = now_naive()
+    db.commit()
+    db.refresh(group)
+    return group_to_payload(db, group)
+
+
 @router.post("/users/simple")
 async def create_admin_simple_user(
     payload: AdminCreateSimpleUserPayload,
@@ -1503,6 +1969,22 @@ async def update_admin_user_token_limits(
         token_limit_per_month=payload.token_limit_per_month,
     )
     return auth_user_to_payload(user)
+
+
+@router.put("/users/{user_id}/model-permission-groups")
+async def update_admin_user_model_permission_groups(
+    user_id: str,
+    payload: AdminGroupIdsPayload,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """设置用户额外绑定的模型权限包。默认包自动应用，不在这里保存。"""
+    return set_user_groups(
+        db,
+        user_id=user_id,
+        group_ids=payload.group_ids,
+        admin_user_id=admin_user_id,
+    )
 
 
 @router.post("/users/{user_id}/reset-password")

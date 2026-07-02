@@ -141,6 +141,9 @@ export interface AdminUserItem {
   sandbox_id?: string | null;
   sandbox_status?: string;
   sandbox_needs_recreate?: boolean;
+  model_permission_group_ids?: string[];
+  model_permission_group_names?: string[];
+  model_permission_default_group_name?: string;
   created_by: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -332,6 +335,86 @@ export interface AdminUserSandboxProfileResponse {
   sandbox_needs_recreate: boolean;
 }
 
+export interface AdminModelItem {
+  id: string;
+  name: string;
+  provider: 'openai' | 'anthropic' | string;
+  api_base: string;
+  model_name: string;
+  max_tokens: number;
+  context_window: number;
+  reasoning_format: string;
+  reasoning_split: boolean;
+  enable_thinking: boolean;
+  supports_thinking: boolean;
+  supports_image: boolean;
+  max_images: number;
+  supports_video: boolean;
+  max_videos: number;
+  enabled: boolean;
+  tags: string[];
+  api_key_set: boolean;
+  group_names: string[];
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AdminModelSettings {
+  default_model_id: string | null;
+  cron_default_model_id: string | null;
+  subagent_default_model_id: string | null;
+}
+
+export interface AdminModelsResponse {
+  models: AdminModelItem[];
+  settings: AdminModelSettings;
+}
+
+export interface AdminModelPayload {
+  model_id?: string;
+  display_name?: string;
+  provider?: string;
+  api_base?: string;
+  api_key?: string;
+  model_name?: string;
+  max_tokens?: number;
+  context_window?: number;
+  reasoning_format?: string;
+  reasoning_split?: boolean;
+  enable_thinking?: boolean;
+  supports_image?: boolean;
+  max_images?: number;
+  supports_video?: boolean;
+  max_videos?: number;
+  enabled?: boolean;
+  tags?: string[];
+}
+
+export interface AdminModelPermissionGroup {
+  id: string;
+  name: string;
+  description: string | null;
+  is_default: boolean;
+  model_ids: string[];
+  model_count: number;
+  bound_users: number;
+  created_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AdminModelPermissionGroupsResponse {
+  groups: AdminModelPermissionGroup[];
+}
+
+export interface AdminUserModelGroupsResponse {
+  user_id: string;
+  default_group: AdminModelPermissionGroup;
+  extra_groups: AdminModelPermissionGroup[];
+  group_ids: string[];
+  group_names: string[];
+}
+
 export async function createAdminSimpleUser(payload: AdminCreateSimpleUserRequest): Promise<AdminAuthUserResponse> {
   const resp = await client.post<AdminAuthUserResponse>('/admin/users/simple', payload);
   return resp.data;
@@ -367,6 +450,87 @@ export async function resetAdminSimpleUserPassword(userId: string, password: str
 
 export async function deleteAdminUser(userId: string): Promise<AdminDeleteUserResponse> {
   const resp = await client.delete<AdminDeleteUserResponse>(`/admin/users/${encodeURIComponent(userId)}`);
+  return resp.data;
+}
+
+export async function getAdminModels(): Promise<AdminModelsResponse> {
+  const resp = await client.get<AdminModelsResponse>('/admin/models');
+  return resp.data;
+}
+
+export async function createAdminModel(payload: Required<AdminModelPayload>): Promise<AdminModelItem> {
+  const resp = await client.post<AdminModelItem>('/admin/models', payload);
+  return resp.data;
+}
+
+export async function updateAdminModel(modelId: string, payload: AdminModelPayload): Promise<AdminModelItem> {
+  const resp = await client.patch<AdminModelItem>(`/admin/models/${encodeURIComponent(modelId)}`, payload);
+  return resp.data;
+}
+
+export async function updateAdminModelSettings(payload: {
+  default_model_id: string;
+  cron_default_model_id?: string | null;
+  subagent_default_model_id?: string | null;
+}): Promise<AdminModelSettings> {
+  const resp = await client.patch<AdminModelSettings>('/admin/models/settings', payload);
+  return resp.data;
+}
+
+export async function getAdminModelPermissionGroups(): Promise<AdminModelPermissionGroupsResponse> {
+  const resp = await client.get<AdminModelPermissionGroupsResponse>('/admin/model-permission-groups');
+  return resp.data;
+}
+
+export async function createAdminModelPermissionGroup(payload: {
+  name: string;
+  description?: string | null;
+}): Promise<AdminModelPermissionGroup> {
+  const resp = await client.post<AdminModelPermissionGroup>('/admin/model-permission-groups', payload);
+  return resp.data;
+}
+
+export async function updateAdminModelPermissionGroup(
+  groupId: string,
+  payload: { name?: string; description?: string | null },
+): Promise<AdminModelPermissionGroup> {
+  const resp = await client.patch<AdminModelPermissionGroup>(
+    `/admin/model-permission-groups/${encodeURIComponent(groupId)}`,
+    payload,
+  );
+  return resp.data;
+}
+
+export async function updateAdminModelPermissionGroupModels(
+  groupId: string,
+  modelIds: string[],
+): Promise<AdminModelPermissionGroup> {
+  const resp = await client.put<AdminModelPermissionGroup>(
+    `/admin/model-permission-groups/${encodeURIComponent(groupId)}/models`,
+    { model_ids: modelIds },
+  );
+  return resp.data;
+}
+
+export async function updateAdminModelPermissionGroupUsers(
+  groupId: string,
+  userIds: string[],
+): Promise<AdminModelPermissionGroup> {
+  const resp = await client.put<AdminModelPermissionGroup>(
+    `/admin/model-permission-groups/${encodeURIComponent(groupId)}/users`,
+    { user_ids: userIds },
+  );
+  return resp.data;
+}
+
+export async function updateAdminUserModelPermissionGroups(
+  userId: string,
+  groupIds: string[],
+): Promise<AdminUserModelGroupsResponse> {
+  const resp = await client.put<AdminUserModelGroupsResponse>(
+    `/admin/users/${encodeURIComponent(userId)}/model-permission-groups`,
+    { group_ids: groupIds },
+  );
   return resp.data;
 }
 

@@ -21,6 +21,12 @@ def _import_models():
     from src.api.models import subagent_run as _  # noqa: F401
     from src.api.models.auth_user import AuthUser as _  # noqa: F401
     from src.api.models.auth_login_event import AuthLoginEvent as _  # noqa: F401
+    from src.api.models.llm_model import LLMModel, LLMModelSettings  # noqa: F401
+    from src.api.models.model_permission import (  # noqa: F401
+        ModelPermissionGroup,
+        ModelPermissionGroupModel,
+        UserModelPermissionGroup,
+    )
     from src.api.models.sandbox_profile import SandboxProfile as _  # noqa: F401
     from src.api.models.user_sandbox_config import UserSandboxConfig as _  # noqa: F401
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
@@ -82,6 +88,7 @@ def init_db():
     _migrate_user_run_locks_schema()
     _migrate_run_cancel_requests_schema()
     _migrate_add_columns()
+    _seed_llm_models_from_yaml_if_empty()
     _ensure_default_sandbox_profile()
 
 
@@ -374,6 +381,19 @@ def _ensure_default_sandbox_profile() -> None:
             logger.info("DB 迁移: 已回填 %s 条 user_sandboxes 默认 profile 指纹", updated)
 
 
+def _seed_llm_models_from_yaml_if_empty() -> None:
+    """Seed the DB model catalog from models.yaml once.
+
+    After the first seed, admins own runtime model configuration in the DB.
+    """
+    from src.api.services.model_access_service import seed_model_catalog_from_yaml_if_empty
+
+    with SessionLocal() as db:
+        seeded = seed_model_catalog_from_yaml_if_empty(db)
+        if seeded:
+            logger.info("DB 初始化: 已从 models.yaml 导入 %s 个模型", seeded)
+
+
 def _migrate_add_columns(target_engine=None):
     """检查并添加缺失的列和约束（幂等，仅在不存在时执行）"""
     bind_engine = target_engine or engine
@@ -440,6 +460,12 @@ def _migrate_add_columns(target_engine=None):
                 if col["name"] == "tool_call_id" and hasattr(col["type"], "length") and (col["type"].length or 0) < 64:
                     conn.execute(text("ALTER TABLE agui_events ALTER COLUMN tool_call_id TYPE VARCHAR(64)"))
                     logger.info("DB 迁移: agui_events.tool_call_id 从 VARCHAR(%s) 升级为 VARCHAR(64)", col["type"].length)
+
+        if inspector.has_table("sessions"):
+            for col in inspector.get_columns("sessions"):
+                if col["name"] == "model_id" and hasattr(col["type"], "length") and (col["type"].length or 0) < 100:
+                    conn.execute(text("ALTER TABLE sessions ALTER COLUMN model_id TYPE VARCHAR(100)"))
+                    logger.info("DB 迁移: sessions.model_id 从 VARCHAR(%s) 升级为 VARCHAR(100)", col["type"].length)
 
         # PostgreSQL: memory_embeddings.embedding 统一为目标 pgvector 维度
         if inspector.has_table("memory_embeddings"):

@@ -43,6 +43,7 @@ from src.api.services.running_rounds import get_main_running_round
 from src.api.services.subagent_graph_service import get_subagent_graph_service
 from src.api.services.turn_orchestrator import TurnExecution, get_turn_orchestrator
 from src.api.services.web_chat_adapter import WebCancelAdapter, WebChatAdapter, WebResumeAdapter
+from src.api.services.model_access_service import assert_user_can_access_model, resolve_default_model_for_user
 from src.api.models.round import Round
 from src.api.services.history_service import HistoryService
 from src.api.models.database import SessionLocal
@@ -88,6 +89,21 @@ _agui_event_bus = get_agui_event_bus()
 _run_cancel_service = get_run_cancel_service()
 _run_coordinator = get_run_coordinator()
 _turn_orchestrator = get_turn_orchestrator()
+
+
+def _resolve_session_model_for_user(db: DBSession, session: Session, user_id: str) -> str:
+    """Validate and resolve a session model for the current user."""
+    if session.model_id:
+        if not isinstance(session, Session):
+            return str(session.model_id)
+        config = assert_user_can_access_model(db, user_id, session.model_id)
+        return config.id
+    config = resolve_default_model_for_user(db, user_id)
+    session.model_id = config.id
+    session.updated_at = now_naive()
+    db.commit()
+    db.refresh(session)
+    return config.id
 _web_chat_adapter = WebChatAdapter()
 _web_resume_adapter = WebResumeAdapter()
 _web_cancel_adapter = WebCancelAdapter()
@@ -563,11 +579,19 @@ async def send_message_stream(
     # 幂等性保證依賴 DB 層 UniqueConstraint（history_service.create_round 的 IntegrityError 兜底）
     # 無需在此做 SELECT fast-path：TOCTOU 窗口使其不可靠，省掉的只是一次 Agent 初始化嘗試
 
-    # 預讀 sandbox_id 和 round_count（輕量查詢，不會超時）
-    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
-    user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
-    round_count = db.query(Round).filter(Round.session_id == chat_session_id).count()
-    model_id = session.model_id
+    try:
+        # 預讀 sandbox_id 和 round_count（輕量查詢，不會超時）
+        user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+        user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+        round_count = db.query(Round).filter(Round.session_id == chat_session_id).count()
+        model_id = _resolve_session_model_for_user(db, session, user_id)
+    except Exception:
+        await _release_user_run_lock_in_new_session(
+            user_id=user_id,
+            lock_id=lock_id,
+            session_id=chat_session_id,
+        )
+        raise
 
     # 定義事件生成器（Agent 初始化移入 generator 內部，讓 SSE 響應頭先返回，心跳保活撐住連接）
     async def event_generator():
@@ -744,9 +768,17 @@ async def resume_interrupt(
     lock_id = await _acquire_lock_and_clear_cancel(db, user_id=user_id, session_id=chat_session_id)
     run_guard_started_at = now_naive()
 
-    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
-    user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
-    model_id = session.model_id
+    try:
+        user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+        user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+        model_id = _resolve_session_model_for_user(db, session, user_id)
+    except Exception:
+        await _release_user_run_lock_in_new_session(
+            user_id=user_id,
+            lock_id=lock_id,
+            session_id=chat_session_id,
+        )
+        raise
 
     async def event_generator():
         _entered_sse = False  # 追蹤 producer 是否已由 TurnOrchestrator 接管

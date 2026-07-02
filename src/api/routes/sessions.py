@@ -28,7 +28,7 @@ from src.api.services.sandbox_service import (
 from src.api.services.history_service import HistoryService
 from src.api.services.agent_service import AgentService
 from src.api.services.running_rounds import main_running_round_join_condition
-from src.api.model_registry import get_model_registry
+from src.api.services.model_access_service import assert_user_can_access_model, resolve_default_model_for_user
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_sandbox import UserSandbox
 from src.api.models.channel_session_binding import ChannelSessionBinding
@@ -494,21 +494,11 @@ async def create_session(
         user_id: 用戶 ID
         model_id: 模型 ID（可選，不傳則使用 models.yaml 中的 default_model）
     """
-    # 解析 model_id：驗證存在且啟用
-    resolved_model_id = None
-    try:
-        registry = get_model_registry()
-        if model_id:
-            # 前端指定了模型 → 驗證
-            config = registry.get_or_raise(model_id)
-            resolved_model_id = config.id
-        else:
-            # 未指定 → 使用默認模型
-            config = registry.get_default()
-            resolved_model_id = config.id
-    except (FileNotFoundError, ValueError) as e:
-        # Registry 不可用：允許 session 建立（向後兼容），但不記錄 model_id
-        logger.warning("Model Registry 不可用 (%s)，使用 .env 全局配置", e)
+    if model_id:
+        config = assert_user_can_access_model(db, user_id, model_id)
+    else:
+        config = resolve_default_model_for_user(db, user_id)
+    resolved_model_id = config.id
 
     # 创建会话
     chat_session_id = str(uuid.uuid4())

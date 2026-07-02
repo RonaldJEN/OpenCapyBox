@@ -21,6 +21,8 @@ from .channel_session_binding import ChannelSessionBinding
 from .subagent_run import SubagentRun
 from .auth_user import AuthUser
 from .auth_login_event import AuthLoginEvent
+from .llm_model import LLMModel, LLMModelSettings
+from .model_permission import ModelPermissionGroup, ModelPermissionGroupModel, UserModelPermissionGroup
 
 __all__ = [
     # 數據庫基礎
@@ -40,6 +42,11 @@ __all__ = [
     "SubagentRun",
     "AuthUser",
     "AuthLoginEvent",
+    "LLMModel",
+    "LLMModelSettings",
+    "ModelPermissionGroup",
+    "ModelPermissionGroupModel",
+    "UserModelPermissionGroup",
     
     # AG-UI 命名（協議兼容）
     "Thread",  # = Session

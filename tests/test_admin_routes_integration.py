@@ -16,7 +16,9 @@ from src.api.deps import get_current_admin_user
 from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
 from src.api.models.database import Base, get_db
+from src.api.models.llm_model import LLMModel
 from src.api.models.llm_call_record import LLMCallRecord
+from src.api.models.model_permission import ModelPermissionGroup, ModelPermissionGroupModel
 from src.api.models.round import Round
 from src.api.models.sandbox_profile import SandboxProfile
 from src.api.models.session import Session
@@ -256,6 +258,86 @@ def test_default_sandbox_profile_assignment_is_normalized_to_null(admin_integrat
     try:
         config = db.query(UserSandboxConfig).filter(UserSandboxConfig.user_id == "default-normalized-user").first()
         assert config is None or config.sandbox_profile_id is None
+    finally:
+        db.close()
+
+
+def _add_test_llm_model(db, *, model_id: str, enabled: bool = True) -> None:
+    db.add(LLMModel(
+        model_id=model_id,
+        display_name=model_id,
+        provider="openai",
+        api_base="https://api.example.com/v1",
+        api_key="test-key",
+        model_name=model_id,
+        max_tokens=1024,
+        context_window=4096,
+        enabled=enabled,
+    ))
+
+
+def test_model_permission_group_rejects_disabled_models(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        group = ModelPermissionGroup(id="biz-disabled-reject", name="业务停用模型校验", created_by="admin")
+        db.add(group)
+        _add_test_llm_model(db, model_id="enabled-model", enabled=True)
+        _add_test_llm_model(db, model_id="disabled-model", enabled=False)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.put(
+        "/admin/model-permission-groups/biz-disabled-reject/models",
+        json={"model_ids": ["enabled-model", "disabled-model"]},
+    )
+
+    assert response.status_code == 400
+    assert "停用模型不能加入权限包" in response.json()["detail"]
+
+    db = SessionLocal()
+    try:
+        rows = db.query(ModelPermissionGroupModel).filter(
+            ModelPermissionGroupModel.group_id == "biz-disabled-reject"
+        ).all()
+        assert rows == []
+    finally:
+        db.close()
+
+
+def test_disabling_model_removes_it_from_permission_groups(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        group = ModelPermissionGroup(id="biz-disable-cleanup", name="业务停用清理", created_by="admin")
+        db.add(group)
+        _add_test_llm_model(db, model_id="cleanup-model", enabled=True)
+        db.flush()
+        db.add(ModelPermissionGroupModel(
+            group_id="biz-disable-cleanup",
+            model_id="cleanup-model",
+            created_by="admin",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.patch("/admin/models/cleanup-model", json={"enabled": False})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["enabled"] is False
+    assert payload["group_names"] == []
+
+    db = SessionLocal()
+    try:
+        rows = db.query(ModelPermissionGroupModel).filter(
+            ModelPermissionGroupModel.model_id == "cleanup-model"
+        ).all()
+        assert rows == []
     finally:
         db.close()
 

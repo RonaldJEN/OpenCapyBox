@@ -437,6 +437,12 @@ def _purge_user_owned_data(db: DBSession, *, user_id: str) -> None:
 
     db.query(UserSandbox).filter(UserSandbox.user_id == user_id).delete(synchronize_session=False)
     db.query(UserSandboxConfig).filter(UserSandboxConfig.user_id == user_id).delete(synchronize_session=False)
+    try:
+        from src.api.models.model_permission import UserModelPermissionGroup
+
+        db.query(UserModelPermissionGroup).filter(UserModelPermissionGroup.user_id == user_id).delete(synchronize_session=False)
+    except Exception:
+        logger.warning("清理用户模型权限包绑定失败: user=%s", user_id, exc_info=True)
 
 
 def _validate_simple_username(username: str) -> None:

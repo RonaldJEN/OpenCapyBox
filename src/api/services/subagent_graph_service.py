@@ -46,7 +46,7 @@ class SubagentGraphService:
         root_run_id = self._root_run_id(db, parent_run_id)
         final_status = status or (self._status_from_child_round(child) if child is not None else SubagentRun.REQUESTED)
         self._validate_status(final_status)
-        resolved_model_id = self._resolve_model_id(model_id)
+        resolved_model_id = self._resolve_model_id(db, user_id=user_id, model_id=model_id)
 
         edge = SubagentRun(
             user_id=user_id,
@@ -231,10 +231,15 @@ class SubagentGraphService:
         return frozenset({SubagentRun.COMPLETED, SubagentRun.FAILED, SubagentRun.CANCELLED})
 
     @staticmethod
-    def _resolve_model_id(model_id: str | None) -> str | None:
+    def _resolve_model_id(db: DBSession, *, user_id: str, model_id: str | None) -> str | None:
         if model_id:
             return model_id
-        return get_model_registry().get_subagent_default().id
+        registry = get_model_registry()
+        if getattr(registry, "source", "") == "db":
+            from src.api.services.model_access_service import resolve_default_model_for_user
+
+            return resolve_default_model_for_user(db, user_id, kind="subagent", registry=registry).id
+        return registry.get_subagent_default().id
 
     @staticmethod
     def _dump_metadata(metadata: dict[str, Any] | None) -> str | None:

@@ -763,6 +763,29 @@ class TestAgentServiceGenerateTitle:
 
 
 class TestAgentServiceInitializeAgent:
+    @pytest.fixture(autouse=True)
+    def _mock_registry(self):
+        model_config = SimpleNamespace(
+            id="test-model",
+            model_name="test-model",
+            provider="openai",
+            api_base="https://api.example.com",
+            supports_image=False,
+            max_images=0,
+            supports_video=False,
+            max_videos=0,
+            context_window=128000,
+            max_tokens=4096,
+            compute_token_limit=lambda: 50000,
+        )
+        registry = MagicMock()
+        registry.source = "yaml"
+        registry.get_default.return_value = model_config
+        registry.get_or_raise.return_value = model_config
+        registry.list_models.return_value = [model_config]
+        with patch("src.api.services.agent_service.get_model_registry", return_value=registry):
+            yield
+
     @pytest.fixture
     def service(self):
         return make_agent_service()

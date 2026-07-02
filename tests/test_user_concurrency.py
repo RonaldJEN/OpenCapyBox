@@ -468,6 +468,96 @@ class TestSendMessageConcurrencyBlock:
             session_id="session-new",
         )
 
+    def test_model_access_failure_releases_user_lock_before_stream(self):
+        from tests.helpers import make_test_client
+        from src.api.routes import chat as chat_routes
+
+        mock_db = MagicMock()
+        mock_session = MagicMock()
+        mock_session.id = "session-model-denied"
+        mock_session.user_id = "testuser"
+        mock_session.status = "active"
+        mock_session.model_id = "denied-model"
+
+        def query_side_effect(model):
+            from src.api.models.session import Session as SessionModel
+            from src.api.models.user_sandbox import UserSandbox
+            from src.api.models.round import Round as RoundModel
+
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                chain.filter.return_value.first.return_value = None
+            elif model is RoundModel:
+                chain.filter.return_value.count.return_value = 0
+            return chain
+
+        mock_db.query.side_effect = query_side_effect
+        client = make_test_client(chat_routes.router, "/chat", db=mock_db)
+
+        with patch("src.api.routes.chat._acquire_user_run_lock", new_callable=AsyncMock, return_value="lock-model"), patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock, return_value=True
+        ) as release_lock, patch(
+            "src.api.routes.chat._resolve_session_model_for_user",
+            side_effect=HTTPException(status_code=403, detail="当前用户无权使用模型"),
+        ):
+            response = client.post(
+                "/chat/session-model-denied/message/stream",
+                json={"content": [{"type": "text", "text": "hello"}]},
+            )
+
+        assert response.status_code == 403
+        release_lock.assert_called_once_with(
+            user_id="testuser",
+            lock_id="lock-model",
+            session_id="session-model-denied",
+        )
+
+    def test_resume_model_access_failure_releases_user_lock_before_stream(self):
+        from tests.helpers import make_test_client
+        from src.api.routes import chat as chat_routes
+
+        mock_db = MagicMock()
+        mock_session = MagicMock()
+        mock_session.id = "session-resume-denied"
+        mock_session.user_id = "testuser"
+        mock_session.model_id = "denied-model"
+
+        def query_side_effect(model):
+            from src.api.models.session import Session as SessionModel
+            from src.api.models.user_sandbox import UserSandbox
+
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                chain.filter.return_value.first.return_value = None
+            return chain
+
+        mock_db.query.side_effect = query_side_effect
+        client = make_test_client(chat_routes.router, "/chat", db=mock_db)
+
+        with patch(
+            "src.api.routes.chat._acquire_lock_and_clear_cancel", new_callable=AsyncMock, return_value="lock-resume-model"
+        ), patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session", new_callable=AsyncMock, return_value=True
+        ) as release_lock, patch(
+            "src.api.routes.chat._resolve_session_model_for_user",
+            side_effect=HTTPException(status_code=403, detail="当前用户无权使用模型"),
+        ):
+            response = client.post(
+                "/chat/session-resume-denied/resume",
+                json={"interrupt_id": "int-1", "answers": {"question": "answer"}},
+            )
+
+        assert response.status_code == 403
+        release_lock.assert_called_once_with(
+            user_id="testuser",
+            lock_id="lock-resume-model",
+            session_id="session-resume-denied",
+        )
+
     def test_pre_stream_commit_failure_does_not_block_stream(self):
         """session.updated_at commit 失败是次要操作，不应阻塞 SSE 流。
 

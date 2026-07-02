@@ -506,7 +506,19 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
 
         try:
             from src.api.model_registry import get_model_registry
-            model_config = get_model_registry().get_cron_default()
+            from src.api.services.model_access_service import resolve_default_model_for_user
+
+            registry = get_model_registry()
+            with SessionLocal() as model_db:
+                if getattr(registry, "source", "") == "db":
+                    model_config = resolve_default_model_for_user(
+                        model_db,
+                        user_id,
+                        kind="cron",
+                        registry=registry,
+                    )
+                else:
+                    model_config = registry.get_cron_default()
             cron_model_id = model_config.id
         except FileNotFoundError as e:
             raise RuntimeError(

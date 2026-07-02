@@ -38,7 +38,7 @@ class Session(Base):
     status = Column(String(20), default="active", index=True)
     
     # 使用的模型 ID（對應 models.yaml 中的 key，nullable 兼容舊數據）
-    model_id = Column(String(50), nullable=True, index=True)
+    model_id = Column(String(100), nullable=True, index=True)
 
     # 時間戳
     created_at = Column(DateTime, default=now_naive, index=True)
