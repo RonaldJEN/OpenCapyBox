@@ -149,6 +149,13 @@ Profile 配置更新仅保留当前行的 `updated_at` 和 `version`，MVP 不�
 - Agent idle eviction / session 删除 / 用户删除等明确清理路径应 best-effort interrupt tracker 中仍在运行的后台命令，避免失去 tracker 后形成孤儿进程。
 - 普通配置失效不得为了清理 tracker 中断正在执行的 Agent run；running Agent 只能懒失效。
 
+### 前台 bash 命令 timeout 与错误诊断
+
+- `SandboxBashTool` 前台命令的 `timeout` 参数默认 10 秒、最大 600 秒；测试、构建、安装等长命令应由模型显式传 `timeout=300` 或 `timeout=600`。
+- `pytest --timeout` 只限制单个测试用例，不改变沙箱前台命令的 timeout；工具描述与 `timeout` 参数 schema 必须明确提示这一点。
+- OpenSandbox `execution.error.traceback` 应返回给 Agent 作为诊断信息，但必须限长；长 traceback 默认最多保留 8 行、2000 字符。
+- 当 traceback 中包含 `signal: killed` 时，截断逻辑必须保留该关键信号，并在工具错误中提示本次前台命令 timeout，方便模型下一轮改为显式 timeout 或后台执行。
+
 ### 暂停策略
 
 - 仅当用户所有 session 都从 AgentPool TTL 过期时才触发 pause

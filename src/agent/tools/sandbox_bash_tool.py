@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_BACKGROUND_COMMAND_TIMEOUT_SECONDS = 21600
 BACKGROUND_INTERRUPT_TIMEOUT_SECONDS = 5
 BACKGROUND_STATUS_TIMEOUT_SECONDS = 5
+MAX_EXECUTION_TRACEBACK_LINES = 8
+MAX_EXECUTION_TRACEBACK_CHARS = 2000
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: OpenSandbox SDK 的 EventNode / EventNodeError 存在多个
@@ -136,6 +138,64 @@ def _extract_exit_code(execution: Any) -> int | None:
         return 1
     # Cannot determine — caller should treat as suspicious
     return None
+
+
+def _format_execution_traceback(
+    traceback_value: Any,
+    *,
+    max_lines: int = MAX_EXECUTION_TRACEBACK_LINES,
+    max_chars: int = MAX_EXECUTION_TRACEBACK_CHARS,
+) -> str:
+    if not traceback_value:
+        return ""
+
+    if isinstance(traceback_value, str):
+        lines = traceback_value.splitlines() or [traceback_value]
+    elif isinstance(traceback_value, (list, tuple)):
+        lines = [str(line) for line in traceback_value if line]
+    else:
+        lines = [str(traceback_value)]
+
+    if not lines:
+        return ""
+
+    original_text = "\n".join(lines)
+    signal_line = next((line for line in lines if "signal: killed" in line.lower()), None)
+    selected = lines[:max_lines]
+    if signal_line and not any("signal: killed" in line.lower() for line in selected):
+        if len(selected) >= max_lines:
+            selected[-1] = signal_line
+        else:
+            selected.append(signal_line)
+
+    text = "\n".join(selected)
+    if len(text) > max_chars:
+        keep_suffix = ""
+        if signal_line and "signal: killed" not in text[:max_chars].lower():
+            keep_suffix = "\n" + signal_line
+        text = text[: max_chars - len(keep_suffix)].rstrip() + keep_suffix
+
+    omitted_lines = max(0, len(lines) - len(selected))
+    omitted_chars = max(0, len(original_text) - len(text))
+    if omitted_lines or omitted_chars:
+        text += f"\n... truncated: {omitted_lines} lines / {omitted_chars} chars omitted"
+
+    return text
+
+
+def _extract_execution_error_message(exec_error: Any) -> str:
+    """Build a useful message from OpenSandbox ExecutionError-like objects."""
+    ename = getattr(exec_error, "name", None) or getattr(exec_error, "ename", None) or ""
+    evalue = getattr(exec_error, "value", None) or getattr(exec_error, "evalue", None) or ""
+    parts: list[str] = []
+    if ename or evalue:
+        parts.append(f"{ename}: {evalue}".strip(": "))
+
+    traceback_text = _format_execution_traceback(getattr(exec_error, "traceback", None))
+    if traceback_text:
+        parts.append("traceback: " + traceback_text)
+
+    return "\n".join(parts)
 
 
 class SandboxBashOutputResult(ToolResult):
@@ -363,6 +423,9 @@ You can freely install packages with pip or npm.
 Parameters:
   - command (required): Bash command to execute
   - timeout (optional): Timeout in seconds (default: 10, max: 600) for foreground commands
+    Always set timeout explicitly for tests, package installs, builds, or commands
+    expected to run more than a few seconds. pytest's --timeout flag only limits
+    individual tests; it does not change this sandbox command timeout.
   - run_in_background (optional): Set true for long-running commands (servers, etc.)
     Background commands are still bounded by a system-configured maximum runtime.
 
@@ -372,12 +435,16 @@ Tips:
     - Skills are available at <workspace_root>/skills/
   - You can install any package: pip install xxx, npm install xxx
   - Chain commands with &&: cd project && python app.py
+  - For pytest/test/build/install commands, pass timeout=300 or timeout=600.
+    If output is redirected to a file before a final tail, make timeout long
+    enough for the command to reach the tail step.
   - For background commands, monitor with bash_output and terminate with bash_kill.
     Do not assume background commands can run forever.
 
 Examples:
   - pip install pandas matplotlib
   - python script.py
+  - python3 -m pytest tests/ -q (with timeout=600)
   - git clone https://github.com/user/repo.git
   - node server.js (with run_in_background=true)"""
 
@@ -392,7 +459,11 @@ Examples:
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 10, max: 600). Only for foreground commands.",
+                    "description": (
+                        "Timeout in seconds (default: 10, max: 600). Only for foreground commands. "
+                        "Always set explicitly for tests, package installs, builds, or slow commands; "
+                        "pytest --timeout does not change this sandbox command timeout."
+                    ),
                     "default": 10,
                 },
                 "run_in_background": {
@@ -480,10 +551,7 @@ Examples:
         exec_error = getattr(execution, "error", None)
         exec_error_msg = ""
         if exec_error:
-            ename = getattr(exec_error, "name", None) or getattr(exec_error, "ename", None) or ""
-            evalue = getattr(exec_error, "value", None) or getattr(exec_error, "evalue", None) or ""
-            if ename or evalue:
-                exec_error_msg = f"{ename}: {evalue}".strip(": ")
+            exec_error_msg = _extract_execution_error_message(exec_error)
 
         if exit_code is None:
             if exec_error:
@@ -521,6 +589,13 @@ Examples:
                 error_msg = f"Command failed with exit code {exit_code}"
             if stderr:
                 error_msg += f"\n{stderr.strip()}"
+            if "signal: killed" in exec_error_msg.lower():
+                error_msg += (
+                    f"\nSandbox reported signal: killed. Foreground command timeout "
+                    f"was {timeout}s; long commands should pass timeout up to 600 "
+                    "or run in background. If timeout was already high, check "
+                    "sandbox memory/resource limits."
+                )
 
         return SandboxBashOutputResult(
             success=is_success,

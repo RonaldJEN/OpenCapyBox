@@ -108,6 +108,16 @@ class TestSandboxBashTool:
         assert len(tool.description) > 0
         assert "command" in tool.parameters.get("properties", {})
 
+    def test_description_tells_model_to_set_timeout_for_tests(self, mock_sandbox):
+        """工具描述应提醒模型 pytest/build/install 需要显式传 timeout。"""
+        tool = SandboxBashTool(mock_sandbox)
+        timeout_desc = tool.parameters["properties"]["timeout"]["description"]
+
+        assert "pytest" in tool.description
+        assert "timeout=600" in tool.description
+        assert "Always set explicitly for tests" in timeout_desc
+        assert "pytest --timeout does not change this sandbox command timeout" in timeout_desc
+
     @pytest.mark.asyncio
     async def test_foreground_command_success(self, mock_sandbox):
         """測試前台成功執行"""
@@ -328,6 +338,65 @@ class TestSandboxBashTool:
         assert result.success is False
         assert "CommandExecError" in (result.error or "")
         assert "no such file or directory" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_foreground_signal_killed_surfaces_traceback_and_timeout_hint(self, mock_sandbox):
+        """生产中的 signal:killed 不能只返回 CommandExecError: -1。"""
+        execution = MagicMock()
+        execution.exit_code = None
+        execution.logs = MagicMock()
+        execution.logs.stdout = []
+        execution.logs.stderr = []
+        err_obj = MagicMock()
+        err_obj.name = "CommandExecError"
+        err_obj.value = "-1"
+        err_obj.ename = None
+        err_obj.evalue = None
+        err_obj.traceback = ["signal: killed"]
+        execution.error = err_obj
+        mock_sandbox.commands.run = AsyncMock(return_value=execution)
+
+        tool = SandboxBashTool(mock_sandbox)
+        result = await tool.execute(
+            command=(
+                "cd /home/user/zhigong && python3 -m pytest tests/ -q "
+                "--timeout=60 > /tmp/pytest_out.txt 2>&1 || true; "
+                "tail -25 /tmp/pytest_out.txt"
+            )
+        )
+
+        assert result.success is False
+        assert "CommandExecError: -1" in (result.error or "")
+        assert "signal: killed" in (result.error or "")
+        assert "Foreground command timeout was 10s" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_foreground_long_traceback_is_truncated_but_keeps_signal_killed(self, mock_sandbox):
+        """OpenSandbox 返回长 traceback 时应控长，同时保留关键 kill 信号。"""
+        execution = MagicMock()
+        execution.exit_code = None
+        execution.logs = MagicMock()
+        execution.logs.stdout = []
+        execution.logs.stderr = []
+        err_obj = MagicMock()
+        err_obj.name = "CommandExecError"
+        err_obj.value = "-1"
+        err_obj.ename = None
+        err_obj.evalue = None
+        err_obj.traceback = [
+            f"frame {index}: {'x' * 300}"
+            for index in range(50)
+        ] + ["signal: killed"]
+        execution.error = err_obj
+        mock_sandbox.commands.run = AsyncMock(return_value=execution)
+
+        tool = SandboxBashTool(mock_sandbox)
+        result = await tool.execute(command="python3 -m pytest tests/ -q")
+
+        assert result.success is False
+        assert "signal: killed" in (result.error or "")
+        assert "... truncated:" in (result.error or "")
+        assert len(result.error or "") < 2400
 
 
 # ============== EventNode Monkey-Patch 验证 ==============
