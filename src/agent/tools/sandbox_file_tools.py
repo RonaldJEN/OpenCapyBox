@@ -183,6 +183,10 @@ MAX_SINGLE_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 50 * 1024 * 1024
 
 
+def _quote_shell_arg(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
 def _is_within_workspace(path: str, workspace_dir: str) -> bool:
     normalized_path = posixpath.normpath(path)
     normalized_workspace = _normalize_workspace_dir(workspace_dir)
@@ -449,14 +453,14 @@ class SandboxReadTool(Tool):
             file_ext = posixpath.splitext(full_path)[1].lower()
             if file_ext in BINARY_FORMAT_SKILLS:
                 skill_name, script_cmd = BINARY_FORMAT_SKILLS[file_ext]
-                filename = posixpath.basename(full_path)
-                safe_filename = f'"{filename}"' if ' ' in filename else filename
+                safe_path = _quote_shell_arg(full_path)
                 return ToolResult(
                     success=False,
                     content="",
                     error=f"Cannot read binary file '{path}'. This is a {file_ext} file.\n\n"
                           f"💡 Quick Fix: Run this command directly:\n"
-                          f"   {script_cmd} {safe_filename}\n\n"
+                          f"   {script_cmd} {safe_path}\n\n"
+                          f"Use the quoted path exactly as shown; do not rename, split, or add spaces.\n\n"
                           f"📚 For more options, use: get_skill('{skill_name}')",
                 )
 

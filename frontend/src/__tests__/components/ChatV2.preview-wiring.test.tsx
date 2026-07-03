@@ -20,6 +20,55 @@ vi.mock('../../services/api', () => ({
   },
 }));
 
+vi.mock('../../services/chatStreamClient', async () => {
+  const { apiService } = await import('../../services/api');
+  const envelope = (args: any, event: any, meta?: any) => ({
+    ownerSessionId: args.ownerSessionId,
+    clientRunKey: args.clientRunKey,
+    serverRunId: event?.runId,
+    transportEpoch: args.transportEpoch,
+    connectionId: args.connectionId,
+    event,
+    source: args.source,
+    sequence: meta?.sequence ?? event?.sequence ?? event?._sequence,
+    isAggregate: meta?.isAggregate ?? event?.isAggregate,
+    messageId: event?.messageId,
+    toolCallId: event?.toolCallId,
+    receivedAt: Date.now(),
+  });
+  const emit = (args: any, event: any, meta?: any) => args.onEnvelope(envelope(args, event, meta));
+  const callbacksFor = (args: any) => ({
+    onStreamAccepted: () => emit(args, { type: 'CUSTOM', name: 'stream_accepted', value: {} }),
+    onRunStarted: (threadId: string, runId: string) => emit(args, { type: 'RUN_STARTED', threadId, runId }),
+    onRunFinished: (threadId: string, runId: string, result: any, outcome: string, interrupt?: any) => (
+      emit(args, { type: 'RUN_FINISHED', threadId, runId, result, outcome, interrupt })
+    ),
+    onRunError: (message: string, code?: string) => {
+      args.onError?.(message, code);
+      emit(args, { type: 'RUN_ERROR', message, code });
+    },
+    onTextMessageContent: (messageId: string, delta: string, meta?: any) => (
+      emit(args, { type: 'TEXT_MESSAGE_CONTENT', messageId, delta }, meta)
+    ),
+  });
+
+  return {
+    startSendStream: vi.fn((args: any) => ({
+      abort: vi.fn(),
+      promise: apiService.sendMessageStreamV2(args.ownerSessionId, args.content, callbacksFor(args)),
+    })),
+    startResumeStream: vi.fn((_args: any) => ({
+      abort: vi.fn(),
+      promise: Promise.resolve(),
+    })),
+    startSubscribeStream: vi.fn(() => ({
+      abort: vi.fn(),
+      promise: Promise.resolve(),
+      getLatestSequence: () => 0,
+    })),
+  };
+});
+
 vi.mock('../../components/ChatInput', () => ({
   ChatInput: (props: any) => {
     lastChatInputProps = props;
@@ -287,7 +336,9 @@ describe('ChatV2 preview callback wiring', () => {
         path: 'results/report.md',
         session_id: 'test-session',
       });
-      expect(lastRoundProps.assistantFileMatches['missing.py']).toBeNull();
+      expect(
+        Object.prototype.hasOwnProperty.call(lastRoundProps.assistantFileMatches, 'missing.py'),
+      ).toBe(false);
     });
   });
 
@@ -369,7 +420,9 @@ describe('ChatV2 preview callback wiring', () => {
     render(<ChatV2 sessionId="test-session" {...defaultProps} />);
 
     await waitFor(() => {
-      expect(lastRoundProps.assistantFileMatches['later.md']).toBeNull();
+      expect(
+        Object.prototype.hasOwnProperty.call(lastRoundProps.assistantFileMatches, 'later.md'),
+      ).toBe(false);
     });
 
     fileExists = true;
@@ -429,7 +482,9 @@ describe('ChatV2 preview callback wiring', () => {
     render(<ChatV2 sessionId="test-session" {...defaultProps} />);
 
     await waitFor(() => {
-      expect(lastRoundProps.assistantFileMatches['later.md']).toBeNull();
+      expect(
+        Object.prototype.hasOwnProperty.call(lastRoundProps.assistantFileMatches, 'later.md'),
+      ).toBe(false);
     });
 
     act(() => {

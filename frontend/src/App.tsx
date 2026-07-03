@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { Dispatch, SetStateAction, useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Login } from './components/Login';
 import { SessionList } from './components/SessionList';
@@ -9,6 +9,7 @@ import CronSchedule from './components/CronSchedule';
 import SkillManager from './components/SkillManager';
 import { apiService } from './services/api';
 import { getUnreadCount } from './services/configApi';
+import { ChatRuntimeProvider, useChatRuntime } from './runtime/ChatRuntimeProvider';
 import type { ModelInfo } from './types';
 
 type ConfigPanel = 'config' | 'skills' | 'cron' | null;
@@ -20,16 +21,33 @@ type SessionScrollTarget = {
 
 const RUNNING_SESSIONS_RECONCILE_INTERVAL_MS = 5000;
 
-const sameStringSet = (left: Set<string>, right: Set<string>) => (
-  left.size === right.size && Array.from(left).every((item) => right.has(item))
-);
-
 // 主页面组件
 function HomePage() {
-  const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const [executingSessionIds, setExecutingSessionIds] = useState<Set<string>>(() => new Set());
-  const [activeSlotSessionIds, setActiveSlotSessionIds] = useState<Set<string>>(() => new Set());
+
+  const handleTitleUpdated = useCallback(() => {
+    setRefreshTrigger((prev) => prev + 1);
+  }, []);
+
+  return (
+    <ChatRuntimeProvider onTitleUpdated={handleTitleUpdated}>
+      <HomePageContent refreshTrigger={refreshTrigger} setRefreshTrigger={setRefreshTrigger} />
+    </ChatRuntimeProvider>
+  );
+}
+
+interface HomePageContentProps {
+  refreshTrigger: number;
+  setRefreshTrigger: Dispatch<SetStateAction<number>>;
+}
+
+function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentProps) {
+  const {
+    getActiveSlotSessionIds,
+    getExecutingSessionIds,
+    syncRunningSessions,
+  } = useChatRuntime();
+  const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [selectedModelId, setSelectedModelId] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
@@ -41,6 +59,8 @@ function HomePage() {
   const currentSessionIdRef = useRef(currentSessionId);
   const initialRunningSessionsHandledRef = useRef(false);
   currentSessionIdRef.current = currentSessionId;
+  const executingSessionIds = getExecutingSessionIds();
+  const activeSlotSessionIds = getActiveSlotSessionIds();
 
   const closeConfigPanel = useCallback(() => {
     setActivePanel(null);
@@ -75,27 +95,6 @@ function HomePage() {
     return () => clearInterval(timer);
   }, []);
 
-  // 刷新会话列表的回调
-  const handleTitleUpdated = () => {
-    setRefreshTrigger((prev) => prev + 1);
-  };
-
-  // 执行状态回调
-  const handleExecutionStart = (sessionId: string) => {
-    setExecutingSessionIds((prev) => {
-      if (prev.has(sessionId)) return prev;
-      const next = new Set(prev);
-      next.add(sessionId);
-      return next;
-    });
-    setActiveSlotSessionIds((prev) => {
-      if (prev.has(sessionId)) return prev;
-      const next = new Set(prev);
-      next.add(sessionId);
-      return next;
-    });
-  };
-
   const handleSessionSelect = (sessionId: string, target?: { roundId: string }) => {
     setCurrentSessionId(sessionId);
     if (target?.roundId) {
@@ -109,38 +108,11 @@ function HomePage() {
     }
   };
 
-  const handleExecutionEnd = (sessionId?: string) => {
-    if (sessionId) {
-      setExecutingSessionIds((prev) => {
-        if (!prev.has(sessionId)) return prev;
-        const next = new Set(prev);
-        next.delete(sessionId);
-        return next;
-      });
-      setActiveSlotSessionIds((prev) => {
-        if (!prev.has(sessionId)) return prev;
-        const next = new Set(prev);
-        next.delete(sessionId);
-        return next;
-      });
-    } else {
-      setExecutingSessionIds(new Set());
-      setActiveSlotSessionIds(new Set());
-    }
-  };
-
   const reconcileRunningSessions = useCallback(async () => {
     try {
       const result = await apiService.getRunningSessions();
       const sessionIds = result.running_sessions.map((item) => item.session_id);
-      const nextSessionIds = new Set(sessionIds);
-
-      setExecutingSessionIds((prev) => (
-        sameStringSet(prev, nextSessionIds) ? prev : new Set(nextSessionIds)
-      ));
-      setActiveSlotSessionIds((prev) => (
-        sameStringSet(prev, nextSessionIds) ? prev : new Set(nextSessionIds)
-      ));
+      syncRunningSessions(result.running_sessions);
 
       if (!initialRunningSessionsHandledRef.current) {
         initialRunningSessionsHandledRef.current = true;
@@ -153,7 +125,7 @@ function HomePage() {
     } catch (error) {
       console.error('Failed to reconcile running sessions:', error);
     }
-  }, []);
+  }, [syncRunningSessions]);
 
   useEffect(() => {
     void reconcileRunningSessions();
@@ -205,9 +177,6 @@ function HomePage() {
       />
       <ChatV2
         sessionId={currentSessionId}
-        onTitleUpdated={handleTitleUpdated}
-        onExecutionStart={handleExecutionStart}
-        onExecutionEnd={handleExecutionEnd}
         onPanelToggle={setIsSidebarCollapsed}
         selectedModelId={selectedModelId}
         onModelChange={setSelectedModelId}

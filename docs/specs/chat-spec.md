@@ -313,11 +313,12 @@ Content-Type: application/json
 | `text` | `{type: "text", text: string}` | 纯文本消息 |
 | `image_url` | `{type: "image_url", image_url: {url: string}}` | 图片（base64 data URI 或 URL） |
 | `video_url` | `{type: "video_url", video_url: {url: string}}` | 视频 |
-| `file` | `{type: "file", ...}` | 文件附件 |
+| `file` | `{type: "file", file: {path: string, name?: string, mime_type?: string, size?: number}}` | 文件附件，`path` 为会话工作区相对路径 |
 
 **file block 注入语义**:
 
-- `file` block 在进入 Agent 上下文前会映射为文本提示：`[附件文件] name=<name> path=<path>。文件已就绪，请根据当前任务上下文决定是否需要读取其内容。`
+- `file` block 在进入 Agent 上下文前会映射为文本提示：`[附件文件] metadata={"name":"<name>","path":"<path>"}。文件已就绪；读取时必须逐字使用 metadata.path，不要根据文件名语义补空格或改写路径。`
+- `metadata` 是由 `{name, path}` 经过 JSON 编码生成；Agent 读取附件时必须以 `metadata.path` 作为唯一事实源。
 - 该提示是中性提示，不强制触发 `read_file` 调用；是否读取由当前任务意图决定。
 
 **图片约束**:

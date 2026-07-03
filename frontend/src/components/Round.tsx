@@ -251,9 +251,6 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
     : [];
   const visibleAssistantFiles = assistantFileMatches
     ? assistantFiles.flatMap((file) => {
-        if (!Object.prototype.hasOwnProperty.call(assistantFileMatches, file.path)) {
-          return [file];
-        }
         const matched = assistantFileMatches[file.path];
         return matched ? [{ ...file, ...matched, path: matched.path.replace(/^\/+/, '') }] : [];
       })

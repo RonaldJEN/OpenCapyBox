@@ -419,7 +419,7 @@ describe('Round 组件', () => {
     }));
   });
 
-  it('传入空校验结果时仍渲染未确认的文件卡片', () => {
+  it('传入空校验结果时不渲染未确认的文件卡片', () => {
     const round = createMockRound({
       final_response: '文件位置： `scripts/pending.py`',
       steps: [],
@@ -436,13 +436,8 @@ describe('Round 组件', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: '查看 pending.py' }));
-
-    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'pending.py',
-      path: 'scripts/pending.py',
-      session_id: 's1',
-    }));
+    expect(screen.queryByRole('button', { name: '查看 pending.py' })).not.toBeInTheDocument();
+    expect(onOpenFileInPanel).not.toHaveBeenCalled();
   });
 
   it('助手回复句子里的 docx 文件名也应该渲染为文件卡片', () => {

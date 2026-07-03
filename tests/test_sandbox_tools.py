@@ -617,6 +617,18 @@ class TestSandboxReadTool:
         assert "path" in tool.parameters.get("properties", {})
 
     @pytest.mark.asyncio
+    async def test_read_binary_docx_quick_fix_preserves_exact_chinese_etf_path(self, mock_sandbox):
+        filename = "xxxx.docx"
+
+        tool = SandboxReadTool(mock_sandbox, workspace_dir="/home/user/sessions/s1")
+        result = await tool.execute(path=filename)
+
+        assert result.success is False
+        assert "python skills/document-skills/docx/scripts/read_docx.py" in (result.error or "")
+        assert f"'/home/user/sessions/s1/{filename}'" in (result.error or "")
+        assert "xxxx .docx" not in (result.error or "")
+
+    @pytest.mark.asyncio
     async def test_read_file_success(self, mock_sandbox):
         """成功讀取文件（含 HEADER + FOOTER 閉合邊界）"""
         mock_sandbox.files.read_file = AsyncMock(return_value="line1\nline2\nline3\n")

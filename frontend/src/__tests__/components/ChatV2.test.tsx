@@ -22,6 +22,103 @@ vi.mock('../../services/api', () => ({
   },
 }));
 
+vi.mock('../../services/chatStreamClient', async () => {
+  const { apiService } = await import('../../services/api');
+
+  const makeEnvelope = (args: any, event: any, meta?: any) => ({
+    ownerSessionId: args.ownerSessionId,
+    clientRunKey: args.clientRunKey,
+    serverRunId: event?.runId,
+    transportEpoch: args.transportEpoch,
+    connectionId: args.connectionId,
+    event,
+    source: args.source,
+    sequence: meta?.sequence ?? event?.sequence ?? event?._sequence,
+    isAggregate: meta?.isAggregate ?? event?.isAggregate,
+    eventId: event?.id,
+    messageId: event?.messageId,
+    toolCallId: event?.toolCallId,
+    receivedAt: Date.now(),
+  });
+
+  const emit = (args: any, event: any, meta?: any) => {
+    args.onEnvelope(makeEnvelope(args, event, meta));
+  };
+
+  const callbacksFor = (args: any) => ({
+    onStreamAccepted: () => emit(args, { type: 'CUSTOM', name: 'stream_accepted', value: {} }),
+    onRunStarted: (threadId: string, runId: string) => emit(args, { type: 'RUN_STARTED', threadId, runId }),
+    onRunFinished: (threadId: string, runId: string, result: any, outcome: string, interrupt?: any) => (
+      emit(args, { type: 'RUN_FINISHED', threadId, runId, result, outcome, interrupt })
+    ),
+    onRunError: (message: string, code?: string) => {
+      args.onError?.(message, code);
+      emit(args, { type: 'RUN_ERROR', message, code });
+    },
+    onStepStarted: (stepName: string, timestamp?: number) => emit(args, { type: 'STEP_STARTED', stepName, timestamp }),
+    onStepFinished: (stepName: string, timestamp?: number) => emit(args, { type: 'STEP_FINISHED', stepName, timestamp }),
+    onTextMessageStart: (messageId: string, role: string) => emit(args, { type: 'TEXT_MESSAGE_START', messageId, role }),
+    onTextMessageContent: (messageId: string, delta: string, meta?: any) => (
+      emit(args, { type: 'TEXT_MESSAGE_CONTENT', messageId, delta }, meta)
+    ),
+    onTextMessageEnd: (messageId: string) => emit(args, { type: 'TEXT_MESSAGE_END', messageId }),
+    onThinkingStart: (messageId: string, timestamp?: number) => (
+      emit(args, { type: 'THINKING_TEXT_MESSAGE_START', messageId, timestamp })
+    ),
+    onThinkingContent: (messageId: string, delta: string, meta?: any) => (
+      emit(args, { type: 'THINKING_TEXT_MESSAGE_CONTENT', messageId, delta }, meta)
+    ),
+    onThinkingEnd: (messageId: string, timestamp?: number) => (
+      emit(args, { type: 'THINKING_TEXT_MESSAGE_END', messageId, timestamp })
+    ),
+    onToolCallStart: (toolCallId: string, toolCallName: string, parentMessageId?: string, timestamp?: number) => (
+      emit(args, { type: 'TOOL_CALL_START', toolCallId, toolCallName, parentMessageId, timestamp })
+    ),
+    onToolCallArgs: (toolCallId: string, delta: string, meta?: any) => emit(args, { type: 'TOOL_CALL_ARGS', toolCallId, delta }, meta),
+    onToolCallEnd: (toolCallId: string, timestamp?: number) => emit(args, { type: 'TOOL_CALL_END', toolCallId, timestamp }),
+    onToolCallResult: (messageId: string, toolCallId: string, content: string, timestamp?: number, executionTimeMs?: number) => (
+      emit(args, { type: 'TOOL_CALL_RESULT', messageId, toolCallId, content, timestamp, executionTimeMs })
+    ),
+    onStateSnapshot: (snapshot: any) => emit(args, { type: 'STATE_SNAPSHOT', snapshot }),
+    onStateDelta: (delta: any) => emit(args, { type: 'STATE_DELTA', delta }),
+    onMessagesSnapshot: (messages: any) => emit(args, { type: 'MESSAGES_SNAPSHOT', messages }),
+    onCustomEvent: (name: string, value: any) => emit(args, { type: 'CUSTOM', name, value }),
+    onActivitySnapshot: (messageId: string, activityType: string, content: any) => (
+      emit(args, { type: 'ACTIVITY_SNAPSHOT', messageId, activityType, content })
+    ),
+    onActivityDelta: (messageId: string, activityType: string, patch: any) => (
+      emit(args, { type: 'ACTIVITY_DELTA', messageId, activityType, patch })
+    ),
+  });
+
+  return {
+    startSendStream: vi.fn((args: any) => ({
+      abort: vi.fn(),
+      promise: apiService.sendMessageStreamV2(args.ownerSessionId, args.content, callbacksFor(args)),
+      getLatestSequence: () => 0,
+    })),
+    startResumeStream: vi.fn((args: any) => ({
+      abort: vi.fn(),
+      promise: apiService.resumeStream(args.ownerSessionId, args.interruptId, args.answers, callbacksFor(args)),
+    })),
+    startSubscribeStream: vi.fn((args: any) => {
+      const subscription = apiService.subscribeToRound(
+        args.ownerSessionId,
+        args.serverRunId,
+        callbacksFor(args),
+        args.lastSequence || 0,
+      );
+      return {
+        ...subscription,
+        promise: subscription.promise.catch((error: any) => {
+          args.onError?.(error?.message || '订阅连接已断开');
+          throw error;
+        }),
+      };
+    }),
+  };
+});
+
 // Mock 子组件
 vi.mock('../../components/Round', () => ({
   Round: ({ round, isStreaming }: any) => (
@@ -852,6 +949,44 @@ describe('ChatV2 组件', () => {
         7,
       );
     });
+  });
+
+  it('running history 订阅瞬断重试期间不应显示错误横幅', async () => {
+    const runningRound: RoundData = {
+      round_id: 'round-retry',
+      user_message: '运行中',
+      final_response: '',
+      steps: [],
+      step_count: 0,
+      status: 'running',
+      created_at: new Date().toISOString(),
+      last_event_sequence: 7,
+    };
+
+    let subscribeCalls = 0;
+    vi.mocked(apiService.subscribeToRound).mockImplementation(() => {
+      subscribeCalls += 1;
+      return {
+        abort: vi.fn(),
+        promise: subscribeCalls === 1
+          ? Promise.reject(new Error('SSE_STREAM_CLOSED'))
+          : new Promise(() => {}),
+      } as any;
+    });
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [runningRound],
+      session_id: 'test-session',
+      total: 1,
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(apiService.subscribeToRound).toHaveBeenCalledTimes(2);
+    }, { timeout: 2500 });
+
+    expect(screen.queryByText(/SSE_STREAM_CLOSED|订阅连接已断开/)).not.toBeInTheDocument();
   });
 
   it('running history 收到终态时应清理临时 assistant_content', async () => {

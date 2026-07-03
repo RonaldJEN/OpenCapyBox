@@ -1379,10 +1379,19 @@ class AgentService:
                 if not file_path:
                     raise ValueError("file.path 不能为空")
                 file_name = file_obj.get("name") or file_path
+                metadata = json.dumps(
+                    {"name": str(file_name), "path": str(file_path)},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
                 agent_blocks.append(
                     {
                         "type": "text",
-                        "text": f"[附件文件] name={file_name} path={file_path}。文件已就绪，请根据当前任务上下文决定是否需要读取其内容。",
+                        "text": (
+                            f"[附件文件] metadata={metadata}。"
+                            "文件已就绪；读取时必须逐字使用 metadata.path，"
+                            "不要根据文件名语义补空格或改写路径。"
+                        ),
                     }
                 )
             else:

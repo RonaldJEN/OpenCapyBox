@@ -651,8 +651,8 @@ class TestAgentServiceChatAgui:
         service.agent.add_user_message.assert_called_once()
         sent_content = service.agent.add_user_message.call_args.args[0]
         assert isinstance(sent_content, list)
-        assert any("path=a.txt" in block.get("text", "") for block in sent_content)
-        assert any("path=b.pdf" in block.get("text", "") for block in sent_content)
+        assert any('"path":"a.txt"' in block.get("text", "") for block in sent_content)
+        assert any('"path":"b.pdf"' in block.get("text", "") for block in sent_content)
         file_text_blocks = [
             block.get("text", "")
             for block in sent_content
@@ -664,6 +664,30 @@ class TestAgentServiceChatAgui:
         assert create_kwargs["user_message"] == "read this"
         assert len(create_kwargs["user_attachments"]) == 2
         assert create_kwargs["user_attachments"][0]["path"] == "a.txt"
+
+    @pytest.mark.asyncio
+    async def test_chat_agui_attachment_prompt_preserves_exact_chinese_etf_path(self, service):
+        filename = "xxxx.docx"
+
+        async for _event in service.chat_agui([
+            {"type": "file", "file": {"path": filename, "name": filename}},
+        ]):
+            pass
+
+        sent_content = service.agent.add_user_message.call_args.args[0]
+        file_text = next(
+            block.get("text", "")
+            for block in sent_content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+
+        assert f'"name":"{filename}"' in file_text
+        assert f'"path":"{filename}"' in file_text
+        assert "metadata.path" in file_text
+        assert "xxxx .docx" not in file_text
+
+        create_kwargs = service.history_service.create_round.call_args.kwargs
+        assert create_kwargs["user_attachments"][0]["path"] == filename
 
     @pytest.mark.asyncio
     async def test_chat_agui_with_attachment_only_message_keeps_history_semantics(self, service):

@@ -77,8 +77,9 @@ AgentState {
 点击行为：
 - 文件卡片位于助手 markdown 后方，不是正文内联替换。
 - 文件卡片调用 `ChatV2` 的文件面板入口，打开 `ArtifactsPanel` 并传入目标文件。
-- 点击前必须按目标父目录查询当前 session 文件列表；只有命中同路径文件时才打开 Files 抽屉。
-- 未命中说明该文本只是助手描述或文件尚未生成，必须提示用户且不得打开预览。
+- 渲染前必须按目标父目录查询当前 session 文件列表；只有命中同路径文件时才渲染文件卡片。
+- 未命中或校验失败说明该文本只是助手描述、文件尚未生成或当前状态不可确认；此类引用必须直接隐藏，不展示文件卡片或错误提示。
+- 点击时仍需二次校验目标文件存在；若已渲染卡片在点击时失效，不得打开预览，可提示用户文件不存在或尚未生成。
 - `ArtifactsPanel` 直接进入面板内 `FilePreview`，不走全屏预览弹窗。
 - 用户上传附件仍沿用原有 `onPreviewAttachment` 全屏预览链路。
 
@@ -112,6 +113,8 @@ catch (SSE error)
       → 若 status == running
           → subscribeToRound(sid, roundId, { lastSequence })
 ```
+
+订阅断连且目标 round 仍为 `running` 时，前端最多静默重试 3 次；重试期间不得展示错误横幅。重试耗尽后才展示“订阅连接已断开，Agent 可能仍在运行。请刷新页面查看结果”，提醒用户刷新查看最终结果。
 
 `_ROUND_TERMINAL_STATUSES` 必须与后端 `Round.SUBSCRIBE_TERMINAL_STATUSES` 保持一致。
 
