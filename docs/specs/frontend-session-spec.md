@@ -46,6 +46,7 @@ SessionList 挂载
   → onSessionSelect(sid, {roundId?})
   → App 更新 currentSessionId + selectedModelId + scrollTarget
   → ChatV2 检测 sessionId 变化 → loadHistory
+  → 普通会话点击（无 roundId）定位到最新消息
   → 若 search result 带 match_round_id，则滚动到对应 round 并短暂高亮
 
 用户新建会话
@@ -151,7 +152,7 @@ const handleExecutionEnd = (sessionId?: string) => {
 - 快速输入必须使用请求序号 stale guard，旧响应不得覆盖新结果。
 - 搜索非空且无结果时显示"没有匹配的对话"。
 - `match_type=user|assistant` 且有 `match_excerpt` 时，在 session 标题下展示一行摘要，前缀分别为"我的问题"、"Agent 回复"。
-- 搜索结果带 `match_round_id` 时，点击 session 后 `ChatV2` 应定位到对应 round 并短暂高亮。
+- 搜索结果带 `match_round_id` 时，点击 session 后 `ChatV2` 应定位到对应 round 并短暂高亮；无 `match_round_id` 的普通点击进入则定位到最新消息。
 
 ## 7. 折叠交互
 

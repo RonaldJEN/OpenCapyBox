@@ -242,7 +242,7 @@ All require Bearer auth.
 ### 手动触发失败兜底
 
 - `POST /api/cron/jobs/{name}/run` 在 `trigger_manual_run` 抛出**任意异常**（HTTPException 503、RuntimeError 等）时，必须把已预创建的 `running` 记录立刻标记为 `failed`，并写入失败原因（HTTPException 取 `detail`，其余取 `repr`）。
-- 否则记录会一直挂着等 startup 1 小时清理 → 前端永久转圈。
+- 否则记录会一直挂着直到下次 startup 统一清理 → 前端长期转圈。
 
 ### Dispatch 异常隔离
 
@@ -251,7 +251,8 @@ All require Bearer auth.
 
 ### 启动清理
 
-- `main.py` startup：标记运行超过 1 小时的 cron run 为 `failed`，防止前端永久 running。
+- `main.py` startup 调用 `cleanup_stale_runtime_state()`：标记所有遗留 `running` cron run 为 `failed`，输出固定中断说明，防止进程重启/部署后前端永久 running。
+- 进程重启后内存中的 worker task、用户锁与 in-flight 状态不可恢复，因此不再按运行时长保留任何旧 `running` 记录。
 
 ### 周期性清理
 

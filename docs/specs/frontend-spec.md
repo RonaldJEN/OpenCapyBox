@@ -108,10 +108,21 @@
 
 ### 4.7 管理后台 Session 监控
 
-- `AdminConsole` 的 Session 监控页必须通过 `services/adminApi.ts` 调用 `/admin/rounds-tree` 与 `/admin/rounds/{round_id}/steps/{step_number}`。
+- `AdminConsole` 的 Session 监控页必须通过 `services/adminApi.ts` 调用 `/admin/rounds-tree` 获取 session 级分页聚合，再在展开单个 session 时调用 `/admin/sessions/{session_id}/rounds` 懒加载 round + 轻量 step 数据。
+- `/admin/rounds-tree` 首屏只返回 session 级字段，`rounds_loaded=false` 且 `rounds=[]`；前端不得假设首屏已包含 round 树。
+- Step 原始详情通过 `/admin/llm-call-records/{llm_record_id}` 按需加载。
+- 筛选条件（status/search/user/page/pageSize）变化后必须折叠已展开 session，避免用旧展开状态展示新查询下的空 rounds。
 - 管理后台是审计视图，可以展示 `sub_agent` child round；但每个 round 必须明确展示 `主Agent` / `子Agent`，并在子 Agent 行展示父 run 与 subagent 类型/描述。
 - 主聊天历史隐藏 child round 是聊天视图契约；管理后台不得为了复用聊天历史过滤逻辑而丢失 child round 审计记录。
 - Step 详情中的 LLM 请求、工具参数、工具返回如果是 JSON 字符串嵌套 JSON，前端必须递归解析并解码 `\uXXXX` 转义，避免把 `sub_agent` 的 prompt/arguments 展示成不可读的原始转义文本。
+
+### 4.8 管理后台模型与权限
+
+- `AdminModelAccessPanel` 负责模型目录、默认模型与模型权限包管理，通过 `services/adminApi.ts` 调用 `/admin/models*`、`/admin/model-permission-groups*` 与 `/admin/users/{user_id}/model-permission-groups`。
+- 新建/编辑模型必须覆盖 provider、api_base、api_key、model_name、token 窗口、reasoning、多模态能力、启停与 tags；编辑时不填 api_key 表示保留旧密钥。
+- 删除模型时若模型被默认配置或历史 Session 使用，必须要求选择启用的替换模型，并在确认弹窗中说明会迁移默认配置、历史 Session 与权限包绑定。
+- 停用模型后不得留在任何模型权限包中；权限包模型选择器只允许加入启用模型。
+- 模型写操作成功后必须重新拉取模型目录与权限包，确保 UI 与后端事实源一致。
 
 ## 5. 设计体系（Claude 暖色调文档流）
 
@@ -173,11 +184,12 @@
 - 推荐：`transition-transform duration-300 ease-out`，backdrop `transition-opacity duration-200`。
 - 打开右侧面板时，左侧栏可自动折叠释放空间；**不锁定聊天滚动**。
 
-### 5.7 会话滚动记忆
+### 5.7 会话滚动策略
 
-- 按 `sessionId` 记忆 `scrollTop`（内存 ref 即可，无需持久化）。
-- 首次渲染用 `useLayoutEffect` 在浏览器绘制前恢复 `scrollTop`，避免视觉跳动。
+- 普通进入历史会话时，首次渲染用 `useLayoutEffect` 在浏览器绘制前定位到底部，保证用户看到最新消息。
+- 从搜索结果进入且带 `scrollTarget` 时，定位到命中 round 并高亮，不执行普通底部定位。
 - 新内容自动跟随**仅在用户位于底部**（距底部 < 100px）时触发。
+- 不按 `sessionId` 记忆历史 `scrollTop`；切走再切回与刷新浏览器后的语义一致，都是普通进入看最新。
 
 ### 5.8 首次渲染动画禁用
 
@@ -243,4 +255,4 @@
 3. **使用 `transition-all`** → 性能抖动，违反 §5.11。
 4. **历史消息入场用 `animate-fade-in`** → 瀑布动效，违反 §5.8。
 5. **右侧面板用 `padding-right`** → reflow 抖动，违反 §5.6。
-6. **scrollTop 恢复放在 `useEffect`**（而非 `useLayoutEffect`）→ 用户看到跳动，违反 §5.7。
+6. **普通进入会话时恢复旧 `scrollTop`** → 切回会话与刷新后的语义不一致，违反 §5.7。

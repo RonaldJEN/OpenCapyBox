@@ -127,10 +127,8 @@ function ChatV2View(props: ChatV2Props) {
   const prevRoundsLengthRef = useRef<number>(0);
   const isInitialLoadRef = useRef<boolean>(true);
   const sessionIdRef = useRef(sessionId);
-  const scrollPosBySessionRef = useRef<Record<string, number>>({});
   const roundElementRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const handledScrollTargetNonceRef = useRef<number | null>(null);
-  const pendingRestoreScrollRef = useRef<number | null>(null);
   const suppressAutoScrollRef = useRef<boolean>(false);
   const selectedModel = availableModels.find((m) => m.id === selectedModelId);
   const displayError = localError || runtimeError;
@@ -235,13 +233,11 @@ function ChatV2View(props: ChatV2Props) {
       roundElementRefs.current = {};
       isInitialLoadRef.current = true;
       suppressAutoScrollRef.current = false;
-      pendingRestoreScrollRef.current = null;
       return;
     }
 
     setDisableInitialMotion(true);
     setBootstrapMessage('');
-    pendingRestoreScrollRef.current = scrollPosBySessionRef.current[sessionId] ?? null;
     isInitialLoadRef.current = true;
     suppressAutoScrollRef.current = true;
     roundElementRefs.current = {};
@@ -354,22 +350,21 @@ function ChatV2View(props: ChatV2Props) {
 
   useLayoutEffect(() => {
     const container = chatAreaRef.current;
-    if (!isInitialLoadRef.current || !container) return;
+    if (!isInitialLoadRef.current || !container || loading) return;
     isInitialLoadRef.current = false;
 
-    const restoreTop = pendingRestoreScrollRef.current;
-    if (restoreTop !== null && Number.isFinite(restoreTop)) {
-      container.scrollTop = restoreTop;
+    const hasExplicitScrollTarget = scrollTarget?.sessionId === sessionId && Boolean(scrollTarget.roundId);
+    if (!hasExplicitScrollTarget) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
     }
 
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-    const atBottom = distanceFromBottom < 100;
+    const atBottom = !hasExplicitScrollTarget || distanceFromBottom < 100;
     setIsAtBottom(atBottom);
     setShowScrollButton(!atBottom);
     suppressAutoScrollRef.current = false;
-    pendingRestoreScrollRef.current = null;
     prevRoundsLengthRef.current = rounds.reduce((sum, round) => sum + 1 + round.steps.length, 0);
-  }, [rounds, sessionId]);
+  }, [loading, rounds, sessionId, scrollTarget?.roundId, scrollTarget?.sessionId]);
 
   useEffect(() => {
     if (!scrollTarget || scrollTarget.sessionId !== sessionId || loading) return;
@@ -404,7 +399,6 @@ function ChatV2View(props: ChatV2Props) {
       const atBottom = distanceFromBottom < 100;
       setIsAtBottom(atBottom);
       setShowScrollButton(!atBottom);
-      if (sessionId) scrollPosBySessionRef.current[sessionId] = scrollTop;
     };
     container.addEventListener('scroll', handleScroll);
     return () => container.removeEventListener('scroll', handleScroll);

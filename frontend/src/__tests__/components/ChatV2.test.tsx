@@ -253,6 +253,23 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('普通进入会话时应直接定位到底部', async () => {
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Round: round-1')).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: 'auto' });
+    });
+  });
+
   it('欢迎页点击快捷建议应该填入输入框', () => {
     render(
       <ChatV2

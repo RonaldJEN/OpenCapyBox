@@ -3,8 +3,8 @@
 ## 1. 模块职责边界
 
 - 为管理员提供跨用户的全局运维视图。
-- 提供概览、Session 监控、用户管理、沙箱管理、系统监控等聚合接口。
-- 不负责业务执行（不创建会话、不驱动对话执行），仅做读侧聚合查询。
+- 提供概览、Session 监控、用户管理、沙箱管理、模型目录/权限、系统监控等聚合与管理接口。
+- 不负责业务执行（不创建会话、不驱动对话执行）；配置与账号类写操作仅改变管理事实源。
 
 ## 2. 鉴权与权限
 
@@ -24,27 +24,30 @@
 ### GET /api/admin/rounds-tree
 
 - Query: `limit`、`offset`、`status`、`user_id`、`search`
-- 响应：按 `session` 聚合的树形数据，结构为 `session -> rounds -> steps`
-  - `session` 层：会话维度统计（round 数、tokens、LLM 调用、压缩步数、最近 round 时间）
-  - `round` 层：round 状态、耗时、token 与压缩指标
-  - `step` 层：来自 `llm_call_records` 的 step 明细。
-    - 首屏列表为轻量字段（step 索引、token、延迟、压缩指标、审阅状态等），不包含大文本原文字段。
-    - 原文详情（`request_messages`/`response_content` 等）通过 `GET /api/admin/llm-call-records/{llm_record_id}` 按需加载。
-    - 轻量字段与详情字段合并后，包含复盘所需的完整输入输出与压缩信息：
-    - 消息细节：`request_messages`、`request_tools`、`response_content`、`response_thinking`、`response_tool_calls`、`response_error`
-    - 时延与 token：`usage_prompt_tokens`、`usage_completion_tokens`、`usage_total_tokens`、`first_token_latency_s`、`completion_latency_s`
-    - 压缩复盘字段：
-      - `compaction_triggered`
-      - `compaction_pre_tokens` / `compaction_post_tokens` / `compaction_tokens_saved`
-      - `compaction_microcompact_compacted_messages`
-      - `compaction_summary_generated_count` / `compaction_summary_reused_count` / `compaction_summary_quality_repair_count`
-      - `compaction_emergency_truncate_dropped_rounds`
-    - 人工审阅字段：`manual_review_status`
-    - Token 口径：session / round 层的 `total_tokens` 均为对应范围内 `SUM(llm_call_records.usage_total_tokens)`，用于成本与用量统计；它不是会话累计上下文长度。排查上下文恢复稳定性时，应优先查看 step 层的 `usage_prompt_tokens`、`request_message_count` 与 `compaction_*` 字段。
+- 响应：按 `session` 聚合的分页列表，首屏不包含 round 树。
+  - 顶层：`total_sessions`、`offset`、`limit`、`sessions`
+  - `session` 层：`session_id`、`user_id`、`session_title`、`rounds_count`、`last_round_at`、`sum_step_count`、`total_tokens`、`llm_calls`、`error_calls`、`compaction_steps`、`total_duration_s`、`status`
+  - `rounds_loaded=false` 且 `rounds=[]`，表示需要通过 `GET /api/admin/sessions/{session_id}/rounds` 懒加载。
+  - `total_duration_s` 为匹配 round 的耗时总和：已完成 round 使用 `completed_at - created_at`，未完成 round 使用当前时间近似。
+  - Token 口径：session 层 `total_tokens` 为对应范围内 `SUM(llm_call_records.usage_total_tokens)`，用于成本与用量统计；它不是会话累计上下文长度。
   - 管理台展示语义（前端约定）：
     - Session 监控默认分页为每页 `5` 条 session，可在页面切换为 `5/10/15`。
-    - step 详情默认先展示“管理员分析摘要”（中文），包含请求概览、响应概览、性能与压缩诊断、建议审阅结论。
-    - 原始英文键作为“排障证据层”保留展示（例如 `request_messages`、`response_tool_calls`），用于精确定位问题。
+    - 筛选条件变化后前端必须折叠已展开 session，再按需重新加载当前列表中的 session rounds。
+
+### GET /api/admin/sessions/{session_id}/rounds
+
+- Query: `status`、`search`
+- 响应：单个 Session 下的 round 列表与轻量 step 明细。
+  - `session_id`
+  - `rounds`: round 状态、耗时、token 与压缩指标、主/子 Agent 元数据、轻量 step 列表。
+  - step 轻量字段来自 `llm_call_records`：step 索引、token、延迟、压缩指标、审阅状态等，不包含大文本原文字段。
+  - 原文详情（`request_messages`/`response_content` 等）通过 `GET /api/admin/llm-call-records/{llm_record_id}` 按需加载。
+  - 轻量字段与详情字段合并后，包含复盘所需的完整输入输出与压缩信息：
+    - 消息细节：`request_messages`、`request_tools`、`response_content`、`response_thinking`、`response_tool_calls`、`response_error`
+    - 时延与 token：`usage_prompt_tokens`、`usage_completion_tokens`、`usage_total_tokens`、`first_token_latency_s`、`completion_latency_s`
+    - 压缩复盘字段：`compaction_triggered`、`compaction_pre_tokens` / `compaction_post_tokens` / `compaction_tokens_saved`、`compaction_microcompact_compacted_messages`、`compaction_summary_generated_count` / `compaction_summary_reused_count` / `compaction_summary_quality_repair_count`、`compaction_emergency_truncate_dropped_rounds`
+    - 人工审阅字段：`manual_review_status`
+  - 管理台 step 详情默认先展示“管理员分析摘要”（中文），原始英文键作为“排障证据层”保留展示。
 
 ### PUT /api/admin/llm-call-records/{llm_record_id}/review
 
@@ -131,6 +134,72 @@
   - MVP 不做 sandbox 文件迁移；DB-backed 记忆文件会在新 sandbox 中重新同步。
 - 记录：用户 Profile 分配记录保存在 `user_sandbox_configs`，包含 `updated_by`、`created_at`、`updated_at`，但不保存多版本分配历史。
 
+### GET /api/admin/models
+
+- 响应：`{models, settings}`。
+- `models` 字段：`id`、`name`、`provider`、`api_base`、`model_name`、`max_tokens`、`context_window`、`reasoning_format`、`reasoning_split`、`enable_thinking`、`supports_thinking`、`supports_image`、`max_images`、`supports_video`、`max_videos`、`enabled`、`tags`、`api_key_set`、`group_names`、`session_count`、`created_at`、`updated_at`。
+- `settings` 字段：`default_model_id`、`cron_default_model_id`、`subagent_default_model_id`。
+
+### POST /api/admin/models
+
+- Body：完整模型配置（`model_id`、`display_name`、`provider`、`api_base`、`api_key`、`model_name`、token 窗口、reasoning、多模态能力、`enabled`、`tags`）。
+- 语义：创建 DB 模型目录项，使用 `ModelConfig` 校验配置；成功后 reload model registry。
+- 失败：重复 `model_id` 返回 409；配置非法返回 400。
+
+### PATCH /api/admin/models/settings
+
+- Body：`{default_model_id, cron_default_model_id?, subagent_default_model_id?}`。
+- 语义：更新普通对话、Cron、Subagent 默认模型；Cron/Subagent 为空时归一化为普通默认模型。
+- 约束：默认模型必须存在且启用；成功后 reload model registry。
+
+### PATCH /api/admin/models/{model_id}
+
+- Body：模型配置增量字段；`api_key=null` 或缺省表示保留旧密钥。
+- 语义：更新模型目录项并 reload model registry。
+- 约束：停用模型会从所有模型权限包中移除；配置非法返回 400，模型不存在返回 404。
+
+### DELETE /api/admin/models/{model_id}
+
+- Query：`replacement_model_id?`
+- 响应：`{model_id, deleted, replacement_model_id, sessions_reassigned, defaults_reassigned}`。
+- 语义：删除模型目录项并 reload model registry。
+- 约束：
+  - 替换模型不能是当前模型，必须存在且启用。
+  - 若模型正在作为普通/Cron/Subagent 默认模型使用，且未提供替换模型，返回 400。
+  - 若历史 Session 使用该模型，且未提供替换模型，返回 409。
+  - 提供替换模型时，迁移默认模型设置、`sessions.model_id` 与模型权限包绑定，再删除旧模型。
+
+### GET /api/admin/model-permission-groups
+
+- 响应：`{groups}`，包含默认权限包与自定义权限包。
+- 默认权限包自动应用给所有普通用户，`bound_users` 为当前用户总数；自定义权限包 `bound_users` 为手动绑定用户数。
+
+### POST /api/admin/model-permission-groups
+
+- Body：`{name, description?}`。
+- 语义：创建非默认模型权限包；名称唯一。
+
+### PATCH /api/admin/model-permission-groups/{group_id}
+
+- Body：`{name?, description?}`。
+- 语义：更新权限包元信息；默认权限包不能重命名。
+
+### PUT /api/admin/model-permission-groups/{group_id}/models
+
+- Body：`{model_ids: string[]}`。
+- 语义：整体替换权限包包含的模型。
+- 约束：模型必须存在且启用；停用模型不能加入权限包。
+
+### PUT /api/admin/model-permission-groups/{group_id}/users
+
+- Body：`{user_ids: string[]}`。
+- 语义：整体替换某权限包绑定的用户；默认权限包不得通过该接口手动绑定。
+
+### PUT /api/admin/users/{user_id}/model-permission-groups
+
+- Body：`{group_ids: string[]}`。
+- 语义：整体替换用户额外绑定的模型权限包；默认权限包自动应用，不得出现在 `group_ids` 中。
+
 ### PATCH /api/admin/users/{user_id}/enabled
 
 - Body: `{enabled: bool}`
@@ -165,20 +234,30 @@
   - round 与 cron 的状态分布
   - LLM 时延（avg/p50/p95）
   - 压缩观测（调用次数、节省 token、质量修复、紧急截断）
+  - `database`: DB 运行态诊断。
+    - `pool`: SQLAlchemy pool 类型、状态、size/checkin/checkout/overflow、配置的 pool size / max overflow / timeout / recycle、数据库名。
+    - `activity`: 当前数据库 `pg_stat_activity` 按 state/wait event 聚合。
+    - `blocked_locks`: 未授予锁数量。
+    - `long_queries`: 超过 30 秒的 active query 样本（最多 20 条）。
+    - 若数据库运行态查询失败，返回 `database.error`，但保留 pool 基础信息。
 
 ## 4. 行为语义与不变量
 
-- 除用户管理接口外，管理端查询仅返回聚合信息，不写业务数据。
-- `rounds-tree` 端点按 session 维度分页，session 内 round 仍按 `created_at` 倒序。
+- 除用户、沙箱 Profile、模型目录/权限等配置管理接口外，管理端查询仅返回聚合信息，不写业务数据。
+- `rounds-tree` 端点按 session 维度分页，round 与 step 通过 `/sessions/{session_id}/rounds` 按需加载；session 内 round 按 `created_at` 倒序。
 - `auth_users` 是后台用户管理的事实源。
 - 管理员不能禁用当前登录账号、不能取消自己的管理员权限、不能删除当前登录账号。
 - 删除用户是硬删除语义；禁用用户才表示保留账号与数据但禁止登录。
+- `llm_models` 与 `llm_model_settings` 是运行时模型目录与默认模型的事实源；管理端模型写操作成功后必须 reload registry。
+- 模型权限包变更是用户可见模型列表的事实源；普通用户只能看到默认权限包 + 额外绑定权限包中的启用模型。
 
 ## 5. 失败模式
 
 - 非管理员访问：admin 接口统一返回 403。
 - 鉴权缺失或 token 无效：返回 401。
 - 删除用户时存在运行中任务、运行中 cron run 或 sandbox 清理失败：返回 409。
+- 删除模型时缺少必要替换模型：默认模型占用返回 400，历史 Session 占用返回 409。
+- 模型权限包写入不存在或停用模型：返回 400。
 
 ## 6. 可观测性
 

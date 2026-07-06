@@ -11,7 +11,7 @@
 - 渲染消息流（user → reasoning → assistant）
 - 将助手回复中的会话文件引用抽取为回复底部的可点击文件卡片，同时保留 markdown 正文原样显示
 - 处理中断/恢复：断连重连、ask_user 中断、用户主动取消
-- 滚动控制：首次恢复 + 底部跟随
+- 滚动控制：普通进入定位最新消息、搜索命中定位 round、流式底部跟随
 
 **不职责**：
 - 会话 CRUD → `SessionList`
@@ -167,19 +167,24 @@ catch (SSE error)
 
 | 场景 | 时机 | 实现 |
 |---|---|---|
-| 会话切换首次加载 | 历史渲染完成前 | `useLayoutEffect` 同步设置 `scrollTop = savedTop` |
-| 流式新内容 | rounds 长度变化 | 仅 `isAtBottom` 时 `scrollIntoView({ behavior: 'smooth' })` |
-| 用户滚动 | `scroll` 事件 | 更新 `isAtBottom`（容差 100px），同时保存 `scrollPosBySessionRef[sid] = scrollTop` |
+| 普通进入会话 | 历史渲染完成后、浏览器绘制前 | `useLayoutEffect` 同步 `messagesEndRef.scrollIntoView({ behavior: 'auto' })`，直接定位最新消息 |
+| 搜索命中进入 | `scrollTarget` 指向当前 session/round | 目标 round `scrollIntoView({ behavior: 'smooth', block: 'center' })` 并短暂高亮；不得先滚到底部 |
+| 流式新内容 | rounds/steps 数量变化 | 仅 `isAtBottom` 时 `scrollIntoView({ behavior: hasNewContent ? 'smooth' : 'auto' })` |
+| 用户滚动 | `scroll` 事件 | 更新 `isAtBottom` 与 `showScrollButton`（容差 100px），不记忆跨会话 `scrollTop` |
+| 底部按钮 | 用户离开底部 | 点击后平滑滚到底；若有回复正在生成，按钮显示 live reply 指示 |
 
 **禁止**：
-- 在普通 `useEffect` 里设置 `scrollTop`（会有跳动）。
+- 普通进入会话时恢复上次浏览位置。用户点击历史会话的默认预期是看到最新状态；浏览器刷新后也必须保持同一语义。
+- 在普通 `useEffect` 里设置初始滚动位置（会有跳动）。
 - 无视 `isAtBottom` 强制滚到底（抢用户滚轮）。
+- 搜索命中带 `scrollTarget` 时先滚到底再滚到目标 round。
 
 ## 5. 动画约定
 
 - 首次渲染历史：`disableInitialMotion = true`，加载完关闭一次性 flag。
 - 实时新内容：启用 `animate-fade-in`。
-- `suppressAutoScrollRef` 用于阻止首次渲染时的自动滚动到底。
+- `suppressAutoScrollRef` 用于阻止历史加载窗口内的流式自动跟随；历史加载完成后，普通进入显式定位到底部，搜索进入交给 `scrollTarget` 处理。
+- 新会话首次发送前可显示 bootstrap message 过渡动画；session handoff 期间显示加载提示，避免空白闪烁。
 
 ## 6. 轮询契约
 
@@ -249,9 +254,11 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] ask_user 中断恢复：刷新页面后 QuestionCard 正常显示
 - [ ] SSE 断连后自动恢复（history API 查询终态/续订）
 - [ ] 幂等冲突自动切 subscribe
-- [ ] 滚动记忆：A 滚到中间 → 切 B → 切回 A，位置恢复
+- [ ] 普通进入长会话时定位到底部；A 滚到中间 → 切 B → 切回 A，A 仍定位到底部
+- [ ] 搜索结果带 `match_round_id` 时定位到命中 round，而不是底部
 - [ ] 首屏历史渲染无瀑布动画
 - [ ] 底部跟随：用户滚离底部时新消息不强制滚动
+- [ ] 用户滚离底部且新回复正在生成时，底部按钮显示 live reply 指示
 - [ ] 助手文件提示行/路径保留在 markdown 正文，同时在回复底部渲染去重文件卡片；点击后打开 Files 抽屉并直接预览目标文件
 - [ ] 代码块内的文件名/命令不触发文件卡片
 
