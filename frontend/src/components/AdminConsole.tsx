@@ -34,6 +34,7 @@ import {
   getAdminOverview,
   getAdminRoundsTree,
   getAdminSandboxProfiles,
+  getAdminSessionRounds,
   getAdminSystem,
   getAdminUserLoginEvents,
   getAdminUsers,
@@ -110,6 +111,15 @@ function formatOptionalNumber(value: number | null | undefined): string {
 function formatPoolOverflow(value: number | null | undefined): string {
   if (typeof value !== 'number' || Number.isNaN(value)) return '-';
   return formatNumber(Math.max(0, value));
+}
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebounced(value), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [value, delayMs]);
+  return debounced;
 }
 
 function formatDetailText(value: unknown): string {
@@ -498,13 +508,16 @@ export default function AdminConsole() {
 
   const [roundStatus, setRoundStatus] = useState('all');
   const [roundSearch, setRoundSearch] = useState('');
+  const debouncedRoundSearch = useDebouncedValue(roundSearch, 350);
   const [roundPage, setRoundPage] = useState(1);
   const [roundPageSize, setRoundPageSize] = useState(5);
   const [overviewDays, setOverviewDays] = useState<OverviewDays>(7);
   const [reviewUpdatingIds, setReviewUpdatingIds] = useState<Record<number, boolean>>({});
   const [stepLoadingIds, setStepLoadingIds] = useState<Record<number, boolean>>({});
+  const [sessionRoundLoadingIds, setSessionRoundLoadingIds] = useState<Record<string, boolean>>({});
   const [reviewError, setReviewError] = useState('');
   const [stepDetailError, setStepDetailError] = useState('');
+  const [sessionRoundLoadError, setSessionRoundLoadError] = useState('');
   const [userActionError, setUserActionError] = useState('');
   const [userActionMessage, setUserActionMessage] = useState('');
   const [userUpdatingKeys, setUserUpdatingKeys] = useState<Record<string, boolean>>({});
@@ -629,6 +642,37 @@ export default function AdminConsole() {
       });
     }
   }, []);
+
+  const handleSessionRoundsLoad = useCallback(async (sessionId: string) => {
+    setSessionRoundLoadError('');
+    setSessionRoundLoadingIds((prev) => ({ ...prev, [sessionId]: true }));
+    try {
+      const detail = await getAdminSessionRounds(sessionId, {
+        status: roundStatus,
+        search: debouncedRoundSearch || undefined,
+      });
+      setRounds((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          sessions: prev.sessions.map((session) => (
+            session.session_id === sessionId
+              ? { ...session, rounds: detail.rounds, rounds_loaded: true }
+              : session
+          )),
+        };
+      });
+    } catch (err) {
+      console.error('Failed to load session rounds:', err);
+      setSessionRoundLoadError('加载 Session 下的 Round 失败，请重试');
+    } finally {
+      setSessionRoundLoadingIds((prev) => {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+    }
+  }, [debouncedRoundSearch, roundStatus]);
 
   const runUserAction = useCallback(async (
     busyKey: string,
@@ -870,7 +914,7 @@ export default function AdminConsole() {
           limit: roundPageSize,
           offset: (roundPage - 1) * roundPageSize,
           status: roundStatus,
-          search: roundSearch || undefined,
+          search: debouncedRoundSearch || undefined,
         }));
       }
       if (activeTab === 'users') {
@@ -901,7 +945,7 @@ export default function AdminConsole() {
     } finally {
       setLoading(false);
     }
-  }, [activeTab, overviewDays, roundPage, roundPageSize, roundSearch, roundStatus]);
+  }, [activeTab, overviewDays, roundPage, roundPageSize, debouncedRoundSearch, roundStatus]);
 
   useEffect(() => {
     setRoundPage(1);
@@ -999,8 +1043,10 @@ export default function AdminConsole() {
               roundPageSize={roundPageSize}
               reviewUpdatingIds={reviewUpdatingIds}
               stepLoadingIds={stepLoadingIds}
+              sessionRoundLoadingIds={sessionRoundLoadingIds}
               reviewError={reviewError}
               stepDetailError={stepDetailError}
+              sessionRoundLoadError={sessionRoundLoadError}
               onStatusChange={setRoundStatus}
               onSearchChange={setRoundSearch}
               onPageChange={setRoundPage}
@@ -1008,6 +1054,7 @@ export default function AdminConsole() {
                 setRoundPage(1);
                 setRoundPageSize(value);
               }}
+              onSessionRoundsLoad={handleSessionRoundsLoad}
               onStepReviewChange={handleStepReviewChange}
               onStepDetailOpen={handleStepDetailOpen}
             />
@@ -1249,12 +1296,15 @@ function RoundsPanel({
   roundPageSize,
   reviewUpdatingIds,
   stepLoadingIds,
+  sessionRoundLoadingIds,
   reviewError,
   stepDetailError,
+  sessionRoundLoadError,
   onStatusChange,
   onSearchChange,
   onPageChange,
   onPageSizeChange,
+  onSessionRoundsLoad,
   onStepReviewChange,
   onStepDetailOpen,
 }: {
@@ -1265,12 +1315,15 @@ function RoundsPanel({
   roundPageSize: number;
   reviewUpdatingIds: Record<number, boolean>;
   stepLoadingIds: Record<number, boolean>;
+  sessionRoundLoadingIds: Record<string, boolean>;
   reviewError: string;
   stepDetailError: string;
+  sessionRoundLoadError: string;
   onStatusChange: (value: string) => void;
   onSearchChange: (value: string) => void;
   onPageChange: (value: number) => void;
   onPageSizeChange: (value: number) => void;
+  onSessionRoundsLoad: (sessionId: string) => Promise<void>;
   onStepReviewChange: (llmRecordId: number, manualReviewStatus: string) => Promise<void>;
   onStepDetailOpen: (llmRecordId: number) => Promise<void>;
 }) {
@@ -1287,7 +1340,18 @@ function RoundsPanel({
   }, [data?.offset, data?.total_sessions, roundStatus, roundSearch]);
 
   const toggleSession = (sessionId: string) => {
-    setExpandedSessions((prev) => ({ ...prev, [sessionId]: !prev[sessionId] }));
+    const session = data?.sessions.find((item) => item.session_id === sessionId);
+    const willExpand = !expandedSessions[sessionId];
+    setExpandedSessions((prev) => ({ ...prev, [sessionId]: willExpand }));
+    if (
+      willExpand
+      && session
+      && session.rounds.length === 0
+      && !session.rounds_loaded
+      && !sessionRoundLoadingIds[sessionId]
+    ) {
+      void onSessionRoundsLoad(sessionId);
+    }
   };
 
   const toggleRound = (roundId: string) => {
@@ -1338,6 +1402,7 @@ function RoundsPanel({
       <div className="admin-table-wrap">
         {reviewError ? <div className="admin-step-review-error">{reviewError}</div> : null}
         {stepDetailError ? <div className="admin-step-review-error">{stepDetailError}</div> : null}
+        {sessionRoundLoadError ? <div className="admin-step-review-error">{sessionRoundLoadError}</div> : null}
         <table className="admin-table">
           <thead>
             <tr>
@@ -1354,6 +1419,7 @@ function RoundsPanel({
           <tbody>
             {(data?.sessions || []).map((session) => {
               const sessionExpanded = !!expandedSessions[session.session_id];
+              const sessionRoundsLoading = !!sessionRoundLoadingIds[session.session_id];
               const SessionChevron = sessionExpanded ? ChevronDown : ChevronRight;
               return (
                 <Fragment key={session.session_id}>
@@ -1379,6 +1445,11 @@ function RoundsPanel({
                   {sessionExpanded ? (
                     <tr>
                       <td className="admin-nested-cell" colSpan={8}>
+                        {sessionRoundsLoading ? (
+                          <div className="admin-loading">正在加载 Round...</div>
+                        ) : session.rounds.length === 0 ? (
+                          <div className="admin-loading">暂无匹配 Round</div>
+                        ) : (
                         <table className="admin-table admin-subtable">
                           <thead>
                             <tr>
@@ -1600,6 +1671,7 @@ function RoundsPanel({
                             })}
                           </tbody>
                         </table>
+                        )}
                       </td>
                     </tr>
                   ) : null}

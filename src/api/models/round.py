@@ -7,7 +7,7 @@ AG-UI 協議概念映射：
 
 此模型同時支持舊的 Round 命名和新的 AG-UI Run 命名。
 """
-from sqlalchemy import Column, String, Text, DateTime, Integer, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, String, Text, DateTime, Integer, ForeignKey, UniqueConstraint, Index
 from datetime import datetime
 from .database import Base
 from src.api.utils.timezone import now_naive
@@ -42,6 +42,8 @@ class Round(Base):
         # 注意：依賴 PostgreSQL UNIQUE 約束中 NULL 不互相衝突的行為。
         # 若未來遷移到其他数据库，需验证该约束只对非 NULL 值生效。
         UniqueConstraint('session_id', 'idempotency_key', name='uq_round_session_idempkey'),
+        Index("idx_rounds_session_created_at", "session_id", "created_at"),
+        Index("idx_rounds_status_created_at", "status", "created_at"),
     )
 
     # === AG-UI 標準字段 ===

@@ -468,6 +468,7 @@ def _migrate_add_columns(target_engine=None):
             _backfill_sandbox_profiles(conn, sandbox_profile_columns)
 
         _ensure_agui_events_run_sequence_unique(conn, inspector)
+        _ensure_admin_monitor_indexes(conn, inspector)
 
         # 补建唯一约束（仅对存量库：如果已有覆盖相同列的唯一索引/约束则跳过）
         for table_name, constraint_name, columns in _PENDING_UNIQUE_CONSTRAINTS:
@@ -627,3 +628,21 @@ def _ensure_agui_events_run_sequence_unique(conn, inspector) -> None:
         "ON agui_events (run_id, sequence)"
     ))
     logger.info("DB 迁移: 新建唯一索引 agui_events.uq_agui_events_run_sequence (run_id, sequence)")
+
+
+def _ensure_admin_monitor_indexes(conn, inspector) -> None:
+    """Create indexes used by the admin Session monitor on existing databases."""
+    if inspector.has_table("rounds"):
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rounds_session_created_at "
+            "ON rounds (session_id, created_at)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rounds_status_created_at "
+            "ON rounds (status, created_at)"
+        ))
+    if inspector.has_table("llm_call_records"):
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_llm_call_records_round_step "
+            "ON llm_call_records (round_id, step_index)"
+        ))

@@ -394,8 +394,22 @@ def _validate_model_config_values(data: dict[str, Any]) -> None:
 
 def _build_admin_models_payload(db: DBSession) -> dict[str, Any]:
     models = db.query(LLMModel).order_by(LLMModel.created_at.asc(), LLMModel.model_id.asc()).all()
+    session_counts = {
+        row[0]: int(row[1] or 0)
+        for row in (
+            db.query(Session.model_id, func.count(Session.id))
+            .filter(Session.model_id.isnot(None))
+            .group_by(Session.model_id)
+            .all()
+        )
+    }
+    model_payloads = []
+    for model in models:
+        payload = admin_model_payload(db, model)
+        payload["session_count"] = session_counts.get(model.model_id, 0)
+        model_payloads.append(payload)
     return {
-        "models": [admin_model_payload(db, model) for model in models],
+        "models": model_payloads,
         "settings": _settings_payload(db),
     }
 
@@ -471,6 +485,125 @@ def _update_admin_model(db: DBSession, model_id: str, payload: AdminModelPatchPa
     db.refresh(model)
     reload_model_registry()
     return admin_model_payload(db, model)
+
+
+def _delete_admin_model(
+    db: DBSession,
+    model_id: str,
+    *,
+    replacement_model_id: str | None = None,
+) -> dict[str, Any]:
+    model = db.query(LLMModel).filter(LLMModel.model_id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    if replacement_model_id == model_id:
+        raise HTTPException(status_code=400, detail="替换模型不能是当前要删除的模型")
+
+    replacement_model: LLMModel | None = None
+    if replacement_model_id:
+        replacement_model = db.query(LLMModel).filter(LLMModel.model_id == replacement_model_id).first()
+        if not replacement_model:
+            raise HTTPException(status_code=400, detail="替换模型不存在")
+        if not replacement_model.enabled:
+            raise HTTPException(status_code=400, detail="替换模型必须是启用状态")
+
+    settings = db.query(LLMModelSettings).filter(LLMModelSettings.id == 1).first()
+    default_usages: list[str] = []
+    if settings:
+        if settings.default_model_id == model_id:
+            default_usages.append("普通对话默认模型")
+        if settings.cron_default_model_id == model_id:
+            default_usages.append("Cron 默认模型")
+        if settings.subagent_default_model_id == model_id:
+            default_usages.append("Subagent 默认模型")
+    if default_usages and not replacement_model_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"模型正在作为{'、'.join(default_usages)}使用，请先切换默认模型后再删除",
+        )
+
+    session_count = int(
+        db.query(func.count(Session.id))
+        .filter(Session.model_id == model_id)
+        .scalar()
+        or 0
+    )
+    if session_count and not replacement_model_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"模型已被 {session_count} 个会话使用，不能直接删除；请选择替换模型迁移历史会话后再删除",
+        )
+
+    defaults_reassigned: list[str] = []
+    if settings and replacement_model_id:
+        if settings.default_model_id == model_id:
+            settings.default_model_id = replacement_model_id
+            defaults_reassigned.append("default_model_id")
+        if settings.cron_default_model_id == model_id:
+            settings.cron_default_model_id = replacement_model_id
+            defaults_reassigned.append("cron_default_model_id")
+        if settings.subagent_default_model_id == model_id:
+            settings.subagent_default_model_id = replacement_model_id
+            defaults_reassigned.append("subagent_default_model_id")
+        if defaults_reassigned:
+            settings.updated_at = now_naive()
+
+    sessions_reassigned = 0
+    if session_count and replacement_model_id:
+        sessions_reassigned = int(
+            db.query(Session)
+            .filter(Session.model_id == model_id)
+            .update(
+                {
+                    Session.model_id: replacement_model_id,
+                    Session.updated_at: now_naive(),
+                },
+                synchronize_session=False,
+            )
+            or 0
+        )
+
+    old_group_ids = [
+        row[0]
+        for row in (
+            db.query(ModelPermissionGroupModel.group_id)
+            .filter(ModelPermissionGroupModel.model_id == model_id)
+            .all()
+        )
+    ]
+    if replacement_model_id and old_group_ids:
+        replacement_group_ids = {
+            row[0]
+            for row in (
+                db.query(ModelPermissionGroupModel.group_id)
+                .filter(
+                    ModelPermissionGroupModel.model_id == replacement_model_id,
+                    ModelPermissionGroupModel.group_id.in_(old_group_ids),
+                )
+                .all()
+            )
+        }
+        for group_id in old_group_ids:
+            if group_id not in replacement_group_ids:
+                db.add(ModelPermissionGroupModel(
+                    group_id=group_id,
+                    model_id=replacement_model_id,
+                    created_by="delete-model-replacement",
+                ))
+
+    db.query(ModelPermissionGroupModel).filter(
+        ModelPermissionGroupModel.model_id == model_id
+    ).delete(synchronize_session=False)
+    db.delete(model)
+    db.commit()
+    reload_model_registry()
+    return {
+        "model_id": model_id,
+        "deleted": True,
+        "replacement_model_id": replacement_model_id,
+        "sessions_reassigned": sessions_reassigned,
+        "defaults_reassigned": defaults_reassigned,
+    }
 
 
 def _update_model_settings(db: DBSession, payload: AdminModelSettingsPayload) -> dict[str, Any]:
@@ -836,73 +969,194 @@ def _build_rounds_tree_payload(
     user_id: str | None,
     search: str | None,
 ) -> dict[str, Any]:
-    def _apply_filters(query):
-        if status != "all":
-            query = query.filter(Round.status == status)
-        if user_id:
-            query = query.filter(Session.user_id == user_id)
-        if search:
-            query = query.filter(
-                or_(
-                    Round.user_message.contains(search),
-                    Round.final_response.contains(search),
-                )
-            )
-        return query
-
-    base_query = (
-        db.query(Round.session_id)
+    filters = _admin_round_filters(status=status, user_id=user_id, search=search)
+    matching_rounds = (
+        db.query(
+            Round.id.label("round_id"),
+            Round.session_id.label("session_id"),
+            Round.status.label("status"),
+            Round.step_count.label("step_count"),
+            Round.created_at.label("created_at"),
+            Round.completed_at.label("completed_at"),
+        )
         .join(Session, Session.id == Round.session_id)
+        .filter(*filters)
+        .subquery()
     )
-    base_query = _apply_filters(base_query)
-    total_sessions = base_query.distinct(Round.session_id).count()
+
+    total_sessions = int(
+        db.query(func.count(func.distinct(matching_rounds.c.session_id))).scalar() or 0
+    )
+
+    usage_by_session = (
+        db.query(
+            matching_rounds.c.session_id.label("session_id"),
+            func.coalesce(func.sum(LLMCallRecord.usage_total_tokens), 0).label("total_tokens"),
+            func.count(LLMCallRecord.id).label("llm_calls"),
+            func.coalesce(
+                func.sum(case((LLMCallRecord.response_error.isnot(None), 1), else_=0)),
+                0,
+            ).label("error_calls"),
+            func.coalesce(
+                func.sum(case((LLMCallRecord.compaction_triggered.is_(True), 1), else_=0)),
+                0,
+            ).label("compaction_steps"),
+        )
+        .outerjoin(LLMCallRecord, LLMCallRecord.round_id == matching_rounds.c.round_id)
+        .group_by(matching_rounds.c.session_id)
+        .subquery()
+    )
+
+    now_for_duration = now_naive()
+    duration_seconds = func.extract(
+        "epoch",
+        func.coalesce(matching_rounds.c.completed_at, now_for_duration) - matching_rounds.c.created_at,
+    )
 
     session_rows = (
         db.query(
             Session.id.label("session_id"),
             Session.user_id,
             Session.title.label("session_title"),
-            func.count(Round.id).label("rounds_count"),
-            func.max(Round.created_at).label("last_round_at"),
+            func.count(matching_rounds.c.round_id).label("rounds_count"),
+            func.max(matching_rounds.c.created_at).label("last_round_at"),
+            func.coalesce(func.sum(matching_rounds.c.step_count), 0).label("sum_step_count"),
+            func.coalesce(
+                func.sum(case((matching_rounds.c.status == "running", 1), else_=0)),
+                0,
+            ).label("running_rounds"),
+            func.coalesce(
+                func.sum(case((matching_rounds.c.status.in_({"failed", "cancelled", "interrupted"}), 1), else_=0)),
+                0,
+            ).label("error_rounds"),
+            func.coalesce(usage_by_session.c.total_tokens, 0).label("total_tokens"),
+            func.coalesce(usage_by_session.c.llm_calls, 0).label("llm_calls"),
+            func.coalesce(usage_by_session.c.error_calls, 0).label("error_calls"),
+            func.coalesce(usage_by_session.c.compaction_steps, 0).label("compaction_steps"),
+            func.coalesce(
+                func.sum(case((matching_rounds.c.created_at.isnot(None), duration_seconds), else_=0)),
+                0,
+            ).label("total_duration_s"),
         )
-        .join(Round, Round.session_id == Session.id)
-    )
-    session_rows = _apply_filters(session_rows)
-    session_rows = (
-        session_rows
-        .group_by(Session.id)
-        .order_by(func.max(Round.created_at).desc())
+        .join(matching_rounds, matching_rounds.c.session_id == Session.id)
+        .outerjoin(usage_by_session, usage_by_session.c.session_id == Session.id)
+        .group_by(
+            Session.id,
+            Session.user_id,
+            Session.title,
+            usage_by_session.c.total_tokens,
+            usage_by_session.c.llm_calls,
+            usage_by_session.c.error_calls,
+            usage_by_session.c.compaction_steps,
+        )
+        .order_by(func.max(matching_rounds.c.created_at).desc())
         .offset(offset)
         .limit(limit)
         .all()
     )
 
-    session_ids = [row.session_id for row in session_rows if row.session_id]
+    ordered_sessions: list[dict[str, Any]] = []
+    for row in session_rows:
+        if int(row.running_rounds or 0) > 0:
+            session_status = "running"
+        elif int(row.error_rounds or 0) > 0:
+            session_status = "error"
+        else:
+            session_status = "completed"
 
-    round_rows = (
-        db.query(
-            Round.id,
-            Round.session_id,
-            Session.user_id,
-            Session.title.label("session_title"),
-            Round.status,
-            Round.step_count,
-            Round.created_at,
-            Round.completed_at,
-            Round.parent_run_id,
-            Round.user_message,
-            Round.final_response,
-        )
-        .join(Session, Session.id == Round.session_id)
-        .filter(Round.session_id.in_(session_ids))
-        .order_by(Round.created_at.desc())
-        .all()
-    ) if session_ids else []
+        ordered_sessions.append({
+            "session_id": row.session_id,
+            "user_id": row.user_id,
+            "session_title": row.session_title,
+            "rounds_count": int(row.rounds_count or 0),
+            "last_round_at": _iso(row.last_round_at),
+            "sum_step_count": int(row.sum_step_count or 0),
+            "total_tokens": int(row.total_tokens or 0),
+            "llm_calls": int(row.llm_calls or 0),
+            "error_calls": int(row.error_calls or 0),
+            "compaction_steps": int(row.compaction_steps or 0),
+            "total_duration_s": round(float(row.total_duration_s or 0), 3),
+            "status": session_status,
+            "rounds_loaded": False,
+            "rounds": [],
+        })
 
+    return {
+        "total_sessions": total_sessions,
+        "offset": offset,
+        "limit": limit,
+        "sessions": ordered_sessions,
+    }
+
+
+def _admin_round_filters(
+    *,
+    status: str,
+    user_id: str | None = None,
+    search: str | None = None,
+    session_id: str | None = None,
+) -> list[Any]:
+    filters: list[Any] = []
+    if session_id:
+        filters.append(Round.session_id == session_id)
+    if status != "all":
+        filters.append(Round.status == status)
+    if user_id:
+        filters.append(Session.user_id == user_id)
+    if search:
+        filters.append(or_(Round.user_message.contains(search), Round.final_response.contains(search)))
+    return filters
+
+
+def _build_lightweight_step_payload(row: Any) -> dict[str, Any]:
+    return {
+        "llm_record_id": int(row.id),
+        "step_index": int(row.step_index),
+        "request_message_count": int(row.request_message_count or 0),
+        "request_messages": "",
+        "request_tools": "",
+        "finish_reason": row.finish_reason,
+        "response_error": row.response_error,
+        "response_content": "",
+        "response_thinking": "",
+        "response_tool_calls": "",
+        "response_preview": "",
+        "usage_prompt_tokens": int(row.usage_prompt_tokens or 0),
+        "usage_completion_tokens": int(row.usage_completion_tokens or 0),
+        "usage_total_tokens": int(row.usage_total_tokens or 0),
+        "first_token_latency_s": round(float(row.first_token_latency_s), 3)
+        if row.first_token_latency_s is not None
+        else None,
+        "completion_latency_s": round(float(row.completion_latency_s), 3)
+        if row.completion_latency_s is not None
+        else None,
+        "compaction_triggered": bool(row.compaction_triggered),
+        "compaction_pre_tokens": int(row.compaction_pre_tokens or 0),
+        "compaction_post_tokens": int(row.compaction_post_tokens or 0),
+        "compaction_tokens_saved": int(row.compaction_tokens_saved or 0),
+        "compaction_microcompact_compacted_messages": int(row.compaction_microcompact_compacted_messages or 0),
+        "compaction_summary_generated_count": int(row.compaction_summary_generated_count or 0),
+        "compaction_summary_reused_count": int(row.compaction_summary_reused_count or 0),
+        "compaction_summary_quality_repair_count": int(row.compaction_summary_quality_repair_count or 0),
+        "compaction_emergency_truncate_dropped_rounds": int(row.compaction_emergency_truncate_dropped_rounds or 0),
+        "manual_review_status": row.manual_review_status,
+        "created_at": _iso(row.created_at),
+    }
+
+
+def _build_round_items_from_rows(db: DBSession, round_rows: list[Any]) -> list[dict[str, Any]]:
     round_ids = [row.id for row in round_rows]
 
     subagent_edges = (
-        db.query(SubagentRun)
+        db.query(
+            SubagentRun.id,
+            SubagentRun.child_run_id,
+            SubagentRun.parent_run_id,
+            SubagentRun.root_run_id,
+            SubagentRun.agent_type,
+            SubagentRun.description,
+            func.substr(func.coalesce(SubagentRun.prompt, ""), 1, 180).label("prompt_preview"),
+        )
         .filter(
             or_(
                 SubagentRun.child_run_id.in_(round_ids),
@@ -952,73 +1206,41 @@ def _build_rounds_tree_payload(
     }
 
     step_rows = (
-        db.query(LLMCallRecord)
+        db.query(
+            LLMCallRecord.id,
+            LLMCallRecord.round_id,
+            LLMCallRecord.step_index,
+            LLMCallRecord.request_message_count,
+            LLMCallRecord.finish_reason,
+            LLMCallRecord.response_error,
+            LLMCallRecord.usage_prompt_tokens,
+            LLMCallRecord.usage_completion_tokens,
+            LLMCallRecord.usage_total_tokens,
+            LLMCallRecord.first_token_latency_s,
+            LLMCallRecord.completion_latency_s,
+            LLMCallRecord.compaction_triggered,
+            LLMCallRecord.compaction_pre_tokens,
+            LLMCallRecord.compaction_post_tokens,
+            LLMCallRecord.compaction_tokens_saved,
+            LLMCallRecord.compaction_microcompact_compacted_messages,
+            LLMCallRecord.compaction_summary_generated_count,
+            LLMCallRecord.compaction_summary_reused_count,
+            LLMCallRecord.compaction_summary_quality_repair_count,
+            LLMCallRecord.compaction_emergency_truncate_dropped_rounds,
+            LLMCallRecord.manual_review_status,
+            LLMCallRecord.created_at,
+        )
         .filter(LLMCallRecord.round_id.in_(round_ids))
-        .order_by(LLMCallRecord.step_index)
+        .order_by(LLMCallRecord.round_id, LLMCallRecord.step_index)
         .all()
     ) if round_ids else []
 
     step_map: dict[str, list[dict[str, Any]]] = {}
     for row in step_rows:
-        step_map.setdefault(row.round_id, []).append(
-            {
-                    "llm_record_id": int(row.id),
-                    "step_index": int(row.step_index),
-                    "request_message_count": int(row.request_message_count or 0),
-                    # 首屏列表返回轻量 step 信息；详细原文通过单条详情接口按需加载。
-                    "request_messages": "",
-                    "request_tools": "",
-                    "finish_reason": row.finish_reason,
-                    "response_error": row.response_error,
-                    "response_content": "",
-                    "response_thinking": "",
-                    "response_tool_calls": "",
-                    "response_preview": "",
-                    "usage_prompt_tokens": int(row.usage_prompt_tokens or 0),
-                    "usage_completion_tokens": int(row.usage_completion_tokens or 0),
-                    "usage_total_tokens": int(row.usage_total_tokens or 0),
-                    "first_token_latency_s": round(float(row.first_token_latency_s), 3)
-                    if row.first_token_latency_s is not None
-                    else None,
-                    "completion_latency_s": round(float(row.completion_latency_s), 3)
-                    if row.completion_latency_s is not None
-                    else None,
-                    "compaction_triggered": bool(row.compaction_triggered),
-                    "compaction_pre_tokens": int(row.compaction_pre_tokens or 0),
-                    "compaction_post_tokens": int(row.compaction_post_tokens or 0),
-                    "compaction_tokens_saved": int(row.compaction_tokens_saved or 0),
-                    "compaction_microcompact_compacted_messages": int(row.compaction_microcompact_compacted_messages or 0),
-                    "compaction_summary_generated_count": int(row.compaction_summary_generated_count or 0),
-                    "compaction_summary_reused_count": int(row.compaction_summary_reused_count or 0),
-                    "compaction_summary_quality_repair_count": int(row.compaction_summary_quality_repair_count or 0),
-                    "compaction_emergency_truncate_dropped_rounds": int(row.compaction_emergency_truncate_dropped_rounds or 0),
-                    "manual_review_status": row.manual_review_status,
-                    "created_at": _iso(row.created_at),
-                }
-            )
+        step_map.setdefault(row.round_id, []).append(_build_lightweight_step_payload(row))
 
     now = now_naive()
-    session_items_map: dict[str, dict[str, Any]] = {
-        row.session_id: {
-            "session_id": row.session_id,
-            "user_id": row.user_id,
-            "session_title": row.session_title,
-            "rounds_count": int(row.rounds_count),
-            "last_round_at": _iso(row.last_round_at),
-            "sum_step_count": 0,
-            "total_tokens": 0,
-            "llm_calls": 0,
-            "error_calls": 0,
-            "compaction_steps": 0,
-            "total_duration_s": 0.0,
-            "status": "completed",
-            "rounds": [],
-            "_status_flags": set(),
-        }
-        for row in session_rows
-        if row.session_id
-    }
-
+    round_items: list[dict[str, Any]] = []
     for row in round_rows:
         subagent_edge = subagent_by_child_run_id.get(row.id)
         is_subagent_round = subagent_edge is not None
@@ -1031,13 +1253,14 @@ def _build_rounds_tree_payload(
                 "compaction_steps": 0,
             },
         )
-        ended_at = row.completed_at or now
-        duration_s = round((ended_at - row.created_at).total_seconds(), 3)
+        duration_s = 0.0
+        if row.created_at:
+            ended_at = row.completed_at or now
+            duration_s = round((ended_at - row.created_at).total_seconds(), 3)
         steps = step_map.get(row.id, [])
-        subagent_prompt = subagent_edge.prompt if subagent_edge else None
         subagent_description = subagent_edge.description if subagent_edge else None
 
-        round_item = {
+        round_items.append({
             "round_id": row.id,
             "session_id": row.session_id,
             "user_id": row.user_id,
@@ -1048,56 +1271,59 @@ def _build_rounds_tree_payload(
             "subagent_edge_id": subagent_edge.id if subagent_edge else None,
             "subagent_type": subagent_edge.agent_type if subagent_edge else None,
             "subagent_description": subagent_description,
-            "subagent_prompt_preview": (subagent_prompt or "")[:180],
+            "subagent_prompt_preview": subagent_edge.prompt_preview if subagent_edge else "",
             "subagent_child_count": int(subagent_child_count_by_parent.get(row.id, 0)),
             "status": row.status,
             "step_count": int(row.step_count or 0),
             "started_at": _iso(row.created_at),
             "completed_at": _iso(row.completed_at),
             "duration_s": duration_s,
-            "user_message_preview": (row.user_message or "")[:120],
-            "final_response_preview": (row.final_response or "")[:180],
+            "user_message_preview": row.user_message_preview or "",
+            "final_response_preview": row.final_response_preview or "",
             **usage,
             "steps": steps,
-        }
+        })
+    return round_items
 
-        session_item = session_items_map.get(row.session_id)
-        if not session_item:
-            continue
 
-        session_item["sum_step_count"] += int(row.step_count or 0)
-        session_item["total_tokens"] += int(usage["total_tokens"])
-        session_item["llm_calls"] += int(usage["llm_calls"])
-        session_item["error_calls"] += int(usage["error_calls"])
-        session_item["compaction_steps"] += int(usage["compaction_steps"])
-        session_item["total_duration_s"] += float(duration_s)
-        session_item["rounds"].append(round_item)
-        session_item["_status_flags"].add(row.status)
+def _build_session_rounds_payload(
+    db: DBSession,
+    *,
+    session_id: str,
+    status: str,
+    search: str | None,
+) -> dict[str, Any]:
+    session = (
+        db.query(Session.id)
+        .filter(Session.id == session_id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Session 不存在")
 
-    ordered_sessions: list[dict[str, Any]] = []
-    for row in session_rows:
-        if not row.session_id:
-            continue
-        session_item = session_items_map.get(row.session_id)
-        if not session_item:
-            continue
-
-        status_flags = session_item.pop("_status_flags")
-        if any(flag == "running" for flag in status_flags):
-            session_item["status"] = "running"
-        elif any(flag in {"failed", "cancelled", "interrupted"} for flag in status_flags):
-            session_item["status"] = "error"
-        else:
-            session_item["status"] = "completed"
-
-        session_item["total_duration_s"] = round(float(session_item["total_duration_s"]), 3)
-        ordered_sessions.append(session_item)
-
+    filters = _admin_round_filters(status=status, search=search, session_id=session_id)
+    round_rows = (
+        db.query(
+            Round.id,
+            Round.session_id,
+            Session.user_id,
+            Session.title.label("session_title"),
+            Round.status,
+            Round.step_count,
+            Round.created_at,
+            Round.completed_at,
+            Round.parent_run_id,
+            func.substr(func.coalesce(Round.user_message, ""), 1, 120).label("user_message_preview"),
+            func.substr(func.coalesce(Round.final_response, ""), 1, 180).label("final_response_preview"),
+        )
+        .join(Session, Session.id == Round.session_id)
+        .filter(*filters)
+        .order_by(Round.created_at.desc())
+        .all()
+    )
     return {
-        "total_sessions": total_sessions,
-        "offset": offset,
-        "limit": limit,
-        "sessions": ordered_sessions,
+        "session_id": session_id,
+        "rounds": _build_round_items_from_rows(db, round_rows),
     }
 
 
@@ -1663,6 +1889,26 @@ async def get_admin_rounds_tree(
     )
 
 
+@router.get("/sessions/{session_id}/rounds")
+async def get_admin_session_rounds(
+    session_id: str,
+    status: str = Query(
+        "all",
+        description="all|running|completed|failed|interrupted|resumed|cancelled|max_steps_reached",
+    ),
+    search: str | None = Query(None),
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """懒加载单个 Session 下的 Round 和 step 级轻量明细。"""
+    return _build_session_rounds_payload(
+        db,
+        session_id=session_id,
+        status=status,
+        search=search,
+    )
+
+
 @router.put("/llm-call-records/{llm_record_id}/review")
 async def update_admin_llm_call_review(
     llm_record_id: int,
@@ -1848,6 +2094,17 @@ async def update_admin_model(
 ):
     """更新模型配置；api_key 留空表示不修改。"""
     return _update_admin_model(db, model_id, payload)
+
+
+@router.delete("/models/{model_id}")
+async def delete_admin_model(
+    model_id: str,
+    replacement_model_id: str | None = Query(None),
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """从 DB 模型目录删除未被默认配置或历史会话引用的模型。"""
+    return _delete_admin_model(db, model_id, replacement_model_id=replacement_model_id)
 
 
 @router.get("/model-permission-groups")

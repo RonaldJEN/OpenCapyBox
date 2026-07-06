@@ -1647,6 +1647,13 @@
   vertical-align: middle;
 }
 
+.admin-model-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .admin-model-pill {
   display: inline-flex;
   align-items: center;

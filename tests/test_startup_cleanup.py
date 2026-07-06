@@ -9,56 +9,7 @@ from src.api.models.database import Base
 from src.api.models.round import Round
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_memory import CronJobRun
-
-
-def _cleanup_stale_runtime_state(db):
-    """模拟启动清理逻辑：清理残留轮次 + 清空用户运行锁。"""
-    from src.api.utils.timezone import now_naive
-
-    stale_count = (
-        db.query(Round)
-        .filter(Round.status == "running")
-        .update({
-            "status": "failed",
-            "completed_at": now_naive(),
-            "final_response": "[系统重启，执行被中断]",
-        })
-    )
-    zombie_count = (
-        db.query(Round)
-        .filter(Round.status == "interrupted")
-        .update({
-            "status": "failed",
-            "completed_at": now_naive(),
-            "interrupt_payload": None,
-            "final_response": "[系统重启，中断问答已失效]",
-        })
-    )
-    stale_lock_count = db.query(UserRunLock).delete(synchronize_session=False)
-    db.commit()
-    return stale_count, zombie_count, stale_lock_count
-
-
-def _cleanup_stuck_cron_runs(db, *, hours: int = 1):
-    """模拟启动时清理卡住的 CronJobRun.running 记录。"""
-    from datetime import timedelta
-    from src.api.utils.timezone import now_naive
-
-    threshold = now_naive() - timedelta(hours=hours)
-    stale_runs = (
-        db.query(CronJobRun)
-        .filter(
-            CronJobRun.status == "running",
-            CronJobRun.started_at < threshold,
-        )
-        .all()
-    )
-    for rec in stale_runs:
-        rec.status = "failed"
-        rec.output = "worker crashed during execution"
-        rec.completed_at = now_naive()
-    db.commit()
-    return len(stale_runs)
+from src.api.main import CRON_INTERRUPTED_OUTPUT, cleanup_stale_runtime_state
 
 
 @pytest.fixture
@@ -86,11 +37,12 @@ class TestStartupCleanup:
             db.commit()
 
             # 模拟启动清理逻辑
-            stale_count, zombie_count, stale_lock_count = _cleanup_stale_runtime_state(db)
+            stale_count, zombie_count, stale_lock_count, stale_cron_count = cleanup_stale_runtime_state(db)
 
             assert stale_count == 2
             assert zombie_count == 0
             assert stale_lock_count == 1
+            assert stale_cron_count == 0
 
             # 验证状态
             all_rounds = db.query(Round).all()
@@ -118,11 +70,12 @@ class TestStartupCleanup:
             db.add(r1)
             db.commit()
 
-            stale_count, zombie_count, stale_lock_count = _cleanup_stale_runtime_state(db)
+            stale_count, zombie_count, stale_lock_count, stale_cron_count = cleanup_stale_runtime_state(db)
 
             assert stale_count == 0
             assert zombie_count == 0
             assert stale_lock_count == 0
+            assert stale_cron_count == 0
 
             # completed 轮次不受影响
             r = db.query(Round).first()
@@ -142,11 +95,12 @@ class TestStartupCleanup:
             db.add_all([r1, r2, r3, lock])
             db.commit()
 
-            stale_count, zombie_count, stale_lock_count = _cleanup_stale_runtime_state(db)
+            stale_count, zombie_count, stale_lock_count, stale_cron_count = cleanup_stale_runtime_state(db)
 
             assert stale_count == 1
             assert zombie_count == 0
             assert stale_lock_count == 1
+            assert stale_cron_count == 0
 
             # 验证原有 completed/failed 未被修改
             r1_db = db.query(Round).filter(Round.id == r1.id).first()
@@ -169,15 +123,16 @@ class TestStartupCleanup:
             db.add_all([lock1, lock2])
             db.commit()
 
-            stale_count, zombie_count, stale_lock_count = _cleanup_stale_runtime_state(db)
+            stale_count, zombie_count, stale_lock_count, stale_cron_count = cleanup_stale_runtime_state(db)
 
             assert stale_count == 0
             assert zombie_count == 0
             assert stale_lock_count == 2
+            assert stale_cron_count == 0
             assert db.query(UserRunLock).count() == 0
 
-    def test_startup_cleans_stuck_running(self, in_memory_db):
-        """启动时应清理超时 running 的 CronJobRun。"""
+    def test_startup_cleans_all_running_cron_runs(self, in_memory_db):
+        """启动时应清理所有 running 的 CronJobRun。"""
         from datetime import timedelta
         from src.api.utils.timezone import now_naive
 
@@ -204,16 +159,51 @@ class TestStartupCleanup:
                 is_read=False,
                 started_at=now - timedelta(minutes=30),
             )
-            db.add_all([old_run, recent_run])
+            success_run = CronJobRun(
+                id=str(uuid.uuid4()),
+                user_id="u1",
+                job_name="success",
+                cron_expr="* * * * *",
+                status="success",
+                output="done",
+                is_read=False,
+                started_at=now - timedelta(minutes=20),
+                completed_at=now - timedelta(minutes=19),
+            )
+            failed_run = CronJobRun(
+                id=str(uuid.uuid4()),
+                user_id="u1",
+                job_name="failed",
+                cron_expr="* * * * *",
+                status="failed",
+                output="already failed",
+                is_read=False,
+                started_at=now - timedelta(minutes=10),
+                completed_at=now - timedelta(minutes=9),
+            )
+            db.add_all([old_run, recent_run, success_run, failed_run])
             db.commit()
 
-            cleaned = _cleanup_stuck_cron_runs(db, hours=1)
-            assert cleaned == 1
+            stale_count, zombie_count, stale_lock_count, cleaned = cleanup_stale_runtime_state(db)
+            assert stale_count == 0
+            assert zombie_count == 0
+            assert stale_lock_count == 0
+            assert cleaned == 2
 
             old_run_db = db.query(CronJobRun).filter(CronJobRun.id == old_run.id).first()
             recent_run_db = db.query(CronJobRun).filter(CronJobRun.id == recent_run.id).first()
+            success_run_db = db.query(CronJobRun).filter(CronJobRun.id == success_run.id).first()
+            failed_run_db = db.query(CronJobRun).filter(CronJobRun.id == failed_run.id).first()
 
             assert old_run_db.status == "failed"
-            assert old_run_db.output == "worker crashed during execution"
+            assert old_run_db.output == CRON_INTERRUPTED_OUTPUT
             assert old_run_db.completed_at is not None
-            assert recent_run_db.status == "running"
+            assert recent_run_db.status == "failed"
+            assert recent_run_db.output == CRON_INTERRUPTED_OUTPUT
+            assert recent_run_db.completed_at is not None
+            assert success_run_db.status == "success"
+            assert success_run_db.output == "done"
+            assert success_run_db.completed_at == success_run.completed_at
+            assert failed_run_db.status == "failed"
+            assert failed_run_db.output == "already failed"
+            assert failed_run_db.completed_at == failed_run.completed_at

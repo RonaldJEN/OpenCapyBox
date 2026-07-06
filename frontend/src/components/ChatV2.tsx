@@ -103,6 +103,9 @@ function ChatV2View(props: ChatV2Props) {
   const [input, setInput] = useState('');
   const [localError, setLocalError] = useState('');
   const [creatingSession, setCreatingSession] = useState(false);
+  const [bootstrapMessage, setBootstrapMessage] = useState('');
+  const [sessionHandoffMessage, setSessionHandoffMessage] = useState('');
+  const [isSessionHandoff, setIsSessionHandoff] = useState(false);
   const [isFilesOpen, setIsFilesOpen] = useState(false);
   const [filePanelTarget, setFilePanelTarget] = useState<{ file: FileInfo; nonce: number } | null>(null);
   const [assistantFileMatches, setAssistantFileMatches] = useState<Record<string, FileInfo>>({});
@@ -216,6 +219,9 @@ function ChatV2View(props: ChatV2Props) {
     if (!sessionId) {
       setInput('');
       setLocalError('');
+      setBootstrapMessage('');
+      setSessionHandoffMessage('');
+      setIsSessionHandoff(false);
       setAttachedFiles([]);
       setPreviewFile(null);
       setPreviewSessionId('');
@@ -234,6 +240,7 @@ function ChatV2View(props: ChatV2Props) {
     }
 
     setDisableInitialMotion(true);
+    setBootstrapMessage('');
     pendingRestoreScrollRef.current = scrollPosBySessionRef.current[sessionId] ?? null;
     isInitialLoadRef.current = true;
     suppressAutoScrollRef.current = true;
@@ -247,7 +254,26 @@ function ChatV2View(props: ChatV2Props) {
     setLocalError('');
     setStopping(false);
     void runtime.loadSessionHistory(sessionId, { hasActiveSlot });
-  }, [sessionId, hasActiveSlot]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!sessionId) return;
+
+    if (!bootstrapMessage) {
+      setSessionHandoffMessage('');
+      setIsSessionHandoff(false);
+      return;
+    }
+
+    setSessionHandoffMessage(bootstrapMessage);
+    setIsSessionHandoff(true);
+    const timer = window.setTimeout(() => {
+      setIsSessionHandoff(false);
+      setSessionHandoffMessage('');
+    }, 520);
+
+    return () => window.clearTimeout(timer);
+  }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!sessionId || sending || resuming) return;
@@ -363,7 +389,9 @@ function ChatV2View(props: ChatV2Props) {
     if (suppressAutoScrollRef.current) return;
     const currentLength = rounds.reduce((sum, round) => sum + 1 + round.steps.length, 0);
     const hasNewContent = currentLength > prevRoundsLengthRef.current;
-    if (hasNewContent && isAtBottom) messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (isAtBottom) {
+      messagesEndRef.current?.scrollIntoView({ behavior: hasNewContent ? 'smooth' : 'auto' });
+    }
     prevRoundsLengthRef.current = currentLength;
   }, [rounds, isAtBottom]);
 
@@ -539,6 +567,10 @@ function ChatV2View(props: ChatV2Props) {
       return;
     }
     const userMessage = buildDisplayMessage(draftInput, draftAttachments);
+    const isStartingNewSession = !sessionId;
+    if (isStartingNewSession) {
+      setBootstrapMessage(userMessage);
+    }
     setInput('');
     setAttachedFiles([]);
     setDisableInitialMotion(false);
@@ -546,13 +578,17 @@ function ChatV2View(props: ChatV2Props) {
 
     let targetSessionId = sessionId;
     if (!targetSessionId) {
-      if (!onCreateSession) return;
+      if (!onCreateSession) {
+        setBootstrapMessage('');
+        return;
+      }
       setCreatingSession(true);
       try {
         targetSessionId = await onCreateSession(selectedModelId || undefined);
       } catch (err) {
         console.error('Failed to create session:', err);
         setLocalError('创建会话失败，请重试');
+        setBootstrapMessage('');
         setInput(draftInput);
         setAttachedFiles(draftAttachments);
         setCreatingSession(false);
@@ -587,6 +623,8 @@ function ChatV2View(props: ChatV2Props) {
 
   const inputDisabled = sending || creatingSession || resuming;
   const sendingLabel = creatingSession ? '创建中' : resuming ? 'Resuming' : sending ? 'Running' : '';
+  const hasLiveReplyBelow = showScrollButton && (sending || resuming);
+  const isBootstrappingSession = !sessionId && (creatingSession || Boolean(bootstrapMessage));
 
   return (
     <div className="flex-1 flex h-screen bg-claude-bg relative">
@@ -623,12 +661,17 @@ function ChatV2View(props: ChatV2Props) {
               }}
               className={`p-2 rounded-lg transition-all active:scale-95 flex items-center gap-2 ${
                 isFilesOpen ? 'bg-claude-text text-white' : 'text-claude-secondary hover:bg-claude-hover'
-              }`}
+              } ${isSessionHandoff ? 'animate-fade-in' : ''}`}
               title="会话资源"
             >
               <Folder size={16} />
               <span className="text-sm hidden sm:inline">Files</span>
             </button>
+          ) : isBootstrappingSession ? (
+            <div className="h-9 min-w-[88px] px-3 rounded-lg bg-claude-surface text-claude-secondary text-xs flex items-center justify-center gap-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-claude-accent" />
+              <span>开启中</span>
+            </div>
           ) : (
             <div className="w-[88px]" />
           )}
@@ -643,28 +686,44 @@ function ChatV2View(props: ChatV2Props) {
               </div>
             </div>
           ) : rounds.length === 0 ? (
-            <div className="flex items-center justify-center h-full">
-              <div className="text-center max-w-lg px-6">
-                <h2 className="text-3xl font-medium text-claude-text mb-3">你好，有什么可以帮你的？</h2>
-                <p className="text-claude-secondary leading-relaxed mb-10">
-                  编写代码、分析数据、处理文件，或者解答技术问题。
-                </p>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {WELCOME_SUGGESTIONS.map((suggestion, index) => (
-                    <button
-                      type="button"
-                      key={index}
-                      onClick={() => setInput(suggestion)}
-                      className="px-4 py-3 bg-white border border-claude-border rounded-2xl text-sm text-claude-secondary hover:border-claude-border-strong hover:bg-claude-hover transition-colors text-left"
-                    >
-                      {suggestion}
-                    </button>
-                  ))}
+            isBootstrappingSession ? (
+              <div className="flex h-full items-center justify-center px-4">
+                <div className="w-full max-w-3xl animate-slide-in-bottom">
+                  <div className="mb-4 flex items-center justify-end gap-2 text-sm text-claude-secondary">
+                    <Loader2 className="h-4 w-4 animate-spin text-claude-accent" />
+                    <span>正在开启对话</span>
+                  </div>
+                  {bootstrapMessage && (
+                    <div className="ml-auto max-w-[82%] rounded-2xl border border-claude-border bg-white px-4 py-3 text-[15px] leading-relaxed text-claude-text shadow-sm">
+                      {bootstrapMessage}
+                    </div>
+                  )}
                 </div>
               </div>
-            </div>
+            ) : (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center max-w-lg px-6">
+                  <h2 className="text-3xl font-medium text-claude-text mb-3">你好，有什么可以帮你的？</h2>
+                  <p className="text-claude-secondary leading-relaxed mb-10">
+                    编写代码、分析数据、处理文件，或者解答技术问题。
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {WELCOME_SUGGESTIONS.map((suggestion, index) => (
+                      <button
+                        type="button"
+                        key={index}
+                        onClick={() => setInput(suggestion)}
+                        className="px-4 py-3 bg-white border border-claude-border rounded-2xl text-sm text-claude-secondary hover:border-claude-border-strong hover:bg-claude-hover transition-colors text-left"
+                      >
+                        {suggestion}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )
           ) : (
-            <div className="mx-auto px-4 md:px-8 py-6 space-y-6 max-w-3xl">
+            <div className={`mx-auto px-4 md:px-8 py-6 space-y-6 max-w-3xl ${isSessionHandoff ? 'animate-slide-in-bottom' : ''}`}>
               {rounds.map((round, index) => (
                 <div
                   key={round.round_id}
@@ -694,13 +753,33 @@ function ChatV2View(props: ChatV2Props) {
             </div>
           )}
 
+          {isSessionHandoff && sessionHandoffMessage && (
+            <div className="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 px-4">
+              <div className="session-handoff-overlay flex items-center gap-2 rounded-full border border-claude-border bg-white/95 px-3.5 py-2 text-sm text-claude-secondary shadow-sm backdrop-blur-sm">
+                <Loader2 className="h-4 w-4 animate-spin text-claude-accent" />
+                <span className="whitespace-nowrap">正在开启对话</span>
+              </div>
+            </div>
+          )}
+
           {showScrollButton && (
             <button
               type="button"
               onClick={() => scrollToBottom(true)}
-              className="fixed bottom-28 right-8 bg-white text-claude-text p-2.5 rounded-full shadow-lg border border-claude-border transition-all hover:scale-105 active:scale-95 z-10"
-              aria-label="回到底部"
+              className={`fixed bottom-28 right-8 z-10 flex items-center gap-2 bg-white text-claude-text shadow-lg border border-claude-border transition-all hover:scale-105 active:scale-95 ${
+                hasLiveReplyBelow ? 'live-reply-pill rounded-full px-3.5 py-2.5 ring-2 ring-claude-accent/25 shadow-xl' : 'rounded-full p-2.5'
+              }`}
+              aria-label={hasLiveReplyBelow ? '新回复正在生成，回到底部' : '回到底部'}
             >
+              {hasLiveReplyBelow && (
+                <>
+                  <span className="relative flex h-2 w-2" aria-hidden="true">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-claude-accent opacity-60" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-claude-accent" />
+                  </span>
+                  <span className="text-xs font-semibold whitespace-nowrap">新回复正在生成</span>
+                </>
+              )}
               <ArrowDown className="w-4 h-4" />
             </button>
           )}

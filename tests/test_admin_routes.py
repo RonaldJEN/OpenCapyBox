@@ -69,6 +69,36 @@ class TestAdminRouter:
         assert mocked.call_args.kwargs["user_id"] == "demo"
         assert mocked.call_args.kwargs["search"] == "hello"
 
+    def test_session_rounds_delegates_to_builder(self):
+        client = _make_client(admin_enabled=True)
+        payload = {"session_id": "session-1", "rounds": []}
+
+        with patch("src.api.routes.admin._build_session_rounds_payload", return_value=payload) as mocked:
+            resp = client.get(
+                "/admin/sessions/session-1/rounds",
+                params={"status": "failed", "search": "hello"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json() == payload
+        assert mocked.call_count == 1
+        assert mocked.call_args.kwargs["session_id"] == "session-1"
+        assert mocked.call_args.kwargs["status"] == "failed"
+        assert mocked.call_args.kwargs["search"] == "hello"
+
+    def test_delete_model_delegates_to_helper(self):
+        client = _make_client(admin_enabled=True)
+        payload = {"model_id": "glm-test", "deleted": True}
+
+        with patch("src.api.routes.admin._delete_admin_model", return_value=payload) as mocked:
+            resp = client.delete("/admin/models/glm-test", params={"replacement_model_id": "glm-new"})
+
+        assert resp.status_code == 200
+        assert resp.json() == payload
+        assert mocked.call_count == 1
+        assert mocked.call_args.args[1] == "glm-test"
+        assert mocked.call_args.kwargs["replacement_model_id"] == "glm-new"
+
     def test_update_llm_review_delegates_to_helper(self):
         client = _make_client(admin_enabled=True)
         payload = {"llm_record_id": 12, "manual_review_status": "有问题"}

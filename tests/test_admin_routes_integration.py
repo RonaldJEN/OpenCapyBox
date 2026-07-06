@@ -16,7 +16,7 @@ from src.api.deps import get_current_admin_user
 from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.auth_user import AuthUser
 from src.api.models.database import Base, get_db
-from src.api.models.llm_model import LLMModel
+from src.api.models.llm_model import LLMModel, LLMModelSettings
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.model_permission import ModelPermissionGroup, ModelPermissionGroupModel
 from src.api.models.round import Round
@@ -342,6 +342,204 @@ def test_disabling_model_removes_it_from_permission_groups(admin_integration_cli
         db.close()
 
 
+def test_delete_model_removes_catalog_entry_and_permission_bindings(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        group = ModelPermissionGroup(id="biz-delete-cleanup", name="业务删除清理", created_by="admin")
+        db.add(group)
+        _add_test_llm_model(db, model_id="delete-model", enabled=True)
+        db.flush()
+        db.add(ModelPermissionGroupModel(
+            group_id="biz-delete-cleanup",
+            model_id="delete-model",
+            created_by="admin",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.delete("/admin/models/delete-model")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["model_id"] == "delete-model"
+    assert payload["deleted"] is True
+    assert payload["replacement_model_id"] is None
+    assert payload["sessions_reassigned"] == 0
+    assert payload["defaults_reassigned"] == []
+
+    db = SessionLocal()
+    try:
+        assert db.query(LLMModel).filter(LLMModel.model_id == "delete-model").first() is None
+        rows = db.query(ModelPermissionGroupModel).filter(
+            ModelPermissionGroupModel.model_id == "delete-model"
+        ).all()
+        assert rows == []
+    finally:
+        db.close()
+
+
+def test_delete_model_rejects_default_model(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        _add_test_llm_model(db, model_id="default-delete-model", enabled=True)
+        db.add(LLMModelSettings(
+            id=1,
+            default_model_id="default-delete-model",
+            cron_default_model_id="default-delete-model",
+            subagent_default_model_id="default-delete-model",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.delete("/admin/models/default-delete-model")
+
+    assert response.status_code == 400
+    assert "切换默认模型" in response.json()["detail"]
+
+    db = SessionLocal()
+    try:
+        assert db.query(LLMModel).filter(LLMModel.model_id == "default-delete-model").first() is not None
+    finally:
+        db.close()
+
+
+def test_delete_model_rejects_session_references(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        _add_test_llm_model(db, model_id="used-delete-model", enabled=True)
+        db.add(Session(
+            id="used-delete-session",
+            user_id="demo-user",
+            title="uses model",
+            status="active",
+            model_id="used-delete-model",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.delete("/admin/models/used-delete-model")
+
+    assert response.status_code == 409
+    assert "会话使用" in response.json()["detail"]
+
+    db = SessionLocal()
+    try:
+        assert db.query(LLMModel).filter(LLMModel.model_id == "used-delete-model").first() is not None
+    finally:
+        db.close()
+
+
+def test_delete_model_can_replace_session_defaults_and_permissions(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        group = ModelPermissionGroup(id="biz-delete-replace", name="业务删除替换", created_by="admin")
+        db.add(group)
+        _add_test_llm_model(db, model_id="old-delete-model", enabled=True)
+        _add_test_llm_model(db, model_id="replacement-delete-model", enabled=True)
+        db.flush()
+        db.add(ModelPermissionGroupModel(
+            group_id="biz-delete-replace",
+            model_id="old-delete-model",
+            created_by="admin",
+        ))
+        db.add(LLMModelSettings(
+            id=1,
+            default_model_id="old-delete-model",
+            cron_default_model_id="old-delete-model",
+            subagent_default_model_id="old-delete-model",
+        ))
+        db.add(Session(
+            id="replace-delete-session",
+            user_id="demo-user",
+            title="uses old model",
+            status="active",
+            model_id="old-delete-model",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.delete(
+        "/admin/models/old-delete-model",
+        params={"replacement_model_id": "replacement-delete-model"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["model_id"] == "old-delete-model"
+    assert payload["replacement_model_id"] == "replacement-delete-model"
+    assert payload["sessions_reassigned"] == 1
+    assert set(payload["defaults_reassigned"]) == {
+        "default_model_id",
+        "cron_default_model_id",
+        "subagent_default_model_id",
+    }
+
+    db = SessionLocal()
+    try:
+        assert db.query(LLMModel).filter(LLMModel.model_id == "old-delete-model").first() is None
+        session = db.query(Session).filter(Session.id == "replace-delete-session").one()
+        assert session.model_id == "replacement-delete-model"
+        settings = db.query(LLMModelSettings).filter(LLMModelSettings.id == 1).one()
+        assert settings.default_model_id == "replacement-delete-model"
+        assert settings.cron_default_model_id == "replacement-delete-model"
+        assert settings.subagent_default_model_id == "replacement-delete-model"
+        assert db.query(ModelPermissionGroupModel).filter(
+            ModelPermissionGroupModel.group_id == "biz-delete-replace",
+            ModelPermissionGroupModel.model_id == "old-delete-model",
+        ).first() is None
+        assert db.query(ModelPermissionGroupModel).filter(
+            ModelPermissionGroupModel.group_id == "biz-delete-replace",
+            ModelPermissionGroupModel.model_id == "replacement-delete-model",
+        ).first() is not None
+    finally:
+        db.close()
+
+
+def test_delete_model_rejects_disabled_replacement(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        _add_test_llm_model(db, model_id="old-disabled-replacement-model", enabled=True)
+        _add_test_llm_model(db, model_id="disabled-replacement-model", enabled=False)
+        db.add(Session(
+            id="disabled-replacement-session",
+            user_id="demo-user",
+            title="uses old model",
+            status="active",
+            model_id="old-disabled-replacement-model",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.delete(
+        "/admin/models/old-disabled-replacement-model",
+        params={"replacement_model_id": "disabled-replacement-model"},
+    )
+
+    assert response.status_code == 400
+    assert "启用状态" in response.json()["detail"]
+
+    db = SessionLocal()
+    try:
+        assert db.query(LLMModel).filter(LLMModel.model_id == "old-disabled-replacement-model").first() is not None
+    finally:
+        db.close()
+
+
 def test_create_user_validates_sandbox_profile_before_persisting_user(admin_integration_client):
     client, SessionLocal = admin_integration_client
 
@@ -596,6 +794,9 @@ def test_rounds_tree_real_sql_supports_limit_offset_status_search(admin_integrat
     assert page1_data["total_sessions"] == 3
     assert len(page1_data["sessions"]) == 2
     assert [item["session_id"] for item in page1_data["sessions"]] == ["s-new", "s-mid"]
+    assert [item["total_duration_s"] for item in page1_data["sessions"]] == [5.0, 5.0]
+    assert all(item["rounds"] == [] for item in page1_data["sessions"])
+    assert all(item["rounds_loaded"] is False for item in page1_data["sessions"])
 
     page2 = client.get("/admin/rounds-tree", params={"limit": 2, "offset": 2, "status": "all"})
     assert page2.status_code == 200
@@ -610,6 +811,7 @@ def test_rounds_tree_real_sql_supports_limit_offset_status_search(admin_integrat
     assert failed_data["total_sessions"] == 1
     assert len(failed_data["sessions"]) == 1
     assert failed_data["sessions"][0]["session_id"] == "s-mid"
+    assert failed_data["sessions"][0]["total_duration_s"] == 5.0
 
     searched = client.get("/admin/rounds-tree", params={"search": "beta", "limit": 10, "offset": 0})
     assert searched.status_code == 200
@@ -650,8 +852,11 @@ def test_rounds_tree_step_list_is_lightweight_and_detail_is_full(admin_integrati
     assert rounds_tree.status_code == 200
     data = rounds_tree.json()
     assert data["total_sessions"] == 1
+    assert data["sessions"][0]["rounds"] == []
 
-    step = data["sessions"][0]["rounds"][0]["steps"][0]
+    session_rounds = client.get("/admin/sessions/s-heavy/rounds", params={"status": "all"})
+    assert session_rounds.status_code == 200
+    step = session_rounds.json()["rounds"][0]["steps"][0]
     assert step["request_messages"] == ""
     assert step["response_content"] == ""
     assert step["response_tool_calls"] == ""
@@ -719,9 +924,12 @@ def test_rounds_tree_marks_subagent_child_rounds(admin_integration_client):
     db.close()
 
     response = client.get("/admin/rounds-tree", params={"limit": 5, "offset": 0, "status": "all"})
-
     assert response.status_code == 200
-    rounds = response.json()["sessions"][0]["rounds"]
+    assert response.json()["sessions"][0]["rounds"] == []
+
+    response = client.get("/admin/sessions/s-subagent/rounds", params={"status": "all"})
+    assert response.status_code == 200
+    rounds = response.json()["rounds"]
     by_id = {item["round_id"]: item for item in rounds}
     assert by_id["parent-run"]["run_kind"] == "main"
     assert by_id["parent-run"]["subagent_child_count"] == 1
@@ -758,7 +966,11 @@ def test_rounds_tree_resumed_round_does_not_make_session_running(admin_integrati
     session = response.json()["sessions"][0]
     assert session["session_id"] == "s-resumed"
     assert session["status"] == "completed"
-    assert session["rounds"][0]["status"] == "resumed"
+    assert session["rounds"] == []
+
+    response = client.get("/admin/sessions/s-resumed/rounds", params={"status": "all"})
+    assert response.status_code == 200
+    assert response.json()["rounds"][0]["status"] == "resumed"
 
 
 def test_users_payload_counts_recent_user_run_lock_as_running(admin_integration_client):

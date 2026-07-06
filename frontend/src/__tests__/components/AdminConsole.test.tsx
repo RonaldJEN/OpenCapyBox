@@ -6,11 +6,13 @@ import {
   createAdminSandboxProfile,
   createAdminLdapUser,
   createAdminSimpleUser,
+  deleteAdminModel,
   deleteAdminUser,
   getAdminLLMCallRecordDetail,
   getAdminOverview,
   getAdminRoundsTree,
   getAdminSandboxProfiles,
+  getAdminSessionRounds,
   getAdminSystem,
   getAdminUserLoginEvents,
   getAdminUsers,
@@ -37,17 +39,27 @@ vi.mock('../../services/api', () => ({
 
 vi.mock('../../services/adminApi', () => ({
   createAdminSandboxProfile: vi.fn(),
+  createAdminModel: vi.fn(),
+  createAdminModelPermissionGroup: vi.fn(),
   createAdminSimpleUser: vi.fn(),
   createAdminLdapUser: vi.fn(),
+  deleteAdminModel: vi.fn(),
   deleteAdminUser: vi.fn(),
+  getAdminModels: vi.fn(),
+  getAdminModelPermissionGroups: vi.fn(),
   getAdminOverview: vi.fn(),
   getAdminRoundsTree: vi.fn(),
+  getAdminSessionRounds: vi.fn(),
   getAdminLLMCallRecordDetail: vi.fn(),
   getAdminUsers: vi.fn(),
   getAdminSandboxProfiles: vi.fn(),
   getAdminSystem: vi.fn(),
   getAdminUserLoginEvents: vi.fn(),
   updateAdminSandboxProfile: vi.fn(),
+  updateAdminModel: vi.fn(),
+  updateAdminModelPermissionGroupModels: vi.fn(),
+  updateAdminModelPermissionGroupUsers: vi.fn(),
+  updateAdminModelSettings: vi.fn(),
   setAdminSandboxProfileDefault: vi.fn(),
   setAdminSandboxProfileEnabled: vi.fn(),
   updateAdminUserSandboxProfile: vi.fn(),
@@ -152,6 +164,10 @@ describe('AdminConsole 组件', () => {
       offset: 0,
       limit: 5,
       sessions: [],
+    });
+    vi.mocked(getAdminSessionRounds).mockResolvedValue({
+      session_id: 'session-1',
+      rounds: [],
     });
 
     vi.mocked(getAdminLLMCallRecordDetail).mockResolvedValue({
@@ -273,6 +289,13 @@ describe('AdminConsole 组件', () => {
     vi.mocked(updateAdminUserAdmin).mockResolvedValue(userPayload);
     vi.mocked(updateAdminUserTokenLimits).mockResolvedValue(userPayload);
     vi.mocked(resetAdminSimpleUserPassword).mockResolvedValue(userPayload);
+    vi.mocked(deleteAdminModel).mockResolvedValue({
+      model_id: 'demo-model',
+      deleted: true,
+      replacement_model_id: null,
+      sessions_reassigned: 0,
+      defaults_reassigned: [],
+    });
     vi.mocked(deleteAdminUser).mockResolvedValue({ user_id: 'demo', deleted: true });
     vi.mocked(createAdminSandboxProfile).mockResolvedValue(makeSandboxProfile());
     vi.mocked(updateAdminSandboxProfile).mockResolvedValue(makeSandboxProfile());
@@ -382,6 +405,82 @@ describe('AdminConsole 组件', () => {
         search: undefined,
       });
     });
+  });
+
+  it('展开 Session 时才懒加载 Round 明细', async () => {
+    vi.mocked(getAdminRoundsTree).mockResolvedValue({
+      total_sessions: 1,
+      offset: 0,
+      limit: 5,
+      sessions: [
+        {
+          session_id: 'session-lazy',
+          user_id: 'admin',
+          session_title: '懒加载会话',
+          rounds_count: 1,
+          last_round_at: '2026-04-26T10:00:00',
+          sum_step_count: 1,
+          total_tokens: 10,
+          llm_calls: 1,
+          error_calls: 0,
+          compaction_steps: 0,
+          total_duration_s: 0,
+          status: 'completed',
+          rounds_loaded: false,
+          rounds: [],
+        },
+      ],
+    });
+    vi.mocked(getAdminSessionRounds).mockResolvedValue({
+      session_id: 'session-lazy',
+      rounds: [
+        {
+          round_id: 'round-lazy',
+          session_id: 'session-lazy',
+          user_id: 'admin',
+          session_title: '懒加载会话',
+          run_kind: 'main',
+          parent_run_id: null,
+          root_run_id: 'round-lazy',
+          subagent_edge_id: null,
+          subagent_type: null,
+          subagent_description: null,
+          subagent_prompt_preview: null,
+          subagent_child_count: 0,
+          status: 'completed',
+          step_count: 1,
+          started_at: '2026-04-26T10:00:00',
+          completed_at: '2026-04-26T10:00:01',
+          duration_s: 1,
+          user_message_preview: '懒加载问题',
+          final_response_preview: '懒加载回答',
+          total_tokens: 10,
+          llm_calls: 1,
+          error_calls: 0,
+          compaction_steps: 0,
+          steps: [],
+        },
+      ],
+    });
+
+    render(<AdminConsole />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Session监控/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('懒加载会话')).toBeInTheDocument();
+    });
+    expect(getAdminSessionRounds).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: /懒加载会话/ }));
+
+    await waitFor(() => {
+      expect(getAdminSessionRounds).toHaveBeenCalledWith('session-lazy', {
+        status: 'all',
+        search: undefined,
+      });
+    });
+    expect(await screen.findByText('懒加载问题')).toBeInTheDocument();
   });
 
   it('step详情可展开并可将审阅状态改为有问题', async () => {

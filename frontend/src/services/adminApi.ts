@@ -100,6 +100,7 @@ export interface AdminRoundSessionItem {
   compaction_steps: number;
   total_duration_s: number;
   status: string;
+  rounds_loaded?: boolean;
   rounds: AdminRoundTreeItem[];
 }
 
@@ -108,6 +109,11 @@ export interface AdminRoundTreeResponse {
   offset: number;
   limit: number;
   sessions: AdminRoundSessionItem[];
+}
+
+export interface AdminSessionRoundsResponse {
+  session_id: string;
+  rounds: AdminRoundTreeItem[];
 }
 
 export type AdminSandboxProfileSource = 'explicit' | 'default' | 'missing' | 'disabled';
@@ -225,6 +231,20 @@ export async function getAdminRoundsTree(params?: {
   search?: string;
 }): Promise<AdminRoundTreeResponse> {
   const resp = await client.get<AdminRoundTreeResponse>('/admin/rounds-tree', { params });
+  return resp.data;
+}
+
+export async function getAdminSessionRounds(
+  sessionId: string,
+  params?: {
+    status?: string;
+    search?: string;
+  },
+): Promise<AdminSessionRoundsResponse> {
+  const resp = await client.get<AdminSessionRoundsResponse>(
+    `/admin/sessions/${encodeURIComponent(sessionId)}/rounds`,
+    { params },
+  );
   return resp.data;
 }
 
@@ -388,6 +408,7 @@ export interface AdminModelItem {
   tags: string[];
   api_key_set: boolean;
   group_names: string[];
+  session_count: number;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -401,6 +422,14 @@ export interface AdminModelSettings {
 export interface AdminModelsResponse {
   models: AdminModelItem[];
   settings: AdminModelSettings;
+}
+
+export interface AdminDeleteModelResponse {
+  model_id: string;
+  deleted: boolean;
+  replacement_model_id: string | null;
+  sessions_reassigned: number;
+  defaults_reassigned: string[];
 }
 
 export interface AdminModelPayload {
@@ -498,6 +527,19 @@ export async function createAdminModel(payload: Required<AdminModelPayload>): Pr
 
 export async function updateAdminModel(modelId: string, payload: AdminModelPayload): Promise<AdminModelItem> {
   const resp = await client.patch<AdminModelItem>(`/admin/models/${encodeURIComponent(modelId)}`, payload);
+  return resp.data;
+}
+
+export async function deleteAdminModel(
+  modelId: string,
+  replacementModelId?: string,
+): Promise<AdminDeleteModelResponse> {
+  const resp = await client.delete<AdminDeleteModelResponse>(
+    `/admin/models/${encodeURIComponent(modelId)}`,
+    {
+      params: replacementModelId ? { replacement_model_id: replacementModelId } : undefined,
+    },
+  );
   return resp.data;
 }
 

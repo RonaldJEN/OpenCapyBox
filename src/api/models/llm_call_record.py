@@ -4,7 +4,7 @@
 便于排查多轮上下文注入与模型输出偏差问题。
 """
 
-from sqlalchemy import Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey, UniqueConstraint, text
+from sqlalchemy import Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey, UniqueConstraint, Index, text
 
 from .database import Base
 from src.api.utils.timezone import now_naive
@@ -16,6 +16,7 @@ class LLMCallRecord(Base):
     __tablename__ = "llm_call_records"
     __table_args__ = (
         UniqueConstraint("round_id", "step_index", name="uq_llm_call_round_step"),
+        Index("idx_llm_call_records_round_step", "round_id", "step_index"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)

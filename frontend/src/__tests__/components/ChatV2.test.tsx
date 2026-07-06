@@ -285,6 +285,45 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('欢迎页首条消息创建会话时应保留过渡状态', async () => {
+    let resolveCreate!: (value: string) => void;
+    const onCreateSession = vi.fn(() => new Promise<string>((resolve) => {
+      resolveCreate = resolve;
+    }));
+
+    const { rerender } = render(
+      <ChatV2
+        sessionId=""
+        {...defaultProps}
+        onCreateSession={onCreateSession}
+      />
+    );
+
+    const textarea = screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...');
+    fireEvent.change(textarea, { target: { value: '测试过渡消息' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+    expect(await screen.findByText('正在开启对话')).toBeInTheDocument();
+    expect(screen.getByText('测试过渡消息')).toBeInTheDocument();
+
+    await act(async () => {
+      resolveCreate('new-session-id');
+    });
+
+    await act(async () => {
+      rerender(
+        <ChatV2
+          sessionId="new-session-id"
+          {...defaultProps}
+          onCreateSession={onCreateSession}
+        />
+      );
+    });
+
+    expect(await screen.findByText('正在开启对话')).toBeInTheDocument();
+    expect(screen.getByTitle('会话资源')).toHaveClass('animate-fade-in');
+  });
+
   it('欢迎页创建会话失败应该显示错误', async () => {
     const onCreateSession = vi.fn().mockRejectedValue(new Error('网络错误'));
     render(
@@ -320,6 +359,98 @@ describe('ChatV2 组件', () => {
       expect(screen.getByText('Round: round-1')).toBeInTheDocument();
       expect(screen.getByText('User: 你好')).toBeInTheDocument();
     });
+  });
+
+  it('当前会话进入运行态时不应重新加载历史记录', async () => {
+    const { rerender } = render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+        activeSlotSessionIds={new Set()}
+      />
+    );
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(1);
+    });
+    vi.mocked(apiService.getSessionHistoryV2).mockClear();
+
+    rerender(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+        activeSlotSessionIds={new Set(['test-session'])}
+      />
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(apiService.getSessionHistoryV2).not.toHaveBeenCalled();
+    expect(screen.queryByText('正在同步会话...')).not.toBeInTheDocument();
+    expect(screen.getByText('Round: round-1')).toBeInTheDocument();
+  });
+
+  it('停在底部时流式文本更新应持续滚到底部', async () => {
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
+      callbacks.onStreamAccepted?.();
+      callbacks.onRunStarted?.('test-session', 'stream-round-1');
+      callbacks.onTextMessageStart?.('msg-1', 'assistant');
+      callbacks.onTextMessageContent?.('msg-1', '第一段');
+      await Promise.resolve();
+      callbacks.onTextMessageContent?.('msg-1', '第一段第二段');
+      await Promise.resolve();
+      callbacks.onTextMessageEnd?.('msg-1');
+      callbacks.onRunFinished?.('test-session', 'stream-round-1', { finalResponse: '第一段第二段' }, 'success');
+    });
+
+    render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    const textarea = await screen.findByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '测试流式粘底' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+    await waitFor(() => {
+      expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: 'auto' });
+    });
+  });
+
+  it('不在底部且正在生成时应提示新回复正在生成', async () => {
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
+      callbacks.onStreamAccepted?.();
+      callbacks.onRunStarted?.('test-session', 'stream-round-live');
+      return new Promise(() => {});
+    });
+
+    const { container } = render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    const textarea = await screen.findByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '测试新回复提示' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+    await waitFor(() => {
+      expect(textarea).toBeDisabled();
+    });
+
+    const chatArea = container.querySelector('.overflow-y-auto.relative.bg-claude-bg') as HTMLDivElement;
+    Object.defineProperty(chatArea, 'scrollTop', { configurable: true, value: 200 });
+    Object.defineProperty(chatArea, 'scrollHeight', { configurable: true, value: 1200 });
+    Object.defineProperty(chatArea, 'clientHeight', { configurable: true, value: 500 });
+    fireEvent.scroll(chatArea);
+
+    expect(await screen.findByText('新回复正在生成')).toBeInTheDocument();
+    expect(screen.getByLabelText('新回复正在生成，回到底部')).toBeInTheDocument();
   });
 
   it('点击文件夹按钮应该打开 Artifacts 面板', async () => {

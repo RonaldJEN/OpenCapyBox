@@ -9,12 +9,14 @@ import {
   Save,
   Search,
   Settings2,
+  Trash2,
   X,
 } from 'lucide-react';
 
 import {
   createAdminModel,
   createAdminModelPermissionGroup,
+  deleteAdminModel,
   getAdminModelPermissionGroups,
   getAdminModels,
   getAdminUsers,
@@ -129,6 +131,18 @@ function modelFeatureText(model: AdminModelItem): string {
   return features.length ? features.join(' / ') : 'base';
 }
 
+function modelDefaultUsages(
+  model: AdminModelItem,
+  settings?: AdminModelsResponse['settings'] | null,
+): string[] {
+  if (!settings) return [];
+  return [
+    settings.default_model_id === model.id ? '普通对话默认模型' : '',
+    settings.cron_default_model_id === model.id ? 'Cron 默认模型' : '',
+    settings.subagent_default_model_id === model.id ? 'Subagent 默认模型' : '',
+  ].filter(Boolean);
+}
+
 function userPermissionText(user: AdminUsersResponse['users'][number]): string {
   if (user.is_admin) return '管理员全部可见';
   return [user.model_permission_default_group_name || '默认', ...(user.model_permission_group_names || [])].join(' + ');
@@ -152,6 +166,8 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
   const [modelDrawerOpen, setModelDrawerOpen] = useState(false);
   const [modelForm, setModelForm] = useState<ModelForm>(emptyModelForm);
+  const [deleteTargetModel, setDeleteTargetModel] = useState<AdminModelItem | null>(null);
+  const [replacementModelId, setReplacementModelId] = useState('');
   const [loading, setLoading] = useState(true);
   const [savingKey, setSavingKey] = useState('');
   const [error, setError] = useState('');
@@ -196,6 +212,18 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
   const selectedGroup = useMemo(
     () => groups.find((group) => group.id === selectedGroupId) || null,
     [groups, selectedGroupId],
+  );
+  const deleteTargetDefaultUsages = useMemo(
+    () => deleteTargetModel ? modelDefaultUsages(deleteTargetModel, modelsData?.settings) : [],
+    [deleteTargetModel, modelsData?.settings],
+  );
+  const deleteReplacementCandidates = useMemo(
+    () => enabledModels.filter((model) => model.id !== deleteTargetModel?.id),
+    [deleteTargetModel, enabledModels],
+  );
+  const deleteTargetNeedsReplacement = Boolean(
+    deleteTargetModel
+    && ((deleteTargetModel.session_count || 0) > 0 || deleteTargetDefaultUsages.length > 0),
   );
 
   useEffect(() => {
@@ -312,6 +340,34 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
     setModelDrawerOpen(false);
     setEditingModelId(null);
     setModelForm(emptyModelForm);
+  };
+
+  const openDeleteModel = (model: AdminModelItem) => {
+    const firstReplacement = enabledModels.find((candidate) => candidate.id !== model.id);
+    setDeleteTargetModel(model);
+    setReplacementModelId(firstReplacement?.id || '');
+  };
+
+  const closeDeleteModel = () => {
+    setDeleteTargetModel(null);
+    setReplacementModelId('');
+  };
+
+  const handleDeleteModel = async () => {
+    if (!deleteTargetModel) return;
+    if (deleteTargetNeedsReplacement && !replacementModelId) {
+      setActionError('该模型有关联默认配置或历史会话，需要先选择替换模型。');
+      return;
+    }
+
+    const modelId = deleteTargetModel.id;
+    await runSave(`delete-model-${modelId}`, async () => {
+      await deleteAdminModel(modelId, deleteTargetNeedsReplacement ? replacementModelId : undefined);
+      if (editingModelId === modelId) {
+        closeModelDrawer();
+      }
+      closeDeleteModel();
+    }, '模型已删除');
   };
 
   const handleSaveModel = async (event: FormEvent<HTMLFormElement>) => {
@@ -477,29 +533,44 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredCatalogModels.map((model) => (
-                    <tr key={model.id}>
-                      <td>
-                        <strong>{model.name}</strong>
-                        <span><b>ID</b>{model.id}<i />{model.model_name}</span>
-                      </td>
-                      <td>
-                        <span className={`admin-model-pill ${model.enabled ? 'on' : 'off'}`}>
-                          {model.enabled ? '启用' : '停用'}
-                        </span>
-                      </td>
-                      <td>{model.api_key_set ? '已设置' : '未设置'}</td>
-                      <td className={model.group_names.length ? 'admin-model-scope-text active' : 'admin-model-scope-text'}>
-                        {model.group_names.join(' / ') || '未加入权限包'}
-                      </td>
-                      <td>
-                        <button className="admin-button admin-icon-button" type="button" onClick={() => startEditModel(model)}>
-                          <Edit3 size={13} />
-                          编辑
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {filteredCatalogModels.map((model) => {
+                    return (
+                      <tr key={model.id}>
+                        <td>
+                          <strong>{model.name}</strong>
+                          <span><b>ID</b>{model.id}<i />{model.model_name}</span>
+                          {(model.session_count || 0) > 0 ? <span><b>会话</b>{model.session_count}</span> : null}
+                        </td>
+                        <td>
+                          <span className={`admin-model-pill ${model.enabled ? 'on' : 'off'}`}>
+                            {model.enabled ? '启用' : '停用'}
+                          </span>
+                        </td>
+                        <td>{model.api_key_set ? '已设置' : '未设置'}</td>
+                        <td className={model.group_names.length ? 'admin-model-scope-text active' : 'admin-model-scope-text'}>
+                          {model.group_names.join(' / ') || '未加入权限包'}
+                        </td>
+                        <td>
+                          <div className="admin-model-actions">
+                            <button className="admin-button admin-icon-button" type="button" onClick={() => startEditModel(model)}>
+                              <Edit3 size={13} />
+                              编辑
+                            </button>
+                            <button
+                              className="admin-button admin-icon-button admin-danger-button"
+                              type="button"
+                              onClick={() => openDeleteModel(model)}
+                              disabled={savingKey === `delete-model-${model.id}`}
+                              title="删除模型"
+                            >
+                              <Trash2 size={13} />
+                              删除
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
               {!filteredCatalogModels.length ? <div className="admin-model-empty">没有匹配的模型</div> : null}
@@ -758,6 +829,64 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
         </>
       ) : null}
 
+      {deleteTargetModel ? (
+        <div className="admin-model-error-backdrop" role="presentation" onClick={closeDeleteModel}>
+          <section
+            className="admin-model-error-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="admin-model-delete-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="admin-model-error-head">
+              <div className="admin-model-error-icon">
+                <Trash2 size={18} />
+              </div>
+              <div>
+                <h3 id="admin-model-delete-title">删除模型</h3>
+                <p>{deleteTargetModel.name}</p>
+              </div>
+              <button className="admin-button admin-icon-only-button" type="button" onClick={closeDeleteModel} aria-label="关闭删除弹窗">
+                <X size={15} />
+              </button>
+            </div>
+            <div className="admin-model-error-body">
+              {(deleteTargetModel.session_count || 0) > 0 ? (
+                <p>将 {deleteTargetModel.session_count} 个历史会话迁移到替换模型。</p>
+              ) : (
+                <p>该模型没有历史会话引用。</p>
+              )}
+              {deleteTargetDefaultUsages.length ? <p>同步替换：{deleteTargetDefaultUsages.join('、')}。</p> : null}
+              {deleteTargetNeedsReplacement ? (
+                <label className="admin-model-field">
+                  替换模型
+                  <select value={replacementModelId} onChange={(event) => setReplacementModelId(event.target.value)}>
+                    <option value="">选择启用模型</option>
+                    {deleteReplacementCandidates.map((model) => (
+                      <option key={model.id} value={model.id}>{model.name}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+            </div>
+            <div className="admin-model-error-actions">
+              <button className="admin-button" type="button" onClick={closeDeleteModel}>
+                取消
+              </button>
+              <button
+                className="admin-button admin-danger-button"
+                type="button"
+                onClick={() => void handleDeleteModel()}
+                disabled={savingKey === `delete-model-${deleteTargetModel.id}` || (deleteTargetNeedsReplacement && !replacementModelId)}
+              >
+                <Trash2 size={14} />
+                确认删除
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {actionError ? (
         <div className="admin-model-error-backdrop" role="presentation" onClick={() => setActionError('')}>
           <section
@@ -772,8 +901,8 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
                 <AlertTriangle size={18} />
               </div>
               <div>
-                <h3 id="admin-model-error-title">保存失败</h3>
-                <p>调整表单后再保存。</p>
+                <h3 id="admin-model-error-title">操作失败</h3>
+                <p>请检查提示后再重试。</p>
               </div>
               <button className="admin-button admin-icon-only-button" type="button" onClick={() => setActionError('')} aria-label="关闭错误弹窗">
                 <X size={15} />

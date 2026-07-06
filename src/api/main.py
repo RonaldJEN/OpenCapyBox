@@ -37,6 +37,60 @@ if platform.system() == "Windows":
 
 settings = get_settings()
 
+
+CRON_INTERRUPTED_OUTPUT = "[系统重启/部署，定时任务执行被中断]"
+
+
+def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
+    """清理上次进程残留的运行状态。"""
+    from src.api.models.round import Round
+    from src.api.models.user_run_lock import UserRunLock
+    from src.api.models.user_memory import CronJobRun
+    from src.api.utils.timezone import now_naive
+
+    cleanup_at = now_naive()
+    stale_count = (
+        db.query(Round)
+        .filter(Round.status == "running")
+        .update({
+            "status": "failed",
+            "completed_at": cleanup_at,
+            "final_response": "[系统重启，执行被中断]",
+        })
+    )
+    # 重启后内存中的 _pending_interrupt 已丢失，interrupted 轮次无法恢复
+    zombie_count = (
+        db.query(Round)
+        .filter(Round.status == "interrupted")
+        .update({
+            "status": "failed",
+            "completed_at": cleanup_at,
+            "interrupt_payload": None,
+            "final_response": "[系统重启，中断问答已失效]",
+        })
+    )
+    # 重启后旧进程已退出，用户运行锁全部失效，直接清空避免启动后 429 卡住
+    stale_lock_count = db.query(UserRunLock).delete(synchronize_session=False)
+
+    # 进程重启/部署中断后，内存中的 cron runner 已不可恢复，所有 running 记录都应收敛。
+    stale_cron_count = (
+        db.query(CronJobRun)
+        .filter(CronJobRun.status == "running")
+        .update({
+            "status": "failed",
+            "output": CRON_INTERRUPTED_OUTPUT,
+            "completed_at": cleanup_at,
+        }, synchronize_session=False)
+    )
+
+    db.commit()
+    return (
+        int(stale_count or 0),
+        int(zombie_count or 0),
+        int(stale_lock_count or 0),
+        int(stale_cron_count or 0),
+    )
+
 # 创建 FastAPI 应用
 app = FastAPI(
     title=settings.app_name,
@@ -73,55 +127,11 @@ async def startup_event():
 
     # 清理上次进程残留的运行状态（服务器重启后 Agent 已不再运行）
     try:
-        from src.api.models.round import Round
-        from src.api.models.user_run_lock import UserRunLock
-        from src.api.models.user_memory import CronJobRun
         from src.api.models.database import SessionLocal
-        from src.api.utils.timezone import now_naive
         from src.api.services.cron_worker import start_cron_worker
-        from datetime import timedelta
 
         with SessionLocal() as db:
-            stale_count = (
-                db.query(Round)
-                .filter(Round.status == "running")
-                .update({
-                    "status": "failed",
-                    "completed_at": now_naive(),
-                    "final_response": "[系统重启，执行被中断]",
-                })
-            )
-            # 重启后内存中的 _pending_interrupt 已丢失，interrupted 轮次无法恢复
-            zombie_count = (
-                db.query(Round)
-                .filter(Round.status == "interrupted")
-                .update({
-                    "status": "failed",
-                    "completed_at": now_naive(),
-                    "interrupt_payload": None,
-                    "final_response": "[系统重启，中断问答已失效]",
-                })
-            )
-            # 重启后旧进程已退出，用户运行锁全部失效，直接清空避免启动后 429 卡住
-            stale_lock_count = db.query(UserRunLock).delete(synchronize_session=False)
-
-            # 清理历史遗留的 cron 运行记录，避免前端永久显示 running
-            threshold = now_naive() - timedelta(hours=1)
-            stale_cron_runs = (
-                db.query(CronJobRun)
-                .filter(
-                    CronJobRun.status == "running",
-                    CronJobRun.started_at < threshold,
-                )
-                .all()
-            )
-            stale_cron_count = len(stale_cron_runs)
-            for rec in stale_cron_runs:
-                rec.status = "failed"
-                rec.output = "worker crashed during execution"
-                rec.completed_at = now_naive()
-
-            db.commit()
+            stale_count, zombie_count, stale_lock_count, stale_cron_count = cleanup_stale_runtime_state(db)
             if stale_count:
                 print(f"⚠️  已清理 {stale_count} 个残留的 running 轮次（标记为 failed）")
             if zombie_count:
