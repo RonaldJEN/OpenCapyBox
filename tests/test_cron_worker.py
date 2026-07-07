@@ -136,7 +136,7 @@ class TestDispatchAndSpawn:
         monkeypatch.setattr(cron_worker, "_spawn", fake_spawn)
         minute = datetime.utcnow().replace(second=0, microsecond=0)
 
-        await cron_worker._dispatch_and_run("w1", {}, minute)
+        await cron_worker._dispatch_and_run("w1", minute)
 
         with cron_db() as db:
             assert db.query(CronFire).count() == 1
@@ -163,7 +163,7 @@ class TestDispatchAndSpawn:
         monkeypatch.setattr(cron_worker, "_spawn", fake_spawn)
         minute = datetime.utcnow().replace(second=0, microsecond=0)
 
-        await cron_worker._dispatch_and_run("w1", {}, minute)
+        await cron_worker._dispatch_and_run("w1", minute)
 
         with cron_db() as db:
             assert db.query(CronFire).count() == 0
@@ -183,7 +183,7 @@ class TestDispatchAndSpawn:
         monkeypatch.setattr(cron_worker, "_spawn", fake_spawn)
         minute = datetime(2026, 4, 17, 5, 0, 0)
 
-        await cron_worker._dispatch_and_run("w1", {}, minute)
+        await cron_worker._dispatch_and_run("w1", minute)
 
         with cron_db() as db:
             assert db.query(CronFire).count() == 0
@@ -204,8 +204,8 @@ class TestDispatchAndSpawn:
         minute = datetime.utcnow().replace(second=0, microsecond=0)
 
         await asyncio.gather(
-            cron_worker._dispatch_and_run("w1", {}, minute),
-            cron_worker._dispatch_and_run("w2", {}, minute),
+            cron_worker._dispatch_and_run("w1", minute),
+            cron_worker._dispatch_and_run("w2", minute),
         )
 
         with cron_db() as db:
@@ -244,7 +244,7 @@ class TestDispatchAndSpawn:
         monkeypatch.setattr(cron_worker, "_cron_matches_minute", flaky_match)
         monkeypatch.setattr(cron_worker, "_spawn", fake_spawn)
 
-        await cron_worker._dispatch_and_run("w1", {}, flaky_match.target_minute)
+        await cron_worker._dispatch_and_run("w1", flaky_match.target_minute)
 
         # bad 抛错被吞 → good 仍然成功抢占执行权并 spawn
         with cron_db() as db:
@@ -254,7 +254,7 @@ class TestDispatchAndSpawn:
 
 class TestRunBehavior:
     @pytest.mark.asyncio
-    async def test_run_respects_per_user_lock(self, monkeypatch):
+    async def test_run_parallel_for_same_user(self, monkeypatch):
         timeline = []
 
         async def fake_run_cron_job(user_id, job_name, run_id):
@@ -264,19 +264,15 @@ class TestRunBehavior:
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
 
-        user_locks = {}
-
+        start = time.perf_counter()
         await asyncio.gather(
-            cron_worker._run("u1", "job-a", user_locks, "w1"),
-            cron_worker._run("u1", "job-b", user_locks, "w1"),
+            cron_worker._run("u1", "job-a", "w1"),
+            cron_worker._run("u1", "job-b", "w1"),
         )
+        elapsed = time.perf_counter() - start
 
-        starts = {name: ts for evt, name, ts in timeline if evt == "start"}
-        ends = {name: ts for evt, name, ts in timeline if evt == "end"}
-        first = min(starts, key=starts.get)
-        second = "job-b" if first == "job-a" else "job-a"
-
-        assert starts[second] >= ends[first]
+        assert elapsed < 0.055
+        assert {name for evt, name, _ in timeline if evt == "start"} == {"job-a", "job-b"}
 
     @pytest.mark.asyncio
     async def test_run_parallel_for_different_users(self, monkeypatch):
@@ -285,12 +281,10 @@ class TestRunBehavior:
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
 
-        user_locks = {}
-
         start = time.perf_counter()
         await asyncio.gather(
-            cron_worker._run("u1", "job-a", user_locks, "w1"),
-            cron_worker._run("u2", "job-b", user_locks, "w1"),
+            cron_worker._run("u1", "job-a", "w1"),
+            cron_worker._run("u2", "job-b", "w1"),
         )
         elapsed = time.perf_counter() - start
 
@@ -305,10 +299,8 @@ class TestRunBehavior:
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
 
-        user_locks = {}
-
-        await cron_worker._run("u1", "job-a", user_locks, "w1", run_id="manual-id")
-        await cron_worker._run("u1", "job-a", user_locks, "w1")
+        await cron_worker._run("u1", "job-a", "w1", run_id="manual-id")
+        await cron_worker._run("u1", "job-a", "w1")
 
         assert calls[0] == "manual-id"
         assert calls[1] != "manual-id"
@@ -350,7 +342,7 @@ class TestRunByIdRevalidation:
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
 
         # 不插入 job → 查询返回 None
-        await cron_worker._run_by_id(9999, {}, "w1")
+        await cron_worker._run_by_id(9999, "w1")
 
         assert calls == []
 
@@ -371,7 +363,7 @@ class TestRunByIdRevalidation:
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
 
-        await cron_worker._run_by_id(job.id, {}, "w1")
+        await cron_worker._run_by_id(job.id, "w1")
 
         assert calls == []
 
@@ -393,7 +385,7 @@ class TestRunByIdRevalidation:
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
 
-        await cron_worker._run_by_id(job.id, {}, "w1")
+        await cron_worker._run_by_id(job.id, "w1")
 
         assert calls == []
 
@@ -414,13 +406,13 @@ class TestRunByIdRevalidation:
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
 
-        await cron_worker._run_by_id(job.id, {}, "w1")
+        await cron_worker._run_by_id(job.id, "w1")
 
         assert calls == [("u1", "live-job")]
 
     @pytest.mark.asyncio
-    async def test_run_by_id_rechecks_enabled_after_lock(self, monkeypatch):
-        """首次快照命中后，若等待锁期间任务被禁用，执行前应再次跳过。"""
+    async def test_run_by_id_rechecks_enabled_before_execute(self, monkeypatch):
+        """首次快照命中后，若执行前任务被禁用，应再次跳过。"""
         calls = []
 
         async def fake_run_cron_job(user_id, job_name, run_id):
@@ -439,7 +431,7 @@ class TestRunByIdRevalidation:
             fake_load_snapshot_if_enabled,
         )
 
-        await cron_worker._run_by_id(42, {}, "w1")
+        await cron_worker._run_by_id(42, "w1")
 
         assert calls == []
 
@@ -544,22 +536,10 @@ class TestTriggerManualRun:
         assert exc_info.value.status_code == 503
 
     @pytest.mark.asyncio
-    async def test_raises_503_when_only_locks_present(self):
-        """半初始化状态（只有 locks 没有 worker_id）也应拒绝。"""
-        from fastapi import HTTPException
-
-        app = SimpleNamespace(state=SimpleNamespace(cron_user_locks={}))
-        with pytest.raises(HTTPException) as exc_info:
-            await cron_worker.trigger_manual_run(
-                app, user_id="u1", job_name="job1", run_id="r1"
-            )
-        assert exc_info.value.status_code == 503
-
-    @pytest.mark.asyncio
     async def test_spawns_task_when_worker_running(self, monkeypatch):
         called = {}
 
-        async def fake_run(user_id, job_name, user_locks, worker_id, run_id=None):
+        async def fake_run(user_id, job_name, worker_id, run_id=None):
             called["user_id"] = user_id
             called["name"] = job_name
             called["worker_id"] = worker_id
@@ -569,7 +549,6 @@ class TestTriggerManualRun:
 
         app = SimpleNamespace(
             state=SimpleNamespace(
-                cron_user_locks={},
                 cron_worker_id="w-test",
             )
         )

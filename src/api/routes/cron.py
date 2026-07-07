@@ -464,9 +464,9 @@ async def trigger_job(
 ):
     """手动触发指定的 Cron 任务。
 
-    所有执行必须走 cron_worker.trigger_manual_run，以共享 worker 内部的
-    per-user 串行锁。注意该串行锁是进程内语义：单 worker 严格串行，
-    多 worker 部署下同一用户任务仍可能并行（与 cron spec 一致）。
+    所有执行必须走 cron_worker.trigger_manual_run，确保 worker 生命周期、
+    后台任务引用和执行记录状态收敛语义一致。Cron 不再按用户串行排队：
+    手动触发会立即进入后台执行。
     """
     from src.api.models.cron_job import CronJob
 

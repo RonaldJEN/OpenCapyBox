@@ -283,7 +283,7 @@ class TestDownloadRunFile:
 class TestTriggerJob:
     """POST /cron/jobs/{job_name}/run"""
 
-    def test_trigger_uses_spawn_and_shared_user_lock(self):
+    def test_trigger_uses_worker_background_spawn(self):
         client, mock_db = _make_client()
 
         mock_job = MagicMock()
@@ -292,7 +292,6 @@ class TestTriggerJob:
         mock_job.cron_expr = "0 9 * * *"
         mock_db.query.return_value.filter.return_value.first.return_value = mock_job
 
-        client.app.state.cron_user_locks = {}
         client.app.state.cron_worker_id = "worker-test"
 
         with patch(

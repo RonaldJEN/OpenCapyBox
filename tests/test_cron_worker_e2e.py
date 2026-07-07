@@ -78,14 +78,11 @@ async def test_two_workers_three_minutes_exactly_once(cron_db, monkeypatch):
     monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
 
     base_minute = datetime.utcnow().replace(second=0, microsecond=0)
-    user_locks_w1 = {}
-    user_locks_w2 = {}
-
     for i in range(3):
         minute = base_minute + timedelta(minutes=i)
         await asyncio.gather(
-            cron_worker._dispatch_and_run("w1", user_locks_w1, minute),
-            cron_worker._dispatch_and_run("w2", user_locks_w2, minute),
+            cron_worker._dispatch_and_run("w1", minute),
+            cron_worker._dispatch_and_run("w2", minute),
         )
         if cron_worker._background_tasks:
             await asyncio.gather(*list(cron_worker._background_tasks))

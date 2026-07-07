@@ -147,7 +147,7 @@ All require Bearer auth.
 - Response 200: `{job_name, run_id, status: "accepted", message: "后台任务已执行"}`
 - Error 404 ("任务不存在")
 - 手动触发不写 cron_fires 去重表
-- 共享 per-user 串行锁
+- 不按用户串行排队；提交后立即进入后台执行
 
 ## 4. 行为语义与不变量
 
@@ -180,13 +180,12 @@ All require Bearer auth.
 
 ### 执行流程
 
-1. 获取 per-user lock（同一 worker 进程内同用户作业串行执行；跨 worker 不串行，详见下方「多 worker 并发模型」）
-2. Resume 用户沙箱
-3. 创建临时 Agent（排除 AskUserQuestionTool、SubAgentTool 和 memory tools；保留 `write_file` / `edit_file` 这类受控文件工具）
-4. Workspace = `{mount}/cron/runs/{run_id}`，通过 `mkdir -p {shlex.quote(...)}` 创建（防 mount 路径含空格时注入）；普通产物文件必须写入该 workspace，后续所有针对 workspace 的 shell 命令（artifact 扫描的 `find` 链）同样使用 `shlex.quote` 保护
-5. `Agent.run_agui` 执行
-6. 扫描 artifacts（fallback 链：GNU `find -printf '%p\t%s'` → `find -exec stat -c '%n\t%s'` → 仅路径 `find -type f`；最后一档 size 置 0）
-7. 更新 run record（output 截断 10000 字符, artifacts JSON ≤ 64KB / 100 entries）
+1. Resume 用户沙箱
+2. 创建临时 Agent（排除 AskUserQuestionTool、SubAgentTool 和 memory tools；保留 `write_file` / `edit_file` 这类受控文件工具）
+3. Workspace = `{mount}/cron/runs/{run_id}`，通过 `mkdir -p {shlex.quote(...)}` 创建（防 mount 路径含空格时注入）；普通产物文件必须写入该 workspace，后续所有针对 workspace 的 shell 命令（artifact 扫描的 `find` 链）同样使用 `shlex.quote` 保护
+4. `Agent.run_agui` 执行
+5. 扫描 artifacts（fallback 链：GNU `find -printf '%p\t%s'` → `find -exec stat -c '%n\t%s'` → 仅路径 `find -type f`；最后一档 size 置 0）
+6. 更新 run record（output 截断 10000 字符, artifacts JSON ≤ 64KB / 100 entries）
 
 ### 记忆与配置文件边界
 
@@ -215,8 +214,8 @@ All require Bearer auth.
 ### 手动触发与调度并发
 
 - 手动触发不写 `cron_fires`，允许与同分钟的自动调度并存。
-- 两者竞争同一个 per-user lock（同一 worker 进程内），实际表现为**串行执行**（先拿到锁的先跑）。
-- 跨 worker 触发的并发约束见下方「多 worker 并发模型」。
+- 手动触发与自动调度均不按用户串行排队；提交后立即进入后台执行。
+- 跨 worker 触发的同一作业同分钟去重约束见下方「多 worker 并发模型」。
 
 ### 作业删除语义
 
@@ -228,16 +227,15 @@ All require Bearer auth.
 ### 多 worker 并发模型
 
 - `cron_fires` UNIQUE 约束保证：**同一 (job_id, scheduled_at) 在所有 worker 中只会被执行一次**。
-- per-user 内存锁（`app.state.cron_user_locks`）只在**单个 worker 进程**内生效；多 uvicorn worker 部署下，每个进程持有独立 dict。
 - 因此**不变量边界**：
-  - 单 worker：同一用户的所有作业（自动调度 + 手动触发）严格串行。
-  - 多 worker：同一用户的不同作业可能被不同 worker 抢到，**会并行执行**。
+  - 单 worker：同一用户的不同作业（自动调度 + 手动触发）可以并行执行。
+  - 多 worker：同一用户的不同作业也可以并行执行。
   - 同一作业（同 job_id 同分钟）在任何部署模式下都不会被并行触发（由 `cron_fires` 兜底）。
 - 影响范围与缓解：
   - 用户沙箱：`get_or_resume` 是幂等的；并发 resume 同一沙箱由 OpenSandbox 层处理。
   - `cron_job_runs` 写入：每条记录有独立 `run_id`，不会互相覆盖。
-  - 手动触发：`POST /jobs/{name}/run` 与同分钟自动调度可能在不同 worker 并行执行同一作业；调用方需自行接受这种语义。
-- 如需严格全局串行：未来可在 `_run` 入口增加 DB 级 user lock（如 `INSERT INTO user_run_locks` 抢占），不在本期实现范围。
+  - 手动触发：`POST /jobs/{name}/run` 与同分钟自动调度可能并行执行同一作业；调用方需自行接受这种语义。
+- 如需重新引入严格全局串行：未来可在 `_run` 入口增加 DB 级 user lock（如 `INSERT INTO user_run_locks` 抢占），不在本期实现范围。
 
 ### 手动触发失败兜底
 

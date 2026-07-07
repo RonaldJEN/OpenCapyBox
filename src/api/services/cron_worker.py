@@ -3,7 +3,7 @@
 每个 worker 独立运行：
 - 到点唤醒扫描 enabled 任务
 - 通过 cron_fires 的 UNIQUE 约束去重抢占执行权
-- 同用户执行串行化
+- 抢到执行权后立即并发执行，不按用户串行排队
 """
 
 from __future__ import annotations
@@ -40,21 +40,12 @@ def _spawn(coro) -> asyncio.Task:
     return task
 
 
-def _get_or_create_user_lock(user_locks: dict[str, asyncio.Lock], user_id: str) -> asyncio.Lock:
-    lock = user_locks.get(user_id)
-    if lock is None:
-        lock = user_locks.setdefault(user_id, asyncio.Lock())
-    return lock
-
-
 async def start_cron_worker(app) -> None:
     """启动当前进程的 cron worker。"""
     worker_id = uuid.uuid4().hex
-    user_locks: dict[str, asyncio.Lock] = {}
     app.state.cron_worker_id = worker_id
-    app.state.cron_user_locks = user_locks
     app.state.cron_worker_task = asyncio.create_task(
-        _cron_worker_loop(worker_id, user_locks)
+        _cron_worker_loop(worker_id)
     )
     logger.info("cron_worker started worker_id=%s", worker_id)
 
@@ -80,7 +71,7 @@ async def stop_cron_worker(app) -> None:
     _background_tasks.clear()
 
 
-async def _cron_worker_loop(worker_id: str, user_locks: dict[str, asyncio.Lock]) -> None:
+async def _cron_worker_loop(worker_id: str) -> None:
     """主循环：到点唤醒后执行 dispatch + run。
 
     时区：以本地时区（`TIMEZONE_OFFSET`，默认 UTC+8）为基准匹配 cron 表达式，
@@ -95,7 +86,7 @@ async def _cron_worker_loop(worker_id: str, user_locks: dict[str, asyncio.Lock])
             next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
             await asyncio.sleep((next_minute - now).total_seconds())
             minute = datetime.now(tz).replace(second=0, microsecond=0, tzinfo=None)
-            await _dispatch_and_run(worker_id, user_locks, minute)
+            await _dispatch_and_run(worker_id, minute)
 
             # 每天凌晨第一次触发时清理过期 cron_fires。
             # 即使多 worker 同时清理也无害：DELETE 幂等，最终状态一致。
@@ -144,7 +135,6 @@ def _load_enabled_job_snapshots() -> list[tuple[int, str, str, str]]:
 
 async def _dispatch_and_run(
     worker_id: str,
-    user_locks: dict[str, asyncio.Lock],
     minute: datetime,
 ) -> None:
     # 同步 DB 调用一律放线程，避免阻塞事件循环（影响同进程的 SSE / 长连接 jitter）
@@ -163,7 +153,7 @@ async def _dispatch_and_run(
             )
             continue
         if won:
-            _spawn(_run_by_id(job_id, user_locks, worker_id))
+            _spawn(_run_by_id(job_id, worker_id))
 
 
 def _cron_matches_minute(expr: str, minute: datetime) -> bool:
@@ -227,55 +217,50 @@ def _try_insert_fire(job_id: int, minute: datetime) -> bool:
 async def _run(
     user_id: str,
     job_name: str,
-    user_locks: dict[str, asyncio.Lock],
     worker_id: str,
     run_id: str | None = None,
     scheduled_job_id: int | None = None,
 ) -> None:
     """执行单个任务，cron 与手动触发共用。
 
-    当 scheduled_job_id 不为空（自动调度路径）时，拿到 per-user 锁后
-    再按 job_id 做一次 enabled 校验，避免“快照已启用 -> 排队等待锁 ->
-    用户在等待期间禁用任务”导致的空跑。
+    当 scheduled_job_id 不为空（自动调度路径）时，在真正执行前按 job_id
+    做一次 enabled 校验，避免“快照已启用 -> 执行前被禁用/删除”导致空跑。
     """
-    lock = _get_or_create_user_lock(user_locks, user_id)
     actual_run_id = run_id or str(uuid.uuid4())
     source = "manual" if run_id else "scheduled"
 
-    async with lock:
-        if scheduled_job_id is not None:
-            # 自动调度路径：在真正执行前（已拿锁）做二次校验，收敛竞态窗口。
-            latest = await asyncio.to_thread(_load_job_snapshot_if_enabled, scheduled_job_id)
-            if latest is None:
-                logger.info(
-                    "cron skip stale job before execute job_id=%s worker=%s (deleted or disabled)",
-                    scheduled_job_id,
-                    worker_id,
-                )
-                return
+    if scheduled_job_id is not None:
+        # 自动调度路径：在真正执行前做二次校验，收敛竞态窗口。
+        latest = await asyncio.to_thread(_load_job_snapshot_if_enabled, scheduled_job_id)
+        if latest is None:
+            logger.info(
+                "cron skip stale job before execute job_id=%s worker=%s (deleted or disabled)",
+                scheduled_job_id,
+                worker_id,
+            )
+            return
 
-        logger.info(
-            "cron start worker=%s user=%s job=%s run=%s source=%s",
-            worker_id,
+    logger.info(
+        "cron start worker=%s user=%s job=%s run=%s source=%s",
+        worker_id,
+        user_id,
+        job_name,
+        actual_run_id,
+        source,
+    )
+    try:
+        await run_cron_job(user_id, job_name, actual_run_id)
+    except Exception:
+        logger.exception(
+            "cron run failed user=%s job=%s run=%s",
             user_id,
             job_name,
             actual_run_id,
-            source,
         )
-        try:
-            await run_cron_job(user_id, job_name, actual_run_id)
-        except Exception:
-            logger.exception(
-                "cron run failed user=%s job=%s run=%s",
-                user_id,
-                job_name,
-                actual_run_id,
-            )
 
 
 async def _run_by_id(
     job_id: int,
-    user_locks: dict[str, asyncio.Lock],
     worker_id: str,
 ) -> None:
     """按 job_id 重新从 DB 拉取 job 并执行。
@@ -292,7 +277,7 @@ async def _run_by_id(
         return
 
     user_id, name = snapshot
-    await _run(user_id, name, user_locks, worker_id, scheduled_job_id=job_id)
+    await _run(user_id, name, worker_id, scheduled_job_id=job_id)
 
 
 def _load_job_snapshot_if_enabled(job_id: int) -> tuple[str, str] | None:
@@ -327,7 +312,7 @@ async def trigger_manual_run(
     路由层应仅通过此函数与 worker 交互，避免直接 import 私有符号。
 
     Args:
-        app: FastAPI app 实例（用于读取共享的 user_locks / worker_id）
+        app: FastAPI app 实例（用于读取 worker_id）
         user_id: 任务所属用户
         job_name: 任务名称
         run_id: 调用方预先生成并已写入 CronJobRun 的执行 id
@@ -337,12 +322,11 @@ async def trigger_manual_run(
 
     Raises:
         HTTPException(503): cron worker 尚未启动（startup 失败或被跳过）。
-            此时不允许悄悄回退到独立 dict 跑任务，否则会与未来上线的 worker
-            分裂出两套 per-user 锁，破坏"同用户串行"的不变量。
+            此时不允许悄悄回退到独立后台任务，避免 worker 生命周期与任务
+            状态收敛语义分裂。
     """
-    user_locks = getattr(app.state, "cron_user_locks", None)
     worker_id = getattr(app.state, "cron_worker_id", None)
-    if user_locks is None or worker_id is None:
+    if worker_id is None:
         from fastapi import HTTPException
 
         raise HTTPException(
@@ -350,4 +334,4 @@ async def trigger_manual_run(
             detail="cron worker 未启动，无法手动触发任务",
         )
 
-    return _spawn(_run(user_id, job_name, user_locks, worker_id, run_id=run_id))
+    return _spawn(_run(user_id, job_name, worker_id, run_id=run_id))

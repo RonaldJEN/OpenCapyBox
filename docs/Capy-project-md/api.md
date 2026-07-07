@@ -1578,7 +1578,7 @@ POST /api/cron/jobs/{job_name}/run
 Authorization: Bearer <access_token>
 ```
 
-**说明**: 从 `cron_jobs` 表查找任务并在当前 worker 后台直接执行（立即返回 `run_id`）。手动触发与定时触发共享同一套每用户串行锁（同一用户同一时刻仅执行一个任务）。手动触发不写入 `cron_fires` 去重表，执行历史以 `cron_job_runs` 为准。执行结果不会注入聊天 Session，用户通过消息中心查看。前端可通过 `GET /api/cron/runs/{run_id}` 轮询执行状态。
+**说明**: 从 `cron_jobs` 表查找任务并在当前 worker 后台直接执行（立即返回 `run_id`）。Cron 不按用户串行排队；手动触发会立即进入后台执行，且不写入 `cron_fires` 去重表。执行历史以 `cron_job_runs` 为准。执行结果不会注入聊天 Session，用户通过消息中心查看。前端可通过 `GET /api/cron/runs/{run_id}` 轮询执行状态。
 
 **Response**:
 ```json

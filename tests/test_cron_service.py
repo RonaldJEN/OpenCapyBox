@@ -349,7 +349,6 @@ class TestCronRoutes:
         mock_job.cron_expr = "0 9 * * *"
 
         client.mock_db.query.return_value.filter.return_value.first.return_value = mock_job
-        client.app.state.cron_user_locks = {}
         client.app.state.cron_worker_id = "worker-test"
 
         with patch("src.api.routes.cron.trigger_manual_run", new_callable=AsyncMock):
