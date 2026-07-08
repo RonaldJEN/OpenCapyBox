@@ -13,6 +13,8 @@ from typing import AsyncIterator, Optional, Any, Callable, Awaitable
 
 import tiktoken
 
+from src.api.utils.timezone import get_timezone, get_timezone_offset
+
 from .llm import LLMClient
 from .logger import AgentLogger
 from .schema import Message
@@ -116,67 +118,10 @@ class Agent:
         if not str(workspace_dir).startswith("/"):
             self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
-        # 🔥 将上下文信息注入到 system_prompt 的开头（而不是末尾）
-        # 这样模型能第一时间看到这些关键信息
-        context_info_parts = []
-
-        # 注入时间信息（支持时区配置）- 使用更强调的格式
-        timezone_str = os.getenv('TIMEZONE') or os.getenv('TZ') or 'UTC+0'
-        current_time = datetime.now()
-        year = current_time.year
-        context_info_parts.append(f"- 🗓️ **当前日期**: {current_time.strftime('%Y年%m月%d日')} ({current_time.strftime('%A')})")
-        context_info_parts.append(f"- ⏰ **当前时间**: {current_time.strftime('%H:%M:%S')} (时区: {timezone_str})")
-        context_info_parts.append(f"- ⚠️ **重要**: 现在是 **{year}年**，不是2024年或更早的年份！请始终使用此实时时间信息。")
-
-        # 注入工作空间信息
-        if "Current Workspace" not in system_prompt:
-            context_info_parts.append(f"- **Workspace（当前会话工作目录）**: `{workspace_dir}`")
-            context_info_parts.append("- **用户根目录**: `/home/user`（记忆文件、Skills 等用户级资源在此）")
-            context_info_parts.append("- **⚠️ 为用户创建的文件（文档、代码等）必须保存在 Workspace 目录下**，用户才能看到和下载")
-
-        # 注入平台信息（固定為 sandbox 執行語義）
-        context_info_parts.append("- **OS**: Linux (OpenSandbox)")
-        context_info_parts.append("- **Python command**: `python3` (use `python3`, NOT `python`)")
-
-        # 注入预装套件信息（可选，不依赖 shared_env 路径）
-        try:
-            candidates: list[Path] = []
-            allowed_packages_env = os.getenv("ALLOWED_PACKAGES_FILE")
-            if allowed_packages_env:
-                candidates.append(Path(allowed_packages_env))
-
-            repo_root = Path(__file__).resolve().parents[2]
-            candidates.append(repo_root / "data" / "allowed_packages.txt")
-            candidates.append(repo_root / "allowed_packages.txt")
-
-            for allowed_packages_file in candidates:
-                if not allowed_packages_file.exists():
-                    continue
-
-                packages = []
-                for line in allowed_packages_file.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        packages.append(line)
-
-                if packages:
-                    context_info_parts.append(f"- **Pre-installed packages** (no need to install): {', '.join(packages)}")
-                break
-        except Exception:
-            pass  # 读取失败不影响核心功能
-
-        # 组装上下文信息块（放在 system_prompt 最前面）- 使用醒目格式
-        context_block = f"""
-## ⚠️ 实时上下文信息 (REAL-TIME CONTEXT) - 必须遵守！
-
-> **这些是系统注入的实时信息，优先级高于你的训练数据！**
-
-{chr(10).join(context_info_parts)}
-
----
-
-"""
-        system_prompt = context_block + system_prompt
+        # Runtime context is assembled per LLM request. Keep self.messages as
+        # stable conversation state so volatile data such as "now" never enters
+        # long-lived history.
+        self._include_workspace_context = "Current Workspace" not in system_prompt
         self.system_prompt = system_prompt
 
         # Initialize message history
@@ -216,9 +161,98 @@ class Agent:
         # after all tool_result messages for the current assistant turn.
         self._pending_tool_content_blocks: list[dict[str, Any]] = []
 
+    @staticmethod
+    def _prompt_timezone():
+        offset_hours = get_timezone_offset()
+        sign = "+" if offset_hours >= 0 else ""
+        return get_timezone(), f"UTC{sign}{offset_hours}"
+
+    def _build_runtime_context_block(self) -> str:
+        context_info_parts = []
+
+        # 注入时间信息（支持时区配置）- 使用更强调的格式
+        prompt_tz, timezone_str = self._prompt_timezone()
+        current_time = datetime.now(prompt_tz)
+        year = current_time.year
+        context_info_parts.append(f"- 🗓️ **当前日期**: {current_time.strftime('%Y年%m月%d日')} ({current_time.strftime('%A')})")
+        context_info_parts.append(f"- ⏰ **当前时间**: {current_time.strftime('%H:%M:%S')} (时区: {timezone_str})")
+        context_info_parts.append(f"- ⚠️ **重要**: 现在是 **{year}年**，不是2024年或更早的年份！请始终使用此实时时间信息。")
+        context_info_parts.append("- ⚠️ **时效原则**: 本块只存在于本次模型请求；历史消息里的时间只代表当时，不可当作当前时间。")
+
+        # 注入工作空间信息
+        if self._include_workspace_context:
+            context_info_parts.append(f"- **Workspace（当前会话工作目录）**: `{self.workspace_dir}`")
+            context_info_parts.append("- **用户根目录**: `/home/user`（记忆文件、Skills 等用户级资源在此）")
+            context_info_parts.append("- **⚠️ 为用户创建的文件（文档、代码等）必须保存在 Workspace 目录下**，用户才能看到和下载")
+
+        # 注入平台信息（固定為 sandbox 執行語義）
+        context_info_parts.append("- **OS**: Linux (OpenSandbox)")
+        context_info_parts.append("- **Python command**: `python3` (use `python3`, NOT `python`)")
+
+        # 注入预装套件信息（可选，不依赖 shared_env 路径）
+        try:
+            candidates: list[Path] = []
+            allowed_packages_env = os.getenv("ALLOWED_PACKAGES_FILE")
+            if allowed_packages_env:
+                candidates.append(Path(allowed_packages_env))
+
+            repo_root = Path(__file__).resolve().parents[2]
+            candidates.append(repo_root / "data" / "allowed_packages.txt")
+            candidates.append(repo_root / "allowed_packages.txt")
+
+            for allowed_packages_file in candidates:
+                if not allowed_packages_file.exists():
+                    continue
+
+                packages = []
+                for line in allowed_packages_file.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        packages.append(line)
+
+                if packages:
+                    context_info_parts.append(f"- **Pre-installed packages** (no need to install): {', '.join(packages)}")
+                break
+        except Exception:
+            pass  # 读取失败不影响核心功能
+
+        return f"""
+## ⚠️ 实时上下文信息 (REAL-TIME CONTEXT) - 必须遵守！
+
+> **这些是系统注入的实时信息，优先级高于你的训练数据！**
+
+{chr(10).join(context_info_parts)}
+
+---
+
+"""
+
+    def _build_llm_request_messages(self, messages: list[Message] | None = None) -> list[Message]:
+        """Return provider-bound messages with request-only runtime context.
+
+        The returned list is a deep copy and must not be stored back into
+        ``self.messages`` or ``conversation_messages``.
+        """
+        source_messages = self.messages if messages is None else messages
+        request_messages = [msg.model_copy(deep=True) for msg in source_messages]
+        runtime_context = self._build_runtime_context_block()
+
+        if request_messages and request_messages[0].role == "system":
+            system_content = request_messages[0].content
+            if isinstance(system_content, str):
+                request_messages[0].content = runtime_context + system_content
+            else:
+                request_messages[0].content = runtime_context + json.dumps(
+                    system_content,
+                    ensure_ascii=False,
+                )
+        else:
+            request_messages.insert(0, Message(role="system", content=runtime_context))
+
+        return request_messages
+
     def add_user_message(self, content: str | list[dict[str, Any]]):
-        """Add a user message to history with current timestamp."""
-        # 在用户消息中附加当前时间（保持轻量级，避免冗余）
+        """Add a user message to history."""
         self.messages.append(Message(role="user", content=content))
 
     def has_pending_interrupt(self, interrupt_id: str | None = None) -> bool:
@@ -1523,8 +1557,9 @@ Rules:
                 
                 # 獲取工具列表
                 tool_list = list(self.tools.values())
-                self.logger.log_request(messages=self.messages, tools=tool_list)
-                request_messages_snapshot = [msg.model_dump(exclude_none=True) for msg in self.messages]
+                llm_request_messages = self._build_llm_request_messages()
+                self.logger.log_request(messages=llm_request_messages, tools=tool_list)
+                request_messages_snapshot = [msg.model_dump(exclude_none=True) for msg in llm_request_messages]
                 request_tools_snapshot = [tool.name for tool in tool_list]
                 step_index = step + 1
                 if hasattr(self.llm, "last_request_snapshot"):
@@ -1605,7 +1640,7 @@ Rules:
                     async def producer():
                         try:
                             return await self.llm.generate_stream(
-                                messages=self.messages,
+                                messages=llm_request_messages,
                                 tools=tool_list,
                                 on_content=on_content_delta,
                                 on_thinking=on_thinking_delta,
@@ -2209,7 +2244,7 @@ Rules:
 
         for _ in range(max_steps):
             response = await self.llm.generate(
-                messages=temp_messages,
+                messages=self._build_llm_request_messages(temp_messages),
                 tools=filtered_tools,
             )
 

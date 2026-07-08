@@ -126,7 +126,7 @@
 
 ### 2.3 `conversation_messages` 表
 
-Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 上下文构建，而非前端事件回放。
+Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 上下文构建，而非前端事件回放。实时运行上下文（如当前时间、时区、workspace）不写入此表。
 
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
@@ -160,7 +160,7 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 | `step_index` | Integer | NOT NULL | 第几次 LLM 调用（从 1 开始） |
 | `request_message_count` | Integer | nullable | 本次实际发送给 provider 的消息条数（若为 provider 快照则取 `messages` 长度） |
 | `manual_review_status` | String(20) | NOT NULL, default=`没问题` | 人工后台标注结果，默认表示未发现问题 |
-| `request_messages` | Text | NOT NULL | 实际发送给 provider 的请求快照（JSON，包含 provider/model/messages，必要时包含 system/tools/stream 等参数） |
+| `request_messages` | Text | NOT NULL | 实际发送给 provider 的请求快照（JSON，包含 provider/model/messages、request-only runtime context，必要时包含 system/tools/stream 等参数） |
 | `request_tools` | Text | NOT NULL | 本次可用工具名称列表（JSON，用于快速检索；真实工具请求体以 `request_messages` 为准） |
 | `response_content` | Text | nullable | LLM 返回文本 |
 | `response_thinking` | Text | nullable | LLM 思考内容（若模型支持） |
@@ -652,8 +652,9 @@ Agent 执行循环中有 **3 个取消检查点**:
 2. 从 `rounds` + `conversation_messages` + `agui_events` + `interrupt_resolutions` 重建历史消息，并应用 `_restore_history` 的摘要锚点和尾窗裁剪规则。
 3. 用重建结果替换本进程内旧 `agent.messages`，不得追加到旧热缓存后面。
 4. 再注入本轮用户输入或 resume 答案后进入 LLM 调用。
+5. LLM 调用前由请求组装层临时构造 provider-bound messages，并在副本的 system 消息前加入 request-only runtime context（当前时间、时区、workspace、平台执行语义等）；不得回写 `agent.messages` 或 `conversation_messages`。
 
-因此，即使重启后命中本地 AgentPool 热缓存，LLM request 也必须基于 DB 中最新 conversation history 构造。`llm_call_records.request_messages` 应能审计到刷新后的输入快照：上一轮已落库的用户纠错/确认信息不得因为 stale hot cache 缺失。
+因此，即使重启后命中本地 AgentPool 热缓存，LLM request 也必须基于 DB 中最新 conversation history 构造，并叠加本次请求生成的实时上下文。`llm_call_records.request_messages` 应能审计到刷新后的输入快照：上一轮已落库的用户纠错/确认信息不得因为 stale hot cache 缺失，当前时间也不得因为长生命周期 Agent 缓存而沿用旧值。
 
 AgentPool 缓存失效不得中断仍在运行的 AgentService：配置更新、sandbox 代际切换、renew 失败或 TTL cleanup 遇到 running Agent 时，只能 detach 或标记懒失效；idle 后的下一次 `get_or_create` 再重建。这样可以保证新 run 不复用旧 system prompt，同时不误杀旧 run 正在执行的后台 bash 命令。
 
@@ -976,10 +977,12 @@ Agent 调用 ask_user 工具
 
 每个 step 的 LLM 调用都会额外持久化到 `llm_call_records`：
 
-1. 调用前：记录 provider 转换后的最终请求快照（与实际发包口径一致）以及可用工具名称列表。
+1. 调用前：记录 provider 转换后的最终请求快照（与实际发包口径一致，包含 request-only runtime context）以及可用工具名称列表。
 2. 调用后成功：记录 `content` / `thinking` / `tool_calls` / `finish_reason` / `usage`。
 3. 调用后失败：记录 `response_error`。
 4. 调用时：额外记录同一步的上下文压缩观测数据（`compaction_*`），用于排查长对话中的压缩收益与恢复稳定性问题。
+
+`request_messages` 是审计用的实际发包记录，不是历史恢复源；其中的 request-only runtime context 只证明当次请求的执行环境，不得被 `_restore_history`、上下文压缩摘要或 conversation history 回放重新注入为长期消息。
 
 约束与边界：
 

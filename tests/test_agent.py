@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from src.agent.agent import Agent, Colors
 from src.agent.logger import AgentLogger
 from src.agent.tools.base import Tool, ToolResult
-from src.agent.schema import Message
+from src.agent.schema import Message, LLMResponse
 from tests.helpers import MockLLMClient, MockTool
 
 
@@ -50,11 +50,76 @@ class TestAgent:
         assert "mock_tool" in agent.tools
 
     def test_system_prompt_injection(self, agent):
-        """測試系統提示注入上下文"""
+        """測試 system prompt 保持穩定，不混入 request-only runtime context"""
         # 確認系統消息是第一條
         assert agent.messages[0].role == "system"
-        # 確認包含時間信息
-        assert "当前日期" in agent.messages[0].content or "Current" in agent.messages[0].content
+        assert agent.messages[0].content == agent.system_prompt
+        assert "当前日期" not in agent.messages[0].content
+        assert "当前时间" not in agent.messages[0].content
+
+    async def test_runtime_context_is_request_only_before_llm_call(self, mock_tool, tmp_path):
+        """runtime context 只进入本次 LLM request，不回写 agent.messages。"""
+
+        class CapturingLLM(MockLLMClient):
+            def __init__(self):
+                super().__init__()
+                self.seen_messages = []
+
+            async def generate_stream(self, messages, tools=None, on_content=None, on_thinking=None, on_tool_call=None):
+                self.seen_messages.append([msg.model_copy(deep=True) for msg in messages])
+                if on_content:
+                    await on_content("ok")
+                return LLMResponse(content="ok", finish_reason="stop")
+
+        llm = CapturingLLM()
+        agent = Agent(
+            llm_client=llm,
+            system_prompt="You are a helpful assistant.",
+            tools=[mock_tool],
+            workspace_dir=str(tmp_path / "workspace"),
+            max_steps=3,
+        )
+        original_system = agent.messages[0].content
+        agent._build_runtime_context_block = lambda: "FRESH REQUEST RUNTIME\n"
+        agent.add_user_message("hello")
+        original_len = len(agent.messages)
+
+        [event async for event in agent.run_agui("thread-1", "run-1")]
+
+        assert llm.seen_messages
+        assert llm.seen_messages[0][0].content == "FRESH REQUEST RUNTIME\n" + original_system
+        assert agent.messages[0].content == original_system
+        assert len(agent.messages) == original_len + 1  # assistant reply only
+
+    def test_build_llm_request_messages_does_not_mutate_history(self, agent):
+        """request-only runtime context 不应污染长期消息状态。"""
+        agent._build_runtime_context_block = lambda: "REQUEST ONLY\n"
+        original_dump = [msg.model_dump(mode="json") for msg in agent.messages]
+
+        request_messages = agent._build_llm_request_messages()
+
+        assert request_messages[0].content == "REQUEST ONLY\n" + agent.system_prompt
+        assert [msg.model_dump(mode="json") for msg in agent.messages] == original_dump
+
+    def test_prompt_timezone_uses_project_timezone_offset(self, monkeypatch):
+        """Agent runtime context 应与项目 TIMEZONE_OFFSET 语义一致。"""
+        monkeypatch.setenv("TIMEZONE_OFFSET", "8")
+        monkeypatch.setenv("TZ", "UTC")
+
+        prompt_tz, timezone_str = Agent._prompt_timezone()
+
+        assert timezone_str == "UTC+8"
+        assert prompt_tz.utcoffset(None).total_seconds() == 8 * 3600
+
+    def test_prompt_timezone_invalid_offset_uses_default(self, monkeypatch):
+        """非法 TIMEZONE_OFFSET 与全局时间工具一样回落到默认 UTC+8。"""
+        monkeypatch.setenv("TIMEZONE_OFFSET", "not-a-number")
+        monkeypatch.setenv("TIMEZONE", "UTC")
+
+        prompt_tz, timezone_str = Agent._prompt_timezone()
+
+        assert timezone_str == "UTC+8"
+        assert prompt_tz.utcoffset(None).total_seconds() == 8 * 3600
 
     def test_add_user_message(self, agent):
         """測試添加用戶消息"""

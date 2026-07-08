@@ -182,6 +182,7 @@
 - 从 SOUL / USER / MEMORY 用户 DB 文件与平台 AGENTS.md 模板拼接
 - Token 预算：`token_limit` 的 15%
 - 低优先级记忆使用二分查找截断
+- System Prompt 只包含稳定规则与记忆；当前时间、时区、workspace 等 runtime context 由 LLM 请求组装层临时注入，不写入 SOUL / USER / MEMORY / AGENTS，也不回写用户 DB。
 
 ---
 

@@ -161,7 +161,7 @@ All require Bearer auth.
 ### 调度机制
 
 - 仅借用 `apscheduler.triggers.cron.CronTrigger` 做单分钟语义匹配，**未使用任何 scheduler 主进程或 jobstore**（无 `AsyncIOScheduler` / 文件锁主节点）；持久化与去重全部走 DB。
-- Worker 每分钟唤醒一次（对齐到本地分钟边界 + 0-2s 随机 jitter）
+- Worker 每分钟唤醒一次（对齐到本地分钟边界 + 0-2s 随机 jitter）。若同进程事件循环被阻塞导致醒来时发现漏过分钟，补扫最近 `cron_dispatch_catch_up_max_minutes` 分钟（默认 60），并以原始分钟写入 `cron_fires.scheduled_at`；进程启动前的历史时间不回补
 - 查询所有 enabled CronJob，通过一次性 `CronTrigger` 匹配当前分钟（本地时区）
 - 匹配成功后使用 PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` 写入 cron_fires 表
   - 插入成功 = 本 worker 赢得执行权

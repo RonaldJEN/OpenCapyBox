@@ -94,6 +94,7 @@
 
 - idle Agent 立即从 AgentPool 移除；若其 tracker 中仍有后台 bash 命令，按 AgentPool eviction 规则做清理。
 - running Agent 不得被 close / interrupt。配置更新只标记该 session 懒失效；当前 run 自然结束后，下一次 `get_or_create` 必须重建 Agent，避免继续使用旧 system prompt。
+- 当前时间、时区、workspace 等 runtime context 不属于用户可配置 Agent 文件；它们在每次 LLM provider request 组装时临时注入，因此不依赖 AgentPool 失效来刷新。
 
 ### 子 Agent Profile（sub_agent）
 
@@ -130,6 +131,7 @@
 
 - 工具层：`SubAgentTool.description` 写明"何时用 / 何时不用"——子任务产生大量一次性输出（联网抓取、长文档检索、批量产物）时委派以隔离上下文；需要与用户频繁来回或与当前上下文紧密迭代时不委派。
 - 系统提示层：`AGENTS.md` 模板的"工具使用规则"含 `sub_agent` 小节与判断框架行，作为主 Agent 的委派策略默认注入。该文件由平台模板统一管理，不作为用户配置面板入口暴露。
+- 子 Agent 与主 Agent 一样使用 request-only runtime context：profile system prompt 保持稳定，实时上下文只进入本次 provider request。
 
 ## 5. 失败模式与错误处理
 

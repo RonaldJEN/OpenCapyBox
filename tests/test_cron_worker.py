@@ -95,6 +95,89 @@ class TestCronMatching:
         assert cron_worker._cron_matches_minute("1 4 * * *", dt) is False
 
 
+class TestDispatchCatchUp:
+    def test_due_minutes_after_includes_all_missed_minutes(self):
+        last = datetime(2026, 7, 8, 8, 59, 32)
+        current = datetime(2026, 7, 8, 9, 2, 7)
+
+        due, dropped = cron_worker._due_minutes_after(last, current, max_catch_up_minutes=60)
+
+        assert dropped == 0
+        assert due == [
+            datetime(2026, 7, 8, 9, 0),
+            datetime(2026, 7, 8, 9, 1),
+            datetime(2026, 7, 8, 9, 2),
+        ]
+
+    def test_due_minutes_after_caps_large_backlog(self):
+        last = datetime(2026, 7, 8, 8, 0)
+        current = datetime(2026, 7, 8, 10, 5)
+
+        due, dropped = cron_worker._due_minutes_after(last, current, max_catch_up_minutes=3)
+
+        assert dropped == 122
+        assert due == [
+            datetime(2026, 7, 8, 10, 3),
+            datetime(2026, 7, 8, 10, 4),
+            datetime(2026, 7, 8, 10, 5),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_due_minutes_replays_missed_ticks(self, monkeypatch):
+        dispatched = []
+
+        async def fake_dispatch(worker_id, minute):
+            dispatched.append((worker_id, minute))
+
+        monkeypatch.setattr(cron_worker, "_dispatch_and_run", fake_dispatch)
+
+        last, cleanup_date = await cron_worker._dispatch_due_minutes(
+            "w1",
+            datetime(2026, 7, 8, 8, 59),
+            datetime(2026, 7, 8, 9, 2),
+            None,
+            60,
+        )
+
+        assert [minute for _, minute in dispatched] == [
+            datetime(2026, 7, 8, 9, 0),
+            datetime(2026, 7, 8, 9, 1),
+            datetime(2026, 7, 8, 9, 2),
+        ]
+        assert last == datetime(2026, 7, 8, 9, 2)
+        assert cleanup_date is None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_due_minutes_runs_midnight_cleanup_once(self, monkeypatch):
+        dispatched = []
+        cleanup_calls = []
+
+        async def fake_dispatch(worker_id, minute):
+            dispatched.append(minute)
+
+        def fake_cleanup():
+            cleanup_calls.append("cleanup")
+
+        monkeypatch.setattr(cron_worker, "_dispatch_and_run", fake_dispatch)
+        monkeypatch.setattr(cron_worker, "_cleanup_old_fires", fake_cleanup)
+
+        last, cleanup_date = await cron_worker._dispatch_due_minutes(
+            "w1",
+            datetime(2026, 7, 7, 23, 59),
+            datetime(2026, 7, 8, 0, 1),
+            None,
+            60,
+        )
+
+        assert dispatched == [
+            datetime(2026, 7, 8, 0, 0),
+            datetime(2026, 7, 8, 0, 1),
+        ]
+        assert cleanup_calls == ["cleanup"]
+        assert last == datetime(2026, 7, 8, 0, 1)
+        assert cleanup_date == datetime(2026, 7, 8).date()
+
+
 class TestInsertFire:
     def test_try_insert_fire_succeeds_when_unique(self, cron_db):
         job = _insert_job(

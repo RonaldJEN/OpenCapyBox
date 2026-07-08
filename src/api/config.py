@@ -72,6 +72,7 @@ class Settings(BaseSettings):
 
     # Cron 配置（去中心化 worker）
     cron_fire_max_age_days: int = 7  # cron_fires 清理保留天数（后续清理任务使用）
+    cron_dispatch_catch_up_max_minutes: int = 60  # worker 醒来后最多补扫的漏调度分钟数
 
     # Agent 資源路徑配置（可通過 .env 覆蓋，預設相對於 src/agent/）
     skills_dir: str = ""          # 留空則自動定位到 src/agent/skills/
@@ -116,6 +117,13 @@ class Settings(BaseSettings):
     def validate_database_max_overflow(cls, value: int) -> int:
         if value < 0:
             raise ValueError("database_max_overflow must be >= 0")
+        return value
+
+    @field_validator("cron_dispatch_catch_up_max_minutes")
+    @classmethod
+    def validate_cron_dispatch_catch_up_max_minutes(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("cron_dispatch_catch_up_max_minutes must be > 0")
         return value
 
     def get_auth_users(self) -> dict[str, str]:

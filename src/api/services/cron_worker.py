@@ -13,7 +13,7 @@ import logging
 import random
 import uuid
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.exc import OperationalError
@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 # 防止 create_task 返回的 Task 被 GC 回收导致后台任务中途丢失
 _background_tasks: set[asyncio.Task] = set()
+
+# Worker 与 API 共用事件循环；当同进程出现短暂阻塞时，醒来后补扫最近的
+# 分钟，避免只看“当前分钟”导致整点任务静默漏发。
+DEFAULT_DISPATCH_CATCH_UP_MINUTES = 60
 
 
 def _spawn(coro) -> asyncio.Task:
@@ -79,25 +83,106 @@ async def _cron_worker_loop(worker_id: str) -> None:
     """
     await asyncio.sleep(random.uniform(0, 2.0))
     tz = get_timezone()
-    last_cleanup_date: datetime | None = None
+    catch_up_limit = max(
+        1,
+        int(
+            getattr(
+                get_settings(),
+                "cron_dispatch_catch_up_max_minutes",
+                DEFAULT_DISPATCH_CATCH_UP_MINUTES,
+            )
+        ),
+    )
+    last_dispatched_minute = _floor_to_minute(datetime.now(tz).replace(tzinfo=None))
+    last_cleanup_date: date | None = None
     while True:
         try:
             now = datetime.now(tz).replace(tzinfo=None)
             next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
             await asyncio.sleep((next_minute - now).total_seconds())
-            minute = datetime.now(tz).replace(second=0, microsecond=0, tzinfo=None)
-            await _dispatch_and_run(worker_id, minute)
-
-            # 每天凌晨第一次触发时清理过期 cron_fires。
-            # 即使多 worker 同时清理也无害：DELETE 幂等，最终状态一致。
-            if last_cleanup_date != minute.date() and minute.hour == 0:
-                _cleanup_old_fires()
-                last_cleanup_date = minute.date()
+            current_minute = _floor_to_minute(datetime.now(tz).replace(tzinfo=None))
+            last_dispatched_minute, last_cleanup_date = await _dispatch_due_minutes(
+                worker_id,
+                last_dispatched_minute,
+                current_minute,
+                last_cleanup_date,
+                catch_up_limit,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("cron_worker loop error worker=%s", worker_id)
             await asyncio.sleep(5)
+
+
+def _floor_to_minute(value: datetime) -> datetime:
+    return value.replace(second=0, microsecond=0, tzinfo=None)
+
+
+def _due_minutes_after(
+    last_dispatched_minute: datetime,
+    current_minute: datetime,
+    max_catch_up_minutes: int = DEFAULT_DISPATCH_CATCH_UP_MINUTES,
+) -> tuple[list[datetime], int]:
+    """Return missed minute ticks after ``last_dispatched_minute``.
+
+    The worker intentionally does not backfill before process startup; this helper
+    only fills gaps observed after the loop has already started. Very large gaps
+    are capped so a suspended process cannot stampede the system on resume.
+    """
+    last_minute = _floor_to_minute(last_dispatched_minute)
+    current = _floor_to_minute(current_minute)
+    if current <= last_minute:
+        return [], 0
+
+    total_minutes = int((current - last_minute).total_seconds() // 60)
+    catch_up_limit = max(1, int(max_catch_up_minutes))
+    dropped = max(0, total_minutes - catch_up_limit)
+    first_due = last_minute + timedelta(minutes=dropped + 1)
+    due_count = total_minutes - dropped
+    return [first_due + timedelta(minutes=i) for i in range(due_count)], dropped
+
+
+async def _dispatch_due_minutes(
+    worker_id: str,
+    last_dispatched_minute: datetime,
+    current_minute: datetime,
+    last_cleanup_date: date | None,
+    catch_up_limit: int,
+) -> tuple[datetime, date | None]:
+    due_minutes, dropped = _due_minutes_after(
+        last_dispatched_minute,
+        current_minute,
+        catch_up_limit,
+    )
+    if dropped:
+        logger.warning(
+            "cron worker=%s skipped %d old missed minute(s); catch_up_limit=%d current=%s",
+            worker_id,
+            dropped,
+            catch_up_limit,
+            current_minute,
+        )
+    elif len(due_minutes) > 1:
+        logger.warning(
+            "cron worker=%s catching up %d missed minute(s): %s -> %s",
+            worker_id,
+            len(due_minutes) - 1,
+            due_minutes[0],
+            due_minutes[-1],
+        )
+
+    for minute in due_minutes:
+        await _dispatch_and_run(worker_id, minute)
+        last_dispatched_minute = minute
+
+        # 每天凌晨第一次触发时清理过期 cron_fires。
+        # 即使多 worker 同时清理也无害：DELETE 幂等，最终状态一致。
+        if last_cleanup_date != minute.date() and minute.hour == 0:
+            _cleanup_old_fires()
+            last_cleanup_date = minute.date()
+
+    return last_dispatched_minute, last_cleanup_date
 
 
 def _cleanup_old_fires() -> None:
