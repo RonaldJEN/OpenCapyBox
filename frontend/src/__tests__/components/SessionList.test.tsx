@@ -110,6 +110,28 @@ describe('SessionList 組件', () => {
     expect(mockOnSelect).toHaveBeenCalledWith('session-1', { roundId: 'round-hit-1' });
   });
 
+  it('当前会话来自刷新恢复时应同步会话模型', async () => {
+    const mockOnModelChange = vi.fn();
+    vi.mocked(apiService.getSessions).mockResolvedValue({
+      sessions: [{
+        ...mockSessions[0],
+        model_id: 'qwen-plus',
+      }],
+    });
+
+    render(
+      <SessionList
+        currentSessionId="session-1"
+        onSessionSelect={vi.fn()}
+        onModelChange={mockOnModelChange}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(mockOnModelChange).toHaveBeenCalledWith('qwen-plus');
+    });
+  });
+
   it('點擊登出應該調用 logout 並導航', async () => {
     render(<SessionList onSessionSelect={vi.fn()} />);
 

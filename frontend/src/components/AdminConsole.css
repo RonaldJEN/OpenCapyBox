@@ -381,6 +381,7 @@
 }
 
 .admin-step-analysis-card {
+  min-width: 0;
   border: 1px solid #ece6d6;
   border-radius: 8px;
   padding: 8px;
@@ -406,13 +407,18 @@
 }
 
 .admin-step-analysis-row span {
+  flex: 0 0 auto;
   white-space: nowrap;
 }
 
 .admin-step-analysis-row strong {
+  min-width: 0;
+  flex: 1 1 auto;
   text-align: right;
   color: #2f2b24;
   font-weight: 600;
+  overflow-wrap: anywhere;
+  white-space: normal;
   word-break: break-word;
 }
 

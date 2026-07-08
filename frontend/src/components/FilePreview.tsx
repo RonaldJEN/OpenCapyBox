@@ -32,6 +32,14 @@ interface SpreadsheetSheet {
   rows: string[][];
 }
 
+const markdownComponents = {
+  table: ({ children, ...props }: any) => (
+    <div className="markdown-table-scroll">
+      <table {...props}>{children}</table>
+    </div>
+  ),
+};
+
 const PREVIEW_CACHE_LIMIT = 30;
 const previewCache = new Map<string, PreviewCacheEntry>();
 
@@ -395,16 +403,16 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
   const fileType = normalizeFileType(file.name, file.type);
 
   const cardClassName = inline
-    ? 'h-full flex flex-col bg-white'
-    : 'relative w-full max-w-4xl h-full bg-white rounded-[32px] shadow-2xl flex flex-col overflow-hidden animate-zoom-in';
+    ? 'h-full flex flex-col bg-white min-w-0'
+    : 'relative w-full max-w-[960px] h-full bg-white rounded-[32px] shadow-2xl flex flex-col overflow-hidden animate-zoom-in';
 
   const headerClassName = inline
     ? 'h-14 border-b border-black/[0.06] flex items-center justify-between px-4 shrink-0 bg-white'
     : 'h-16 border-b border-black/[0.06] flex items-center justify-between px-6 shrink-0 bg-white/80 backdrop-blur-xl';
 
   const contentClassName = inline
-    ? 'flex-1 overflow-y-auto p-5 bg-claude-bg'
-    : 'flex-1 overflow-y-auto p-8 bg-claude-bg';
+    ? 'flex-1 min-w-0 overflow-auto p-5 bg-claude-bg'
+    : 'flex-1 min-w-0 overflow-auto p-8 bg-claude-bg';
 
   const closeButtonClassName = inline
     ? 'p-2.5 hover:bg-claude-hover rounded-full transition-all text-claude-muted'
@@ -538,9 +546,9 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
           </div>
         ) : isMarkdownFile(fileType) ? (
           viewMode === 'rendered' ? (
-            <div className="max-w-2xl mx-auto bg-white p-12 rounded-2xl shadow-sm border border-black/[0.03]">
-              <div className="prose max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{textContent}</ReactMarkdown>
+            <div className="w-full max-w-[860px] mx-auto bg-white p-8 sm:p-12 rounded-2xl shadow-sm border border-black/[0.03]">
+              <div className="prose max-w-none min-w-0">
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{textContent}</ReactMarkdown>
               </div>
             </div>
           ) : (

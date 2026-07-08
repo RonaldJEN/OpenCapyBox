@@ -136,8 +136,8 @@ vi.mock('../../components/Round', () => ({
 }));
 
 vi.mock('../../components/ArtifactsPanel', () => ({
-  ArtifactsPanel: ({ isOpen, onClose }: any) => (
-    <div data-testid="artifacts-panel" data-open={String(isOpen)}>
+  ArtifactsPanel: ({ isOpen, onClose, variant }: any) => (
+    <div data-testid="artifacts-panel" data-open={String(isOpen)} data-variant={variant}>
       <button onClick={onClose}>Close Panel</button>
     </div>
   ),
@@ -492,6 +492,36 @@ describe('ChatV2 组件', () => {
     // 面板应该打开
     await waitFor(() => {
       expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'true');
+      expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-variant', 'workspace');
+      expect(screen.queryByPlaceholderText('输入指令...')).not.toBeInTheDocument();
+    });
+  });
+
+  it('打开 Files 后切到新对话应该恢复欢迎页输入框', async () => {
+    const { rerender } = render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    fireEvent.click(screen.getByTitle('会话资源'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'true');
+      expect(screen.queryByPlaceholderText('输入指令...')).not.toBeInTheDocument();
+    });
+
+    rerender(
+      <ChatV2
+        sessionId=""
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('artifacts-panel')).not.toBeInTheDocument();
+      expect(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...')).toBeInTheDocument();
     });
   });
 

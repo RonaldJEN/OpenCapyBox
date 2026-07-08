@@ -36,7 +36,7 @@ vi.mock('../../services/configApi', () => ({
 }));
 
 vi.mock('../../components/SessionList', () => ({
-  SessionList: ({ isCollapsed, onOpenConfig, onSessionSelect, executingSessionIds }: { isCollapsed?: boolean; onOpenConfig?: () => void; onSessionSelect?: (sessionId: string) => void; executingSessionIds?: Set<string> }) => (
+  SessionList: ({ isCollapsed, onOpenConfig, onSessionSelect, onModelChange, executingSessionIds }: { isCollapsed?: boolean; onOpenConfig?: () => void; onSessionSelect?: (sessionId: string) => void; onModelChange?: (modelId: string) => void; executingSessionIds?: Set<string> }) => (
     <div>
       <div data-testid="sidebar-state">{isCollapsed ? 'collapsed' : 'open'}</div>
       <div data-testid="executing-sessions">{Array.from(executingSessionIds ?? []).join(',')}</div>
@@ -45,15 +45,17 @@ vi.mock('../../components/SessionList', () => ({
         onSessionSelect?.('manual-session');
         mockControls.resolveRunningDuringManualSelect?.();
       }}>select-manual</button>
+      <button onClick={() => onModelChange?.('qwen-plus')}>select-qwen-model</button>
     </div>
   ),
 }));
 
 vi.mock('../../components/ChatV2', () => ({
-  ChatV2: ({ sessionId, activeSlotSessionIds }: { sessionId?: string; activeSlotSessionIds?: Set<string> }) => (
+  ChatV2: ({ sessionId, selectedModelId, activeSlotSessionIds }: { sessionId?: string; selectedModelId?: string; activeSlotSessionIds?: Set<string> }) => (
     <div
       data-testid="chat-v2"
       data-session-id={sessionId}
+      data-selected-model-id={selectedModelId}
       data-active-slots={Array.from(activeSlotSessionIds ?? []).join(',')}
     >chat</div>
   ),
@@ -96,6 +98,71 @@ describe('App 配置抽屉交互', () => {
     await waitFor(() => {
       expect(screen.getByTestId('sidebar-state')).toHaveTextContent('open');
     });
+  });
+
+  it('模型列表较晚返回时不应覆盖已恢复的会话模型', async () => {
+    let resolveModels!: (value: {
+      models: Array<{
+        id: string;
+        name: string;
+        provider: string;
+        supports_thinking: boolean;
+        supports_image: boolean;
+        max_images: number;
+        supports_video: boolean;
+        max_videos: number;
+        max_tokens: number;
+        enabled: boolean;
+        tags: string[];
+      }>;
+      default_model: string;
+      subagent_default_model: string;
+    }) => void;
+    vi.mocked(apiService.getModels).mockReturnValueOnce(new Promise((resolve) => {
+      resolveModels = resolve;
+    }));
+
+    render(<App />);
+
+    fireEvent.click(screen.getByText('select-qwen-model'));
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-selected-model-id', 'qwen-plus');
+
+    await act(async () => {
+      resolveModels({
+        models: [
+          {
+            id: 'glm-default',
+            name: 'GLM Default',
+            provider: 'test',
+            supports_thinking: false,
+            supports_image: false,
+            max_images: 0,
+            supports_video: false,
+            max_videos: 0,
+            max_tokens: 8192,
+            enabled: true,
+            tags: [],
+          },
+          {
+            id: 'qwen-plus',
+            name: 'Qwen Plus',
+            provider: 'test',
+            supports_thinking: true,
+            supports_image: true,
+            max_images: 5,
+            supports_video: false,
+            max_videos: 0,
+            max_tokens: 8192,
+            enabled: true,
+            tags: [],
+          },
+        ],
+        default_model: 'glm-default',
+        subagent_default_model: 'glm-default',
+      });
+    });
+
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-selected-model-id', 'qwen-plus');
   });
 
   it('挂载后应立即同步 running-sessions 并选中第一个运行中会话', async () => {

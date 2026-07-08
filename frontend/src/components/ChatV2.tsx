@@ -81,7 +81,6 @@ export function ChatV2(props: ChatV2Props) {
 function ChatV2View(props: ChatV2Props) {
   const {
     sessionId,
-    onPanelToggle,
     selectedModelId,
     onModelChange,
     availableModels = [],
@@ -137,8 +136,11 @@ function ChatV2View(props: ChatV2Props) {
   sessionIdRef.current = sessionId;
 
   useEffect(() => {
-    onPanelToggle?.(isFilesOpen);
-  }, [isFilesOpen, onPanelToggle]);
+    if (!sessionId) {
+      setIsFilesOpen(false);
+      setFilePanelTarget(null);
+    }
+  }, [sessionId]);
 
   useEffect(() => {
     const visibleRunKey = projection.visibleAgentStateRunKey;
@@ -653,8 +655,10 @@ function ChatV2View(props: ChatV2Props) {
                 setFilePanelTarget(null);
                 setIsFilesOpen(!isFilesOpen);
               }}
-              className={`p-2 rounded-lg transition-all active:scale-95 flex items-center gap-2 ${
-                isFilesOpen ? 'bg-claude-text text-white' : 'text-claude-secondary hover:bg-claude-hover'
+              className={`h-9 px-3 rounded-xl border transition-all active:scale-95 flex items-center gap-2 ${
+                isFilesOpen
+                  ? 'border-[#2f6f54] bg-[#eef8f2] text-[#234d3c]'
+                  : 'border-transparent text-claude-secondary hover:bg-claude-hover'
               } ${isSessionHandoff ? 'animate-fade-in' : ''}`}
               title="会话资源"
             >
@@ -671,8 +675,33 @@ function ChatV2View(props: ChatV2Props) {
           )}
         </header>
 
-        <div ref={chatAreaRef} className="flex-1 overflow-y-auto relative bg-claude-bg">
-          {loading ? (
+        <div ref={chatAreaRef} className={`flex-1 relative bg-claude-bg ${isFilesOpen ? 'overflow-hidden' : 'overflow-y-auto'}`}>
+          {sessionId && !isFilesOpen && (
+            <ArtifactsPanel
+              sessionId={sessionId}
+              isOpen={false}
+              onClose={() => {
+                setIsFilesOpen(false);
+                setFilePanelTarget(null);
+              }}
+              targetFile={filePanelTarget?.file || null}
+              targetFileNonce={filePanelTarget?.nonce}
+              variant="workspace"
+            />
+          )}
+          {isFilesOpen && sessionId ? (
+            <ArtifactsPanel
+              sessionId={sessionId}
+              isOpen={isFilesOpen}
+              onClose={() => {
+                setIsFilesOpen(false);
+                setFilePanelTarget(null);
+              }}
+              targetFile={filePanelTarget?.file || null}
+              targetFileNonce={filePanelTarget?.nonce}
+              variant="workspace"
+            />
+          ) : loading ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
                 <Loader2 className="w-6 h-6 text-claude-muted animate-spin mx-auto mb-3" />
@@ -747,7 +776,7 @@ function ChatV2View(props: ChatV2Props) {
             </div>
           )}
 
-          {isSessionHandoff && sessionHandoffMessage && (
+          {!isFilesOpen && isSessionHandoff && sessionHandoffMessage && (
             <div className="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 px-4">
               <div className="session-handoff-overlay flex items-center gap-2 rounded-full border border-claude-border bg-white/95 px-3.5 py-2 text-sm text-claude-secondary shadow-sm backdrop-blur-sm">
                 <Loader2 className="h-4 w-4 animate-spin text-claude-accent" />
@@ -756,7 +785,7 @@ function ChatV2View(props: ChatV2Props) {
             </div>
           )}
 
-          {showScrollButton && (
+          {!isFilesOpen && showScrollButton && (
             <button
               type="button"
               onClick={() => scrollToBottom(true)}
@@ -817,38 +846,27 @@ function ChatV2View(props: ChatV2Props) {
           </div>
         )}
 
-        <ChatInput
-          value={input}
-          onChange={setInput}
-          onSend={handleSend}
-          onStop={(sending || resuming) ? handleStop : undefined}
-          disabled={inputDisabled}
-          sendDisabled={stopping}
-          sendingLabel={sendingLabel}
-          placeholder={sessionId ? '输入指令...' : '输入你的问题，按 Enter 开始对话...'}
-          attachedFiles={attachedFiles}
-          onRemoveAttachment={handleRemoveAttachment}
-          onFileUpload={handleFileUpload}
-          onInputDropHandled={() => setIsDragging(false)}
-          onPreviewAttachment={sessionId ? handlePreviewAttachment : undefined}
-          uploading={uploading}
-          onInputChangeRaw={handleInputChange}
-          onFileSelected={handleSelectFile}
-        />
+        {!isFilesOpen && (
+          <ChatInput
+            value={input}
+            onChange={setInput}
+            onSend={handleSend}
+            onStop={(sending || resuming) ? handleStop : undefined}
+            disabled={inputDisabled}
+            sendDisabled={stopping}
+            sendingLabel={sendingLabel}
+            placeholder={sessionId ? '输入指令...' : '输入你的问题，按 Enter 开始对话...'}
+            attachedFiles={attachedFiles}
+            onRemoveAttachment={handleRemoveAttachment}
+            onFileUpload={handleFileUpload}
+            onInputDropHandled={() => setIsDragging(false)}
+            onPreviewAttachment={sessionId ? handlePreviewAttachment : undefined}
+            uploading={uploading}
+            onInputChangeRaw={handleInputChange}
+            onFileSelected={handleSelectFile}
+          />
+        )}
       </div>
-
-      {sessionId && (
-        <ArtifactsPanel
-          sessionId={sessionId}
-          isOpen={isFilesOpen}
-          onClose={() => {
-            setIsFilesOpen(false);
-            setFilePanelTarget(null);
-          }}
-          targetFile={filePanelTarget?.file || null}
-          targetFileNonce={filePanelTarget?.nonce}
-        />
-      )}
 
       {previewFile && previewSessionId && (
         <FilePreview

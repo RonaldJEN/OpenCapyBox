@@ -77,9 +77,7 @@ function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentP
   useEffect(() => {
     apiService.getModels().then((res) => {
       setAvailableModels(res.models);
-      if (!selectedModelId) {
-        setSelectedModelId(res.default_model);
-      }
+      setSelectedModelId((current) => current || res.default_model);
     }).catch((err) => {
       console.error('Failed to load models:', err);
     });
@@ -197,10 +195,9 @@ function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentP
           />
           <div
             className={`fixed top-0 right-0 bottom-0 bg-claude-bg border-l border-claude-border z-30 transition-transform duration-300 ease-out shadow-xl ${
-              activePanel === 'cron' ? 'w-[760px]' : 'w-[380px]'
-            } ${
               activePanel ? 'translate-x-0' : 'translate-x-full'
             }`}
+            style={{ width: activePanel === 'cron' ? 'min(1040px, calc(100vw - 48px))' : '380px' }}
           >
             {activePanel === 'config' && <AgentConfig onClose={closeConfigPanel} />}
             {activePanel === 'skills' && <SkillManager onClose={closeConfigPanel} />}

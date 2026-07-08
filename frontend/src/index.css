@@ -148,6 +148,7 @@ body {
   border-radius: 12px;
   overflow: hidden;
   margin: 1rem 0;
+  min-width: 100%;
 }
 .prose thead {
   background: #F3F1EB;
@@ -160,12 +161,51 @@ body {
   letter-spacing: 0.05em;
   padding: 0.75rem;
   border-bottom: 1px solid #E8E5DE;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .prose td {
   padding: 0.75rem;
   border-bottom: 1px solid rgba(232, 229, 222, 0.5);
   font-size: 14px;
   color: #1A1915;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.markdown-table-scroll {
+  max-width: 100%;
+  margin: 1rem 0;
+  overflow-x: auto;
+  border: 1px solid #E8E5DE;
+  border-radius: 12px;
+  background: #FFFFFF;
+}
+
+.markdown-table-scroll table {
+  width: max-content;
+  min-width: 100%;
+  max-width: none;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+.markdown-table-scroll th,
+.markdown-table-scroll td {
+  min-width: 7.5rem;
+  max-width: 18rem;
+  white-space: normal;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.markdown-table-scroll th:last-child,
+.markdown-table-scroll td:last-child {
+  max-width: 22rem;
 }
 
 /* 列表标记 */

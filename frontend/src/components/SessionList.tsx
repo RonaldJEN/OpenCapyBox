@@ -43,6 +43,14 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     loadSessions(debouncedSearchQuery);
   }, [refreshTrigger, currentSessionId, debouncedSearchQuery]);
 
+  useEffect(() => {
+    if (!currentSessionId || !onModelChange) return;
+    const currentSession = sessions.find((session) => session.id === currentSessionId);
+    if (currentSession?.model_id) {
+      onModelChange(currentSession.model_id);
+    }
+  }, [currentSessionId, onModelChange, sessions]);
+
   // 30s 自动刷新会话列表
   useEffect(() => {
     const timer = setInterval(() => {
