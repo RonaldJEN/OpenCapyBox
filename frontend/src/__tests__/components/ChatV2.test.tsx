@@ -796,6 +796,52 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('欢迎页连续提交两次时只创建并发送一次', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'new-session',
+      total: 0,
+    });
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+
+    let resolveCreateSession!: (sessionId: string) => void;
+    const onCreateSession = vi.fn(() => new Promise<string>((resolve) => {
+      resolveCreateSession = resolve;
+    }));
+
+    render(
+      <ChatV2
+        sessionId=""
+        {...defaultProps}
+        onCreateSession={onCreateSession}
+      />
+    );
+
+    const textarea = screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...');
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: '连续发送测试' } });
+    });
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+
+    expect(onCreateSession).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveCreateSession('new-session');
+    });
+
+    await waitFor(() => {
+      expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1);
+      expect(apiService.sendMessageStreamV2).toHaveBeenCalledWith(
+        'new-session',
+        [{ type: 'text', text: '连续发送测试' }],
+        expect.any(Object),
+      );
+    });
+  });
+
   it('resume 失败后应恢复问题卡片以便重试', async () => {
     const interruptedRounds: RoundData[] = [
       {

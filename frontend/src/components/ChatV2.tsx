@@ -129,6 +129,7 @@ function ChatV2View(props: ChatV2Props) {
   const roundElementRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const handledScrollTargetNonceRef = useRef<number | null>(null);
   const suppressAutoScrollRef = useRef<boolean>(false);
+  const pendingSendSessionKeysRef = useRef<Set<string>>(new Set());
   const selectedModel = availableModels.find((m) => m.id === selectedModelId);
   const displayError = localError || runtimeError;
   const hasActiveSlot = activeSlotSessionIds?.has(sessionId) ?? false;
@@ -552,7 +553,14 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleSend = async () => {
-    if ((!input.trim() && attachedFiles.length === 0) || sending || creatingSession || stopping) return;
+    const initialSessionKey = sessionId || '__new_session__';
+    if (
+      (!input.trim() && attachedFiles.length === 0)
+      || sending
+      || creatingSession
+      || stopping
+      || pendingSendSessionKeysRef.current.has(initialSessionKey)
+    ) return;
     const draftInput = input;
     const draftAttachments = [...attachedFiles];
     let contentBlocks: ChatContentBlock[] = [];
@@ -562,44 +570,53 @@ function ChatV2View(props: ChatV2Props) {
       setLocalError(err?.message || '消息构建失败');
       return;
     }
-    const userMessage = buildDisplayMessage(draftInput, draftAttachments);
-    const isStartingNewSession = !sessionId;
-    if (isStartingNewSession) {
-      setBootstrapMessage(userMessage);
-    }
-    setInput('');
-    setAttachedFiles([]);
-    setDisableInitialMotion(false);
-    setLocalError('');
-
-    let targetSessionId = sessionId;
-    if (!targetSessionId) {
-      if (!onCreateSession) {
-        setBootstrapMessage('');
-        return;
+    pendingSendSessionKeysRef.current.add(initialSessionKey);
+    let targetSessionKey = initialSessionKey;
+    try {
+      const userMessage = buildDisplayMessage(draftInput, draftAttachments);
+      const isStartingNewSession = !sessionId;
+      if (isStartingNewSession) {
+        setBootstrapMessage(userMessage);
       }
-      setCreatingSession(true);
-      try {
-        targetSessionId = await onCreateSession(selectedModelId || undefined);
-      } catch (err) {
-        console.error('Failed to create session:', err);
-        setLocalError('创建会话失败，请重试');
-        setBootstrapMessage('');
-        setInput(draftInput);
-        setAttachedFiles(draftAttachments);
-        setCreatingSession(false);
-        return;
-      } finally {
-        setCreatingSession(false);
-      }
-    }
+      setInput('');
+      setAttachedFiles([]);
+      setDisableInitialMotion(false);
+      setLocalError('');
 
-    await runtime.sendMessage({
-      sessionId: targetSessionId,
-      displayMessage: userMessage,
-      content: contentBlocks,
-      attachments: draftAttachments,
-    });
+      let targetSessionId = sessionId;
+      if (!targetSessionId) {
+        if (!onCreateSession) {
+          setBootstrapMessage('');
+          return;
+        }
+        setCreatingSession(true);
+        try {
+          targetSessionId = await onCreateSession(selectedModelId || undefined);
+        } catch (err) {
+          console.error('Failed to create session:', err);
+          setLocalError('创建会话失败，请重试');
+          setBootstrapMessage('');
+          setInput(draftInput);
+          setAttachedFiles(draftAttachments);
+          setCreatingSession(false);
+          return;
+        } finally {
+          setCreatingSession(false);
+        }
+      }
+
+      targetSessionKey = targetSessionId;
+      pendingSendSessionKeysRef.current.add(targetSessionKey);
+      await runtime.sendMessage({
+        sessionId: targetSessionId,
+        displayMessage: userMessage,
+        content: contentBlocks,
+        attachments: draftAttachments,
+      });
+    } finally {
+      pendingSendSessionKeysRef.current.delete(initialSessionKey);
+      pendingSendSessionKeysRef.current.delete(targetSessionKey);
+    }
   };
 
   const handleStop = async () => {
