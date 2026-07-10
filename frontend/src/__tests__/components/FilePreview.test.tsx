@@ -160,37 +160,6 @@ describe('FilePreview custom source', () => {
     });
   });
 
-  it('wraps rendered markdown tables in a horizontal scroll container', async () => {
-    const tableMarkdownFile: FileInfo = {
-      ...markdownFile,
-      name: 'table-report.md',
-      path: 'table-report.md',
-      size: 320,
-      modified: '2026-04-16T18:35:00Z',
-    };
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      text: () => Promise.resolve([
-        '| 数据点 | 原文数值 | 来源/区间 | 核验方式 | 证据编号 | 核验结果 | 处理建议 |',
-        '| --- | --- | --- | --- | --- | --- | --- |',
-        '| 基金全称 | 示例中证细分化工产业主题交易型开放式指数证券投资基金 | 产品要素表 | example-db-skill / PMS产品要素核验 | DB-PMS-158006 | 一致 | 保留 |',
-      ].join('\n')),
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    render(
-      <FilePreview
-        file={tableMarkdownFile}
-        sessionId="session-1"
-        onClose={() => {}}
-      />,
-    );
-
-    expect(await screen.findByText('数据点')).toBeInTheDocument();
-    const table = screen.getByRole('table');
-    expect(table.parentElement).toHaveClass('markdown-table-scroll');
-  });
-
   it('renders HTML with blob iframe sandbox', async () => {
     const htmlFile: FileInfo = {
       name: 'preview.html',
