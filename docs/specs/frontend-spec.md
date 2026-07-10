@@ -3,7 +3,7 @@
 > 本文是 OpenCapyBox 前端的**单一事实源**。细分模块见：
 > - [frontend-chat-spec.md](./frontend-chat-spec.md) — 聊天/SSE/推理面板
 > - [frontend-session-spec.md](./frontend-session-spec.md) — 会话列表与切换
-> - [frontend-panel-spec.md](./frontend-panel-spec.md) — 抽屉类面板（Files/AgentConfig/Skills/Cron）
+> - [frontend-panel-spec.md](./frontend-panel-spec.md) — 抽屉/弹窗类面板（Files/SettingsCenter/Cron）
 
 ## 1. 技术栈与版本
 
@@ -24,8 +24,7 @@
 | `components/Round.tsx` | 单轮（user+assistant+reasoning）视觉渲染 | 消息状态管理 |
 | `components/ReasoningPanel.tsx` | `StepData[]` → Display Blocks 可视化 | 事件接收 |
 | `components/ArtifactsPanel.tsx` | 沙箱文件浏览（覆盖式抽屉） | 文件内容预览（由 `FilePreview` 负责）|
-| `components/AgentConfig.tsx` | SOUL/USER/MEMORY 记忆文件编辑 | Skills/Cron |
-| `components/SkillManager.tsx` | Skills 启停、分类筛选 | Skill 执行（后端负责）|
+| `components/SettingsCenter.tsx` | 设置中心居中弹窗：MEMORY/USER 记忆编辑 + SOUL/Skills 能力设定 | Skill 执行（后端负责）/Cron |
 | `components/CronSchedule.tsx` / `CronMessageCenter.tsx` | Cron 列表与执行历史 | Cron 调度（后端 worker）|
 | `components/AdminConsole.tsx` | 管理后台概览、Session 监控、用户管理、系统监控 | 业务执行、用户认证判定 |
 | `services/api.ts` | 所有 HTTP/SSE 调用封装 | 业务决策 |

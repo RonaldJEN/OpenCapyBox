@@ -36,11 +36,12 @@ vi.mock('../../services/configApi', () => ({
 }));
 
 vi.mock('../../components/SessionList', () => ({
-  SessionList: ({ isCollapsed, onOpenConfig, onSessionSelect, onModelChange, executingSessionIds }: { isCollapsed?: boolean; onOpenConfig?: () => void; onSessionSelect?: (sessionId: string) => void; onModelChange?: (modelId: string) => void; executingSessionIds?: Set<string> }) => (
+  SessionList: ({ isCollapsed, onOpenConfig, onOpenCron, onSessionSelect, onModelChange, executingSessionIds }: { isCollapsed?: boolean; onOpenConfig?: () => void; onOpenCron?: () => void; onSessionSelect?: (sessionId: string) => void; onModelChange?: (modelId: string) => void; executingSessionIds?: Set<string> }) => (
     <div>
       <div data-testid="sidebar-state">{isCollapsed ? 'collapsed' : 'open'}</div>
       <div data-testid="executing-sessions">{Array.from(executingSessionIds ?? []).join(',')}</div>
       <button onClick={onOpenConfig}>open-config</button>
+      <button onClick={onOpenCron}>open-cron</button>
       <button onClick={() => {
         onSessionSelect?.('manual-session');
         mockControls.resolveRunningDuringManualSelect?.();
@@ -61,16 +62,19 @@ vi.mock('../../components/ChatV2', () => ({
   ),
 }));
 
-vi.mock('../../components/AgentConfig', () => ({
-  default: ({ onClose }: { onClose?: () => void }) => (
-    <div data-testid="agent-config-panel">
+vi.mock('../../components/SettingsCenter', () => ({
+  default: ({
+    onClose,
+    onUnsavedChangesChange,
+  }: {
+    onClose?: () => void;
+    onUnsavedChangesChange?: (hasUnsavedChanges: boolean) => void;
+  }) => (
+    <div data-testid="settings-center-panel">
+      <button onClick={() => onUnsavedChangesChange?.(true)}>mark-dirty</button>
       <button onClick={onClose}>close-config</button>
     </div>
   ),
-}));
-
-vi.mock('../../components/SkillManager', () => ({
-  default: () => <div data-testid="skills-panel">skills</div>,
 }));
 
 vi.mock('../../components/CronSchedule', () => ({
@@ -90,14 +94,101 @@ describe('App 配置抽屉交互', () => {
 
     fireEvent.click(screen.getByText('open-config'));
 
-    expect(screen.getByTestId('sidebar-state')).toHaveTextContent('collapsed');
-    expect(screen.getByTestId('agent-config-panel')).toBeInTheDocument();
+    expect(screen.getByTestId('sidebar-state')).toHaveTextContent('open');
+    expect(screen.getByTestId('settings-center-panel')).toBeInTheDocument();
 
     fireEvent.click(screen.getByText('close-config'));
 
     await waitFor(() => {
       expect(screen.getByTestId('sidebar-state')).toHaveTextContent('open');
     });
+  });
+
+  it('设置中心打开时应使用 modal 语义并让背景不可聚焦', async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByText('open-config'));
+
+    const dialog = screen.getByRole('dialog', { name: '设置' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    await waitFor(() => {
+      expect(screen.getByTestId('app-main-content')).toHaveAttribute('inert');
+      expect(screen.getByTestId('app-main-content')).toHaveAttribute('aria-hidden', 'true');
+      expect(document.activeElement).toBe(dialog);
+    });
+    fireEvent.keyDown(dialog, { key: 'Tab' });
+    expect(dialog).toContainElement(document.activeElement as HTMLElement);
+
+    fireEvent.click(screen.getByText('close-config'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('app-main-content')).not.toHaveAttribute('inert');
+      expect(screen.getByTestId('app-main-content')).not.toHaveAttribute('aria-hidden');
+    });
+  });
+
+  it('设置中心有未保存修改时关闭应先确认并支持取消', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+
+    render(<App />);
+
+    fireEvent.click(screen.getByText('open-config'));
+    fireEvent.click(screen.getByText('mark-dirty'));
+
+    const modal = screen.getByTestId('settings-center-panel').parentElement?.parentElement;
+    expect(modal).toHaveClass('opacity-100');
+
+    fireEvent.click(screen.getByText('close-config'));
+
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(screen.getByRole('alertdialog', { name: '放弃未保存的修改？' })).toBeInTheDocument();
+    expect(modal).toHaveClass('opacity-100');
+
+    fireEvent.click(screen.getByRole('button', { name: '继续编辑' }));
+    await waitFor(() => {
+      expect(screen.queryByRole('alertdialog', { name: '放弃未保存的修改？' })).not.toBeInTheDocument();
+    });
+    expect(modal).toHaveClass('opacity-100');
+
+    fireEvent.click(screen.getByText('close-config'));
+    fireEvent.click(screen.getByRole('button', { name: '放弃并关闭' }));
+
+    await waitFor(() => {
+      expect(modal).toHaveClass('opacity-0');
+    });
+
+    confirmSpy.mockRestore();
+  });
+
+  it('设置中心有未保存修改时切换到 Cron 也应先确认', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+
+    render(<App />);
+
+    fireEvent.click(screen.getByText('open-config'));
+    fireEvent.click(screen.getByText('mark-dirty'));
+    fireEvent.click(screen.getByText('open-cron'));
+
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(screen.getByRole('alertdialog', { name: '放弃未保存的修改？' })).toBeInTheDocument();
+    expect(screen.getByTestId('settings-center-panel')).toBeInTheDocument();
+    expect(screen.queryByTestId('cron-panel')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '继续编辑' }));
+    await waitFor(() => {
+      expect(screen.queryByRole('alertdialog', { name: '放弃未保存的修改？' })).not.toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('cron-panel')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('open-cron'));
+    fireEvent.click(screen.getByRole('button', { name: '放弃并关闭' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('cron-panel')).toBeInTheDocument();
+      expect(screen.getByTestId('sidebar-state')).toHaveTextContent('collapsed');
+    });
+
+    confirmSpy.mockRestore();
   });
 
   it('模型列表较晚返回时不应覆盖已恢复的会话模型', async () => {

@@ -136,9 +136,10 @@ describe('SessionList 組件', () => {
     render(<SessionList onSessionSelect={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByText('退出登录')).toBeInTheDocument();
+      expect(screen.getByLabelText('账户菜单')).toBeInTheDocument();
     });
 
+    fireEvent.click(screen.getByLabelText('账户菜单'));
     fireEvent.click(screen.getByText('退出登录'));
 
     expect(apiService.logout).toHaveBeenCalled();

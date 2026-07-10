@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
 import type { Session } from '../types';
-import { MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Zap, Clock, Search, X } from 'lucide-react';
+import { ChevronDown, MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Clock, Search, X } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
 
@@ -16,19 +16,21 @@ interface SessionListProps {
   onNewChat?: () => void;
   cronUnreadCount?: number;
   onOpenConfig?: () => void;
-  onOpenSkills?: () => void;
   onOpenCron?: () => void;
 }
 
-export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionIds, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenSkills, onOpenCron }: SessionListProps) {
+export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionIds, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenCron }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const [searchLoading, setSearchLoading] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const searchRequestSeqRef = useRef(0);
   const debouncedSearchQueryRef = useRef('');
   const navigate = useNavigate();
+  const userId = apiService.getUserId() || 'user';
+  const userInitial = userId.trim().charAt(0).toUpperCase() || 'U';
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -57,7 +59,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
       loadSessions(debouncedSearchQueryRef.current);
     }, 30000);
     return () => clearInterval(timer);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   const loadSessions = async (query = debouncedSearchQueryRef.current) => {
     const requestSeq = ++searchRequestSeqRef.current;
@@ -99,6 +101,11 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
   const handleLogout = () => {
     apiService.logout();
     navigate('/login');
+  };
+
+  const handleOpenSettings = () => {
+    setAccountMenuOpen(false);
+    onOpenConfig?.();
   };
 
   const isSearchActive = debouncedSearchQuery.trim().length > 0;
@@ -254,21 +261,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
       </div>
 
       {/* Footer */}
-      <div className="space-y-1 pt-4 border-t border-claude-border">
-        <button
-          onClick={onOpenConfig}
-          className="w-full flex items-center space-x-3 px-3 py-2 text-sm text-claude-secondary hover:bg-claude-hover rounded-lg transition-all group"
-        >
-          <Settings size={16} className="text-claude-muted group-hover:text-claude-secondary" />
-          <span>Agent 配置</span>
-        </button>
-        <button
-          onClick={onOpenSkills}
-          className="w-full flex items-center space-x-3 px-3 py-2 text-sm text-claude-secondary hover:bg-claude-hover rounded-lg transition-all group"
-        >
-          <Zap size={16} className="text-claude-muted group-hover:text-claude-secondary" />
-          <span>Skills 管理</span>
-        </button>
+      <div className="pt-3 border-t border-claude-border">
         <button
           onClick={onOpenCron}
           className="w-full flex items-center gap-3 px-3 py-2 text-sm text-claude-secondary hover:bg-claude-hover rounded-lg transition-all group"
@@ -281,13 +274,55 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
             </span>
           )}
         </button>
+      </div>
+
+      <div className="relative mt-2 border-t border-claude-border pt-2">
         <button
-          onClick={handleLogout}
-          className="w-full flex items-center space-x-3 px-3 py-2.5 text-sm text-claude-secondary hover:bg-claude-hover rounded-lg transition-all group"
+          type="button"
+          aria-label="账户菜单"
+          onClick={() => setAccountMenuOpen((open) => !open)}
+          className="w-full flex items-center gap-3 px-2 py-2 rounded-lg text-left text-claude-secondary hover:bg-claude-hover transition-all"
         >
-          <LogOut size={16} className="text-claude-muted group-hover:text-claude-secondary" />
-          <span>退出登录</span>
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-claude-accent text-xs font-bold text-white">
+            {userInitial}
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[13px] font-semibold text-claude-text">
+              {userId}
+            </span>
+          </span>
+          <ChevronDown size={14} className="shrink-0 text-claude-muted" />
         </button>
+
+        {accountMenuOpen && (
+          <>
+            <button
+              type="button"
+              aria-label="关闭账户菜单"
+              className="fixed inset-0 z-30 cursor-default bg-transparent"
+              onClick={() => setAccountMenuOpen(false)}
+            />
+            <div className="absolute bottom-14 left-0 right-0 z-40 rounded-xl border border-claude-border bg-white p-1.5 shadow-[0_12px_32px_rgba(30,26,20,0.14)]">
+              <button
+                type="button"
+                onClick={handleOpenSettings}
+                className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] text-claude-text transition hover:bg-claude-surface"
+              >
+                <Settings size={16} className="text-claude-muted" />
+                <span>设置</span>
+              </button>
+              <div className="mx-0.5 my-1 h-px bg-claude-border" />
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] text-claude-error transition hover:bg-red-50"
+              >
+                <LogOut size={16} />
+                <span>退出登录</span>
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </aside>
   );

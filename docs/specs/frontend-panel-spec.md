@@ -1,12 +1,11 @@
 # 前端 Panel Spec — 覆盖式抽屉面板
 
 > 父级：[frontend-spec.md](./frontend-spec.md)
-> 对应后端：[sandbox-spec.md](./sandbox-spec.md)（Files）、[config-spec.md](./config-spec.md)（AgentConfig/Skills）、[cron-spec.md](./cron-spec.md)
+> 对应后端：[sandbox-spec.md](./sandbox-spec.md)（Files）、[config-spec.md](./config-spec.md)（记忆文件/Skills）、[cron-spec.md](./cron-spec.md)
 
 覆盖组件：
 - `ArtifactsPanel.tsx` — 沙箱文件浏览
-- `AgentConfig.tsx` — SOUL/USER/MEMORY 记忆文件编辑
-- `SkillManager.tsx` — Skills 启停
+- `SettingsCenter.tsx` — 设置中心居中弹窗：记忆文件编辑（MEMORY/USER）+ 能力设定（SOUL/Skills）
 - `CronSchedule.tsx` / `CronMessageCenter.tsx` — Cron 看板与未读消息
 - `FilePreview.tsx` — 文件内容预览（由其他面板触发）
 
@@ -133,43 +132,42 @@ useEffect(() => {
 - 父目录文件列表加载完成后，如果列表中存在相同路径文件，必须用列表项刷新 `selectedFile` 的 `size` / `modified` / `type` 等元数据。
 - session 切换或手动从 Header 打开 Files 时，外部目标状态由 `ChatV2` 清空，避免旧 session 目标污染新 session。
 
-## 4. AgentConfig（记忆文件编辑）
+## 4. SettingsCenter（设置中心）
 
-### 4.1 功能范围
+### 4.1 形态与入口
 
-编辑三个沙箱内记忆文件：
-- `SOUL.md` — Agent 人格
-- `USER.md` — 用户画像
-- `MEMORY.md` — 长期记忆
+- **居中弹窗**（非右侧抽屉）：`fixed inset-0 flex items-center justify-center`，内层卡片固定宽高（`min(980px, 100vw-48px)` × `min(760px, 88vh)`），背景加 backdrop 遮罩。
+- **点击卡片外遮罩关闭**：外层容器 `onClick=onClose`，内层卡片 `stopPropagation`。
+- **Modal 可访问性**：设置卡片必须有 `role="dialog"` / `aria-modal="true"`，打开时背景主内容 `inert` + `aria-hidden`，Tab 焦点限制在弹窗内，Esc 走同一关闭确认逻辑。
+- **未保存确认弹窗**：不得使用浏览器原生 `window.confirm`；必须使用应用内 `alertdialog`，标题「放弃未保存的修改？」，按钮「继续编辑」/「放弃并关闭」。
+- **入口**：左侧栏左下角「账户菜单」下拉中的「设置」按钮触发，不再使用侧栏底部独立按钮。
+- **打开不折叠左侧栏**（与 Cron 不同）。
 
-### 4.2 API 契约
+### 4.2 功能范围
 
-- `GET /api/config/memory?type={soul|user|memory}` → `{ content: string }`
-- `PUT /api/config/memory` body `{ type, content }` → 保存
+合并原 AgentConfig 与 SkillManager，分两个 section：
+- **我的记忆**：`USER.md`（用户画像）、`MEMORY.md`（长期记忆）两个 tab。
+- **能力设定**：`SOUL.md`（角色设定）与 Skills 启停两个 tab。
 
-### 4.3 关键不变量
+三个记忆文件（memory/user/soul）编辑共用一套加载/保存/编辑态逻辑。
 
-- **未保存提示**：内容有变更且未保存时关闭抽屉前必须 `confirm('有未保存的修改...')`。
-- **并发冲突**：后端若返回 409，提示"文件已被其他端修改，请刷新"，不自动覆盖。
-- **切会话不影响**：记忆是用户级，非会话级。切 session 时无需重载。
+### 4.3 API 契约
 
-## 5. SkillManager（Skills 启停）
-
-### 5.1 功能范围
-
-- 显示官方 Skills（分类过滤）
-- 每个 Skill 可启停（toggle）
-- 批量启停同类别
-
-### 5.2 API 契约
-
+- `GET /api/config/agent-files/{name}`（name ∈ `memory|user|soul`）→ `{ content, version }`
+- `PUT /api/config/agent-files/{name}` body `{ content }` → `{ version }`
 - `GET /api/config/skills` → `{ skills: SkillInfo[] }`
-- `PUT /api/config/skills/{name}` body `{ enabled: boolean }`
+- `PUT /api/config/skills/{name}` body `{ enabled }`
 
-### 5.3 关键不变量
+### 4.4 关键不变量
 
-- **乐观更新**：toggle 后立即更新 UI，失败时回滚并提示。
-- **启停不立即生效于已发消息**：Skill 启停影响**下一次** Agent 请求的工具集。
+- **记忆是用户级**，切 session 时无需重载。
+- **未保存保护**：任一记忆文件处于编辑态且内容有变更时，关闭按钮或点击遮罩关闭前必须展示应用内确认弹窗；用户取消时保持弹窗打开。
+- **面板切换保护**：从 SettingsCenter 切到 Cron 或再次点击设置入口关闭时，必须复用同一未保存确认逻辑，不得直接 `setActivePanel` 绕过。
+- **刷新防覆盖**：激活 `USER.md` / `MEMORY.md` / `SOUL.md` 所在 tab 或点击编辑前，必须重新拉取该文件；若该文件已有本地未保存修改，则跳过刷新以保留用户输入。
+- **保存反馈**：保存成功后短暂显示「已保存」提示（约 1.8s 后自动消失）。
+- **Skills 乐观更新**：toggle 后立即更新 UI，失败时回滚并提示；每个 skill 的切换请求必须独立锁定对应开关，避免并发请求乱序造成 UI 与后端状态不一致。
+- **Skills 启停影响下一次请求**：不改变已发消息的工具集。
+- **默认入口状态**：从「设置」入口进入默认「我的记忆 · 用户画像」。
 
 ## 6. CronSchedule / CronMessageCenter
 
@@ -266,7 +264,7 @@ useEffect(() => {
 - [ ] ArtifactsPanel 快速切换目录不出现"旧数据覆盖新数据"
 - [ ] 抽屉打开时聊天区宽度不变（不触发 reflow）
 - [ ] session 切换后 ArtifactsPanel 回到根目录
-- [ ] AgentConfig 未保存修改时关闭面板有确认提示
+- [ ] SettingsCenter 从账户菜单「设置」入口打开，居中弹窗；无未保存修改时点击卡片外遮罩可关闭，有未保存修改时需确认
 - [ ] CronSchedule 顶栏显示日历/列表 segmented switcher，无「消息中心」tab
 - [ ] WeekAgenda 呈现为时间轴日历：左侧 00–23 时间轴 + 7 列，任务按时间 absolute 定位；任务色块统一柔和米橘色，disabled 灰调
 - [ ] WeekAgenda 点击事件块或 hover 才浮出工具条（仅运行图标）
@@ -287,7 +285,7 @@ useEffect(() => {
 - [ ] 进入「执行记录」面板不自动清未读；展开未读终态 run 卡片触发单条标已读，running 记录不触发
 - [ ] 「全部标已读」按钮在有未读时可点击、点击后红点归零；无未读时 disabled
 - [ ] failed 状态的未读 run 卡片显示红点
-- [ ] 面板打开左侧栏自动折叠（AgentConfig/Skills/Cron），ArtifactsPanel 打开不折叠
+- [ ] 面板打开左侧栏自动折叠（仅 Cron），SettingsCenter 居中弹窗与 ArtifactsPanel 打开均不折叠
 
 ## 9. 已知易错点
 

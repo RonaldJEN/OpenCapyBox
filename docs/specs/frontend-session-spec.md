@@ -156,8 +156,9 @@ const handleExecutionEnd = (sessionId?: string) => {
 
 ## 7. 折叠交互
 
-- 打开右侧配置抽屉（AgentConfig/Skills/Cron）时自动折叠左侧栏：`setIsSidebarCollapsed(true)`。
-- 关闭配置抽屉时恢复：`setIsSidebarCollapsed(false)`。
+- 打开右侧 Cron 抽屉时自动折叠左侧栏：`setIsSidebarCollapsed(true)`。
+- SettingsCenter 为居中弹窗（非右侧抽屉），打开时**不折叠**左侧栏：`setIsSidebarCollapsed(false)`。
+- 关闭抽屉/弹窗时恢复：`setIsSidebarCollapsed(false)`。
 - 聊天区的 ArtifactsPanel 打开**不折叠**左侧栏（用户可能需要对照会话）。
 
 折叠动画：`width: 260px ↔ 0` + `opacity: 1 ↔ 0`，`transition-all duration-300 ease-in-out`。
