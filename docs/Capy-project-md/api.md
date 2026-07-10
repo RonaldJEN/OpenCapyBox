@@ -1504,10 +1504,20 @@ Authorization: Bearer <access_token>
 ```json
 {
   "skills": [
-    { "name": "docx", "description": "Word 文档处理", "category": "document", "enabled": true }
-  ]
+    { "name": "docx", "description": "Word 文档处理", "category": "document", "source": "official", "enabled": true },
+    { "name": "my-skill", "description": "用户自定义能力", "category": "user", "source": "user", "enabled": true }
+  ],
+  "sandbox_status": "available"
 }
 ```
+
+`source` 为 `official` 或 `user`。`sandbox_status` 为：
+
+- `not_created`：尚无持久化沙箱，仅返回官方 Skills；
+- `available`：沙箱可用，合并官方与用户 Skills；
+- `unavailable`：既有沙箱本次不可连接、恢复或发现，仍返回 200 和官方 Skills（部分成功）。
+
+该接口只尝试连接/恢复既有沙箱，不会为了列出 Skills 创建替代沙箱。
 
 ### 启用/禁用 Skill
 
@@ -1520,6 +1530,13 @@ Authorization: Bearer <access_token>
 ```json
 { "enabled": false }
 ```
+
+**Response**:
+```json
+{ "skill_name": "docx", "enabled": false, "message": "ok" }
+```
+
+启停以数据库逻辑状态为准，后续 LLM 请求按 30s TTL 缓存重新求值（最迟约 30s 内生效）；禁用不会物理删除沙箱中的 Skill 文件。当前 MVP 按单 worker 部署，跨 worker/副本的 Skill 推送状态协调延后实现。
 
 ---
 

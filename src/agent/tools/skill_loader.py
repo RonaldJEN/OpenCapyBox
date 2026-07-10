@@ -4,12 +4,17 @@ Skill Loader - Load Claude Skills
 Supports loading skills from SKILL.md files and providing them to Agent
 """
 
+import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 import yaml
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,16 +47,80 @@ class Skill:
 class SkillLoader:
     """Skill loader"""
 
-    def __init__(self, skills_dir: str = "./skills"):
+    # Default reuse window for disabled-set snapshots (seconds), overridable per
+    # instance. Reusing within this window avoids one DB query per LLM step;
+    # toggling a skill takes effect on the next request after the window elapses
+    # (worst-case staleness ≈ TTL), matching the "affects the next turn" model.
+    _DISABLED_CACHE_TTL_SECONDS = 30.0
+
+    def __init__(
+        self,
+        skills_dir: str = "./skills",
+        disabled_cache_ttl_seconds: Optional[float] = None,
+    ):
         """
         Initialize Skill Loader
 
         Args:
             skills_dir: Skills directory path
+            disabled_cache_ttl_seconds: Reuse window for the disabled-set
+                snapshot; falls back to ``_DISABLED_CACHE_TTL_SECONDS`` when None.
         """
         self.skills_dir = Path(skills_dir)
         self.loaded_skills: Dict[str, Skill] = {}
         self.sandbox_skills: Dict[str, Skill] = {}
+        self.disabled_skill_names: Set[str] = set()
+        self._disabled_skills_provider: Optional[Callable[[], Set[str]]] = None
+        self._disabled_refreshed_at: Optional[float] = None
+        self._disabled_cache_ttl_seconds: float = (
+            disabled_cache_ttl_seconds
+            if disabled_cache_ttl_seconds is not None
+            else self._DISABLED_CACHE_TTL_SECONDS
+        )
+        self._monotonic: Callable[[], float] = time.monotonic
+
+    def set_disabled_skills_provider(
+        self,
+        provider: Callable[[], Set[str]],
+    ) -> None:
+        """Set the request-time source of disabled skill names."""
+        self._disabled_skills_provider = provider
+
+    def refresh_disabled_skills(self, force: bool = False) -> Set[str]:
+        """Refresh the effective disabled set without mutating inventory.
+
+        The provider is skipped while a successful snapshot is still within
+        ``_disabled_cache_ttl_seconds`` (pass ``force=True`` to bypass). Provider
+        failures keep the last successful snapshot and do not extend the TTL, so
+        the next call retries. Before the first successful refresh that snapshot
+        is empty, which intentionally falls back to all discovered skills being
+        enabled.
+        """
+        if self._disabled_skills_provider is None:
+            return set(self.disabled_skill_names)
+
+        now = self._monotonic()
+        if (
+            not force
+            and self._disabled_refreshed_at is not None
+            and (now - self._disabled_refreshed_at) < self._disabled_cache_ttl_seconds
+        ):
+            return set(self.disabled_skill_names)
+
+        try:
+            refreshed_names = set(self._disabled_skills_provider())
+        except Exception as exc:
+            logger.warning(
+                "刷新禁用 Skill 配置失败，沿用上次状态: %s",
+                exc,
+            )
+        else:
+            self.disabled_skill_names = refreshed_names
+            self._disabled_refreshed_at = now
+        return set(self.disabled_skill_names)
+
+    def is_skill_enabled(self, name: str) -> bool:
+        return name not in self.disabled_skill_names
 
     def load_skill(self, skill_path: Path) -> Optional[Skill]:
         """
@@ -267,6 +336,8 @@ class SkillLoader:
         Returns:
             Skill object, or None if not found
         """
+        if not self.is_skill_enabled(name):
+            return None
         return self.loaded_skills.get(name) or self.sandbox_skills.get(name)
 
     def list_skills(self) -> List[str]:
@@ -276,7 +347,11 @@ class SkillLoader:
         Returns:
             List of skill names
         """
-        return list({**self.sandbox_skills, **self.loaded_skills}.keys())
+        return [
+            name
+            for name in {**self.sandbox_skills, **self.loaded_skills}
+            if self.is_skill_enabled(name)
+        ]
 
     def get_skills_metadata_prompt(self) -> str:
         """
@@ -286,7 +361,11 @@ class SkillLoader:
         Returns:
             Metadata-only prompt string
         """
-        all_skills = {**self.sandbox_skills, **self.loaded_skills}  # official overrides
+        all_skills = {
+            name: skill
+            for name, skill in {**self.sandbox_skills, **self.loaded_skills}.items()
+            if self.is_skill_enabled(name)
+        }  # official overrides
         if not all_skills:
             return ""
 
@@ -296,10 +375,21 @@ class SkillLoader:
 
         for skill in all_skills.values():
             tag = " [用户]" if skill.source == "user" else ""
-            line = f"- `{skill.name}`{tag}: {skill.description}"
+            safe_name = self._single_line(skill.name).replace("`", "'")
+            safe_description = self._single_line(skill.description)
+            line = f"- `{safe_name}`{tag}: {safe_description}"
             prompt_parts.append(line)
 
         return "\n".join(prompt_parts)
+
+    @staticmethod
+    def _single_line(value: object) -> str:
+        """Collapse a metadata field to a single line.
+
+        Prevents a skill's name/description from injecting line breaks that would
+        forge extra list entries or break the markdown structure.
+        """
+        return " ".join(str(value or "").split())
 
     @staticmethod
     def process_sandbox_skill_paths(content: str, sandbox_skill_dir: str) -> str:

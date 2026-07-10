@@ -83,6 +83,7 @@ class Agent:
         max_output_tokens: int = 16384,  # 單次輸出上限（output tokens）
         tool_timeout: int = 300,  # 单次工具执行超时（秒），0 表示不限
         subagent_max_parallel: int = 1,  # 同一 step 内最多并行执行的 sub_agent 数
+        runtime_prompt_provider: Callable[[], str] | None = None,
     ):
         self.llm = llm_client
         self.tools = {tool.name: tool for tool in tools}
@@ -123,6 +124,7 @@ class Agent:
         # long-lived history.
         self._include_workspace_context = "Current Workspace" not in system_prompt
         self.system_prompt = system_prompt
+        self._runtime_prompt_provider = runtime_prompt_provider
 
         # Initialize message history
         self.messages: list[Message] = [Message(role="system", content=system_prompt)]
@@ -236,6 +238,9 @@ class Agent:
         source_messages = self.messages if messages is None else messages
         request_messages = [msg.model_copy(deep=True) for msg in source_messages]
         runtime_context = self._build_runtime_context_block()
+        dynamic_prompt = self._build_dynamic_runtime_prompt()
+        if dynamic_prompt:
+            runtime_context += f"{dynamic_prompt}\n\n---\n\n"
 
         if request_messages and request_messages[0].role == "system":
             system_content = request_messages[0].content
@@ -250,6 +255,21 @@ class Agent:
             request_messages.insert(0, Message(role="system", content=runtime_context))
 
         return request_messages
+
+    def _build_dynamic_runtime_prompt(self) -> str:
+        """Build a request-only prompt without mutating history.
+
+        Metadata is already normalized to a single line per skill upstream, and
+        the realistic aggregate stays well within the compaction headroom, so no
+        extra token accounting is done here.
+        """
+        if self._runtime_prompt_provider is None:
+            return ""
+        try:
+            return self._runtime_prompt_provider().strip()
+        except Exception:
+            logger.warning("构建请求级动态系统提示失败", exc_info=True)
+            return ""
 
     def add_user_message(self, content: str | list[dict[str, Any]]):
         """Add a user message to history."""

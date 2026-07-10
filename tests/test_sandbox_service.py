@@ -323,6 +323,57 @@ class TestGetOrResume:
             MockSandbox.create.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_get_existing_never_creates_replacement(self, service):
+        with patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.connect = AsyncMock(side_effect=Exception("connect failed"))
+            MockSandbox.resume = AsyncMock(side_effect=Exception("not found"))
+            MockSandbox.create = AsyncMock()
+
+            with pytest.raises(RuntimeError, match="既有沙箱不可用"):
+                await service.get_existing("session-1", "sbx-old-id")
+
+            MockSandbox.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_existing_rejects_different_cached_generation(
+        self, service, mock_sandbox
+    ):
+        mock_sandbox.id = "sbx-current"
+        mock_sandbox.is_healthy = AsyncMock(return_value=True)
+        service._cache["session-1"] = mock_sandbox
+        service._cache_profile_ids["session-1"] = "env-default"
+        service._cache_profile_versions["session-1"] = 1
+
+        with patch.object(
+            service,
+            "_persisted_profile_matches_runtime",
+            return_value=False,
+        ):
+            with pytest.raises(RuntimeError, match="profile 指纹不匹配"):
+                await service.get_existing("session-1", "sbx-old")
+
+        assert service.get_cached("session-1") is mock_sandbox
+
+    @pytest.mark.asyncio
+    async def test_get_existing_accepts_matching_live_cache_before_persistence(
+        self, service, mock_sandbox
+    ):
+        mock_sandbox.id = "sbx-current"
+        mock_sandbox.is_healthy = AsyncMock(return_value=True)
+        service._cache["session-1"] = mock_sandbox
+        service._cache_profile_ids["session-1"] = "env-default"
+        service._cache_profile_versions["session-1"] = 1
+
+        with patch.object(
+            service,
+            "_persisted_profile_matches_runtime",
+            return_value=False,
+        ):
+            result = await service.get_existing("session-1", "sbx-current")
+
+        assert result is mock_sandbox
+
+    @pytest.mark.asyncio
     async def test_no_sandbox_id_creates_new(self, service, mock_sandbox):
         """測試沒有 sandbox_id -> 直接創建"""
         with patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
@@ -704,6 +755,48 @@ class TestPushSkillLazy:
 
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_push_skill_rechecks_enabled_before_cached_shortcut(
+        self, service, mock_sandbox, tmp_path
+    ):
+        service._cache["session-1"] = mock_sandbox
+        service._pushed_skills["session-1"] = {"pdf"}
+
+        result = await service.push_skill(
+            "session-1",
+            str(tmp_path),
+            "pdf",
+            enabled_check=lambda: False,
+        )
+
+        assert result is False
+        mock_sandbox.files.write_files.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_push_skill_keeps_files_when_disabled_during_upload(
+        self, service, mock_sandbox, tmp_path
+    ):
+        service._cache["session-1"] = mock_sandbox
+        skills_root = tmp_path / "skills"
+        skill_dir = skills_root / "document-skills" / "pdf"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: pdf\ndescription: pdf skill\n---\n"
+        )
+        enabled_states = iter([True, False])
+
+        result = await service.push_skill(
+            "session-1",
+            str(skills_root),
+            "pdf",
+            enabled_check=lambda: next(enabled_states),
+        )
+
+        assert result is False
+        mock_sandbox.files.write_files.assert_awaited_once()
+        mock_sandbox.commands.run.assert_not_awaited()
+        assert "pdf" in service._pushed_skills["session-1"]
+
 
 # ============== get_sandbox_service ==============
 
@@ -738,6 +831,8 @@ class TestDiscoverSandboxSkills:
         """模擬沙箱中含有用戶 Skill 的場景"""
         # find 命令返回 SKILL.md 路徑列表
         exec_result = MagicMock()
+        exec_result.exit_code = 0
+        exec_result.error = None
         exec_result.logs = MagicMock()
         exec_result.logs.stdout = (
             "/home/user/skills/industry-report/SKILL.md\n"
@@ -802,11 +897,16 @@ class TestDiscoverSandboxSkills:
         results = await service.discover_sandbox_skills("user-1")
         assert results == []
 
+        with pytest.raises(RuntimeError, match="用户 Skill 发现失败"):
+            await service.discover_sandbox_skills("user-1", strict=True)
+
     @pytest.mark.asyncio
     async def test_discover_sandbox_skills_no_skills(self, service, mock_sandbox):
         """測試沙箱中無 Skill 時返回空列表"""
         service._cache["user-1"] = mock_sandbox
         exec_result = MagicMock()
+        exec_result.exit_code = 0
+        exec_result.error = None
         exec_result.logs = MagicMock()
         exec_result.logs.stdout = ""
         mock_sandbox.commands.run = AsyncMock(return_value=exec_result)
@@ -819,11 +919,30 @@ class TestDiscoverSandboxSkills:
         """測試 find 命令返回 logs=None（靜默失敗）"""
         service._cache["user-1"] = mock_sandbox
         exec_result = MagicMock()
+        exec_result.exit_code = 0
+        exec_result.error = None
         exec_result.logs = None
         mock_sandbox.commands.run = AsyncMock(return_value=exec_result)
 
         results = await service.discover_sandbox_skills("user-1")
         assert results == []
+
+        with pytest.raises(RuntimeError, match="用户 Skill 发现失败"):
+            await service.discover_sandbox_skills("user-1", strict=True)
+
+    @pytest.mark.asyncio
+    async def test_discover_sandbox_skills_strict_rejects_execution_error(
+        self, service, mock_sandbox
+    ):
+        service._cache["user-1"] = mock_sandbox
+        mock_sandbox.commands.run = AsyncMock(return_value=SimpleNamespace(
+            exit_code=None,
+            error="remote execution failed",
+            logs=None,
+        ))
+
+        with pytest.raises(RuntimeError, match="用户 Skill 发现失败"):
+            await service.discover_sandbox_skills("user-1", strict=True)
 
     @pytest.mark.asyncio
     async def test_discover_sandbox_skills_read_file_fails(self, service, mock_sandbox):
@@ -831,6 +950,8 @@ class TestDiscoverSandboxSkills:
         service._cache["user-1"] = mock_sandbox
 
         exec_result = MagicMock()
+        exec_result.exit_code = 0
+        exec_result.error = None
         exec_result.logs = MagicMock()
         exec_result.logs.stdout = (
             "/home/user/skills/good/SKILL.md\n"
@@ -849,12 +970,17 @@ class TestDiscoverSandboxSkills:
         assert len(results) == 1
         assert results[0]["name"] == "good-skill"
 
+        with pytest.raises(RuntimeError, match="读取用户 Skill 失败"):
+            await service.discover_sandbox_skills("user-1", strict=True)
+
     @pytest.mark.asyncio
     async def test_discover_sandbox_skills_reads_skill_files_concurrently(self, service, mock_sandbox):
         """讀取多個 SKILL.md 時應並發發起沙箱文件請求"""
         service._cache["user-1"] = mock_sandbox
 
         exec_result = MagicMock()
+        exec_result.exit_code = 0
+        exec_result.error = None
         exec_result.logs = MagicMock()
         exec_result.logs.stdout = (
             "/home/user/skills/first/SKILL.md\n"

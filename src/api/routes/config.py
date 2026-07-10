@@ -6,7 +6,9 @@
 - PUT /api/config/skills/{skill_name}: 启用/禁用 Skill
 """
 
+import asyncio
 import logging
+from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
@@ -32,6 +34,15 @@ _SKILL_CATEGORY_MAP = {
     "example_skills": "example",
     "example-skills": "example",
 }
+
+
+def _get_skills_dir() -> Path:
+    from src.api.config import get_settings
+
+    setting_value = get_settings().skills_dir
+    if setting_value:
+        return Path(setting_value).resolve()
+    return (Path(__file__).parent.parent.parent / "agent" / "skills").resolve()
 
 
 class AgentFileUpdateRequest(BaseModel):
@@ -148,17 +159,11 @@ async def get_skills(
     db: DBSession = Depends(get_db),
 ):
     """获取用户的 Skill 配置列表"""
-    # 从 SkillLoader 获取所有可用 skills
-    from pathlib import Path
     from src.agent.tools.skill_loader import SkillLoader, Skill
-    from src.api.config import get_settings
+    from src.api.models.user_sandbox import UserSandbox
+    from src.api.services.sandbox_service import get_sandbox_service
 
-    settings = get_settings()
-    skills_dir_setting = settings.skills_dir
-    if skills_dir_setting:
-        skills_dir = Path(skills_dir_setting).resolve()
-    else:
-        skills_dir = (Path(__file__).parent.parent.parent / "agent" / "skills").resolve()
+    skills_dir = _get_skills_dir()
 
     available_skills: list[dict] = []
     if skills_dir.exists():
@@ -182,11 +187,66 @@ async def get_skills(
                     "name": skill.name,
                     "description": skill.description,
                     "category": category,
+                    "source": "official",
                 })
         except Exception as e:
             logger.warning("Skills 发现失败: %s", e)
 
-    # 获取用户配置
+    official_names = {skill["name"] for skill in available_skills}
+    sandbox_status = "not_created"
+    sandbox_id: str | None = None
+
+    # 只在本地 DB 查询期间占用连接；远程沙箱 I/O 前主动结束事务，
+    # 避免并发打开设置页时把连接池耗尽。
+    try:
+        user_sandbox = (
+            db.query(UserSandbox)
+            .filter(UserSandbox.user_id == user_id)
+            .first()
+        )
+        persisted_id = getattr(user_sandbox, "sandbox_id", None)
+        if isinstance(persisted_id, str) and persisted_id:
+            sandbox_id = persisted_id
+    finally:
+        db.rollback()
+
+    try:
+        sandbox_service = get_sandbox_service()
+        cached_sandbox = sandbox_service.get_cached(user_id)
+        cached_id = getattr(cached_sandbox, "id", None)
+        candidate_id = sandbox_id or (
+            cached_id if isinstance(cached_id, str) and cached_id else None
+        )
+
+        if candidate_id:
+            sandbox_status = "unavailable"
+            await asyncio.wait_for(
+                sandbox_service.get_existing(user_id, candidate_id),
+                timeout=10,
+            )
+            sandbox_skills = await asyncio.wait_for(
+                sandbox_service.discover_sandbox_skills(
+                    user_id,
+                    official_names,
+                    strict=True,
+                ),
+                timeout=12,
+            )
+            sandbox_status = "available"
+            for skill in sandbox_skills:
+                available_skills.append({
+                    "name": skill["name"],
+                    "description": skill["description"],
+                    "category": "user",
+                    "source": "user",
+                })
+        elif cached_sandbox is not None:
+            sandbox_status = "unavailable"
+    except Exception as e:
+        sandbox_status = "unavailable"
+        logger.warning("读取用户沙箱 Skills 失败（仍返回官方 Skills）: %s", e)
+
+    # 沙箱 I/O 完成后再读取最新配置，避免长请求用旧快照覆盖刚完成的 toggle。
     configs = (
         db.query(UserSkillConfig)
         .filter(UserSkillConfig.user_id == user_id)
@@ -203,7 +263,7 @@ async def get_skills(
             "enabled": user_config.get(skill_name, True),  # 默认启用
         })
 
-    return {"skills": result}
+    return {"skills": result, "sandbox_status": sandbox_status}
 
 
 @router.put("/skills/{skill_name}")

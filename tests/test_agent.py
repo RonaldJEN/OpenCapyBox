@@ -101,6 +101,54 @@ class TestAgent:
         assert request_messages[0].content == "REQUEST ONLY\n" + agent.system_prompt
         assert [msg.model_dump(mode="json") for msg in agent.messages] == original_dump
 
+    def test_dynamic_prompt_provider_is_request_only(self, mock_tool, tmp_path):
+        calls = 0
+
+        def _dynamic_prompt() -> str:
+            nonlocal calls
+            calls += 1
+            return f"DYNAMIC SKILLS {calls}"
+
+        agent = Agent(
+            llm_client=MockLLMClient(),
+            system_prompt="Stable system",
+            tools=[mock_tool],
+            workspace_dir=str(tmp_path / "workspace"),
+            runtime_prompt_provider=_dynamic_prompt,
+        )
+
+        first = agent._build_llm_request_messages()
+        second = agent._build_llm_request_messages()
+
+        assert "DYNAMIC SKILLS 1" in first[0].content
+        assert "DYNAMIC SKILLS 2" in second[0].content
+        assert agent.messages[0].content == "Stable system"
+
+    def test_dynamic_prompt_passes_through_without_token_reservation(self, mock_tool, tmp_path):
+        provider_output = "## Available Skills\n- `pdf`: PDF documents"
+        dynamic_agent = Agent(
+            llm_client=MockLLMClient(),
+            system_prompt="Stable system",
+            tools=[mock_tool],
+            workspace_dir=str(tmp_path / "dynamic-workspace"),
+            runtime_prompt_provider=lambda: f"  {provider_output}  ",
+        )
+        plain_agent = Agent(
+            llm_client=MockLLMClient(),
+            system_prompt="Stable system",
+            tools=[mock_tool],
+            workspace_dir=str(tmp_path / "plain-workspace"),
+        )
+
+        # Provider output is passed through verbatim (only stripped), no cap.
+        assert dynamic_agent._build_dynamic_runtime_prompt() == provider_output
+        # Request-only prompt is not persisted, so it is not reserved in the
+        # history token accounting used for compaction decisions.
+        assert (
+            dynamic_agent._estimate_tokens(force_recalculate=True)
+            == plain_agent._estimate_tokens(force_recalculate=True)
+        )
+
     def test_prompt_timezone_uses_project_timezone_offset(self, monkeypatch):
         """Agent runtime context 应与项目 TIMEZONE_OFFSET 语义一致。"""
         monkeypatch.setenv("TIMEZONE_OFFSET", "8")

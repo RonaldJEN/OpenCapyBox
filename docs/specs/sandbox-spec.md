@@ -68,6 +68,7 @@
 
 - `create(user_id) -> Sandbox`
 - `get_or_resume(user_id, sandbox_id) -> Sandbox` — 级联恢复: 内存缓存 -> 查询状态 -> connect/resume -> fallback create
+- `get_existing(user_id, sandbox_id) -> Sandbox` — 仅复用 ID/Profile 均匹配的缓存或连接/恢复该指定沙箱；不可用或指纹不匹配时抛出 `RuntimeError`，不得返回其他缓存代际，也绝不 fallback create
 - `get_or_resume_with_persisted_id(user_id, sandbox_id) -> tuple[Sandbox, str|None]`
 - `pause(user_id) -> bool`
 - `kill(user_id, sandbox_id) -> bool` — 先清理 mount 目录（rm -rf），再 kill 容器；用户删除路径必须在硬删除账号前调用
@@ -77,8 +78,8 @@
 - `get_cached_profile_fingerprint(user_id) -> tuple[str|None, int|None]`
 - `cached_is_current(user_id, sandbox_id=None) -> bool`
 - `push_skills(user_id, skills_dir) -> bool` — 批量上传（排除 node_modules, __pycache__, .git, .venv）
-- `push_skill(user_id, skills_dir, skill_name) -> bool` — 单个推送，幂等（跟踪已推送集合）
-- `discover_sandbox_skills(user_id, official_names) -> list[dict]`
+- `push_skill(user_id, skills_dir, skill_name, enabled_check=None) -> bool` — 单个按需推送，幂等；可在推送前后复核逻辑启用状态
+- `discover_sandbox_skills(user_id, official_names, strict=False) -> list[dict]` — 默认容错返回空列表；设置页使用严格模式区分空清单与沙箱故障
 - `read_sandbox_skill_content(user_id, skill_dir) -> str|None`
 
 ## 4. 行为语义与不变量
@@ -89,6 +90,12 @@
 - 内部缓存 `_cache: dict[str, Sandbox]` (user_id -> Sandbox)
 - 内部缓存同步记录 Profile 指纹：`_cache_profile_ids`、`_cache_profile_versions`、`_cache_mount_paths`
 - 已推送技能跟踪 `_pushed_skills: dict[str, set[str]]`
+- Skill 推送互斥锁与 `_pushed_skills` 均为进程内状态
+
+### 单 worker MVP 约束
+
+- 当前部署固定为单 worker；进程内 sandbox cache、Skill 推送标记和 per-skill lock 是本阶段的一致性边界。
+- 多 worker/多副本下的 Skill 推送去重、状态广播与锁协调不在本阶段保证范围内，后续应改为共享存储/分布式协调后再开放。
 
 ### 生命周期级联
 
@@ -180,8 +187,17 @@ Profile 配置更新仅保留当前行的 `updated_at` 和 `version`，MVP 不�
 ### Skill 推送
 
 - 批量推送遍历目录，排除 node_modules/__pycache__/.git/.venv
-- 单个推送通过 SKILL.md frontmatter 的 dir 字段定位
+- 单个推送按 `SKILL.md` frontmatter 的 `name` 查找定义，并将该 `SKILL.md` 所在物理目录按相对 skills 根目录的路径推送到沙箱
 - 已推送集合跟踪避免重复
+- `enabled_check` 在按需推送前后复核 DB 逻辑状态；已禁用时返回 False，不向 Agent 提供 Skill
+- 用户 Skill 按需读取前后都要刷新逻辑状态；若读取期间被禁用，丢弃正文且不得写入 SkillLoader 内容缓存
+- 禁用 Skill 不物理删除沙箱文件；启停只影响元数据暴露和 `get_skill`，保留文件供重新启用复用
+
+### 只连接既有沙箱
+
+- `get_existing` 供设置页等只允许读取既有沙箱、不得隐式创建资源的路径使用。
+- 它遵循 sandbox_id 与 Profile 指纹校验，允许 connect/resume；连接和恢复均失败、指纹不匹配或无可用既有实例时抛出 `RuntimeError`。
+- 调用方应将失败作为可降级状态处理，不得自行改走 `create()`；例如 GET Skills 返回官方清单并标记沙箱不可用。
 
 ## 5. 失败模式与错误处理
 
@@ -191,6 +207,7 @@ Profile 配置更新仅保留当前行的 `updated_at` 和 `version`，MVP 不�
 - kill 时沙箱不可达、挂载目录清理失败，或未命中 live cached sandbox 且既有 sandbox 的 active Profile 指纹无法解析/版本不匹配 -> 返回 False；用户删除路径不得继续清理 DB 账号数据；管理员切换用户 Profile 路径可继续切换，并将旧 sandbox 交给 OpenSandbox TTL 回收
 - mkdir 失败 -> get_or_resume 的重试机制
 - Skill 推送失败 -> 返回 False，warning 日志
+- 既有沙箱不可连接/恢复且调用 `get_existing` -> RuntimeError，不创建替代沙箱
 - 用户绑定的 Profile 不存在或被禁用 -> 409
 - 默认 Profile 被禁用 -> 409（管理端不允许禁用默认 Profile）
 - Profile 解析/数据库查询异常 -> 直接失败，不回退到当前用户有效 Profile 或 `.env` 默认后端

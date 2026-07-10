@@ -211,15 +211,17 @@ async def create_agent_tools(
     skills_dir = _auto_locate_skills_dir(settings.skills_dir)
     try:
         if skills_dir.exists():
-            skill_loader = SkillLoader(str(skills_dir))
-            skills = skill_loader.discover_skills()
+            skill_loader = SkillLoader(
+                str(skills_dir),
+                disabled_cache_ttl_seconds=settings.skill_disabled_cache_ttl_seconds,
+            )
+            skill_loader.discover_skills()
 
-            # 按用户 skill 配置过滤掉禁用的 skill
-            try:
+            def _load_disabled_skills() -> set[str]:
                 from src.api.models.user_memory import UserSkillConfig
                 db = db_session_factory()
                 try:
-                    disabled_skills = {
+                    return {
                         r.skill_name for r in
                         db.query(UserSkillConfig)
                         .filter(
@@ -230,10 +232,12 @@ async def create_agent_tools(
                     }
                 finally:
                     db.close()
+
+            # 保留完整技能清单，仅在运行时按 DB 配置过滤。
+            try:
+                skill_loader.set_disabled_skills_provider(_load_disabled_skills)
+                disabled_skills = skill_loader.refresh_disabled_skills()
                 if disabled_skills:
-                    for name in disabled_skills:
-                        skill_loader.loaded_skills.pop(name, None)
-                    skills = [s for s in skills if s.name not in disabled_skills]
                     logger.info("已按用户配置禁用 %d 个 Skills: %s", len(disabled_skills), disabled_skills)
             except Exception as e:
                 logger.warning("查询 UserSkillConfig 失败，加载全部 Skills: %s", e)
@@ -256,11 +260,39 @@ async def create_agent_tools(
                 logger.warning("沙箱 Skill 发现失败（不影响官方 Skills）: %s", e)
 
             async def _ensure_skill_ready(skill_name: str) -> bool:
+                # On-demand skill loading needs strong consistency, so bypass the
+                # metadata TTL cache and re-read the latest logical state here.
+                try:
+                    skill_loader.refresh_disabled_skills(force=True)
+                except Exception as e:
+                    logger.warning("刷新 Skill 启停配置失败: %s", e)
+                if not skill_loader.is_skill_enabled(skill_name):
+                    return False
                 skill = skill_loader.get_skill(skill_name)
-                if skill and skill.source == "user":
+                if skill is None:
+                    # Let GetSkillTool refresh the sandbox index before retrying;
+                    # unknown names must not allocate permanent per-skill locks or
+                    # scan the complete official skill tree.
+                    return False
+                if skill.source == "user":
                     return True
                 svc = get_sandbox_service()
-                return await svc.push_skill(user_id, str(skills_dir), skill_name)
+
+                def _is_still_enabled() -> bool:
+                    try:
+                        skill_loader.refresh_disabled_skills(force=True)
+                    except Exception as e:
+                        logger.warning("推送前刷新 Skill 启停配置失败: %s", e)
+                        # Preserve the last-known snapshot. An initial failure
+                        # therefore follows the documented load-all fallback.
+                    return skill_loader.is_skill_enabled(skill_name)
+
+                return await svc.push_skill(
+                    user_id,
+                    str(skills_dir),
+                    skill_name,
+                    enabled_check=_is_still_enabled,
+                )
 
             async def _refresh_sandbox_skills() -> None:
                 svc = get_sandbox_service()
@@ -275,11 +307,33 @@ async def create_agent_tools(
                     logger.info("get_skill miss 后刷新发现用户沙箱 Skills: %s", sorted(new_names))
 
             async def _read_sandbox_skill(skill_name: str) -> str | None:
+                # Reads must reflect the live enable state so a mid-read disable
+                # discards content; force past the metadata TTL cache.
+                try:
+                    skill_loader.refresh_disabled_skills(force=True)
+                except Exception as e:
+                    logger.warning("读取前刷新 Skill 启停配置失败，沿用上次状态: %s", e)
                 skill = skill_loader.get_skill(skill_name)
                 if not skill or skill.source != "user" or not skill.sandbox_skill_dir:
                     return None
                 svc = get_sandbox_service()
-                return await svc.read_sandbox_skill_content(user_id, skill.sandbox_skill_dir)
+                content = await svc.read_sandbox_skill_content(
+                    user_id,
+                    skill.sandbox_skill_dir,
+                )
+                try:
+                    skill_loader.refresh_disabled_skills(force=True)
+                except Exception as e:
+                    logger.warning("读取后刷新 Skill 启停配置失败，沿用上次状态: %s", e)
+                if not skill_loader.is_skill_enabled(skill_name):
+                    logger.info(
+                        "用户 Skill 读取期间被禁用，丢弃内容 "
+                        "(user=%s, skill=%s)",
+                        user_id,
+                        skill_name,
+                    )
+                    return None
+                return content
 
             tools.append(GetSkillTool(
                 skill_loader,

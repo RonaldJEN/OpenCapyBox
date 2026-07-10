@@ -23,7 +23,7 @@ import hashlib
 import posixpath
 import shlex
 from datetime import timedelta
-from typing import Optional
+from typing import Callable, Optional
 from pathlib import Path
 
 from opensandbox import Sandbox
@@ -156,11 +156,16 @@ class SandboxSessionService:
         self._cache_mount_paths: dict[str, str] = {}  # user_id → active mount path
         self._pushed_skills: dict[str, set[str]] = {}  # user_id → pushed skill names
         self._lifecycle_locks: dict[str, asyncio.Lock] = {}  # user_id → sandbox lifecycle lock
+        self._skill_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._initialized = True
 
     def _get_lifecycle_lock(self, user_id: str) -> asyncio.Lock:
         """Return the per-user sandbox lifecycle lock for this process."""
         return self._lifecycle_locks.setdefault(user_id, asyncio.Lock())
+
+    def _get_skill_lock(self, user_id: str, skill_name: str) -> asyncio.Lock:
+        """Serialize concurrent pushes for one user skill in this worker."""
+        return self._skill_locks.setdefault((user_id, skill_name), asyncio.Lock())
 
     @staticmethod
     def _sandbox_id_from_instance(sandbox: Sandbox | None) -> str | None:
@@ -434,6 +439,17 @@ class SandboxSessionService:
         async with self._get_lifecycle_lock(user_id):
             return await self._get_or_resume_unlocked(user_id, sandbox_id)
 
+    async def get_existing(
+        self, user_id: str, sandbox_id: str
+    ) -> Sandbox:
+        """Connect or resume an existing sandbox without creating a replacement."""
+        async with self._get_lifecycle_lock(user_id):
+            return await self._get_or_resume_unlocked(
+                user_id,
+                sandbox_id,
+                create_if_missing=False,
+            )
+
     async def get_or_resume_with_persisted_id(
         self, user_id: str, sandbox_id: str | None = None
     ) -> tuple[Sandbox, str | None]:
@@ -452,7 +468,11 @@ class SandboxSessionService:
             return sandbox, current_sandbox_id
 
     async def _get_or_resume_unlocked(
-        self, user_id: str, sandbox_id: str | None = None
+        self,
+        user_id: str,
+        sandbox_id: str | None = None,
+        *,
+        create_if_missing: bool = True,
     ) -> Sandbox:
         """獲取沙箱實例（先快取 → connect → resume → create）
 
@@ -467,15 +487,28 @@ class SandboxSessionService:
         connection_config = _build_connection_config(runtime_config)
         sandbox_id = sandbox_id if isinstance(sandbox_id, str) and sandbox_id else None
         if sandbox_id and not self._persisted_profile_matches_runtime(user_id, sandbox_id, runtime_config):
-            logger.warning(
-                "持久化 sandbox profile 指纹已过期，跳过旧 sandbox 并重建 "
-                "(user=%s, sandbox_id=%s, current_profile=%s/%s)",
+            # A matching live cache already records the runtime profile used by
+            # this process and remains a valid existing sandbox even before its
+            # DB row is persisted. Never substitute a *different* cached sandbox
+            # for get_existing(), though: that API promises the requested ID or
+            # a failure, not a replacement generation.
+            matching_live_cache = self._cache_matches_runtime(
                 user_id,
+                runtime_config,
                 sandbox_id,
-                runtime_config.profile_id,
-                runtime_config.profile_version,
             )
-            sandbox_id = None
+            if not matching_live_cache and not create_if_missing:
+                raise RuntimeError("既有沙箱 profile 指纹不匹配")
+            if not matching_live_cache:
+                logger.warning(
+                    "持久化 sandbox profile 指纹已过期，跳过旧 sandbox 并重建 "
+                    "(user=%s, sandbox_id=%s, current_profile=%s/%s)",
+                    user_id,
+                    sandbox_id,
+                    runtime_config.profile_id,
+                    runtime_config.profile_version,
+                )
+                sandbox_id = None
 
         # 1. 先從記憶體快取獲取
         if user_id in self._cache:
@@ -558,6 +591,9 @@ class SandboxSessionService:
                     "沙箱恢復失敗 (user=%s, sandbox_id=%s): %s — 將創建新沙箱",
                     user_id, sandbox_id, e,
                 )
+
+        if not create_if_missing:
+            raise RuntimeError("既有沙箱不可用")
 
         # 3. 所有嘗試均失敗 → 創建新沙箱
         sandbox = await self.create(user_id)
@@ -974,7 +1010,40 @@ class SandboxSessionService:
             logger.error("Skills 推送失敗 (user=%s): %s", user_id, e, exc_info=True)
             return False
 
-    async def push_skill(self, user_id: str, skills_dir: str, skill_name: str) -> bool:
+    async def push_skill(
+        self,
+        user_id: str,
+        skills_dir: str,
+        skill_name: str,
+        *,
+        enabled_check: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Push one skill while respecting the latest logical enable state."""
+        async with self._get_skill_lock(user_id, skill_name):
+            if enabled_check is not None and not enabled_check():
+                logger.info(
+                    "skill 已禁用，取消推送 (user=%s, skill=%s)",
+                    user_id,
+                    skill_name,
+                )
+                return False
+            pushed = await self._push_skill_unlocked(user_id, skills_dir, skill_name)
+            if pushed and enabled_check is not None and not enabled_check():
+                logger.info(
+                    "skill 推送期间被禁用，保留文件但不暴露给 Agent "
+                    "(user=%s, skill=%s)",
+                    user_id,
+                    skill_name,
+                )
+                return False
+            return pushed
+
+    async def _push_skill_unlocked(
+        self,
+        user_id: str,
+        skills_dir: str,
+        skill_name: str,
+    ) -> bool:
         """按需推送單一 skill 到沙箱。
 
         Args:
@@ -1070,6 +1139,8 @@ class SandboxSessionService:
         self,
         user_id: str,
         official_skill_names: set[str] | None = None,
+        *,
+        strict: bool = False,
     ) -> list[dict]:
         """發現沙箱中用戶自行安裝的第三方 Skill。
 
@@ -1079,10 +1150,12 @@ class SandboxSessionService:
         Args:
             user_id: 用戶 ID
             official_skill_names: 官方 Skill 名稱集合（用於去重）
+            strict: 沙箱访问失败时是否抛出异常。API 列表端点使用严格模式
+                区分“没有用户 Skill”和“沙箱不可用”；Agent 发现保持容错。
 
         Returns:
             包含 ``name``, ``description``, ``sandbox_skill_dir`` 的字典列表。
-            沙箱不可用或出錯時返回空列表。
+            容错模式下沙箱不可用或出错时返回空列表；严格模式下抛出异常。
         """
         if official_skill_names is None:
             official_skill_names = set()
@@ -1090,20 +1163,27 @@ class SandboxSessionService:
         sandbox = self._cache.get(user_id)
         if not sandbox:
             logger.debug("discover_sandbox_skills: 沙箱不在快取中 (user=%s)", user_id)
+            if strict:
+                raise RuntimeError("沙箱不在缓存中")
             return []
 
         mount_path = self.get_mount_path(user_id)
         skills_root = posixpath.join(mount_path, "skills")
+        quoted_skills_root = shlex.quote(skills_root)
 
         try:
             exec_result = await sandbox.commands.run(
-                f"find {skills_root} -maxdepth 2 -name SKILL.md -type f 2>/dev/null",
+                "if [ -d {root} ]; then "
+                "find {root} -maxdepth 2 -name SKILL.md -type f; "
+                "fi".format(root=quoted_skills_root),
                 opts=RunCommandOpts(timeout=10),
             )
+            exit_code = _extract_command_exit_code(exec_result)
+            if exit_code != 0:
+                raise RuntimeError(f"find 命令退出码异常: {exit_code}")
             logs = getattr(exec_result, "logs", None)
             if logs is None:
-                logger.debug("discover_sandbox_skills: find 命令返回空 logs (user=%s)", user_id)
-                return []
+                raise RuntimeError("find 命令返回空 logs")
 
             stdout_text = getattr(logs, "stdout", "") or ""
             if isinstance(stdout_text, list):
@@ -1113,6 +1193,8 @@ class SandboxSessionService:
             paths = [p.strip() for p in stdout_text.strip().splitlines() if p.strip()]
         except Exception as e:
             logger.warning("discover_sandbox_skills: find 命令失敗 (user=%s): %s", user_id, e)
+            if strict:
+                raise RuntimeError("用户 Skill 发现失败") from e
             return []
 
         async def _read_skill(skill_md_path: str):
@@ -1130,6 +1212,10 @@ class SandboxSessionService:
         for skill_md_path, raw in zip(paths, raw_results):
             if isinstance(raw, BaseException):
                 logger.debug("discover_sandbox_skills: 讀取 %s 失敗: %s", skill_md_path, raw)
+                if strict:
+                    raise RuntimeError(
+                        f"读取用户 Skill 失败: {skill_md_path}"
+                    ) from raw
                 continue
 
             content = raw

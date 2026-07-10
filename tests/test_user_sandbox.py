@@ -1340,67 +1340,35 @@ class TestAgentServicePostRoundTasks:
 class TestAgentServiceSkillFiltering:
     """UserSkillConfig 运行时过滤逻辑测试"""
 
-    def test_disabled_skill_filtered_from_loader(self):
-        """禁用的 skill 应从 skill_loader.loaded_skills 中移除"""
-        from src.api.models.user_memory import UserSkillConfig
+    def test_disabled_skill_filtered_without_removing_inventory(self):
+        """禁用项不生效，但仍保留在完整清单中供重新启用。"""
+        from src.agent.tools.skill_loader import Skill, SkillLoader
 
-        # 模拟 DB 返回一个禁用的 skill
-        disabled_record = MagicMock()
-        disabled_record.skill_name = "docx"
-        disabled_record.enabled = False
-
-        mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.all.return_value = [disabled_record]
-
-        # 模拟 skill_loader（直接测试过滤逻辑）
-        loaded_skills = {"docx": MagicMock(), "pdf": MagicMock(), "xlsx": MagicMock()}
-
-        # 使用简单对象代替 MagicMock 的 name 属性（MagicMock 的 name 是特殊参数）
-        class FakeSkill:
-            def __init__(self, name):
-                self.name = name
-        skills_list = [FakeSkill("docx"), FakeSkill("pdf"), FakeSkill("xlsx")]
-
-        # 执行 agent_service.py 中的过滤逻辑
-        user_id = "user-1"
-        disabled_skills = {
-            r.skill_name for r in
-            mock_db.query(UserSkillConfig)
-            .filter(
-                UserSkillConfig.user_id == user_id,
-                UserSkillConfig.enabled == False,
-            )
-            .all()
+        loader = SkillLoader("/tmp/empty")
+        loader.loaded_skills = {
+            "docx": Skill(name="docx", description="Word", content=""),
+            "pdf": Skill(name="pdf", description="PDF", content=""),
         }
+        loader.set_disabled_skills_provider(lambda: {"docx"})
+        loader.refresh_disabled_skills()
 
-        if disabled_skills:
-            for name in disabled_skills:
-                loaded_skills.pop(name, None)
-            skills_list = [s for s in skills_list if s.name not in disabled_skills]
-
-        assert "docx" not in loaded_skills
-        assert "pdf" in loaded_skills
-        assert "xlsx" in loaded_skills
-        assert len(skills_list) == 2
-        assert all(s.name != "docx" for s in skills_list)
+        assert "docx" in loader.loaded_skills
+        assert loader.get_skill("docx") is None
+        assert loader.get_skill("pdf") is not None
 
     def test_no_disabled_skills_keeps_all(self):
         """无禁用 skill 时应保留所有 skill"""
-        mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.all.return_value = []
+        from src.agent.tools.skill_loader import Skill, SkillLoader
 
-        loaded_skills = {"docx": MagicMock(), "pdf": MagicMock()}
-
-        disabled_skills = {
-            r.skill_name for r in
-            mock_db.query.return_value.filter.return_value.all()
+        loader = SkillLoader("/tmp/empty")
+        loader.loaded_skills = {
+            "docx": Skill(name="docx", description="Word", content=""),
+            "pdf": Skill(name="pdf", description="PDF", content=""),
         }
+        loader.set_disabled_skills_provider(set)
+        loader.refresh_disabled_skills()
 
-        if disabled_skills:
-            for name in disabled_skills:
-                loaded_skills.pop(name, None)
-
-        assert len(loaded_skills) == 2
+        assert set(loader.list_skills()) == {"docx", "pdf"}
 
 
 # ============================================================

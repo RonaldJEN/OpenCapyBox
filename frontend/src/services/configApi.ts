@@ -64,19 +64,27 @@ export interface SkillInfo {
   name: string;
   description: string;
   category: string;
+  source: 'official' | 'user';
   enabled: boolean;
 }
 
-export async function getSkills(): Promise<SkillInfo[]> {
-  const resp = await client.get<{ skills: SkillInfo[] }>('/config/skills');
-  return resp.data.skills;
+export type SkillSandboxStatus = 'available' | 'unavailable' | 'not_created';
+
+export interface SkillsResponse {
+  skills: SkillInfo[];
+  sandbox_status: SkillSandboxStatus;
+}
+
+export async function getSkills(): Promise<SkillsResponse> {
+  const resp = await client.get<SkillsResponse>('/config/skills');
+  return resp.data;
 }
 
 export async function toggleSkill(
   skillName: string,
   enabled: boolean,
 ): Promise<void> {
-  await client.put(`/config/skills/${skillName}`, { enabled });
+  await client.put(`/config/skills/${encodeURIComponent(skillName)}`, { enabled });
 }
 
 // ========== Cron 任务 API ==========

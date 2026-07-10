@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     agent_tool_timeout: int = 300  # 单次工具执行超时（秒），0 表示不限
     agent_subagent_max_parallel: int = 3  # 同一父 Agent step 内最多并行执行的 sub_agent 数；1 表示串行
     agent_user_concurrency_limit: int = 1  # 同一用户允许同时运行的不同会话数，至少为 1
+    skill_disabled_cache_ttl_seconds: float = 30.0  # Skill 启停快照复用窗口（秒），避免每步 LLM 请求都查库
 
     # Cron 配置（去中心化 worker）
     cron_fire_max_age_days: int = 7  # cron_fires 清理保留天数（后续清理任务使用）

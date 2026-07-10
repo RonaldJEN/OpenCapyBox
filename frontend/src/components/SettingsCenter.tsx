@@ -18,6 +18,7 @@ import {
   updateAgentFile,
   type AgentFileDetail,
   type SkillInfo,
+  type SkillSandboxStatus,
 } from '../services/configApi';
 
 type AgentFileName = 'memory' | 'user' | 'soul';
@@ -127,18 +128,21 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     soul: emptyFileState(),
   });
   const [skills, setSkills] = useState<SkillInfo[]>([]);
-  const [skillsLoading, setSkillsLoading] = useState(true);
+  const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsError, setSkillsError] = useState('');
+  const [skillSandboxStatus, setSkillSandboxStatus] = useState<SkillSandboxStatus | null>(null);
   const [togglingSkills, setTogglingSkills] = useState<Set<string>>(() => new Set());
   const [savedFlash, setSavedFlash] = useState<AgentFileName | ''>('');
   const filesRef = useRef(files);
   const togglingSkillsRef = useRef<Set<string>>(new Set());
+  const skillMutationVersionsRef = useRef<Map<string, number>>(new Map());
   const savedTimerRef = useRef<number | null>(null);
   const fileLoadSeqRef = useRef<Record<AgentFileName, number>>({
     memory: 0,
     user: 0,
     soul: 0,
   });
+  const skillsLoadSeqRef = useRef(0);
   const initialPropsAppliedRef = useRef(false);
 
   useEffect(() => {
@@ -206,6 +210,45 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     }
   }, []);
 
+  const loadSkills = useCallback(async () => {
+    const seq = ++skillsLoadSeqRef.current;
+    const mutationVersionsAtStart = new Map(skillMutationVersionsRef.current);
+    setSkillsLoading(true);
+    setSkillsError('');
+    setSkillSandboxStatus(null);
+    try {
+      const result = await getSkills();
+      if (seq !== skillsLoadSeqRef.current) return;
+      setSkills((previousSkills) => {
+        const previousByName = new Map(
+          previousSkills.map((skill) => [skill.name, skill]),
+        );
+        return result.skills.map((skill) => {
+          const mutationOverlappedLoad = (
+            (skillMutationVersionsRef.current.get(skill.name) ?? 0)
+            !== (mutationVersionsAtStart.get(skill.name) ?? 0)
+          );
+          if (
+            !mutationOverlappedLoad
+            && !togglingSkillsRef.current.has(skill.name)
+          ) return skill;
+          const optimisticSkill = previousByName.get(skill.name);
+          return optimisticSkill
+            ? { ...skill, enabled: optimisticSkill.enabled }
+            : skill;
+        });
+      });
+      setSkillSandboxStatus(result.sandbox_status);
+    } catch (err) {
+      if (seq !== skillsLoadSeqRef.current) return;
+      setSkillsError(fileErrorMessage(err));
+    } finally {
+      if (seq === skillsLoadSeqRef.current) {
+        setSkillsLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     const next = getInitialState(initialSection, initialMemoryTab, initialSoulTab);
     setActiveSection(next.section);
@@ -228,13 +271,10 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   }, [loadFile]);
 
   useEffect(() => {
-    setSkillsLoading(true);
-    setSkillsError('');
-    getSkills()
-      .then(setSkills)
-      .catch((err) => setSkillsError(fileErrorMessage(err)))
-      .finally(() => setSkillsLoading(false));
-  }, []);
+    if (activeSection === 'soul' && soulTab === 'skills') {
+      void loadSkills();
+    }
+  }, [activeSection, loadSkills, soulTab]);
 
   useEffect(() => () => {
     if (savedTimerRef.current !== null) {
@@ -341,6 +381,10 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
 
   const handleSkillToggle = async (skillName: string, currentEnabled: boolean) => {
     if (togglingSkillsRef.current.has(skillName)) return;
+    const bumpMutationVersion = () => {
+      const versions = skillMutationVersionsRef.current;
+      versions.set(skillName, (versions.get(skillName) ?? 0) + 1);
+    };
     const setSkillToggling = (isToggling: boolean) => {
       const next = new Set(togglingSkillsRef.current);
       if (isToggling) {
@@ -352,6 +396,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
       setTogglingSkills(next);
     };
 
+    bumpMutationVersion();
     setSkillToggling(true);
     setSkillsError('');
     setSkills((prev) =>
@@ -370,6 +415,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
       );
       setSkillsError(fileErrorMessage(err));
     } finally {
+      bumpMutationVersion();
       setSkillToggling(false);
     }
   };
@@ -541,7 +587,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
       state.content.trim() ? '编辑' : '添加',
       renderEditableBody(
         'soul',
-        '定义 OpenCapyBox 的语气、视角和判断边界...',
+        '定义智能体的语气、视角和判断边界...',
         state.content.trim() ? (
           <MarkdownView content={state.content} />
         ) : (
@@ -575,6 +621,24 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
 
       {skillsError && <p className="mb-3 text-xs font-medium text-claude-error">{skillsError}</p>}
 
+      {skillSandboxStatus === 'unavailable' && (
+        <p
+          role="status"
+          className="mb-3 rounded-lg border border-[#ead8bd] bg-[#fff8ec] px-3 py-2 text-xs font-medium text-[#8a5a2f]"
+        >
+          用户技能暂时无法读取，以下仅显示官方技能。
+        </p>
+      )}
+
+      {skillSandboxStatus === 'not_created' && (
+        <p
+          role="status"
+          className="mb-3 rounded-lg border border-[#e8e3d9] bg-[#faf8f3] px-3 py-2 text-xs font-medium text-[#6f6960]"
+        >
+          尚未创建工作沙箱，以下仅显示官方技能。
+        </p>
+      )}
+
       {skillsLoading ? (
         <div className="flex h-32 items-center justify-center text-sm text-[#a39c8e]">
           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -603,7 +667,14 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
                     <span className="truncate font-mono text-[13.5px] font-bold text-[#1c1a16]">
                       {skill.name}
                     </span>
-                    {skill.category && (
+                    <span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold ${
+                      skill.source === 'user'
+                        ? 'bg-[#e7f2eb] text-[#477057]'
+                        : 'bg-[#f0ece3] text-[#8a8377]'
+                    }`}>
+                      {skill.source === 'user' ? '用户' : '官方'}
+                    </span>
+                    {skill.category && skill.category !== 'user' && (
                       <span className="shrink-0 rounded-md bg-[#f0ece3] px-1.5 py-0.5 text-[10.5px] font-semibold text-[#8a8377]">
                         {skill.category}
                       </span>

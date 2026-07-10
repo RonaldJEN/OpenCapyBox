@@ -15,7 +15,7 @@
 ### Skill 元数据（文件系统）
 
 - 来源：`src/agent/skills/` 目录下各子目录
-- 每个 Skill 目录包含 `SKILL.md`（frontmatter: name, description, category, dir）
+- 每个 Skill 目录包含 `SKILL.md`（frontmatter 至少包含 `name`、`description`；其余字段可选）
 - 用户自定义 Skill：沙箱中 `/home/user/skills/` 目录
 
 ### 工具候选表（tool_factory）
@@ -48,14 +48,21 @@
 
 ### GET /api/config/skills
 
-- **Response 200**: `{skills: [{name, description, category, enabled}]}`
+- **Response 200**: `{skills: [{name, description, category, source, enabled}], sandbox_status}`
+- `source`: `official`（平台文件系统）或 `user`（用户沙箱）
+- `sandbox_status`: `not_created` / `available` / `unavailable`
+  - `not_created`: 用户尚无可连接的持久化沙箱，仅返回官方 Skills
+  - `available`: 沙箱可用，返回官方 Skills 与发现到的用户 Skills
+  - `unavailable`: 已有沙箱记录但本次连接、恢复或发现失败；接口仍返回 200 和官方 Skills
 - 合并：SkillLoader 文件系统发现 + UserSkillConfig DB 状态
 - 包含沙箱中用户自定义 Skill
+- 沙箱发现采用部分成功语义：沙箱不可用不应阻断官方 Skills 清单
 
 ### PUT /api/config/skills/{skill_name}
 
 - **Body**: `{enabled: bool}`
 - **Response 200**: `{skill_name, enabled, message: "ok"}`
+- 启停状态以 `UserSkillConfig` 为权威源，仅控制运行时是否向模型暴露/加载 Skill；禁用不删除沙箱中的 Skill 文件
 
 ## 4. 行为语义与不变量
 
@@ -63,7 +70,7 @@
 
 三级加载：
 
-- **L1（元数据）**：技能名称和描述注入 system prompt，Agent 知道有哪些技能
+- **L1（元数据）**：每次 LLM 请求前按当前启停快照（30s TTL）生成技能名称和描述，作为请求级上下文拼接，不写入长期 system message；每项 name/description 仅归一化为单行（并对 name 内反引号转义），防止换行伪造条目或破坏 markdown。不做字符数或总 token 上限截断——受单项来源限制，实际体量远小于压缩阈值留出的余量，故不额外做 token 记账
 - **L2（按需加载）**：Agent 调用 `get_skill(name)` → 读取完整 SKILL.md 内容
 - **L3（资源解析）**：自动将 SKILL.md 中的相对路径解析为沙箱绝对路径
 
@@ -72,9 +79,17 @@
 1. 从候选表实例化工具（lazy lambda）
 2. 通过 `exclude` set 排除不需要的工具（如 cron worker 排除 AskUserQuestion、SubAgentTool 和 memory tools）
 3. 条件加载搜索工具（检查 `BOCHA_SEARCH_APPCODE` env var）
-4. 发现 official skills（文件系统）→ 过滤 disabled skills → 发现沙箱 user skills
+4. 发现 official skills（文件系统）并保留完整 inventory → 发现沙箱 user skills
 5. 注册 GetSkillTool（带 lazy push/read 回调）
 6. 返回 `(tools, skill_loader)`
+
+### Skill 启停语义
+
+- SkillLoader 保留官方与用户 Skill 的完整 inventory；禁用项不从 inventory 删除，便于之后重新启用。
+- `UserSkillConfig` 由 SkillLoader 按 TTL 缓存后重新读取（`refresh_disabled_skills`），窗口由 `SKILL_DISABLED_CACHE_TTL_SECONDS` 配置（默认 30s，`0` 表示每步实时查库）：**每步 LLM provider 请求的元数据热路径复用该快照**，避免每步一次 DB 查询；**按需 `get_skill` 的 push/read 守卫路径用 `force=True` 跳过 TTL 强一致读取**，保证运行途中禁用能在单次加载内被捕获。变更无需重建 Agent，元数据最迟在 TTL 内影响后续请求。
+- `UserSkillConfig` 刷新失败时沿用最近一次成功的禁用集合，且失败不刷新 TTL 时间戳（下次调用即重试）；若启动后尚无成功快照，则按全部启用降级，保证与既有“配置查询失败时加载全部 Skills”语义一致。
+- 禁用是 DB/逻辑状态，不删除或改写用户沙箱中的官方/用户 Skill 文件；重新启用后可复用既有文件，必要时再按需推送。
+- 当前 MVP 按单 worker 部署，进程内 Skill inventory、推送标记与并发锁只保证单 worker 内一致性；跨 worker/副本的推送状态协调延后实现。
 
 ### Bash 工具共享状态
 
@@ -138,6 +153,8 @@
 - Skill 目录不存在 → 跳过，warning 日志
 - `exclude` 中包含未知工具名 → warning 日志
 - Skill push 失败 → 不阻塞工具注册
+- Skill 启停配置刷新失败 → 记录 warning 并沿用最近成功状态；无历史状态时默认全部启用
+- 用户沙箱发现失败 → GET Skills 返回官方清单并标记 `sandbox_status=unavailable`
 - 搜索工具 env var 缺失 → 不注册搜索工具（静默降级）
 
 ## 6. 可观测性

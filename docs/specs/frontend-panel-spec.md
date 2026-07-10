@@ -155,7 +155,7 @@ useEffect(() => {
 
 - `GET /api/config/agent-files/{name}`（name ∈ `memory|user|soul`）→ `{ content, version }`
 - `PUT /api/config/agent-files/{name}` body `{ content }` → `{ version }`
-- `GET /api/config/skills` → `{ skills: SkillInfo[] }`
+- `GET /api/config/skills` → `{ skills: SkillInfo[], sandbox_status: 'not_created' | 'available' | 'unavailable' }`，其中 `SkillInfo.source` 为 `official | user`
 - `PUT /api/config/skills/{name}` body `{ enabled }`
 
 ### 4.4 关键不变量
@@ -166,7 +166,11 @@ useEffect(() => {
 - **刷新防覆盖**：激活 `USER.md` / `MEMORY.md` / `SOUL.md` 所在 tab 或点击编辑前，必须重新拉取该文件；若该文件已有本地未保存修改，则跳过刷新以保留用户输入。
 - **保存反馈**：保存成功后短暂显示「已保存」提示（约 1.8s 后自动消失）。
 - **Skills 乐观更新**：toggle 后立即更新 UI，失败时回滚并提示；每个 skill 的切换请求必须独立锁定对应开关，避免并发请求乱序造成 UI 与后端状态不一致。
-- **Skills 启停影响下一次请求**：不改变已发消息的工具集。
+- **Skills 懒加载**：打开 SettingsCenter 不请求技能清单；仅进入「能力设定 · Skills」tab 时请求，之后再次进入可重新刷新。
+- **Skills 来源展示**：每项显示「官方」或「用户」来源标识；用户 Skill 不重复展示 `category=user` 标签。
+- **沙箱状态展示**：`not_created` 时提示尚未创建沙箱、当前仅展示官方 Skills；`unavailable` 时提示沙箱暂不可用、当前清单为部分结果；`available` 不显示降级提示。
+- **部分成功**：`GET /config/skills` 返回 200 且 `sandbox_status!=available` 时不得当作整页错误，仍应渲染返回的官方 Skills。
+- **Skills 启停影响下一次请求**：后端在每次 LLM 请求前读取最新逻辑状态；不改变已发消息，也不删除沙箱文件。
 - **默认入口状态**：从「设置」入口进入默认「我的记忆 · 用户画像」。
 
 ## 6. CronSchedule / CronMessageCenter
@@ -265,6 +269,8 @@ useEffect(() => {
 - [ ] 抽屉打开时聊天区宽度不变（不触发 reflow）
 - [ ] session 切换后 ArtifactsPanel 回到根目录
 - [ ] SettingsCenter 从账户菜单「设置」入口打开，居中弹窗；无未保存修改时点击卡片外遮罩可关闭，有未保存修改时需确认
+- [ ] 打开 SettingsCenter 不请求 Skills；进入「能力设定 · Skills」后才加载，并显示官方/用户来源
+- [ ] Skills 接口返回 `not_created` / `unavailable` 时显示降级提示并保留官方 Skills，`available` 时合并用户 Skills
 - [ ] CronSchedule 顶栏显示日历/列表 segmented switcher，无「消息中心」tab
 - [ ] WeekAgenda 呈现为时间轴日历：左侧 00–23 时间轴 + 7 列，任务按时间 absolute 定位；任务色块统一柔和米橘色，disabled 灰调
 - [ ] WeekAgenda 点击事件块或 hover 才浮出工具条（仅运行图标）
@@ -295,3 +301,4 @@ useEffect(() => {
 4. **抽屉 z-index 低于 Modal** → 点击抽屉里的按钮打开 FilePreview 后被抽屉遮住。
 5. **关闭动画未延迟卸载** → 动画被截断，抽屉瞬间消失。
 6. **Skill toggle 直接等后端响应再更新 UI** → 感觉卡顿；应乐观更新。
+7. **把 sandbox_status 非 available 当成整页失败** → 会隐藏仍可用的官方 Skills；应显示状态提示并保留部分结果。

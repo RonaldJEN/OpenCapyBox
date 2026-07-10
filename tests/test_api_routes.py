@@ -908,6 +908,110 @@ class TestConfigRouter:
         assert skills["docx"]["enabled"] is False
         assert skills["xlsx"]["enabled"] is True
 
+    def test_get_skills_includes_sandbox_user_skills(self, client, tmp_path):
+        """设置页清单应合并沙箱用户 Skill 并标记来源。"""
+        from src.agent.tools.skill_loader import Skill
+
+        fake_settings = MagicMock()
+        fake_settings.skills_dir = str(tmp_path)
+        fake_loader = MagicMock()
+        fake_loader.discover_skills.return_value = [
+            Skill(name="pdf", description="PDF", content=""),
+        ]
+        sandbox_service = MagicMock()
+        cached_sandbox = MagicMock(id="sbx-current")
+        sandbox_service.get_cached.return_value = cached_sandbox
+
+        async def _get_existing_after_db_release(user_id, sandbox_id):
+            assert client.mock_db.rollback.called  # type: ignore[attr-defined]
+            return cached_sandbox
+
+        sandbox_service.get_existing = AsyncMock(
+            side_effect=_get_existing_after_db_release
+        )
+        sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[{
+            "name": "my-skill",
+            "description": "User uploaded",
+            "sandbox_skill_dir": "/home/user/skills/my-skill",
+        }])
+        client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader",
+            return_value=fake_loader,
+        ), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ):
+            response = client.get("/config/skills")
+
+        assert response.status_code == 200
+        skills = {item["name"]: item for item in response.json()["skills"]}
+        assert skills["pdf"]["source"] == "official"
+        assert skills["my-skill"]["source"] == "user"
+        assert skills["my-skill"]["category"] == "user"
+        assert response.json()["sandbox_status"] == "available"
+        sandbox_service.get_existing.assert_awaited_once_with(
+            "testuser",
+            "sbx-current",
+        )
+        sandbox_service.discover_sandbox_skills.assert_awaited_once_with(
+            "testuser",
+            {"pdf"},
+            strict=True,
+        )
+
+    def test_get_skills_marks_unavailable_sandbox_as_partial_success(
+        self, client, tmp_path
+    ):
+        from src.agent.tools.skill_loader import Skill
+
+        fake_settings = MagicMock()
+        fake_settings.skills_dir = str(tmp_path)
+        fake_loader = MagicMock()
+        fake_loader.discover_skills.return_value = [
+            Skill(name="pdf", description="PDF", content=""),
+        ]
+        sandbox_service = MagicMock()
+        cached_sandbox = MagicMock(id="sbx-current")
+        sandbox_service.get_cached.return_value = cached_sandbox
+        sandbox_service.get_existing = AsyncMock(
+            side_effect=RuntimeError("sandbox unavailable")
+        )
+        client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader",
+            return_value=fake_loader,
+        ), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ):
+            response = client.get("/config/skills")
+
+        assert response.status_code == 200
+        assert response.json()["sandbox_status"] == "unavailable"
+        assert [skill["name"] for skill in response.json()["skills"]] == ["pdf"]
+        client.mock_db.rollback.assert_called_once()  # type: ignore[attr-defined]
+
+    def test_disabling_skill_is_logical_only(self, client):
+        sandbox_service = MagicMock()
+        client.mock_db.query.return_value.filter.return_value.first.return_value = None  # type: ignore[attr-defined]
+
+        with patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ):
+            response = client.put(
+                "/config/skills/my-skill",
+                json={"enabled": False},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["enabled"] is False
+        client.mock_db.commit.assert_called_once()  # type: ignore[attr-defined]
+        assert sandbox_service.mock_calls == []
+
 
 class TestEncodeFilename:
     """文件名編碼測試"""

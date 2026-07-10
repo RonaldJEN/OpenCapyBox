@@ -191,13 +191,22 @@ class AgentService:
             max_images=model_config.max_images,
         )
 
-        # 注入技能元数据到系统提示符（Progressive Disclosure - Level 1）
+        # 技能元数据和时间一样按 LLM 请求动态生成，不写入长期 system message。
+        runtime_prompt_provider = None
         if self.skill_loader:
-            skills_metadata = self.skill_loader.get_skills_metadata_prompt()
-            if skills_metadata:
-                system_prompt += f"\n\n## 已注册技能列表\n\n{skills_metadata}\n"
-                total = len(self.skill_loader.loaded_skills) + len(self.skill_loader.sandbox_skills)
-                logger.info("已注入 %d 个技能元数据到系统提示符", total)
+            def _build_skills_runtime_prompt() -> str:
+                try:
+                    self.skill_loader.refresh_disabled_skills()
+                except Exception as e:
+                    # SkillLoader normally keeps the last-known snapshot itself;
+                    # retain metadata even for alternate/test loaders that raise.
+                    logger.warning("刷新请求级 Skill 启停配置失败，沿用上次状态: %s", e)
+                skills_metadata = self.skill_loader.get_skills_metadata_prompt()
+                if not skills_metadata:
+                    return ""
+                return f"## 已注册技能列表\n\n{skills_metadata}"
+
+            runtime_prompt_provider = _build_skills_runtime_prompt
 
         # 创建 Agent
         self.agent = Agent(
@@ -211,6 +220,7 @@ class AgentService:
             max_output_tokens=model_config.max_tokens,  # output token limit, not context
             tool_timeout=settings.agent_tool_timeout,
             subagent_max_parallel=settings.agent_subagent_max_parallel,
+            runtime_prompt_provider=runtime_prompt_provider,
         )
 
         # 从数据库恢复历史

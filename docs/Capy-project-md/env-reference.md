@@ -76,6 +76,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 | `AGENT_TOOL_TIMEOUT` | 否 | `300` | 单次工具执行超时（秒），0 表示不限。详见下方超时体系说明 |
 | `AGENT_SUBAGENT_MAX_PARALLEL` | 否 | `3` | 同一父 Agent step 内最多并行执行的 `sub_agent` 数；`1` 表示串行 |
 | `AGENT_USER_CONCURRENCY_LIMIT` | 否 | `1` | 同一用户允许同时运行的不同会话数 |
+| `SKILL_DISABLED_CACHE_TTL_SECONDS` | 否 | `30` | Skill 启停快照复用窗口（秒），避免每步 LLM 请求都查库；改启停最迟约此值内生效，`0` 表示每步实时查库 |
 | `SSE_HEARTBEAT_INTERVAL` | 否 | `15` | SSE 心跳间隔（秒） |
 | `SSE_SUBSCRIBE_TIMEOUT` | 否 | `300` | SSE 订阅超时（秒） |
 | `AGUI_REPAIR_TERMINAL_SINCE_HOURS` | 否 | `24` | `scripts/repair_terminal_runs.py` 默认扫描窗口（小时） |

@@ -85,6 +85,112 @@ class TestAgentServiceCreateTools:
         assert image_tool._supports_image is True
         assert image_tool._model_max_images == 3
 
+    @pytest.mark.asyncio
+    async def test_skill_config_query_failure_keeps_skill_metadata_and_tool_available(
+        self, service, tmp_path
+    ):
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "pdf"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: pdf\ndescription: PDF documents\n---\nUse PDF guidance.\n",
+            encoding="utf-8",
+        )
+        failing_db = MagicMock()
+        failing_db.query.side_effect = RuntimeError("skill config database unavailable")
+        db_session_factory = MagicMock(return_value=failing_db)
+        sandbox_service = MagicMock()
+        sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[])
+
+        async def _push_skill(*_args, enabled_check=None, **_kwargs):
+            assert enabled_check is not None
+            assert enabled_check() is True
+            return True
+
+        sandbox_service.push_skill = AsyncMock(side_effect=_push_skill)
+
+        with patch("src.api.services.tool_factory.settings") as mock_settings, patch(
+            "src.api.services.tool_factory.get_sandbox_service",
+            return_value=sandbox_service,
+        ):
+            mock_settings.bocha_search_appcode = None
+            mock_settings.skills_dir = str(skills_dir)
+            mock_settings.sandbox_background_command_timeout_seconds = 21600
+            from src.api.services.tool_factory import create_agent_tools
+
+            tools, loader = await create_agent_tools(
+                sandbox=service.sandbox,
+                workspace_dir=service._workspace_dir,
+                mount="/home/user",
+                user_id=service.user_id,
+                db_session_factory=db_session_factory,
+            )
+            skill_tool = next(tool for tool in tools if tool.name == "get_skill")
+            result = await skill_tool.execute(skill_name="pdf")
+            unknown_result = await skill_tool.execute(skill_name="not-installed")
+
+        assert loader is not None
+        assert "`pdf`" in loader.get_skills_metadata_prompt()
+        assert result.success is True
+        assert "Use PDF guidance" in result.content
+        assert unknown_result.success is False
+        assert sandbox_service.push_skill.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_user_skill_disabled_during_read_is_not_cached_or_returned(
+        self, service, tmp_path
+    ):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        state = {"disabled": False}
+        disabled_record = SimpleNamespace(skill_name="my-skill", enabled=False)
+
+        def db_session_factory():
+            db = MagicMock()
+            db.query.return_value.filter.return_value.all.return_value = (
+                [disabled_record] if state["disabled"] else []
+            )
+            return db
+
+        sandbox_service = MagicMock()
+        sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[{
+            "name": "my-skill",
+            "description": "User skill",
+            "sandbox_skill_dir": "/home/user/skills/my-skill",
+        }])
+
+        async def _read_and_disable(*_args, **_kwargs):
+            state["disabled"] = True
+            return "User-only guidance"
+
+        sandbox_service.read_sandbox_skill_content = AsyncMock(
+            side_effect=_read_and_disable
+        )
+
+        with patch("src.api.services.tool_factory.settings") as mock_settings, patch(
+            "src.api.services.tool_factory.get_sandbox_service",
+            return_value=sandbox_service,
+        ):
+            mock_settings.bocha_search_appcode = None
+            mock_settings.skills_dir = str(skills_dir)
+            mock_settings.sandbox_background_command_timeout_seconds = 21600
+            from src.api.services.tool_factory import create_agent_tools
+
+            tools, loader = await create_agent_tools(
+                sandbox=service.sandbox,
+                workspace_dir=service._workspace_dir,
+                mount="/home/user",
+                user_id=service.user_id,
+                db_session_factory=db_session_factory,
+            )
+            skill_tool = next(tool for tool in tools if tool.name == "get_skill")
+            result = await skill_tool.execute(skill_name="my-skill")
+
+        assert loader is not None
+        assert result.success is False
+        assert "my-skill" in loader.disabled_skill_names
+        assert loader.sandbox_skills["my-skill"].content == ""
+
 
 class TestAgentServiceRestoreHistory:
     def test_restore_history_empty_gives_empty_messages(self):
@@ -830,6 +936,32 @@ class TestAgentServiceInitializeAgent:
                     MockAgent.return_value = MagicMock()
                     await service.initialize_agent()
                     assert service.agent is not None
+
+    @pytest.mark.asyncio
+    async def test_runtime_skill_metadata_survives_refresh_failure(self, service):
+        loader = MagicMock()
+        loader.refresh_disabled_skills.side_effect = RuntimeError("database unavailable")
+        loader.get_skills_metadata_prompt.return_value = "- `pdf`: PDF documents"
+        service._provision_default_files_if_needed = MagicMock()
+        service._load_system_prompt = MagicMock(return_value="system")
+        service._restore_history = MagicMock()
+
+        with patch("src.api.services.agent_service.settings") as mock_settings, patch(
+            "src.api.services.agent_service.create_agent_tools",
+            new_callable=AsyncMock,
+            return_value=([], loader),
+        ), patch("src.api.services.agent_service.LLMClient") as MockLLM, patch(
+            "src.api.services.agent_service.Agent"
+        ) as MockAgent:
+            mock_settings.agent_max_steps = 10
+            mock_settings.agent_tool_timeout = 300
+            mock_settings.agent_subagent_max_parallel = 1
+            MockLLM.from_model_config.return_value = MagicMock()
+
+            await service.initialize_agent()
+
+        runtime_provider = MockAgent.call_args.kwargs["runtime_prompt_provider"]
+        assert "`pdf`" in runtime_provider()
 
     @pytest.mark.asyncio
     async def test_initialize_agent_filters_multimodal_incompatible_fallbacks(self, service):

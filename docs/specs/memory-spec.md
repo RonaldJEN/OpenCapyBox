@@ -103,13 +103,17 @@
       "name": "web_search",
       "description": "搜索互联网",
       "category": "builtin",
+      "source": "official",
       "enabled": true
     }
-  ]
+  ],
+  "sandbox_status": "available"
 }
 ```
 
 - 合并 SkillLoader 发现结果 + UserSkillConfig 数据库状态
+- `source` 为 `official` 或 `user`；`sandbox_status` 为 `not_created`、`available` 或 `unavailable`
+- 沙箱未创建或暂不可用时仍返回 200 和官方 Skills；用户 Skills 仅在沙箱可用并发现成功时合并
 
 ### PUT /api/config/skills/{skill_name}
 
@@ -128,6 +132,8 @@
   "message": "ok"
 }
 ```
+
+- 启停仅更新 `UserSkillConfig` 并影响后续 LLM 请求的 Skill 元数据/按需加载；不会删除沙箱中的 Skill 文件
 
 ---
 
