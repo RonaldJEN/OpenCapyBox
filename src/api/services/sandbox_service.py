@@ -439,6 +439,30 @@ class SandboxSessionService:
         async with self._get_lifecycle_lock(user_id):
             return await self._get_or_resume_unlocked(user_id, sandbox_id)
 
+    async def get_or_resume_and_renew(
+        self, user_id: str, sandbox_id: str | None = None
+    ) -> Sandbox:
+        """獲取並續租同一沙箱，失敗恢復全程持有用戶生命週期鎖。"""
+        async with self._get_lifecycle_lock(user_id):
+            sandbox = await self._get_or_resume_unlocked(user_id, sandbox_id)
+            if await self._renew_instance(user_id, sandbox):
+                return sandbox
+
+            logger.warning(
+                "沙箱續租失敗，清理快取後重新獲取 "
+                "(user=%s, sandbox_id=%s)",
+                user_id,
+                self._sandbox_id_from_instance(sandbox) or sandbox_id,
+            )
+            retry_sandbox_id = self._sandbox_id_from_instance(sandbox) or sandbox_id
+            if self._cache.get(user_id) is sandbox:
+                self.invalidate_cache(user_id)
+
+            sandbox = await self._get_or_resume_unlocked(user_id, retry_sandbox_id)
+            if not await self._renew_instance(user_id, sandbox):
+                raise RuntimeError("沙箱續租失敗，無法安全開始任務")
+            return sandbox
+
     async def get_existing(
         self, user_id: str, sandbox_id: str
     ) -> Sandbox:
@@ -875,6 +899,25 @@ class SandboxSessionService:
             except Exception:
                 pass
 
+    async def _renew_instance(self, user_id: str, sandbox: Sandbox) -> bool:
+        """直接續租指定實例，避免按 user_id 二次讀取到不同快取。"""
+        try:
+            await sandbox.renew(timedelta(minutes=settings.sandbox_timeout_minutes))
+            logger.debug(
+                "沙箱已續租 (user=%s, sandbox_id=%s)",
+                user_id,
+                self._sandbox_id_from_instance(sandbox),
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "沙箱續租失敗 (user=%s, sandbox_id=%s): %s",
+                user_id,
+                self._sandbox_id_from_instance(sandbox),
+                e,
+            )
+            return False
+
     async def renew(self, user_id: str) -> bool:
         """續租沙箱（保持活躍狀態）
 
@@ -884,17 +927,11 @@ class SandboxSessionService:
         Returns:
             是否成功續租
         """
-        sandbox = self._cache.get(user_id)
-        if not sandbox:
-            return False
-
-        try:
-            await sandbox.renew(timedelta(minutes=settings.sandbox_timeout_minutes))
-            logger.debug("沙箱已續租 (user=%s)", user_id)
-            return True
-        except Exception as e:
-            logger.warning("沙箱續租失敗 (user=%s): %s", user_id, e)
-            return False
+        async with self._get_lifecycle_lock(user_id):
+            sandbox = self._cache.get(user_id)
+            if not sandbox:
+                return False
+            return await self._renew_instance(user_id, sandbox)
 
     # ------------------------------------------------------------------
     # 輔助方法

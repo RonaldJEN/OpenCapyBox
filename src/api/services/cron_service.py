@@ -410,6 +410,11 @@ class CronService:
         return result, total
 
 
+async def _get_renewed_cron_sandbox(sandbox_service, user_id: str, sandbox_id: str | None):
+    """Get a usable sandbox and renew it before an unattended cron run starts."""
+    return await sandbox_service.get_or_resume_and_renew(user_id, sandbox_id)
+
+
 async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -> str | None:
     """执行单个 Cron 任务（从 CronJob DB 查任务定义）
 
@@ -478,7 +483,11 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
             user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
             sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
 
-        sandbox = await sandbox_service.get_or_resume(user_id, sandbox_id)
+        sandbox = await _get_renewed_cron_sandbox(
+            sandbox_service,
+            user_id,
+            sandbox_id,
+        )
         latest_sandbox_id = sandbox_service.get_sandbox_id(user_id)
         if isinstance(latest_sandbox_id, str) and latest_sandbox_id:
             with SessionLocal() as db:
