@@ -3,7 +3,7 @@
 import time
 import uuid
 import jwt
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session as DBSession
 
@@ -16,6 +16,7 @@ _ISSUER = "opencapybox"
 _ALGORITHM = "HS256"
 
 _bearer_scheme = HTTPBearer(auto_error=False)
+MOBILE_SESSION_COOKIE_NAME = "opencapybox_mobile_session"
 
 
 def _unauthorized(detail: str) -> HTTPException:
@@ -106,13 +107,20 @@ def verify_access_token(token: str, db: DBSession | None = None) -> str:
 
 
 async def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
     db: DBSession = Depends(get_db),
 ) -> str:
-    """从 Bearer Token 校验并返回当前用户 ID。"""
-    if not credentials or credentials.scheme.lower() != "bearer":
+    """从 Bearer Token 或移动端 HttpOnly Cookie 校验当前用户。"""
+    if credentials:
+        if credentials.scheme.lower() != "bearer":
+            raise _unauthorized("未提供访问令牌")
+        return verify_access_token(credentials.credentials, db)
+
+    cookie_token = request.cookies.get(MOBILE_SESSION_COOKIE_NAME)
+    if not cookie_token:
         raise _unauthorized("未提供访问令牌")
-    return verify_access_token(credentials.credentials, db)
+    return verify_access_token(cookie_token, db)
 
 
 async def get_current_admin_user(

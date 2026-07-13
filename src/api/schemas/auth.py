@@ -19,3 +19,18 @@ class LoginResponse(BaseModel):
     role: str
     is_admin: bool
     message: str = "登录成功"
+
+
+class MobileSessionRequest(BaseModel):
+    """移动端企业 SSO 会话交换请求。"""
+
+    nd_auth_token: str | None = None
+
+
+class MobileSessionResponse(BaseModel):
+    """移动端会话信息；JWT 仅通过 HttpOnly Cookie 下发。"""
+
+    user_id: str
+    username: str
+    role: str
+    is_admin: bool

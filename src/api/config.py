@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     auth_secret_key: str = ""
     auth_token_expire_minutes: int = 720
 
+    # 企业微信移动端 SSO。浏览器先经企业网关建立 Cookie，后端再调用
+    # curUser 校验域账号并签发 OpenCapyBox 自身会话 Cookie。
+    mobile_sso_gateway_base_url: str = ""
+    mobile_sso_current_user_path: str = "/base/sys/role/curUser"
+    mobile_sso_timeout_seconds: float = 10.0
+    # 企业网关要求的可选附加请求头；名称留空时不发送。
+    mobile_sso_gateway_header_name: str = ""
+    mobile_sso_gateway_header_value: str = ""
+    mobile_auth_cookie_secure: bool = True
+
     # LDAP 直连认证配置。LDAP_URLS 支持逗号分隔主备地址。
     ldap_urls: str = ""
     ldap_user_domain: str = ""

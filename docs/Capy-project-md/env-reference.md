@@ -14,10 +14,18 @@
 | `AUTH_ADMIN_USERS` | 首次初始化需要 | `admin` | 首次 bootstrap 管理员用户名列表，格式：`admin,user2`，需出现在 `SIMPLE_AUTH_USERS` 中。运行时管理员权限以 `auth_users.is_admin` 为准 |
 | `AUTH_SECRET_KEY` | 是 | 派生密钥（启动告警） | JWT 签名密钥，建议 32+ 随机字符串 |
 | `AUTH_TOKEN_EXPIRE_MINUTES` | 否 | `720` | JWT 过期时间（分钟） |
+| `MOBILE_SSO_GATEWAY_BASE_URL` | 移动端必填 | — | 企业认证网关内部基础地址；后端使用浏览器 Cookie 调用 `curUser` |
+| `MOBILE_SSO_CURRENT_USER_PATH` | 否 | `/base/sys/role/curUser` | 企业网关当前用户接口路径 |
+| `MOBILE_SSO_TIMEOUT_SECONDS` | 否 | `10` | 后端请求企业认证网关的超时时间 |
+| `MOBILE_SSO_GATEWAY_HEADER_NAME` | 否 | 空 | 企业网关要求的可选附加请求头名称；留空时不发送 |
+| `MOBILE_SSO_GATEWAY_HEADER_VALUE` | 配置请求头名称时必填 | 空 | 企业网关附加请求头的值 |
+| `MOBILE_AUTH_COOKIE_SECURE` | 否 | `true` | 移动端 HttpOnly Cookie 是否仅允许 HTTPS；仅本地 HTTP 联调设为 `false` |
 | `LDAP_URLS` | LDAP 用户登录需要 | — | LDAP 地址列表，逗号分隔，按顺序主备尝试；生产环境建议使用 `ldaps://`，例如 `ldaps://ldap.example.local,ldaps://ldap-backup.example.local:636` |
 | `LDAP_USER_DOMAIN` | 否 | — | LDAP 绑定域；填写 `example.local` 时使用 `username@example.local` 作为 bind 用户，不填则直接使用短账号 |
 
 认证用户、启停状态、管理员权限、周/月 token 限额运行时均以 `auth_users` 表为事实源。`SIMPLE_AUTH_USERS` / `AUTH_ADMIN_USERS` 只负责空表首次初始化，后续请通过管理后台维护用户。
+
+企业微信移动端不保存账号密码或 localStorage Token。浏览器经外层网关建立企业 Cookie，`POST /api/auth/mobile/session` 再由后端调用 `curUser` 验证域账号，并签发本系统 host-only HttpOnly Cookie。正式入口域名必须位于企业 Cookie 可覆盖的域下。
 
 ## API / 数据库 / CORS
 
