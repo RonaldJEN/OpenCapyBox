@@ -53,7 +53,7 @@
 | DELETE | `/rules/{id}` | 删除用户级规则 |
 | GET | `/tools` | 工具清单 + 每个工具的当前裁决 `effect` 与 `matched_rule_id` |
 
-- `GET /tools` 汇总内置工具（默认 `allow`）与该用户 installation 作用域内的 MCP 快照工具（默认 `ask`），并按 §4.1 裁决
+- `GET /tools` 汇总内置工具与该用户 installation 作用域内的 MCP 快照工具（均默认 `allow`），并按 §4.1 裁决
 - `GET /rules` 中 `managed=true` 的平台规则仅用于展示权限天花板，用户端不得 PATCH/DELETE；用户端只可管理 `scope_type=user`、`scope_id` 为自己的非 managed 规则
 - 变更规则后调用 `invalidate_user_async` 让 Agent 池尽快生效（DB `policy_version` 为权威源）
 
@@ -81,13 +81,14 @@
 2. **本地规则（user/session，非 managed）**：先取最高**特异度**，特异度相同再取最**严格** effect
    - 特异度 `_specificity` = `(scope_rank, server_match, tool_match, priority)`；`scope_rank`: platform<user<session
    - 严格度 `_restrictiveness`: allow(1) < ask(2) < deny(3)
-3. 无本地规则时：平台 managed ALLOW → allow；否则用 provider 默认（builtin=allow，mcp=ask）
+3. 无本地规则时：平台 managed ALLOW → allow；否则用 provider 默认（builtin=allow，mcp=allow）
 4. **平台 managed ASK 是天花板**：下级可收紧到 DENY，但不可放宽到 ALLOW（ALLOW 会被抬回 ASK）
 
-### 4.2 条件匹配（`_rule_conditions_match`，fail-closed）
+### 4.2 条件匹配（无效授权不命中，限制规则保守生效）
 - `conditions_json` NULL = 无条件适用
-- 解析/校验失败：**ALLOW 规则失效**（不得授权），ASK/DENY 仍保守适用
-- 有条件时要求 `schema_hash` 相等；MCP 还要求 `connection_fingerprint` 相等
+- 解析/校验失败：该条件 **ALLOW 规则不参与裁决**，ASK/DENY 仍保守适用，避免损坏的限制规则被意外移除
+- 有条件时要求 `schema_hash` 相等；MCP 还要求 `connection_fingerprint` 相等；绑定不匹配的条件 ALLOW 同样不参与裁决
+- 条件规则不参与裁决后，最终结果继续由其他适用规则及 provider 默认策略决定；由于 MCP 默认 `allow`，没有其他限制规则时最终仍为 `ALLOW`
 
 ### 4.3 审批解决与「记住选择」
 - `allow_once`：仅本次执行，不建规则
@@ -140,7 +141,7 @@
 | 并发解决同一审批 | CAS 只放一个成功，其余抛「already resolved」 |
 | 执行中 worker 崩溃 | 租约到期后 reconciler 置 `unknown`，不自动重试 |
 | 完成时 claim token 不匹配 | 拒绝完成（陈旧 worker 被围栏挡下） |
-| 规则条件损坏 | ALLOW 失效、ASK/DENY 保守生效 |
+| 规则条件损坏或绑定不匹配 | 条件 ALLOW 不参与裁决，ASK/DENY 保守生效；最终结果按其他适用规则及 provider 默认策略计算 |
 | MCP 服务被删但审批未决 | 保留原始身份为证据，执行前重新校验归属/可用性 |
 | 记住选择时绑定已漂移 | 只执行本次，不建规则 |
 | 手动设置无权访问/已停用的 MCP | selection 接口拒绝（404），不改动任何规则 |

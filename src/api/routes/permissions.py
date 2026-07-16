@@ -318,7 +318,7 @@ async def get_permission_tools(
                 server_id=server.id,
                 tool_name=snapshot.tool_name,
             )
-            default_effect = "ask"
+            default_effect = "allow"
             if installation.id not in installation_fingerprints:
                 effective = resolve_effective_mcp_installation(
                     db,

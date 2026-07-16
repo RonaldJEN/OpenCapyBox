@@ -899,7 +899,7 @@ def test_clear_selection_endpoint_cleans_up_rules_for_inaccessible_mcp(permissio
         )
 
 
-def test_default_policy_allows_builtin_and_asks_for_mcp(permission_db):
+def test_default_policy_allows_builtin_and_mcp(permission_db):
     builtin = _decision(permission_db, ToolRef(provider="builtin", tool_name="read_file"))
     remote = _decision(
         permission_db,
@@ -908,7 +908,7 @@ def test_default_policy_allows_builtin_and_asks_for_mcp(permission_db):
 
     assert builtin.effect == "allow"
     assert builtin.reason == "using builtin default policy"
-    assert remote.effect == "ask"
+    assert remote.effect == "allow"
     assert remote.reason == "using mcp default policy"
 
 
@@ -1011,7 +1011,7 @@ def test_batch_permission_evaluator_matches_single_semantics_with_one_rule_query
         "deny",
         "ask",
         "allow",
-        "ask",
+        "allow",
     ]
     assert len(rule_selects) == 1
 
@@ -1794,19 +1794,25 @@ def test_remembered_mcp_allow_is_bound_to_approved_schema(
         schema_hash="schema-v1",
         connection_fingerprint=connection_fingerprint,
     ).effect == "allow"
-    assert _decision(
+    stale_schema = _decision(
         permission_db,
         ref,
         schema_hash="schema-v2",
         connection_fingerprint=connection_fingerprint,
-    ).effect == "ask"
-    assert _decision(
+    )
+    assert stale_schema.effect == "allow"
+    assert stale_schema.matched_rule_id is None
+    stale_connection = _decision(
         permission_db,
         ref,
         schema_hash="schema-v1",
         connection_fingerprint="changed-target",
-    ).effect == "ask"
-    assert _decision(permission_db, ref).effect == "ask"
+    )
+    assert stale_connection.effect == "allow"
+    assert stale_connection.matched_rule_id is None
+    missing_binding = _decision(permission_db, ref)
+    assert missing_binding.effect == "allow"
+    assert missing_binding.matched_rule_id is None
 
 
 @pytest.mark.parametrize(
@@ -1944,7 +1950,7 @@ def test_conditions_are_supported_only_for_allow_rules(permission_db):
         '{"version":1,"schema_hash":"schema-v1","connection_fingerprint":"connection-v1","unknown":true}',
     ],
 )
-def test_invalid_persisted_allow_conditions_fail_closed(permission_db, conditions_json):
+def test_invalid_persisted_allow_conditions_are_ignored(permission_db, conditions_json):
     tool_name = f"invalid-{abs(hash(conditions_json))}"
     permission_db.add(ToolPermissionRule(
         id=f"rule-{abs(hash(conditions_json))}",
@@ -1969,7 +1975,8 @@ def test_invalid_persisted_allow_conditions_fail_closed(permission_db, condition
         connection_fingerprint="connection-v1",
     )
 
-    assert decision.effect == "ask"
+    assert decision.effect == "allow"
+    assert decision.matched_rule_id is None
 
 
 @pytest.mark.parametrize("effect", ["ask", "deny"])
@@ -2020,12 +2027,14 @@ def test_versioned_mcp_allow_requires_both_live_bindings(permission_db):
         schema_hash="schema-v1",
         connection_fingerprint="connection-v1",
     ).effect == "allow"
-    assert _decision(
+    missing_connection = _decision(
         permission_db,
         ref,
         schema_hash="schema-v1",
         connection_fingerprint=None,
-    ).effect == "ask"
+    )
+    assert missing_connection.effect == "allow"
+    assert missing_connection.matched_rule_id is None
 
 
 def test_deleted_mcp_target_can_resolve_without_creating_dangling_allow_rule(

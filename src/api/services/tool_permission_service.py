@@ -436,7 +436,7 @@ def evaluate_tool_permissions(
         _validate_ref(check.ref)
         default_effect = check.default_effect
         if default_effect is None:
-            default_effect = "allow" if check.ref.provider == "builtin" else "ask"
+            default_effect = "allow"
         if default_effect not in VALID_EFFECTS:
             raise ValueError(f"invalid default effect: {default_effect}")
         prepared.append((check, default_effect))
