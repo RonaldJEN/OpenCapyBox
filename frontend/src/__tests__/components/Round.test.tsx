@@ -60,6 +60,30 @@ describe('Round 组件', () => {
     expect(screen.getByText('请帮我分析这个问题')).toBeInTheDocument();
   });
 
+  it('工具审批控制标记不渲染为用户消息气泡', () => {
+    const round = createMockRound({
+      user_message: 'Tool approval: allow_once',
+      control_kind: 'tool_approval',
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    // 审批解决结果是控制决策而非用户输入，不应出现在对话气泡里。
+    expect(screen.queryByText('Tool approval: allow_once')).not.toBeInTheDocument();
+    expect(screen.queryByText('你')).not.toBeInTheDocument();
+    // 助手响应仍正常渲染。
+    expect(screen.getByText('这是我的分析结果...')).toBeInTheDocument();
+  });
+
+  it('普通用户发送审批格式文本时仍渲染用户消息气泡', () => {
+    const round = createMockRound({ user_message: 'Tool approval: allow_once' });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    expect(screen.getByText('Tool approval: allow_once')).toBeInTheDocument();
+    expect(screen.getByText('你')).toBeInTheDocument();
+  });
+
   it('应该渲染助手最终响应', () => {
     const round = createMockRound();
 

@@ -315,6 +315,19 @@ class TestHistoryServiceGetSessionRounds:
         
         assert rounds == []
 
+    def test_tool_approval_resume_ids_use_structural_join(
+        self, history_service, mock_db
+    ):
+        query = mock_db.query.return_value
+        query.join.return_value.filter.return_value.all.return_value = [
+            ("round-approval-resume",),
+        ]
+
+        result = history_service._get_tool_approval_resume_round_ids("session-123")
+
+        assert result == {"round-approval-resume"}
+        query.join.assert_called_once()
+
     def test_get_session_rounds_with_data(self, history_service, mock_db):
         """測試獲取有數據的會話輪次（steps 從 AG-UI 事件重建）"""
         mock_round = MagicMock()
@@ -357,6 +370,52 @@ class TestHistoryServiceGetSessionRounds:
         assert rounds[0]["user_message"] == "Hello"
         # steps 從事件重建
         assert "steps" in rounds[0]
+
+    def test_get_session_rounds_marks_durable_tool_approval_controls(
+        self, history_service, mock_db
+    ):
+        """Only structurally linked approval resumes receive control_kind."""
+
+        approval_round = MagicMock(
+            id="round-approval-resume",
+            user_message="Tool approval: allow_once",
+            final_response="done",
+            step_count=0,
+            status="completed",
+            created_at=datetime.now(),
+            completed_at=datetime.now(),
+            user_attachments=None,
+            parent_run_id="round-parent",
+            idempotency_key=None,
+            interrupt_payload=None,
+        )
+        literal_round = MagicMock(
+            id="round-literal",
+            user_message="Tool approval: deny",
+            final_response="ordinary response",
+            step_count=0,
+            status="completed",
+            created_at=datetime.now(),
+            completed_at=datetime.now(),
+            user_attachments=None,
+            parent_run_id=None,
+            idempotency_key=None,
+            interrupt_payload=None,
+        )
+        history_service._get_subagent_child_round_ids = MagicMock(return_value=set())
+        history_service._get_tool_approval_resume_round_ids = MagicMock(
+            return_value={"round-approval-resume"}
+        )
+        history_service._rebuild_steps_from_events = MagicMock(return_value=([], 0))
+        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            approval_round,
+            literal_round,
+        ]
+
+        rounds = history_service.get_session_rounds("session-123")
+
+        assert rounds[0]["control_kind"] == "tool_approval"
+        assert rounds[1]["control_kind"] is None
 
 
 class TestHistoryServiceRebuildSteps:

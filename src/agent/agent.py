@@ -18,8 +18,9 @@ from src.api.utils.timezone import get_timezone, get_timezone_offset
 from .llm import LLMClient
 from .logger import AgentLogger
 from .schema import Message
-from .tools.base import Tool, ToolResult, ToolRuntimeContext
+from .tools.base import Tool, ToolExposure, ToolResult, ToolRuntimeContext
 from .tools.ask_user_tool import ASK_USER_TOOL_NAME
+from .tools.tool_discovery import TOOL_SEARCH_NAME, ToolDiscoveryTool
 from .utils import calculate_display_width
 from .utils.token_utils import truncate_text_by_tokens
 from .event_emitter import AGUIEventEmitter
@@ -28,6 +29,26 @@ from .schema.agui_events import (
 )
 
 logger = logging.getLogger(__name__)
+
+_TOOL_UNAVAILABLE_MESSAGE = "Tool is unavailable in this conversation"
+_MAX_DEFERRED_TOOLS_PER_SESSION = 32
+_MAX_DEFERRED_TOOL_SESSIONS = 128
+_MAX_TOOL_SEARCH_DESCRIPTION_BYTES = 2 * 1024
+
+
+def _tool_search_description_preview(value: object) -> str:
+    """Keep repeated deferred-tool searches bounded by a small text preview."""
+
+    # Slice before encoding so even a future provider with unexpectedly large
+    # metadata cannot force an unbounded temporary UTF-8 allocation here.
+    text = str(value or "")[:_MAX_TOOL_SEARCH_DESCRIPTION_BYTES]
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= _MAX_TOOL_SEARCH_DESCRIPTION_BYTES:
+        return text
+    return encoded[:_MAX_TOOL_SEARCH_DESCRIPTION_BYTES].decode(
+        "utf-8",
+        errors="ignore",
+    )
 
 
 @dataclass(frozen=True)
@@ -39,6 +60,30 @@ class _ExecutedToolCall:
     result: ToolResult
     result_content: str
     execution_time_ms: int
+
+
+@dataclass(frozen=True)
+class _ToolPolicyDecision:
+    effect: str
+    reason: str
+    matched_rule_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _PendingApprovedToolCall:
+    request_id: str
+    tool_call_id: str
+    function_name: str
+    arguments: dict[str, Any]
+    provider: str
+    tool_name: str
+    server_id: str | None
+    installation_id: str | None
+    schema_hash: str | None
+    resolution: str
+    should_execute: bool
+    connection_fingerprint: str | None = None
+    claim_token: str | None = None
 
 
 # ANSI color codes
@@ -84,9 +129,23 @@ class Agent:
         tool_timeout: int = 300,  # 单次工具执行超时（秒），0 表示不限
         subagent_max_parallel: int = 1,  # 同一 step 内最多并行执行的 sub_agent 数
         runtime_prompt_provider: Callable[[], str] | None = None,
+        user_id: str | None = None,
+        allow_human_interrupts: bool = True,
     ):
         self.llm = llm_client
-        self.tools = {tool.name: tool for tool in tools}
+        self.tools: dict[str, Tool] = {}
+        for tool in tools:
+            if not isinstance(tool.exposure, ToolExposure):
+                raise ValueError(
+                    f"Invalid exposure {tool.exposure!r} for tool {tool.name!r}"
+                )
+            if tool.name in self.tools:
+                previous = self.tools[tool.name]
+                raise ValueError(
+                    "Duplicate model tool name "
+                    f"{tool.name!r}: {previous.tool_ref!r} conflicts with {tool.tool_ref!r}"
+                )
+            self.tools[tool.name] = tool
 
         # Level 2 microcompact: tool result 超過此字符數時壓縮為摘要佔位符
         self._MICROCOMPACT_CHAR_THRESHOLD = 4000
@@ -112,6 +171,22 @@ class Agent:
         self.context_window = context_window
         self.max_output_tokens = max_output_tokens
         self.workspace_dir = Path(workspace_dir)
+        self.user_id = user_id
+        self.allow_human_interrupts = allow_human_interrupts
+
+        # Deferred tools stay registered for execution and policy checks, but
+        # their schemas are projected only after an explicit, session-scoped
+        # discovery call. Activations are deliberately in-memory: after a cold
+        # restart the model must discover the tool again, while a previously
+        # claimed human approval can still resume through its durable record.
+        self._activated_deferred_tools: dict[str, dict[str, None]] = {}
+        if any(tool.exposure == ToolExposure.DEFERRED for tool in self.tools.values()):
+            if TOOL_SEARCH_NAME in self.tools:
+                raise ValueError(
+                    f"{TOOL_SEARCH_NAME!r} is reserved when deferred tools are registered"
+                )
+            discovery_tool = ToolDiscoveryTool(self._discover_deferred_tools)
+            self.tools[discovery_tool.name] = discovery_tool
 
         # workspace 目录由 agent_pool_service 在沙箱中远程创建，
         # 此处仅对本地路径（非沙箱路径）兜底创建，避免 Windows 上对
@@ -155,6 +230,10 @@ class Agent:
 
         # Human-in-the-Loop: ask_user 中断状态
         self._pending_interrupt: dict[str, Any] | None = None
+        # A claimed approval is executed as the first action of the resume run.
+        # Claiming and creating that run share one DB transaction in AgentService;
+        # this in-memory value never acts as the exactly-once source of truth.
+        self._pending_approved_tool: _PendingApprovedToolCall | None = None
 
         # 单次 LLM 调用快照回调（由 AgentService 在 run 级别绑定）
         self._llm_call_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None
@@ -301,6 +380,488 @@ class Agent:
         return True
 
     @staticmethod
+    def _permission_ref(tool: Tool):
+        """Translate an Agent tool identity into the policy-domain identity."""
+        from src.api.services.tool_permission_service import ToolRef as PermissionToolRef
+
+        ref = tool.tool_ref
+        return PermissionToolRef(
+            provider=ref.provider,
+            tool_name=ref.name,
+            server_id=ref.server_id,
+        )
+
+    @staticmethod
+    def _snapshot_connection_fingerprint(tool: Tool) -> str | None:
+        value = getattr(tool, "connection_fingerprint", None)
+        return value if isinstance(value, str) and value else None
+
+    def _current_connection_fingerprint(self, tool: Tool) -> str | None:
+        """Return the live MCP target binding, failing closed on lookup errors."""
+
+        if tool.tool_ref.provider != "mcp":
+            return None
+        getter = getattr(tool, "current_connection_fingerprint", None)
+        if not callable(getter):
+            return self._snapshot_connection_fingerprint(tool)
+        try:
+            value = getter()
+        except Exception:
+            logger.exception("读取 MCP 实时连接指纹失败: tool=%s", tool.name)
+            return None
+        return value if isinstance(value, str) and value else None
+
+    def _resolve_tool_permission(
+        self,
+        tool: Tool,
+        *,
+        session_id: str,
+    ) -> _ToolPolicyDecision:
+        """Resolve the latest policy immediately before exposing/executing a tool."""
+        if not self.user_id:
+            return _ToolPolicyDecision(effect="allow", reason="standalone Agent")
+
+        ref = tool.tool_ref
+        try:
+            from src.api.models.database import SessionLocal
+            from src.api.services.tool_permission_service import evaluate_tool_permission
+
+            with SessionLocal() as db:
+                decision = evaluate_tool_permission(
+                    db,
+                    user_id=self.user_id,
+                    session_id=session_id,
+                    ref=self._permission_ref(tool),
+                    schema_hash=getattr(tool, "schema_hash", None),
+                    connection_fingerprint=self._current_connection_fingerprint(tool),
+                )
+            return _ToolPolicyDecision(
+                effect=decision.effect,
+                reason=decision.reason,
+                matched_rule_id=decision.matched_rule_id,
+            )
+        except Exception:
+            # Authenticated policy evaluation is fail-closed for every provider.
+            # Otherwise a store outage could bypass a managed DENY on shell,
+            # filesystem, memory, or remote tools.
+            logger.exception(
+                "工具权限解析失败，采用安全默认值: user=%s tool=%s",
+                self.user_id,
+                tool.name,
+            )
+            return _ToolPolicyDecision(effect="deny", reason="permission store unavailable")
+
+    def _resolve_tool_permissions(
+        self,
+        tools: list[Tool],
+        *,
+        session_id: str,
+    ) -> list[_ToolPolicyDecision]:
+        """Resolve one request surface with one rule query.
+
+        Live MCP target bindings are stable per installation, so resolving them
+        once per batch avoids repeating the same repository lookup for every
+        snapshotted tool on that server.
+        """
+
+        if not tools:
+            return []
+        if not self.user_id:
+            return [
+                _ToolPolicyDecision(effect="allow", reason="standalone Agent")
+                for _tool in tools
+            ]
+
+        try:
+            from src.api.models.database import SessionLocal
+            from src.api.services.tool_permission_service import (
+                ToolPermissionCheck,
+                evaluate_tool_permissions,
+            )
+
+            installation_fingerprints: dict[str, str | None] = {}
+            fingerprints: list[str | None] = []
+            for tool in tools:
+                ref = tool.tool_ref
+                if ref.provider != "mcp":
+                    fingerprints.append(None)
+                    continue
+                installation_id = ref.installation_id
+                if installation_id:
+                    if installation_id not in installation_fingerprints:
+                        installation_fingerprints[installation_id] = (
+                            self._current_connection_fingerprint(tool)
+                        )
+                    fingerprints.append(installation_fingerprints[installation_id])
+                else:
+                    # A malformed/legacy remote identity cannot share a safe
+                    # cache key. Resolve it independently and let policy fail
+                    # closed if no live binding is available.
+                    fingerprints.append(self._current_connection_fingerprint(tool))
+
+            checks = [
+                ToolPermissionCheck(
+                    ref=self._permission_ref(tool),
+                    schema_hash=getattr(tool, "schema_hash", None),
+                    connection_fingerprint=fingerprint,
+                )
+                for tool, fingerprint in zip(tools, fingerprints)
+            ]
+            with SessionLocal() as db:
+                decisions = evaluate_tool_permissions(
+                    db,
+                    user_id=self.user_id,
+                    session_id=session_id,
+                    checks=checks,
+                )
+            if len(decisions) != len(tools):
+                raise RuntimeError("permission evaluator returned an incomplete batch")
+            return [
+                _ToolPolicyDecision(
+                    effect=decision.effect,
+                    reason=decision.reason,
+                    matched_rule_id=decision.matched_rule_id,
+                )
+                for decision in decisions
+            ]
+        except Exception:
+            logger.exception(
+                "批量工具权限解析失败，采用安全默认值: user=%s tools=%d",
+                self.user_id,
+                len(tools),
+            )
+            return [
+                _ToolPolicyDecision(
+                    effect="deny",
+                    reason="permission store unavailable",
+                )
+                for _tool in tools
+            ]
+
+    def _is_exposure_visible(self, tool: Tool, *, session_id: str) -> bool:
+        """Apply the exposure planner independently from permission policy."""
+        if tool.name == ASK_USER_TOOL_NAME and not self.allow_human_interrupts:
+            return False
+        exposure = tool.exposure
+        if exposure == ToolExposure.HIDDEN:
+            return False
+        if exposure == ToolExposure.DEFERRED:
+            return tool.name in self._activated_deferred_tools.get(session_id, {})
+        # No nested Code Mode executor exists yet, so DIRECT_MODEL_ONLY shares
+        # the current direct model surface with DIRECT.
+        return exposure in {ToolExposure.DIRECT, ToolExposure.DIRECT_MODEL_ONLY}
+
+    def _exposure_execution_error(self, tool: Tool, *, session_id: str) -> str | None:
+        if tool.exposure == ToolExposure.HIDDEN:
+            return _TOOL_UNAVAILABLE_MESSAGE
+        if (
+            tool.exposure == ToolExposure.DEFERRED
+            and tool.name not in self._activated_deferred_tools.get(session_id, {})
+        ):
+            return _TOOL_UNAVAILABLE_MESSAGE
+        if tool.exposure not in {
+            ToolExposure.DIRECT,
+            ToolExposure.DEFERRED,
+            ToolExposure.DIRECT_MODEL_ONLY,
+        }:
+            return _TOOL_UNAVAILABLE_MESSAGE
+        return None
+
+    async def _discover_deferred_tools(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        names: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return and activate permission-visible deferred tools for one session."""
+        exact_names = set(names)
+        words = [word for word in query.casefold().split() if word]
+        candidates: list[Tool] = []
+
+        for tool in self.tools.values():
+            if tool.exposure != ToolExposure.DEFERRED:
+                continue
+
+            searchable = " ".join(
+                str(value)
+                for value in (
+                    tool.name,
+                    getattr(tool, "title", None) or "",
+                    _tool_search_description_preview(tool.description),
+                    getattr(tool, "server_name", None) or "",
+                )
+            ).casefold()
+            exact = tool.name in exact_names
+            query_match = bool(words) and all(word in searchable for word in words)
+            if exact or query_match:
+                candidates.append(tool)
+
+        # Text matching is intentionally first: a zero-match search performs no
+        # policy or live-MCP lookup. DENY still remains undiscoverable because
+        # only permission-visible candidates are returned below.
+        decisions = self._resolve_tool_permissions(candidates, session_id=session_id)
+        matches = [
+            tool
+            for tool, decision in zip(candidates, decisions)
+            if decision.effect != "deny"
+            and (decision.effect != "ask" or self.allow_human_interrupts)
+        ]
+
+        matches.sort(key=lambda item: item.name)
+        selected = matches[:limit]
+        if selected:
+            active = self._activated_deferred_tools.get(session_id)
+            if active is None:
+                if len(self._activated_deferred_tools) >= _MAX_DEFERRED_TOOL_SESSIONS:
+                    oldest_session = next(iter(self._activated_deferred_tools))
+                    self._activated_deferred_tools.pop(oldest_session, None)
+                active = {}
+                self._activated_deferred_tools[session_id] = active
+            for tool in selected:
+                active.pop(tool.name, None)
+                active[tool.name] = None
+            while len(active) > _MAX_DEFERRED_TOOLS_PER_SESSION:
+                oldest_tool = next(iter(active))
+                active.pop(oldest_tool, None)
+
+        return [
+            {
+                "model_name": tool.name,
+                "title": getattr(tool, "title", None) or tool.name,
+                "description": tool.description[:500],
+                "provider": tool.tool_ref.provider,
+                "server_name": getattr(tool, "server_name", None),
+            }
+            for tool in selected
+        ]
+
+    def _visible_tools_for_request(self, session_id: str) -> list[Tool]:
+        exposure_visible = [
+            tool
+            for tool in self.tools.values()
+            if self._is_exposure_visible(tool, session_id=session_id)
+        ]
+        if not self.user_id:
+            return exposure_visible
+
+        decisions = self._resolve_tool_permissions(
+            exposure_visible,
+            session_id=session_id,
+        )
+        return [
+            tool
+            for tool, decision in zip(exposure_visible, decisions)
+            if decision.effect != "deny"
+            and (decision.effect != "ask" or self.allow_human_interrupts)
+        ]
+
+    def _record_permission_audit(
+        self,
+        *,
+        tool: Tool,
+        effect: str,
+        outcome: str,
+        session_id: str,
+        run_id: str,
+        tool_call_id: str,
+        arguments: dict[str, Any] | None,
+        reason: str | None = None,
+        matched_rule_id: str | None = None,
+    ) -> None:
+        if not self.user_id:
+            return
+        try:
+            from src.api.models.database import SessionLocal
+            from src.api.services.tool_permission_service import record_permission_audit
+
+            with SessionLocal() as db:
+                record_permission_audit(
+                    db,
+                    user_id=self.user_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    ref=self._permission_ref(tool),
+                    effect=effect,
+                    outcome=outcome,
+                    matched_rule_id=matched_rule_id,
+                    reason=reason,
+                    arguments=arguments,
+                )
+        except Exception:
+            logger.warning("写入工具权限审计失败", exc_info=True)
+
+    @staticmethod
+    def _safe_arguments_display(arguments: dict[str, Any]) -> str:
+        sensitive_fragments = (
+            "password", "passwd", "secret", "token", "authorization",
+            "api_key", "apikey", "cookie", "credential", "private_key",
+        )
+
+        def _redact(value: Any, key: str = "") -> Any:
+            normalized = key.lower().replace("-", "_")
+            if key and any(fragment in normalized for fragment in sensitive_fragments):
+                return "[REDACTED]"
+            if isinstance(value, dict):
+                return {str(k): _redact(v, str(k)) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_redact(item) for item in value[:50]]
+            if isinstance(value, str) and len(value) > 1000:
+                return value[:1000] + "…"
+            return value
+
+        rendered = json.dumps(_redact(arguments), ensure_ascii=False, indent=2, default=str)
+        if len(rendered) > 6000:
+            rendered = rendered[:6000] + "\n… [truncated]"
+        return rendered
+
+    def _create_tool_approval(
+        self,
+        *,
+        tool: Tool,
+        decision: _ToolPolicyDecision,
+        session_id: str,
+        run_id: str,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        if not self.user_id:
+            raise RuntimeError("tool approval requires an authenticated user")
+        validation_error = self._validate_tool_arguments(tool.name, arguments)
+        if validation_error:
+            raise ValueError(validation_error)
+
+        from src.api.models.database import SessionLocal
+        from src.api.services.tool_permission_service import (
+            create_approval_request,
+            policy_version_for_user,
+            record_permission_audit,
+        )
+
+        request_id = str(uuid.uuid4())
+        ref = tool.tool_ref
+        schema_hash = getattr(tool, "schema_hash", None)
+        connection_fingerprint = self._snapshot_connection_fingerprint(tool)
+        if ref.provider == "mcp":
+            live_connection_fingerprint = self._current_connection_fingerprint(tool)
+            if (
+                not isinstance(schema_hash, str)
+                or not schema_hash
+                or not connection_fingerprint
+                or not live_connection_fingerprint
+                or connection_fingerprint != live_connection_fingerprint
+            ):
+                raise RuntimeError(
+                    "MCP tool schema or endpoint/credential binding is stale"
+                )
+        with SessionLocal() as db:
+            policy_version = policy_version_for_user(
+                db,
+                user_id=self.user_id,
+                session_id=session_id,
+            )
+            create_approval_request(
+                db,
+                request_id=request_id,
+                user_id=self.user_id,
+                session_id=session_id,
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                ref=self._permission_ref(tool),
+                model_tool_name=tool.name,
+                arguments=arguments,
+                installation_id=ref.installation_id,
+                schema_hash=schema_hash,
+                connection_fingerprint=connection_fingerprint,
+                policy_version=policy_version,
+                matched_rule_id=decision.matched_rule_id,
+                commit=False,
+            )
+            record_permission_audit(
+                db,
+                user_id=self.user_id,
+                session_id=session_id,
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                ref=self._permission_ref(tool),
+                effect="ask",
+                outcome="requested",
+                matched_rule_id=decision.matched_rule_id,
+                reason=decision.reason,
+                arguments=arguments,
+                commit=False,
+            )
+            db.commit()
+
+        if ref.provider == "mcp":
+            canonical = f"mcp:{ref.server_id}:{ref.name}"
+            source_type = getattr(tool, "source", "personal")
+        else:
+            canonical = f"builtin:{ref.name}"
+            source_type = "builtin"
+
+        annotations = getattr(tool, "annotations", {}) or {}
+        warning = None
+        if annotations.get("destructiveHint") is True:
+            warning = "该 MCP 工具声明可能执行破坏性操作，请确认参数和目标。"
+        elif ref.provider == "mcp":
+            warning = "这是远程 MCP 调用；服务端会收到以上参数。"
+
+        payload = {
+            "kind": "tool_approval",
+            "tool_ref": canonical,
+            "provider": ref.provider,
+            "source_type": source_type,
+            "server_id": ref.server_id,
+            "server_name": getattr(tool, "server_name", None),
+            "tool_name": ref.name,
+            "tool_title": getattr(tool, "title", None) or tool.name,
+            "tool_description": tool.description[:2000],
+            "arguments_display": self._safe_arguments_display(arguments),
+            "warning": warning,
+            "schema_hash": schema_hash,
+            "tool_call_id": tool_call_id,
+        }
+        return request_id, payload
+
+    def queue_tool_approval_resume(
+        self,
+        *,
+        request_id: str,
+        tool_call_id: str,
+        function_name: str,
+        arguments: dict[str, Any],
+        provider: str,
+        tool_name: str,
+        server_id: str | None,
+        installation_id: str | None,
+        schema_hash: str | None,
+        resolution: str,
+        should_execute: bool,
+        connection_fingerprint: str | None = None,
+        claim_token: str | None = None,
+    ) -> None:
+        """Queue a durably claimed approval for the first action of a resume run."""
+        self._pending_approved_tool = _PendingApprovedToolCall(
+            request_id=request_id,
+            tool_call_id=tool_call_id,
+            function_name=function_name,
+            arguments=dict(arguments),
+            provider=provider,
+            tool_name=tool_name,
+            server_id=server_id,
+            installation_id=installation_id,
+            schema_hash=schema_hash,
+            resolution=resolution,
+            should_execute=should_execute,
+            connection_fingerprint=connection_fingerprint,
+            claim_token=claim_token,
+        )
+        self._pending_interrupt = None
+
+    @staticmethod
     def format_interrupt_tool_result(answers: dict[str, str]) -> str:
         """格式化 ask_user 回答为热 resume 写入 tool result 的内容。"""
         answer_lines = []
@@ -317,6 +878,8 @@ class Agent:
         placeholders = {
             "[Awaiting user response]",
             "[Interrupt resolved in subsequent round]",
+            "[Awaiting tool approval]",
+            "[Tool approval execution pending]",
         }
         for msg in self.messages:
             if (
@@ -344,6 +907,8 @@ class Agent:
             raise ValueError(
                 f"Interrupt ID mismatch: expected {self._pending_interrupt['interrupt_id']}, got {interrupt_id}"
             )
+        if self._pending_interrupt.get("kind") == "tool_approval":
+            raise ValueError("tool approvals must be resumed through AgentService")
 
         tool_call_id = self._pending_interrupt["tool_call_id"]
         formatted_answers = self.format_interrupt_tool_result(answers)
@@ -351,16 +916,40 @@ class Agent:
 
         self._pending_interrupt = None
 
-    def clear_pending_interrupt(self, replacement_content: str = "User chose not to answer and sent a new message instead.") -> None:
+    def clear_pending_interrupt(
+        self,
+        replacement_content: str = "User chose not to answer and sent a new message instead.",
+        *,
+        claim_approval: bool = True,
+    ) -> None:
         """清除待处理的中断（用户发送了新消息而不是回答问题时调用）。"""
         if not self._pending_interrupt:
             return
         tool_call_id = self._pending_interrupt["tool_call_id"]
+        if (
+            claim_approval
+            and self._pending_interrupt.get("kind") == "tool_approval"
+            and self.user_id
+        ):
+            try:
+                from src.api.models.database import SessionLocal
+                from src.api.services.tool_permission_service import claim_approval_request
+
+                with SessionLocal() as db:
+                    claim_approval_request(
+                        db,
+                        request_id=self._pending_interrupt["interrupt_id"],
+                        user_id=self.user_id,
+                        resolution="deny",
+                    )
+                replacement_content = "Tool execution denied because the user continued without approving it."
+            except Exception:
+                logger.warning("取消待审批工具失败", exc_info=True)
         for msg in self.messages:
             if (
                 msg.role == "tool"
                 and msg.tool_call_id == tool_call_id
-                and msg.content == "[Awaiting user response]"
+                and msg.content in {"[Awaiting user response]", "[Awaiting tool approval]"}
             ):
                 msg.content = replacement_content
                 break
@@ -417,7 +1006,7 @@ class Agent:
             Error message when invalid, otherwise None.
         """
         if tool_name not in self.tools:
-            return f"Unknown tool: {tool_name}"
+            return _TOOL_UNAVAILABLE_MESSAGE
 
         if not isinstance(arguments, dict):
             return f"Invalid tool arguments: expected dict, got {type(arguments).__name__}"
@@ -427,6 +1016,10 @@ class Agent:
         missing_fields = sorted(field for field in required_fields if field not in arguments)
         if missing_fields:
             return f"Missing required tool arguments for '{tool_name}': {', '.join(missing_fields)}"
+
+        provider_error = tool.validate_arguments(arguments)
+        if provider_error:
+            return f"Invalid tool arguments for '{tool_name}': {provider_error}"
 
         return None
 
@@ -1208,7 +1801,39 @@ Rules:
         function_name: str,
         arguments: Any,
         cancel_token: Optional[asyncio.Event],
+        allowed_policy_effects: frozenset[str] | None = None,
+        allow_unactivated_deferred: bool = False,
     ) -> _ExecutedToolCall:
+        tool = self.tools.get(function_name)
+        if tool is not None and allowed_policy_effects is not None:
+            exposure_error = self._exposure_execution_error(tool, session_id=thread_id)
+            if allow_unactivated_deferred and tool.exposure == ToolExposure.DEFERRED:
+                exposure_error = None
+            latest = self._resolve_tool_permission(tool, session_id=thread_id)
+            if exposure_error is not None or latest.effect not in allowed_policy_effects:
+                reason = exposure_error or latest.reason
+                result = ToolResult(success=False, error=_TOOL_UNAVAILABLE_MESSAGE)
+                self._record_permission_audit(
+                    tool=tool,
+                    effect="deny" if exposure_error is not None else latest.effect,
+                    outcome="blocked_at_execution",
+                    session_id=thread_id,
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    arguments=arguments if isinstance(arguments, dict) else None,
+                    reason=reason,
+                    matched_rule_id=latest.matched_rule_id,
+                )
+                return _ExecutedToolCall(
+                    index=index,
+                    tool_call_id=tool_call_id,
+                    function_name=function_name,
+                    arguments=arguments,
+                    result=result,
+                    result_content=_TOOL_UNAVAILABLE_MESSAGE,
+                    execution_time_ms=0,
+                )
+
         execution_time_ms = 0
         validation_error = self._validate_tool_arguments(function_name, arguments)
         if validation_error:
@@ -1254,6 +1879,7 @@ Rules:
                     success=False,
                     content="",
                     error=f"Tool execution timed out after {timeout_used}s",
+                    outcome_uncertain=True,
                 )
             except Exception as e:
                 import traceback
@@ -1268,6 +1894,33 @@ Rules:
                 execution_time_ms = int((perf_counter() - start_time) * 1000)
 
         result_content = self._tool_result_content(function_name, result)
+        audited_tool = self.tools.get(function_name)
+        if audited_tool is not None:
+            audit_outcome = (
+                "unknown"
+                if result.outcome_uncertain
+                else "executed" if result.success else "failed"
+            )
+            self._record_permission_audit(
+                tool=audited_tool,
+                effect="allow",
+                outcome=audit_outcome,
+                session_id=thread_id,
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                arguments=arguments if isinstance(arguments, dict) else None,
+                # Tool output/errors may contain customer data or credentials.
+                # The append-only audit keeps only the decision/outcome and an
+                # argument hash; full results belong in the normal protected
+                # conversation/approval stores, never this plaintext column.
+                reason=(
+                    "tool execution completed"
+                    if result.success
+                    else "tool execution outcome unknown"
+                    if result.outcome_uncertain
+                    else "tool execution failed"
+                ),
+            )
         return _ExecutedToolCall(
             index=index,
             tool_call_id=tool_call_id,
@@ -1277,6 +1930,319 @@ Rules:
             result_content=result_content,
             execution_time_ms=execution_time_ms,
         )
+
+    def _renew_approval_lease_before_execution(
+        self,
+        pending: _PendingApprovedToolCall,
+    ) -> bool:
+        """Synchronously prove this worker still owns the durable claim.
+
+        The reconciler may have closed an expired claim as ``unknown`` between
+        the HTTP approval response and the resumed Agent turn.  A successful
+        token-fenced renewal is therefore the dispatch gate, not merely a
+        background liveness optimization.
+        """
+
+        # Standalone Agents cannot create durable approvals; preserve their
+        # in-memory test/embedding mode without pretending a database claim
+        # exists. Every authenticated approval must carry a claim token.
+        if not self.user_id:
+            return True
+        if not pending.claim_token:
+            return False
+        try:
+            from src.api.models.database import SessionLocal
+            from src.api.services.tool_permission_service import (
+                renew_approval_execution_lease,
+            )
+
+            with SessionLocal() as db:
+                return bool(
+                    renew_approval_execution_lease(
+                        db,
+                        request_id=pending.request_id,
+                        user_id=self.user_id,
+                        claim_token=pending.claim_token,
+                    )
+                )
+        except Exception:
+            logger.warning(
+                "工具审批执行前续租失败，拒绝派发: request=%s",
+                pending.request_id,
+                exc_info=True,
+            )
+            return False
+
+    async def _renew_approval_lease_until_cancelled(
+        self,
+        pending: _PendingApprovedToolCall,
+    ) -> None:
+        """Keep one already-claimed approval alive while its tool is running."""
+
+        if not self.user_id or not pending.claim_token:
+            return
+        from src.api.config import get_settings
+        from src.api.models.database import SessionLocal
+        from src.api.services.tool_permission_service import (
+            renew_approval_execution_lease,
+        )
+
+        interval = float(get_settings().tool_approval_lease_heartbeat_seconds)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                with SessionLocal() as db:
+                    renewed = renew_approval_execution_lease(
+                        db,
+                        request_id=pending.request_id,
+                        user_id=self.user_id,
+                        claim_token=pending.claim_token,
+                    )
+                if not renewed:
+                    logger.warning(
+                        "工具审批执行 lease 已不可续租（不会重试工具）: request=%s",
+                        pending.request_id,
+                    )
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A transient database failure must not cancel an in-flight
+                # external call. A later heartbeat may recover; otherwise the
+                # reconciler conservatively closes the row as unknown.
+                logger.warning(
+                    "续租工具审批执行 lease 失败: request=%s",
+                    pending.request_id,
+                    exc_info=True,
+                )
+
+    async def _execute_pending_approved_tool(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        cancel_token: Optional[asyncio.Event],
+    ) -> _ExecutedToolCall | None:
+        """Execute a claimed approval once, before the resume run calls the LLM."""
+        pending = self._pending_approved_tool
+        if pending is None:
+            return None
+
+        tool = self.tools.get(pending.function_name)
+        record: _ExecutedToolCall
+        lease_heartbeat: asyncio.Task[None] | None = None
+        lease_owned = False
+        if pending.should_execute:
+            lease_owned = self._renew_approval_lease_before_execution(pending)
+        if lease_owned and self.user_id and pending.claim_token:
+            lease_heartbeat = asyncio.create_task(
+                self._renew_approval_lease_until_cancelled(pending),
+                name=f"tool-approval-lease-{pending.request_id}",
+            )
+        try:
+            if pending.should_execute and not lease_owned:
+                result = ToolResult(
+                    success=False,
+                    error="Approved tool execution lease was lost",
+                )
+                record = _ExecutedToolCall(
+                    index=0,
+                    tool_call_id=pending.tool_call_id,
+                    function_name=pending.function_name,
+                    arguments=pending.arguments,
+                    result=result,
+                    result_content=(
+                        "Approved tool was not executed because its execution "
+                        "lease was lost."
+                    ),
+                    execution_time_ms=0,
+                )
+            elif not pending.should_execute:
+                result = ToolResult(success=False, error="Tool execution denied by user")
+                record = _ExecutedToolCall(
+                    index=0,
+                    tool_call_id=pending.tool_call_id,
+                    function_name=pending.function_name,
+                    arguments=pending.arguments,
+                    result=result,
+                    result_content="Tool execution denied by user.",
+                    execution_time_ms=0,
+                )
+                if tool is not None:
+                    self._record_permission_audit(
+                        tool=tool,
+                        effect="deny",
+                        outcome="denied_by_user",
+                        session_id=thread_id,
+                        run_id=run_id,
+                        tool_call_id=pending.tool_call_id,
+                        arguments=pending.arguments,
+                        reason="user denied approval request",
+                    )
+            elif cancel_token and cancel_token.is_set():
+                result = ToolResult(success=False, error="Cancelled before approved tool execution")
+                record = _ExecutedToolCall(
+                    index=0,
+                    tool_call_id=pending.tool_call_id,
+                    function_name=pending.function_name,
+                    arguments=pending.arguments,
+                    result=result,
+                    result_content="Cancelled before approved tool execution.",
+                    execution_time_ms=0,
+                )
+            elif tool is None:
+                result = ToolResult(success=False, error="Approved tool is no longer available")
+                record = _ExecutedToolCall(
+                    index=0,
+                    tool_call_id=pending.tool_call_id,
+                    function_name=pending.function_name,
+                    arguments=pending.arguments,
+                    result=result,
+                    result_content="Approved tool is no longer available; it was not executed.",
+                    execution_time_ms=0,
+                )
+            else:
+                current_ref = tool.tool_ref
+                identity_changed = (
+                    current_ref.provider != pending.provider
+                    or current_ref.name != pending.tool_name
+                    or current_ref.server_id != pending.server_id
+                    or current_ref.installation_id != pending.installation_id
+                )
+                current_schema_hash = getattr(tool, "schema_hash", None)
+                if pending.provider == "mcp":
+                    schema_changed = bool(
+                        not pending.schema_hash
+                        or not current_schema_hash
+                        or pending.schema_hash != current_schema_hash
+                    )
+                else:
+                    schema_changed = bool(
+                        pending.schema_hash is not None
+                        and pending.schema_hash != current_schema_hash
+                    )
+                snapshot_connection_fingerprint = self._snapshot_connection_fingerprint(tool)
+                current_connection_fingerprint = self._current_connection_fingerprint(tool)
+                connection_changed = bool(
+                    pending.provider == "mcp"
+                    and (
+                        not pending.connection_fingerprint
+                        or not snapshot_connection_fingerprint
+                        or not current_connection_fingerprint
+                        or pending.connection_fingerprint
+                        != snapshot_connection_fingerprint
+                        or pending.connection_fingerprint
+                        != current_connection_fingerprint
+                    )
+                )
+                # An exact, already-claimed approval may cold-resume a Deferred
+                # tool without rediscovery. Hidden is an administrative surface
+                # boundary and always revokes execution.
+                exposure_blocked = tool.exposure == ToolExposure.HIDDEN
+                latest = self._resolve_tool_permission(tool, session_id=thread_id)
+                if (
+                    identity_changed
+                    or schema_changed
+                    or connection_changed
+                    or exposure_blocked
+                    or latest.effect == "deny"
+                ):
+                    reason = (
+                        "tool identity changed"
+                        if identity_changed
+                        else "tool schema changed"
+                        if schema_changed
+                        else "MCP endpoint or credential changed"
+                        if connection_changed
+                        else "tool is no longer published"
+                        if exposure_blocked
+                        else latest.reason
+                    )
+                    result = ToolResult(success=False, error=f"Approved tool blocked: {reason}")
+                    record = _ExecutedToolCall(
+                        index=0,
+                        tool_call_id=pending.tool_call_id,
+                        function_name=pending.function_name,
+                        arguments=pending.arguments,
+                        result=result,
+                        result_content=f"Approved tool was not executed: {reason}.",
+                        execution_time_ms=0,
+                    )
+                    self._record_permission_audit(
+                        tool=tool,
+                        effect="deny",
+                        outcome="blocked_after_approval",
+                        session_id=thread_id,
+                        run_id=run_id,
+                        tool_call_id=pending.tool_call_id,
+                        arguments=pending.arguments,
+                        reason=reason,
+                        matched_rule_id=latest.matched_rule_id,
+                    )
+                else:
+                    # ALLOW_ONCE remains valid even though its latest policy is
+                    # still ASK. Only a new DENY or identity/schema change can
+                    # revoke the already-claimed call.
+                    record = await self._execute_tool_call_for_record(
+                        index=0,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        tool_call_id=pending.tool_call_id,
+                        function_name=pending.function_name,
+                        arguments=pending.arguments,
+                        cancel_token=cancel_token,
+                        allowed_policy_effects=frozenset({"allow", "ask"}),
+                        allow_unactivated_deferred=True,
+                    )
+
+            self._record_tool_result(record, replace_interrupt_placeholder=True)
+
+            if self.user_id:
+                try:
+                    from src.api.models.database import SessionLocal
+                    from src.api.models.interrupt_resolution import InterruptResolution
+                    from src.api.services.tool_permission_service import finish_approval_request
+
+                    with SessionLocal() as db:
+                        if pending.should_execute and lease_owned:
+                            finish_approval_request(
+                                db,
+                                request_id=pending.request_id,
+                                user_id=self.user_id,
+                                claim_token=pending.claim_token,
+                                result_content=record.result_content,
+                                success=record.result.success,
+                                outcome_uncertain=record.result.outcome_uncertain,
+                                commit=False,
+                            )
+                        resolution = (
+                            db.query(InterruptResolution)
+                            .filter(InterruptResolution.interrupt_id == pending.request_id)
+                            .first()
+                        )
+                        if resolution is not None:
+                            resolution.tool_result_content = record.result_content
+                        if (
+                            (pending.should_execute and lease_owned)
+                            or resolution is not None
+                        ):
+                            db.commit()
+                except Exception:
+                    # The request was already claimed before external execution;
+                    # leaving it in executing state prevents an unsafe retry.
+                    logger.exception(
+                        "持久化工具审批执行结果失败（不会自动重试）: request=%s",
+                        pending.request_id,
+                    )
+            return record
+        finally:
+            if lease_heartbeat is not None:
+                lease_heartbeat.cancel()
+                try:
+                    await lease_heartbeat
+                except asyncio.CancelledError:
+                    pass
+            self._pending_approved_tool = None
 
     def _tool_result_content(self, function_name: str, result: ToolResult) -> str:
         if result.success:
@@ -1289,7 +2255,12 @@ Rules:
         budget = getattr(tool_obj, 'max_result_tokens', 8000) if tool_obj else 8000
         return truncate_text_by_tokens(result_content, budget)
 
-    def _record_tool_result(self, record: _ExecutedToolCall) -> None:
+    def _record_tool_result(
+        self,
+        record: _ExecutedToolCall,
+        *,
+        replace_interrupt_placeholder: bool = False,
+    ) -> None:
         if record.result.success:
             result_text = record.result.content
             if len(result_text) > 500:
@@ -1306,13 +2277,19 @@ Rules:
             result_error=record.result.error if not record.result.success else None,
         )
 
-        tool_msg = Message(
-            role="tool",
-            content=record.result_content,
-            tool_call_id=record.tool_call_id,
-            name=record.function_name,
+        replaced = (
+            self.replace_interrupt_tool_result(record.tool_call_id, record.result_content)
+            if replace_interrupt_placeholder
+            else False
         )
-        self.messages.append(tool_msg)
+        if not replaced:
+            tool_msg = Message(
+                role="tool",
+                content=record.result_content,
+                tool_call_id=record.tool_call_id,
+                name=record.function_name,
+            )
+            self.messages.append(tool_msg)
         self._queue_tool_content_blocks(record.result)
 
     def _queue_tool_content_blocks(self, result: ToolResult) -> None:
@@ -1457,6 +2434,7 @@ Rules:
                     function_name=function_name,
                     arguments=arguments,
                     cancel_token=cancel_token,
+                    allowed_policy_effects=frozenset({"allow"}),
                 )
 
         tasks = [asyncio.create_task(_run_one(index, tool_call)) for index, tool_call in batch]
@@ -1538,6 +2516,32 @@ Rules:
                 total_steps=self.max_steps,
                 status="running",
             ))
+
+            # A claimed human approval belongs to the prior assistant tool call,
+            # but executes inside this resume run so cancellation and SSE result
+            # delivery retain the normal Turn lifecycle.
+            approved_record = await self._execute_pending_approved_tool(
+                thread_id=thread_id,
+                run_id=run_id,
+                cancel_token=cancel_token,
+            )
+            if approved_record is not None:
+                # History stitching writes this result back into the original
+                # assistant tool call. The marker lets cold reconstruction skip
+                # the resume-round copy while clients still receive the normal
+                # TOOL_CALL_RESULT event in real time.
+                yield emitter.custom_event(
+                    "tool_approval_resume",
+                    {"toolCallId": approved_record.tool_call_id},
+                )
+                yield emitter.tool_call_result(
+                    tool_call_id=approved_record.tool_call_id,
+                    content=approved_record.result_content,
+                    execution_time_ms=approved_record.execution_time_ms,
+                )
+                flush_event = _flush_pending_tool_content_event()
+                if flush_event:
+                    yield flush_event
             
             while step < self.max_steps:
                 # 🛑 取消檢查點 1: 每個 step 開始前
@@ -1576,7 +2580,10 @@ Rules:
                 print(f"{Colors.DIM}╰{'─' * BOX_WIDTH}╯{Colors.RESET}")
                 
                 # 獲取工具列表
-                tool_list = list(self.tools.values())
+                # DENY tools are omitted from the model schema; ASK/ALLOW remain
+                # visible. Execution performs the same lookup again to close the
+                # race with policy edits made after this request starts.
+                tool_list = self._visible_tools_for_request(thread_id)
                 llm_request_messages = self._build_llm_request_messages()
                 self.logger.log_request(messages=llm_request_messages, tools=tool_list)
                 request_messages_snapshot = [msg.model_dump(exclude_none=True) for msg in llm_request_messages]
@@ -1935,6 +2942,243 @@ Rules:
                         yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
                         return
 
+                    tool = self.tools.get(function_name)
+                    # Only tools projected in the exact request that produced
+                    # this response may run. This prevents same-response
+                    # tool_search activation and hallucinated special tools.
+                    if tool is None or function_name not in request_tools_snapshot:
+                        exposure_error = _TOOL_UNAVAILABLE_MESSAGE
+                    else:
+                        exposure_error = self._exposure_execution_error(
+                            tool,
+                            session_id=thread_id,
+                        )
+                    if exposure_error is not None:
+                        for event in self._tool_call_events(
+                            emitter,
+                            tool_call_id=tool_call_id,
+                            function_name=function_name,
+                            arguments=arguments,
+                        ):
+                            yield event
+                        self._print_tool_call(function_name, arguments)
+                        blocked = _ExecutedToolCall(
+                            index=tool_call_index,
+                            tool_call_id=tool_call_id,
+                            function_name=function_name,
+                            arguments=arguments,
+                            result=ToolResult(success=False, error=exposure_error),
+                            result_content=exposure_error,
+                            execution_time_ms=0,
+                        )
+                        yield emitter.tool_call_result(
+                            tool_call_id=tool_call_id,
+                            content=exposure_error,
+                            execution_time_ms=0,
+                        )
+                        self._record_tool_result(blocked)
+                        tool_call_index += 1
+                        continue
+
+                    # Resolve policy before schema validation so an unprojected
+                    # or newly denied tool cannot reveal required field names.
+                    assert tool is not None
+                    pre_validation_decision = self._resolve_tool_permission(
+                        tool,
+                        session_id=thread_id,
+                    )
+                    if (
+                        pre_validation_decision.effect == "ask"
+                        and not self.allow_human_interrupts
+                    ):
+                        pre_validation_decision = _ToolPolicyDecision(
+                            effect="deny",
+                            reason="tool requires human approval, unavailable in sub-agent runs",
+                            matched_rule_id=pre_validation_decision.matched_rule_id,
+                        )
+                    if pre_validation_decision.effect == "deny":
+                        for event in self._tool_call_events(
+                            emitter,
+                            tool_call_id=tool_call_id,
+                            function_name=function_name,
+                            arguments=arguments,
+                        ):
+                            yield event
+                        self._print_tool_call(function_name, arguments)
+                        blocked = _ExecutedToolCall(
+                            index=tool_call_index,
+                            tool_call_id=tool_call_id,
+                            function_name=function_name,
+                            arguments=arguments,
+                            result=ToolResult(success=False, error=_TOOL_UNAVAILABLE_MESSAGE),
+                            result_content=_TOOL_UNAVAILABLE_MESSAGE,
+                            execution_time_ms=0,
+                        )
+                        yield emitter.tool_call_result(
+                            tool_call_id=tool_call_id,
+                            content=_TOOL_UNAVAILABLE_MESSAGE,
+                            execution_time_ms=0,
+                        )
+                        self._record_tool_result(blocked)
+                        self._record_permission_audit(
+                            tool=tool,
+                            effect="deny",
+                            outcome="blocked",
+                            session_id=thread_id,
+                            run_id=run_id,
+                            tool_call_id=tool_call_id,
+                            arguments=arguments if isinstance(arguments, dict) else None,
+                            reason=pre_validation_decision.reason,
+                            matched_rule_id=pre_validation_decision.matched_rule_id,
+                        )
+                        tool_call_index += 1
+                        continue
+
+                    validation_error = self._validate_tool_arguments(function_name, arguments)
+                    if tool is not None and validation_error is None:
+                        decision = self._resolve_tool_permission(tool, session_id=thread_id)
+                        if decision.effect == "ask" and not self.allow_human_interrupts:
+                            decision = _ToolPolicyDecision(
+                                effect="deny",
+                                reason="tool requires human approval, unavailable in sub-agent runs",
+                                matched_rule_id=decision.matched_rule_id,
+                            )
+                        if decision.effect == "deny":
+                            for event in self._tool_call_events(
+                                emitter,
+                                tool_call_id=tool_call_id,
+                                function_name=function_name,
+                                arguments=arguments,
+                            ):
+                                yield event
+                            self._print_tool_call(function_name, arguments)
+                            blocked_content = _TOOL_UNAVAILABLE_MESSAGE
+                            blocked = _ExecutedToolCall(
+                                index=tool_call_index,
+                                tool_call_id=tool_call_id,
+                                function_name=function_name,
+                                arguments=arguments,
+                                result=ToolResult(success=False, error=blocked_content),
+                                result_content=blocked_content,
+                                execution_time_ms=0,
+                            )
+                            yield emitter.tool_call_result(
+                                tool_call_id=tool_call_id,
+                                content=blocked_content,
+                                execution_time_ms=0,
+                            )
+                            self._record_tool_result(blocked)
+                            self._record_permission_audit(
+                                tool=tool,
+                                effect="deny",
+                                outcome="blocked",
+                                session_id=thread_id,
+                                run_id=run_id,
+                                tool_call_id=tool_call_id,
+                                arguments=arguments,
+                                reason=decision.reason,
+                                matched_rule_id=decision.matched_rule_id,
+                            )
+                            tool_call_index += 1
+                            continue
+
+                        if decision.effect == "ask":
+                            for event in self._tool_call_events(
+                                emitter,
+                                tool_call_id=tool_call_id,
+                                function_name=function_name,
+                                arguments=arguments,
+                            ):
+                                yield event
+                            self._print_tool_call(function_name, arguments)
+                            try:
+                                interrupt_id, approval_payload = self._create_tool_approval(
+                                    tool=tool,
+                                    decision=decision,
+                                    session_id=thread_id,
+                                    run_id=run_id,
+                                    tool_call_id=tool_call_id,
+                                    arguments=arguments,
+                                )
+                            except Exception as exc:
+                                logger.exception("创建工具审批请求失败，调用将被阻止")
+                                blocked_content = (
+                                    "Tool was not executed because its approval request "
+                                    f"could not be persisted: {type(exc).__name__}"
+                                )
+                                blocked = _ExecutedToolCall(
+                                    index=tool_call_index,
+                                    tool_call_id=tool_call_id,
+                                    function_name=function_name,
+                                    arguments=arguments,
+                                    result=ToolResult(success=False, error=blocked_content),
+                                    result_content=blocked_content,
+                                    execution_time_ms=0,
+                                )
+                                yield emitter.tool_call_result(
+                                    tool_call_id=tool_call_id,
+                                    content=blocked_content,
+                                    execution_time_ms=0,
+                                )
+                                self._record_tool_result(blocked)
+                                tool_call_index += 1
+                                continue
+
+                            yield emitter.tool_call_result(
+                                tool_call_id=tool_call_id,
+                                content="[Awaiting tool approval]",
+                                execution_time_ms=0,
+                            )
+                            self.messages.append(Message(
+                                role="tool",
+                                content="[Awaiting tool approval]",
+                                tool_call_id=tool_call_id,
+                                name=function_name,
+                            ))
+
+                            # A model turn may contain multiple tool calls. Once
+                            # one asks, all later calls are explicitly closed and
+                            # never carried over into the resume execution.
+                            for remaining_tc in tool_calls[tool_call_index + 1:]:
+                                remaining_id, remaining_name, _remaining_args = self._tool_call_identity(remaining_tc)
+                                yield emitter.tool_call_start(
+                                    tool_call_id=remaining_id,
+                                    tool_name=remaining_name,
+                                )
+                                yield emitter.tool_call_end(remaining_id)
+                                yield emitter.tool_call_result(
+                                    tool_call_id=remaining_id,
+                                    content="[Skipped: tool approval pending]",
+                                    execution_time_ms=0,
+                                )
+                                self.messages.append(Message(
+                                    role="tool",
+                                    content="[Skipped: tool approval pending]",
+                                    tool_call_id=remaining_id,
+                                    name=remaining_name,
+                                ))
+
+                            self._pending_interrupt = {
+                                "kind": "tool_approval",
+                                "interrupt_id": interrupt_id,
+                                "tool_call_id": tool_call_id,
+                                "approval_request_id": interrupt_id,
+                                "payload": approval_payload,
+                            }
+                            flush_event = _flush_pending_tool_content_event()
+                            if flush_event:
+                                yield flush_event
+                            yield emitter.step_finished(step_name)
+                            yield emitter.run_finished(
+                                outcome="interrupt",
+                                interrupt=InterruptDetails(
+                                    id=interrupt_id,
+                                    reason="human_approval",
+                                    payload=approval_payload,
+                                ),
+                            )
+                            return
+
                     if function_name == "sub_agent" and self.subagent_max_parallel > 1:
                         batch: list[tuple[int, Any]] = [(tool_call_index, tool_call)]
                         next_index = tool_call_index + 1
@@ -2066,7 +3310,7 @@ Rules:
                         return
 
                     # 🛑 Human-in-the-Loop: ask_user 拦截点
-                    if function_name == ASK_USER_TOOL_NAME:
+                    if function_name == ASK_USER_TOOL_NAME and self.allow_human_interrupts:
                         questions_payload = arguments.get("questions", []) if isinstance(arguments, dict) else []
 
                         # 防御性校验：空 questions 不应触发中断，返回错误结果继续执行
@@ -2128,6 +3372,7 @@ Rules:
 
                         # 保存中断状态
                         self._pending_interrupt = {
+                            "kind": "ask_user",
                             "interrupt_id": interrupt_id,
                             "tool_call_id": tool_call_id,
                             "questions": questions_payload,
@@ -2158,6 +3403,7 @@ Rules:
                         function_name=function_name,
                         arguments=arguments,
                         cancel_token=cancel_token,
+                        allowed_policy_effects=frozenset({"allow"}),
                     )
                     yield emitter.tool_call_result(
                         tool_call_id=record.tool_call_id,
@@ -2206,7 +3452,7 @@ Rules:
             print(f"\n{Colors.BRIGHT_RED}❌ Unexpected error:{Colors.RESET} {error_detail}")
             yield emitter.run_error(message=error_detail)
 
-    async def maybe_flush_memory_silent(self) -> bool:
+    async def maybe_flush_memory_silent(self, session_id: str | None = None) -> bool:
         """软阈值触发静默记忆刷新（在 run_agui() 外单独调用，不 yield SSE 事件）
 
         当 token 用量达到 75% 时，通过调用 LLM 将重要内容写入记忆工具。
@@ -2221,6 +3467,9 @@ Rules:
         estimated = self._estimate_tokens()
         if estimated < self.token_limit * 0.75:
             return False
+        if self.user_id and not session_id:
+            logger.warning("静默记忆刷新缺少 session_id，已安全跳过")
+            return False
 
         # 检查是否有记忆工具可用
         memory_tools = {"record_memory", "update_long_term_memory", "update_user"}
@@ -2231,10 +3480,13 @@ Rules:
         print(f"{Colors.DIM}📝 静默记忆刷新 (tokens: {estimated}/{self.token_limit})...{Colors.RESET}")
 
         try:
-            await self._run_tool_call_only(
+            flushed = await self._run_tool_call_only(
                 "请把本次对话中需要长期记住的重要信息（用户偏好、关键决策、重要事实）写入记忆工具，然后回复 OK。",
                 allowed_tools=list(available_tools),
+                session_id=session_id or "silent-memory",
             )
+            if not flushed:
+                return False
             self._memory_flushed_this_compaction = True
             print(f"{Colors.DIM}✓ 静默记忆刷新完成{Colors.RESET}")
             return True
@@ -2246,8 +3498,9 @@ Rules:
         self,
         prompt: str,
         allowed_tools: list[str],
+        session_id: str,
         max_steps: int = 3,
-    ) -> None:
+    ) -> bool:
         """执行一次仅工具调用的 LLM 交互（静默，不 yield 事件）
 
         Args:
@@ -2258,9 +3511,22 @@ Rules:
         temp_messages = list(self.messages)
         temp_messages.append(Message(role="user", content=prompt))
 
-        filtered_tools = [t for t in self.tools.values() if t.name in allowed_tools]
+        filtered_tools: list[Tool] = []
+        for tool in self.tools.values():
+            if tool.name not in allowed_tools:
+                continue
+            if self._exposure_execution_error(tool, session_id=session_id) is not None:
+                continue
+            # Silent background work cannot ask a human. Only an explicit
+            # effective ALLOW is eligible for model exposure.
+            if self._resolve_tool_permission(tool, session_id=session_id).effect == "allow":
+                filtered_tools.append(tool)
         if not filtered_tools:
-            return
+            return False
+
+        eligible_names = {tool.name for tool in filtered_tools}
+        silent_run_id = str(uuid.uuid4())
+        executed_any = False
 
         for _ in range(max_steps):
             response = await self.llm.generate(
@@ -2278,17 +3544,41 @@ Rules:
             ))
 
             for tc in response.tool_calls:
-                if tc.function.name in allowed_tools and tc.function.name in self.tools:
-                    try:
-                        result = await self.tools[tc.function.name].execute(**tc.function.arguments)
-                        result_text = self._tool_result_content(tc.function.name, result)
-                    except Exception as e:
-                        result_text = self._tool_result_content(
-                            tc.function.name,
-                            ToolResult(success=False, error=str(e)),
+                if tc.function.name in eligible_names and tc.function.name in self.tools:
+                    tool = self.tools[tc.function.name]
+                    exposure_error = self._exposure_execution_error(
+                        tool,
+                        session_id=session_id,
+                    )
+                    decision = self._resolve_tool_permission(tool, session_id=session_id)
+                    if exposure_error is not None or decision.effect != "allow":
+                        result_text = _TOOL_UNAVAILABLE_MESSAGE
+                        self._record_permission_audit(
+                            tool=tool,
+                            effect=decision.effect,
+                            outcome="blocked_silent",
+                            session_id=session_id,
+                            run_id=silent_run_id,
+                            tool_call_id=tc.id,
+                            arguments=tc.function.arguments,
+                            reason=exposure_error or decision.reason,
+                            matched_rule_id=decision.matched_rule_id,
                         )
+                    else:
+                        record = await self._execute_tool_call_for_record(
+                            index=0,
+                            thread_id=session_id,
+                            run_id=silent_run_id,
+                            tool_call_id=tc.id,
+                            function_name=tc.function.name,
+                            arguments=tc.function.arguments,
+                            cancel_token=None,
+                            allowed_policy_effects=frozenset({"allow"}),
+                        )
+                        result_text = record.result_content
+                        executed_any = executed_any or record.result.success
                 else:
-                    result_text = f"Tool {tc.function.name} not allowed in this context"
+                    result_text = _TOOL_UNAVAILABLE_MESSAGE
 
                 temp_messages.append(Message(
                     role="tool",
@@ -2296,6 +3586,8 @@ Rules:
                     tool_call_id=tc.id,
                     name=tc.function.name,
                 ))
+
+        return executed_any
 
     def get_history(self) -> list[Message]:
         """Get message history."""

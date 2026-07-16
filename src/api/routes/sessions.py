@@ -814,6 +814,12 @@ async def delete_session(
         db.query(LLMCallRecord).filter(LLMCallRecord.round_id.in_(round_ids)).delete(synchronize_session=False)
     db.query(Round).filter(Round.session_id == chat_session_id).delete(synchronize_session=False)
     db.query(ConversationMessage).filter(ConversationMessage.session_id == chat_session_id).delete(synchronize_session=False)
+    from src.api.models.tool_permission import ToolPermissionRule
+
+    db.query(ToolPermissionRule).filter(
+        ToolPermissionRule.scope_type == "session",
+        ToolPermissionRule.scope_id == chat_session_id,
+    ).delete(synchronize_session=False)
 
     # 刪除会话
     db.delete(session)

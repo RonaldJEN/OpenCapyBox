@@ -112,6 +112,8 @@ OpenCapyBox 是一个前后端分离的 Web 智能体平台，核心能力包括
 | `docs/specs/sandbox-spec.md`          | 沙箱交互                   |
 | `docs/specs/models-spec.md`           | 模型注册与切换             |
 | `docs/specs/config-spec.md`           | Agent 配置与技能           |
+| `docs/specs/mcp-spec.md`              | MCP 数据连接与工具发布     |
+| `docs/specs/tool-permission-spec.md`  | 工具执行权限与审批         |
 | `docs/specs/admin-spec.md`           | 管理后台聚合接口           |
 | `docs/specs/subagent-run-graph-spec.md` | Subagent 运行图            |
 | `docs/specs/frontend-spec.md`         | 前端总规范与设计体系       |

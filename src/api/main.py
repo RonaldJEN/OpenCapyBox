@@ -4,13 +4,19 @@ import logging
 import platform
 import sys
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.config import get_settings
 from src.api.routes import auth, sessions, chat, models
 from src.api.routes import cron as cron_routes
 from src.api.routes import config as config_routes
 from src.api.routes import admin as admin_routes
+from src.api.routes import admin_mcp as admin_mcp_routes
+from src.api.routes import mcp as mcp_routes
+from src.api.routes import permissions as permission_routes
+from src.api.routes import admin_permissions as admin_permission_routes
 from src.api.models.database import init_db
+from src.api.validation_errors import safe_request_validation_exception_handler
 import os
 
 # 配置日志等级（从环境变量 LOG_LEVEL 读取，默认 INFO）
@@ -38,56 +44,124 @@ if platform.system() == "Windows":
 settings = get_settings()
 
 
-CRON_INTERRUPTED_OUTPUT = "[系统重启/部署，定时任务执行被中断]"
-
-
 def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
-    """清理上次进程残留的运行状态。"""
+    """Conservatively reclaim runtime state whose heartbeat has expired.
+
+    Startup is a per-worker event, not proof that every other worker stopped.
+    A rolling worker must therefore leave fresh locks and their rounds alone.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import and_, exists, or_, select
+
     from src.api.models.round import Round
     from src.api.models.user_run_lock import UserRunLock
-    from src.api.models.user_memory import CronJobRun
+    from src.api.services.tool_permission_service import (
+        reconcile_expired_approval_leases,
+    )
     from src.api.utils.timezone import now_naive
 
     cleanup_at = now_naive()
-    stale_count = (
-        db.query(Round)
-        .filter(Round.status == "running")
-        .update({
-            "status": "failed",
-            "completed_at": cleanup_at,
-            "final_response": "[系统重启，执行被中断]",
-        })
-    )
-    # 重启后内存中的 _pending_interrupt 已丢失，interrupted 轮次无法恢复
-    zombie_count = (
-        db.query(Round)
-        .filter(Round.status == "interrupted")
-        .update({
-            "status": "failed",
-            "completed_at": cleanup_at,
-            "interrupt_payload": None,
-            "final_response": "[系统重启，中断问答已失效]",
-        })
-    )
-    # 重启后旧进程已退出，用户运行锁全部失效，直接清空避免启动后 429 卡住
-    stale_lock_count = db.query(UserRunLock).delete(synchronize_session=False)
+    stale_after_seconds = max(float(get_settings().sse_subscribe_timeout), 1.0)
+    cutoff = cleanup_at - timedelta(seconds=stale_after_seconds)
 
-    # 进程重启/部署中断后，内存中的 cron runner 已不可恢复，所有 running 记录都应收敛。
-    stale_cron_count = (
-        db.query(CronJobRun)
-        .filter(CronJobRun.status == "running")
-        .update({
-            "status": "failed",
-            "output": CRON_INTERRUPTED_OUTPUT,
-            "completed_at": cleanup_at,
-        }, synchronize_session=False)
+    # Delete expired locks with a heartbeat-guarded CAS.  A concurrent owner
+    # that refreshes ``updated_at`` before this DELETE wins and remains intact.
+    stale_lock_filter = or_(
+        UserRunLock.updated_at <= cutoff,
+        and_(
+            UserRunLock.updated_at.is_(None),
+            UserRunLock.created_at <= cutoff,
+        ),
     )
+    stale_lock_candidates = db.query(
+        UserRunLock.lock_id,
+        UserRunLock.session_id,
+    ).filter(stale_lock_filter).all()
+    stale_lock_count = 0
+    for candidate in stale_lock_candidates:
+        deleted = (
+            db.query(UserRunLock)
+            .filter(
+                UserRunLock.lock_id == candidate.lock_id,
+                stale_lock_filter,
+            )
+            .delete(synchronize_session=False)
+        )
+        if deleted:
+            stale_lock_count += int(deleted)
+    db.flush()
+
+    # Any lock that survived the CAS is authoritative, whether it was already
+    # fresh or won a concurrent heartbeat race.  Only old running rounds with
+    # no surviving lock are orphaned.  The created_at guard also prevents a
+    # newly-created round from being swept after an old lock was reclaimed.
+    protected_session_ids = {
+        str(row[0])
+        for row in db.query(UserRunLock.session_id).all()
+        if row[0]
+    }
+    stale_count = 0
+    old_running_rounds = (
+        db.query(Round.id, Round.session_id, Round.thread_id)
+        .filter(
+            Round.status == "running",
+            Round.created_at <= cutoff,
+        )
+        .all()
+    )
+    for old_round in old_running_rounds:
+        session_ids = {
+            str(value)
+            for value in (old_round.session_id, old_round.thread_id)
+            if value
+        }
+        if session_ids & protected_session_ids:
+            continue
+        # A reclaimed lock identifies the expected stale-worker path; an old
+        # round without any lock is the supported orphan path.
+        round_update = db.query(Round).filter(
+            Round.id == old_round.id,
+            Round.status == "running",
+            Round.created_at <= cutoff,
+        )
+        if session_ids:
+            # Re-check at the UPDATE boundary so a lock acquired after the
+            # candidate snapshot also protects its round.
+            round_update = round_update.filter(
+                ~exists(
+                    select(UserRunLock.lock_id).where(
+                        UserRunLock.session_id.in_(tuple(session_ids))
+                    )
+                )
+            )
+        stale_count += int(
+            round_update.update(
+                {
+                    "status": "failed",
+                    "completed_at": cleanup_at,
+                    "final_response": "[运行心跳已过期，执行被中断]",
+                },
+                synchronize_session=False,
+            )
+            or 0
+        )
+    # interrupted 轮次的 payload 与工具占位都已持久化，可以冷恢复；
+    # 启动时保留 ASK/ask_user，不再因内存 Agent 丢失而误判失败。
+    zombie_count = 0
+    # Another worker may still own an active execution lease. Only expired (or
+    # legacy lease-less) claims become terminal unknown; none are retried.
+    reconcile_expired_approval_leases(db, now=cleanup_at, commit=False)
+    # CronJobRun has no owner token or renewable lease.  Age alone cannot
+    # distinguish an abandoned record from a healthy long-running job on
+    # another worker, so startup must not mutate running cron rows.
+    stale_cron_count = 0
 
     db.commit()
     return (
         int(stale_count or 0),
         int(zombie_count or 0),
-        int(stale_lock_count or 0),
+        int(stale_lock_count),
         int(stale_cron_count or 0),
     )
 
@@ -164,10 +238,26 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Cron worker 启动失败: {e}")
 
+    try:
+        from src.api.services.approval_reconciler import start_approval_reconciler
+
+        await start_approval_reconciler(app)
+        print("✅ 工具审批执行 lease reconciler 已启动")
+    except Exception as e:
+        print(f"⚠️  工具审批执行 lease reconciler 启动失败: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭时停止 cron worker。"""
+    try:
+        from src.api.services.approval_reconciler import stop_approval_reconciler
+
+        await stop_approval_reconciler(app)
+        print("✅ 工具审批执行 lease reconciler 已关闭")
+    except Exception as e:
+        print(f"⚠️  工具审批执行 lease reconciler 关闭失败: {e}")
+
     try:
         from src.api.services.cron_worker import stop_cron_worker
 
@@ -187,6 +277,26 @@ app.include_router(models.router, prefix=f"{settings.api_prefix}/models", tags=[
 app.include_router(cron_routes.router, prefix=f"{settings.api_prefix}/cron", tags=["定时任务"])
 app.include_router(config_routes.router, prefix=f"{settings.api_prefix}/config", tags=["配置管理"])
 app.include_router(admin_routes.router, prefix=f"{settings.api_prefix}/admin", tags=["管理后台"])
+app.include_router(
+    admin_mcp_routes.router,
+    prefix=f"{settings.api_prefix}/admin/mcp",
+    tags=["管理后台 MCP"],
+)
+app.add_exception_handler(
+    RequestValidationError,
+    safe_request_validation_exception_handler,
+)
+app.include_router(mcp_routes.router, prefix=f"{settings.api_prefix}/mcp", tags=["MCP"])
+app.include_router(
+    permission_routes.router,
+    prefix=f"{settings.api_prefix}/permissions",
+    tags=["工具权限"],
+)
+app.include_router(
+    admin_permission_routes.router,
+    prefix=f"{settings.api_prefix}/admin/tool-permissions",
+    tags=["管理后台工具权限"],
+)
 
 
 # 根路径

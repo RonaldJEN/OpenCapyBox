@@ -90,6 +90,11 @@ _run_cancel_service = get_run_cancel_service()
 _run_coordinator = get_run_coordinator()
 _turn_orchestrator = get_turn_orchestrator()
 
+ABORT_OUTCOME_WARNING = (
+    "本地执行已停止，但这不能撤销已经发送到远端 MCP 的请求；"
+    "远端副作用可能已经发生，请先确认外部状态再决定是否重试。"
+)
+
 
 def _resolve_session_model_for_user(db: DBSession, session: Session, user_id: str) -> str:
     """Validate and resolve a session model for the current user."""
@@ -1099,9 +1104,11 @@ async def abort_chat(
     if local_runner and not local_runner.done():
         logger.info("abort 命中本地 runner，等待其通过 cancel_token/终态检查退出: session=%s", chat_session_id)
 
-    # 若有 running round，立即收斂為 cancelled，避免前端與 running-sessions 視圖回跳。
+    # 若有 running round，立即收斂本地状态为 cancelled，避免前端與
+    # running-sessions 視圖回跳。取消不能撤回已经跨过 dispatch 边界的
+    # 远端请求，因此终态必须持久化保守的 outcome-unknown 警告。
     if running_round:
-        final_response = running_round.final_response or "Aborted by user"
+        final_response = ABORT_OUTCOME_WARNING
         finished_event = RunFinishedEvent(
             threadId=chat_session_id,
             runId=running_round_id,
@@ -1110,6 +1117,8 @@ async def abort_chat(
                 "reason": "user_cancelled",
                 "finalResponse": final_response,
                 "stepCount": running_round.step_count or 0,
+                "outcomeUncertain": True,
+                "warning": ABORT_OUTCOME_WARNING,
             },
         )
         try:
@@ -1165,10 +1174,20 @@ async def abort_chat(
             reason = "worker_dead"
         else:
             reason = "force_aborted"
-        return {"status": "cancelled", "request_id": request_id, "reason": reason}
+        return {
+            "status": "cancelled",
+            "request_id": request_id,
+            "reason": reason,
+            "outcome_warning": ABORT_OUTCOME_WARNING,
+        }
 
     # 僅處於 init-window（有鎖無 round）時也立即解除阻塞。
-    return {"status": "cancelled", "request_id": request_id, "reason": "force_unlocked"}
+    return {
+        "status": "cancelled",
+        "request_id": request_id,
+        "reason": "force_unlocked",
+        "outcome_warning": ABORT_OUTCOME_WARNING,
+    }
 
 
 @router.get("/{chat_session_id}/abort/status")

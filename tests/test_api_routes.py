@@ -1927,12 +1927,21 @@ class TestAbortEndpoint:
             "src.api.routes.chat._turn_orchestrator.cancel_turn",
             new_callable=AsyncMock,
             return_value=self._cancel_result("req-1"),
-        ):
+        ), patch(
+            "src.api.routes.chat.RunCompletionService.complete",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as complete_round:
             response = client.post("/chat/session-1/abort")
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
         assert response.json()["reason"] == "force_aborted"
         assert response.json()["request_id"] == "req-1"
+        assert "远端副作用可能已经发生" in response.json()["outcome_warning"]
+        terminal_event = complete_round.await_args.kwargs["terminal_event"]
+        assert terminal_event.result["outcomeUncertain"] is True
+        assert terminal_event.result["warning"] == response.json()["outcome_warning"]
+        assert complete_round.await_args.kwargs["final_response"] == response.json()["outcome_warning"]
         assert cancel_token.is_set()
 
     @patch("src.api.routes.chat.get_agent_pool")

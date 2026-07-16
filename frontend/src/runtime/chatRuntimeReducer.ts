@@ -330,6 +330,7 @@ function mergeActiveRound(localRound: RoundData, serverRound: RoundData): RoundD
   return {
     ...serverRound,
     round_id: serverRound.round_id,
+    control_kind: localRound.control_kind ?? serverRound.control_kind,
     user_message: localRound.user_message || serverRound.user_message,
     user_attachments: localRound.user_attachments || serverRound.user_attachments,
     final_response: localRound.final_response || serverRound.final_response,

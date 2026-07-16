@@ -165,6 +165,27 @@ class AgentPoolService:
             or cached_profile_version != current_profile_version
         )
 
+    def _cached_agent_mcp_is_stale(self, *, user_id: str, chat_session_id: str) -> bool:
+        agent_service = self._cache.get(chat_session_id)
+        if getattr(agent_service, "mcp_catalog_retry_required", False) is True:
+            return True
+        cached = getattr(agent_service, "mcp_catalog_fingerprint", None)
+        if not isinstance(cached, str) or not cached:
+            return False
+        try:
+            from src.api.services.mcp_runtime import get_mcp_runtime
+
+            current = get_mcp_runtime().catalog_fingerprint(user_id)
+        except Exception:
+            logger.warning(
+                "检查 MCP 目录版本失败，沿用 Agent 快照: user=%s session=%s",
+                user_id,
+                chat_session_id,
+                exc_info=True,
+            )
+            return False
+        return current != cached
+
     def _cached_agent_needs_rebuild(
         self,
         *,
@@ -181,6 +202,11 @@ class AgentPoolService:
         )
         if chat_session_id in self._invalidated_sessions:
             return True, "marked_invalid", cached_sandbox_id, current_sandbox_id
+        if self._cached_agent_mcp_is_stale(
+            user_id=user_id,
+            chat_session_id=chat_session_id,
+        ):
+            return True, "mcp_catalog_stale", cached_sandbox_id, current_sandbox_id
         if self._cached_agent_profile_is_stale(
             user_id=user_id,
             chat_session_id=chat_session_id,

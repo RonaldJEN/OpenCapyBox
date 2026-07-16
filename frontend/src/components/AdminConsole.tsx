@@ -1,8 +1,9 @@
-import { Fragment, useCallback, useEffect, useMemo, useState, type ComponentType, type FormEvent } from 'react';
+import { Fragment, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   AlertTriangle,
   BarChart3,
+  Cable,
   ChevronDown,
   ChevronRight,
   Download,
@@ -17,6 +18,7 @@ import {
   Save,
   Search,
   Server,
+  Shield,
   ShieldCheck,
   Trash2,
   Users,
@@ -64,7 +66,10 @@ import {
 } from '../services/adminApi';
 import './AdminConsole.css';
 
-type AdminTab = 'overview' | 'rounds' | 'users' | 'sandboxes' | 'models' | 'system';
+const LazyAdminMcpCatalogPanel = lazy(() => import('./AdminMcpCatalogPanel'));
+const LazyAdminToolPermissionsPanel = lazy(() => import('./AdminToolPermissionsPanel'));
+
+type AdminTab = 'overview' | 'rounds' | 'users' | 'sandboxes' | 'models' | 'mcp' | 'permissions' | 'system';
 type UserCreateMode = 'simple' | 'ldap';
 type UserStatusFilter = 'all' | 'enabled' | 'disabled';
 type UserRoleFilter = 'all' | 'admin' | 'user';
@@ -90,6 +95,8 @@ const NAV_ITEMS: Array<{ id: AdminTab; label: string; icon: ComponentType<{ size
   { id: 'users', label: '用户管理', icon: Users },
   { id: 'sandboxes', label: '沙箱管理', icon: Server },
   { id: 'models', label: '模型权限', icon: KeyRound },
+  { id: 'mcp', label: '官方 MCP', icon: Cable },
+  { id: 'permissions', label: '工具权限', icon: Shield },
   { id: 'system', label: '系统监控', icon: Gauge },
 ];
 
@@ -505,6 +512,12 @@ export default function AdminConsole() {
   const [sandboxProfiles, setSandboxProfiles] = useState<AdminSandboxProfilesResponse | null>(null);
   const [systemData, setSystemData] = useState<AdminSystemResponse | null>(null);
   const [modelRefreshToken, setModelRefreshToken] = useState(0);
+  const [mcpRefreshToken, setMcpRefreshToken] = useState(0);
+  const [permissionRefreshToken, setPermissionRefreshToken] = useState(0);
+  const [adminMcpDirty, setAdminMcpDirty] = useState(false);
+  const [pendingAdminTab, setPendingAdminTab] = useState<AdminTab | null>(null);
+  const adminMcpDiscardDialogRef = useRef<HTMLElement>(null);
+  const adminMcpNavigationReturnFocusRef = useRef<HTMLElement | null>(null);
 
   const [roundStatus, setRoundStatus] = useState('all');
   const [roundSearch, setRoundSearch] = useState('');
@@ -525,6 +538,27 @@ export default function AdminConsole() {
   const [sandboxActionMessage, setSandboxActionMessage] = useState('');
   const [sandboxUpdatingKeys, setSandboxUpdatingKeys] = useState<Record<string, boolean>>({});
   const currentUser = useMemo(() => apiService.getUserId() || '-', []);
+
+  const requestAdminTabChange = (nextTab: AdminTab) => {
+    if (nextTab === activeTab) return;
+    if (activeTab === 'mcp' && adminMcpDirty) {
+      adminMcpNavigationReturnFocusRef.current = document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+      setPendingAdminTab(nextTab);
+      return;
+    }
+    setActiveTab(nextTab);
+  };
+
+  useEffect(() => {
+    if (pendingAdminTab) adminMcpDiscardDialogRef.current?.focus();
+  }, [pendingAdminTab]);
+
+  const cancelAdminTabChange = () => {
+    setPendingAdminTab(null);
+    adminMcpNavigationReturnFocusRef.current?.focus();
+  };
 
   const handleLogout = () => {
     apiService.logout();
@@ -936,6 +970,12 @@ export default function AdminConsole() {
       if (activeTab === 'models') {
         setModelRefreshToken((prev) => prev + 1);
       }
+      if (activeTab === 'mcp') {
+        setMcpRefreshToken((prev) => prev + 1);
+      }
+      if (activeTab === 'permissions') {
+        setPermissionRefreshToken((prev) => prev + 1);
+      }
       if (activeTab === 'system') {
         setSystemData(await getAdminSystem(24));
       }
@@ -986,7 +1026,7 @@ export default function AdminConsole() {
               <button
                 key={item.id}
                 className={`admin-nav-btn ${isActive ? 'active' : ''}`}
-                onClick={() => setActiveTab(item.id)}
+                onClick={() => requestAdminTabChange(item.id)}
               >
                 <Icon size={15} />
                 <span>{item.label}</span>
@@ -1094,11 +1134,77 @@ export default function AdminConsole() {
             <AdminModelAccessPanel apiErrorDetail={apiErrorDetail} refreshToken={modelRefreshToken} />
           ) : null}
 
+          {!loading && !error && activeTab === 'mcp' ? (
+            <Suspense fallback={<div className="admin-card admin-empty-card">正在加载官方 MCP...</div>}>
+              <LazyAdminMcpCatalogPanel refreshToken={mcpRefreshToken} onDirtyChange={setAdminMcpDirty} />
+            </Suspense>
+          ) : null}
+
+          {!loading && !error && activeTab === 'permissions' ? (
+            <Suspense fallback={<div className="admin-card admin-empty-card">正在加载工具权限...</div>}>
+              <LazyAdminToolPermissionsPanel refreshToken={permissionRefreshToken} />
+            </Suspense>
+          ) : null}
+
           {!loading && !error && activeTab === 'system' ? (
             <SystemPanel data={systemData} />
           ) : null}
         </div>
       </main>
+
+      {pendingAdminTab ? (
+        <div className="admin-modal-backdrop admin-mcp-navigation-confirm" role="presentation">
+          <section
+            ref={adminMcpDiscardDialogRef}
+            className="admin-modal admin-mcp-delete-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="admin-mcp-navigation-discard-title"
+            tabIndex={-1}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+                cancelAdminTabChange();
+                return;
+              }
+              if (event.key !== 'Tab' || !adminMcpDiscardDialogRef.current) return;
+              const buttons = Array.from(
+                adminMcpDiscardDialogRef.current.querySelectorAll<HTMLButtonElement>('button:not([disabled])'),
+              );
+              if (!buttons.length) {
+                event.preventDefault();
+                adminMcpDiscardDialogRef.current.focus();
+                return;
+              }
+              const first = buttons[0];
+              const last = buttons[buttons.length - 1];
+              if (document.activeElement === adminMcpDiscardDialogRef.current) {
+                event.preventDefault();
+                (event.shiftKey ? last : first).focus();
+              } else if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+              } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+              }
+            }}
+          >
+            <h3 id="admin-mcp-navigation-discard-title">离开并放弃官方 MCP 修改？</h3>
+            <p>当前服务定义尚未保存，切换模块会丢失这些修改。</p>
+            <div>
+              <button type="button" className="admin-button" onClick={cancelAdminTabChange}>继续编辑</button>
+              <button type="button" className="admin-button admin-danger-button" onClick={() => {
+                const nextTab = pendingAdminTab;
+                setPendingAdminTab(null);
+                setAdminMcpDirty(false);
+                setActiveTab(nextTab);
+              }}>放弃修改并离开</button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

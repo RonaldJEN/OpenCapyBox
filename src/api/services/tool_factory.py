@@ -36,9 +36,15 @@ from src.agent.tools.ask_user_tool import AskUserQuestionTool
 from src.agent.tools.sub_agent_tool import SubAgentTool
 from src.agent.tools.skill_loader import Skill, SkillLoader
 from src.agent.tools.skill_tool import GetSkillTool
+from src.agent.tools.mcp_tool import McpRemoteTool
 
 from src.api.services.sandbox_service import get_sandbox_service
 from src.api.config import get_settings
+from src.api.services.mcp_runtime import (
+    McpRequiredServerUnavailable,
+    McpToolNameCollisionError,
+    get_mcp_runtime,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -101,6 +107,7 @@ async def create_agent_tools(
     exclude: Optional[Set[str]] = None,
     supports_image: bool = False,
     max_images: int = 0,
+    build_metadata: dict[str, object] | None = None,
 ) -> tuple[List, Optional[SkillLoader]]:
     """创建标准 Agent 工具列表。
 
@@ -114,6 +121,9 @@ async def create_agent_tools(
     """
     exclude = exclude or set()
     skill_loader_ref: Optional[SkillLoader] = None
+    if build_metadata is not None:
+        build_metadata["mcp_catalog_fingerprint"] = None
+        build_metadata["mcp_catalog_retry_required"] = False
 
     bg_tracker = _BackgroundCommandTracker()
     agent_config_sync = _build_agent_config_sync(
@@ -353,5 +363,46 @@ async def create_agent_tools(
             logger.warning("Skills 目录不存在: %s", skills_dir)
     except Exception as e:
         logger.warning("Skills 加载失败: %s", e)
+
+    # Database-backed Streamable HTTP MCP tools. Each Agent receives an
+    # immutable discovery snapshot, but McpRemoteTool marks these schemas as
+    # DEFERRED; Agent injects the small tool_search gateway instead of
+    # sending the full remote catalog on the initial model request. Every
+    # actual call is still re-authorized against live connection and policy
+    # state.
+    mcp_runtime = get_mcp_runtime()
+    try:
+        mcp_catalog = await mcp_runtime.resolve_catalog(user_id)
+    except McpRequiredServerUnavailable:
+        # A required official integration is part of the Agent contract.
+        raise
+    except Exception as exc:
+        # Catalog/database rollout must not make the existing built-in Agent
+        # unavailable. Individual server failures are already isolated inside
+        # resolve_catalog; this protects installations that predate MCP tables.
+        logger.warning("MCP 目录加载失败，跳过远程工具: user=%s error=%s", user_id, exc)
+        if build_metadata is not None:
+            build_metadata["mcp_catalog_retry_required"] = True
+    else:
+        if build_metadata is not None:
+            build_metadata["mcp_catalog_fingerprint"] = mcp_catalog.fingerprint
+            # Optional failures are cached as a partial catalog for this exact
+            # config/refresh fingerprint. Rebuilding every chat would hammer an
+            # offline server; the next refresh bucket or config version retries.
+            build_metadata["mcp_catalog_retry_required"] = False
+        existing_names = {tool.name for tool in tools}
+        for snapshot in mcp_catalog.tools:
+            if snapshot.model_name in existing_names:
+                raise McpToolNameCollisionError(
+                    f"MCP model tool name conflicts with an existing tool: {snapshot.model_name}"
+                )
+            tools.append(McpRemoteTool(
+                user_id=user_id,
+                snapshot=snapshot,
+                runtime=mcp_runtime,
+            ))
+            existing_names.add(snapshot.model_name)
+        for error in mcp_catalog.errors:
+            logger.warning("MCP 服务发现失败（已隔离）: user=%s %s", user_id, error)
 
     return tools, skill_loader_ref

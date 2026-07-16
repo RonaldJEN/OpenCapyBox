@@ -70,6 +70,16 @@ vi.mock('../../services/adminApi', () => ({
   updateAdminLLMCallReview: vi.fn(),
 }));
 
+vi.mock('../../components/AdminMcpCatalogPanel', () => ({
+  default: ({ onDirtyChange }: { onDirtyChange?: (dirty: boolean) => void }) => (
+    <><div>官方 MCP 目录面板</div><button type="button" onClick={() => onDirtyChange?.(true)}>模拟修改官方 MCP</button></>
+  ),
+}));
+
+vi.mock('../../components/AdminToolPermissionsPanel', () => ({
+  default: () => <div>平台工具权限面板</div>,
+}));
+
 const mockNavigate = vi.fn();
 vi.mock('react-router-dom', async () => {
   const actual = await vi.importActual('react-router-dom');
@@ -324,6 +334,48 @@ describe('AdminConsole 组件', () => {
     });
 
     expect(screen.getByRole('button', { name: /Session监控/ })).toBeInTheDocument();
+  });
+
+  it('官方 MCP 导航应懒加载独立目录面板', async () => {
+    render(<AdminConsole />);
+    await waitFor(() => expect(getAdminOverview).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole('button', { name: '官方 MCP' }));
+
+    expect(await screen.findByText('官方 MCP 目录面板')).toBeInTheDocument();
+  });
+
+  it('官方 MCP 有未保存修改时切换后台模块需要确认', async () => {
+    render(<AdminConsole />);
+    await waitFor(() => expect(getAdminOverview).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: '官方 MCP' }));
+    fireEvent.click(await screen.findByRole('button', { name: '模拟修改官方 MCP' }));
+
+    fireEvent.click(screen.getByRole('button', { name: '工具权限' }));
+    const discardDialog = screen.getByRole('alertdialog', { name: '离开并放弃官方 MCP 修改？' });
+    expect(discardDialog).toBeInTheDocument();
+    expect(screen.getByText('官方 MCP 目录面板')).toBeInTheDocument();
+
+    await waitFor(() => expect(discardDialog).toHaveFocus());
+    fireEvent.keyDown(discardDialog, { key: 'Tab', shiftKey: true });
+    expect(screen.getByRole('button', { name: '放弃修改并离开' })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole('button', { name: '继续编辑' }));
+    expect(screen.queryByRole('alertdialog', { name: '离开并放弃官方 MCP 修改？' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '工具权限' }));
+    fireEvent.click(screen.getByRole('button', { name: '放弃修改并离开' }));
+
+    expect(await screen.findByText('平台工具权限面板')).toBeInTheDocument();
+  });
+
+  it('工具权限导航应与官方 MCP 独立并懒加载平台策略面板', async () => {
+    render(<AdminConsole />);
+    await waitFor(() => expect(getAdminOverview).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole('button', { name: '工具权限' }));
+
+    expect(await screen.findByText('平台工具权限面板')).toBeInTheDocument();
+    expect(screen.queryByText('官方 MCP 目录面板')).not.toBeInTheDocument();
   });
 
   it('系统监控应展示数据库运行态诊断', async () => {

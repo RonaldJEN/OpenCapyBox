@@ -128,26 +128,30 @@
 
 ### 🔌 MCP 工具集成
 
-OpenCapyBox 支持通过 [MCP（Model Context Protocol）](https://modelcontextprotocol.io/) 接入外部工具服务。配置文件位于 `src/agent/config/mcp.json`：
+OpenCapyBox 支持通过 [MCP（Model Context Protocol）](https://modelcontextprotocol.io/) 接入外部工具服务，目前**只支持 Streamable HTTP**。连接配置存储在数据库中，不再从服务端本地 `mcp.json` 启动进程：
+
+- **官方 MCP**：管理员在管理后台统一创建、测试、发布或停用，可配置平台凭证及“平台必需”连接；普通官方连接由用户启用并可覆盖自己的凭证，平台必需连接会自动启用且用户不能停用。
+- **个人 MCP**：用户在“数据连接”中自行维护，仅本人可见；默认只允许公网 HTTPS。
+- **`mcp.json`**：仅作为个人 MCP 的导入/导出格式。导出永远移除 Token 和 Headers，不是运行时配置源。
 
 ```json
 {
   "mcpServers": {
     "my-mcp-server": {
       "description": "My MCP Server",
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@example/mcp-server"],
-      "env": { "API_KEY": "your-key" },
+      "type": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
       "disabled": false
     }
   }
 }
 ```
 
-- `type` 支持 `stdio`（本地进程）和 `streamable-http`（远程 HTTP）
-- 设置 `"disabled": true` 可暂时停用某个 MCP 服务
-- 环境变量 `MCP_CONFIG_PATH` 可自定义配置文件路径
+- MCP 凭证使用独立的 `MCP_SECRET_KEY` 加密保存，API 不回显 Secret；生产模式会拒绝缺失、示例值、短密钥、复用 `AUTH_SECRET_KEY` 以及公开示例账号。
+- 每个官方或个人连接都可独立启停具体工具；allowlist / denylist 只决定工具是否发布给 Agent，不授予执行权限。工具发现后使用稳定模型名称，并在每次调用前重新校验连接状态、归属与最新发布策略；`tools/call` 有独立且不可关闭的墙钟超时，越过发送边界后若结果不确定会标记为 `unknown`，绝不自动重试。
+- MCP 工具默认采用 Deferred 暴露：初始请求不注入完整远端 schema，Agent 通过 `tool_search` 按需发现后才加载，隐藏工具和权限 `DENY` 工具不会出现在搜索结果中。
+- 对存在有效 MCP 连接的用户，目录指纹会按 `MCP_CATALOG_REFRESH_SECONDS` 周期轮转（默认 300 秒），即使 URL 和凭证未变化，下次重建 Agent 也会重新请求 `tools/list`。发现失败时不会把数据库中的旧 schema 快照暴露成可执行工具，并保留后续重试语义。
+- MCP 与权限管控分离：连接与工具发布决定“工具是否可见”，`ALLOW / ASK / DENY` 决定“这次是否可执行”。MCP 工具默认 `ASK`，用户可选择允许本次、当前会话、永久允许或拒绝；审批生成的会话/永久授权同时绑定当前 schema 与连接目标/凭证指纹，任一变化都会回退为 `ASK`；管理员规则是不可被用户放宽的上限。
 
 ## 📸 截图预览
 
@@ -474,7 +478,8 @@ DATABASE_URL=postgresql://user:password@host:5432/opencapybox
 # PostgreSQL 必须安装 pgvector：CREATE EXTENSION IF NOT EXISTS vector;
 # pytest 集成测试库，禁止指向生产库：
 TEST_DATABASE_URL=postgresql://user:password@host:5432/opencapybox_test
-AUTH_SECRET_KEY=                        # 不配则自动派生
+AUTH_SECRET_KEY=<至少 32 个随机字符>    # 生产环境必填
+MCP_SECRET_KEY=<另一组至少 32 个随机字符> # 生产环境必填，且不得与 AUTH_SECRET_KEY 相同
 AUTH_TOKEN_EXPIRE_MINUTES=720
 
 # === Agent ===

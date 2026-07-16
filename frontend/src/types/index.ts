@@ -251,6 +251,21 @@ export interface InterruptDetails {
   payload?: any;
 }
 
+export interface ToolApprovalPayload {
+  kind: 'tool_approval';
+  tool_ref: string;
+  provider: 'builtin' | 'mcp';
+  source_type: 'builtin' | 'official' | 'personal';
+  server_id?: string | null;
+  server_name?: string | null;
+  tool_name: string;
+  tool_title?: string | null;
+  tool_description?: string | null;
+  arguments_display: string;
+  warning?: string | null;
+  schema_hash?: string | null;
+}
+
 // AskUser 问题类型
 export interface AskUserOption {
   label: string;
@@ -422,6 +437,7 @@ export interface AttachmentInfo {
 export interface RoundData {
   round_id: string;
   parent_run_id?: string | null;
+  control_kind?: 'tool_approval' | null;
   idempotency_key?: string | null;
   last_event_sequence?: number;
   user_message: string;

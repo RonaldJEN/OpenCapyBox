@@ -2405,6 +2405,12 @@
   box-shadow: 0 22px 60px rgba(31, 29, 24, 0.22);
 }
 
+.admin-mcp-navigation-confirm { z-index: 92; }
+.admin-mcp-navigation-confirm .admin-modal { width: min(430px, calc(100vw - 32px)); padding: 20px; }
+.admin-mcp-navigation-confirm h3 { margin: 0; font-size: 15px; }
+.admin-mcp-navigation-confirm p { margin: 8px 0 18px; color: #6f7871; font-size: 11px; line-height: 1.6; }
+.admin-mcp-navigation-confirm .admin-modal > div { display: flex; justify-content: flex-end; gap: 7px; }
+
 .admin-login-events-modal {
   width: min(760px, 100%);
 }

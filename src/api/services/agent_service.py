@@ -67,6 +67,7 @@ class AgentService:
         tool_exclude: set[str] | None = None,
         system_prompt_override: str | None = None,
         workspace_dir: str | None = None,
+        allow_human_interrupts: bool = True,
     ):
         self.sandbox = sandbox
         self.history_service = history_service
@@ -75,10 +76,13 @@ class AgentService:
         self.model_id = model_id
         self.tool_exclude = set(tool_exclude or set())
         self.system_prompt_override = system_prompt_override
+        self.allow_human_interrupts = allow_human_interrupts
         self.agent: Agent | None = None
         self._last_saved_index = 0
         self._pending_interrupt_round_ids: dict[str, str] = {}
         self.skill_loader = None  # 保存 skill_loader 引用
+        self.mcp_catalog_fingerprint: str | None = None
+        self.mcp_catalog_retry_required = False
         self.cancel_token: asyncio.Event | None = None  # per-run 取消令牌
         self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
         self._active_run_count = 0
@@ -179,6 +183,7 @@ class AgentService:
         system_prompt = self.system_prompt_override or self._load_system_prompt()
 
         # 创建工具列表
+        tool_build_metadata: dict[str, object] = {}
         tools, self.skill_loader = await create_agent_tools(
             sandbox=self.sandbox,
             workspace_dir=self._workspace_dir,
@@ -189,6 +194,16 @@ class AgentService:
             exclude=self.tool_exclude,
             supports_image=model_config.supports_image,
             max_images=model_config.max_images,
+            build_metadata=tool_build_metadata,
+        )
+        exact_mcp_fingerprint = tool_build_metadata.get("mcp_catalog_fingerprint")
+        self.mcp_catalog_fingerprint = (
+            exact_mcp_fingerprint
+            if isinstance(exact_mcp_fingerprint, str) and exact_mcp_fingerprint
+            else None
+        )
+        self.mcp_catalog_retry_required = (
+            tool_build_metadata.get("mcp_catalog_retry_required") is True
         )
 
         # 技能元数据和时间一样按 LLM 请求动态生成，不写入长期 system message。
@@ -221,6 +236,8 @@ class AgentService:
             tool_timeout=settings.agent_tool_timeout,
             subagent_max_parallel=settings.agent_subagent_max_parallel,
             runtime_prompt_provider=runtime_prompt_provider,
+            user_id=self.user_id,
+            allow_human_interrupts=self.allow_human_interrupts,
         )
 
         # 从数据库恢复历史
@@ -419,6 +436,7 @@ class AgentService:
                 model_id=model_id,
                 tool_exclude=set(profile.tool_exclude),
                 system_prompt_override=profile.system_prompt,
+                allow_human_interrupts=False,
             )
             await child_service.initialize_agent()
             child_service.cancel_token = context.cancel_token
@@ -1008,7 +1026,10 @@ class AgentService:
                             fallback_reason,
                         )
                 for msg in round_messages:
-                    if msg.role == "tool" and msg.content == "[Awaiting user response]":
+                    if msg.role == "tool" and msg.content in {
+                        "[Awaiting user response]",
+                        "[Awaiting tool approval]",
+                    }:
                         msg.content = "[Interrupt resolved in subsequent round]"
 
             messages.extend(round_messages)
@@ -1030,6 +1051,8 @@ class AgentService:
         placeholders = {
             "[Awaiting user response]",
             "[Interrupt resolved in subsequent round]",
+            "[Awaiting tool approval]",
+            "[Tool approval execution pending]",
         }
         for msg in messages:
             if (
@@ -1122,6 +1145,7 @@ class AgentService:
         step_tool_calls: list[ToolCall] = []
         step_tool_results: list[dict] = []
         tc_id_to_name: dict[str, str] = {}
+        stitched_tool_result_ids: set[str] = set()
         _skipped = 0
         synthetic_content_iter = iter(synthetic_user_contents or [])
 
@@ -1188,6 +1212,8 @@ class AgentService:
 
             elif evt_type == "TOOL_CALL_RESULT":
                 tc_id = payload.get("toolCallId", "")
+                if tc_id in stitched_tool_result_ids:
+                    continue
                 tc_name = tc_id_to_name.get(tc_id, "")
                 content = payload.get("content", "")
                 step_tool_results.append({
@@ -1199,6 +1225,12 @@ class AgentService:
             elif evt_type == "STEP_FINISHED":
                 # Flush step：生成 assistant + tool messages
                 flush_step_messages()
+
+            elif evt_type == "CUSTOM" and payload.get("name") == "tool_approval_resume":
+                value = payload.get("value") if isinstance(payload.get("value"), dict) else {}
+                tc_id = value.get("toolCallId")
+                if isinstance(tc_id, str) and tc_id:
+                    stitched_tool_result_ids.add(tc_id)
 
             elif evt_type == "CUSTOM" and payload.get("name") == "synthetic_user_message":
                 content = next(synthetic_content_iter, None) if synthetic_user_contents is not None else None
@@ -1515,16 +1547,56 @@ class AgentService:
         if not self.agent:
             raise RuntimeError("Agent not initialized")
 
-        # 如果有待处理的 ask_user 中断，用户发送新消息意味着跳过问题
-        if self.agent.has_pending_interrupt():
-            logger.info("用户发送新消息，清除待处理的 ask_user 中断")
+        # 用户可以不点审批/问答卡而直接发送新消息。热状态使用 Agent
+        # 快照，重启/TTL 回收后则使用 Round.interrupt_payload 冷恢复。
+        pending_interrupt = None
+        pending_getter = getattr(type(self.agent), "get_pending_interrupt", None)
+        if callable(pending_getter):
+            candidate = self.agent.get_pending_interrupt()
+            if isinstance(candidate, dict):
+                pending_interrupt = candidate
+        if pending_interrupt is None and self.agent.has_pending_interrupt():
+            candidate = getattr(self.agent, "_pending_interrupt", None)
+            pending_interrupt = (
+                candidate
+                if isinstance(candidate, dict)
+                else {"kind": "ask_user"}
+            )
+        persisted_interrupt = (
+            None if pending_interrupt else self._load_persisted_interrupt(None)
+        )
+        interrupt_to_abandon = pending_interrupt or persisted_interrupt
+        if interrupt_to_abandon:
+            logger.info("用户发送新消息，清除待处理中断")
+            db = self.history_service.db
             try:
-                # 先持久化清理，再清内存状态，降低跨层状态不一致窗口
-                self.history_service.resolve_interrupted_rounds(self.session_id)
+                if interrupt_to_abandon.get("kind") == "tool_approval":
+                    from src.api.services.tool_permission_service import claim_approval_request
+
+                    claim_approval_request(
+                        db,
+                        request_id=interrupt_to_abandon["interrupt_id"],
+                        user_id=self.user_id,
+                        resolution="deny",
+                        commit=False,
+                    )
+                    self.history_service.resolve_interrupted_rounds(
+                        self.session_id,
+                        commit=False,
+                    )
+                    db.commit()
+                else:
+                    self.history_service.resolve_interrupted_rounds(self.session_id)
             except Exception:
+                db.rollback()
                 logger.exception("清理 interrupted 轮次失败，保留 pending interrupt 以便重试")
             else:
-                self.agent.clear_pending_interrupt()
+                if pending_interrupt:
+                    try:
+                        self.agent.clear_pending_interrupt(claim_approval=False)
+                    except TypeError:
+                        # Compatibility with small test/fallback Agent doubles.
+                        self.agent.clear_pending_interrupt()
 
         # 正規化 + 校驗 + 構建輸入內容
         normalized_blocks = self._normalize_content_blocks(user_content)
@@ -1607,12 +1679,13 @@ class AgentService:
 
         return "\n".join(lines)
 
-    def _load_persisted_interrupt(self, interrupt_id: str) -> dict[str, Any] | None:
+    def _load_persisted_interrupt(self, interrupt_id: str | None) -> dict[str, Any] | None:
         """从数据库查找仍处于 interrupted 状态的中断详情。
 
         该方法用于 Agent 内存状态丢失（例如 AgentPool TTL 回收）后的冷恢复。
         """
         from src.api.models.round import Round
+        from src.api.models.tool_permission import ToolApprovalRequest
 
         db = self.history_service.db
         try:
@@ -1635,17 +1708,47 @@ class AgentService:
 
                 if not isinstance(payload, dict):
                     continue
-                if payload.get("id") != interrupt_id:
+                persisted_id = payload.get("id")
+                if not isinstance(persisted_id, str) or not persisted_id:
+                    continue
+                if interrupt_id is not None and persisted_id != interrupt_id:
                     continue
 
                 details = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
                 questions = details.get("questions") if isinstance(details.get("questions"), list) else []
-                return {
-                    "interrupt_id": interrupt_id,
+                reason = payload.get("reason") if isinstance(payload.get("reason"), str) else None
+                kind = details.get("kind") if isinstance(details.get("kind"), str) else None
+                if not kind:
+                    kind = "tool_approval" if reason == "human_approval" else "ask_user"
+                if kind == "tool_approval":
+                    approval = (
+                        db.query(ToolApprovalRequest)
+                        .filter(
+                            ToolApprovalRequest.id == persisted_id,
+                            ToolApprovalRequest.user_id == self.user_id,
+                            ToolApprovalRequest.session_id == self.session_id,
+                        )
+                        .first()
+                    )
+                    # Only a never-claimed request is approvable. Executing,
+                    # denied, completed and unknown rows are terminal from the
+                    # resume surface even if their historical Round remains
+                    # interrupted for audit/replay purposes.
+                    if approval is None or approval.status != "requested":
+                        continue
+                result = {
+                    "interrupt_id": persisted_id,
                     "round_id": round_obj.id,
                     "tool_call_id": details.get("tool_call_id"),
                     "questions": questions,
                 }
+                if kind == "tool_approval":
+                    result.update({
+                        "reason": reason,
+                        "kind": kind,
+                        "payload": details,
+                    })
+                return result
 
             return None
         finally:
@@ -1654,8 +1757,30 @@ class AgentService:
     def has_pending_interrupt(self, interrupt_id: str) -> bool:
         """检查是否存在匹配的待处理中断（内存态 + 持久化态）。"""
         if self.agent and self.agent.has_pending_interrupt(interrupt_id):
-            return True
+            snapshot = self._get_agent_pending_interrupt_snapshot(interrupt_id)
+            if (snapshot or {}).get("kind") != "tool_approval":
+                return True
+            return self._tool_approval_is_requested(interrupt_id)
         return self._load_persisted_interrupt(interrupt_id) is not None
+
+    def _tool_approval_is_requested(self, interrupt_id: str) -> bool:
+        from src.api.models.tool_permission import ToolApprovalRequest
+
+        db = self.history_service.db
+        try:
+            return (
+                db.query(ToolApprovalRequest.id)
+                .filter(
+                    ToolApprovalRequest.id == interrupt_id,
+                    ToolApprovalRequest.user_id == self.user_id,
+                    ToolApprovalRequest.session_id == self.session_id,
+                    ToolApprovalRequest.status == "requested",
+                )
+                .first()
+                is not None
+            )
+        finally:
+            db.rollback()
 
     def _get_agent_pending_interrupt_snapshot(self, interrupt_id: str) -> dict[str, Any] | None:
         """尽量从 Agent 内存态读取 pending interrupt 快照。"""
@@ -1695,6 +1820,114 @@ class AgentService:
             return False
 
         return self._replace_interrupt_tool_result_in_messages(messages, tool_call_id, content)
+
+    def _prepare_tool_approval_resume_locked(
+        self,
+        *,
+        interrupt_id: str,
+        answers: dict[str, str],
+        parent_run_id: str,
+    ) -> PreparedAgentRun:
+        """Atomically claim an approval and create its resume round.
+
+        External execution is intentionally deferred to ``Agent.run_agui`` so
+        the approved call remains cancellable and its result is delivered over
+        the normal persisted SSE stream. A crash after the claim leaves the
+        request in ``executing`` and is never retried automatically.
+        """
+        if not self.agent:
+            raise RuntimeError("Agent not initialized")
+
+        from src.api.services.tool_permission_service import (
+            APPROVAL_RESOLUTIONS,
+            claim_approval_request,
+        )
+
+        resolution = str(answers.get("approval") or "").strip().lower()
+        if resolution not in APPROVAL_RESOLUTIONS:
+            raise ValueError(
+                "tool approval requires answers.approval to be one of "
+                "allow_once, allow_session, allow_always, deny"
+            )
+
+        resume_user_message = f"Tool approval: {resolution}"
+        run_id = str(uuid.uuid4())
+        marker = (
+            "Tool execution denied by user."
+            if resolution == "deny"
+            else "[Tool approval execution pending]"
+        )
+        messages_snapshot = copy.deepcopy(self.agent.messages)
+        pending_interrupt_snapshot = copy.deepcopy(
+            getattr(self.agent, "_pending_interrupt", None)
+        )
+        pending_approved_snapshot = copy.deepcopy(
+            getattr(self.agent, "_pending_approved_tool", None)
+        )
+        pending_round_ids_snapshot = dict(self._pending_interrupt_round_ids)
+        db = self.history_service.db
+
+        try:
+            self._refresh_runtime_messages_from_history()
+            claim = claim_approval_request(
+                db,
+                request_id=interrupt_id,
+                user_id=self.user_id,
+                resolution=resolution,
+                commit=False,
+            )
+            request = claim.request
+            self.history_service.create_resume_round(
+                session_id=self.session_id,
+                round_id=run_id,
+                user_message=resume_user_message,
+                parent_run_id=parent_run_id,
+                user_attachments=[],
+                interrupt_id=interrupt_id,
+                tool_call_id=request.tool_call_id,
+                answers=answers,
+                tool_result_content=marker,
+                restore_strategy="approval_queued",
+                fallback_reason=None,
+                commit=False,
+            )
+            self.agent.queue_tool_approval_resume(
+                request_id=request.id,
+                tool_call_id=request.tool_call_id,
+                function_name=request.model_tool_name,
+                arguments=claim.arguments,
+                provider=request.provider,
+                tool_name=request.tool_name,
+                server_id=request.server_id,
+                installation_id=request.installation_id,
+                schema_hash=request.schema_hash,
+                connection_fingerprint=request.connection_fingerprint,
+                resolution=resolution,
+                should_execute=claim.should_execute,
+                claim_token=claim.claim_token,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            self.agent.messages = messages_snapshot
+            self.agent._pending_interrupt = pending_interrupt_snapshot
+            self.agent._pending_approved_tool = pending_approved_snapshot
+            self._pending_interrupt_round_ids = pending_round_ids_snapshot
+            raise
+
+        self._pending_interrupt_round_ids.pop(interrupt_id, None)
+        # A tool-approval resolution is a control decision, not user chat input.
+        # It is already durably recorded in tool_approval_requests, the interrupt
+        # resolution and the audit trail, and the approved tool result is stitched
+        # into the parent round on history rebuild. Persisting an extra role="user"
+        # conversation message would surface the resolution as a fake user turn in
+        # both the transcript and the rebuilt model context, so it is deliberately
+        # not saved here (unlike ask_user, whose answer is genuine user input).
+        return PreparedAgentRun(
+            run_id=run_id,
+            user_message=resume_user_message,
+            parent_run_id=parent_run_id,
+        )
 
     async def resume_agui(
         self,
@@ -1740,6 +1973,11 @@ class AgentService:
             resume_user_message = self._format_resume_user_message(answers)
             persisted_interrupt = self._load_persisted_interrupt(interrupt_id)
             pending_interrupt = self._get_agent_pending_interrupt_snapshot(interrupt_id)
+            if (
+                (pending_interrupt or {}).get("kind") == "tool_approval"
+                and not self._tool_approval_is_requested(interrupt_id)
+            ):
+                pending_interrupt = None
             parent_run_id = (
                 (persisted_interrupt or {}).get("round_id")
                 or (pending_interrupt or {}).get("round_id")
@@ -1747,6 +1985,17 @@ class AgentService:
             )
             if not parent_run_id:
                 raise ValueError("No pending interrupt to resume from")
+
+            interrupt_kind = (
+                (pending_interrupt or {}).get("kind")
+                or (persisted_interrupt or {}).get("kind")
+            )
+            if interrupt_kind == "tool_approval":
+                return self._prepare_tool_approval_resume_locked(
+                    interrupt_id=interrupt_id,
+                    answers=answers,
+                    parent_run_id=parent_run_id,
+                )
 
             tool_call_id = (
                 (persisted_interrupt or {}).get("tool_call_id")
@@ -2125,7 +2374,9 @@ class AgentService:
 
         # 静默记忆刷新
         try:
-            flushed_by_silent_mode = await self.agent.maybe_flush_memory_silent()
+            flushed_by_silent_mode = await self.agent.maybe_flush_memory_silent(
+                session_id=self.session_id,
+            )
         except Exception as e:
             logger.warning("后台记忆刷新异常: %s", e)
 

@@ -86,6 +86,43 @@ class TestAgentServiceCreateTools:
         assert image_tool._model_max_images == 3
 
     @pytest.mark.asyncio
+    async def test_partial_mcp_catalog_does_not_request_immediate_agent_retry(
+        self,
+        service,
+    ):
+        runtime = MagicMock()
+        runtime.resolve_catalog = AsyncMock(return_value=SimpleNamespace(
+            fingerprint="refresh-bucket-7",
+            tools=(),
+            errors=("optional server offline",),
+        ))
+        metadata = {}
+        with (
+            patch("src.api.services.tool_factory.settings") as mock_settings,
+            patch(
+                "src.api.services.tool_factory.get_mcp_runtime",
+                return_value=runtime,
+            ),
+        ):
+            mock_settings.bocha_search_appcode = None
+            mock_settings.skills_dir = ""
+            mock_settings.sandbox_background_command_timeout_seconds = 21600
+            from src.api.services.tool_factory import create_agent_tools
+            from src.api.services.sandbox_service import get_sandbox_mount_path
+
+            await create_agent_tools(
+                sandbox=service.sandbox,
+                workspace_dir=service._workspace_dir,
+                mount=get_sandbox_mount_path(),
+                user_id=service.user_id,
+                db_session_factory=service._get_db_session_factory(),
+                build_metadata=metadata,
+            )
+
+        assert metadata["mcp_catalog_fingerprint"] == "refresh-bucket-7"
+        assert metadata["mcp_catalog_retry_required"] is False
+
+    @pytest.mark.asyncio
     async def test_skill_config_query_failure_keeps_skill_metadata_and_tool_available(
         self, service, tmp_path
     ):
@@ -233,6 +270,37 @@ class TestAgentServiceRestoreHistory:
             "tool_call_id": "tc-1",
             "questions": [{"text": "ok?"}],
         }
+        mock_db.rollback.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "approval_status",
+        ["executing", "executed", "failed", "denied", "unknown"],
+    )
+    def test_cold_restore_never_reoffers_claimed_tool_approval(
+        self,
+        approval_status,
+    ):
+        history_service = MagicMock()
+        mock_db = MagicMock()
+        round_row = MagicMock()
+        round_row.id = "round-approval"
+        round_row.interrupt_payload = (
+            '{"id":"approval-1","reason":"human_approval",'
+            '"payload":{"kind":"tool_approval","tool_call_id":"tc-1"}}'
+        )
+        round_query = MagicMock()
+        round_query.filter.return_value.order_by.return_value.all.return_value = [
+            round_row
+        ]
+        approval_query = MagicMock()
+        approval_query.filter.return_value.first.return_value = SimpleNamespace(
+            status=approval_status
+        )
+        mock_db.query.side_effect = [round_query, approval_query]
+        history_service.db = mock_db
+        service = make_agent_service(history_service=history_service)
+
+        assert service._load_persisted_interrupt("approval-1") is None
         mock_db.rollback.assert_called_once()
 
 

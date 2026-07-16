@@ -8,7 +8,7 @@
 
 from typing import Any
 
-from .base import Tool, ToolResult
+from .base import Tool, ToolExposure, ToolResult
 
 # ask_user 的 tool name 常量，方便 agent.py 引用
 ASK_USER_TOOL_NAME = "ask_user"
@@ -20,6 +20,8 @@ class AskUserQuestionTool(Tool):
     此工具的 execute() 不会被正常调用 — agent 主循环在检测到 ask_user
     调用时会拦截并触发 AG-UI interrupt 流程。
     """
+
+    exposure = ToolExposure.DIRECT_MODEL_ONLY
 
     @property
     def name(self) -> str:

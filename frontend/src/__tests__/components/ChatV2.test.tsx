@@ -6,6 +6,14 @@ import { apiService } from '../../services/api';
 import { RoundData } from '../../types';
 import { makeChatV2DefaultProps } from '../utils/chatv2-helpers';
 
+const ABORT_WARNING = '远端副作用可能已经发生，请确认后再重试。';
+const ABORT_RESPONSE = {
+  status: 'cancelled' as const,
+  request_id: 'abort-request',
+  reason: 'force_aborted',
+  outcome_warning: ABORT_WARNING,
+};
+
 // Mock apiService
 vi.mock('../../services/api', () => ({
   apiService: {
@@ -127,6 +135,7 @@ vi.mock('../../components/Round', () => ({
       data-assistant={round.final_response}
       data-steps={JSON.stringify(round.steps)}
       data-status={round.status}
+      data-control-kind={round.control_kind || ''}
     >
       <span>Round: {round.round_id}</span>
       <span>Streaming: {String(isStreaming)}</span>
@@ -153,12 +162,12 @@ vi.mock('../../components/FilePreview', () => ({
 }));
 
 vi.mock('../../components/QuestionCard', () => ({
-  QuestionCard: ({ onSubmit, onDismiss, disabled }: any) => (
+  QuestionCard: ({ questions, onSubmit, onDismiss, disabled }: any) => (
     <div data-testid="question-card">
       <button
         type="button"
         disabled={disabled}
-        onClick={() => onSubmit({ 'Which database should we use?': 'PostgreSQL' })}
+        onClick={() => onSubmit({ [questions?.[0]?.question || 'Which database should we use?']: 'PostgreSQL' })}
       >
         Submit Question
       </button>
@@ -202,6 +211,7 @@ describe('ChatV2 组件', () => {
       running_sessions: [],
     });
     vi.mocked(apiService.resumeStream).mockResolvedValue(undefined);
+    vi.mocked(apiService.abortChat).mockResolvedValue(ABORT_RESPONSE);
   });
 
   it('没有 sessionId 时应该显示欢迎页（含输入框）', () => {
@@ -901,6 +911,197 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('普通 ask_user 的问题键为 approval 时仍是用户回答而非工具审批控制', async () => {
+    const interruptedRounds: RoundData[] = [{
+      round_id: 'round-ask-approval-key',
+      user_message: '请确认审批字段',
+      final_response: '',
+      steps: [],
+      step_count: 0,
+      status: 'interrupted',
+      created_at: new Date().toISOString(),
+      interrupt: {
+        id: 'interrupt-approval-key',
+        reason: 'input_required',
+        payload: {
+          questions: [{
+            question: 'approval',
+            header: '字段名称',
+            options: [{ label: 'PostgreSQL', description: '普通回答' }],
+          }],
+        },
+      },
+    }];
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: interruptedRounds,
+      session_id: 'test-session',
+      total: 1,
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    fireEvent.click(await screen.findByText('Submit Question'));
+
+    await waitFor(() => {
+      expect(apiService.resumeStream).toHaveBeenCalledWith(
+        'test-session',
+        'interrupt-approval-key',
+        { approval: 'PostgreSQL' },
+        expect.any(Object),
+      );
+      const answerRound = screen.getByText(/User: Q: approval/).closest('[data-testid="round"]');
+      expect(answerRound).toHaveAttribute('data-control-kind', '');
+      expect(answerRound).toHaveTextContent('A: PostgreSQL');
+    });
+  });
+
+  it('应渲染工具审批中断，并把精确审批结果提交到 resume 接口', async () => {
+    const interruptedRounds: RoundData[] = [
+      {
+        round_id: 'round-approval-1',
+        user_message: '查询企业知识库',
+        final_response: '',
+        steps: [],
+        step_count: 1,
+        status: 'interrupted',
+        created_at: new Date().toISOString(),
+        interrupt: {
+          id: 'approval-1',
+          reason: 'human_approval',
+          payload: {
+            kind: 'tool_approval',
+            tool_ref: 'mcp:server-1:search',
+            provider: 'mcp',
+            source_type: 'official',
+            server_id: 'server-1',
+            server_name: '官方知识库',
+            tool_name: 'search',
+            tool_title: '知识检索',
+            tool_description: '检索企业知识库',
+            arguments_display: '{"query":"季度收入"}',
+          },
+        },
+      },
+    ];
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: interruptedRounds,
+      session_id: 'test-session',
+      total: 1,
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    expect(await screen.findByText('工具执行需要确认')).toBeInTheDocument();
+    expect(screen.getByText('官方 MCP · 官方知识库')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /允许本次/ }));
+
+    await waitFor(() => {
+      expect(apiService.resumeStream).toHaveBeenCalledWith(
+        'test-session',
+        'approval-1',
+        { approval: 'allow_once' },
+        expect.any(Object),
+      );
+      expect(screen.queryByText('User: Tool approval: allow_once')).not.toBeInTheDocument();
+      expect(screen.getAllByTestId('round')).toHaveLength(1);
+      expect(screen.getByText('User: 查询企业知识库')).toBeInTheDocument();
+    });
+  });
+
+  it('历史中的连续工具审批恢复应整合为同一轮助手响应', async () => {
+    const approvalChain: RoundData[] = [
+      {
+        round_id: 'round-root',
+        user_message: '查询贵州茅台过去一年的 Beta',
+        final_response: '',
+        steps: [{
+          step_number: 1,
+          thinking: '先查询指标。',
+          tool_calls: [],
+          tool_results: [],
+          status: 'completed',
+        }],
+        step_count: 1,
+        status: 'interrupted',
+        created_at: '2026-07-16T10:00:00Z',
+      },
+      {
+        round_id: 'round-resume-1',
+        parent_run_id: 'round-root',
+        control_kind: 'tool_approval',
+        user_message: 'Tool approval: allow_once',
+        final_response: '第一次查询没有返回 Beta，改用日期区间重试。',
+        steps: [{
+          step_number: 1,
+          thinking: '调整查询参数。',
+          tool_calls: [],
+          tool_results: [],
+          status: 'completed',
+        }],
+        step_count: 1,
+        status: 'interrupted',
+        created_at: '2026-07-16T10:00:06Z',
+      },
+      {
+        round_id: 'round-resume-2',
+        parent_run_id: 'round-resume-1',
+        control_kind: 'tool_approval',
+        user_message: 'Tool approval: allow_once',
+        final_response: '最终 Beta 为 0.2308。',
+        steps: [{
+          step_number: 1,
+          thinking: '整理最终结果。',
+          tool_calls: [],
+          tool_results: [],
+          status: 'completed',
+        }],
+        step_count: 1,
+        status: 'completed',
+        created_at: '2026-07-16T10:00:08Z',
+        completed_at: '2026-07-16T10:00:12Z',
+      },
+    ];
+
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: approvalChain,
+      session_id: 'test-session',
+      total: approvalChain.length,
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    await waitFor(() => expect(screen.getAllByTestId('round')).toHaveLength(1));
+    const displayedRound = screen.getByTestId('round');
+    expect(displayedRound).toHaveAttribute('data-assistant', '最终 Beta 为 0.2308。');
+    expect(displayedRound).toHaveAttribute('data-status', 'completed');
+    expect(JSON.parse(displayedRound.getAttribute('data-steps') || '[]')).toHaveLength(3);
+    expect(screen.getByText('User: 查询贵州茅台过去一年的 Beta')).toBeInTheDocument();
+    expect(screen.queryByText(/User: Tool approval:/)).not.toBeInTheDocument();
+  });
+
+  it('普通用户发送审批格式文本时不应被当作控制轮次', async () => {
+    const literalApprovalMessage: RoundData = {
+      round_id: 'round-literal-approval',
+      user_message: 'Tool approval: deny',
+      final_response: '这是普通聊天内容。',
+      steps: [],
+      step_count: 0,
+      status: 'completed',
+      created_at: '2026-07-16T10:00:00Z',
+      completed_at: '2026-07-16T10:00:01Z',
+    };
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [literalApprovalMessage],
+      session_id: 'test-session',
+      total: 1,
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    expect(await screen.findByText('User: Tool approval: deny')).toBeInTheDocument();
+    expect(screen.getAllByTestId('round')).toHaveLength(1);
+  });
+
   it('interrupted 历史状态下输入框不应被锁死', async () => {
     const interruptedRounds: RoundData[] = [
       {
@@ -1384,8 +1585,8 @@ describe('ChatV2 组件', () => {
     });
 
     let resolveAbort: () => void = () => {};
-    vi.mocked(apiService.abortChat).mockImplementation(() => new Promise<void>((resolve) => {
-      resolveAbort = resolve;
+    vi.mocked(apiService.abortChat).mockImplementation(() => new Promise((resolve) => {
+      resolveAbort = () => resolve(ABORT_RESPONSE);
     }));
 
     render(
@@ -1436,6 +1637,8 @@ describe('ChatV2 组件', () => {
     await act(async () => {
       resolveAbort();
     });
+
+    expect(await screen.findByText(ABORT_WARNING)).toBeInTheDocument();
 
     await act(async () => {
       fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
@@ -1565,7 +1768,7 @@ describe('ChatV2 组件', () => {
       promise: Promise.resolve(),
     } as any);
 
-    vi.mocked(apiService.abortChat).mockResolvedValue(undefined);
+    vi.mocked(apiService.abortChat).mockResolvedValue(ABORT_RESPONSE);
 
     render(
       <ChatV2
@@ -1688,7 +1891,7 @@ describe('ChatV2 组件', () => {
     });
 
     let rejectAbort: (reason?: unknown) => void = () => {};
-    vi.mocked(apiService.abortChat).mockImplementation(() => new Promise<void>((_resolve, reject) => {
+    vi.mocked(apiService.abortChat).mockImplementation(() => new Promise((_resolve, reject) => {
       rejectAbort = reject;
     }));
 

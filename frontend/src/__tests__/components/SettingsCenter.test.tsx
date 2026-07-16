@@ -16,6 +16,27 @@ vi.mock('../../services/configApi', () => ({
   updateAgentFile: vi.fn(),
 }));
 
+vi.mock('../../components/McpConnectionsPanel', () => ({
+  default: ({
+    onDirtyChange,
+    onPermissionsInvalidated,
+  }: {
+    onDirtyChange?: (dirty: boolean) => void;
+    onPermissionsInvalidated?: () => void;
+  }) => (
+    <>
+      <button type="button" onClick={() => onDirtyChange?.(true)}>模拟修改 MCP</button>
+      <button type="button" onClick={() => onPermissionsInvalidated?.()}>模拟 MCP 工具变化</button>
+    </>
+  ),
+}));
+
+vi.mock('../../components/ToolPermissionsPanel', () => ({
+  default: ({ refreshToken = 0 }: { refreshToken?: number }) => (
+    <><div>独立权限策略面板</div><output aria-label="权限刷新版本">{refreshToken}</output></>
+  ),
+}));
+
 describe('SettingsCenter', () => {
   let resolveSave: ((value: { version: number }) => void) | null = null;
 
@@ -104,6 +125,54 @@ describe('SettingsCenter', () => {
     fireEvent.click(screen.getByRole('button', { name: '技能' }));
 
     await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(1));
+  });
+
+  it('进入数据连接后才加载 MCP，并把表单 dirty 状态上报给外层', async () => {
+    const onUnsavedChangesChange = vi.fn();
+    render(<SettingsCenter onUnsavedChangesChange={onUnsavedChangesChange} />);
+
+    await screen.findByText('old user');
+    expect(screen.queryByRole('button', { name: '模拟修改 MCP' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '数据连接' }));
+    fireEvent.click(await screen.findByRole('button', { name: '模拟修改 MCP' }));
+
+    await waitFor(() => expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(true));
+  });
+
+  it('把权限管控作为与数据连接独立的设置分区', async () => {
+    render(<SettingsCenter />);
+
+    await screen.findByText('old user');
+    expect(screen.queryByText('独立权限策略面板')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '权限管控' }));
+    expect(await screen.findByText('独立权限策略面板')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '模拟修改 MCP' })).not.toBeInTheDocument();
+  });
+
+  it('MCP mutation 会让保活的权限面板刷新', async () => {
+    render(<SettingsCenter initialSection="permissions" />);
+    await screen.findByText('独立权限策略面板');
+    expect(screen.getByRole('status', { name: '权限刷新版本' })).toHaveTextContent('0');
+
+    fireEvent.click(screen.getByRole('button', { name: '数据连接' }));
+    fireEvent.click(await screen.findByRole('button', { name: '模拟 MCP 工具变化' }));
+    fireEvent.click(screen.getByRole('button', { name: '权限管控' }));
+
+    expect(screen.getByRole('status', { name: '权限刷新版本' })).toHaveTextContent('1');
+  });
+
+  it('为窄屏提供顶部横向设置导航并收紧内容留白', async () => {
+    render(<SettingsCenter />);
+    await screen.findByText('old user');
+
+    const navigation = screen.getByRole('navigation', { name: '设置分区' });
+    const content = screen.getByRole('main');
+
+    expect(navigation).toHaveClass('w-full', 'flex-row', 'overflow-x-auto');
+    expect(navigation).toHaveClass('sm:w-[180px]', 'sm:flex-col');
+    expect(content).toHaveClass('px-4', 'pt-5', 'sm:px-8', 'sm:pt-8');
   });
 
   it('多个技能切换请求并发时分别锁定对应开关', async () => {

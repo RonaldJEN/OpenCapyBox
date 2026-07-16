@@ -1,7 +1,8 @@
-"""ask_user 中断恢复事实表。
+"""Human-in-the-loop 中断恢复事实表。
 
 该表只服务后端 Agent 上下文恢复：把一次 interrupt_id 对应的用户回答
-结构化持久化，使冷恢复可以还原热 resume 时写入 tool result 的语义。
+或工具审批决策结构化持久化，使冷恢复可以还原热 resume 时写入 tool
+result 的语义，并让历史 API 不依赖用户可见文本识别控制轮次。
 """
 from sqlalchemy import Column, String, Text, DateTime, ForeignKey, UniqueConstraint
 

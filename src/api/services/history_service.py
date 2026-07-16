@@ -13,6 +13,7 @@ from src.api.models.agui_event import AGUIEventLog
 from src.api.models.interrupt_resolution import InterruptResolution
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.subagent_run import SubagentRun
+from src.api.models.tool_permission import ToolApprovalRequest
 from src.agent.schema.agui_events import AGUIEvent, EventType
 from src.api.services.agui_event_bus import AguiEventBus, StoredEvent
 from src.api.services.run_completion_service import RunCompletionService
@@ -166,6 +167,7 @@ class HistoryService:
         tool_result_content: Optional[str] = None,
         restore_strategy: Optional[str] = None,
         fallback_reason: Optional[str] = None,
+        commit: bool = True,
     ) -> Round:
         """原子创建 resume round，并将被接管的父 round 标记为 resumed。"""
         completed_at = now_naive()
@@ -228,7 +230,10 @@ class HistoryService:
                     fallback_reason=fallback_reason,
                 )
                 self.db.add(resolution)
-            self.db.commit()
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
         except IntegrityError as e:
             self.db.rollback()
             if interrupt_id and _is_interrupt_resolution_unique_violation(e):
@@ -237,7 +242,8 @@ class HistoryService:
         except Exception:
             self.db.rollback()
             raise
-        self._refresh_detached(round_obj)
+        if commit:
+            self._refresh_detached(round_obj)
         return round_obj
 
     def update_interrupt_resolution_fallback(
@@ -255,7 +261,7 @@ class HistoryService:
             self.db.commit()
         return updated
 
-    def resolve_interrupted_rounds(self, session_id: str) -> int:
+    def resolve_interrupted_rounds(self, session_id: str, *, commit: bool = True) -> int:
         """将会话中所有 interrupted 轮次标记为已解决（清除 interrupt_payload）。
 
         在 resume 成功创建新 round 之前调用，防止旧中断被前端重复恢复。
@@ -270,8 +276,10 @@ class HistoryService:
                 synchronize_session="fetch",
             )
         )
-        if updated:
+        if updated and commit:
             self.db.commit()
+        elif updated:
+            self.db.flush()
         return updated
 
     # 終態集合引用 Round 模型的全局常量（唯一事實源）。
@@ -485,6 +493,9 @@ class HistoryService:
         步骤(steps)从 AG-UI 事件日志动态重建，而非单独存储。
         """
         subagent_child_round_ids = self._get_subagent_child_round_ids(session_id)
+        tool_approval_resume_round_ids = self._get_tool_approval_resume_round_ids(
+            session_id
+        )
         rounds = (
             self.db.query(Round)
             .filter(Round.session_id == session_id)
@@ -522,6 +533,11 @@ class HistoryService:
                 {
                     "round_id": round_obj.id,
                     "parent_run_id": round_obj.parent_run_id,
+                    "control_kind": (
+                        "tool_approval"
+                        if round_obj.id in tool_approval_resume_round_ids
+                        else None
+                    ),
                     "idempotency_key": round_obj.idempotency_key,
                     "last_event_sequence": last_event_sequence,
                     "user_message": round_obj.user_message,
@@ -539,6 +555,34 @@ class HistoryService:
             )
 
         return result
+
+    def _get_tool_approval_resume_round_ids(self, session_id: str) -> set[str]:
+        """Return resume rounds backed by a durable tool approval request.
+
+        ``parent_run_id`` is shared by every interrupt resume (and may also be
+        used by future branching flows), so it cannot identify approval control
+        rounds on its own.  ``InterruptResolution`` already records the resume
+        round structurally, while a matching ``ToolApprovalRequest`` separates
+        tool approvals from ordinary ``ask_user`` answers without inspecting
+        user-visible message text.
+        """
+
+        rows = (
+            self.db.query(InterruptResolution.resume_round_id)
+            .join(
+                ToolApprovalRequest,
+                ToolApprovalRequest.id == InterruptResolution.interrupt_id,
+            )
+            .filter(
+                InterruptResolution.session_id == session_id,
+                ToolApprovalRequest.session_id == session_id,
+            )
+            .all()
+        )
+        return {
+            str(row[0] if isinstance(row, tuple) else row.resume_round_id)
+            for row in rows
+        }
 
     def _get_subagent_child_round_ids(self, session_id: str) -> set[str]:
         """Return child round ids that belong to subagent sidechains."""

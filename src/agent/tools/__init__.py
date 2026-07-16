@@ -1,6 +1,6 @@
 """Tools module."""
 
-from .base import Tool, ToolResult, ToolRuntimeContext
+from .base import Tool, ToolExposure, ToolRef, ToolResult, ToolRuntimeContext
 
 # Sandbox tools (for web backend via OpenSandbox)
 from .sandbox_bash_tool import (
@@ -15,6 +15,8 @@ from .sub_agent_tool import SubAgentTool
 
 __all__ = [
     "Tool",
+    "ToolExposure",
+    "ToolRef",
     "ToolResult",
     "ToolRuntimeContext",
     # Sandbox

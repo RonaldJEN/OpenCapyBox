@@ -19,6 +19,10 @@ from tests.db_safety import configure_pytest_database_urls  # noqa: E402
 configure_pytest_database_urls(project_root)
 
 # 設置測試環境變量（如果未設置）
+if "AUTH_SECRET_KEY" not in os.environ:
+    os.environ["AUTH_SECRET_KEY"] = "ci-auth-signing-key-7f39507f606f4fb89169c3dc"
+if "MCP_SECRET_KEY" not in os.environ:
+    os.environ["MCP_SECRET_KEY"] = "ci-mcp-envelope-key-12b894bb8df849e588a51f07"
 if "LLM_API_KEY" not in os.environ:
     os.environ["LLM_API_KEY"] = "test-api-key-for-ci"
 if "LLM_API_BASE" not in os.environ:

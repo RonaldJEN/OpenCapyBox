@@ -27,7 +27,7 @@
 | 消息发送与 SSE 流式响应 | 接收用户消息，启动 Agent 执行，通过 SSE 实时推送事件流 |
 | Agent 执行生命周期 | 管理从启动到终态的完整流程：启动 → 工具调用 → 完成/中断/取消/错误 |
 | SSE 订阅与断线重连 | 支持客户端重连后从指定 sequence 恢复事件流 |
-| 执行中断与恢复 | Human-in-the-Loop：Agent 调用 `ask_user` 工具时暂停执行，等待用户输入后恢复 |
+| 执行中断与恢复 | Human-in-the-Loop：`ask_user` 补充输入及工具权限审批均可暂停执行并通过结构化 resolution 恢复 |
 | 执行取消 | 支持主动取消当前单 worker 进程内正在运行的 Agent；跨 worker 投递不属于第一版能力 |
 | 幂等性保证 | 前端重复提交相同 `idempotency_key` 不会产生多次执行 |
 | AG-UI 事件生成与持久化 | 生成标准 AG-UI 事件并写入数据库，支持事后重放 |
@@ -259,19 +259,19 @@ adapter 复用，未来外部 channel adapter 可用本表将 peer 映射到 ses
 
 ### 2.8 `interrupt_resolutions` 表
 
-`ask_user` 中断恢复的结构化事实表。它记录某个 `interrupt_id` 被哪一个 resume round 接管，以及热路径当时写入 LLM 历史的 tool result 文本，用于冷启动后还原等价上下文。
+Human-in-the-Loop 中断恢复的结构化事实表，兼容 `ask_user` 与工具权限审批。它记录某个 `interrupt_id` 被哪一个 resume round 接管，以及热路径当时写入/拼接的 tool result 文本，用于冷启动后还原等价上下文，并为历史 API 提供不依赖展示文本的控制轮次身份。
 
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
-| `interrupt_id` | String(36) | PK | ask_user 中断 ID；同一个 interrupt 只能恢复一次 |
+| `interrupt_id` | String(36) | PK | Human-in-the-Loop 中断 ID；工具审批时同时是 `tool_approval_requests.id`；同一个 interrupt 只能恢复一次 |
 | `session_id` | String(36) | FK → `sessions.id` (CASCADE), NOT NULL, indexed | 所属会话 |
 | `parent_round_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL, indexed | 被中断并被接管的父 Round |
 | `resume_round_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL, indexed, unique | 承载恢复后执行的新 Round |
-| `tool_call_id` | String(64) | nullable | 原 ask_user tool call ID；旧数据或异常 payload 缺失时可为空 |
+| `tool_call_id` | String(64) | nullable | 原交互/审批对应的 tool call ID；旧数据或异常 payload 缺失时可为空 |
 | `answers_json` | Text | NOT NULL | 用户回答的结构化 JSON |
-| `resume_user_message` | Text | NOT NULL | resume round 中保存的 Q/A user 消息文本 |
-| `tool_result_content` | Text | NOT NULL | 热路径实际注入 LLM 的 tool result 文本，例如 `User answered:\n- Q?: A` |
-| `restore_strategy` | String(40) | nullable | resume 时采用的策略：`hot_replace` / `cold_replace` / `cold_fallback_user_message` |
+| `resume_user_message` | Text | NOT NULL | resume round 的内部文本；`ask_user` 为 Q/A，工具审批可为 `Tool approval: <resolution>`，但不得据此判断轮次类型 |
+| `tool_result_content` | Text | NOT NULL | 热路径实际注入/拼接的 tool result 文本，例如用户回答或审批执行占位/拒绝结果 |
+| `restore_strategy` | String(40) | nullable | resume 策略：`hot_replace` / `cold_replace` / `cold_fallback_user_message` / `approval_queued` |
 | `fallback_reason` | Text | nullable | 降级原因；运行时 fallback 或后续冷启动 stitching 失败时写入/更新 |
 | `created_at` | DateTime | default=now, indexed | 写入时间 |
 
@@ -282,6 +282,7 @@ adapter 复用，未来外部 channel adapter 可用本表将 peer 映射到 ses
 - 每个 `interrupt_id` 最多对应一条 resolution，防止同一中断被并发恢复成多个 child round。
 - `parent_round_id` 必须与 `rounds.parent_run_id == parent_round_id` 的 `resume_round_id` 对齐；冷启动重建时若无法对齐，该 resolution 会被忽略并记录告警。
 - 同时保存 `answers_json` 与 `tool_result_content` 是有意冗余：前者是结构化事实源，后者固定当时注入 LLM 的文本格式，避免 formatter 变更导致旧会话冷恢复 prompt 漂移。
+- 历史 API 通过 `InterruptResolution.resume_round_id` JOIN `ToolApprovalRequest.id == InterruptResolution.interrupt_id` 返回 `RoundData.control_kind="tool_approval"`；普通 `ask_user` 与用户真实发送的 `Tool approval: ...` 文本均不带该标记。前端只允许依据 `control_kind` 合并/隐藏审批控制轮次。
 
 ---
 
@@ -1093,7 +1094,7 @@ SSE 连接建立
 |----------|----------|----------|----------|
 | **LLM 调用失败** | 异常捕获 + 重试耗尽 (`RetryExhaustedError`) | 发射 `RUN_ERROR` 事件，Round 标记 `failed` | SSE 收到错误事件，前端展示错误提示 |
 | **Agent 初始化失败** | 初始化异常捕获 | 发射 `AGENT_INIT_FAILED` 事件，Round 标记 `failed` | 同上 |
-| **工具执行超时** | `tool_timeout=300s` | 工具返回超时错误信息，Agent 继续执行（可选择重试或放弃该工具） | Agent 可能告知用户工具超时，或尝试替代方案 |
+| **工具执行超时** | `tool_timeout=300s` | 工具返回超时错误信息并标记 `outcome_uncertain=true`；Agent 继续执行，权限审计记 `unknown` 而非 `failed` | Agent 告知用户超时；远端副作用可能已经发生，不应把它当作确定失败 |
 | **LLM 返回空响应** | 检测空内容 | 给予一次 nudge 机会（注入提示重新生成）；连续空响应 → `RUN_ERROR` | 首次空响应用户无感知；连续空响应收到错误 |
 | **输出截断** | `finish_reason=length` | 自动重试一次（调整 prompt 或 context） | 用户无感知（自动恢复） |
 | **SSE 断开** | 连接关闭检测 | Producer 继续运行在 `_active_runners` 中，等待客户端重连通过 subscribe 恢复 | 前端检测断开，自动重连并通过 subscribe 恢复事件流 |

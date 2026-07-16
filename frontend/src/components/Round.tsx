@@ -238,6 +238,11 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
   // 解析用户消息，提取附件信息
   const { attachments, cleanContent } = parseMessageContent(round.user_message);
 
+  // 工具审批的解决结果是控制决策而非用户输入。后端根据持久化的
+  // InterruptResolution/ToolApprovalRequest 关系返回结构化标记，避免把
+  // 用户恰好输入的同名文本误判为控制消息。
+  const isApprovalControlMessage = round.control_kind === 'tool_approval';
+
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'max_steps_reached', 'interrupted', 'resumed', 'cancelled']);
   const isCompleted = TERMINAL_STATUSES.has(round.status);
   const effectiveStreaming = isStreaming && !isCompleted;
@@ -259,6 +264,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
   return (
     <div className={`space-y-6 ${disableMotion ? '' : 'animate-fade-in'}`}>
       {/* ── 用户消息 ── */}
+      {!isApprovalControlMessage && (
       <div className="flex items-start gap-3">
         <div className="w-7 h-7 rounded-full bg-claude-surface flex items-center justify-center flex-shrink-0 mt-0.5">
           <User size={14} className="text-claude-secondary" />
@@ -323,6 +329,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
           )}
         </div>
       </div>
+      )}
 
       {/* ── 助手响应 ── */}
       <div className="flex items-start gap-3">

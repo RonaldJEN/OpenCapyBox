@@ -3,10 +3,12 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   Blocks,
+  Cable,
   Check,
   Layers,
   Loader2,
   Pencil,
+  Shield,
   Sparkles,
   UserRound,
   X,
@@ -21,8 +23,11 @@ import {
   type SkillSandboxStatus,
 } from '../services/configApi';
 
+const LazyMcpConnectionsPanel = React.lazy(() => import('./McpConnectionsPanel'));
+const LazyToolPermissionsPanel = React.lazy(() => import('./ToolPermissionsPanel'));
+
 type AgentFileName = 'memory' | 'user' | 'soul';
-type SettingsSection = 'memory' | 'soul';
+type SettingsSection = 'memory' | 'soul' | 'connections' | 'permissions';
 type MemoryTab = 'main' | 'user';
 type SoulTab = 'role' | 'skills';
 
@@ -120,6 +125,10 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
 }) => {
   const initial = getInitialState(initialSection, initialMemoryTab, initialSoulTab);
   const [activeSection, setActiveSection] = useState<SettingsSection>(initial.section);
+  const [connectionsVisited, setConnectionsVisited] = useState(initial.section === 'connections');
+  const [permissionsVisited, setPermissionsVisited] = useState(initial.section === 'permissions');
+  const [mcpDirty, setMcpDirty] = useState(false);
+  const [permissionsRefreshToken, setPermissionsRefreshToken] = useState(0);
   const [memoryTab, setMemoryTab] = useState<MemoryTab>(initial.memoryTab);
   const [soulTab, setSoulTab] = useState<SoulTab>(initial.soulTab);
   const [files, setFiles] = useState<Record<AgentFileName, FileState>>({
@@ -255,9 +264,11 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     setMemoryTab(next.memoryTab);
     setSoulTab(next.soulTab);
 
+    if (next.section === 'connections') setConnectionsVisited(true);
+    if (next.section === 'permissions') setPermissionsVisited(true);
     const fileToRefresh = next.section === 'memory'
       ? fileForMemoryTab(next.memoryTab)
-      : next.soulTab === 'role'
+      : next.section === 'soul' && next.soulTab === 'role'
         ? 'soul'
         : null;
     if (initialPropsAppliedRef.current && fileToRefresh) {
@@ -283,7 +294,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   }, []);
 
   const enabledSkillCount = skills.filter((skill) => skill.enabled).length;
-  const hasUnsavedChanges = Object.values(files).some(
+  const hasUnsavedChanges = mcpDirty || Object.values(files).some(
     (state) => state.editing && state.content !== state.original,
   );
 
@@ -298,9 +309,11 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
 
   const activateSection = (section: SettingsSection) => {
     setActiveSection(section);
+    if (section === 'connections') setConnectionsVisited(true);
+    if (section === 'permissions') setPermissionsVisited(true);
     const fileToRefresh = section === 'memory'
       ? fileForMemoryTab(memoryTab)
-      : soulTab === 'role'
+      : section === 'soul' && soulTab === 'role'
         ? 'soul'
         : null;
     if (fileToRefresh) {
@@ -712,11 +725,13 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   const navItems = [
     { id: 'memory' as const, label: '我的记忆', icon: <Layers size={17} /> },
     { id: 'soul' as const, label: '能力设定', icon: <Sparkles size={17} /> },
+    { id: 'connections' as const, label: '数据连接', icon: <Cable size={17} /> },
+    { id: 'permissions' as const, label: '权限管控', icon: <Shield size={17} /> },
   ];
 
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-[22px] bg-[#fdfbf8] text-[#1c1a16]">
-      <header className="flex shrink-0 items-center justify-between px-5 py-5">
+      <header className="flex shrink-0 items-center justify-between px-4 py-3 sm:px-5 sm:py-5">
         <span className="text-[13px] font-semibold text-[#a39c8e]">设置</span>
         {onClose && (
           <button
@@ -730,8 +745,11 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
         )}
       </header>
 
-      <div className="flex min-h-0 flex-1">
-        <nav className="flex w-[180px] shrink-0 flex-col gap-0.5 overflow-y-auto px-2 pb-5 pt-1">
+      <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
+        <nav
+          aria-label="设置分区"
+          className="flex w-full shrink-0 flex-row gap-1 overflow-x-auto border-b border-[#e8e3d9] px-3 pb-3 pt-1 sm:w-[180px] sm:flex-col sm:gap-0.5 sm:overflow-y-auto sm:border-b-0 sm:px-2 sm:pb-5"
+        >
           {navItems.map((item) => {
             const active = activeSection === item.id;
             return (
@@ -739,7 +757,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
                 key={item.id}
                 type="button"
                 onClick={() => activateSection(item.id)}
-                className={`flex items-center gap-2.5 rounded-[10px] px-3 py-2.5 text-[14.5px] font-medium transition focus:outline-none focus:ring-2 focus:ring-[#b8814a]/20 ${
+                className={`flex shrink-0 items-center gap-2.5 whitespace-nowrap rounded-[10px] px-3 py-2.5 text-[14.5px] font-medium transition focus:outline-none focus:ring-2 focus:ring-[#b8814a]/20 ${
                   active
                     ? 'bg-white font-bold text-[#8a5a2f] shadow-[0_1px_3px_rgba(20,16,10,0.08)]'
                     : 'text-[#6f6960] hover:bg-black/[0.035]'
@@ -752,7 +770,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           })}
         </nav>
 
-        <main className="min-w-0 flex-1 overflow-y-auto px-8 pb-10 pt-8">
+        <main className="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 pb-8 pt-5 sm:px-8 sm:pb-10 sm:pt-8">
           {activeSection === 'memory' ? (
             <>
               <h2 className="mb-1.5 text-2xl font-bold tracking-[-0.01em] text-[#1c1a16]">我的记忆</h2>
@@ -785,7 +803,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
               </div>
               {memoryTab === 'main' ? renderMemory() : renderUserProfile()}
             </>
-          ) : (
+          ) : activeSection === 'soul' ? (
             <>
               <h2 className="mb-1.5 text-2xl font-bold tracking-[-0.01em] text-[#1c1a16]">能力设定</h2>
               <p className="mb-6 max-w-[640px] text-sm leading-7 text-[#6f6960]">
@@ -817,7 +835,40 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
               </div>
               {soulTab === 'role' ? renderSoul() : renderSkills()}
             </>
-          )}
+          ) : null}
+          {connectionsVisited ? (
+            <div hidden={activeSection !== 'connections'}>
+              <h2 className="mb-1.5 text-2xl font-bold tracking-[-0.01em] text-[#1c1a16]">数据连接</h2>
+              <p className="mb-6 max-w-[680px] text-sm leading-7 text-[#6f6960]">
+                连接官方或个人 MCP 服务，为 OpenCapyBox 增加外部工具。工具执行权限与连接配置独立管理。
+              </p>
+              <React.Suspense
+                fallback={(
+                  <div className="flex h-40 items-center justify-center text-sm text-[#a39c8e]">
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />加载数据连接...
+                  </div>
+                )}
+              >
+                <LazyMcpConnectionsPanel
+                  onDirtyChange={setMcpDirty}
+                  onPermissionsInvalidated={() => setPermissionsRefreshToken((token) => token + 1)}
+                />
+              </React.Suspense>
+            </div>
+          ) : null}
+          {permissionsVisited ? (
+            <div hidden={activeSection !== 'permissions'}>
+              <React.Suspense
+                fallback={(
+                  <div className="flex h-40 items-center justify-center text-sm text-[#a39c8e]">
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />加载权限策略...
+                  </div>
+                )}
+              >
+                <LazyToolPermissionsPanel refreshToken={permissionsRefreshToken} />
+              </React.Suspense>
+            </div>
+          ) : null}
         </main>
       </div>
     </div>

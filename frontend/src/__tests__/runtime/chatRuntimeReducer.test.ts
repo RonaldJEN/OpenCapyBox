@@ -203,6 +203,26 @@ describe('chatRuntimeReducer', () => {
     expect(state.sessions['sess-a'].activeRunKeys).toEqual(['run-a']);
   });
 
+  it('preserves structured approval control metadata while history is catching up', () => {
+    let state = startRun(initialChatRuntimeState, { control_kind: 'tool_approval' });
+
+    state = chatRuntimeReducer(state, {
+      type: 'HISTORY_LOADED',
+      sessionId: 'sess-a',
+      rounds: [
+        round({
+          round_id: 'server-r1',
+          idempotency_key: 'idem-a',
+          status: 'running',
+        }),
+      ],
+      loadedAt: Date.parse('2026-01-01T00:00:03.000Z'),
+      source: 'history',
+    });
+
+    expect(state.sessions['sess-a'].rounds[0].control_kind).toBe('tool_approval');
+  });
+
   it('keeps the running round lastSequence when a subscribe run is (re)started', () => {
     let state = chatRuntimeReducer(initialChatRuntimeState, {
       type: 'HISTORY_LOADED',

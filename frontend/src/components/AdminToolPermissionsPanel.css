@@ -1,0 +1,35 @@
+.admin-tool-policy-page { display: grid; gap: 18px; }
+.admin-tool-policy-hero { display: flex; min-height: 146px; align-items: center; justify-content: space-between; gap: 28px; padding: 24px 28px; border: 1px solid #ded6ec; border-radius: 18px; background: linear-gradient(128deg, #f6f3fb, #fdfcfe 60%, #f2eef9); }
+.admin-tool-policy-hero > div:first-child { max-width: 680px; }
+.admin-tool-policy-eyebrow { display: inline-flex; align-items: center; gap: 6px; color: #6d58a1; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; font-weight: 800; letter-spacing: .1em; }
+.admin-tool-policy-hero h2 { margin: 7px 0 5px; color: #302942; font-size: 24px; letter-spacing: -.02em; }
+.admin-tool-policy-hero p { margin: 0; color: #746e7d; font-size: 12px; line-height: 1.7; }
+.admin-tool-policy-metrics { display: grid; min-width: 280px; grid-template-columns: repeat(3, 1fr); overflow: hidden; border: 1px solid #e1daeb; border-radius: 13px; background: rgb(255 255 255 / 82%); box-shadow: 0 8px 30px rgb(68 48 98 / 6%); }
+.admin-tool-policy-metrics div { display: flex; min-height: 72px; flex-direction: column; align-items: center; justify-content: center; border-right: 1px solid #e9e3ef; }
+.admin-tool-policy-metrics div:last-child { border-right: 0; }
+.admin-tool-policy-metrics strong { color: #5c487d; font-size: 19px; }
+.admin-tool-policy-metrics span { margin-top: 2px; color: #898192; font-size: 9px; }
+.admin-tool-policy-create form { display: grid; grid-template-columns: 140px minmax(180px, 1fr) minmax(180px, 1.4fr) 120px 100px; gap: 12px; align-items: end; padding: 18px; }
+.admin-tool-policy-tool-field { min-width: 0; }
+.admin-tool-policy-description-field { grid-column: 1 / -2; }
+.admin-tool-policy-create .admin-primary-button { justify-self: end; }
+.admin-tool-policy-table code { color: #3f3850; font-size: 10px; overflow-wrap: anywhere; }
+.admin-tool-policy-table .admin-select { min-width: 88px; }
+.admin-tool-policy-effect { font-weight: 800; }
+.admin-tool-policy-effect.allow { color: #327043; background: #edf7ef; }
+.admin-tool-policy-effect.ask { color: #93621b; background: #fff7e7; }
+.admin-tool-policy-effect.deny { color: #a33b31; background: #fff0ee; }
+.admin-tool-policy-table .admin-status { border: 0; cursor: pointer; }
+.admin-tool-policy-spin { animation: admin-tool-policy-spin .8s linear infinite; }
+@keyframes admin-tool-policy-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 1120px) {
+  .admin-tool-policy-hero { align-items: stretch; flex-direction: column; }
+  .admin-tool-policy-metrics { width: 100%; min-width: 0; }
+  .admin-tool-policy-create form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-tool-policy-description-field { grid-column: 1 / -1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .admin-tool-policy-spin { animation-duration: 1.8s; }
+}

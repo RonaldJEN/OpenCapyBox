@@ -23,6 +23,15 @@ from .auth_user import AuthUser
 from .auth_login_event import AuthLoginEvent
 from .llm_model import LLMModel, LLMModelSettings
 from .model_permission import ModelPermissionGroup, ModelPermissionGroupModel, UserModelPermissionGroup
+from .mcp import (
+    McpServer,
+    McpCredential,
+    McpInstallation,
+    McpToolVisibility,
+    McpToolSnapshot,
+    McpConfigVersion,
+)
+from .tool_permission import ToolPermissionRule, ToolApprovalRequest, ToolPermissionAudit
 
 __all__ = [
     # 數據庫基礎
@@ -47,6 +56,15 @@ __all__ = [
     "ModelPermissionGroup",
     "ModelPermissionGroupModel",
     "UserModelPermissionGroup",
+    "McpServer",
+    "McpCredential",
+    "McpInstallation",
+    "McpToolVisibility",
+    "McpToolSnapshot",
+    "McpConfigVersion",
+    "ToolPermissionRule",
+    "ToolApprovalRequest",
+    "ToolPermissionAudit",
     
     # AG-UI 命名（協議兼容）
     "Thread",  # = Session

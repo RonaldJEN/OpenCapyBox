@@ -144,6 +144,49 @@ class TestDatabaseConfig:
 class TestDatabaseMigration:
     """测试数据库迁移逻辑"""
 
+    def test_mcp_tool_visibility_migration_includes_revision(self):
+        """存量工具发布策略表应补齐乐观并发控制版本列。"""
+        from src.api.models.database import _PENDING_COLUMNS
+
+        pending = {
+            (table_name, column_name, column_type)
+            for table_name, column_name, column_type in _PENDING_COLUMNS
+        }
+        assert (
+            "mcp_tool_visibility",
+            "revision",
+            "INTEGER NOT NULL DEFAULT 1",
+        ) in pending
+
+    def test_mcp_approval_binding_migrations_include_connection_fingerprints(self):
+        from src.api.models.database import _PENDING_COLUMNS
+
+        pending = {
+            (table_name, column_name, column_type)
+            for table_name, column_name, column_type in _PENDING_COLUMNS
+        }
+        assert (
+            "tool_approval_requests",
+            "connection_fingerprint",
+            "VARCHAR(64)",
+        ) in pending
+        assert (
+            "mcp_tool_snapshots",
+            "connection_fingerprint",
+            "VARCHAR(64)",
+        ) in pending
+        assert (
+            "tool_approval_requests",
+            "execution_claim_token",
+            "VARCHAR(64)",
+        ) in pending
+        assert (
+            "tool_approval_requests",
+            "execution_lease_expires_at",
+            "TIMESTAMP",
+        ) in pending
+        assert ("mcp_servers", "last_tools_count", "INTEGER") in pending
+
     def test_sandbox_profile_migration_includes_current_schema_columns(self):
         """存量 sandbox_profiles 表应补齐当前模型依赖的新列。"""
         from src.api.models.database import _PENDING_COLUMNS

@@ -1,7 +1,7 @@
 """Agent cancel_token 取消機制測試"""
 import asyncio
 import pytest
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock, AsyncMock, patch
 
 from src.agent.schema import ToolCall, FunctionCall, LLMResponse
 from src.agent.schema.agui_events import EventType
@@ -214,8 +214,9 @@ async def test_tool_execution_timeout():
     llm.generate_stream = _fake_stream
 
     events = []
-    async for event in agent.run_agui("thread-1", "run-timeout"):
-        events.append(event)
+    with patch.object(agent, "_record_permission_audit") as audit:
+        async for event in agent.run_agui("thread-1", "run-timeout"):
+            events.append(event)
 
     types = [e.type for e in events]
     # 应该正常完成（工具超时不中断 Agent，只是返回错误）
@@ -227,6 +228,8 @@ async def test_tool_execution_timeout():
     tool_results = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
     assert len(tool_results) >= 1
     assert "timed out" in tool_results[0].content.lower()
+    audit.assert_called_once()
+    assert audit.call_args.kwargs["outcome"] == "unknown"
 
 
 @pytest.mark.asyncio

@@ -128,26 +128,30 @@ Define Cron jobs via the `manage_cron` tool, and your AI assistant runs them aut
 
 ### 🔌 MCP Tool Integration
 
-OpenCapyBox supports external tool services via [MCP (Model Context Protocol)](https://modelcontextprotocol.io/). Configuration file at `src/agent/config/mcp.json`:
+OpenCapyBox supports external tools through [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) and currently supports **Streamable HTTP only**. Connections are stored in the database; the server no longer launches MCP processes from a local `mcp.json`:
+
+- **Official MCP** servers are created, tested, published, and disabled by administrators. They may use a platform credential and may be marked platform-required; ordinary connections are user-enabled and may use a credential override, while required connections are automatically enabled and cannot be disabled by users.
+- **Personal MCP** servers are owned and visible only by the user. Public HTTPS is required by default.
+- **`mcp.json`** is an import/export format for personal MCP entries, not the runtime source of truth. Exports always omit tokens and headers.
 
 ```json
 {
   "mcpServers": {
     "my-mcp-server": {
       "description": "My MCP Server",
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@example/mcp-server"],
-      "env": { "API_KEY": "your-key" },
+      "type": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
       "disabled": false
     }
   }
 }
 ```
 
-- `type` supports `stdio` (local process) and `streamable-http` (remote HTTP)
-- Set `"disabled": true` to temporarily disable an MCP service
-- Use `MCP_CONFIG_PATH` env variable to customize the config file path
+- Credentials are encrypted at rest with an independent `MCP_SECRET_KEY`, and API responses never echo secrets. Production startup rejects missing, example, short, or reused signing/encryption keys and public example accounts.
+- Each official or personal connection has an independent per-tool allowlist/denylist. This controls publication to the Agent, not execution permission. Discovered tools receive stable model-visible names; ownership, connection state, and the latest publication policy are rechecked before every call. `tools/call` has an independent non-disableable wall-clock deadline; an indeterminate result after the dispatch boundary is marked `unknown` and is never retried automatically.
+- MCP tools use Deferred exposure by default: remote schemas are omitted from the initial request and loaded on demand through `tool_search`. Hidden tools and permission-`DENY` tools are excluded from discovery results.
+- For users with effective MCP connections, the catalog fingerprint rotates every `MCP_CATALOG_REFRESH_SECONDS` (300 seconds by default), so the next Agent build fetches `tools/list` again even when the URL and credential are unchanged. If discovery fails, stored schema snapshots are not exposed as executable tools; the failure remains retryable.
+- MCP connectivity/publication and tool permissions are separate domains: availability determines whether a tool is visible, while `ALLOW / ASK / DENY` decides whether a call may run. MCP tools default to `ASK`; users may allow once, allow for the session, always allow, or deny. Approval-created session/permanent grants are bound to both the current schema and the endpoint/credential fingerprint, and fall back to `ASK` when either changes. Administrator rules form a ceiling users cannot relax.
 
 ## 📸 Screenshots
 
@@ -475,7 +479,8 @@ DATABASE_URL=postgresql://user:password@host:5432/opencapybox
 # PostgreSQL must have pgvector installed: CREATE EXTENSION IF NOT EXISTS vector;
 # Optional pytest integration database, never point this at production:
 TEST_DATABASE_URL=postgresql://user:password@host:5432/opencapybox_test
-AUTH_SECRET_KEY=                        # Auto-derived if not set
+AUTH_SECRET_KEY=<32+ random characters> # Required in production
+MCP_SECRET_KEY=<different 32+ random characters> # Required in production and must differ from AUTH_SECRET_KEY
 AUTH_TOKEN_EXPIRE_MINUTES=720
 
 # === Agent ===

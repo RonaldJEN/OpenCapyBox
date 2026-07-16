@@ -421,15 +421,23 @@ export function ChatRuntimeProvider({
     const clientRunKey = randomId('resume');
     const tempRoundId = `resume-temp-${Date.now()}`;
     const resumeEntries = Object.entries(answers);
-    const userMessage = resumeEntries.length > 0
-      ? resumeEntries.map(([question, answer], index) => {
-          const safeQuestion = question?.trim() || '(Untitled question)';
-          const safeAnswer = answer?.trim() || '[No preference]';
-          return `${index > 0 ? '\n\n' : ''}Q: ${safeQuestion}\nA: ${safeAnswer}`;
-        }).join('')
-      : 'Q: (No question)\nA: [No preference]';
+    // A tool-approval resolution is a control decision, not user chat input, so
+    // it must not render as a user bubble. ask_user answers remain genuine user
+    // messages and are still shown as Q/A text.
+    const isToolApproval = interrupt.reason === 'human_approval'
+      || interrupt.payload?.kind === 'tool_approval';
+    const userMessage = isToolApproval
+      ? `Tool approval: ${answers.approval}`
+      : resumeEntries.length > 0
+        ? resumeEntries.map(([question, answer], index) => {
+            const safeQuestion = question?.trim() || '(Untitled question)';
+            const safeAnswer = answer?.trim() || '[No preference]';
+            return `${index > 0 ? '\n\n' : ''}Q: ${safeQuestion}\nA: ${safeAnswer}`;
+          }).join('')
+        : 'Q: (No question)\nA: [No preference]';
     const round: RoundData = {
       round_id: tempRoundId,
+      control_kind: isToolApproval ? 'tool_approval' : undefined,
       user_message: userMessage,
       user_attachments: [],
       final_response: '',
@@ -503,7 +511,14 @@ export function ChatRuntimeProvider({
     dispatch({ type: 'LOCAL_CANCELLED', sessionId });
     notifyEnd(sessionId);
     try {
-      await apiService.abortChat(sessionId);
+      const result = await apiService.abortChat(sessionId);
+      if (result.outcome_warning) {
+        dispatch({
+          type: 'SESSION_ERROR',
+          sessionId,
+          error: result.outcome_warning,
+        });
+      }
     } catch (error) {
       const statusCode = (error as { response?: { status?: number } })?.response?.status;
       if (statusCode === 409) {

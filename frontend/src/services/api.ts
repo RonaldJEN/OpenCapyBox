@@ -17,6 +17,13 @@ import type {
 import { buildSandboxFileUrl } from '../utils/fileUtils';
 import { formatHttpErrorMessage } from '../utils/errorMessages';
 
+export interface AbortChatResponse {
+  status: 'cancelled';
+  request_id: string;
+  reason: string;
+  outcome_warning: string;
+}
+
 /**
  * 幂等衝突：服務端已有對應 Round，客戶端應走 subscribe 路徑
  */
@@ -287,10 +294,11 @@ class APIService {
 
   /**
    * 中止正在进行的 Agent 执行
-   * 后端会设置 cancel_token，Agent 通过 SSE 正常推送 RUN_FINISHED(interrupt)
+   * 后端会立即收敛本地终态，并返回无法撤销远端副作用的保守警告
    */
-  async abortChat(chatSessionId: string): Promise<void> {
-    await this.client.post(`/chat/${chatSessionId}/abort`);
+  async abortChat(chatSessionId: string): Promise<AbortChatResponse> {
+    const response = await this.client.post<AbortChatResponse>(`/chat/${chatSessionId}/abort`);
+    return response.data;
   }
 
   /**

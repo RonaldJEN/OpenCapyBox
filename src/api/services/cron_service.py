@@ -613,6 +613,7 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                 f"所有产出文件必须保存在当前工作目录下（{run_workspace}），禁止写入其他路径。"
             ),
             workspace_dir=run_workspace,
+            allow_human_interrupts=False,
         )
         await agent_service.initialize_agent()
 

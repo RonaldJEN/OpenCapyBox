@@ -97,6 +97,23 @@ describe('APIService', () => {
         params: { q: '搜索词' },
       });
     });
+
+    it('abortChat 应返回远端副作用不确定警告', async () => {
+      const axiosModule = await import('axios');
+      const client = vi.mocked(axiosModule.default.create).mock.results[0].value as unknown as {
+        post: ReturnType<typeof vi.fn>;
+      };
+      const payload = {
+        status: 'cancelled',
+        request_id: 'cancel-1',
+        reason: 'force_aborted',
+        outcome_warning: '远端副作用可能已经发生',
+      };
+      client.post.mockResolvedValue({ data: payload });
+
+      await expect(apiService.abortChat('session-1')).resolves.toEqual(payload);
+      expect(client.post).toHaveBeenCalledWith('/chat/session-1/abort');
+    });
   });
 
   describe('流式连接可靠性', () => {

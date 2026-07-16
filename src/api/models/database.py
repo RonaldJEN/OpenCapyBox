@@ -38,6 +38,19 @@ def _import_models():
     )
     from src.api.models.cron_job import CronJob as _  # noqa: F401
     from src.api.models.cron_fire import CronFire as _  # noqa: F401
+    from src.api.models.mcp import (  # noqa: F401
+        McpServer,
+        McpCredential,
+        McpInstallation,
+        McpToolVisibility,
+        McpToolSnapshot,
+        McpConfigVersion,
+    )
+    from src.api.models.tool_permission import (  # noqa: F401
+        ToolPermissionRule,
+        ToolApprovalRequest,
+        ToolPermissionAudit,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +346,12 @@ _PENDING_COLUMNS = [
     ("sandbox_profiles", "updated_at", "TIMESTAMP DEFAULT NOW()"),
     ("user_sandboxes", "active_profile_id", "VARCHAR(36)"),
     ("user_sandboxes", "active_profile_version", "INTEGER"),
+    ("mcp_servers", "last_tools_count", "INTEGER"),
+    ("mcp_tool_visibility", "revision", "INTEGER NOT NULL DEFAULT 1"),
+    ("tool_approval_requests", "connection_fingerprint", "VARCHAR(64)"),
+    ("tool_approval_requests", "execution_claim_token", "VARCHAR(64)"),
+    ("tool_approval_requests", "execution_lease_expires_at", "TIMESTAMP"),
+    ("mcp_tool_snapshots", "connection_fingerprint", "VARCHAR(64)"),
 ]
 
 
@@ -454,6 +473,15 @@ def _migrate_add_columns(target_engine=None):
                 conn.execute(text(stmt))
                 existing_columns.add(column_name)
                 logger.info("DB 迁移: %s 表新增列 %s (%s)", table_name, column_name, column_type)
+
+        # The periodic reconciler must not scan the full approval history on
+        # an existing production database. ``create_all`` covers new installs;
+        # this explicit migration covers tables that predate execution leases.
+        if inspector.has_table("tool_approval_requests"):
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_tool_approval_execution_lease "
+                "ON tool_approval_requests (status, execution_lease_expires_at)"
+            ))
 
         for table_name, column_name in _DEPRECATED_COLUMNS:
             if not inspector.has_table(table_name):

@@ -8,6 +8,7 @@ import {
   FileInfo,
   ModelInfo,
   RoundData,
+  ToolApprovalPayload,
 } from '../types';
 import {
   ChatRuntimeProvider,
@@ -28,6 +29,7 @@ import { FilePreview } from './FilePreview';
 import { ModelSelector } from './ModelSelector';
 import { ChatInput } from './ChatInput';
 import { QuestionCard } from './QuestionCard';
+import { ToolApprovalCard } from './ToolApprovalCard';
 import {
   Loader2,
   AlertCircle,
@@ -62,6 +64,50 @@ interface ChatV2Props {
   } | null;
 }
 
+interface DisplayRoundGroup {
+  round: RoundData;
+  sourceRoundIds: string[];
+}
+
+function mergeApprovalContinuation(base: RoundData, continuation: RoundData): RoundData {
+  return {
+    ...base,
+    last_event_sequence: continuation.last_event_sequence ?? base.last_event_sequence,
+    final_response: continuation.final_response || base.final_response,
+    steps: [...base.steps, ...continuation.steps],
+    step_count: base.step_count + continuation.step_count,
+    status: continuation.status,
+    completed_at: continuation.completed_at,
+    interrupt: continuation.interrupt,
+  };
+}
+
+function buildDisplayRoundGroups(rounds: RoundData[]): DisplayRoundGroup[] {
+  const groups: DisplayRoundGroup[] = [];
+
+  for (const round of rounds) {
+    const isApprovalContinuation = round.control_kind === 'tool_approval';
+    if (isApprovalContinuation) {
+      const parentGroupIndex = round.parent_run_id
+        ? groups.findIndex((group) => group.sourceRoundIds.includes(round.parent_run_id!))
+        : groups.length - 1;
+
+      if (parentGroupIndex >= 0) {
+        const parentGroup = groups[parentGroupIndex];
+        groups[parentGroupIndex] = {
+          round: mergeApprovalContinuation(parentGroup.round, round),
+          sourceRoundIds: [...parentGroup.sourceRoundIds, round.round_id],
+        };
+        continue;
+      }
+    }
+
+    groups.push({ round, sourceRoundIds: [round.round_id] });
+  }
+
+  return groups;
+}
+
 export function ChatV2(props: ChatV2Props) {
   const runtime = useChatRuntimeOptional();
   if (!runtime) {
@@ -91,6 +137,7 @@ function ChatV2View(props: ChatV2Props) {
   const runtime = useChatRuntime();
   const projection = runtime.getSessionProjection(sessionId);
   const rounds = projection.rounds;
+  const displayRoundGroups = buildDisplayRoundGroups(rounds);
   const loading = projection.loading;
   const sending = projection.sending;
   const resuming = projection.resuming;
@@ -764,11 +811,13 @@ function ChatV2View(props: ChatV2Props) {
             )
           ) : (
             <div className={`mx-auto px-4 md:px-8 py-6 space-y-6 max-w-3xl ${isSessionHandoff ? 'animate-slide-in-bottom' : ''}`}>
-              {rounds.map((round, index) => (
+              {displayRoundGroups.map(({ round, sourceRoundIds }, index) => (
                 <div
                   key={round.round_id}
                   ref={(el) => {
-                    roundElementRefs.current[round.round_id] = el;
+                    sourceRoundIds.forEach((roundId) => {
+                      roundElementRefs.current[roundId] = el;
+                    });
                   }}
                   data-round-id={round.round_id}
                   className={`scroll-mt-20 rounded-2xl transition-colors duration-300 ${
@@ -784,7 +833,7 @@ function ChatV2View(props: ChatV2Props) {
                     assistantFileMatches={assistantFileMatches}
                     onPreviewAttachment={handlePreviewAttachment}
                     onOpenFileInPanel={handleOpenAssistantFile}
-                    isStreaming={(sending || resuming) && index === rounds.length - 1}
+                    isStreaming={(sending || resuming) && index === displayRoundGroups.length - 1}
                     disableMotion={disableInitialMotion}
                   />
                 </div>
@@ -854,6 +903,19 @@ function ChatV2View(props: ChatV2Props) {
           <div className="relative z-20 px-4 md:px-8 mb-[-3.5rem] mx-auto w-full max-w-3xl">
             <QuestionCard
               questions={pendingInterrupt.payload.questions as AskUserQuestion[]}
+              onSubmit={handleResumeSubmit}
+              onDismiss={() => {
+                setDismissedInterruptId(pendingInterrupt.id || 'dismissed');
+              }}
+              disabled={resuming}
+            />
+          </div>
+        )}
+
+        {pendingInterrupt && pendingInterrupt.id !== dismissedInterruptId && pendingInterrupt.reason === 'human_approval' && pendingInterrupt.payload?.kind === 'tool_approval' && (
+          <div className="relative z-20 px-4 md:px-8 mb-[-3.5rem] mx-auto w-full max-w-3xl">
+            <ToolApprovalCard
+              approval={pendingInterrupt.payload as ToolApprovalPayload}
               onSubmit={handleResumeSubmit}
               onDismiss={() => {
                 setDismissedInterruptId(pendingInterrupt.id || 'dismissed');

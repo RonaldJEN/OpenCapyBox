@@ -424,6 +424,29 @@ def _purge_user_owned_data(db: DBSession, *, user_id: str) -> None:
     db.query(SubagentRun).filter(SubagentRun.user_id == user_id).delete(synchronize_session=False)
 
     session_ids = [row[0] for row in db.query(Session.id).filter(Session.user_id == user_id).all()]
+    from src.api.models.tool_permission import (
+        ToolApprovalRequest,
+        ToolPermissionAudit,
+        ToolPermissionRule,
+    )
+
+    db.query(ToolApprovalRequest).filter(
+        ToolApprovalRequest.user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(ToolPermissionAudit).filter(
+        ToolPermissionAudit.user_id == user_id
+    ).delete(synchronize_session=False)
+    user_rule_filter = (
+        (ToolPermissionRule.scope_type == "user")
+        & (ToolPermissionRule.scope_id == user_id)
+    )
+    if session_ids:
+        user_rule_filter = or_(
+            user_rule_filter,
+            (ToolPermissionRule.scope_type == "session")
+            & (ToolPermissionRule.scope_id.in_(session_ids)),
+        )
+    db.query(ToolPermissionRule).filter(user_rule_filter).delete(synchronize_session=False)
     if session_ids:
         round_filter = or_(Round.session_id.in_(session_ids), Round.thread_id.in_(session_ids))
         round_ids = [row[0] for row in db.query(Round.id).filter(round_filter).all()]

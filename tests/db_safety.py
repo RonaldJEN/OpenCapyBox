@@ -94,3 +94,25 @@ def create_all_for_test_engine(engine, metadata) -> None:
         from src.api.models.database import _migrate_add_columns
 
         _migrate_add_columns(engine)
+
+
+def build_pytest_pg_engine(project_root: Path):
+    """Create an engine bound to the validated PostgreSQL pytest database."""
+
+    from sqlalchemy import create_engine
+
+    test_url = os.environ.get("TEST_DATABASE_URL", "")
+    ensure_safe_test_database_url(test_url, load_dotenv_database_url(project_root))
+    return create_engine(test_url)
+
+
+def reset_all_tables(engine, metadata) -> None:
+    """Truncate every table and restart identity sequences for test isolation."""
+
+    from sqlalchemy import text as _text
+
+    table_names = ", ".join(t.name for t in reversed(metadata.sorted_tables))
+    if not table_names:
+        return
+    with engine.begin() as conn:
+        conn.execute(_text(f"TRUNCATE TABLE {table_names} RESTART IDENTITY CASCADE"))
