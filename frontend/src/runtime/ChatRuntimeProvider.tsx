@@ -511,14 +511,7 @@ export function ChatRuntimeProvider({
     dispatch({ type: 'LOCAL_CANCELLED', sessionId });
     notifyEnd(sessionId);
     try {
-      const result = await apiService.abortChat(sessionId);
-      if (result.outcome_warning) {
-        dispatch({
-          type: 'SESSION_ERROR',
-          sessionId,
-          error: result.outcome_warning,
-        });
-      }
+      await apiService.abortChat(sessionId);
     } catch (error) {
       const statusCode = (error as { response?: { status?: number } })?.response?.status;
       if (statusCode === 409) {

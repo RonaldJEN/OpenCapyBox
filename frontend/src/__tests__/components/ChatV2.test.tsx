@@ -1638,7 +1638,8 @@ describe('ChatV2 组件', () => {
       resolveAbort();
     });
 
-    expect(await screen.findByText(ABORT_WARNING)).toBeInTheDocument();
+    // 正常停止不展示远端副作用提醒。
+    expect(screen.queryByText(ABORT_WARNING)).not.toBeInTheDocument();
 
     await act(async () => {
       fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });

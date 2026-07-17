@@ -10,7 +10,7 @@ import asyncio
 import pytest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from tests.helpers import make_mock_sandbox
 
@@ -48,7 +48,11 @@ def mock_settings():
 @pytest.fixture
 def service(mock_settings):
     """創建 SandboxSessionService 實例"""
-    from src.api.services.sandbox_service import SandboxSessionService, _runtime_config_from_settings
+    from src.api.services.sandbox_service import (
+        ProfileCompatibility,
+        SandboxSessionService,
+        _runtime_config_from_settings,
+    )
     with patch.object(
         SandboxSessionService,
         "_resolve_runtime_config",
@@ -59,8 +63,13 @@ def service(mock_settings):
         side_effect=lambda user_id, sandbox_id: _runtime_config_from_settings(),
     ), patch.object(
         SandboxSessionService,
-        "_persisted_profile_matches_runtime",
-        side_effect=lambda user_id, sandbox_id, runtime_config: bool(sandbox_id),
+        "_persisted_profile_compatibility",
+        return_value=ProfileCompatibility.MATCH,
+    ), patch.object(
+        SandboxSessionService,
+        "_query_sandbox_state",
+        new_callable=AsyncMock,
+        return_value="running",
     ):
         yield SandboxSessionService()
 
@@ -249,7 +258,7 @@ class TestGetOrResume:
 
         assert result is mock_sandbox
         stale_sandbox.is_healthy.assert_not_awaited()
-        query_state.assert_awaited_once_with("sbx-test-123")
+        query_state.assert_awaited_once_with("sbx-test-123", ANY)
         MockSandbox.connect.assert_awaited_once()
         assert service.get_cached("session-1") is mock_sandbox
         assert service._pushed_skills["session-1"] == set()
@@ -282,9 +291,17 @@ class TestGetOrResume:
     @pytest.mark.asyncio
     async def test_stale_profile_fingerprint_skips_connect_and_creates_new(self, service, mock_sandbox):
         """Profile 指紋過期時不得復用舊 sandbox_id。"""
-        from src.api.services.sandbox_service import SandboxSessionService
+        from src.api.services.sandbox_service import ProfileCompatibility, SandboxSessionService
 
-        with patch.object(SandboxSessionService, "_persisted_profile_matches_runtime", return_value=False):
+        with patch.object(
+            SandboxSessionService,
+            "_persisted_profile_compatibility",
+            return_value=ProfileCompatibility.MISMATCH,
+        ), patch.object(
+            service,
+            "_compare_and_swap_sandbox_binding",
+            return_value=(True, mock_sandbox.id),
+        ):
             with patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
                 MockSandbox.connect = AsyncMock()
                 MockSandbox.resume = AsyncMock()
@@ -298,35 +315,205 @@ class TestGetOrResume:
                 MockSandbox.create.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_connect_failure_falls_to_resume(self, service, mock_sandbox):
-        """測試 connect 失敗 -> fallback 到 resume"""
+    async def test_connect_failure_does_not_resume_or_create(self, service):
+        """Running 状态连接失败只能暂时不可用，不能继续 resume/create。"""
+        from src.api.services.sandbox_service import SandboxTemporarilyUnavailable
+
         with patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
             MockSandbox.connect = AsyncMock(side_effect=Exception("connect failed"))
-            MockSandbox.resume = AsyncMock(return_value=mock_sandbox)
+            MockSandbox.resume = AsyncMock()
+            MockSandbox.create = AsyncMock()
 
-            result = await service.get_or_resume("session-1", "sbx-old-id")
+            with pytest.raises(SandboxTemporarilyUnavailable):
+                await service.get_or_resume("session-1", "sbx-old-id")
 
-            assert result is mock_sandbox
-            MockSandbox.resume.assert_awaited_once()
+            MockSandbox.resume.assert_not_awaited()
+            MockSandbox.create.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_resume_failure_creates_new(self, service, mock_sandbox):
-        """測試 resume 失敗 -> 創建新沙箱"""
-        with patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
-            MockSandbox.connect = AsyncMock(side_effect=Exception("connect failed"))
-            MockSandbox.resume = AsyncMock(side_effect=Exception("not found"))
+    async def test_resume_failure_does_not_create_new(self, service):
+        """Paused 状态恢复失败只能暂时不可用，不能创建替代沙箱。"""
+        from src.api.services.sandbox_service import SandboxTemporarilyUnavailable
+
+        with patch.object(
+            service,
+            "_query_sandbox_state",
+            new=AsyncMock(return_value="paused"),
+        ), patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.connect = AsyncMock()
+            MockSandbox.resume = AsyncMock(side_effect=Exception("resume timeout"))
+            MockSandbox.create = AsyncMock()
+
+            with pytest.raises(SandboxTemporarilyUnavailable):
+                await service.get_or_resume("session-1", "sbx-old-id")
+
+            MockSandbox.connect.assert_not_awaited()
+            MockSandbox.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["terminated", "failed", "not_found"])
+    async def test_terminal_state_rebuilds_with_cas(self, service, mock_sandbox, state):
+        """只有明确终态才创建候选沙箱并条件更新绑定。"""
+        with patch.object(
+            service,
+            "_query_sandbox_state",
+            new=AsyncMock(return_value=state),
+        ), patch.object(
+            service,
+            "_compare_and_swap_sandbox_binding",
+            return_value=(True, mock_sandbox.id),
+        ) as cas, patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.connect = AsyncMock()
+            MockSandbox.resume = AsyncMock()
             MockSandbox.create = AsyncMock(return_value=mock_sandbox)
 
-            result = await service.get_or_resume("session-1", "sbx-old-id")
+            result = await service.recover_persisted_sandbox("session-1", "sbx-old-id")
 
-            assert result is mock_sandbox
-            MockSandbox.create.assert_awaited_once()
+        assert result is mock_sandbox
+        MockSandbox.connect.assert_not_awaited()
+        MockSandbox.resume.assert_not_awaited()
+        MockSandbox.create.assert_awaited_once()
+        cas.assert_called_once_with(
+            "session-1",
+            "sbx-old-id",
+            mock_sandbox.id,
+            runtime_config=ANY,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["pausing", "stopping", "unknown", "mystery"])
+    async def test_transitional_or_unknown_state_never_creates(self, service, state):
+        from src.api.services.sandbox_service import SandboxTemporarilyUnavailable
+
+        with patch.object(
+            service,
+            "_query_sandbox_state",
+            new=AsyncMock(return_value=state),
+        ), patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.connect = AsyncMock()
+            MockSandbox.resume = AsyncMock()
+            MockSandbox.create = AsyncMock()
+
+            with pytest.raises(SandboxTemporarilyUnavailable):
+                await service.recover_persisted_sandbox("session-1", "sbx-old-id")
+
+        MockSandbox.connect.assert_not_awaited()
+        MockSandbox.resume.assert_not_awaited()
+        MockSandbox.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_state_query_failure_never_creates(self, service):
+        from src.api.services.sandbox_service import SandboxTemporarilyUnavailable
+
+        with patch.object(
+            service,
+            "_query_sandbox_state",
+            new=AsyncMock(side_effect=SandboxTemporarilyUnavailable("network")),
+        ), patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.create = AsyncMock()
+
+            with pytest.raises(SandboxTemporarilyUnavailable):
+                await service.recover_persisted_sandbox("session-1", "sbx-old-id")
+
+        MockSandbox.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_paused_resume_keeps_same_id(self, service):
+        resumed = make_mock_sandbox(sandbox_id="sbx-old-id")
+        with patch.object(
+            service,
+            "_query_sandbox_state",
+            new=AsyncMock(return_value="paused"),
+        ), patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.connect = AsyncMock()
+            MockSandbox.resume = AsyncMock(return_value=resumed)
+            MockSandbox.create = AsyncMock()
+
+            result = await service.recover_persisted_sandbox("session-1", "sbx-old-id")
+
+        assert result.id == "sbx-old-id"
+        MockSandbox.resume.assert_awaited_once()
+        MockSandbox.connect.assert_not_awaited()
+        MockSandbox.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_profile_unknown_never_rebuilds(self, service):
+        from src.api.services.sandbox_service import (
+            ProfileCompatibility,
+            SandboxTemporarilyUnavailable,
+        )
+
+        with patch.object(
+            service,
+            "_persisted_profile_compatibility",
+            return_value=ProfileCompatibility.UNKNOWN,
+        ), patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.create = AsyncMock()
+
+            with pytest.raises(SandboxTemporarilyUnavailable):
+                await service.recover_persisted_sandbox("session-1", "sbx-old-id")
+
+        MockSandbox.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_requested_id_reuses_current_binding(self, service):
+        from src.api.services.sandbox_service import ProfileCompatibility
+
+        winner = make_mock_sandbox(sandbox_id="sbx-winner")
+        with patch.object(
+            service,
+            "_persisted_profile_compatibility",
+            side_effect=[ProfileCompatibility.STALE_BINDING, ProfileCompatibility.MATCH],
+        ), patch.object(
+            service,
+            "_read_persisted_sandbox_id",
+            return_value="sbx-winner",
+        ), patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.connect = AsyncMock(return_value=winner)
+            MockSandbox.resume = AsyncMock()
+            MockSandbox.create = AsyncMock()
+
+            result = await service.recover_persisted_sandbox("session-1", "sbx-old-id")
+
+        assert result is winner
+        MockSandbox.connect.assert_awaited_once()
+        MockSandbox.resume.assert_not_awaited()
+        MockSandbox.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rebuild_cas_loser_destroys_only_container_and_uses_winner(
+        self, service
+    ):
+        candidate = make_mock_sandbox(sandbox_id="sbx-candidate")
+        winner = make_mock_sandbox(sandbox_id="sbx-winner")
+        with patch.object(
+            service,
+            "_query_sandbox_state",
+            new=AsyncMock(side_effect=["terminated", "running"]),
+        ), patch.object(
+            service,
+            "_compare_and_swap_sandbox_binding",
+            return_value=(False, "sbx-winner"),
+        ), patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
+            MockSandbox.create = AsyncMock(return_value=candidate)
+            MockSandbox.connect = AsyncMock(return_value=winner)
+            MockSandbox.resume = AsyncMock()
+
+            result = await service.recover_persisted_sandbox("session-1", "sbx-old-id")
+
+        assert result is winner
+        candidate.kill.assert_awaited_once()
+        candidate.close.assert_awaited_once()
+        candidate.commands.run.assert_not_awaited()
+        MockSandbox.connect.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_get_existing_never_creates_replacement(self, service):
-        with patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
-            MockSandbox.connect = AsyncMock(side_effect=Exception("connect failed"))
-            MockSandbox.resume = AsyncMock(side_effect=Exception("not found"))
+        with patch.object(
+            service,
+            "_query_sandbox_state",
+            new=AsyncMock(return_value="terminated"),
+        ), patch("src.api.services.sandbox_service.Sandbox") as MockSandbox:
             MockSandbox.create = AsyncMock()
 
             with pytest.raises(RuntimeError, match="既有沙箱不可用"):
@@ -344,10 +531,12 @@ class TestGetOrResume:
         service._cache_profile_ids["session-1"] = "env-default"
         service._cache_profile_versions["session-1"] = 1
 
+        from src.api.services.sandbox_service import ProfileCompatibility
+
         with patch.object(
             service,
-            "_persisted_profile_matches_runtime",
-            return_value=False,
+            "_persisted_profile_compatibility",
+            return_value=ProfileCompatibility.MISMATCH,
         ):
             with pytest.raises(RuntimeError, match="profile 指纹不匹配"):
                 await service.get_existing("session-1", "sbx-old")
@@ -364,10 +553,12 @@ class TestGetOrResume:
         service._cache_profile_ids["session-1"] = "env-default"
         service._cache_profile_versions["session-1"] = 1
 
+        from src.api.services.sandbox_service import ProfileCompatibility
+
         with patch.object(
             service,
-            "_persisted_profile_matches_runtime",
-            return_value=False,
+            "_persisted_profile_compatibility",
+            return_value=ProfileCompatibility.UNKNOWN,
         ):
             result = await service.get_existing("session-1", "sbx-current")
 
@@ -383,6 +574,109 @@ class TestGetOrResume:
 
             assert result is mock_sandbox
             MockSandbox.create.assert_awaited_once()
+
+
+class TestSandboxBindingCas:
+    @staticmethod
+    def _session_factory():
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from src.api.models.database import Base
+        from src.api.models.user_sandbox import UserSandbox
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine, tables=[UserSandbox.__table__])
+        return sessionmaker(bind=engine)
+
+    def test_only_first_rebuild_candidate_can_replace_old_binding(self, mock_settings):
+        from src.api.models.user_sandbox import UserSandbox
+        from src.api.services.sandbox_service import (
+            SandboxSessionService,
+            _runtime_config_from_settings,
+        )
+
+        Session = self._session_factory()
+        with Session() as db:
+            db.add(UserSandbox(
+                id="binding-1",
+                user_id="user-1",
+                sandbox_id="sbx-old",
+                active_profile_id="env-default",
+                active_profile_version=1,
+                status="active",
+            ))
+            db.commit()
+
+        runtime_config = _runtime_config_from_settings()
+        with patch("src.api.models.database.SessionLocal", Session):
+            first = SandboxSessionService._compare_and_swap_sandbox_binding(
+                "user-1",
+                "sbx-old",
+                "sbx-new-a",
+                runtime_config=runtime_config,
+            )
+            second = SandboxSessionService._compare_and_swap_sandbox_binding(
+                "user-1",
+                "sbx-old",
+                "sbx-new-b",
+                runtime_config=runtime_config,
+            )
+
+        assert first == (True, "sbx-new-a")
+        assert second == (False, "sbx-new-a")
+        with Session() as db:
+            assert db.query(UserSandbox).filter(UserSandbox.user_id == "user-1").one().sandbox_id == "sbx-new-a"
+
+    def test_profile_compatibility_distinguishes_mismatch_from_query_failure(
+        self, mock_settings
+    ):
+        from src.api.models.user_sandbox import UserSandbox
+        from src.api.services.sandbox_service import (
+            ProfileCompatibility,
+            SandboxSessionService,
+            _runtime_config_from_settings,
+        )
+
+        Session = self._session_factory()
+        with Session() as db:
+            db.add(UserSandbox(
+                id="binding-1",
+                user_id="user-1",
+                sandbox_id="sbx-old",
+                active_profile_id="env-default",
+                active_profile_version=1,
+                status="active",
+            ))
+            db.commit()
+
+        runtime_config = _runtime_config_from_settings()
+        with patch("src.api.models.database.SessionLocal", Session):
+            assert SandboxSessionService._persisted_profile_compatibility(
+                "user-1", "sbx-old", runtime_config
+            ) == ProfileCompatibility.MATCH
+
+            assert SandboxSessionService._persisted_profile_compatibility(
+                "user-1", "sbx-stale", runtime_config
+            ) == ProfileCompatibility.STALE_BINDING
+
+            with Session() as db:
+                row = db.query(UserSandbox).filter(UserSandbox.user_id == "user-1").one()
+                row.active_profile_version = 2
+                db.commit()
+
+            assert SandboxSessionService._persisted_profile_compatibility(
+                "user-1", "sbx-old", runtime_config
+            ) == ProfileCompatibility.MISMATCH
+
+        with patch("src.api.models.database.SessionLocal", side_effect=RuntimeError("db down")):
+            assert SandboxSessionService._persisted_profile_compatibility(
+                "user-1", "sbx-old", runtime_config
+            ) == ProfileCompatibility.UNKNOWN
 
 
 # ============== pause ==============

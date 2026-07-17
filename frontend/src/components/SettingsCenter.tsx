@@ -224,7 +224,6 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     const mutationVersionsAtStart = new Map(skillMutationVersionsRef.current);
     setSkillsLoading(true);
     setSkillsError('');
-    setSkillSandboxStatus(null);
     try {
       const result = await getSkills();
       if (seq !== skillsLoadSeqRef.current) return;
@@ -618,7 +617,9 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     <section className="mb-4 max-w-[680px] rounded-2xl border border-[#e8e3d9] bg-white px-6 py-6 shadow-[0_1px_3px_rgba(30,26,20,0.05)]">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs text-[#a39c8e]">
-          {skillsLoading ? '正在加载技能...' : `${enabledSkillCount} / ${skills.length} 项技能已启用`}
+          {skillsLoading
+            ? '正在恢复工作沙箱并加载技能…'
+            : `${enabledSkillCount} / ${skills.length} 项技能已启用`}
         </div>
         <button
           type="button"
@@ -632,15 +633,35 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
         </button>
       </div>
 
-      {skillsError && <p className="mb-3 text-xs font-medium text-claude-error">{skillsError}</p>}
+      {skillsError && (
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-[#efd0ca] bg-[#fff5f3] px-3 py-2 text-xs font-medium text-claude-error">
+          <span>{skillsError}</span>
+          <button
+            type="button"
+            onClick={loadSkills}
+            disabled={skillsLoading}
+            className="shrink-0 cursor-pointer rounded-md border border-current px-2 py-1 font-semibold transition-[color,background-color,border-color,box-shadow,transform] duration-200 ease-in-out hover:bg-[#fde9e5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c75c4a]/30 focus-visible:ring-offset-1 focus-visible:ring-offset-[#fff5f3] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent motion-reduce:transition-none"
+          >
+            重新加载
+          </button>
+        </div>
+      )}
 
-      {skillSandboxStatus === 'unavailable' && (
-        <p
+      {skillSandboxStatus === 'unavailable' && !skillsError && (
+        <div
           role="status"
-          className="mb-3 rounded-lg border border-[#ead8bd] bg-[#fff8ec] px-3 py-2 text-xs font-medium text-[#8a5a2f]"
+          className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-[#ead8bd] bg-[#fff8ec] px-3 py-2 text-xs font-medium text-[#8a5a2f]"
         >
-          用户技能暂时无法读取，以下仅显示官方技能。
-        </p>
+          <span>工作沙箱暂时不可用，目前仅显示官方技能。</span>
+          <button
+            type="button"
+            onClick={loadSkills}
+            disabled={skillsLoading}
+            className="shrink-0 cursor-pointer rounded-md border border-current px-2 py-1 font-semibold transition-[color,background-color,border-color,box-shadow,transform] duration-200 ease-in-out hover:bg-[#f8ead5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8a5a2f]/30 focus-visible:ring-offset-1 focus-visible:ring-offset-[#fff8ec] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent motion-reduce:transition-none"
+          >
+            重新加载
+          </button>
+        </div>
       )}
 
       {skillSandboxStatus === 'not_created' && (
@@ -652,10 +673,10 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
         </p>
       )}
 
-      {skillsLoading ? (
+      {skillsLoading && skills.length === 0 ? (
         <div className="flex h-32 items-center justify-center text-sm text-[#a39c8e]">
           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          加载中...
+          正在恢复工作沙箱并加载技能…
         </div>
       ) : skills.length === 0 ? (
         <div className="flex flex-col items-center justify-center px-5 py-11 text-center text-[#a39c8e]">

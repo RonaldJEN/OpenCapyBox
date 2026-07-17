@@ -210,41 +210,58 @@ async def get_skills(
     finally:
         db.rollback()
 
-    try:
-        sandbox_service = get_sandbox_service()
-        cached_sandbox = sandbox_service.get_cached(user_id)
-        cached_id = getattr(cached_sandbox, "id", None)
-        candidate_id = sandbox_id or (
-            cached_id if isinstance(cached_id, str) and cached_id else None
-        )
+    sandbox_service = get_sandbox_service()
+    cached_sandbox = sandbox_service.get_cached(user_id)
+    cached_id = getattr(cached_sandbox, "id", None)
+    candidate_id = sandbox_id or (
+        cached_id if isinstance(cached_id, str) and cached_id else None
+    )
 
-        if candidate_id:
-            sandbox_status = "unavailable"
-            await asyncio.wait_for(
-                sandbox_service.get_existing(user_id, candidate_id),
-                timeout=10,
-            )
-            sandbox_skills = await asyncio.wait_for(
-                sandbox_service.discover_sandbox_skills(
-                    user_id,
-                    official_names,
-                    strict=True,
-                ),
-                timeout=12,
-            )
-            sandbox_status = "available"
-            for skill in sandbox_skills:
-                available_skills.append({
-                    "name": skill["name"],
-                    "description": skill["description"],
-                    "category": "user",
-                    "source": "user",
-                })
-        elif cached_sandbox is not None:
-            sandbox_status = "unavailable"
-    except Exception as e:
+    if candidate_id:
         sandbox_status = "unavailable"
-        logger.warning("读取用户沙箱 Skills 失败（仍返回官方 Skills）: %s", e)
+        try:
+            await sandbox_service.recover_persisted_sandbox(user_id, candidate_id)
+        except Exception as e:
+            logger.warning(
+                "工作沙箱恢复失败（仍返回官方 Skills）: user=%s, sandbox_id=%s, error=%s",
+                user_id,
+                candidate_id,
+                e,
+            )
+        else:
+            try:
+                sandbox_skills = await asyncio.wait_for(
+                    sandbox_service.discover_sandbox_skills(
+                        user_id,
+                        official_names,
+                        strict=True,
+                    ),
+                    timeout=12,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "用户 Skills 扫描超时（仍返回官方 Skills）: user=%s, sandbox_id=%s",
+                    user_id,
+                    candidate_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "用户 Skills 扫描失败（仍返回官方 Skills）: user=%s, sandbox_id=%s, error=%s",
+                    user_id,
+                    candidate_id,
+                    e,
+                )
+            else:
+                sandbox_status = "available"
+                for skill in sandbox_skills:
+                    available_skills.append({
+                        "name": skill["name"],
+                        "description": skill["description"],
+                        "category": "user",
+                        "source": "user",
+                    })
+    elif cached_sandbox is not None:
+        sandbox_status = "unavailable"
 
     # 沙箱 I/O 完成后再读取最新配置，避免长请求用旧快照覆盖刚完成的 toggle。
     configs = (

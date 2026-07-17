@@ -33,7 +33,7 @@ vi.mock('axios', () => {
   };
 });
 
-describe('configApi downloadCronRunFile', () => {
+describe('configApi', () => {
   let configApi: typeof import('../../services/configApi');
 
   beforeEach(async () => {
@@ -44,6 +44,18 @@ describe('configApi downloadCronRunFile', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('allows the skills recovery request to wait up to 240 seconds', async () => {
+    mockAxiosInstance.get.mockResolvedValue({
+      data: { skills: [], sandbox_status: 'not_created' },
+    });
+
+    await configApi.getSkills();
+
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/config/skills', {
+      timeout: 240_000,
+    });
   });
 
   it('downloads cron artifact via authorized blob request', async () => {

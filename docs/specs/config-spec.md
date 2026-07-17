@@ -57,6 +57,11 @@
 - 合并：SkillLoader 文件系统发现 + UserSkillConfig DB 状态
 - 包含沙箱中用户自定义 Skill
 - 沙箱发现采用部分成功语义：沙箱不可用不应阻断官方 Skills 清单
+- 存在持久化或进程缓存 sandbox ID 时，接口先调用 `recover_persisted_sandbox` 再以严格模式发现用户 Skills：
+  - 只在控制面确认旧沙箱终止/失败/不存在，或 Profile 明确不匹配时允许候选重建并以 CAS 更新绑定；
+  - 状态查询、connect、resume 或 Profile 指纹确认发生暂时性失败时不得重建，返回 `sandbox_status=unavailable`；
+  - 远程恢复/发现前必须结束本地 DB 事务，完成远程 I/O 后再读取最新 `UserSkillConfig`，避免长事务占用连接并防止旧配置快照覆盖并发 toggle。
+- 该 GET 是“清单读取 + 工作沙箱恢复”端点，确认旧代际丢失时可能创建容器并更新绑定，不得代理缓存或预取；前端使用长请求超时、保留已有清单，并在降级结果上提供手动重试。
 
 ### PUT /api/config/skills/{skill_name}
 

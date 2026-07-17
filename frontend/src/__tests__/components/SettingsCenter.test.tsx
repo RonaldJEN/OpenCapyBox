@@ -264,9 +264,69 @@ describe('SettingsCenter', () => {
 
     expect(await screen.findByText('pdf')).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent(
-      '用户技能暂时无法读取，以下仅显示官方技能。',
+      '工作沙箱暂时不可用，目前仅显示官方技能。',
+    );
+    const retryButton = screen.getByRole('button', { name: '重新加载' });
+    expect(retryButton).toHaveClass(
+      'cursor-pointer',
+      'hover:bg-[#f8ead5]',
+      'focus-visible:ring-2',
+      'active:scale-95',
+      'motion-reduce:transition-none',
     );
     expect(screen.getByText('官方')).toBeInTheDocument();
+  });
+
+  it('手动重试期间保留现有官方技能并在成功后加载用户技能', async () => {
+    let resolveRetry: ((value: SkillsResponse) => void) | null = null;
+    vi.mocked(getSkills)
+      .mockResolvedValueOnce({
+        skills: [{
+          name: 'pdf',
+          description: 'PDF documents',
+          category: 'document',
+          source: 'official',
+          enabled: true,
+        }],
+        sandbox_status: 'unavailable',
+      })
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveRetry = resolve;
+      }));
+
+    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
+    expect(await screen.findByText('pdf')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
+
+    expect(screen.getByText('pdf')).toBeInTheDocument();
+    expect(screen.getByText('正在恢复工作沙箱并加载技能…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '重新加载' })).toBeDisabled();
+
+    await act(async () => {
+      resolveRetry?.({
+        skills: [
+          {
+            name: 'pdf',
+            description: 'PDF documents',
+            category: 'document',
+            source: 'official',
+            enabled: true,
+          },
+          {
+            name: 'my-skill',
+            description: 'User skill',
+            category: 'user',
+            source: 'user',
+            enabled: true,
+          },
+        ],
+        sandbox_status: 'available',
+      });
+    });
+
+    expect(await screen.findByText('my-skill')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重新加载' })).not.toBeInTheDocument();
   });
 
   it('尚未创建沙箱时说明当前仅展示官方技能', async () => {
@@ -323,7 +383,7 @@ describe('SettingsCenter', () => {
       });
     });
 
-    expect(screen.getByText('加载中...')).toBeInTheDocument();
+    expect(screen.getAllByText('正在恢复工作沙箱并加载技能…')).not.toHaveLength(0);
     expect(screen.queryByText('stale-skill')).not.toBeInTheDocument();
 
     await act(async () => {

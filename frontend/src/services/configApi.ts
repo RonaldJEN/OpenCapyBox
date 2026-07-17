@@ -76,7 +76,9 @@ export interface SkillsResponse {
 }
 
 export async function getSkills(): Promise<SkillsResponse> {
-  const resp = await client.get<SkillsResponse>('/config/skills');
+  const resp = await client.get<SkillsResponse>('/config/skills', {
+    timeout: 240_000,
+  });
   return resp.data;
 }
 
