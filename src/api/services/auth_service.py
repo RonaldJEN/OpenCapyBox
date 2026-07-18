@@ -31,6 +31,7 @@ from src.api.models.user_memory import CronJobRun, MemoryEmbedding, UserMemory, 
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_sandbox import UserSandbox
 from src.api.models.user_sandbox_config import UserSandboxConfig
+from src.api.models.user_skill_inventory import UserSkillInventorySnapshot
 from src.api.utils.timezone import now_naive
 
 
@@ -417,6 +418,12 @@ def _purge_user_owned_data(db: DBSession, *, user_id: str) -> None:
     db.query(MemoryEmbedding).filter(MemoryEmbedding.user_id == user_id).delete(synchronize_session=False)
     db.query(UserMemory).filter(UserMemory.user_id == user_id).delete(synchronize_session=False)
     db.query(UserSkillConfig).filter(UserSkillConfig.user_id == user_id).delete(synchronize_session=False)
+    # Keep the same lock order as inventory publication: binding first, then
+    # snapshot. This avoids a delete/publish deadlock under concurrent teardown.
+    db.query(UserSandbox).filter(UserSandbox.user_id == user_id).delete(synchronize_session=False)
+    db.query(UserSkillInventorySnapshot).filter(
+        UserSkillInventorySnapshot.user_id == user_id
+    ).delete(synchronize_session=False)
 
     db.query(RunCancelRequest).filter(RunCancelRequest.user_id == user_id).delete(synchronize_session=False)
     db.query(UserRunLock).filter(UserRunLock.user_id == user_id).delete(synchronize_session=False)
@@ -458,7 +465,6 @@ def _purge_user_owned_data(db: DBSession, *, user_id: str) -> None:
         db.query(Round).filter(round_filter).delete(synchronize_session=False)
         db.query(Session).filter(Session.id.in_(session_ids)).delete(synchronize_session=False)
 
-    db.query(UserSandbox).filter(UserSandbox.user_id == user_id).delete(synchronize_session=False)
     db.query(UserSandboxConfig).filter(UserSandboxConfig.user_id == user_id).delete(synchronize_session=False)
     try:
         from src.api.models.model_permission import UserModelPermissionGroup

@@ -3,6 +3,7 @@ import { eventMessageId, eventSequence, eventToolCallId, flushSSEBuffer, parseSS
 import { formatHttpErrorMessage } from '../utils/errorMessages';
 import type {
   ChatContentBlock,
+  RoundData,
   StreamDeltaMeta,
 } from '../types';
 import type { StreamEnvelope, StreamSource } from '../runtime/chatRuntimeTypes';
@@ -76,6 +77,8 @@ interface StreamHandlers {
 interface StartSendArgs extends StreamIdentity, StreamHandlers {
   content: ChatContentBlock[];
   idempotencyKey?: string;
+  preferredSkillKeys?: string[];
+  onRejectedBeforeAccept?: () => void;
 }
 
 interface SubscribeArgs extends StreamIdentity, StreamHandlers {
@@ -105,6 +108,28 @@ function abortState(state: AbortState) {
   state.userAborted = true;
   for (const controller of state.controllers) {
     controller.abort();
+  }
+}
+
+async function getSessionHistoryWithAbort(
+  abort: AbortState,
+  ownerSessionId: string,
+): ReturnType<typeof apiService.getSessionHistoryV2> {
+  if (abort.userAborted) throw new UserAbort();
+  const controller = new AbortController();
+  abort.controllers.add(controller);
+  try {
+    const history = await apiService.getSessionHistoryV2(
+      ownerSessionId,
+      controller.signal,
+    );
+    if (abort.userAborted) throw new UserAbort();
+    return history;
+  } catch (error) {
+    if (abort.userAborted || controller.signal.aborted) throw new UserAbort();
+    throw error;
+  } finally {
+    abort.controllers.delete(controller);
   }
 }
 
@@ -152,8 +177,11 @@ function terminalFromRound(round: any, threadId: string, runId: string): any | n
   if (round.status === 'failed') {
     return {
       type: 'RUN_ERROR',
+      threadId,
+      runId,
       message: round.final_response || 'Run failed',
       code: 'RUN_FAILED',
+      sequence: round.last_event_sequence,
     };
   }
 
@@ -184,6 +212,31 @@ function terminalFromRound(round: any, threadId: string, runId: string): any | n
   };
 }
 
+function runStartedFromRound(round: RoundData | undefined, threadId: string, runId: string) {
+  return {
+    type: 'RUN_STARTED',
+    threadId,
+    runId,
+    preferredSkills: Array.isArray(round?.preferred_skills)
+      ? round.preferred_skills
+      : [],
+  };
+}
+
+function emitRecoveredTerminal(
+  handlers: StreamHandlers,
+  identity: StreamIdentity,
+  round: RoundData | undefined,
+  runId: string,
+): boolean {
+  const terminal = terminalFromRound(round, identity.ownerSessionId, runId);
+  if (!terminal) return false;
+  const started = runStartedFromRound(round, identity.ownerSessionId, runId);
+  emit(handlers, identity, started, metaForEvent(started, identity.source));
+  emit(handlers, identity, terminal, metaForEvent(terminal, identity.source));
+  return true;
+}
+
 function roundCreatedAtMs(round: any): number {
   const value = new Date(round?.created_at || 0).getTime();
   return Number.isFinite(value) ? value : 0;
@@ -207,8 +260,23 @@ function is5xx(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status >= 500;
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function delayWithAbort(abort: AbortState, ms: number): Promise<void> {
+  if (abort.userAborted) return Promise.resolve();
+
+  const controller = new AbortController();
+  abort.controllers.add(controller);
+
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      controller.signal.removeEventListener('abort', finish);
+      abort.controllers.delete(controller);
+      resolve();
+    };
+
+    controller.signal.addEventListener('abort', finish, { once: true });
+    const timer = setTimeout(finish, ms);
+  });
 }
 
 async function fetchSSE(
@@ -218,6 +286,7 @@ async function fetchSSE(
   onAccepted: (() => void) | undefined,
   onEvent: (event: any) => void,
 ): Promise<void> {
+  if (abort.userAborted) throw new UserAbort();
   const controller = new AbortController();
   abort.controllers.add(controller);
   let lastDataTime = Date.now();
@@ -304,13 +373,12 @@ async function recoverTerminal(
   identity: StreamIdentity,
   handlers: StreamHandlers,
   runId: string,
+  abort: AbortState,
 ): Promise<boolean> {
-  const history = await apiService.getSessionHistoryV2(identity.ownerSessionId);
+  const history = await getSessionHistoryWithAbort(abort, identity.ownerSessionId);
+  if (abort.userAborted) throw new UserAbort();
   const round = history.rounds.find((item: any) => item.round_id === runId);
-  const terminal = terminalFromRound(round, identity.ownerSessionId, runId);
-  if (!terminal) return false;
-  emit(handlers, identity, terminal, metaForEvent(terminal, identity.source));
-  return true;
+  return emitRecoveredTerminal(handlers, identity, round, runId);
 }
 
 function subscribeOnce(args: SubscribeArgs, abort: AbortState): RuntimeSubscription {
@@ -359,10 +427,11 @@ function subscribeOnce(args: SubscribeArgs, abort: AbortState): RuntimeSubscript
         return;
       }
       try {
-        if (await recoverTerminal(identity, args, args.serverRunId)) {
+        if (await recoverTerminal(identity, args, args.serverRunId, abort)) {
           return;
         }
       } catch (recoverError) {
+        if (recoverError instanceof UserAbort || abort.userAborted) return;
         console.error('检查轮次状态失败:', recoverError);
       }
       args.onError?.(error?.message || '订阅连接已断开');
@@ -395,9 +464,24 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
   let currentRunId: string | null = null;
   let runCompleted = false;
   let streamAccepted = false;
+  let preAcceptRejectionNotified = false;
   let retryCount = 0;
+  let successfulHistoryChecks = 0;
+  let failedHistoryChecks = 0;
   let latestSequence = 0;
   const seenSequences = new Set<number>();
+
+  const notifyRejectedBeforeAccept = () => {
+    if (streamAccepted || preAcceptRejectionNotified) return;
+    preAcceptRejectionNotified = true;
+    args.onRejectedBeforeAccept?.();
+  };
+
+  const markStreamAccepted = () => {
+    if (streamAccepted) return;
+    streamAccepted = true;
+    emit(args, identity, { type: 'CUSTOM', name: 'stream_accepted', value: {} });
+  };
 
   const markSequence = (event: any): boolean => {
     const sequence = eventSequence(event);
@@ -412,6 +496,33 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
     return true;
   };
 
+  const subscribeToKnownRound = async (runId: string) => {
+    if (abort.userAborted) throw new UserAbort();
+    currentRunId = runId;
+    currentThreadId = args.ownerSessionId;
+    const subscription = subscribeOnce({
+      ownerSessionId: args.ownerSessionId,
+      clientRunKey: args.clientRunKey,
+      transportEpoch: args.transportEpoch,
+      connectionId: args.connectionId,
+      source: 'subscribe',
+      serverRunId: runId,
+      lastSequence: latestSequence,
+      onEnvelope: args.onEnvelope,
+      onError: args.onError,
+    }, abort);
+
+    try {
+      await subscription.promise;
+      runCompleted = true;
+    } finally {
+      latestSequence = Math.max(
+        latestSequence,
+        subscription.getLatestSequence?.() ?? latestSequence,
+      );
+    }
+  };
+
   const doPost = async () => {
     await fetchSSE(
       `/api/chat/${args.ownerSessionId}/message/stream`,
@@ -424,13 +535,13 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
         body: JSON.stringify({
           content: args.content,
           idempotency_key: args.idempotencyKey,
+          ...(args.preferredSkillKeys?.length
+            ? { preferred_skill_keys: args.preferredSkillKeys }
+            : {}),
         }),
       },
       abort,
-      () => {
-        streamAccepted = true;
-        emit(args, identity, { type: 'CUSTOM', name: 'stream_accepted', value: {} });
-      },
+      markStreamAccepted,
       (event) => {
         if (!markSequence(event)) return;
         handleStreamEvent(
@@ -461,12 +572,14 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
       if (error instanceof UserAbort) return;
 
       if (is4xx(error)) {
+        notifyRejectedBeforeAccept();
         const code = error.status === 429 ? 'USER_BUSY' : 'HTTP_CLIENT_ERROR';
         emit(args, identity, { type: 'RUN_ERROR', message: error.message, code });
         return;
       }
 
       if (is5xx(error)) {
+        notifyRejectedBeforeAccept();
         emit(args, identity, { type: 'RUN_ERROR', message: error.message, code: 'SERVER_ERROR' });
         return;
       }
@@ -478,61 +591,56 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
 
       while (!runCompleted && retryCount < MAX_RETRIES && !abort.userAborted) {
         retryCount += 1;
-        await delay(RETRY_BASE_MS * retryCount);
+        await delayWithAbort(abort, RETRY_BASE_MS * retryCount);
         if (abort.userAborted) return;
 
-        try {
-          if (currentThreadId && currentRunId) {
-            const subscription = subscribeOnce({
-              ownerSessionId: args.ownerSessionId,
-              clientRunKey: args.clientRunKey,
-              transportEpoch: args.transportEpoch,
-              connectionId: args.connectionId,
-              source: 'subscribe',
-              serverRunId: currentRunId,
-              lastSequence: latestSequence,
-              onEnvelope: args.onEnvelope,
-              onError: args.onError,
-            }, abort);
+        if (currentThreadId && currentRunId) {
+          try {
+            await subscribeToKnownRound(currentRunId);
+            return;
+          } catch (retryError) {
+            if (retryError instanceof UserAbort || abort.userAborted) return;
+            console.error(`重连/重试失败 (${retryCount}/${MAX_RETRIES}):`, retryError);
+            continue;
+          }
+        }
 
-            await subscription.promise;
-            latestSequence = Math.max(latestSequence, subscription.getLatestSequence?.() ?? latestSequence);
+        let history: Awaited<ReturnType<typeof apiService.getSessionHistoryV2>>;
+        try {
+          history = await getSessionHistoryWithAbort(abort, args.ownerSessionId);
+        } catch (retryError) {
+          if (abort.userAborted) return;
+          failedHistoryChecks += 1;
+          console.error(`请求状态确认失败 (${retryCount}/${MAX_RETRIES}):`, retryError);
+          continue;
+        }
+        if (abort.userAborted) return;
+        successfulHistoryChecks += 1;
+
+        const acceptedRound = newestRound(history.rounds, (round) => (
+          matchesAcceptedRequest(round, args.idempotencyKey)
+          && (round.status === 'running' || ROUND_TERMINAL_STATUSES.has(round.status))
+        ));
+
+        if (acceptedRound) markStreamAccepted();
+
+        if (acceptedRound && acceptedRound.status !== 'running') {
+          if (emitRecoveredTerminal(args, identity, acceptedRound, acceptedRound.round_id)) {
             runCompleted = true;
             return;
           }
+        }
 
-          const history = await apiService.getSessionHistoryV2(args.ownerSessionId);
-          const acceptedRound = streamAccepted
-            ? newestRound(history.rounds, (round) => (
-                matchesAcceptedRequest(round, args.idempotencyKey)
-                && (round.status === 'running' || ROUND_TERMINAL_STATUSES.has(round.status))
-              ))
-            : undefined;
-
-          if (acceptedRound && acceptedRound.status !== 'running') {
-            const terminal = terminalFromRound(acceptedRound, args.ownerSessionId, acceptedRound.round_id);
-            if (terminal) {
-              emit(args, identity, terminal, metaForEvent(terminal, identity.source));
-              runCompleted = true;
-              return;
-            }
-          }
-
-          if (acceptedRound?.status === 'running') {
-            currentRunId = acceptedRound.round_id;
-            currentThreadId = args.ownerSessionId;
+        if (acceptedRound?.status === 'running') {
+          if (abort.userAborted) return;
+          try {
+            await subscribeToKnownRound(acceptedRound.round_id);
+            return;
+          } catch (retryError) {
+            if (retryError instanceof UserAbort || abort.userAborted) return;
+            console.error(`重连/重试失败 (${retryCount}/${MAX_RETRIES}):`, retryError);
             continue;
           }
-
-          emit(args, identity, {
-            type: 'RUN_ERROR',
-            message: '网络中断，请检查连接后重试',
-            code: 'REQUEST_FAILED',
-          });
-          return;
-        } catch (retryError) {
-          if (retryError instanceof UserAbort) return;
-          console.error(`重连/重试失败 (${retryCount}/${MAX_RETRIES}):`, retryError);
         }
       }
 
@@ -544,22 +652,42 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
             { ...identity, source: 'subscribe' },
             args,
             currentRunId,
+            abort,
           );
           if (recovered) return;
         } catch (recoverError) {
+          if (recoverError instanceof UserAbort || abort.userAborted) return;
           console.error('检查轮次状态失败:', recoverError);
         }
+        if (abort.userAborted) return;
         emit(args, identity, {
           type: 'RUN_ERROR',
           message: '连接已断开，Agent 可能仍在运行。请刷新页面查看结果',
           code: 'SSE_DISCONNECTED',
         });
       } else {
-        emit(args, identity, {
-          type: 'RUN_ERROR',
-          message: '连接已断开，请重新发送',
-          code: 'SSE_DISCONNECTED',
-        });
+        const confirmedNotAccepted = (
+          !streamAccepted
+          && Boolean(args.idempotencyKey)
+          && successfulHistoryChecks === MAX_RETRIES
+          && failedHistoryChecks === 0
+        );
+        if (confirmedNotAccepted) {
+          emit(args, identity, {
+            type: 'RUN_ERROR',
+            message: '网络中断，请检查连接后重试',
+            code: 'REQUEST_FAILED',
+          });
+          notifyRejectedBeforeAccept();
+        } else {
+          emit(args, identity, {
+            type: 'RUN_ERROR',
+            message: streamAccepted
+              ? '连接已断开，Agent 可能仍在运行。请刷新页面查看结果'
+              : '连接已断开，暂时无法确认请求是否已受理。请刷新页面查看结果',
+            code: 'REQUEST_STATUS_UNKNOWN',
+          });
+        }
       }
     }
   })();

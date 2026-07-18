@@ -1,10 +1,12 @@
 """Agent 服务 - 连接 OpenCapyBox 核心"""
 import asyncio
 import copy
+import contextvars
+import inspect
 import json
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional, AsyncIterator, Any
 
 from opensandbox import Sandbox
@@ -14,7 +16,17 @@ from src.api.utils.timezone import now_naive
 from src.agent.agent import Agent
 from src.agent.llm import LLMClient
 from src.agent.schema import Message as AgentMessage
-from src.agent.schema.agui_events import AGUIEvent, EventType
+from src.agent.schema.agui_events import AGUIEvent, Context, EventType
+from src.agent.schema.run_context import (
+    AgentRunContext,
+    LLMRequestContext,
+    RequestedPreferredSkillsContext,
+    ResolvedPreferredSkillsContext,
+    ResolvedSkillRef,
+    current_run_context,
+    parse_requested_preferred_skills_contexts,
+    requested_preferred_skills_to_context,
+)
 
 from src.api.services.history_service import HistoryService
 from src.api.services.agui_event_bus import SequencedAGUIEvent, StoredEvent, get_agui_event_bus
@@ -28,6 +40,10 @@ from src.agent.tools.base import ToolResult, ToolRuntimeContext
 from pathlib import Path as PathlibPath
 
 logger = logging.getLogger(__name__)
+
+PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY = (
+    "preferred_skills_origin_user_message_id"
+)
 
 
 class DuplicateRoundError(Exception):
@@ -43,10 +59,57 @@ class PreparedAgentRun:
 
     run_id: str
     user_message: str
+    user_message_id: str = ""
+    context: AgentRunContext = field(default_factory=AgentRunContext)
+    requested_context: RequestedPreferredSkillsContext | None = None
     parent_run_id: str | None = None
 
 
 settings = get_settings()
+
+
+def _compact_mcp_routing_text(value: object, *, limit: int) -> str:
+    """Normalize user-visible connection metadata into one bounded prompt line."""
+
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+
+def _render_mcp_connections_runtime_prompt(connections: object) -> str:
+    """Render compact connection labels without exposing remote tool schemas."""
+
+    if not isinstance(connections, (list, tuple)):
+        return ""
+
+    entries: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for connection in connections:
+        if isinstance(connection, dict):
+            raw_name = connection.get("server_name")
+            raw_description = connection.get("server_description")
+        else:
+            raw_name = getattr(connection, "server_name", None)
+            raw_description = getattr(connection, "server_description", None)
+        name = _compact_mcp_routing_text(raw_name, limit=100)
+        if not name:
+            continue
+        description = _compact_mcp_routing_text(raw_description, limit=500)
+        key = (name, description)
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(key)
+
+    if not entries:
+        return ""
+
+    entries.sort(key=lambda item: (item[0].casefold(), item[1].casefold()))
+    lines = ["## 当前可用数据连接（仅供工具路由）"]
+    lines.extend(
+        f"- {name}：{description}" if description else f"- {name}"
+        for name, description in entries
+    )
+    return "\n".join(lines)
 
 
 def get_sandbox_mount_path(user_id: str | None = None) -> str:
@@ -206,22 +269,59 @@ class AgentService:
             tool_build_metadata.get("mcp_catalog_retry_required") is True
         )
 
-        # 技能元数据和时间一样按 LLM 请求动态生成，不写入长期 system message。
+        # 技能和数据连接元数据按 LLM 请求动态生成，不写入长期 system message。
         runtime_prompt_provider = None
-        if self.skill_loader:
-            def _build_skills_runtime_prompt() -> str:
-                try:
-                    self.skill_loader.refresh_disabled_skills()
-                except Exception as e:
-                    # SkillLoader normally keeps the last-known snapshot itself;
-                    # retain metadata even for alternate/test loaders that raise.
-                    logger.warning("刷新请求级 Skill 启停配置失败，沿用上次状态: %s", e)
-                skills_metadata = self.skill_loader.get_skills_metadata_prompt()
-                if not skills_metadata:
-                    return ""
-                return f"## 已注册技能列表\n\n{skills_metadata}"
+        mcp_connections_prompt = _render_mcp_connections_runtime_prompt(
+            tool_build_metadata.get("mcp_connections", ())
+        )
+        if self.skill_loader or mcp_connections_prompt:
+            def _build_tools_runtime_prompt() -> str:
+                parts: list[str] = []
+                if self.skill_loader:
+                    try:
+                        self.skill_loader.refresh_disabled_skills()
+                    except Exception as e:
+                        # SkillLoader normally keeps the last-known snapshot itself;
+                        # retain metadata even for alternate/test loaders that raise.
+                        logger.warning("刷新请求级 Skill 启停配置失败，沿用上次状态: %s", e)
+                    skills_metadata = self.skill_loader.get_skills_metadata_prompt()
+                    if skills_metadata:
+                        parts.append(f"## 已注册技能列表\n\n{skills_metadata}")
+                if mcp_connections_prompt:
+                    parts.append(mcp_connections_prompt)
+                return "\n\n".join(parts)
 
-            runtime_prompt_provider = _build_skills_runtime_prompt
+            runtime_prompt_provider = _build_tools_runtime_prompt
+
+        deferred_tool_retriever = None
+        deferred_tool_catalog_is_current = None
+        if any(tool.tool_ref.provider == "mcp" for tool in tools):
+            from src.api.services.mcp_runtime import get_mcp_runtime
+            from src.api.services.mcp_tool_search_service import (
+                get_mcp_tool_search_service,
+            )
+
+            deferred_tool_retriever = get_mcp_tool_search_service()
+            expected_mcp_fingerprint = self.mcp_catalog_fingerprint
+            mcp_runtime = get_mcp_runtime()
+
+            def _mcp_catalog_is_current() -> bool:
+                if not self.user_id or not expected_mcp_fingerprint:
+                    return False
+                try:
+                    return (
+                        mcp_runtime.catalog_fingerprint(self.user_id)
+                        == expected_mcp_fingerprint
+                    )
+                except Exception:
+                    logger.warning(
+                        "检查 MCP 工具检索目录版本失败，隐藏旧目录工具: user=%s",
+                        self.user_id,
+                        exc_info=True,
+                    )
+                    return False
+
+            deferred_tool_catalog_is_current = _mcp_catalog_is_current
 
         # 创建 Agent
         self.agent = Agent(
@@ -236,6 +336,8 @@ class AgentService:
             tool_timeout=settings.agent_tool_timeout,
             subagent_max_parallel=settings.agent_subagent_max_parallel,
             runtime_prompt_provider=runtime_prompt_provider,
+            deferred_tool_retriever=deferred_tool_retriever,
+            deferred_tool_catalog_is_current=deferred_tool_catalog_is_current,
             user_id=self.user_id,
             allow_human_interrupts=self.allow_human_interrupts,
         )
@@ -891,6 +993,7 @@ class AgentService:
             return False
 
         for rnd in rounds:
+            round_id = rnd.id if isinstance(getattr(rnd, "id", None), str) else None
             round_events = events_by_round.get(rnd.id, [])
             has_synthetic_user_custom = _round_has_synthetic_user_custom(round_events)
 
@@ -924,6 +1027,8 @@ class AgentService:
                     messages.append(
                         AgentMessage(
                             role="user",
+                            id=f"{round_id}:user" if round_id else None,
+                            run_id=round_id,
                             content=content,
                             is_synthetic=is_synthetic,
                         )
@@ -941,7 +1046,12 @@ class AgentService:
                         "Round %s 無 conversation_messages user 記錄，fallback 到 rounds.user_message (session=%s)",
                         rnd.id, self.session_id,
                     )
-                    messages.append(AgentMessage(role="user", content=rnd.user_message))
+                    messages.append(AgentMessage(
+                        role="user",
+                        id=f"{round_id}:user" if round_id else None,
+                        run_id=round_id,
+                        content=rnd.user_message,
+                    ))
             elif not has_real_user_record:
                 if skip_resume_user:
                     skipped_resume_user = True
@@ -1542,6 +1652,7 @@ class AgentService:
         *,
         user_content: list[Any],
         idempotency_key: str | None = None,
+        contexts: list[Context] | None = None,
     ) -> PreparedAgentRun:
         """Create the user round and update Agent memory before execution."""
         if not self.agent:
@@ -1598,6 +1709,9 @@ class AgentService:
                         # Compatibility with small test/fallback Agent doubles.
                         self.agent.clear_pending_interrupt()
 
+        requested_context = parse_requested_preferred_skills_contexts(contexts or [])
+        run_context = await self._resolve_run_context(requested_context)
+
         # 正規化 + 校驗 + 構建輸入內容
         normalized_blocks = self._normalize_content_blocks(user_content)
         if not normalized_blocks:
@@ -1619,6 +1733,17 @@ class AgentService:
             round_id=run_id,
             user_message=user_message_for_history,
             user_attachments=user_attachments,
+            preferred_skills=[
+                {
+                    "key": skill.key,
+                    "display_name": skill.display_name,
+                }
+                for skill in (
+                    run_context.preferred_skills.skills
+                    if run_context.preferred_skills is not None
+                    else ()
+                )
+            ],
             idempotency_key=idempotency_key,
         )
 
@@ -1631,11 +1756,31 @@ class AgentService:
             raise DuplicateRoundError(created_round.id)
         
         # 添加到 agent
-        self.agent.add_user_message(agent_content)
+        user_message_id = f"{run_id}:user"
+        add_user_parameters = inspect.signature(self.agent.add_user_message).parameters
+        if "message_id" in add_user_parameters:
+            self.agent.add_user_message(
+                agent_content,
+                message_id=user_message_id,
+                run_id=run_id,
+            )
+        else:
+            # Compatibility for small Agent doubles and third-party wrappers.
+            self.agent.add_user_message(agent_content)
+            last_message = (getattr(self.agent, "messages", None) or [None])[-1]
+            if isinstance(last_message, AgentMessage):
+                last_message.id = user_message_id
+                last_message.run_id = run_id
         # 持久化用戶消息到 conversation_messages
         self._save_conversation_message("user", agent_content, round_id=run_id)
 
-        return PreparedAgentRun(run_id=run_id, user_message=user_message_for_history)
+        return PreparedAgentRun(
+            run_id=run_id,
+            user_message=user_message_for_history,
+            user_message_id=user_message_id,
+            context=run_context,
+            requested_context=requested_context,
+        )
 
     async def run_prepared_round(
         self,
@@ -1644,12 +1789,65 @@ class AgentService:
         error_label: str = "执行失败",
     ) -> AsyncIterator[AGUIEvent]:
         """Execute an already-created round."""
+        preferred_skills = (
+            [
+                {
+                    "key": skill.key,
+                    "display_name": skill.display_name,
+                }
+                for skill in prepared.context.preferred_skills.skills
+            ]
+            if prepared.parent_run_id is None
+            and prepared.context.preferred_skills is not None
+            else []
+        )
         async for event in self._run_round_stream(
             run_id=prepared.run_id,
             user_message=prepared.user_message,
+            user_message_id=prepared.user_message_id,
+            run_context=prepared.context,
+            requested_context=prepared.requested_context,
+            round_preferred_skills=preferred_skills,
             error_label=error_label,
         ):
             yield event
+
+    async def _resolve_run_context(
+        self,
+        requested: RequestedPreferredSkillsContext | None,
+    ) -> AgentRunContext:
+        """Resolve user-provided keys against the effective registry for this run."""
+        if requested is None or self.skill_loader is None:
+            return AgentRunContext()
+        try:
+            refresh_inventory = getattr(self.skill_loader, "refresh_inventory", None)
+            if callable(refresh_inventory):
+                await refresh_inventory()
+        except Exception:
+            logger.warning("Preferred Skill Inventory 刷新失败，沿用当前 Registry", exc_info=True)
+        try:
+            self.skill_loader.refresh_disabled_skills(force=True)
+        except Exception:
+            logger.warning("Preferred Skill 状态刷新失败，按当前 Registry 解析", exc_info=True)
+        resolved: list[ResolvedSkillRef] = []
+        for key in requested.keys:
+            skill = self.skill_loader.get_skill(key)
+            if skill is None:
+                logger.info("忽略当前 Run 不可用的 preferred Skill: %s", key)
+                continue
+            metadata = skill.metadata if isinstance(skill.metadata, dict) else {}
+            display_name = str(metadata.get("display_name") or skill.name)
+            resolved.append(ResolvedSkillRef(
+                key=skill.name,
+                load_name=skill.name,
+                display_name=display_name,
+            ))
+        preferred = (
+            ResolvedPreferredSkillsContext(skills=tuple(resolved))
+            if resolved
+            else None
+        )
+        return AgentRunContext(preferred_skills=preferred)
 
     @staticmethod
     def _on_post_round_done(task: asyncio.Task) -> None:
@@ -1742,6 +1940,15 @@ class AgentService:
                     "tool_call_id": details.get("tool_call_id"),
                     "questions": questions,
                 }
+                if isinstance(payload.get("runtime_context"), dict):
+                    result["runtime_context"] = payload["runtime_context"]
+                origin_user_message_id = payload.get(
+                    PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY
+                )
+                if isinstance(origin_user_message_id, str):
+                    result[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = (
+                        origin_user_message_id
+                    )
                 if kind == "tool_approval":
                     result.update({
                         "reason": reason,
@@ -1753,6 +1960,70 @@ class AgentService:
             return None
         finally:
             db.rollback()
+
+    @staticmethod
+    def _requested_context_from_interrupt(
+        snapshot: dict[str, Any] | None,
+    ) -> RequestedPreferredSkillsContext | None:
+        raw = (snapshot or {}).get("runtime_context")
+        if not isinstance(raw, dict):
+            return None
+        try:
+            wire = Context.model_validate(raw)
+        except Exception:
+            logger.warning("忽略中断元数据中的非法 Runtime Context")
+            return None
+        return parse_requested_preferred_skills_contexts([wire])
+
+    @staticmethod
+    def _preferred_skills_origin_user_message_id_from_interrupt(
+        snapshot: dict[str, Any] | None,
+        *,
+        parent_run_id: str,
+    ) -> str:
+        """Read the server-owned preferred-Skill anchor with a legacy fallback."""
+        raw = (snapshot or {}).get(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY)
+        if isinstance(raw, str):
+            candidate = raw.strip()
+            if candidate and candidate != ":user" and candidate.endswith(":user"):
+                return candidate
+        return f"{parent_run_id}:user"
+
+    @staticmethod
+    def _attach_preferred_skills_interrupt_context(
+        interrupt_payload: dict[str, Any],
+        pending_interrupt: dict[str, Any] | None,
+        *,
+        requested_context: RequestedPreferredSkillsContext | None,
+        origin_user_message_id: str,
+    ) -> None:
+        """Persist requested keys and their original user-message anchor."""
+        # The anchor is server-owned. Drop any value serialized by an interrupt
+        # producer before assigning the trusted value derived from PreparedAgentRun.
+        interrupt_payload.pop(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY, None)
+        if isinstance(pending_interrupt, dict):
+            pending_interrupt.pop(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY, None)
+        if requested_context is None:
+            return
+
+        runtime_wire = requested_preferred_skills_to_context(
+            requested_context
+        ).model_dump()
+        interrupt_payload["runtime_context"] = runtime_wire
+        if isinstance(pending_interrupt, dict):
+            pending_interrupt["runtime_context"] = runtime_wire
+
+        trusted_anchor = origin_user_message_id.strip()
+        if (
+            not trusted_anchor
+            or trusted_anchor == ":user"
+            or not trusted_anchor.endswith(":user")
+        ):
+            logger.warning("Preferred Skill 原始用户消息锚点无效，未写入中断元数据")
+            return
+        interrupt_payload[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = trusted_anchor
+        if isinstance(pending_interrupt, dict):
+            pending_interrupt[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = trusted_anchor
 
     def has_pending_interrupt(self, interrupt_id: str) -> bool:
         """检查是否存在匹配的待处理中断（内存态 + 持久化态）。"""
@@ -1827,6 +2098,9 @@ class AgentService:
         interrupt_id: str,
         answers: dict[str, str],
         parent_run_id: str,
+        preferred_skills_origin_user_message_id: str,
+        requested_context: RequestedPreferredSkillsContext | None,
+        run_context: AgentRunContext,
     ) -> PreparedAgentRun:
         """Atomically claim an approval and create its resume round.
 
@@ -1926,6 +2200,9 @@ class AgentService:
         return PreparedAgentRun(
             run_id=run_id,
             user_message=resume_user_message,
+            user_message_id=preferred_skills_origin_user_message_id,
+            context=run_context,
+            requested_context=requested_context,
             parent_run_id=parent_run_id,
         )
 
@@ -1990,11 +2267,25 @@ class AgentService:
                 (pending_interrupt or {}).get("kind")
                 or (persisted_interrupt or {}).get("kind")
             )
+            interrupt_snapshot = persisted_interrupt or pending_interrupt
+            requested_context = self._requested_context_from_interrupt(interrupt_snapshot)
+            preferred_skills_origin_user_message_id = (
+                self._preferred_skills_origin_user_message_id_from_interrupt(
+                    interrupt_snapshot,
+                    parent_run_id=parent_run_id,
+                )
+            )
+            run_context = await self._resolve_run_context(requested_context)
             if interrupt_kind == "tool_approval":
                 return self._prepare_tool_approval_resume_locked(
                     interrupt_id=interrupt_id,
                     answers=answers,
                     parent_run_id=parent_run_id,
+                    preferred_skills_origin_user_message_id=(
+                        preferred_skills_origin_user_message_id
+                    ),
+                    requested_context=requested_context,
+                    run_context=run_context,
                 )
 
             tool_call_id = (
@@ -2086,6 +2377,9 @@ class AgentService:
             return PreparedAgentRun(
                 run_id=run_id,
                 user_message=resume_user_message,
+                user_message_id=preferred_skills_origin_user_message_id,
+                context=run_context,
+                requested_context=requested_context,
                 parent_run_id=parent_run_id,
             )
 
@@ -2093,6 +2387,10 @@ class AgentService:
         self,
         run_id: str,
         user_message: str,
+        user_message_id: str = "",
+        run_context: AgentRunContext | None = None,
+        requested_context: RequestedPreferredSkillsContext | None = None,
+        round_preferred_skills: list[dict[str, str]] | None = None,
         error_label: str = "执行失败",
     ) -> AsyncIterator[AGUIEvent]:
         """共享的 round 事件流处理：追踪状态、持久化事件、完成 round。
@@ -2104,6 +2402,7 @@ class AgentService:
             user_message: 用户消息文本（用于后台任务）
             error_label: 失败时的错误前缀
         """
+        run_context = run_context or AgentRunContext()
         final_response: Optional[str] = None
         step_count = 0
         status = "running"
@@ -2120,6 +2419,7 @@ class AgentService:
         # 固化本輪 cancel_token，避免後續新 run 覆蓋 self.cancel_token 導致判定串擾。
         run_cancel_token = self.cancel_token
         self._active_run_count += 1
+        run_context_token = current_run_context.set(run_context)
 
         async def _record_llm_call(payload: dict[str, Any]) -> None:
             try:
@@ -2161,11 +2461,23 @@ class AgentService:
         self.agent.set_llm_call_hook(_record_llm_call)
 
         try:
-            async for event in self.agent.run_agui(
-                thread_id=self.session_id,
-                run_id=run_id,
-                cancel_token=run_cancel_token,
+            run_agui_kwargs = {
+                "thread_id": self.session_id,
+                "run_id": run_id,
+                "cancel_token": run_cancel_token,
+            }
+            run_agui_parameters = inspect.signature(self.agent.run_agui).parameters.values()
+            if any(
+                parameter.name == "llm_request_context"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in run_agui_parameters
             ):
+                run_agui_kwargs["llm_request_context"] = LLMRequestContext(
+                    purpose="agent_step",
+                    run_context=run_context,
+                    user_message_id=user_message_id,
+                )
+            async for event in self.agent.run_agui(**run_agui_kwargs):
                 # 本輪已被外部收斂為終態（常見於 abort 立即 cancelled）時，
                 # 停止處理遲到事件，避免污染 conversation_messages 與 round 狀態。
                 if self.history_service.is_round_terminal(run_id) is True:
@@ -2187,6 +2499,20 @@ class AgentService:
                     if isinstance(stored_terminal, StoredEvent):
                         yield stored_terminal.event
                     break
+
+                if (
+                    event.type == EventType.RUN_STARTED
+                    and round_preferred_skills is not None
+                ):
+                    event = event.model_copy(update={
+                        "preferred_skills": [
+                            {
+                                "key": item["key"],
+                                "display_name": item["display_name"],
+                            }
+                            for item in round_preferred_skills
+                        ],
+                    })
 
                 event_to_store = event
                 event_to_yield = event
@@ -2279,10 +2605,18 @@ class AgentService:
                                         run_id,
                                     )
                                     self._pending_interrupt_round_ids[interrupt_id] = run_id
+                                interrupt_payload = event.interrupt.model_dump(exclude_none=True)
+                                pending = getattr(self.agent, "_pending_interrupt", None)
+                                self._attach_preferred_skills_interrupt_context(
+                                    interrupt_payload,
+                                    pending if isinstance(pending, dict) else None,
+                                    requested_context=requested_context,
+                                    origin_user_message_id=user_message_id,
+                                )
                                 _interrupt_json = json.dumps(
-                                    event.interrupt.model_dump(exclude_none=True),
+                                    interrupt_payload,
                                     ensure_ascii=False,
-                        )
+                                )
                     else:
                         status = "failed"
                 elif event.type == EventType.RUN_ERROR:
@@ -2320,12 +2654,15 @@ class AgentService:
             if status == "completed" and not bool(run_cancel_token and run_cancel_token.is_set()):
                 self._persist_latest_summary_anchor(run_id)
 
-                task = asyncio.create_task(self._post_round_tasks(
-                    sync_memory=_dirty_memory,
-                    round_id=run_id,
-                    user_message=user_message,
-                    assistant_response=final_response,
-                ))
+                task = asyncio.create_task(
+                    self._post_round_tasks(
+                        sync_memory=_dirty_memory,
+                        round_id=run_id,
+                        user_message=user_message,
+                        assistant_response=final_response,
+                    ),
+                    context=contextvars.Context(),
+                )
                 task.add_done_callback(self._on_post_round_done)
 
         except Exception as e:
@@ -2361,6 +2698,7 @@ class AgentService:
                     logger.error("Round %s 異常退出後無法更新 DB", run_id, exc_info=True)
             self.agent.set_llm_call_hook(None)
             self._active_run_count = max(0, self._active_run_count - 1)
+            current_run_context.reset(run_context_token)
 
     async def _post_round_tasks(
         self,

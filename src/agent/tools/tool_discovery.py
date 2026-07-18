@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Protocol
 from typing import Any
 
 from .base import Tool, ToolExposure, ToolResult, ToolRuntimeContext
@@ -11,10 +13,49 @@ from .base import Tool, ToolExposure, ToolResult, ToolRuntimeContext
 
 TOOL_SEARCH_NAME = "tool_search"
 _MAX_DISCOVERY_RESULTS = 20
+MAX_TOOL_SEARCH_DESCRIPTION_BYTES = 2 * 1024
+
+
+def bound_tool_search_text(value: object, *, max_bytes: int) -> str:
+    """Normalize and UTF-8 bound metadata before ranking or external embedding."""
+
+    text = " ".join(str(value or "").split())[:max_bytes]
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+@dataclass(frozen=True)
+class ToolSearchDocument:
+    """Bounded, non-secret metadata for ranking one current Agent candidate."""
+
+    model_name: str
+    provider: str
+    tool_name: str
+    installation_id: str | None
+    server_name: str
+    server_description: str
+    title: str
+    description: str
+    schema_hash: str
+    connection_fingerprint: str
+
+
+class DeferredToolRetriever(Protocol):
+    """Non-authoritative async ranker for an already-authorized candidate set."""
+
+    async def rank(
+        self,
+        query: str,
+        candidates: list[ToolSearchDocument],
+        *,
+        limit: int,
+    ) -> list[str]: ...
 
 
 class ToolDiscoveryTool(Tool):
-    """Search deferred tools and expose exact matches on the next model step."""
+    """Search deferred tools and expose ranked matches on the next model step."""
 
     exposure = ToolExposure.DIRECT_MODEL_ONLY
 
@@ -32,7 +73,9 @@ class ToolDiscoveryTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Search tools that are not included in the initial tool list. "
+            "Search tools from the user's enabled MCP data connections that "
+            "are not included in the initial tool list. Search by connection "
+            "name or a natural-language capability description. "
             "Matching tools returned by this call become available with their "
             "full schemas starting on the next step of this conversation."
         )
@@ -45,7 +88,8 @@ class ToolDiscoveryTool(Tool):
                 "query": {
                     "type": "string",
                     "description": (
-                        "Case-insensitive words to match against tool name, server, "
+                        "Natural-language capability query ranked with hybrid "
+                        "semantic and keyword retrieval across tool name, server, "
                         "title, and description."
                     ),
                     "maxLength": 200,
@@ -128,4 +172,11 @@ class ToolDiscoveryTool(Tool):
         )
 
 
-__all__ = ["TOOL_SEARCH_NAME", "ToolDiscoveryTool"]
+__all__ = [
+    "TOOL_SEARCH_NAME",
+    "MAX_TOOL_SEARCH_DESCRIPTION_BYTES",
+    "DeferredToolRetriever",
+    "ToolDiscoveryTool",
+    "ToolSearchDocument",
+    "bound_tool_search_text",
+]

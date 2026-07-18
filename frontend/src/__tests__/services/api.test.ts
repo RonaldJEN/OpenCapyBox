@@ -98,6 +98,28 @@ describe('APIService', () => {
       });
     });
 
+    it('getSessionHistoryV2 preserves the legacy call and forwards an optional AbortSignal', async () => {
+      const axiosModule = await import('axios');
+      const client = vi.mocked(axiosModule.default.create).mock.results[0].value as unknown as {
+        get: ReturnType<typeof vi.fn>;
+      };
+      const payload = { session_id: 'session-1', rounds: [], total: 0 };
+      client.get.mockResolvedValue({ data: payload });
+
+      await expect(apiService.getSessionHistoryV2('session-1')).resolves.toEqual(payload);
+      expect(client.get).toHaveBeenNthCalledWith(1, '/sessions/session-1/history/v2');
+
+      const controller = new AbortController();
+      await expect(
+        apiService.getSessionHistoryV2('session-1', controller.signal),
+      ).resolves.toEqual(payload);
+      expect(client.get).toHaveBeenNthCalledWith(
+        2,
+        '/sessions/session-1/history/v2',
+        { signal: controller.signal },
+      );
+    });
+
     it('abortChat 应返回远端副作用不确定警告', async () => {
       const axiosModule = await import('axios');
       const client = vi.mocked(axiosModule.default.create).mock.results[0].value as unknown as {

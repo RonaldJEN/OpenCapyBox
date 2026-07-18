@@ -808,61 +808,11 @@ class MemoryService:
 
     @staticmethod
     async def _generate_embeddings(texts: list[str]) -> list[list[float] | None]:
-        """调用 Embedding API 生成向量
+        """Generate vectors through the shared registry-first embedding client."""
 
-        优先从 model_registry 获取 Embedding 模型配置；
-        若 model_registry 无配置，fallback 到 settings 中的旧配置。
-        两者均无则对每个文本返回 None。
-        """
-        api_key: str = ""
-        api_base: str = ""
-        model_name: str = ""
-        dimensions: int | None = None
+        from src.api.services.embedding_service import generate_embeddings
 
-        # 1. 尝试 model_registry
-        try:
-            from src.api.model_registry import get_model_registry
-            registry = get_model_registry()
-            emb_config = registry.get_embedding_model()
-            if emb_config:
-                api_key = emb_config.resolve_api_key()
-                api_base = emb_config.api_base
-                model_name = emb_config.model_name
-                dimensions = emb_config.dimensions
-        except Exception:
-            pass
-
-        # 2. fallback: settings
-        if not api_key and settings.embedding_api_key:
-            api_key = settings.embedding_api_key
-            api_base = settings.embedding_api_base
-            model_name = settings.embedding_model
-
-        if not api_key:
-            return [None] * len(texts)
-
-        try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=30) as client:
-                payload = {
-                    "model": model_name,
-                    "input": texts,
-                }
-                if dimensions is not None:
-                    payload["dimensions"] = dimensions
-                resp = await client.post(
-                    f"{api_base.rstrip('/')}/embeddings",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json=payload,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                embeddings = [item["embedding"] for item in data["data"]]
-                return embeddings
-        except Exception as e:
-            logger.warning("Embedding API 调用失败: %s", e)
-            return [None] * len(texts)
+        return await generate_embeddings(texts)
 
     # ------------------------------------------------------------------
     # 对话内容自动索引

@@ -8,6 +8,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.api.schemas.chat import ContentBlock
+from src.agent.schema.agui_events import Context
 
 
 class StrictModel(BaseModel):
@@ -55,6 +56,7 @@ class NormalizedInboundTurn(StrictModel):
     peer_id: str
     external_thread_id: str | None = None
     content: list[ContentBlock]
+    context: list[Context] = Field(default_factory=list)
     attachments: list[Attachment] = Field(default_factory=list)
     reply_route: ReplyRoute
     metadata: dict[str, Any] = Field(default_factory=dict)

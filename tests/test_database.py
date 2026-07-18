@@ -78,6 +78,47 @@ class TestDatabaseConfig:
         except StopIteration:
             pass
 
+    def test_user_skill_config_key_column_matches_shared_limit(self):
+        from src.agent.schema.skill_key import MAX_SKILL_KEY_LENGTH
+        from src.api.models.user_memory import UserSkillConfig
+
+        assert UserSkillConfig.__table__.c.skill_name.type.length == (
+            MAX_SKILL_KEY_LENGTH
+        )
+
+    def test_existing_user_skill_key_column_is_widened(self):
+        from sqlalchemy import String
+
+        from src.agent.schema.skill_key import MAX_SKILL_KEY_LENGTH
+        from src.api.models import database as database_module
+
+        inspector = MagicMock()
+        inspector.has_table.side_effect = (
+            lambda table_name: table_name == "user_skill_configs"
+        )
+        inspector.get_columns.return_value = [
+            {"name": "skill_name", "type": String(100)},
+        ]
+
+        conn = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = conn
+        context.__exit__.return_value = None
+        fake_engine = MagicMock()
+        fake_engine.begin.return_value = context
+
+        with patch.object(database_module, "inspect", return_value=inspector), patch.object(
+            database_module,
+            "_sync_postgres_sequence",
+        ):
+            database_module._migrate_add_columns(fake_engine)
+
+        executed_sql = [str(call.args[0]) for call in conn.execute.call_args_list]
+        assert (
+            "ALTER TABLE user_skill_configs ALTER COLUMN skill_name "
+            f"TYPE VARCHAR({MAX_SKILL_KEY_LENGTH})"
+        ) in executed_sql
+
     def test_get_db_close_operational_error_is_logged(self, caplog):
         """请求清理阶段连接已断开时记录日志，不再污染已完成响应。"""
         import logging
@@ -143,6 +184,37 @@ class TestDatabaseConfig:
 
 class TestDatabaseMigration:
     """测试数据库迁移逻辑"""
+
+    def test_round_preferred_skills_uses_cross_dialect_add_column_migration(self):
+        from sqlalchemy import create_engine, inspect, text
+
+        from src.api.models import database as database_module
+
+        pending = {
+            (table_name, column_name, column_type)
+            for table_name, column_name, column_type in database_module._PENDING_COLUMNS
+        }
+        assert ("rounds", "preferred_skills", "TEXT") in pending
+
+        sqlite_engine = create_engine("sqlite://")
+        try:
+            with sqlite_engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE TABLE rounds ("
+                    "id VARCHAR(36) PRIMARY KEY, "
+                    "session_id VARCHAR(36), "
+                    "status VARCHAR(20), "
+                    "created_at DATETIME"
+                    ")"
+                ))
+            database_module._migrate_add_columns(sqlite_engine)
+            columns = {
+                column["name"]
+                for column in inspect(sqlite_engine).get_columns("rounds")
+            }
+            assert "preferred_skills" in columns
+        finally:
+            sqlite_engine.dispose()
 
     def test_mcp_tool_visibility_migration_includes_revision(self):
         """存量工具发布策略表应补齐乐观并发控制版本列。"""
@@ -395,6 +467,19 @@ class TestMemoryEmbeddingColumnType:
 
         assert embedding_type.compile(dialect=sqlite.dialect()) == "JSON"
         assert embedding_type.compile(dialect=postgresql.dialect()) == f"vector({MEMORY_EMBEDDING_DIMENSIONS})"
+
+    def test_mcp_tool_search_embedding_uses_shared_vector_storage_type(self):
+        from sqlalchemy.dialects import postgresql, sqlite
+
+        from src.api.models.mcp import McpToolSearchIndex
+        from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS
+
+        embedding_type = McpToolSearchIndex.__table__.c.embedding.type
+
+        assert embedding_type.compile(dialect=sqlite.dialect()) == "JSON"
+        assert embedding_type.compile(dialect=postgresql.dialect()) == (
+            f"vector({MEMORY_EMBEDDING_DIMENSIONS})"
+        )
 
     def test_postgres_existing_vector_column_resizes_to_target_dimensions(self):
         from src.api.models import database as database_module

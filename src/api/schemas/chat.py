@@ -1,6 +1,12 @@
 """对话相关 Schema"""
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any, Annotated, Literal
+from typing import Annotated, Any, Dict, List, Literal, Optional
+
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints
+
+from src.agent.schema.skill_key import (
+    MAX_SKILL_KEY_LENGTH,
+    normalize_optional_skill_key,
+)
 
 
 class TextContentBlock(BaseModel):
@@ -58,6 +64,12 @@ ContentBlock = Annotated[
     Field(discriminator="type"),
 ]
 
+SkillKey = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=MAX_SKILL_KEY_LENGTH),
+    AfterValidator(normalize_optional_skill_key),
+]
+
 
 class ChatRequest(BaseModel):
     """对话请求"""
@@ -70,6 +82,11 @@ class SendMessageRequest(BaseModel):
 
     content: List[ContentBlock] = Field(..., min_length=1, description="用户消息内容块")
     idempotency_key: Optional[str] = Field(default=None, max_length=64, description="幂等键（防止多 Worker 重复处理同一请求）")
+    preferred_skill_keys: List[SkillKey] = Field(
+        default_factory=list,
+        max_length=50,
+        description="本轮优先考虑的 Skill 内部 key",
+    )
 
 
 class ResumeRequest(BaseModel):
@@ -104,6 +121,13 @@ class ToolResult(BaseModel):
     execution_time_ms: Optional[int] = None
 
 
+class RoundPreferredSkill(BaseModel):
+    """本轮实际生效的 Preferred Skill 展示快照。"""
+
+    key: str
+    display_name: str
+
+
 class StepData(BaseModel):
     """执行步骤数据"""
     step_number: int
@@ -129,6 +153,7 @@ class RoundData(BaseModel):
     last_event_sequence: int = 0
     user_message: str
     user_attachments: List[Dict[str, Any]] = Field(default_factory=list)
+    preferred_skills: List[RoundPreferredSkill] = Field(default_factory=list)
     final_response: Optional[str] = None
     steps: List[StepData] = Field(default_factory=list)
     step_count: int

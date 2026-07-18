@@ -27,8 +27,16 @@ class ExposureTool(MockTool):
 
 
 class ExposureMcpTool(ExposureTool):
-    def __init__(self, name: str, installation_id: str, live_reads: list[str]) -> None:
-        super().__init__(name, ToolExposure.DIRECT)
+    def __init__(
+        self,
+        name: str,
+        installation_id: str,
+        live_reads: list[str],
+        *,
+        exposure: ToolExposure = ToolExposure.DIRECT,
+        description: str = "",
+    ) -> None:
+        super().__init__(name, exposure, description)
         self._installation_id = installation_id
         self._live_reads = live_reads
 
@@ -73,6 +81,19 @@ class CapturingLLM(MockLLMClient):
         )
 
 
+class StubDeferredRetriever:
+    def __init__(self, ranked_names, *, on_rank=None):
+        self.ranked_names = list(ranked_names)
+        self.candidate_names = []
+        self.on_rank = on_rank
+
+    async def rank(self, query, candidates, *, limit):
+        self.candidate_names = [item.model_name for item in candidates]
+        if self.on_rank is not None:
+            self.on_rank()
+        return list(self.ranked_names)
+
+
 def _tool_call(name: str, arguments: dict) -> LLMResponse:
     return LLMResponse(
         content="",
@@ -109,6 +130,7 @@ def test_exposure_projection_keeps_deferred_and_hidden_out_of_initial_request(tm
         "model_only",
         TOOL_SEARCH_NAME,
     ]
+    assert "enabled MCP data connections" in agent.tools[TOOL_SEARCH_NAME].description
 
 
 @pytest.mark.asyncio
@@ -293,6 +315,159 @@ async def test_discovery_excludes_deny_and_hidden_tools(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_semantic_discovery_filters_permissions_before_and_after_ranking(tmp_path):
+    allowed = ExposureTool("allowed_remote", ToolExposure.DEFERRED, "market data")
+    denied = ExposureTool("denied_remote", ToolExposure.DEFERRED, "market data")
+    retriever = StubDeferredRetriever([denied.name, "foreign_tool", allowed.name])
+    agent = _agent(
+        tmp_path,
+        [allowed, denied],
+        user_id="alice",
+        deferred_tool_retriever=retriever,
+    )
+
+    def resolve(tools, *, session_id):
+        return [
+            SimpleNamespace(
+                effect="deny" if tool.name == denied.name else "allow",
+                reason="test",
+                matched_rule_id=None,
+            )
+            for tool in tools
+        ]
+
+    with patch.object(agent, "_resolve_tool_permissions", side_effect=resolve):
+        matches = await agent._discover_deferred_tools(
+            session_id="session-a",
+            query="share price",
+            names=[denied.name],
+            limit=1,
+        )
+
+    assert retriever.candidate_names == [allowed.name]
+    assert [match["model_name"] for match in matches] == [allowed.name]
+    assert set(agent._activated_deferred_tools["session-a"]) == {allowed.name}
+
+
+@pytest.mark.asyncio
+async def test_semantic_discovery_rechecks_permission_changes_after_await(tmp_path):
+    candidate = ExposureTool("remote_market", ToolExposure.DEFERRED, "market data")
+    retriever = StubDeferredRetriever([candidate.name])
+    agent = _agent(
+        tmp_path,
+        [candidate],
+        user_id="alice",
+        deferred_tool_retriever=retriever,
+    )
+    resolve_count = 0
+
+    def resolve(tools, *, session_id):
+        nonlocal resolve_count
+        resolve_count += 1
+        effect = "allow" if resolve_count == 1 else "deny"
+        return [
+            SimpleNamespace(effect=effect, reason="test", matched_rule_id=None)
+            for _tool in tools
+        ]
+
+    with patch.object(agent, "_resolve_tool_permissions", side_effect=resolve):
+        matches = await agent._discover_deferred_tools(
+            session_id="session-a",
+            query="share price",
+            names=[],
+            limit=1,
+        )
+
+    assert resolve_count == 2
+    assert retriever.candidate_names == [candidate.name]
+    assert matches == []
+    assert "session-a" not in agent._activated_deferred_tools
+
+
+@pytest.mark.asyncio
+async def test_semantic_discovery_applies_limit_after_post_await_permissions(tmp_path):
+    first = ExposureTool("first_remote", ToolExposure.DEFERRED, "market data")
+    second = ExposureTool("second_remote", ToolExposure.DEFERRED, "market data")
+    retriever = StubDeferredRetriever([first.name, second.name])
+    agent = _agent(
+        tmp_path,
+        [first, second],
+        user_id="alice",
+        deferred_tool_retriever=retriever,
+    )
+    resolve_count = 0
+
+    def resolve(tools, *, session_id):
+        nonlocal resolve_count
+        resolve_count += 1
+        return [
+            SimpleNamespace(
+                effect=(
+                    "deny"
+                    if resolve_count == 2 and tool.name == first.name
+                    else "allow"
+                ),
+                reason="test",
+                matched_rule_id=None,
+            )
+            for tool in tools
+        ]
+
+    with patch.object(agent, "_resolve_tool_permissions", side_effect=resolve):
+        matches = await agent._discover_deferred_tools(
+            session_id="session-a",
+            query="share price",
+            names=[],
+            limit=1,
+        )
+
+    assert resolve_count == 2
+    assert [match["model_name"] for match in matches] == [second.name]
+    assert set(agent._activated_deferred_tools["session-a"]) == {second.name}
+
+
+@pytest.mark.asyncio
+async def test_semantic_discovery_discards_mcp_catalog_that_changes_during_await(
+    tmp_path,
+):
+    state = {"current": True, "checks": 0}
+
+    def is_current():
+        state["checks"] += 1
+        return state["current"]
+
+    def mark_stale():
+        state["current"] = False
+
+    candidate = ExposureMcpTool(
+        "mcp__market__quote",
+        "installation-1",
+        [],
+        exposure=ToolExposure.DEFERRED,
+        description="realtime stock quote",
+    )
+    retriever = StubDeferredRetriever([candidate.name], on_rank=mark_stale)
+    agent = _agent(
+        tmp_path,
+        [candidate],
+        deferred_tool_retriever=retriever,
+        deferred_tool_catalog_is_current=is_current,
+    )
+
+    matches = await agent._discover_deferred_tools(
+        session_id="session-a",
+        query="share price",
+        names=[candidate.name],
+        limit=1,
+    )
+
+    assert state["checks"] == 2
+    assert retriever.candidate_names == [candidate.name]
+    assert matches == []
+    assert "session-a" not in agent._activated_deferred_tools
+
+
+@pytest.mark.asyncio
 async def test_zero_match_discovery_does_not_read_policy_or_live_bindings(tmp_path):
     deferred = ExposureTool(
         "mcp__weather__forecast",
@@ -314,6 +489,63 @@ async def test_zero_match_discovery_does_not_read_policy_or_live_bindings(tmp_pa
 
     assert matches == []
     assert "session-a" not in agent._activated_deferred_tools
+
+
+@pytest.mark.asyncio
+async def test_discovery_uses_partial_keyword_recall_and_coverage_ranking(tmp_path):
+    realtime = ExposureTool(
+        "stock_highfreq_quotes",
+        ToolExposure.DEFERRED,
+        "A股股票行情数据的实时快照与高频实时行情指标",
+    )
+    history = ExposureTool(
+        "get_stock_performance",
+        ToolExposure.DEFERRED,
+        "A股股票日频历史行情和技术指标",
+    )
+    unrelated = ExposureTool(
+        "get_company_filings",
+        ToolExposure.DEFERRED,
+        "上市公司公告和定期报告",
+    )
+    agent = _agent(tmp_path, [history, unrelated, realtime])
+
+    matches = await agent._discover_deferred_tools(
+        session_id="session-a",
+        query="股票 股价 实时行情",
+        names=[],
+        limit=2,
+    )
+
+    assert [item["model_name"] for item in matches] == [
+        realtime.name,
+        history.name,
+    ]
+    assert unrelated.name not in agent._activated_deferred_tools["session-a"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_ranks_explicit_model_names_before_keyword_matches(tmp_path):
+    keyword_match = ExposureTool(
+        "stock_highfreq_quotes",
+        ToolExposure.DEFERRED,
+        "股票实时行情",
+    )
+    explicitly_named = ExposureTool(
+        "get_stock_info",
+        ToolExposure.DEFERRED,
+        "股票基本资料",
+    )
+    agent = _agent(tmp_path, [keyword_match, explicitly_named])
+
+    matches = await agent._discover_deferred_tools(
+        session_id="session-a",
+        query="股票 实时行情",
+        names=[explicitly_named.name],
+        limit=1,
+    )
+
+    assert [item["model_name"] for item in matches] == [explicitly_named.name]
 
 
 @pytest.mark.asyncio

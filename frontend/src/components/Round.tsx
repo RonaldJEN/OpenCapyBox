@@ -274,6 +274,20 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
           <div className="text-[15px] text-claude-text leading-relaxed whitespace-pre-wrap break-words">
             {cleanContent}
           </div>
+          {round.preferred_skills && round.preferred_skills.length > 0 && (
+            <div className="mt-2.5 flex flex-wrap items-center gap-1.5" aria-label="本轮优先 Skill">
+              <span className="mr-0.5 text-[11px] font-medium text-claude-muted">本轮优先 Skill</span>
+              {round.preferred_skills.map((skill, index) => (
+                <span
+                  key={`${skill.key}-${index}`}
+                  className="inline-flex max-w-full items-center rounded-full border border-claude-border bg-claude-surface px-2 py-0.5 text-[11px] font-medium text-claude-secondary"
+                  title={skill.key}
+                >
+                  <span className="truncate">{skill.display_name?.trim() || skill.key}</span>
+                </span>
+              ))}
+            </div>
+          )}
           {/* 附件展示 */}
           {userAttachments.length > 0 ? (
             <div className="mt-3 flex flex-wrap gap-2">

@@ -4,7 +4,7 @@ import json
 import asyncio
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import os
@@ -18,9 +18,21 @@ from src.api.utils.timezone import get_timezone, get_timezone_offset
 from .llm import LLMClient
 from .logger import AgentLogger
 from .schema import Message
+from .schema.run_context import (
+    LLMRequestContext,
+    render_preferred_skills_context_block,
+    render_preferred_skills_system_policy,
+)
 from .tools.base import Tool, ToolExposure, ToolResult, ToolRuntimeContext
 from .tools.ask_user_tool import ASK_USER_TOOL_NAME
-from .tools.tool_discovery import TOOL_SEARCH_NAME, ToolDiscoveryTool
+from .tools.tool_discovery import (
+    MAX_TOOL_SEARCH_DESCRIPTION_BYTES,
+    TOOL_SEARCH_NAME,
+    DeferredToolRetriever,
+    ToolDiscoveryTool,
+    ToolSearchDocument,
+    bound_tool_search_text,
+)
 from .utils import calculate_display_width
 from .utils.token_utils import truncate_text_by_tokens
 from .event_emitter import AGUIEventEmitter
@@ -33,21 +45,13 @@ logger = logging.getLogger(__name__)
 _TOOL_UNAVAILABLE_MESSAGE = "Tool is unavailable in this conversation"
 _MAX_DEFERRED_TOOLS_PER_SESSION = 32
 _MAX_DEFERRED_TOOL_SESSIONS = 128
-_MAX_TOOL_SEARCH_DESCRIPTION_BYTES = 2 * 1024
 
 
 def _tool_search_description_preview(value: object) -> str:
     """Keep repeated deferred-tool searches bounded by a small text preview."""
-
-    # Slice before encoding so even a future provider with unexpectedly large
-    # metadata cannot force an unbounded temporary UTF-8 allocation here.
-    text = str(value or "")[:_MAX_TOOL_SEARCH_DESCRIPTION_BYTES]
-    encoded = text.encode("utf-8", errors="replace")
-    if len(encoded) <= _MAX_TOOL_SEARCH_DESCRIPTION_BYTES:
-        return text
-    return encoded[:_MAX_TOOL_SEARCH_DESCRIPTION_BYTES].decode(
-        "utf-8",
-        errors="ignore",
+    return bound_tool_search_text(
+        value,
+        max_bytes=MAX_TOOL_SEARCH_DESCRIPTION_BYTES,
     )
 
 
@@ -129,6 +133,8 @@ class Agent:
         tool_timeout: int = 300,  # 单次工具执行超时（秒），0 表示不限
         subagent_max_parallel: int = 1,  # 同一 step 内最多并行执行的 sub_agent 数
         runtime_prompt_provider: Callable[[], str] | None = None,
+        deferred_tool_retriever: DeferredToolRetriever | None = None,
+        deferred_tool_catalog_is_current: Callable[[], bool] | None = None,
         user_id: str | None = None,
         allow_human_interrupts: bool = True,
     ):
@@ -173,6 +179,8 @@ class Agent:
         self.workspace_dir = Path(workspace_dir)
         self.user_id = user_id
         self.allow_human_interrupts = allow_human_interrupts
+        self._deferred_tool_retriever = deferred_tool_retriever
+        self._deferred_tool_catalog_is_current = deferred_tool_catalog_is_current
 
         # Deferred tools stay registered for execution and policy checks, but
         # their schemas are projected only after an explicit, session-scoped
@@ -308,7 +316,13 @@ class Agent:
 
 """
 
-    def _build_llm_request_messages(self, messages: list[Message] | None = None) -> list[Message]:
+    def _build_llm_request_messages(
+        self,
+        messages: list[Message] | None = None,
+        *,
+        request_context: LLMRequestContext | None = None,
+        exposed_tool_names: set[str] | None = None,
+    ) -> list[Message]:
         """Return provider-bound messages with request-only runtime context.
 
         The returned list is a deep copy and must not be stored back into
@@ -317,6 +331,19 @@ class Agent:
         source_messages = self.messages if messages is None else messages
         request_messages = [msg.model_copy(deep=True) for msg in source_messages]
         runtime_context = self._build_runtime_context_block()
+        should_project_preferred_skills = (
+            request_context is not None
+            and request_context.purpose in {"agent_step", "tool_followup"}
+            and bool(request_context.user_message_id)
+            and "get_skill" in (exposed_tool_names or set())
+        )
+        preferred_skills_policy = render_preferred_skills_system_policy(
+            request_context.run_context
+            if should_project_preferred_skills and request_context is not None
+            else None
+        )
+        if preferred_skills_policy:
+            runtime_context += f"{preferred_skills_policy}\n\n---\n\n"
         dynamic_prompt = self._build_dynamic_runtime_prompt()
         if dynamic_prompt:
             runtime_context += f"{dynamic_prompt}\n\n---\n\n"
@@ -333,7 +360,50 @@ class Agent:
         else:
             request_messages.insert(0, Message(role="system", content=runtime_context))
 
+        self._project_user_run_context(
+            request_messages,
+            request_context=request_context,
+            exposed_tool_names=exposed_tool_names,
+        )
+
         return request_messages
+
+    @staticmethod
+    def _project_user_run_context(
+        messages: list[Message],
+        *,
+        request_context: LLMRequestContext | None,
+        exposed_tool_names: set[str] | None,
+    ) -> None:
+        """Prepend user-authority context to the exact request-only turn copy."""
+        if (
+            request_context is None
+            or request_context.purpose not in {"agent_step", "tool_followup"}
+            or not request_context.user_message_id
+            or "get_skill" not in (exposed_tool_names or set())
+        ):
+            return
+        block = render_preferred_skills_context_block(request_context.run_context)
+        if not block:
+            return
+        for message in messages:
+            if message.role != "user" or message.id != request_context.user_message_id:
+                continue
+            if (
+                isinstance(message.content, list)
+                and message.content
+                and message.content[0].get("type") == "text"
+                and str(message.content[0].get("text") or "").startswith(
+                    '<runtime_context type="preferred_skills"'
+                )
+            ):
+                return
+            context_part = {"type": "text", "text": block}
+            if isinstance(message.content, str):
+                message.content = [context_part, {"type": "text", "text": message.content}]
+            else:
+                message.content = [context_part, *message.content]
+            return
 
     def _build_dynamic_runtime_prompt(self) -> str:
         """Build a request-only prompt without mutating history.
@@ -350,9 +420,15 @@ class Agent:
             logger.warning("构建请求级动态系统提示失败", exc_info=True)
             return ""
 
-    def add_user_message(self, content: str | list[dict[str, Any]]):
+    def add_user_message(
+        self,
+        content: str | list[dict[str, Any]],
+        *,
+        message_id: str | None = None,
+        run_id: str | None = None,
+    ):
         """Add a user message to history."""
-        self.messages.append(Message(role="user", content=content))
+        self.messages.append(Message(role="user", id=message_id, run_id=run_id, content=content))
 
     def has_pending_interrupt(self, interrupt_id: str | None = None) -> bool:
         """检查是否存在待处理中断。
@@ -576,31 +652,163 @@ class Agent:
         limit: int,
     ) -> list[dict[str, Any]]:
         """Return and activate permission-visible deferred tools for one session."""
-        exact_names = set(names)
-        words = [word for word in query.casefold().split() if word]
-        candidates: list[Tool] = []
+        deferred_tools = [
+            tool
+            for tool in self.tools.values()
+            if tool.exposure == ToolExposure.DEFERRED
+        ]
+        has_mcp_candidates = any(
+            tool.tool_ref.provider == "mcp" for tool in deferred_tools
+        )
 
-        for tool in self.tools.values():
-            if tool.exposure != ToolExposure.DEFERRED:
-                continue
-
-            searchable = " ".join(
-                str(value)
-                for value in (
-                    tool.name,
-                    getattr(tool, "title", None) or "",
-                    _tool_search_description_preview(tool.description),
-                    getattr(tool, "server_name", None) or "",
+        def mcp_catalog_is_current() -> bool:
+            guard = self._deferred_tool_catalog_is_current
+            if guard is None or not has_mcp_candidates:
+                return True
+            try:
+                return bool(guard())
+            except Exception:
+                logger.warning(
+                    "Deferred MCP catalog freshness check failed; hiding MCP candidates",
+                    exc_info=True,
                 )
-            ).casefold()
-            exact = tool.name in exact_names
-            query_match = bool(words) and all(word in searchable for word in words)
-            if exact or query_match:
-                candidates.append(tool)
+                return False
 
-        # Text matching is intentionally first: a zero-match search performs no
-        # policy or live-MCP lookup. DENY still remains undiscoverable because
-        # only permission-visible candidates are returned below.
+        # Exact-name discovery must obey the same live publication boundary as
+        # semantic retrieval. A stale Agent may keep non-MCP deferred tools,
+        # but its MCP metadata is no longer authoritative.
+        if not mcp_catalog_is_current():
+            deferred_tools = [
+                tool for tool in deferred_tools if tool.tool_ref.provider != "mcp"
+            ]
+        by_name = {tool.name: tool for tool in deferred_tools}
+        exact_names = set(names)
+        words = list(dict.fromkeys(
+            word for word in query.casefold().split() if word
+        ))
+
+        def lexical_ranking(tools: list[Tool]) -> list[Tool]:
+            ranked: list[tuple[tuple[int, int], Tool]] = []
+            for tool in tools:
+                fields = (
+                    (tool.name.casefold(), 32),
+                    (str(getattr(tool, "title", None) or "").casefold(), 16),
+                    (str(getattr(tool, "server_name", None) or "").casefold(), 12),
+                    (_tool_search_description_preview(tool.description).casefold(), 4),
+                )
+                matched_words = [
+                    word
+                    for word in words
+                    if any(word in field for field, _weight in fields)
+                ]
+                if not matched_words:
+                    continue
+                field_score = sum(
+                    weight
+                    for word in matched_words
+                    for field, weight in fields
+                    if word in field
+                )
+                ranked.append(((len(matched_words), field_score), tool))
+            ranked.sort(
+                key=lambda item: (-item[0][0], -item[0][1], item[1].name)
+            )
+            return [tool for _rank, tool in ranked]
+
+        lexical = lexical_ranking(deferred_tools)
+        exact = [
+            by_name[name]
+            for name in names
+            if name in exact_names and name in by_name
+        ]
+
+        if self._deferred_tool_retriever is not None and query.strip():
+            # Permission is the authority boundary for metadata sent to the
+            # configured embedding provider. Visibility was already enforced
+            # when this Agent's immutable MCP catalog was constructed.
+            initial_decisions = self._resolve_tool_permissions(
+                deferred_tools,
+                session_id=session_id,
+            )
+            discoverable = [
+                tool
+                for tool, decision in zip(deferred_tools, initial_decisions)
+                if decision.effect != "deny"
+                and (decision.effect != "ask" or self.allow_human_interrupts)
+            ]
+            discoverable_by_name = {tool.name: tool for tool in discoverable}
+            documents = []
+            for tool in discoverable:
+                ref = tool.tool_ref
+                documents.append(ToolSearchDocument(
+                    model_name=tool.name,
+                    provider=ref.provider,
+                    tool_name=ref.name,
+                    installation_id=ref.installation_id,
+                    server_name=bound_tool_search_text(
+                        getattr(tool, "server_name", None),
+                        max_bytes=255,
+                    ),
+                    server_description=bound_tool_search_text(
+                        getattr(tool, "server_description", None),
+                        max_bytes=1024,
+                    ),
+                    title=bound_tool_search_text(
+                        getattr(tool, "title", None),
+                        max_bytes=512,
+                    ),
+                    description=_tool_search_description_preview(tool.description),
+                    schema_hash=str(getattr(tool, "schema_hash", None) or ""),
+                    connection_fingerprint=str(
+                        getattr(tool, "connection_fingerprint", None) or ""
+                    ),
+                ))
+            try:
+                retrieved_names = await self._deferred_tool_retriever.rank(
+                    query,
+                    documents,
+                    limit=max(1, len(documents)),
+                )
+            except Exception:
+                logger.warning(
+                    "Deferred tool semantic retrieval failed; using lexical ranking",
+                    exc_info=True,
+                )
+                retrieved_names = []
+
+            if not mcp_catalog_is_current():
+                discoverable_by_name = {
+                    name: tool
+                    for name, tool in discoverable_by_name.items()
+                    if tool.tool_ref.provider != "mcp"
+                }
+
+            candidates = []
+            seen_names: set[str] = set()
+            for tool in (
+                [item for item in exact if item.name in discoverable_by_name]
+                + [
+                    discoverable_by_name[name]
+                    for name in retrieved_names
+                    if name in discoverable_by_name
+                ]
+                + [item for item in lexical if item.name in discoverable_by_name]
+            ):
+                if tool.name not in seen_names:
+                    seen_names.add(tool.name)
+                    candidates.append(tool)
+        else:
+            candidates = []
+            seen_names = set()
+            for tool in exact + lexical:
+                if tool.name not in seen_names:
+                    seen_names.add(tool.name)
+                    candidates.append(tool)
+
+        # Recheck after the async retriever: a session-scoped policy may have
+        # changed while the embedding request was in flight. Unknown retriever
+        # IDs and stale MCP catalog entries were already discarded against the
+        # authoritative candidate set.
         decisions = self._resolve_tool_permissions(candidates, session_id=session_id)
         matches = [
             tool
@@ -609,7 +817,6 @@ class Agent:
             and (decision.effect != "ask" or self.allow_human_interrupts)
         ]
 
-        matches.sort(key=lambda item: item.name)
         selected = matches[:limit]
         if selected:
             active = self._activated_deferred_tools.get(session_id)
@@ -2468,6 +2675,7 @@ Rules:
         thread_id: str,
         run_id: str,
         cancel_token: Optional[asyncio.Event] = None,
+        llm_request_context: LLMRequestContext | None = None,
     ) -> AsyncIterator[AGUIEvent]:
         """執行 Agent 並輸出 AG-UI 事件流
         
@@ -2584,7 +2792,18 @@ Rules:
                 # visible. Execution performs the same lookup again to close the
                 # race with policy edits made after this request starts.
                 tool_list = self._visible_tools_for_request(thread_id)
-                llm_request_messages = self._build_llm_request_messages()
+                step_request_context = (
+                    replace(
+                        llm_request_context,
+                        purpose="agent_step" if step == 0 else "tool_followup",
+                    )
+                    if llm_request_context is not None
+                    else None
+                )
+                llm_request_messages = self._build_llm_request_messages(
+                    request_context=step_request_context,
+                    exposed_tool_names={tool.name for tool in tool_list},
+                )
                 self.logger.log_request(messages=llm_request_messages, tools=tool_list)
                 request_messages_snapshot = [msg.model_dump(exclude_none=True) for msg in llm_request_messages]
                 request_tools_snapshot = [tool.name for tool in tool_list]

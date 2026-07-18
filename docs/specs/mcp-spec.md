@@ -46,6 +46,13 @@
 - `schema_hash`: 工具 input schema 的哈希，用于权限条件绑定
 - `connection_fingerprint`: 产出该快照的端点/凭证目标指纹；**NULL 为遗留快照，永不用于回退执行**
 
+### `mcp_tool_search_indexes` — 派生检索索引（按 installation）
+- `(installation_id, tool_name)` 为稳定主键；与 installation 级联删除，但与执行热路径的快照表物理分离
+- `search_document` 仅由有界的工具名、标题、连接名、连接说明和工具说明组成；不包含 URL、凭证或 input schema
+- `search_document_hash` + `schema_hash` + `connection_fingerprint` 绑定索引内容与当前可执行工具身份；任一变化都会原子清空旧向量
+- `embedding_model_fingerprint` + `embedded_document_hash` 防止模型切换或旧文档向量被复用
+- `claim_token` / `lease_expires_at` / `retry_after` 用于跨 worker 的索引生成租约和失败退避；迟到结果必须通过 token 与全部身份条件后才可写入
+
 ### `mcp_config_versions` — 目录代次
 - `scope_key`: `"global"` 或 `"user:<user_id>"`；单键设计规避不同数据库 NULL 唯一性差异
 
@@ -113,6 +120,15 @@
 - 目录构建按 `(server_id, installation_id)` 稳定排序并分为 required、optional 两阶段；required 优先发现和计入预算，只有 required 集合自身违反 installation 数、总 deadline、工具数或累计字节限制时才抛 `McpRequiredServerUnavailable`
 - optional 服务按稳定顺序整服务加入目录；发现失败、超时、模型工具名碰撞或加入后超过工具数/字节预算时，仅跳过该 optional 服务并记录脱敏 error，不得拖垮已验证的 required 目录
 - 网络发现完成、写缓存前再次采样 config generation 并重读完整 effective-installation 集合；前后不一致即拒绝混合代际目录
+- 成功贡献至少一个可见工具的连接会附带紧凑路由摘要（连接名 + 配置说明），由 Agent 仅在请求级 system 副本中列出；不得包含 URL、凭证或远端工具 schema，也不得写入长期消息历史
+
+#### 4.3.1 `tool_search` 混合检索
+- 候选集合的唯一权威来源是当前 Agent 已装配且 exposure 为 `DEFERRED` 的工具；数据库中的旧快照、已隐藏工具、其他用户或其他 Agent 的索引行不能自行成为候选
+- 精确 `model_name` 始终优先；自然语言 query 使用字段加权 BM25 与 pgvector 余弦相似度并行排序，再以 RRF 融合。关键词匹配采用部分召回，不要求所有词同时命中
+- 调用 embedding 前先校验 Agent 的 MCP catalog fingerprint，并按当前用户/session 批量过滤 DENY，以及非交互 Agent 无法处理的 ASK；异步检索返回后再次校验目录代次与权限，且丢弃不属于原候选集合的任何 ID，最后才应用 `limit` 并激活工具
+- 快照事务只同步派生索引的文档与身份，不在锁内发起网络请求；缺失向量由检索服务通过 `FOR UPDATE SKIP LOCKED` 租约渐进生成，单次搜索最多预热 256 个文档、每个 embedding 请求最多 64 个文档，未变化的向量可跨快照刷新保留
+- embedding 请求只发送用户 query 与上述有界检索文档；使用配置的 embedding 服务，因此其数据边界与记忆语义检索相同
+- embedding 未配置、索引尚未完成、API/向量数据库失败或结果不合法时，稳定降级为纯关键词排序；向量写入不递增 MCP config version，避免 Agent 重建风暴
 
 ### 4.4 快照与执行绑定
 - 每次成功发现刷新 `mcp_tool_snapshots`（`schema_hash` + `connection_fingerprint`）
@@ -148,6 +164,9 @@
 | 迟到 discovery 的 execution fingerprint 已变化 | CAS 拒绝快照，结果不返回、不缓存，后续按新代次重试 |
 | optional MCP 发现失败/超时/超预算/名称碰撞 | 跳过该整服务并记录脱敏错误；required 与其他 optional 继续可用 |
 | required 集合自身超出目录限制或 deadline | 整体失败并抛 `McpRequiredServerUnavailable` |
+| embedding 未配置、超时、返回无效向量或 pgvector 查询失败 | `tool_search` 降级为字段加权关键词排序，不影响 MCP 目录与工具执行 |
+| 检索器返回隐藏、跨用户或不在当前 Agent 目录中的工具 ID | 丢弃该结果；不得展示、激活或执行 |
+| embedding 等待期间 MCP catalog fingerprint 变化 | 本次不返回或激活旧 Agent 中的 MCP 工具，等待 Agent 按新目录重建 |
 | `expected_revision` 不匹配 | 409，前端重载后需重新编辑 |
 | 凭证损坏无法解密 | 该 installation 标记 configuration_error，工具不暴露（fail-closed） |
 | 导入超过 100 个 | 校验失败，整体拒绝 |
@@ -158,3 +177,5 @@
 - [tests/test_mcp_catalog.py](../../tests/test_mcp_catalog.py)：目录 CRUD、发布策略、导入导出、凭证不回显
 - [tests/test_mcp_runtime.py](../../tests/test_mcp_runtime.py)：连接、发现、指纹、并发、取消
 - [tests/test_mcp_security.py](../../tests/test_mcp_security.py)：SSRF、header 校验、异常脱敏
+- [tests/test_tool_search_hybrid.py](../../tests/test_tool_search_hybrid.py)：BM25、向量语义命中、RRF 与故障降级
+- [tests/test_tool_exposure.py](../../tests/test_tool_exposure.py)：候选范围、权限前后校验、limit 与会话激活

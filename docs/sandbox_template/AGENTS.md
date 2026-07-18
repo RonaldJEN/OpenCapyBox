@@ -26,7 +26,8 @@ read_when:
 | 系统命令、依赖、测试、Git、进程           | `bash`                                       |
 | 后台命令查看输出 / 终止                    | `bash_output` / `bash_kill`              |
 | 本轮临时笔记（短期，随会话）              | `record_note` / `recall_notes`           |
-| 联网搜索（需配置，可选）                  | `search` / `batch_search`                |
+| 已连接数据源可能覆盖的实时 / 结构化数据    | `tool_search`（按连接名或能力词发现）     |
+| 公开网络信息，或数据连接无匹配 / 调用失败  | `search` / `batch_search`                |
 | 沉淀事实/经验                             | 记忆工具                                       |
 
 ### 文件操作

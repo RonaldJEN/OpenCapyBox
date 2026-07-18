@@ -1,9 +1,18 @@
-import { useRef, useEffect, useState } from 'react';
-import { ArrowUp, Loader2, Paperclip, Square, X } from 'lucide-react';
+import { useRef, useEffect, useMemo, useState } from 'react';
+import { ArrowUp, BookOpenCheck, Check, Loader2, Paperclip, Search, Square, X } from 'lucide-react';
 import { FileInfo } from '../types';
 import { getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, isImageFile } from '../utils/fileUtils';
+import {
+  getSkills,
+  type SkillInfo,
+  type SkillInventoryState,
+} from '../services/configApi';
+import { MAX_SELECTED_SKILLS } from '../utils/skillDrafts';
 
 const MAX_TEXTAREA_HEIGHT = 200;
+
+const skillKey = (skill: SkillInfo) => skill.key || skill.name;
+const skillDisplayName = (skill: SkillInfo) => skill.display_name || skill.name;
 
 interface ChatInputProps {
   /** 当前输入文本 */
@@ -30,6 +39,10 @@ interface ChatInputProps {
   onPreviewAttachment?: (file: FileInfo) => void;
   uploading?: boolean;
 
+  // ---- 本轮 Skill 偏好 ----
+  selectedSkillKeys?: string[];
+  onSelectedSkillKeysChange?: (keys: string[]) => void;
+
   // ---- 输入代理 ----
   onInputChangeRaw?: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
   onFileSelected?: (file: FileInfo, newInputValue: string) => void;
@@ -53,12 +66,109 @@ export function ChatInput({
   onInputDropHandled,
   onPreviewAttachment,
   uploading = false,
+  selectedSkillKeys = [],
+  onSelectedSkillKeysChange,
   onInputChangeRaw,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [previewImage, setPreviewImage] = useState<{ src: string; name: string } | null>(null);
   const [isInputDragging, setIsInputDragging] = useState(false);
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [skillsLoading, setSkillsLoading] = useState(false);
+  const [skillsLoaded, setSkillsLoaded] = useState(false);
+  const [skillsError, setSkillsError] = useState('');
+  const [skillsInventoryState, setSkillsInventoryState] = useState<SkillInventoryState | null>(null);
+  const [skillsLoadRevision, setSkillsLoadRevision] = useState(0);
+  const [skillQuery, setSkillQuery] = useState('');
+  const skillsLoadedRef = useRef(false);
+  const skillsRequestRef = useRef<ReturnType<typeof getSkills> | null>(null);
+  const skillPickerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!skillsOpen) return;
+    let active = true;
+    const hadLoadedSkills = skillsLoadedRef.current;
+    setSkillsLoading(true);
+    setSkillsError('');
+    const request = skillsRequestRef.current ?? getSkills();
+    skillsRequestRef.current = request;
+    void request
+      .then((response) => {
+        if (active) {
+          setSkills(response.skills.filter((skill) => skill.enabled));
+          setSkillsInventoryState(response.inventory_state ?? null);
+          skillsLoadedRef.current = true;
+          setSkillsLoaded(true);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setSkillsError(hadLoadedSkills
+            ? 'Skill 列表刷新失败，已显示上次结果'
+            : 'Skill 列表加载失败');
+        }
+      })
+      .finally(() => {
+        if (skillsRequestRef.current === request) skillsRequestRef.current = null;
+        if (active) setSkillsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [skillsLoadRevision, skillsOpen]);
+
+  useEffect(() => {
+    if (!skillsOpen) return;
+    const closeOnOutside = (event: MouseEvent) => {
+      if (!skillPickerRef.current?.contains(event.target as Node)) setSkillsOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSkillsOpen(false);
+    };
+    document.addEventListener('mousedown', closeOnOutside);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('mousedown', closeOnOutside);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [skillsOpen]);
+
+  const filteredSkills = useMemo(() => {
+    const query = skillQuery.trim().toLocaleLowerCase();
+    if (!query) return skills;
+    return skills.filter((skill) => [
+      skillDisplayName(skill),
+      skill.name,
+      skillKey(skill),
+      skill.description,
+    ].some((value) => value.toLocaleLowerCase().includes(query)));
+  }, [skillQuery, skills]);
+
+  const skillByKey = useMemo(
+    () => new Map(skills.map((skill) => [skillKey(skill), skill])),
+    [skills],
+  );
+
+  const toggleSkill = (key: string) => {
+    if (!onSelectedSkillKeysChange) return;
+    if (selectedSkillKeys.includes(key)) {
+      onSelectedSkillKeysChange(selectedSkillKeys.filter((item) => item !== key));
+      return;
+    }
+    if (selectedSkillKeys.length >= MAX_SELECTED_SKILLS) return;
+    onSelectedSkillKeysChange([...selectedSkillKeys, key]);
+  };
+
+  const toggleSkillsOpen = () => {
+    if (skillsOpen) {
+      setSkillsOpen(false);
+      return;
+    }
+    setSkillQuery('');
+    setSkillsOpen(true);
+  };
 
   // 自动调整 textarea 高度
   useEffect(() => {
@@ -219,6 +329,28 @@ export function ChatInput({
               : 'border-claude-border shadow-sm hover:border-claude-border-strong'
           } ${isInputDragging ? 'ring-2 ring-claude-accent/25 border-claude-accent/50 bg-claude-accent/5' : ''}`}
           >
+            {selectedSkillKeys.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 px-3 pt-3" aria-label="已选择 Skill">
+                {selectedSkillKeys.map((key) => (
+                  <span
+                    key={key}
+                    className="inline-flex max-w-full items-center gap-1 rounded-full border border-claude-accent/30 bg-claude-accent/10 px-2.5 py-1 text-xs text-claude-secondary"
+                  >
+                    <span className="truncate">{skillByKey.get(key) ? skillDisplayName(skillByKey.get(key)!) : key}</span>
+                    <button
+                      type="button"
+                      onClick={() => toggleSkill(key)}
+                      disabled={disabled}
+                      className="rounded-full p-0.5 hover:bg-claude-accent/15 disabled:opacity-50"
+                      aria-label={`移除 Skill ${skillByKey.get(key) ? skillDisplayName(skillByKey.get(key)!) : key}`}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+
             {/* textarea */}
             <textarea
               ref={textareaRef}
@@ -258,6 +390,119 @@ export function ChatInput({
                       )}
                     </button>
                   </>
+                )}
+
+                {onSelectedSkillKeysChange && (
+                  <div ref={skillPickerRef} className="relative">
+                    <button
+                      type="button"
+                      onClick={toggleSkillsOpen}
+                      disabled={disabled}
+                      className={`flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
+                        selectedSkillKeys.length > 0
+                          ? 'bg-claude-accent/10 text-claude-secondary'
+                          : 'text-claude-muted hover:bg-claude-hover hover:text-claude-secondary'
+                      }`}
+                      aria-expanded={skillsOpen}
+                      aria-label="选择本轮 Skill"
+                      title="选择本轮优先考虑的 Skill"
+                    >
+                      <BookOpenCheck className="h-4 w-4" />
+                      <span>Skill{selectedSkillKeys.length > 0 ? ` ${selectedSkillKeys.length}` : ''}</span>
+                    </button>
+
+                    {skillsOpen && (
+                      <div className="fixed inset-x-3 bottom-3 z-[120] max-h-[70vh] overflow-hidden rounded-2xl border border-claude-border bg-white shadow-2xl md:absolute md:inset-x-auto md:bottom-full md:left-0 md:mb-2 md:w-[24rem]">
+                        <div className="border-b border-claude-border p-3">
+                          <div className="mb-2 flex items-center justify-between">
+                            <div>
+                              <div className="text-sm font-medium text-claude-text">本轮优先 Skill</div>
+                              <div className="text-[11px] text-claude-muted">相关时 Agent 会优先考虑，不强制调用</div>
+                            </div>
+                            <button type="button" onClick={() => setSkillsOpen(false)} className="rounded-lg p-1 text-claude-muted hover:bg-claude-hover md:hidden" aria-label="关闭 Skill 选择器">
+                              <X className="h-4 w-4" />
+                            </button>
+                          </div>
+                          <label className="flex items-center gap-2 rounded-xl border border-claude-border px-3 py-2 focus-within:border-claude-border-strong">
+                            <Search className="h-4 w-4 text-claude-muted" />
+                            <input
+                              value={skillQuery}
+                              onChange={(event) => setSkillQuery(event.target.value)}
+                              placeholder="搜索名称、key 或描述"
+                              className="min-w-0 flex-1 border-0 bg-transparent p-0 text-sm text-claude-text outline-none placeholder:text-claude-muted focus:ring-0"
+                              autoFocus
+                            />
+                          </label>
+                        </div>
+                        <div className="max-h-[50vh] overflow-y-auto p-2">
+                          {skillsLoading && !skillsLoaded && <div className="flex items-center justify-center gap-2 p-6 text-sm text-claude-muted"><Loader2 className="h-4 w-4 animate-spin" />加载中</div>}
+                          {skillsError && !skillsLoaded && (
+                            <div className="flex flex-col items-center gap-2 p-6 text-center text-sm text-claude-error">
+                              <span>{skillsError}</span>
+                              <button
+                                type="button"
+                                onClick={() => setSkillsLoadRevision((revision) => revision + 1)}
+                                className="rounded-lg border border-claude-border px-3 py-1.5 text-xs text-claude-secondary hover:bg-claude-hover"
+                              >
+                                重新加载
+                              </button>
+                            </div>
+                          )}
+                          {skillsLoaded && skillsLoading && (
+                            <div className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] text-claude-muted" aria-label="正在刷新 Skill 列表">
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                              正在刷新
+                            </div>
+                          )}
+                          {skillsLoaded && skillsError && (
+                            <div className="mx-2 mb-1 flex items-center justify-between gap-2 rounded-lg bg-claude-error/5 px-2.5 py-2 text-xs text-claude-error">
+                              <span>{skillsError}</span>
+                              <button
+                                type="button"
+                                onClick={() => setSkillsLoadRevision((revision) => revision + 1)}
+                                className="shrink-0 rounded-md border border-claude-border bg-white px-2 py-1 text-[11px] text-claude-secondary hover:bg-claude-hover"
+                              >
+                                重试
+                              </button>
+                            </div>
+                          )}
+                          {skillsLoaded && skillsInventoryState === 'stale' && !skillsError && (
+                            <div
+                              role="status"
+                              className="mx-2 mb-1 rounded-lg bg-[#fff8ec] px-2.5 py-2 text-xs text-[#8a5a2f]"
+                            >
+                              刷新失败，正在显示上次成功加载的 Skill 清单。
+                            </div>
+                          )}
+                          {skillsLoaded && filteredSkills.length === 0 && <div className="p-6 text-center text-sm text-claude-muted">没有匹配的 Skill</div>}
+                          {skillsLoaded && filteredSkills.map((skill) => {
+                            const key = skillKey(skill);
+                            const selected = selectedSkillKeys.includes(key);
+                            const limitReached = !selected && selectedSkillKeys.length >= MAX_SELECTED_SKILLS;
+                            return (
+                              <button
+                                key={key}
+                                type="button"
+                                onClick={() => toggleSkill(key)}
+                                disabled={limitReached}
+                                aria-pressed={selected}
+                                className="flex w-full items-start gap-3 rounded-xl px-3 py-2.5 text-left hover:bg-claude-hover disabled:cursor-not-allowed disabled:opacity-40"
+                              >
+                                <span className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border ${selected ? 'border-claude-accent bg-claude-accent text-white' : 'border-claude-border'}`}>
+                                  {selected && <Check className="h-3.5 w-3.5" />}
+                                </span>
+                                <span className="min-w-0">
+                                  <span className="block truncate text-sm font-medium text-claude-text">{skillDisplayName(skill)}</span>
+                                  <span className="block truncate text-[11px] text-claude-muted">{key}</span>
+                                  <span className="mt-0.5 block line-clamp-2 text-xs text-claude-muted">{skill.description}</span>
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
 

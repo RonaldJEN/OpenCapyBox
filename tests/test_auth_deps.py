@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+from starlette.requests import Request
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -44,23 +45,31 @@ class TestGetCurrentUser:
             Base.metadata.drop_all(bind=engine)
             engine.dispose()
 
+    @pytest.fixture
+    def http_request(self):
+        return Request({"type": "http", "headers": []})
+
     @pytest.mark.asyncio
-    async def test_valid_bearer_token(self, db):
+    async def test_valid_bearer_token(self, db, http_request):
         from src.api.deps import create_access_token, get_current_user
 
         token, _ = create_access_token("demo")
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
 
-        result = await get_current_user(credentials=credentials, db=db)
+        result = await get_current_user(
+            request=http_request, credentials=credentials, db=db
+        )
         assert result == "demo"
 
     @pytest.mark.asyncio
-    async def test_invalid_scheme(self, db):
+    async def test_invalid_scheme(self, db, http_request):
         from src.api.deps import get_current_user
 
         credentials = HTTPAuthorizationCredentials(scheme="Basic", credentials="abc")
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_user(credentials=credentials, db=db)
+            await get_current_user(
+                request=http_request, credentials=credentials, db=db
+            )
 
         assert exc_info.value.status_code == 401
         assert "未提供访问令牌" in exc_info.value.detail
@@ -79,13 +88,17 @@ class TestGetCurrentUser:
             id="unknown_user",
         ),
     ])
-    async def test_invalid_bearer_returns_401(self, make_token, detail_substr, db):
+    async def test_invalid_bearer_returns_401(
+        self, make_token, detail_substr, db, http_request
+    ):
         from src.api.deps import get_current_user
 
         token = make_token()
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_user(credentials=credentials, db=db)
+            await get_current_user(
+                request=http_request, credentials=credentials, db=db
+            )
 
         assert exc_info.value.status_code == 401
         if detail_substr:
@@ -109,7 +122,7 @@ class TestGetCurrentUser:
         assert "管理员权限" in exc_info.value.detail
 
     @pytest.mark.asyncio
-    async def test_old_token_rejected_after_disable(self, db):
+    async def test_old_token_rejected_after_disable(self, db, http_request):
         """回归：禁用用户后重新启用，禁用前签发的 token 不可用。"""
         from src.api.deps import create_access_token, get_current_user
         from src.api.services.auth_service import update_user_enabled
@@ -123,11 +136,13 @@ class TestGetCurrentUser:
 
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_user(credentials=credentials, db=db)
+            await get_current_user(
+                request=http_request, credentials=credentials, db=db
+            )
         assert exc_info.value.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_new_token_accepted_after_reenable(self, db):
+    async def test_new_token_accepted_after_reenable(self, db, http_request):
         """重新启用后用新 generation 签发的 token 可用。"""
         from src.api.deps import create_access_token, get_current_user
         from src.api.services.auth_service import update_user_enabled
@@ -140,11 +155,15 @@ class TestGetCurrentUser:
         token, _ = create_access_token("demo", token_generation=1)
 
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-        result = await get_current_user(credentials=credentials, db=db)
+        result = await get_current_user(
+            request=http_request, credentials=credentials, db=db
+        )
         assert result == "demo"
 
     @pytest.mark.asyncio
-    async def test_same_second_token_rejected_after_generation_bump(self, db):
+    async def test_same_second_token_rejected_after_generation_bump(
+        self, db, http_request
+    ):
         """同秒内签发的 token 在 generation 递增后被拒绝（无精度问题）。"""
         from src.api.deps import create_access_token, get_current_user
         from src.api.services.auth_service import update_user_enabled
@@ -156,11 +175,13 @@ class TestGetCurrentUser:
 
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_user(credentials=credentials, db=db)
+            await get_current_user(
+                request=http_request, credentials=credentials, db=db
+            )
         assert exc_info.value.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_token_rejected_after_user_id_recreated(self, db):
+    async def test_token_rejected_after_user_id_recreated(self, db, http_request):
         """同名账号硬删除后重建，旧账号签发的 token 不可复用。"""
         from src.api.deps import create_access_token, get_current_user
         from src.api.services.auth_service import create_simple_user, delete_auth_user
@@ -186,5 +207,7 @@ class TestGetCurrentUser:
 
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_user(credentials=credentials, db=db)
+            await get_current_user(
+                request=http_request, credentials=credentials, db=db
+            )
         assert exc_info.value.status_code == 401

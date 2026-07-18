@@ -119,6 +119,10 @@ class RunStartedEvent(BaseEvent):
     thread_id: str = Field(..., alias="threadId")
     run_id: str = Field(..., alias="runId")
     parent_run_id: Optional[str] = Field(None, alias="parentRunId")
+    preferred_skills: Optional[List[Dict[str, str]]] = Field(
+        None,
+        alias="preferredSkills",
+    )
 
 
 class RunFinishedEvent(BaseEvent):

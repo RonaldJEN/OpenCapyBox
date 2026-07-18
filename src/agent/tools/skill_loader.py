@@ -9,9 +9,11 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Awaitable, Callable, Dict, List, Optional, Set
 
 import yaml
+
+from ..schema.skill_key import normalize_skill_key
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +74,7 @@ class SkillLoader:
         self.disabled_skill_names: Set[str] = set()
         self._disabled_skills_provider: Optional[Callable[[], Set[str]]] = None
         self._disabled_refreshed_at: Optional[float] = None
+        self._inventory_refresher: Optional[Callable[[], Awaitable[None]]] = None
         self._disabled_cache_ttl_seconds: float = (
             disabled_cache_ttl_seconds
             if disabled_cache_ttl_seconds is not None
@@ -85,6 +88,17 @@ class SkillLoader:
     ) -> None:
         """Set the request-time source of disabled skill names."""
         self._disabled_skills_provider = provider
+
+    def set_inventory_refresher(
+        self,
+        refresher: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Set the live user-Skill inventory refresher used at run boundaries."""
+        self._inventory_refresher = refresher
+
+    async def refresh_inventory(self) -> None:
+        if self._inventory_refresher is not None:
+            await self._inventory_refresher()
 
     def refresh_disabled_skills(self, force: bool = False) -> Set[str]:
         """Refresh the effective disabled set without mutating inventory.
@@ -164,14 +178,33 @@ class SkillLoader:
             # This ensures scripts and resources can be found from any working directory
             processed_content = self._process_skill_paths(skill_content, skill_dir)
 
+            raw_metadata = frontmatter.get("metadata")
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            display_candidates = [
+                frontmatter.get("display_name"),
+                frontmatter.get("display-name"),
+                metadata.get("display_name"),
+                metadata.get("display-name"),
+            ]
+            display_name = next(
+                (
+                    candidate.strip()
+                    for candidate in display_candidates
+                    if isinstance(candidate, str) and candidate.strip()
+                ),
+                None,
+            )
+            if display_name is not None:
+                metadata["display_name"] = display_name
+
             # Create Skill object
             skill = Skill(
-                name=frontmatter["name"],
+                name=normalize_skill_key(frontmatter["name"]),
                 description=frontmatter["description"],
                 content=processed_content,
                 license=frontmatter.get("license"),
                 allowed_tools=frontmatter.get("allowed-tools"),
-                metadata=frontmatter.get("metadata"),
+                metadata=metadata or None,
                 skill_path=skill_path,
             )
 
@@ -322,9 +355,26 @@ class SkillLoader:
         Official skills with the same name take priority — duplicates are
         silently ignored.
         """
+        skill.name = normalize_skill_key(skill.name)
         if skill.name in self.loaded_skills:
             return  # official takes priority
+        if skill.name in self.sandbox_skills:
+            raise ValueError(f"Duplicate user Skill key: {skill.name}")
         self.sandbox_skills[skill.name] = skill
+
+    def replace_sandbox_skills(self, skills: List[Skill]) -> None:
+        """Atomically replace the complete user Skill registry."""
+
+        replacement: Dict[str, Skill] = {}
+        seen: Set[str] = set()
+        for skill in skills:
+            skill.name = normalize_skill_key(skill.name)
+            if skill.name in seen:
+                raise ValueError(f"Duplicate user Skill key: {skill.name}")
+            seen.add(skill.name)
+            if skill.name not in self.loaded_skills:
+                replacement[skill.name] = skill
+        self.sandbox_skills = replacement
 
     def get_skill(self, name: str) -> Optional[Skill]:
         """

@@ -30,6 +30,8 @@ class Message(BaseModel):
     """Chat message."""
 
     role: str  # "system", "user", "assistant", "tool"
+    id: str | None = None  # Stable request anchor for the originating turn
+    run_id: str | None = None
     content: str | list[dict[str, Any]]  # Can be string or list of content blocks
     thinking: str | None = None  # Extended thinking content for assistant messages
     tool_calls: list[ToolCall] | None = None

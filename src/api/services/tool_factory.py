@@ -6,6 +6,7 @@
 
 import logging
 import posixpath
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Callable, Set
 
@@ -39,7 +40,16 @@ from src.agent.tools.skill_tool import GetSkillTool
 from src.agent.tools.mcp_tool import McpRemoteTool
 
 from src.api.services.sandbox_service import get_sandbox_service
+from src.api.services.skill_inventory_service import (
+    SkillInventoryIdentity,
+    cached_sandbox_identity,
+    inventory_view_is_current_winner,
+    load_user_skill_inventory,
+    normalize_user_skill_inventory,
+    persist_user_skill_inventory,
+)
 from src.api.config import get_settings
+from src.api.utils.timezone import now_naive
 from src.api.services.mcp_runtime import (
     McpRequiredServerUnavailable,
     McpToolNameCollisionError,
@@ -84,16 +94,44 @@ def _auto_locate_skills_dir(setting_value: str) -> Path:
     return (Path(__file__).parent.parent.parent / "agent" / "skills").resolve()
 
 
-def _register_sandbox_skill_infos(skill_loader: SkillLoader, sandbox_skill_infos: list[dict]) -> None:
-    for info in sandbox_skill_infos:
-        user_skill = Skill(
+def _replace_sandbox_skill_infos(skill_loader: SkillLoader, sandbox_skill_infos: list[dict]) -> None:
+    canonical_infos = normalize_user_skill_inventory(sandbox_skill_infos)
+    replacement = [
+        Skill(
             name=info["name"],
             description=info["description"],
             content="",
+            metadata={"display_name": info["display_name"]},
             source="user",
             sandbox_skill_dir=info["sandbox_skill_dir"],
         )
-        skill_loader.register_sandbox_skill(user_skill)
+        for info in canonical_infos
+    ]
+    skill_loader.replace_sandbox_skills(replacement)
+
+
+def _load_matching_inventory_winner(
+    db_session_factory: Callable,
+    *,
+    user_id: str,
+    identity: SkillInventoryIdentity,
+    observed_at: datetime,
+) -> list[dict] | None:
+    """Load the winning complete snapshot after a publish CAS loss."""
+
+    db = db_session_factory()
+    try:
+        view = load_user_skill_inventory(db, user_id=user_id)
+        if not inventory_view_is_current_winner(
+            view,
+            identity=identity,
+            observed_at=observed_at,
+        ):
+            return None
+        return view.skills
+    finally:
+        db.rollback()
+        db.close()
 
 
 async def create_agent_tools(
@@ -124,6 +162,7 @@ async def create_agent_tools(
     if build_metadata is not None:
         build_metadata["mcp_catalog_fingerprint"] = None
         build_metadata["mcp_catalog_retry_required"] = False
+        build_metadata["mcp_connections"] = ()
 
     bg_tracker = _BackgroundCommandTracker()
     agent_config_sync = _build_agent_config_sync(
@@ -256,15 +295,42 @@ async def create_agent_tools(
             try:
                 sandbox_service = get_sandbox_service()
                 official_names = set(skill_loader.loaded_skills.keys())
-                sandbox_skill_infos = await sandbox_service.discover_sandbox_skills(
-                    user_id, official_names,
+                inventory_identity = cached_sandbox_identity(sandbox_service, user_id)
+                if inventory_identity is None:
+                    raise RuntimeError("沙箱缓存缺少完整代际指纹")
+                inventory_observed_at = now_naive()
+                sandbox_skill_infos = normalize_user_skill_inventory(
+                    await sandbox_service.discover_sandbox_skills(
+                        user_id,
+                        official_names,
+                        strict=True,
+                    )
                 )
-                _register_sandbox_skill_infos(skill_loader, sandbox_skill_infos)
-                if sandbox_skill_infos:
+                if cached_sandbox_identity(sandbox_service, user_id) != inventory_identity:
+                    raise RuntimeError("扫描期间沙箱代际发生变化")
+                published = persist_user_skill_inventory(
+                    db_session_factory,
+                    user_id=user_id,
+                    identity=inventory_identity,
+                    skills=sandbox_skill_infos,
+                    observed_at=inventory_observed_at,
+                )
+                registry_skill_infos = sandbox_skill_infos
+                if not published:
+                    registry_skill_infos = _load_matching_inventory_winner(
+                        db_session_factory,
+                        user_id=user_id,
+                        identity=inventory_identity,
+                        observed_at=inventory_observed_at,
+                    )
+                    if registry_skill_infos is None:
+                        raise RuntimeError("扫描结果已过期，且无同代际胜出快照")
+                _replace_sandbox_skill_infos(skill_loader, registry_skill_infos)
+                if registry_skill_infos:
                     logger.info(
                         "已发现 %d 个用户沙箱 Skills: %s",
-                        len(sandbox_skill_infos),
-                        [i["name"] for i in sandbox_skill_infos],
+                        len(registry_skill_infos),
+                        [i["name"] for i in registry_skill_infos],
                     )
             except Exception as e:
                 logger.warning("沙箱 Skill 发现失败（不影响官方 Skills）: %s", e)
@@ -307,14 +373,56 @@ async def create_agent_tools(
             async def _refresh_sandbox_skills() -> None:
                 svc = get_sandbox_service()
                 official_names = set(skill_loader.loaded_skills.keys())
-                sandbox_skill_infos = await svc.discover_sandbox_skills(
-                    user_id, official_names,
-                )
+                try:
+                    inventory_identity = cached_sandbox_identity(svc, user_id)
+                    if inventory_identity is None:
+                        raise RuntimeError("沙箱缓存缺少完整代际指纹")
+                    inventory_observed_at = now_naive()
+                    sandbox_skill_infos = normalize_user_skill_inventory(
+                        await svc.discover_sandbox_skills(
+                            user_id,
+                            official_names,
+                            strict=True,
+                        )
+                    )
+                    if cached_sandbox_identity(svc, user_id) != inventory_identity:
+                        raise RuntimeError("扫描期间沙箱代际发生变化")
+                    published = persist_user_skill_inventory(
+                        db_session_factory,
+                        user_id=user_id,
+                        identity=inventory_identity,
+                        skills=sandbox_skill_infos,
+                        observed_at=inventory_observed_at,
+                    )
+                    registry_skill_infos = sandbox_skill_infos
+                    if not published:
+                        registry_skill_infos = _load_matching_inventory_winner(
+                            db_session_factory,
+                            user_id=user_id,
+                            identity=inventory_identity,
+                            observed_at=inventory_observed_at,
+                        )
+                        if registry_skill_infos is None:
+                            raise RuntimeError("扫描结果已过期，且无同代际胜出快照")
+                except Exception:
+                    logger.warning(
+                        "刷新用户沙箱 Skill 清单失败，保留现有 Registry "
+                        "(user=%s)",
+                        user_id,
+                        exc_info=True,
+                    )
+                    return
                 before_names = set(skill_loader.sandbox_skills.keys())
-                _register_sandbox_skill_infos(skill_loader, sandbox_skill_infos)
-                new_names = set(skill_loader.sandbox_skills.keys()) - before_names
+                _replace_sandbox_skill_infos(skill_loader, registry_skill_infos)
+                current_names = set(skill_loader.sandbox_skills.keys())
+                new_names = current_names - before_names
+                removed_names = before_names - current_names
                 if new_names:
                     logger.info("get_skill miss 后刷新发现用户沙箱 Skills: %s", sorted(new_names))
+                if removed_names:
+                    logger.info("刷新后移除已卸载用户沙箱 Skills: %s", sorted(removed_names))
+
+            skill_loader.set_inventory_refresher(_refresh_sandbox_skills)
 
             async def _read_sandbox_skill(skill_name: str) -> str | None:
                 # Reads must reflect the live enable state so a mid-read disable
@@ -390,6 +498,9 @@ async def create_agent_tools(
             # config/refresh fingerprint. Rebuilding every chat would hammer an
             # offline server; the next refresh bucket or config version retries.
             build_metadata["mcp_catalog_retry_required"] = False
+            build_metadata["mcp_connections"] = tuple(
+                getattr(mcp_catalog, "connections", ()) or ()
+            )
         existing_names = {tool.name for tool in tools}
         for snapshot in mcp_catalog.tools:
             if snapshot.model_name in existing_names:

@@ -74,6 +74,10 @@ class Round(Base):
 
     # 用戶附件（JSON 字符串，保存 path/name/mime_type 等）
     user_attachments = Column(Text, nullable=True)
+
+    # 本轮已解析且实际可用的 Preferred Skills 展示快照。
+    # JSON 数组项固定为 {"key": str, "display_name": str}；旧数据为 NULL。
+    preferred_skills = Column(Text, nullable=True)
     
     # 最終響應（Agent 的最後輸出）
     final_response = Column(Text, nullable=True)

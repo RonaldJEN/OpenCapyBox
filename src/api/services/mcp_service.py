@@ -1397,11 +1397,14 @@ def _save_tool_snapshots(
     tools: list[Any],
     *,
     connection_fingerprint: str,
+    server_name: str,
+    server_description: str | None,
 ) -> None:
     db.query(McpToolSnapshot).filter(
         McpToolSnapshot.installation_id == installation.id
     ).delete(synchronize_session=False)
     discovered_at = now_naive()
+    search_targets = []
     for tool in tools:
         raw = _jsonable(tool)
         if not isinstance(raw, dict):
@@ -1431,6 +1434,12 @@ def _save_tool_snapshots(
             annotations=annotations,
         )
         schema_json = json.dumps(input_schema, ensure_ascii=False, sort_keys=True, default=str)
+        schema_hash = mcp_tool_schema_hash(
+            raw_name=name,
+            description=description,
+            input_schema=input_schema,
+            annotations=annotations,
+        )
         db.add(McpToolSnapshot(
             installation_id=installation.id,
             tool_name=name,
@@ -1442,15 +1451,30 @@ def _save_tool_snapshots(
                 if annotations
                 else None
             ),
-            schema_hash=mcp_tool_schema_hash(
-                raw_name=name,
-                description=description,
-                input_schema=input_schema,
-                annotations=annotations,
-            ),
+            schema_hash=schema_hash,
             connection_fingerprint=connection_fingerprint,
             discovered_at=discovered_at,
         ))
+        from src.api.services.mcp_tool_search_service import McpToolSearchIndexTarget
+
+        search_targets.append(McpToolSearchIndexTarget(
+            installation_id=str(installation.id),
+            tool_name=name,
+            server_name=server_name,
+            server_description=server_description or "",
+            title=title or "",
+            description=description,
+            schema_hash=schema_hash,
+            connection_fingerprint=connection_fingerprint,
+        ))
+
+    from src.api.services.mcp_tool_search_service import sync_mcp_tool_search_indexes
+
+    sync_mcp_tool_search_indexes(
+        db,
+        installation_id=str(installation.id),
+        targets=search_targets,
+    )
 
 
 async def test_admin_server(db: DBSession, server_id: str) -> dict[str, Any]:
@@ -1614,6 +1638,12 @@ async def test_user_server(
                     current_installation,
                     tools,
                     connection_fingerprint=target_fingerprint,
+                    server_name=str(current_server.name),
+                    server_description=(
+                        str(current_server.description)
+                        if current_server.description is not None
+                        else None
+                    ),
                 )
                 bump_config_version(db, user_id)
         except Exception as exc:

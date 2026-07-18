@@ -13,7 +13,7 @@
    ╰━━━━━━━━━━━━╯
 ```
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![TypeScript 5.2+](https://img.shields.io/badge/TypeScript-5.2+-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React 18](https://img.shields.io/badge/React-18.2-61DAFB?logo=react&logoColor=black)](https://react.dev/)
@@ -197,7 +197,7 @@ Markdown 渲染预览，支持源码查看与一键下载。
 
 ### 前置要求
 
-- Python 3.10+
+- Python 3.11+
 - Node.js 16+
 - [uv](https://github.com/astral-sh/uv)（Python 包管理器）
 - [OpenSandbox](https://github.com/alibaba/OpenSandbox)（可选，沙箱执行环境）

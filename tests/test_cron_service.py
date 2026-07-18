@@ -589,7 +589,9 @@ class TestCronAgentConstruction:
 
             mock_sandbox = AsyncMock()
             mock_sandbox.commands.run = AsyncMock(return_value=MagicMock(logs=MagicMock(stdout=[])))
-            mock_svc.return_value.get_or_resume = AsyncMock(return_value=mock_sandbox)
+            mock_svc.return_value.get_or_resume_and_renew = AsyncMock(
+                return_value=mock_sandbox
+            )
 
             mock_agent_instance = MagicMock()
 
@@ -687,7 +689,9 @@ class TestCronAgentConstruction:
 
             mock_sandbox = AsyncMock()
             mock_sandbox.commands.run = AsyncMock(return_value=MagicMock(logs=MagicMock(stdout=[])))
-            mock_svc.return_value.get_or_resume = AsyncMock(return_value=mock_sandbox)
+            mock_svc.return_value.get_or_resume_and_renew = AsyncMock(
+                return_value=mock_sandbox
+            )
 
             mock_agent_instance = MagicMock()
 

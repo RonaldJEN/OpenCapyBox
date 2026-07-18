@@ -245,6 +245,12 @@ Authorization: Bearer <access_token>
           "type": "image/png"
         }
       ],
+      "preferred_skills": [
+        {
+          "key": "pdf",
+          "display_name": "PDF 处理"
+        }
+      ],
       "final_response": "已经为你创建了 hello.py 文件",
       "steps": [
         {
@@ -277,6 +283,10 @@ Authorization: Bearer <access_token>
   "total": 1
 }
 ```
+
+`preferred_skills` 始终为 `[{key, display_name}]` 数组。普通 direct Round 返回本次发送开始时根据可见且已启用 Skill 清单解析并持久化的有效“优先 Skill”展示快照；空选择、全部 key 无效或旧版 Round 没有该数据时返回 `[]`。`display_name` 是发送当时的不可变展示名，历史读取不会因 Skill 后续改名、禁用或删除而重算。
+
+该字段仅说明这次请求要求 Agent 优先考虑这些 Skill，不代表 Skill 已被加载、调用或实际参与结果。resume child Round 虽在运行时继承并重新解析原请求偏好，但自身返回 `preferred_skills: []`，避免在每条 Q/A 或工具审批 child 消息旁重复展示。之后每个独立 direct Round 只返回自己当次选择的快照，不从前序 Round 继承、合并或累积。
 
 ---
 
@@ -553,6 +563,7 @@ Content-Type: application/json
 ```json
 {
   "idempotency_key": "550e8400-e29b-41d4-a716-446655440000",
+  "preferred_skill_keys": ["pdf", "data_analysis"],
   "content": [
     {
       "type": "text",
@@ -592,6 +603,15 @@ Content-Type: application/json
 | ---------------- | -------- | ---- | ---- |
 | content          | array    | 是   | 内容块数组（见上方类型说明） |
 | idempotency_key  | string   | 否   | 幂等键（UUID），防止同一请求被重复处理。前端自动生成 |
+| preferred_skill_keys | string[] | 否 | 本次逻辑执行链优先考虑的 Skill 稳定内部 `key`；最多 50 项，每项最多 128 个字符 |
+
+`preferred_skill_keys` 表达偏好而非强制调用。服务端按首次出现顺序去重，并在每次运行（包括中断后的 child resume round）按当时可见且已启用的 Skill 清单重新解析；未知、已删除或已禁用的 key 会被忽略。该偏好不会从同一会话的前序独立消息继承。
+
+该字段来自 UI 控件元数据，不属于用户消息正文。Agent 不得仅因收到这些 key 就声称用户在正文中提到、点名或要求加载了对应 Skill；与正文无关时也不应主动复述选择。
+
+普通 direct Round 会把首次运行时解析出的有效项以 `preferred_skills: [{key, display_name}]` 固化到 Round，并由 `history/v2` 返回，供前端在该用户消息旁展示。该快照不证明 Skill 实际被加载或调用；resume child 只继承运行时偏好，不重复保存/展示该数组，之后的独立 direct Round 也不会继承或累积它。
+
+有效 key 经 trim 后必须非空且不超过 128 个 Unicode 字符；兼容人类可读 Unicode、空格和括号，禁止 `/`、`\`、`?`、`#`、`%` 及 Unicode `C*` 控制/不可见类别字符。请求数组中的空白项会被忽略，其他非法 key 返回校验错误。
 
 **模型能力限制**
 
@@ -898,6 +918,8 @@ Content-Type: application/json
 | interrupt_id | string            | 是   | 中断 ID（来自 `RUN_FINISHED.interrupt.id`） |
 | answers      | dict[string, string] | 是   | 用户回答（问题文本 → 选项值） |
 
+`resume` 不接收 `preferred_skill_keys`，也不接收或允许覆盖服务端保存的原始用户消息锚点。服务端从中断快照继承原请求的 Skill key 与锚点；连续多次中断/恢复仍锚定最初发起该逻辑执行链的 user message，并按本次 resume 时的有效 Skill 清单重新解析。
+
 **响应** `200 OK`
 
 ```
@@ -960,9 +982,14 @@ Agent 运行开始。
   "type": "RUN_STARTED",
   "threadId": "session-uuid",
   "runId": "run-uuid",
+  "preferredSkills": [
+    {"key": "pdf", "display_name": "PDF 处理"}
+  ],
   "timestamp": 1699000000000
 }
 ```
+
+普通 direct Round 的 `preferredSkills` 是与该 Round 持久化数据相同的权威展示快照；没有有效选择时也显式返回 `[]`，供前端清除 optimistic key。resume child 固定返回 `[]`，避免重复展示父 Round 标签。该字段表示请求级偏好，不代表 Skill 已实际加载或调用；订阅重放以及从历史直接恢复终态时保持相同语义。
 
 #### RUN_FINISHED
 
@@ -1500,24 +1527,32 @@ GET /api/config/skills
 Authorization: Bearer <access_token>
 ```
 
+可选 `refresh=true` 强制连接/恢复沙箱并执行一次完整严格扫描；缺省直接读取与当前 sandbox/Profile 代际匹配的 DB 清单快照。
+
 **Response**:
 ```json
 {
   "skills": [
-    { "name": "docx", "description": "Word 文档处理", "category": "document", "source": "official", "enabled": true },
-    { "name": "my-skill", "description": "用户自定义能力", "category": "user", "source": "user", "enabled": true }
+    { "key": "docx", "name": "docx", "display_name": "Word 文档", "description": "Word 文档处理", "category": "document", "source": "official", "enabled": true },
+    { "key": "my-skill", "name": "my-skill", "display_name": "我的 Skill", "description": "用户自定义能力", "category": "user", "source": "user", "enabled": true }
   ],
-  "sandbox_status": "available"
+  "sandbox_status": "available",
+  "inventory_state": "current",
+  "inventory_discovered_at": "2026-07-17T10:00:00"
 }
 ```
+
+`key` 是稳定内部标识，用于 `preferred_skill_keys`、启停和运行时加载；`display_name` 仅用于展示。SKILL.md 的展示名按顶层 `display_name` / `display-name`、`metadata` 内同名字段、`name` 的顺序回退。
 
 `source` 为 `official` 或 `user`。`sandbox_status` 为：
 
 - `not_created`：尚无持久化沙箱，仅返回官方 Skills；
-- `available`：沙箱可用，合并官方与用户 Skills；
-- `unavailable`：既有沙箱本次不可连接、恢复或发现，仍返回 200 和官方 Skills（部分成功）。
+- `available`：当前 sandbox/Profile 代际已有完整清单（匹配的 DB 快照或本次严格扫描），不表示本次做过实时探活；
+- `unavailable`：既有沙箱本次不可连接、恢复或发现，仍返回 200 和官方 Skills；若当前代际有旧快照，也可附带用户 Skills 并标记 `inventory_state=stale`。
 
-该接口只尝试连接/恢复既有沙箱，不会为了列出 Skills 创建替代沙箱。
+普通请求不访问远程沙箱。仅当快照缺失或显式 `refresh=true` 时才连接/恢复并扫描；控制面确认旧代际终止、失败、不存在或 Profile 明确不匹配时，该刷新路径可能创建替代沙箱并以 CAS 更新绑定。
+
+用户 Skill 完整清单最多 256 项；每项 `display_name`、`description`、`sandbox_skill_dir` 分别上限 1024、8192、1024 UTF-8 bytes，清单规范 JSON 总量上限 1 MiB。重复/非法 key、非法元数据或任何容量超限都会使整次严格扫描失败，不会发布部分清单。
 
 ### 启用/禁用 Skill
 

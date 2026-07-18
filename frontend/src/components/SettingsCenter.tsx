@@ -8,6 +8,7 @@ import {
   Layers,
   Loader2,
   Pencil,
+  RefreshCw,
   Shield,
   Sparkles,
   UserRound,
@@ -20,6 +21,7 @@ import {
   updateAgentFile,
   type AgentFileDetail,
   type SkillInfo,
+  type SkillInventoryState,
   type SkillSandboxStatus,
 } from '../services/configApi';
 
@@ -88,6 +90,14 @@ function hasDirtyContent(state: FileState): boolean {
   return state.editing && state.content !== state.original;
 }
 
+function skillKey(skill: SkillInfo): string {
+  return skill.key || skill.name;
+}
+
+function skillDisplayName(skill: SkillInfo): string {
+  return skill.display_name || skill.name;
+}
+
 function fileForMemoryTab(tab: MemoryTab): AgentFileName {
   return tab === 'main' ? 'memory' : 'user';
 }
@@ -140,6 +150,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsError, setSkillsError] = useState('');
   const [skillSandboxStatus, setSkillSandboxStatus] = useState<SkillSandboxStatus | null>(null);
+  const [skillInventoryState, setSkillInventoryState] = useState<SkillInventoryState | null>(null);
   const [togglingSkills, setTogglingSkills] = useState<Set<string>>(() => new Set());
   const [savedFlash, setSavedFlash] = useState<AgentFileName | ''>('');
   const filesRef = useRef(files);
@@ -152,6 +163,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     soul: 0,
   });
   const skillsLoadSeqRef = useRef(0);
+  const skillsRefreshRequestRef = useRef<Promise<void> | null>(null);
   const initialPropsAppliedRef = useRef(false);
 
   useEffect(() => {
@@ -219,43 +231,72 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     }
   }, []);
 
-  const loadSkills = useCallback(async () => {
-    const seq = ++skillsLoadSeqRef.current;
-    const mutationVersionsAtStart = new Map(skillMutationVersionsRef.current);
-    setSkillsLoading(true);
-    setSkillsError('');
-    try {
-      const result = await getSkills();
-      if (seq !== skillsLoadSeqRef.current) return;
-      setSkills((previousSkills) => {
-        const previousByName = new Map(
-          previousSkills.map((skill) => [skill.name, skill]),
-        );
-        return result.skills.map((skill) => {
-          const mutationOverlappedLoad = (
-            (skillMutationVersionsRef.current.get(skill.name) ?? 0)
-            !== (mutationVersionsAtStart.get(skill.name) ?? 0)
+  const loadSkills = useCallback(async (options: { refresh?: boolean } = {}) => {
+    const inFlightRefresh = skillsRefreshRequestRef.current;
+    if (inFlightRefresh) {
+      await inFlightRefresh;
+      return;
+    }
+
+    const executeLoad = async () => {
+      const seq = ++skillsLoadSeqRef.current;
+      const mutationVersionsAtStart = new Map(skillMutationVersionsRef.current);
+      setSkillsLoading(true);
+      setSkillsError('');
+      try {
+        const result = await getSkills({ refresh: options.refresh });
+        if (seq !== skillsLoadSeqRef.current) return;
+        setSkills((previousSkills) => {
+          const previousByKey = new Map(
+            previousSkills.map((skill) => [skillKey(skill), skill]),
           );
-          if (
-            !mutationOverlappedLoad
-            && !togglingSkillsRef.current.has(skill.name)
-          ) return skill;
-          const optimisticSkill = previousByName.get(skill.name);
-          return optimisticSkill
-            ? { ...skill, enabled: optimisticSkill.enabled }
-            : skill;
+          return result.skills.map((skill) => {
+            const key = skillKey(skill);
+            const mutationOverlappedLoad = (
+              (skillMutationVersionsRef.current.get(key) ?? 0)
+              !== (mutationVersionsAtStart.get(key) ?? 0)
+            );
+            if (
+              !mutationOverlappedLoad
+              && !togglingSkillsRef.current.has(key)
+            ) return skill;
+            const optimisticSkill = previousByKey.get(key);
+            return optimisticSkill
+              ? { ...skill, enabled: optimisticSkill.enabled }
+              : skill;
+          });
         });
-      });
-      setSkillSandboxStatus(result.sandbox_status);
-    } catch (err) {
-      if (seq !== skillsLoadSeqRef.current) return;
-      setSkillsError(fileErrorMessage(err));
+        setSkillSandboxStatus(result.sandbox_status);
+        setSkillInventoryState(result.inventory_state ?? null);
+      } catch (err) {
+        if (seq !== skillsLoadSeqRef.current) return;
+        setSkillsError(fileErrorMessage(err));
+      } finally {
+        if (seq === skillsLoadSeqRef.current) {
+          setSkillsLoading(false);
+        }
+      }
+    };
+
+    const request = executeLoad();
+    if (!options.refresh) {
+      await request;
+      return;
+    }
+
+    skillsRefreshRequestRef.current = request;
+    try {
+      await request;
     } finally {
-      if (seq === skillsLoadSeqRef.current) {
-        setSkillsLoading(false);
+      if (skillsRefreshRequestRef.current === request) {
+        skillsRefreshRequestRef.current = null;
       }
     }
   }, []);
+
+  const refreshSkills = useCallback(() => {
+    void loadSkills({ refresh: true });
+  }, [loadSkills]);
 
   useEffect(() => {
     const next = getInitialState(initialSection, initialMemoryTab, initialSoulTab);
@@ -391,18 +432,18 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     }
   };
 
-  const handleSkillToggle = async (skillName: string, currentEnabled: boolean) => {
-    if (togglingSkillsRef.current.has(skillName)) return;
+  const handleSkillToggle = async (key: string, currentEnabled: boolean) => {
+    if (togglingSkillsRef.current.has(key)) return;
     const bumpMutationVersion = () => {
       const versions = skillMutationVersionsRef.current;
-      versions.set(skillName, (versions.get(skillName) ?? 0) + 1);
+      versions.set(key, (versions.get(key) ?? 0) + 1);
     };
     const setSkillToggling = (isToggling: boolean) => {
       const next = new Set(togglingSkillsRef.current);
       if (isToggling) {
-        next.add(skillName);
+        next.add(key);
       } else {
-        next.delete(skillName);
+        next.delete(key);
       }
       togglingSkillsRef.current = next;
       setTogglingSkills(next);
@@ -413,16 +454,16 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     setSkillsError('');
     setSkills((prev) =>
       prev.map((skill) =>
-        skill.name === skillName ? { ...skill, enabled: !currentEnabled } : skill,
+        skillKey(skill) === key ? { ...skill, enabled: !currentEnabled } : skill,
       ),
     );
 
     try {
-      await toggleSkill(skillName, !currentEnabled);
+      await toggleSkill(key, !currentEnabled);
     } catch (err) {
       setSkills((prev) =>
         prev.map((skill) =>
-          skill.name === skillName ? { ...skill, enabled: currentEnabled } : skill,
+          skillKey(skill) === key ? { ...skill, enabled: currentEnabled } : skill,
         ),
       );
       setSkillsError(fileErrorMessage(err));
@@ -618,19 +659,31 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs text-[#a39c8e]">
           {skillsLoading
-            ? '正在恢复工作沙箱并加载技能…'
+            ? '正在加载技能清单…'
             : `${enabledSkillCount} / ${skills.length} 项技能已启用`}
         </div>
-        <button
-          type="button"
-          disabled
-          className="inline-flex h-8 cursor-default items-center gap-2 rounded-[9px] border border-[#e8e3d9] bg-white px-3.5 text-[13px] font-semibold text-[#1c1a16] opacity-60"
-        >
-          浏览更多技能
-          <span className="rounded-md bg-[#f5ece2] px-1.5 py-0.5 text-[10px] font-bold text-[#8a5a2f]">
-            即将上线
-          </span>
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={refreshSkills}
+            disabled={skillsLoading}
+            className="inline-flex h-8 items-center gap-1.5 rounded-[9px] border border-[#e8e3d9] bg-white px-3 text-[12px] font-semibold text-[#6f6960] transition hover:bg-[#f6f2ea] disabled:cursor-not-allowed disabled:opacity-50"
+            aria-label="刷新 Skill 清单"
+          >
+            <RefreshCw size={13} className={skillsLoading ? 'animate-spin' : ''} />
+            刷新
+          </button>
+          <button
+            type="button"
+            disabled
+            className="inline-flex h-8 cursor-default items-center gap-2 rounded-[9px] border border-[#e8e3d9] bg-white px-3.5 text-[13px] font-semibold text-[#1c1a16] opacity-60"
+          >
+            浏览更多技能
+            <span className="rounded-md bg-[#f5ece2] px-1.5 py-0.5 text-[10px] font-bold text-[#8a5a2f]">
+              即将上线
+            </span>
+          </button>
+        </div>
       </div>
 
       {skillsError && (
@@ -638,7 +691,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           <span>{skillsError}</span>
           <button
             type="button"
-            onClick={loadSkills}
+            onClick={refreshSkills}
             disabled={skillsLoading}
             className="shrink-0 cursor-pointer rounded-md border border-current px-2 py-1 font-semibold transition-[color,background-color,border-color,box-shadow,transform] duration-200 ease-in-out hover:bg-[#fde9e5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c75c4a]/30 focus-visible:ring-offset-1 focus-visible:ring-offset-[#fff5f3] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent motion-reduce:transition-none"
           >
@@ -647,7 +700,24 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
         </div>
       )}
 
-      {skillSandboxStatus === 'unavailable' && !skillsError && (
+      {skillInventoryState === 'stale' && !skillsError && (
+        <div
+          role="status"
+          className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-[#ead8bd] bg-[#fff8ec] px-3 py-2 text-xs font-medium text-[#8a5a2f]"
+        >
+          <span>刷新失败，正在显示上次成功加载的 Skill 清单。</span>
+          <button
+            type="button"
+            onClick={refreshSkills}
+            disabled={skillsLoading}
+            className="shrink-0 cursor-pointer rounded-md border border-current px-2 py-1 font-semibold transition-[color,background-color,border-color,box-shadow,transform] duration-200 ease-in-out hover:bg-[#f8ead5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8a5a2f]/30 focus-visible:ring-offset-1 focus-visible:ring-offset-[#fff8ec] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent motion-reduce:transition-none"
+          >
+            重新加载
+          </button>
+        </div>
+      )}
+
+      {skillSandboxStatus === 'unavailable' && skillInventoryState !== 'stale' && !skillsError && (
         <div
           role="status"
           className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-[#ead8bd] bg-[#fff8ec] px-3 py-2 text-xs font-medium text-[#8a5a2f]"
@@ -655,7 +725,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           <span>工作沙箱暂时不可用，目前仅显示官方技能。</span>
           <button
             type="button"
-            onClick={loadSkills}
+            onClick={refreshSkills}
             disabled={skillsLoading}
             className="shrink-0 cursor-pointer rounded-md border border-current px-2 py-1 font-semibold transition-[color,background-color,border-color,box-shadow,transform] duration-200 ease-in-out hover:bg-[#f8ead5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8a5a2f]/30 focus-visible:ring-offset-1 focus-visible:ring-offset-[#fff8ec] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent motion-reduce:transition-none"
           >
@@ -676,7 +746,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
       {skillsLoading && skills.length === 0 ? (
         <div className="flex h-32 items-center justify-center text-sm text-[#a39c8e]">
           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          正在恢复工作沙箱并加载技能…
+          正在加载技能清单…
         </div>
       ) : skills.length === 0 ? (
         <div className="flex flex-col items-center justify-center px-5 py-11 text-center text-[#a39c8e]">
@@ -687,10 +757,12 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
       ) : (
         <div>
           {skills.map((skill) => {
-            const isToggling = togglingSkills.has(skill.name);
+            const key = skillKey(skill);
+            const displayName = skillDisplayName(skill);
+            const isToggling = togglingSkills.has(key);
             return (
               <div
-                key={skill.name}
+                key={key}
                 className="flex items-center gap-3.5 border-b border-[#f1ede4] px-1 py-3.5 last:border-b-0"
               >
                 <div className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[9px] bg-[#f4f0e9] text-[#6f6960]">
@@ -699,7 +771,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
                 <div className="min-w-0 flex-1">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="truncate font-mono text-[13.5px] font-bold text-[#1c1a16]">
-                      {skill.name}
+                      {displayName}
                     </span>
                     <span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold ${
                       skill.source === 'user'
@@ -722,9 +794,9 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
                   type="button"
                   role="switch"
                   aria-checked={skill.enabled}
-                  aria-label={`${skill.enabled ? '禁用' : '启用'} ${skill.name}`}
+                  aria-label={`${skill.enabled ? '禁用' : '启用'} ${displayName}`}
                   disabled={isToggling}
-                  onClick={() => handleSkillToggle(skill.name, skill.enabled)}
+                  onClick={() => handleSkillToggle(key, skill.enabled)}
                   className={`relative h-[22px] w-[38px] shrink-0 rounded-full transition focus:outline-none focus:ring-2 focus:ring-[#b8814a]/30 ${
                     skill.enabled ? 'bg-[#b8814a]' : 'bg-[#e3ddd0]'
                   } ${isToggling ? 'opacity-60' : ''}`}

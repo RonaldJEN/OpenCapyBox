@@ -8,6 +8,7 @@
 
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -155,13 +156,23 @@ async def update_agent_file(
 
 @router.get("/skills")
 async def get_skills(
+    refresh: bool = False,
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
     """获取用户的 Skill 配置列表"""
     from src.agent.tools.skill_loader import SkillLoader, Skill
-    from src.api.models.user_sandbox import UserSandbox
     from src.api.services.sandbox_service import get_sandbox_service
+    from src.api.services.skill_inventory_service import (
+        SkillInventoryIdentity,
+        UserSkillInventoryView,
+        cached_sandbox_identity,
+        inventory_view_is_current_winner,
+        load_user_skill_inventory,
+        normalize_user_skill_inventory,
+        replace_user_skill_inventory,
+    )
+    from src.api.utils.timezone import now_naive
 
     skills_dir = _get_skills_dir()
 
@@ -184,7 +195,9 @@ async def get_skills(
                         pass
 
                 available_skills.append({
+                    "key": skill.name,
                     "name": skill.name,
+                    "display_name": str((skill.metadata or {}).get("display_name") or skill.name),
                     "description": skill.description,
                     "category": category,
                     "source": "official",
@@ -194,43 +207,51 @@ async def get_skills(
 
     official_names = {skill["name"] for skill in available_skills}
     sandbox_status = "not_created"
-    sandbox_id: str | None = None
+    inventory_state = "unavailable"
+    inventory_discovered_at = None
 
     # 只在本地 DB 查询期间占用连接；远程沙箱 I/O 前主动结束事务，
     # 避免并发打开设置页时把连接池耗尽。
-    try:
-        user_sandbox = (
-            db.query(UserSandbox)
-            .filter(UserSandbox.user_id == user_id)
-            .first()
-        )
-        persisted_id = getattr(user_sandbox, "sandbox_id", None)
-        if isinstance(persisted_id, str) and persisted_id:
-            sandbox_id = persisted_id
-    finally:
-        db.rollback()
+    def _read_inventory_view() -> UserSkillInventoryView:
+        try:
+            return load_user_skill_inventory(db, user_id=user_id)
+        finally:
+            db.rollback()
+
+    inventory_view = _read_inventory_view()
 
     sandbox_service = get_sandbox_service()
     cached_sandbox = sandbox_service.get_cached(user_id)
     cached_id = getattr(cached_sandbox, "id", None)
-    candidate_id = sandbox_id or (
+    candidate_id = (
+        inventory_view.identity.sandbox_id
+        if inventory_view.identity is not None
+        else None
+    ) or (
         cached_id if isinstance(cached_id, str) and cached_id else None
     )
 
     if candidate_id:
         sandbox_status = "unavailable"
-        try:
-            await sandbox_service.recover_persisted_sandbox(user_id, candidate_id)
-        except Exception as e:
-            logger.warning(
-                "工作沙箱恢复失败（仍返回官方 Skills）: user=%s, sandbox_id=%s, error=%s",
-                user_id,
-                candidate_id,
-                e,
-            )
-        else:
-            try:
-                sandbox_skills = await asyncio.wait_for(
+        sandbox_skills: list[dict] | None = None
+
+        if inventory_view.skills is not None and not refresh:
+            sandbox_skills = inventory_view.skills
+            sandbox_status = "available"
+            inventory_state = "current"
+            inventory_discovered_at = inventory_view.discovered_at
+
+        async def _discover_user_skills() -> tuple[
+            list[dict[str, str]],
+            SkillInventoryIdentity,
+            datetime,
+        ]:
+            identity_before = cached_sandbox_identity(sandbox_service, user_id)
+            if identity_before is None:
+                raise RuntimeError("沙箱缓存缺少完整代际指纹")
+            observed_at = now_naive()
+            discovered = normalize_user_skill_inventory(
+                await asyncio.wait_for(
                     sandbox_service.discover_sandbox_skills(
                         user_id,
                         official_names,
@@ -238,28 +259,150 @@ async def get_skills(
                     ),
                     timeout=12,
                 )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "用户 Skills 扫描超时（仍返回官方 Skills）: user=%s, sandbox_id=%s",
-                    user_id,
-                    candidate_id,
-                )
+            )
+            identity_after = cached_sandbox_identity(sandbox_service, user_id)
+            if identity_after != identity_before:
+                raise RuntimeError("扫描期间沙箱代际发生变化")
+            return discovered, identity_before, observed_at
+
+        if sandbox_skills is None:
+            scanned_result: tuple[
+                list[dict[str, str]],
+                SkillInventoryIdentity,
+                datetime,
+            ] | None = None
+            try:
+                cached_is_current = sandbox_service.cached_is_current(user_id, candidate_id)
             except Exception as e:
+                cached_is_current = False
                 logger.warning(
-                    "用户 Skills 扫描失败（仍返回官方 Skills）: user=%s, sandbox_id=%s, error=%s",
+                    "工作沙箱缓存校验失败，将走恢复流程: user=%s, sandbox_id=%s, error=%s",
                     user_id,
                     candidate_id,
                     e,
                 )
+
+            # 命中同 ID、同 Profile 的进程内缓存时，严格扫描本身即可验证沙箱
+            # 是否可访问，避免首次建快照或强制刷新时再做冗余健康检查。
+            if (
+                cached_is_current
+                and cached_sandbox_identity(sandbox_service, user_id)
+                == inventory_view.identity
+            ):
+                try:
+                    scanned_result = await _discover_user_skills()
+                except Exception as e:
+                    logger.warning(
+                        "缓存沙箱直接扫描失败，将恢复后重试: user=%s, sandbox_id=%s, error=%s",
+                        user_id,
+                        candidate_id,
+                        e,
+                    )
+
+            if scanned_result is None:
+                try:
+                    await sandbox_service.recover_persisted_sandbox(user_id, candidate_id)
+                except Exception as e:
+                    logger.warning(
+                        "工作沙箱恢复失败（仍返回最近快照或官方 Skills）: user=%s, sandbox_id=%s, error=%s",
+                        user_id,
+                        candidate_id,
+                        e,
+                    )
+                else:
+                    try:
+                        scanned_result = await _discover_user_skills()
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "用户 Skills 扫描超时（仍返回最近快照或官方 Skills）: user=%s, sandbox_id=%s",
+                            user_id,
+                            candidate_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "用户 Skills 扫描失败（仍返回最近快照或官方 Skills）: user=%s, sandbox_id=%s, error=%s",
+                            user_id,
+                            candidate_id,
+                            e,
+                        )
+
+            if scanned_result is not None:
+                scanned_skills, scanned_identity, scan_observed_at = scanned_result
+                publish_failed = False
+                try:
+                    published = replace_user_skill_inventory(
+                        db,
+                        user_id=user_id,
+                        identity=scanned_identity,
+                        skills=scanned_skills,
+                        observed_at=scan_observed_at,
+                    )
+                except Exception:
+                    publish_failed = True
+                    published = False
+                    logger.warning(
+                        "持久化用户 Skill 清单快照失败 (user=%s, sandbox_id=%s)",
+                        user_id,
+                        getattr(scanned_identity, "sandbox_id", None),
+                        exc_info=True,
+                    )
+
+                if published:
+                    sandbox_skills = scanned_skills
+                    sandbox_status = "available"
+                    inventory_state = "current"
+                    inventory_discovered_at = scan_observed_at
+                else:
+                    # A persistence exception is not evidence that another
+                    # scan won. A normal CAS loss is current only when the DB
+                    # contains the exact same generation and a scan that
+                    # started no earlier than this attempt.
+                    try:
+                        winner = _read_inventory_view()
+                    except Exception:
+                        winner = UserSkillInventoryView(None, None, None)
+                        logger.warning(
+                            "读取用户 Skill 清单胜出快照失败 (user=%s)",
+                            user_id,
+                            exc_info=True,
+                        )
+                    if (
+                        not publish_failed
+                        and inventory_view_is_current_winner(
+                            winner,
+                            identity=scanned_identity,
+                            observed_at=scan_observed_at,
+                        )
+                    ):
+                        sandbox_skills = winner.skills
+                        sandbox_status = "available"
+                        inventory_state = "current"
+                        inventory_discovered_at = winner.discovered_at
+                    elif winner.skills is not None:
+                        sandbox_skills = winner.skills
+                        inventory_state = "stale"
+                        inventory_discovered_at = winner.discovered_at
             else:
-                sandbox_status = "available"
-                for skill in sandbox_skills:
-                    available_skills.append({
-                        "name": skill["name"],
-                        "description": skill["description"],
-                        "category": "user",
-                        "source": "user",
-                    })
+                # Recovery may have rebuilt/rebound the sandbox. Only a snapshot
+                # matching the binding *after* that attempt is safe to reuse.
+                fallback = _read_inventory_view()
+                if fallback.skills is not None:
+                    sandbox_skills = fallback.skills
+                    inventory_state = "stale"
+                    inventory_discovered_at = fallback.discovered_at
+
+        if sandbox_skills is not None:
+            for skill in sandbox_skills:
+                if skill["name"] in official_names:
+                    continue
+                available_skills.append({
+                    "key": skill["name"],
+                    "name": skill["name"],
+                    "display_name": skill.get("display_name") or skill["name"],
+                    "description": skill["description"],
+                    "category": "user",
+                    "source": "user",
+                })
     elif cached_sandbox is not None:
         sandbox_status = "unavailable"
 
@@ -280,7 +423,16 @@ async def get_skills(
             "enabled": user_config.get(skill_name, True),  # 默认启用
         })
 
-    return {"skills": result, "sandbox_status": sandbox_status}
+    return {
+        "skills": result,
+        "sandbox_status": sandbox_status,
+        "inventory_state": inventory_state,
+        "inventory_discovered_at": (
+            inventory_discovered_at.isoformat()
+            if hasattr(inventory_discovered_at, "isoformat")
+            else None
+        ),
+    }
 
 
 @router.put("/skills/{skill_name}")
@@ -291,6 +443,21 @@ async def toggle_skill(
     db: DBSession = Depends(get_db),
 ):
     """启用/禁用指定 Skill"""
+    from src.agent.schema.skill_key import (
+        PUBLIC_SKILL_KEY_VALIDATION_ERRORS,
+        SKILL_KEY_UNSAFE_CHARACTERS_ERROR,
+        SkillKeyValidationError,
+        normalize_skill_key,
+    )
+
+    try:
+        skill_name = normalize_skill_key(skill_name)
+    except SkillKeyValidationError as exc:
+        detail = str(exc)
+        if detail not in PUBLIC_SKILL_KEY_VALIDATION_ERRORS:
+            detail = SKILL_KEY_UNSAFE_CHARACTERS_ERROR
+        raise HTTPException(status_code=422, detail=detail) from exc
+
     config = (
         db.query(UserSkillConfig)
         .filter(

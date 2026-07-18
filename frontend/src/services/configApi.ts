@@ -61,7 +61,9 @@ export async function updateAgentFile(
 // ========== Skill 管理 API ==========
 
 export interface SkillInfo {
+  key?: string;
   name: string;
+  display_name?: string;
   description: string;
   category: string;
   source: 'official' | 'user';
@@ -69,14 +71,20 @@ export interface SkillInfo {
 }
 
 export type SkillSandboxStatus = 'available' | 'unavailable' | 'not_created';
+export type SkillInventoryState = 'current' | 'stale' | 'unavailable';
 
 export interface SkillsResponse {
   skills: SkillInfo[];
   sandbox_status: SkillSandboxStatus;
+  inventory_state?: SkillInventoryState;
+  inventory_discovered_at?: string | null;
 }
 
-export async function getSkills(): Promise<SkillsResponse> {
+export async function getSkills(
+  options: { refresh?: boolean } = {},
+): Promise<SkillsResponse> {
   const resp = await client.get<SkillsResponse>('/config/skills', {
+    params: options.refresh ? { refresh: true } : undefined,
     timeout: 240_000,
   });
   return resp.data;

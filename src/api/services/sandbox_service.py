@@ -27,17 +27,24 @@ from enum import Enum
 from typing import Callable, Optional
 from pathlib import Path
 
+import yaml
 from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
 from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.sandboxes import Volume, Host
 from sqlalchemy.exc import IntegrityError
 
+from src.agent.schema.skill_key import normalize_skill_key
 from src.api.config import get_settings
 from src.api.services.sandbox_profile_service import SandboxRuntimeConfig
+from src.api.services.skill_inventory_service import (
+    SkillInventoryValidationError,
+    normalize_user_skill_inventory,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+MAX_SKILL_DISCOVERY_CANDIDATES = 1024
 
 
 class SandboxTemporarilyUnavailable(RuntimeError):
@@ -218,6 +225,22 @@ class SandboxSessionService:
         return files_to_push
 
     @staticmethod
+    def _extract_skill_frontmatter(text: str) -> dict | None:
+        """Parse a SKILL.md YAML frontmatter mapping."""
+
+        normalized = text.lstrip("\ufeff")
+        if not normalized.startswith("---"):
+            return None
+        end_idx = normalized.find("\n---", 3)
+        if end_idx == -1:
+            return None
+        try:
+            value = yaml.safe_load(normalized[3:end_idx])
+        except yaml.YAMLError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
     def _extract_skill_name_from_skill_md(text: str) -> str | None:
         """從 SKILL.md frontmatter 中提取 name。"""
         normalized = text.lstrip("\ufeff")
@@ -233,6 +256,22 @@ class SandboxSessionService:
         if not match:
             return None
         return match.group(1).strip()
+
+    @classmethod
+    def _extract_skill_display_name_from_skill_md(cls, text: str) -> str | None:
+        """Extract an optional human-facing display name from frontmatter."""
+
+        frontmatter = cls._extract_skill_frontmatter(text)
+        if not frontmatter:
+            return None
+        value = frontmatter.get("display_name") or frontmatter.get("display-name")
+        metadata = frontmatter.get("metadata")
+        if not value and isinstance(metadata, dict):
+            value = metadata.get("display_name") or metadata.get("display-name")
+        if not isinstance(value, str):
+            return None
+        display_name = value.strip()
+        return display_name or None
 
     @staticmethod
     def _user_storage_host_path(user_id: str) -> str:
@@ -1446,6 +1485,11 @@ class SandboxSessionService:
                     getattr(line, "text", str(line)) for line in stdout_text
                 )
             paths = [p.strip() for p in stdout_text.strip().splitlines() if p.strip()]
+            max_candidates = (
+                MAX_SKILL_DISCOVERY_CANDIDATES + len(official_skill_names)
+            )
+            if len(paths) > max_candidates:
+                raise SkillInventoryValidationError("Too many Skill discovery candidates")
         except Exception as e:
             logger.warning("discover_sandbox_skills: find 命令失敗 (user=%s): %s", user_id, e)
             if strict:
@@ -1474,22 +1518,79 @@ class SandboxSessionService:
                 continue
 
             content = raw
-
-            name = self._extract_skill_name_from_skill_md(content)
-            if not name:
+            frontmatter = self._extract_skill_frontmatter(content)
+            name_value = frontmatter.get("name") if frontmatter else None
+            description_value = frontmatter.get("description") if frontmatter else None
+            metadata_value = frontmatter.get("metadata") if frontmatter else None
+            display_name_value = None
+            invalid_metadata = not isinstance(name_value, str)
+            if description_value is not None and not isinstance(description_value, str):
+                invalid_metadata = True
+            if metadata_value is not None and not isinstance(metadata_value, dict):
+                invalid_metadata = True
+            if frontmatter:
+                display_candidates = [
+                    frontmatter.get("display_name"),
+                    frontmatter.get("display-name"),
+                ]
+                if isinstance(metadata_value, dict):
+                    display_candidates.extend([
+                        metadata_value.get("display_name"),
+                        metadata_value.get("display-name"),
+                    ])
+                for candidate in display_candidates:
+                    if candidate is not None and not isinstance(candidate, str):
+                        invalid_metadata = True
+                    elif (
+                        display_name_value is None
+                        and isinstance(candidate, str)
+                        and candidate.strip()
+                    ):
+                        display_name_value = candidate
+            if invalid_metadata:
+                if strict:
+                    raise RuntimeError(
+                        f"用户 Skill 元数据无效: {skill_md_path}"
+                    )
+                continue
+            try:
+                name = normalize_skill_key(name_value)
+            except ValueError as exc:
+                if strict:
+                    raise RuntimeError(
+                        f"用户 Skill 元数据无效: {skill_md_path}"
+                    ) from exc
                 continue
             if name in official_skill_names:
                 logger.debug("discover_sandbox_skills: 跳過與官方同名的 skill: %s", name)
                 continue
 
-            description = self._extract_skill_description_from_skill_md(content) or ""
+            description = description_value or ""
+            display_name = (
+                display_name_value.strip()
+                if isinstance(display_name_value, str) and display_name_value.strip()
+                else name
+            )
             skill_dir = posixpath.dirname(skill_md_path)
 
             results.append({
                 "name": name,
+                "display_name": display_name,
                 "description": description,
                 "sandbox_skill_dir": skill_dir,
             })
+
+        try:
+            results = normalize_user_skill_inventory(results)
+        except SkillInventoryValidationError as exc:
+            logger.warning(
+                "discover_sandbox_skills: 用户 Skill 清单无效 (user=%s): %s",
+                user_id,
+                exc,
+            )
+            if strict:
+                raise RuntimeError("用户 Skill 清单无效") from exc
+            return []
 
         logger.info(
             "discover_sandbox_skills: 發現 %d 個用戶 Skill (user=%s)",

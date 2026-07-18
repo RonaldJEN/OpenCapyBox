@@ -348,6 +348,9 @@ export function ChatRuntimeProvider({
     displayMessage,
     content,
     attachments = [],
+    preferredSkillKeys = [],
+    onStreamAccepted,
+    onRejectedBeforeAccept,
   }: SendMessageInput) => {
     const clientRunKey = randomId('run');
     const tempRoundId = `temp-${Date.now()}`;
@@ -357,6 +360,10 @@ export function ChatRuntimeProvider({
       idempotency_key: idempotencyKey,
       user_message: displayMessage,
       user_attachments: [...attachments],
+      preferred_skills: preferredSkillKeys.map((key) => ({
+        key,
+        display_name: key,
+      })),
       final_response: '',
       steps: [],
       step_count: 0,
@@ -381,6 +388,7 @@ export function ChatRuntimeProvider({
     }
     entry.startedEpochs.add(transportEpoch);
 
+    let streamAccepted = false;
     try {
       const subscription = startSendStream({
         ownerSessionId: sessionId,
@@ -390,7 +398,19 @@ export function ChatRuntimeProvider({
         source: 'direct',
         content,
         idempotencyKey,
-        onEnvelope: guardAndDispatch,
+        preferredSkillKeys,
+        onRejectedBeforeAccept,
+        onEnvelope: (envelope) => {
+          if (
+            !streamAccepted
+            && envelope.event?.type === 'CUSTOM'
+            && envelope.event.name === 'stream_accepted'
+          ) {
+            streamAccepted = true;
+            onStreamAccepted?.();
+          }
+          guardAndDispatch(envelope);
+        },
         onError: (message) => {
           dispatch({ type: 'SESSION_ERROR', sessionId, error: message });
         },
@@ -399,6 +419,9 @@ export function ChatRuntimeProvider({
       entry.abort = subscription.abort;
       await subscription.promise;
     } catch (error: any) {
+      if (!streamAccepted) {
+        onRejectedBeforeAccept?.();
+      }
       console.error('Failed to send message:', error);
       dispatchRunError(
         sessionId,

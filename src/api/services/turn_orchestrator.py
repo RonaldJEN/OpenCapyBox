@@ -114,10 +114,13 @@ class TurnOrchestrator:
         if agent_service is None:
             raise RuntimeError("submit_turn requires agent_service")
 
-        prepared = await agent_service.prepare_chat_round(
-            user_content=turn.content,
-            idempotency_key=turn.idempotency_key,
-        )
+        prepare_kwargs = {
+            "user_content": turn.content,
+            "idempotency_key": turn.idempotency_key,
+        }
+        if turn.context:
+            prepare_kwargs["contexts"] = turn.context
+        prepared = await agent_service.prepare_chat_round(**prepare_kwargs)
         return self._execution_from_prepared(
             turn=turn,
             prepared=prepared,

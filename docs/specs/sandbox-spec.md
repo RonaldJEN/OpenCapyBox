@@ -208,11 +208,11 @@ Profile 配置更新仅保留当前行的 `updated_at` 和 `version`，MVP 不�
 ### 既有沙箱连接与技能设置恢复
 
 - `get_existing` 供严格限制为既有代际、不得隐式创建资源的路径使用。它遵循 sandbox_id 与 Profile 指纹校验，允许按已确认状态 connect/resume；状态不可处理、连接/恢复失败、指纹不匹配或无可用实例时抛出异常，绝不创建替代沙箱。
-- GET `/config/skills` 使用 `recover_persisted_sandbox`，属于“读取清单 + 恢复工作沙箱”的自修复路径：
+- GET `/config/skills` 的普通热路径读取与当前 sandbox/Profile 代际匹配的 DB inventory 快照，不连接沙箱。快照缺失或显式 `refresh=true` 时使用 `recover_persisted_sandbox`，属于“刷新清单 + 恢复工作沙箱”的自修复路径：
   - 旧沙箱仍存在时连接或恢复原 ID；
   - 仅在控制面确认终态/不存在或 Profile 明确不匹配时允许候选重建并更新绑定；
-  - 状态查询失败、连接失败、恢复失败或过渡状态只返回官方 Skills，并标记 `sandbox_status=unavailable`。
-- 因此 GET `/config/skills` 可能在确认旧代际已丢失时创建容器并更新 `user_sandboxes`，不得被代理缓存或作为无副作用的预取请求；前端应展示恢复中的 loading，并允许用户在降级结果上手动重试。
+  - 状态查询失败、连接失败、恢复失败或过渡状态标记 `sandbox_status=unavailable`；仅可在快照仍匹配恢复后的当前 sandbox/Profile 指纹时附带旧用户清单并标记 `inventory_state=stale`，否则只返回官方 Skills。
+- 因此 cache miss/`refresh=true` 请求可能在确认旧代际已丢失时创建容器并更新 `user_sandboxes`，不得预取强制刷新；普通快照读取保持无远程 I/O。前端应在首次建快照或手动刷新时展示 loading，并在降级结果上保留旧快照/官方清单。
 
 ## 5. 失败模式与错误处理
 

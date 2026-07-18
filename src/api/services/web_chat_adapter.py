@@ -11,6 +11,11 @@ from src.api.schemas.turn import (
     TurnCancelTarget,
     WebReplyRoute,
 )
+from src.agent.schema.run_context import (
+    RequestedPreferredSkillsContext,
+    normalize_preferred_skill_keys,
+    requested_preferred_skills_to_context,
+)
 
 
 class WebChatAdapter:
@@ -25,12 +30,19 @@ class WebChatAdapter:
         user_id: str,
         request: SendMessageRequest,
     ) -> NormalizedInboundTurn:
+        preferred_keys = normalize_preferred_skill_keys(request.preferred_skill_keys)
+        contexts = []
+        if preferred_keys:
+            contexts.append(requested_preferred_skills_to_context(
+                RequestedPreferredSkillsContext(keys=preferred_keys)
+            ))
         return NormalizedInboundTurn(
             channel=self.channel,
             user_id=user_id,
             peer_kind="web",
             peer_id=session_id,
             content=request.content,
+            context=contexts,
             attachments=_extract_attachments(request),
             reply_route=WebReplyRoute(session_id=session_id),
             idempotency_key=request.idempotency_key,

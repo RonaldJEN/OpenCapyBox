@@ -280,6 +280,39 @@ content
         assert skill.name == "alias_skill"
         assert not hasattr(skill, "aliases") or getattr(skill, "aliases", None) is None
 
+    @pytest.mark.parametrize(
+        ("display_frontmatter", "expected"),
+        [
+            (
+                "display_name: Top Name\nmetadata:\n  display_name: Nested Name",
+                "Top Name",
+            ),
+            ("display-name: Top Hyphen Name", "Top Hyphen Name"),
+            ("metadata:\n  display-name: Nested Hyphen Name", "Nested Hyphen Name"),
+        ],
+    )
+    def test_load_skill_normalizes_display_name_priority(
+        self, skills_dir, display_frontmatter, expected
+    ):
+        skill_dir = skills_dir / "display_skill"
+        skill_dir.mkdir()
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(
+            "---\n"
+            "name: display_skill\n"
+            "description: Display metadata\n"
+            f"{display_frontmatter}\n"
+            "---\n"
+            "content\n",
+            encoding="utf-8",
+        )
+
+        skill = SkillLoader(str(skills_dir)).load_skill(skill_file)
+
+        assert skill is not None
+        assert skill.metadata is not None
+        assert skill.metadata["display_name"] == expected
+
     def test_metadata_prompt_no_aliases_keywords(self, skills_dir):
         """测试 metadata prompt 不包含 aliases/keywords"""
         skill_dir = skills_dir / "alias_prompt_skill"
@@ -696,6 +729,26 @@ class TestSandboxSkillRegistration:
         assert "industry-report" in loader.list_skills()
         assert loader.get_skill("industry-report") is user_skill
         assert loader.get_skill("industry-report").source == "user"
+
+    def test_duplicate_user_skill_key_is_rejected_without_replacing_registry(
+        self, loader_with_official
+    ):
+        loader = loader_with_official
+        existing = Skill(
+            name="existing",
+            description="Existing",
+            content="",
+            source="user",
+        )
+        loader.replace_sandbox_skills([existing])
+
+        with pytest.raises(ValueError, match="Duplicate user Skill key"):
+            loader.replace_sandbox_skills([
+                Skill(name=" duplicate ", description="First", content=""),
+                Skill(name="duplicate", description="Second", content=""),
+            ])
+
+        assert loader.sandbox_skills == {"existing": existing}
 
     def test_official_priority_over_sandbox(self, loader_with_official):
         """測試官方 Skill 同名優先，沙箱 Skill 被忽略"""

@@ -120,6 +120,9 @@ export interface SendMessageInput {
   displayMessage: string;
   content: ChatContentBlock[];
   attachments?: FileInfo[];
+  preferredSkillKeys?: string[];
+  onStreamAccepted?: () => void;
+  onRejectedBeforeAccept?: () => void;
 }
 
 export const emptyAgentState = (): AgentState => ({

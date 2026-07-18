@@ -58,12 +58,18 @@ function stream(state: ChatRuntimeState, event: any, overrides: Partial<StreamEn
 
 describe('chatRuntimeReducer', () => {
   it('binds RUN_STARTED to the temp round and run maps', () => {
-    let state = startRun();
+    let state = startRun(initialChatRuntimeState, {
+      preferred_skills: [
+        { key: 'pdf', display_name: 'pdf' },
+        { key: 'removed', display_name: 'removed' },
+      ],
+    });
 
     state = stream(state, {
       type: 'RUN_STARTED',
       threadId: 'sess-a',
       runId: 'server-r1',
+      preferredSkills: [{ key: 'pdf', display_name: 'PDF 文档' }],
     });
 
     expect(state.sessions['sess-a'].rounds[0].round_id).toBe('server-r1');
@@ -71,6 +77,29 @@ describe('chatRuntimeReducer', () => {
     expect(state.runs['run-a'].status).toBe('streaming');
     expect(state.serverRunIdToClientRunKey['server-r1']).toBe('run-a');
     expect(state.tempRoundIdToServerRoundId['temp-r1']).toBe('server-r1');
+    expect(state.sessions['sess-a'].rounds[0].preferred_skills).toEqual([
+      { key: 'pdf', display_name: 'PDF 文档' },
+    ]);
+  });
+
+  it('clears optimistic Skill chips when RUN_STARTED resolves no valid Skill', () => {
+    let state = startRun(initialChatRuntimeState, {
+      preferred_skills: [{ key: 'removed', display_name: 'removed' }],
+    });
+
+    state = stream(state, {
+      type: 'RUN_STARTED',
+      threadId: 'sess-a',
+      runId: 'server-r1',
+    });
+    state = stream(state, {
+      type: 'RUN_STARTED',
+      threadId: 'sess-a',
+      runId: 'server-r1',
+      preferredSkills: [],
+    });
+
+    expect(state.sessions['sess-a'].rounds[0].preferred_skills).toEqual([]);
   });
 
   it('appends sequenced text deltas and drops duplicate sequence events', () => {
@@ -221,6 +250,55 @@ describe('chatRuntimeReducer', () => {
     });
 
     expect(state.sessions['sess-a'].rounds[0].control_kind).toBe('tool_approval');
+  });
+
+  it('uses the server preferred Skill snapshot while merging a running history round', () => {
+    let state = startRun(initialChatRuntimeState, {
+      preferred_skills: [{ key: 'pdf', display_name: 'pdf' }],
+    });
+
+    state = chatRuntimeReducer(state, {
+      type: 'HISTORY_LOADED',
+      sessionId: 'sess-a',
+      rounds: [
+        round({
+          round_id: 'server-r1',
+          idempotency_key: 'idem-a',
+          status: 'running',
+          preferred_skills: [{ key: 'pdf', display_name: 'PDF 处理' }],
+        }),
+      ],
+      loadedAt: Date.parse('2026-01-01T00:00:03.000Z'),
+      source: 'history',
+    });
+
+    expect(state.sessions['sess-a'].rounds[0].preferred_skills).toEqual([
+      { key: 'pdf', display_name: 'PDF 处理' },
+    ]);
+  });
+
+  it('keeps the optimistic preferred Skill snapshot until history provides one', () => {
+    let state = startRun(initialChatRuntimeState, {
+      preferred_skills: [{ key: 'pdf', display_name: 'pdf' }],
+    });
+
+    state = chatRuntimeReducer(state, {
+      type: 'HISTORY_LOADED',
+      sessionId: 'sess-a',
+      rounds: [
+        round({
+          round_id: 'server-r1',
+          idempotency_key: 'idem-a',
+          status: 'running',
+        }),
+      ],
+      loadedAt: Date.parse('2026-01-01T00:00:03.000Z'),
+      source: 'history',
+    });
+
+    expect(state.sessions['sess-a'].rounds[0].preferred_skills).toEqual([
+      { key: 'pdf', display_name: 'pdf' },
+    ]);
   });
 
   it('keeps the running round lastSequence when a subscribe run is (re)started', () => {

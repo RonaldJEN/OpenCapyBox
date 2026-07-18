@@ -5,6 +5,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
+from datetime import timedelta
 from pathlib import Path
 from threading import Event
 from unittest.mock import AsyncMock, patch
@@ -25,6 +26,7 @@ from src.api.models.mcp import (
     McpCredential,
     McpInstallation,
     McpServer,
+    McpToolSearchIndex,
     McpToolSnapshot,
     McpToolVisibility,
 )
@@ -47,6 +49,16 @@ from src.api.services.mcp_service import (
     resolve_installation_headers,
 )
 from src.api.services.mcp_security import McpSecurityError
+from src.api.services.mcp_tool_search_service import (
+    McpToolSearchIndexTarget,
+    McpToolSearchService,
+    SqlAlchemyMcpToolSearchRepository,
+    _prepare_candidate,
+    sync_mcp_tool_search_indexes,
+)
+from src.api.services.embedding_service import EmbeddingRequestConfig
+from src.api.utils.timezone import now_naive
+from src.agent.tools.tool_discovery import ToolSearchDocument
 from tests.db_safety import (
     build_pytest_pg_engine,
     create_all_for_test_engine,
@@ -134,9 +146,350 @@ def test_models_are_registered_in_metadata():
         "mcp_installations",
         "mcp_tool_visibility",
         "mcp_tool_snapshots",
+        "mcp_tool_search_indexes",
         "mcp_config_versions",
     }
     assert expected.issubset(Base.metadata.tables)
+
+
+def test_tool_search_index_sync_retains_and_invalidates_vectors(mcp_client: TestClient):
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        server = McpServer(
+            source="personal",
+            owner_user_id="alice",
+            name="market-data",
+            description="market capabilities",
+            url="https://example.com/mcp",
+            status="published",
+            auth_type="none",
+        )
+        db.add(server)
+        db.flush()
+        installation = McpInstallation(
+            server_id=server.id,
+            user_id="alice",
+            enabled=True,
+        )
+        db.add(installation)
+        db.flush()
+        target = McpToolSearchIndexTarget(
+            installation_id=installation.id,
+            tool_name="quotes",
+            server_name=server.name,
+            server_description=server.description,
+            title="Realtime quotes",
+            description="Intraday market snapshot",
+            schema_hash="schema-1",
+            connection_fingerprint="connection-1",
+        )
+        sync_mcp_tool_search_indexes(
+            db,
+            installation_id=installation.id,
+            targets=[target],
+        )
+        db.flush()
+        row = db.query(McpToolSearchIndex).one()
+        row.embedding = [1.0, 0.0, 0.0]
+        row.embedding_model_fingerprint = "model-1"
+        row.embedded_document_hash = row.search_document_hash
+        db.commit()
+
+        sync_mcp_tool_search_indexes(
+            db,
+            installation_id=installation.id,
+            targets=[target],
+        )
+        db.commit()
+        retained = db.query(McpToolSearchIndex).one()
+        assert retained.embedding is not None
+        assert retained.embedding_model_fingerprint == "model-1"
+
+        changed = McpToolSearchIndexTarget(
+            **{**target.__dict__, "description": "Changed capability"}
+        )
+        sync_mcp_tool_search_indexes(
+            db,
+            installation_id=installation.id,
+            targets=[changed],
+        )
+        db.commit()
+        invalidated = db.query(McpToolSearchIndex).one()
+        assert invalidated.embedding is None
+        assert invalidated.embedding_model_fingerprint is None
+        assert invalidated.embedded_document_hash is None
+
+        sync_mcp_tool_search_indexes(
+            db,
+            installation_id=installation.id,
+            targets=[],
+        )
+        db.commit()
+        assert db.query(McpToolSearchIndex).count() == 0
+
+
+def test_tool_search_index_claims_are_leased_retriable_and_fenced(
+    mcp_client: TestClient,
+):
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        server = McpServer(
+            source="personal",
+            owner_user_id="alice",
+            name="market-data",
+            url="https://example.com/mcp",
+            status="published",
+            auth_type="none",
+        )
+        db.add(server)
+        db.flush()
+        installation = McpInstallation(
+            server_id=server.id,
+            user_id="alice",
+            enabled=True,
+        )
+        db.add(installation)
+        db.flush()
+        installation_id = str(installation.id)
+        target = McpToolSearchIndexTarget(
+            installation_id=installation_id,
+            tool_name="quotes",
+            server_name=server.name,
+            server_description="market capabilities",
+            title="Realtime quotes",
+            description="Intraday market snapshot",
+            schema_hash="schema-1",
+            connection_fingerprint="connection-1",
+        )
+        sync_mcp_tool_search_indexes(
+            db,
+            installation_id=installation_id,
+            targets=[target],
+        )
+        db.commit()
+
+    candidate = _prepare_candidate(ToolSearchDocument(
+        model_name="mcp__market__quotes",
+        provider="mcp",
+        tool_name="quotes",
+        installation_id=installation_id,
+        server_name="market-data",
+        server_description="market capabilities",
+        title="Realtime quotes",
+        description="Intraday market snapshot",
+        schema_hash="schema-1",
+        connection_fingerprint="connection-1",
+    ))
+    repository = SqlAlchemyMcpToolSearchRepository(
+        mcp_client.SessionLocal  # type: ignore[attr-defined]
+    )
+
+    first = repository.claim_missing([candidate], model_fingerprint="model-1")
+    assert len(first) == 1
+    assert repository.claim_missing(
+        [candidate], model_fingerprint="model-1"
+    ) == []
+
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        row = db.query(McpToolSearchIndex).one()
+        row.lease_expires_at = now_naive() - timedelta(seconds=1)
+        db.commit()
+    reclaimed = repository.claim_missing([candidate], model_fingerprint="model-1")
+    assert len(reclaimed) == 1
+    assert reclaimed[0].claim_token != first[0].claim_token
+
+    changed_target = McpToolSearchIndexTarget(
+        **{**target.__dict__, "description": "Changed capability"}
+    )
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        sync_mcp_tool_search_indexes(
+            db,
+            installation_id=installation_id,
+            targets=[changed_target],
+        )
+        db.commit()
+    repository.finalize_claims(
+        reclaimed,
+        [[1.0, 0.0, 0.0]],
+        model_fingerprint="model-1",
+    )
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        fenced = db.query(McpToolSearchIndex).one()
+        assert fenced.embedding is None
+        assert fenced.claim_token is None
+
+    changed_candidate = _prepare_candidate(ToolSearchDocument(
+        **{
+            **candidate.document.__dict__,
+            "description": "Changed capability",
+        }
+    ))
+    failed = repository.claim_missing(
+        [changed_candidate],
+        model_fingerprint="model-1",
+    )
+    assert len(failed) == 1
+    repository.finalize_claims(
+        failed,
+        [None],
+        model_fingerprint="model-1",
+    )
+    assert repository.claim_missing(
+        [changed_candidate],
+        model_fingerprint="model-1",
+    ) == []
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        retrying = db.query(McpToolSearchIndex).one()
+        assert retrying.claim_token is None
+        assert retrying.retry_after is not None
+
+
+@pytest.mark.asyncio
+async def test_pgvector_tool_search_is_restricted_to_current_candidates(
+    mcp_client: TestClient,
+):
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        alice_server = McpServer(
+            source="personal",
+            owner_user_id="alice",
+            name="alice-market",
+            url="https://alice.example/mcp",
+            status="published",
+            auth_type="none",
+        )
+        bob_server = McpServer(
+            source="personal",
+            owner_user_id="bob",
+            name="bob-market",
+            url="https://bob.example/mcp",
+            status="published",
+            auth_type="none",
+        )
+        db.add_all([alice_server, bob_server])
+        db.flush()
+        alice_installation = McpInstallation(
+            server_id=alice_server.id,
+            user_id="alice",
+            enabled=True,
+        )
+        bob_installation = McpInstallation(
+            server_id=bob_server.id,
+            user_id="bob",
+            enabled=True,
+        )
+        db.add_all([alice_installation, bob_installation])
+        db.flush()
+
+        alice_targets = [
+            McpToolSearchIndexTarget(
+                installation_id=alice_installation.id,
+                tool_name=name,
+                server_name=alice_server.name,
+                server_description="",
+                title=name,
+                description=description,
+                schema_hash=f"schema-{name}",
+                connection_fingerprint="alice-connection",
+            )
+            for name, description in (
+                ("close", "intraday market snapshot"),
+                ("far", "company filing archive"),
+                ("hidden", "hidden closest vector"),
+            )
+        ]
+        bob_target = McpToolSearchIndexTarget(
+            installation_id=bob_installation.id,
+            tool_name="bob-private",
+            server_name=bob_server.name,
+            server_description="",
+            title="bob-private",
+            description="private closest vector",
+            schema_hash="schema-bob-private",
+            connection_fingerprint="bob-connection",
+        )
+        sync_mcp_tool_search_indexes(
+            db,
+            installation_id=alice_installation.id,
+            targets=alice_targets,
+        )
+        sync_mcp_tool_search_indexes(
+            db,
+            installation_id=bob_installation.id,
+            targets=[bob_target],
+        )
+        db.flush()
+        for row in db.query(McpToolSearchIndex).all():
+            if row.tool_name not in {"hidden", "bob-private"}:
+                continue
+            row.embedding = [1.0, 0.0, 0.0]
+            row.embedding_model_fingerprint = "embedding-fp"
+            row.embedded_document_hash = row.search_document_hash
+        alice_installation_id = str(alice_installation.id)
+        alice_server_name = str(alice_server.name)
+        db.commit()
+
+    candidates = [
+        ToolSearchDocument(
+            model_name=name,
+            provider="mcp",
+            tool_name=name,
+            installation_id=alice_installation_id,
+            server_name=alice_server_name,
+            server_description="",
+            title=name,
+            description=description,
+            schema_hash=f"schema-{name}",
+            connection_fingerprint="alice-connection",
+        )
+        for name, description in (
+            ("close", "intraday market snapshot"),
+            ("far", "company filing archive"),
+        )
+    ]
+    config = EmbeddingRequestConfig(
+        identity="embedding-fp",
+        api_key="secret",
+        api_base="https://embedding.example/v1",
+        model_name="embedding-model",
+        dimensions=3,
+    )
+    async def embed(texts, _config):
+        return [
+            [1.0, 0.0, 0.0]
+            if text == "semantic-only" or "tool: close" in text
+            else [0.0, 1.0, 0.0]
+            for text in texts
+        ]
+
+    provider = AsyncMock(side_effect=embed)
+    repository = SqlAlchemyMcpToolSearchRepository(
+        mcp_client.SessionLocal  # type: ignore[attr-defined]
+    )
+    service = McpToolSearchService(
+        repository,
+        embedding_provider=provider,
+        config_provider=lambda: config,
+    )
+
+    ranked = await service.rank("semantic-only", candidates, limit=10)
+
+    assert ranked == ["close"]
+    assert provider.await_count == 2
+    request_sizes = [len(call.args[0]) for call in provider.await_args_list]
+    assert sorted(request_sizes) == [1, 2]
+    assert repository.vector_ranking(
+        [1.0, 0.0, 0.0],
+        [_prepare_candidate(candidate) for candidate in candidates],
+        model_fingerprint="embedding-fp",
+        min_score=0.25,
+    ) == ["close"]
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        indexed = {
+            row.tool_name: row
+            for row in db.query(McpToolSearchIndex)
+            .filter(McpToolSearchIndex.installation_id == alice_installation_id)
+            .all()
+        }
+        assert indexed["close"].embedding_model_fingerprint == "embedding-fp"
+        assert indexed["far"].embedding_model_fingerprint == "embedding-fp"
 
 
 def test_config_version_bump_uses_atomic_upsert_expression(mcp_client: TestClient):
@@ -450,6 +803,32 @@ def test_catalog_fingerprint_refresh_bucket_only_applies_with_effective_installa
     assert repository.catalog_fingerprint("alice") == bucket_zero
     now[0] = 300.0
     assert repository.catalog_fingerprint("alice") != bucket_zero
+
+
+def test_effective_installation_carries_configured_routing_description(
+    mcp_client: TestClient,
+):
+    created = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "同花顺股票 MCP",
+            "description": "A 股实时行情、个股资料、财务和公告",
+            "url": "https://93.184.216.34/stock-mcp",
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    repository = _SqlAlchemyMcpRepository(
+        mcp_client.SessionLocal,  # type: ignore[attr-defined]
+    )
+    installation = next(
+        item
+        for item in repository.list_effective_installations("alice")
+        if item.server_id == created.json()["id"]
+    )
+
+    assert installation.server_name == "同花顺股票 MCP"
+    assert installation.server_description == "A 股实时行情、个股资料、财务和公告"
 
 
 def test_official_connection_uses_user_secret_without_overwriting_platform_secret(
@@ -1088,6 +1467,7 @@ def test_user_probe_persists_tool_snapshot_without_echoing_secret(mcp_client: Te
     assert response.json() == {"ok": True, "tools_count": 1, "latency_ms": 12, "error": None}
     with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
         snapshot = db.query(McpToolSnapshot).one()
+        search_index = db.query(McpToolSearchIndex).one()
         assert snapshot.tool_name == "search"
         assert snapshot.connection_fingerprint
         assert snapshot.schema_hash == mcp_tool_schema_hash(
@@ -1096,6 +1476,13 @@ def test_user_probe_persists_tool_snapshot_without_echoing_secret(mcp_client: Te
             input_schema=remote_tools[0]["inputSchema"],
             annotations=remote_tools[0]["annotations"],
         )
+        assert search_index.schema_hash == snapshot.schema_hash
+        assert (
+            search_index.connection_fingerprint
+            == snapshot.connection_fingerprint
+        )
+        assert "tool: search" in search_index.search_document
+        assert "93.184.216.34" not in search_index.search_document
     assert mcp_client.get("/mcp/servers").json()["config_version"] != before_version
 
 
@@ -1263,6 +1650,11 @@ def test_runtime_snapshot_replace_bumps_generation_only_on_identity_change(
     assert after_first == before + 1
     with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
         first_discovered_at = db.query(McpToolSnapshot).one().discovered_at
+        search_index = db.query(McpToolSearchIndex).one()
+        search_index.embedding = [1.0, 0.0, 0.0]
+        search_index.embedding_model_fingerprint = "model-1"
+        search_index.embedded_document_hash = search_index.search_document_hash
+        db.commit()
     assert repository.get_tool_snapshot_binding(installation, "search") == (
         "a" * 64,
         installation.execution_fingerprint,
@@ -1272,6 +1664,7 @@ def test_runtime_snapshot_replace_bumps_generation_only_on_identity_change(
     assert current_version() == after_first
     with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
         assert db.query(McpToolSnapshot).one().discovered_at > first_discovered_at
+        assert db.query(McpToolSearchIndex).one().embedding is not None
 
     assert repository.replace_tool_snapshots(
         installation,
@@ -1280,12 +1673,20 @@ def test_runtime_snapshot_replace_bumps_generation_only_on_identity_change(
     assert current_version() == after_first + 1
     with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
         assert db.query(McpToolSnapshot).one().title == "Search tool"
+        changed_index = db.query(McpToolSearchIndex).one()
+        assert changed_index.embedding is None
+        assert "title: Search tool" in changed_index.search_document
 
     assert repository.replace_tool_snapshots(
         installation,
         [snapshot("b" * 64)],
     ) is True
     assert current_version() == after_first + 2
+
+    assert repository.replace_tool_snapshots(installation, []) is True
+    assert current_version() == after_first + 3
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        assert db.query(McpToolSearchIndex).count() == 0
 
 
 def test_runtime_snapshot_replace_rejects_stale_execution_target(

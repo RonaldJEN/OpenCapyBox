@@ -277,10 +277,14 @@ class APIService {
   /**
    * 🆕 获取会话的轮次历史（V2）
    */
-  async getSessionHistoryV2(chatSessionId: string): Promise<HistoryResponseV2> {
-    const response = await this.client.get<HistoryResponseV2>(
-      `/sessions/${chatSessionId}/history/v2`
-    );
+  async getSessionHistoryV2(
+    chatSessionId: string,
+    signal?: AbortSignal,
+  ): Promise<HistoryResponseV2> {
+    const url = `/sessions/${chatSessionId}/history/v2`;
+    const response = signal
+      ? await this.client.get<HistoryResponseV2>(url, { signal })
+      : await this.client.get<HistoryResponseV2>(url);
     return response.data;
   }
 

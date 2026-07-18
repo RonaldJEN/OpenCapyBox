@@ -18,6 +18,7 @@ import {
 import { readFileAsDataUrl } from '../utils/imageUtils';
 import { toFileInfo, isImageFile } from '../utils/fileUtils';
 import { extractAssistantFiles } from '../utils/assistantFileRefs';
+import { restoreFailedSkillDraft, type SkillDraft } from '../utils/skillDrafts';
 import {
   MAX_TEXT_BLOCK_CHARS,
   formatUploadError,
@@ -147,6 +148,7 @@ function ChatV2View(props: ChatV2Props) {
   const [disableInitialMotion, setDisableInitialMotion] = useState(false);
   const [highlightedRoundId, setHighlightedRoundId] = useState<string | null>(null);
   const [input, setInput] = useState('');
+  const [skillDrafts, setSkillDrafts] = useState<Record<string, SkillDraft>>({});
   const [localError, setLocalError] = useState('');
   const [creatingSession, setCreatingSession] = useState(false);
   const [bootstrapMessage, setBootstrapMessage] = useState('');
@@ -178,6 +180,8 @@ function ChatV2View(props: ChatV2Props) {
   const suppressAutoScrollRef = useRef<boolean>(false);
   const pendingSendSessionKeysRef = useRef<Set<string>>(new Set());
   const selectedModel = availableModels.find((m) => m.id === selectedModelId);
+  const currentSkillDraftKey = sessionId || '__new_session__';
+  const currentSkillDraft = skillDrafts[currentSkillDraftKey] || { keys: [], revision: 0 };
   const displayError = localError || runtimeError;
   const hasActiveSlot = activeSlotSessionIds?.has(sessionId) ?? false;
 
@@ -599,6 +603,17 @@ function ChatV2View(props: ChatV2Props) {
     }
   };
 
+  const handleSelectedSkillKeysChange = (keys: string[]) => {
+    const draftKey = sessionId || '__new_session__';
+    setSkillDrafts((previous) => {
+      const current = previous[draftKey] || { keys: [], revision: 0 };
+      return {
+        ...previous,
+        [draftKey]: { keys, revision: current.revision + 1 },
+      };
+    });
+  };
+
   const handleSend = async () => {
     const initialSessionKey = sessionId || '__new_session__';
     if (
@@ -610,6 +625,20 @@ function ChatV2View(props: ChatV2Props) {
     ) return;
     const draftInput = input;
     const draftAttachments = [...attachedFiles];
+    const skillSnapshot: SkillDraft = {
+      keys: [...currentSkillDraft.keys],
+      revision: currentSkillDraft.revision,
+    };
+    const clearedSkillRevision = skillSnapshot.revision + 1;
+    let restoreSkillDraftKey = initialSessionKey;
+    const restoreSkillSnapshot = () => {
+      setSkillDrafts((previous) => restoreFailedSkillDraft(
+        previous,
+        restoreSkillDraftKey,
+        skillSnapshot,
+        clearedSkillRevision,
+      ));
+    };
     let contentBlocks: ChatContentBlock[] = [];
     try {
       contentBlocks = buildContentBlocks(draftInput, draftAttachments);
@@ -627,6 +656,10 @@ function ChatV2View(props: ChatV2Props) {
       }
       setInput('');
       setAttachedFiles([]);
+      setSkillDrafts((previous) => ({
+        ...previous,
+        [initialSessionKey]: { keys: [], revision: clearedSkillRevision },
+      }));
       setDisableInitialMotion(false);
       setLocalError('');
 
@@ -634,6 +667,9 @@ function ChatV2View(props: ChatV2Props) {
       if (!targetSessionId) {
         if (!onCreateSession) {
           setBootstrapMessage('');
+          setInput(draftInput);
+          setAttachedFiles(draftAttachments);
+          restoreSkillSnapshot();
           return;
         }
         setCreatingSession(true);
@@ -645,21 +681,34 @@ function ChatV2View(props: ChatV2Props) {
           setBootstrapMessage('');
           setInput(draftInput);
           setAttachedFiles(draftAttachments);
+          restoreSkillSnapshot();
           setCreatingSession(false);
           return;
-        } finally {
-          setCreatingSession(false);
         }
       }
 
       targetSessionKey = targetSessionId;
+      if (targetSessionKey !== initialSessionKey) {
+        restoreSkillDraftKey = targetSessionKey;
+        setSkillDrafts((previous) => {
+          if (previous[targetSessionKey]) return previous;
+          return {
+            ...previous,
+            [targetSessionKey]: { keys: [], revision: clearedSkillRevision },
+          };
+        });
+      }
       pendingSendSessionKeysRef.current.add(targetSessionKey);
-      await runtime.sendMessage({
+      const sendPromise = runtime.sendMessage({
         sessionId: targetSessionId,
         displayMessage: userMessage,
         content: contentBlocks,
         attachments: draftAttachments,
+        preferredSkillKeys: skillSnapshot.keys,
+        onRejectedBeforeAccept: restoreSkillSnapshot,
       });
+      if (isStartingNewSession) setCreatingSession(false);
+      await sendPromise;
     } finally {
       pendingSendSessionKeysRef.current.delete(initialSessionKey);
       pendingSendSessionKeysRef.current.delete(targetSessionKey);
@@ -943,6 +992,8 @@ function ChatV2View(props: ChatV2Props) {
             uploading={uploading}
             onInputChangeRaw={handleInputChange}
             onFileSelected={handleSelectFile}
+            selectedSkillKeys={currentSkillDraft.keys}
+            onSelectedSkillKeysChange={handleSelectedSkillKeysChange}
           />
         )}
       </div>

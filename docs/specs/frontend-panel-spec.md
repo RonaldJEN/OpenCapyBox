@@ -155,7 +155,7 @@ useEffect(() => {
 
 - `GET /api/config/agent-files/{name}`（name ∈ `memory|user|soul`）→ `{ content, version }`
 - `PUT /api/config/agent-files/{name}` body `{ content }` → `{ version }`
-- `GET /api/config/skills` → `{ skills: SkillInfo[], sandbox_status: 'not_created' | 'available' | 'unavailable' }`，其中 `SkillInfo.source` 为 `official | user`
+- `GET /api/config/skills?refresh={bool}` → `{ skills: SkillInfo[], sandbox_status, inventory_state, inventory_discovered_at }`，其中 `SkillInfo.source` 为 `official | user`；缺省读取 DB 快照，显式刷新才要求远程严格扫描
 - `PUT /api/config/skills/{name}` body `{ enabled }`
 
 ### 4.4 关键不变量
@@ -167,8 +167,9 @@ useEffect(() => {
 - **保存反馈**：保存成功后短暂显示「已保存」提示（约 1.8s 后自动消失）。
 - **Skills 乐观更新**：toggle 后立即更新 UI，失败时回滚并提示；每个 skill 的切换请求必须独立锁定对应开关，避免并发请求乱序造成 UI 与后端状态不一致。
 - **Skills 懒加载**：打开 SettingsCenter 不请求技能清单；仅进入「能力设定 · Skills」tab 时请求，之后再次进入可重新刷新。
+- **Skills 快照与手动刷新**：普通加载读取用户隔离的 DB inventory 快照；标题区“刷新”及错误/降级态“重新加载”使用 `refresh=true`。刷新期间保留已有列表，防止远程恢复遮空界面；用户离开再返回 Skills tab 时必须复用尚未完成的强制刷新，不得用后发的普通快照请求覆盖刷新结果。
 - **Skills 来源展示**：每项显示「官方」或「用户」来源标识；用户 Skill 不重复展示 `category=user` 标签。
-- **沙箱状态展示**：`not_created` 时提示尚未创建沙箱、当前仅展示官方 Skills；`unavailable` 时提示沙箱暂不可用、当前清单为部分结果；`available` 不显示降级提示。
+- **沙箱状态展示**：`not_created` 时提示尚未创建沙箱、当前仅展示官方 Skills；`inventory_state=stale` 时提示刷新失败且正在显示上次成功清单，不得声称仅有官方 Skills；其余 `unavailable` 时提示沙箱暂不可用、当前清单为部分结果；`available` 不显示降级提示。
 - **部分成功**：`GET /config/skills` 返回 200 且 `sandbox_status!=available` 时不得当作整页错误，仍应渲染返回的官方 Skills。
 - **Skills 启停影响下一次请求**：后端在每次 LLM 请求前读取最新逻辑状态；不改变已发消息，也不删除沙箱文件。
 - **默认入口状态**：从「设置」入口进入默认「我的记忆 · 用户画像」。

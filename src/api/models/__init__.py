@@ -21,6 +21,7 @@ from .channel_session_binding import ChannelSessionBinding
 from .subagent_run import SubagentRun
 from .auth_user import AuthUser
 from .auth_login_event import AuthLoginEvent
+from .user_skill_inventory import UserSkillInventorySnapshot
 from .llm_model import LLMModel, LLMModelSettings
 from .model_permission import ModelPermissionGroup, ModelPermissionGroupModel, UserModelPermissionGroup
 from .mcp import (
@@ -29,6 +30,7 @@ from .mcp import (
     McpInstallation,
     McpToolVisibility,
     McpToolSnapshot,
+    McpToolSearchIndex,
     McpConfigVersion,
 )
 from .tool_permission import ToolPermissionRule, ToolApprovalRequest, ToolPermissionAudit
@@ -51,6 +53,7 @@ __all__ = [
     "SubagentRun",
     "AuthUser",
     "AuthLoginEvent",
+    "UserSkillInventorySnapshot",
     "LLMModel",
     "LLMModelSettings",
     "ModelPermissionGroup",
@@ -61,6 +64,7 @@ __all__ = [
     "McpInstallation",
     "McpToolVisibility",
     "McpToolSnapshot",
+    "McpToolSearchIndex",
     "McpConfigVersion",
     "ToolPermissionRule",
     "ToolApprovalRequest",

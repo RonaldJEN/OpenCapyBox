@@ -43,7 +43,7 @@
 |---|---|---|
 | id | Integer | PK, autoincrement |
 | user_id | String(100) | NOT NULL, indexed |
-| skill_name | String(100) | NOT NULL |
+| skill_name | String(128) | NOT NULL；trim 后的稳定 Skill key，与 API/运行时 128 字符上限一致 |
 | enabled | Boolean | default=True |
 | updated_at | DateTime | default=now, onupdate=now |
 
@@ -100,20 +100,29 @@
 {
   "skills": [
     {
+      "key": "web_search",
       "name": "web_search",
+      "display_name": "网页搜索",
       "description": "搜索互联网",
       "category": "builtin",
       "source": "official",
       "enabled": true
     }
   ],
-  "sandbox_status": "available"
+  "sandbox_status": "available",
+  "inventory_state": "current",
+  "inventory_discovered_at": "2026-07-17T10:00:00"
 }
 ```
 
+- `key` 是聊天 `preferred_skill_keys`、Skill 启停和运行时加载共同使用的稳定内部标识：trim 后必须非空且不超过 128 个 Unicode 字符；允许人类可读 Unicode、空格和括号，禁止 `/`、`\`、`?`、`#`、`%` 及 Unicode `C*` 控制/不可见类别字符
+- `display_name` 只用于展示：依次读取 SKILL.md frontmatter 顶层 `display_name` / `display-name`、`metadata` 内同名字段，缺失或空白时回退 `name`；不得作为请求 key
 - 合并 SkillLoader 发现结果 + UserSkillConfig 数据库状态
 - `source` 为 `official` 或 `user`；`sandbox_status` 为 `not_created`、`available` 或 `unavailable`
-- 沙箱未创建或暂不可用时仍返回 200 和官方 Skills；用户 Skills 仅在沙箱可用并发现成功时合并
+- 用户 Skill 使用与当前 sandbox/Profile 代际绑定的最近一次完整 DB 快照，普通读取不等待远程扫描；`refresh=true` 或快照缺失时严格扫描并原子发布新快照
+- 完整用户 Skill inventory 最多 256 项；每项 `display_name`、`description`、`sandbox_skill_dir` 分别不超过 1024、8192、1024 UTF-8 bytes，规范 JSON 总量不超过 1 MiB。重复/非法 key、非法结构或任一容量超限都使整次严格扫描失败，不得发布部分清单
+- 沙箱未创建或暂不可用时仍返回 200 和官方 Skills；强制刷新失败时可保留并返回当前 sandbox/Profile 代际的旧快照，同时用 `inventory_state=stale` 与 `sandbox_status=unavailable` 标记降级
+- 完整扫描成功且快照发布成功时才能把该扫描结果标记为 `current`。正常 CAS 竞争失败时必须重新读取并返回当前代际的 winner，方可标记 `current`；快照持久化抛错不是 CAS 竞争胜负，若安全旧快照存在只能标记 `stale`，否则为 `unavailable`，不得把旧快照或未发布扫描误报为 `current`
 
 ### PUT /api/config/skills/{skill_name}
 

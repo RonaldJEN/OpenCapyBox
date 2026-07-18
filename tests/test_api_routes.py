@@ -2,6 +2,7 @@
 import json
 import pytest
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
@@ -861,16 +862,27 @@ class TestConfigRouter:
 
         fake_loader = MagicMock()
         fake_loader.discover_skills.return_value = [
-            Skill(name="docx", description="Word 处理", content="", metadata={"category": "document"}),
+            Skill(
+                name="docx",
+                description="Word 处理",
+                content="",
+                metadata={"category": "document", "display_name": "Word 文档"},
+            ),
             Skill(name="pdf", description="PDF 处理", content="", metadata={"category": "document"}),
         ]
 
         # 用户配置为空 → 默认全部 enabled=True
         client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
 
-        with patch("src.api.config.get_settings", return_value=fake_settings):
-            with patch("src.agent.tools.skill_loader.SkillLoader", return_value=fake_loader):
-                response = client.get("/config/skills", params={"user_id": "testuser"})
+        from src.api.services.skill_inventory_service import UserSkillInventoryView
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader", return_value=fake_loader
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            return_value=UserSkillInventoryView(None, None, None),
+        ):
+            response = client.get("/config/skills", params={"user_id": "testuser"})
 
         assert response.status_code == 200
         data = response.json()
@@ -879,6 +891,11 @@ class TestConfigRouter:
         names = {s["name"] for s in data["skills"]}
         assert names == {"docx", "pdf"}
         assert all(s["enabled"] is True for s in data["skills"])
+        skills = {item["name"]: item for item in data["skills"]}
+        assert skills["docx"]["key"] == "docx"
+        assert skills["docx"]["display_name"] == "Word 文档"
+        assert skills["pdf"]["key"] == "pdf"
+        assert skills["pdf"]["display_name"] == "pdf"
 
     def test_get_skills_merges_user_enabled_config(self, client, tmp_path):
         """应保留全部可发现技能，并合并用户启停配置"""
@@ -898,9 +915,15 @@ class TestConfigRouter:
         disabled.enabled = False
         client.mock_db.query.return_value.filter.return_value.all.return_value = [disabled]  # type: ignore[attr-defined]
 
-        with patch("src.api.config.get_settings", return_value=fake_settings):
-            with patch("src.agent.tools.skill_loader.SkillLoader", return_value=fake_loader):
-                response = client.get("/config/skills", params={"user_id": "testuser"})
+        from src.api.services.skill_inventory_service import UserSkillInventoryView
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader", return_value=fake_loader
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            return_value=UserSkillInventoryView(None, None, None),
+        ):
+            response = client.get("/config/skills", params={"user_id": "testuser"})
 
         assert response.status_code == 200
         skills = {item["name"]: item for item in response.json()["skills"]}
@@ -911,6 +934,10 @@ class TestConfigRouter:
     def test_get_skills_includes_sandbox_user_skills(self, client, tmp_path):
         """设置页清单应合并沙箱用户 Skill 并标记来源。"""
         from src.agent.tools.skill_loader import Skill
+        from src.api.services.skill_inventory_service import (
+            SkillInventoryIdentity,
+            UserSkillInventoryView,
+        )
 
         fake_settings = MagicMock()
         fake_settings.skills_dir = str(tmp_path)
@@ -921,18 +948,172 @@ class TestConfigRouter:
         sandbox_service = MagicMock()
         cached_sandbox = MagicMock(id="sbx-current")
         sandbox_service.get_cached.return_value = cached_sandbox
+        sandbox_service.cached_is_current.return_value = True
+        sandbox_service.get_sandbox_id.return_value = "sbx-current"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 1)
+        inventory_identity = SkillInventoryIdentity("sbx-current", "profile-1", 1)
 
-        async def _recover_after_db_release(user_id, sandbox_id):
+        async def _discover_after_db_release(user_id, official_names, *, strict):
             assert client.mock_db.rollback.called  # type: ignore[attr-defined]
-            return cached_sandbox
+            assert user_id == "testuser"
+            assert official_names == {"pdf"}
+            assert strict is True
+            return [
+                {
+                    "name": "my-skill",
+                    "display_name": "我的技能",
+                    "description": "User uploaded",
+                    "sandbox_skill_dir": "/home/user/skills/my-skill",
+                },
+                {
+                    "name": "fallback-skill",
+                    "description": "Fallback display name",
+                    "sandbox_skill_dir": "/home/user/skills/fallback-skill",
+                },
+            ]
 
-        sandbox_service.recover_persisted_sandbox = AsyncMock(
-            side_effect=_recover_after_db_release
+        sandbox_service.recover_persisted_sandbox = AsyncMock()
+        sandbox_service.discover_sandbox_skills = AsyncMock(
+            side_effect=_discover_after_db_release
         )
+        client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader",
+            return_value=fake_loader,
+        ), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            return_value=UserSkillInventoryView(inventory_identity, None, None),
+        ), patch(
+            "src.api.services.skill_inventory_service.replace_user_skill_inventory",
+            return_value=True,
+        ):
+            response = client.get("/config/skills")
+
+        assert response.status_code == 200
+        skills = {item["name"]: item for item in response.json()["skills"]}
+        assert skills["pdf"]["source"] == "official"
+        assert skills["my-skill"]["source"] == "user"
+        assert skills["my-skill"]["category"] == "user"
+        assert skills["my-skill"]["key"] == "my-skill"
+        assert skills["my-skill"]["display_name"] == "我的技能"
+        assert skills["fallback-skill"]["source"] == "user"
+        assert skills["fallback-skill"]["key"] == "fallback-skill"
+        assert skills["fallback-skill"]["display_name"] == "fallback-skill"
+        assert response.json()["sandbox_status"] == "available"
+        sandbox_service.recover_persisted_sandbox.assert_not_awaited()
+        sandbox_service.discover_sandbox_skills.assert_awaited_once_with(
+            "testuser",
+            {"pdf"},
+            strict=True,
+        )
+
+    def test_get_skills_uses_persisted_inventory_without_remote_scan(
+        self, client, tmp_path
+    ):
+        """热路径应直接读取用户隔离的 DB 快照。"""
+        from src.agent.tools.skill_loader import Skill
+        from src.api.models.user_memory import UserSkillConfig
+        from src.api.services.skill_inventory_service import (
+            SkillInventoryIdentity,
+            UserSkillInventoryView,
+        )
+
+        fake_settings = MagicMock(skills_dir=str(tmp_path))
+        fake_loader = MagicMock()
+        fake_loader.discover_skills.return_value = [
+            Skill(name="pdf", description="PDF", content=""),
+        ]
+        snapshot = MagicMock(
+            sandbox_id="sbx-current",
+            active_profile_id="profile-1",
+            active_profile_version=3,
+            inventory_json=json.dumps([{
+                "name": "my-skill",
+                "display_name": "我的技能",
+                "description": "Cached user Skill",
+                "sandbox_skill_dir": "/home/user/skills/my-skill",
+            }]),
+            discovered_at=datetime(2026, 7, 17, 1, 0, 0),
+        )
+
+        def _query_result(*, first=None, all_items=None):
+            query = MagicMock()
+            query.filter.return_value = query
+            query.first.return_value = first
+            query.all.return_value = all_items or []
+            return query
+
+        def _query_side_effect(model):
+            if model is UserSkillConfig:
+                return _query_result(all_items=[])
+            return _query_result()
+
+        client.mock_db.query.side_effect = _query_side_effect  # type: ignore[attr-defined]
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = MagicMock(id="sbx-current")
+        sandbox_service.recover_persisted_sandbox = AsyncMock()
+        sandbox_service.discover_sandbox_skills = AsyncMock()
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader",
+            return_value=fake_loader,
+        ), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            return_value=UserSkillInventoryView(
+                SkillInventoryIdentity("sbx-current", "profile-1", 3),
+                json.loads(snapshot.inventory_json),
+                snapshot.discovered_at,
+            ),
+        ):
+            response = client.get("/config/skills")
+
+        assert response.status_code == 200
+        assert response.json()["inventory_state"] == "current"
+        assert {skill["name"] for skill in response.json()["skills"]} == {
+            "pdf",
+            "my-skill",
+        }
+        sandbox_service.recover_persisted_sandbox.assert_not_awaited()
+        sandbox_service.discover_sandbox_skills.assert_not_awaited()
+
+    def test_get_skills_refresh_bypasses_snapshot_and_publishes_live_scan(
+        self, client, tmp_path
+    ):
+        from src.agent.tools.skill_loader import Skill
+        from src.api.services.skill_inventory_service import (
+            SkillInventoryIdentity,
+            UserSkillInventoryView,
+        )
+
+        fake_settings = MagicMock(skills_dir=str(tmp_path))
+        fake_loader = MagicMock()
+        fake_loader.discover_skills.return_value = [
+            Skill(name="pdf", description="PDF", content=""),
+        ]
+        identity = SkillInventoryIdentity("sbx-current", "profile-1", 3)
+        old_snapshot = [{
+            "name": "old-skill",
+            "display_name": "old-skill",
+            "description": "old",
+            "sandbox_skill_dir": "/home/user/skills/old-skill",
+        }]
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = MagicMock(id="sbx-current")
+        sandbox_service.cached_is_current.return_value = True
+        sandbox_service.get_sandbox_id.return_value = "sbx-current"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 3)
+        sandbox_service.recover_persisted_sandbox = AsyncMock()
         sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[{
-            "name": "my-skill",
-            "description": "User uploaded",
-            "sandbox_skill_dir": "/home/user/skills/my-skill",
+            "name": "new-skill",
+            "description": "new",
+            "sandbox_skill_dir": "/home/user/skills/new-skill",
         }])
         client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
 
@@ -942,24 +1123,330 @@ class TestConfigRouter:
         ), patch(
             "src.api.services.sandbox_service.get_sandbox_service",
             return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            return_value=UserSkillInventoryView(identity, old_snapshot, datetime(2026, 7, 17)),
+        ), patch(
+            "src.api.services.skill_inventory_service.replace_user_skill_inventory",
+            return_value=True,
+        ) as publish:
+            response = client.get("/config/skills", params={"refresh": "true"})
+
+        assert response.status_code == 200
+        assert {skill["name"] for skill in response.json()["skills"]} == {"pdf", "new-skill"}
+        publish.assert_called_once()
+        sandbox_service.discover_sandbox_skills.assert_awaited_once()
+
+    def test_get_skills_cas_loser_returns_persisted_winner(self, client, tmp_path):
+        from src.agent.tools.skill_loader import Skill
+        from src.api.services.skill_inventory_service import (
+            SkillInventoryIdentity,
+            UserSkillInventoryView,
+        )
+
+        fake_settings = MagicMock(skills_dir=str(tmp_path))
+        fake_loader = MagicMock()
+        fake_loader.discover_skills.return_value = [
+            Skill(name="pdf", description="PDF", content=""),
+        ]
+        identity = SkillInventoryIdentity("sbx-current", "profile-1", 3)
+        winner_skills = [{
+            "name": "winner-skill",
+            "display_name": "winner-skill",
+            "description": "newer scan",
+            "sandbox_skill_dir": "/home/user/skills/winner-skill",
+        }]
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = MagicMock(id="sbx-current")
+        sandbox_service.cached_is_current.return_value = True
+        sandbox_service.get_sandbox_id.return_value = "sbx-current"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 3)
+        sandbox_service.recover_persisted_sandbox = AsyncMock()
+        sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[{
+            "name": "loser-skill",
+            "description": "older scan",
+            "sandbox_skill_dir": "/home/user/skills/loser-skill",
+        }])
+        client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+        scan_started_at = datetime(2026, 7, 17, 1, 0, 0)
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader",
+            return_value=fake_loader,
+        ), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            side_effect=[
+                UserSkillInventoryView(identity, None, None),
+                UserSkillInventoryView(
+                    identity,
+                    winner_skills,
+                    scan_started_at + timedelta(seconds=1),
+                ),
+            ],
+        ), patch(
+            "src.api.services.skill_inventory_service.replace_user_skill_inventory",
+            return_value=False,
+        ), patch(
+            "src.api.utils.timezone.now_naive",
+            return_value=scan_started_at,
         ):
             response = client.get("/config/skills")
 
         assert response.status_code == 200
-        skills = {item["name"]: item for item in response.json()["skills"]}
-        assert skills["pdf"]["source"] == "official"
-        assert skills["my-skill"]["source"] == "user"
-        assert skills["my-skill"]["category"] == "user"
+        assert {skill["name"] for skill in response.json()["skills"]} == {
+            "pdf",
+            "winner-skill",
+        }
+        assert response.json()["inventory_state"] == "current"
+
+    def test_get_skills_cas_loser_with_older_snapshot_is_stale(
+        self, client, tmp_path
+    ):
+        from src.agent.tools.skill_loader import Skill
+        from src.api.services.skill_inventory_service import (
+            SkillInventoryIdentity,
+            UserSkillInventoryView,
+        )
+
+        fake_settings = MagicMock(skills_dir=str(tmp_path))
+        fake_loader = MagicMock()
+        fake_loader.discover_skills.return_value = [
+            Skill(name="pdf", description="PDF", content=""),
+        ]
+        identity = SkillInventoryIdentity("sbx-current", "profile-1", 3)
+        old_skills = [{
+            "name": "old-skill",
+            "display_name": "old-skill",
+            "description": "older snapshot",
+            "sandbox_skill_dir": "/home/user/skills/old-skill",
+        }]
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = MagicMock(id="sbx-current")
+        sandbox_service.cached_is_current.return_value = True
+        sandbox_service.get_sandbox_id.return_value = "sbx-current"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 3)
+        sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[{
+            "name": "losing-scan",
+            "description": "not published",
+            "sandbox_skill_dir": "/home/user/skills/losing-scan",
+        }])
+        client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+        scan_started_at = datetime(2026, 7, 17, 2, 0, 0)
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader",
+            return_value=fake_loader,
+        ), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            side_effect=[
+                UserSkillInventoryView(identity, None, None),
+                UserSkillInventoryView(
+                    identity,
+                    old_skills,
+                    scan_started_at - timedelta(seconds=1),
+                ),
+            ],
+        ), patch(
+            "src.api.services.skill_inventory_service.replace_user_skill_inventory",
+            return_value=False,
+        ), patch(
+            "src.api.utils.timezone.now_naive",
+            return_value=scan_started_at,
+        ):
+            response = client.get("/config/skills")
+
+        assert response.status_code == 200
+        assert {skill["name"] for skill in response.json()["skills"]} == {
+            "pdf",
+            "old-skill",
+        }
+        assert response.json()["inventory_state"] == "stale"
+        assert response.json()["sandbox_status"] == "unavailable"
+
+    def test_get_skills_publish_exception_only_reuses_snapshot_as_stale(
+        self, client, tmp_path
+    ):
+        from src.agent.tools.skill_loader import Skill
+        from src.api.services.skill_inventory_service import (
+            SkillInventoryIdentity,
+            UserSkillInventoryView,
+        )
+
+        fake_settings = MagicMock(skills_dir=str(tmp_path))
+        fake_loader = MagicMock()
+        fake_loader.discover_skills.return_value = [
+            Skill(name="pdf", description="PDF", content=""),
+        ]
+        identity = SkillInventoryIdentity("sbx-current", "profile-1", 3)
+        old_skills = [{
+            "name": "old-skill",
+            "display_name": "old-skill",
+            "description": "last successful snapshot",
+            "sandbox_skill_dir": "/home/user/skills/old-skill",
+        }]
+        old_discovered_at = datetime(2026, 7, 17, 1, 0, 0)
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = MagicMock(id="sbx-current")
+        sandbox_service.cached_is_current.return_value = True
+        sandbox_service.get_sandbox_id.return_value = "sbx-current"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 3)
+        sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[{
+            "name": "unpublished-scan",
+            "description": "must not be returned",
+            "sandbox_skill_dir": "/home/user/skills/unpublished-scan",
+        }])
+        client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader",
+            return_value=fake_loader,
+        ), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            side_effect=[
+                UserSkillInventoryView(identity, old_skills, old_discovered_at),
+                UserSkillInventoryView(identity, old_skills, old_discovered_at),
+            ],
+        ), patch(
+            "src.api.services.skill_inventory_service.replace_user_skill_inventory",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            response = client.get("/config/skills", params={"refresh": "true"})
+
+        assert response.status_code == 200
+        assert {skill["name"] for skill in response.json()["skills"]} == {
+            "pdf",
+            "old-skill",
+        }
+        assert response.json()["inventory_state"] == "stale"
+        assert response.json()["sandbox_status"] == "unavailable"
+        assert response.json()["inventory_discovered_at"] == old_discovered_at.isoformat()
+
+    def test_get_skills_rebuild_failure_does_not_reuse_old_generation_snapshot(
+        self, client, tmp_path
+    ):
+        from src.agent.tools.skill_loader import Skill
+        from src.api.services.skill_inventory_service import (
+            SkillInventoryIdentity,
+            UserSkillInventoryView,
+        )
+
+        fake_settings = MagicMock(skills_dir=str(tmp_path))
+        fake_loader = MagicMock()
+        fake_loader.discover_skills.return_value = [
+            Skill(name="pdf", description="PDF", content=""),
+        ]
+        old_identity = SkillInventoryIdentity("sbx-old", "profile-1", 1)
+        new_identity = SkillInventoryIdentity("sbx-new", "profile-2", 1)
+        old_skills = [{
+            "name": "old-private-skill",
+            "display_name": "old-private-skill",
+            "description": "must not leak",
+            "sandbox_skill_dir": "/home/user/skills/old-private-skill",
+        }]
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = MagicMock(id="sbx-old")
+        sandbox_service.cached_is_current.return_value = False
+        sandbox_service.get_sandbox_id.return_value = "sbx-new"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-2", 1)
+        sandbox_service.recover_persisted_sandbox = AsyncMock()
+        sandbox_service.discover_sandbox_skills = AsyncMock(
+            side_effect=RuntimeError("new generation scan failed")
+        )
+        client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader",
+            return_value=fake_loader,
+        ), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            side_effect=[
+                UserSkillInventoryView(old_identity, old_skills, datetime(2026, 7, 17, 1)),
+                UserSkillInventoryView(new_identity, None, None),
+            ],
+        ):
+            response = client.get("/config/skills", params={"refresh": "true"})
+
+        assert response.status_code == 200
+        assert [skill["name"] for skill in response.json()["skills"]] == ["pdf"]
+        assert response.json()["inventory_state"] == "unavailable"
+        assert response.json()["sandbox_status"] == "unavailable"
+
+    def test_get_skills_recovers_and_retries_when_cached_scan_fails(
+        self, client, tmp_path
+    ):
+        """缓存快路径失败后应恢复沙箱并重试严格扫描。"""
+        from src.agent.tools.skill_loader import Skill
+        from src.api.services.skill_inventory_service import (
+            SkillInventoryIdentity,
+            UserSkillInventoryView,
+        )
+
+        fake_settings = MagicMock(skills_dir=str(tmp_path))
+        fake_loader = MagicMock()
+        fake_loader.discover_skills.return_value = [
+            Skill(name="pdf", description="PDF", content=""),
+        ]
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = MagicMock(id="sbx-current")
+        sandbox_service.cached_is_current.return_value = True
+        sandbox_service.get_sandbox_id.return_value = "sbx-current"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 1)
+        inventory_identity = SkillInventoryIdentity("sbx-current", "profile-1", 1)
+        sandbox_service.recover_persisted_sandbox = AsyncMock()
+        sandbox_service.discover_sandbox_skills = AsyncMock(side_effect=[
+            RuntimeError("stale cached connection"),
+            [{
+                "name": "my-skill",
+                "description": "User uploaded",
+                "sandbox_skill_dir": "/home/user/skills/my-skill",
+            }],
+        ])
+        client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+        first_scan_started_at = datetime(2026, 7, 17, 1, 0, 0)
+        retry_scan_started_at = first_scan_started_at + timedelta(seconds=5)
+
+        with patch("src.api.config.get_settings", return_value=fake_settings), patch(
+            "src.agent.tools.skill_loader.SkillLoader",
+            return_value=fake_loader,
+        ), patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            return_value=UserSkillInventoryView(inventory_identity, None, None),
+        ), patch(
+            "src.api.services.skill_inventory_service.replace_user_skill_inventory",
+            return_value=True,
+        ) as publish, patch(
+            "src.api.utils.timezone.now_naive",
+            side_effect=[first_scan_started_at, retry_scan_started_at],
+        ):
+            response = client.get("/config/skills")
+
+        assert response.status_code == 200
         assert response.json()["sandbox_status"] == "available"
+        assert {skill["name"] for skill in response.json()["skills"]} == {
+            "pdf",
+            "my-skill",
+        }
         sandbox_service.recover_persisted_sandbox.assert_awaited_once_with(
             "testuser",
             "sbx-current",
         )
-        sandbox_service.discover_sandbox_skills.assert_awaited_once_with(
-            "testuser",
-            {"pdf"},
-            strict=True,
-        )
+        assert sandbox_service.discover_sandbox_skills.await_count == 2
+        assert publish.call_args.kwargs["observed_at"] == retry_scan_started_at
 
     def test_get_skills_marks_unavailable_sandbox_as_partial_success(
         self, client, tmp_path
@@ -975,10 +1462,13 @@ class TestConfigRouter:
         sandbox_service = MagicMock()
         cached_sandbox = MagicMock(id="sbx-current")
         sandbox_service.get_cached.return_value = cached_sandbox
+        sandbox_service.cached_is_current.return_value = False
         sandbox_service.recover_persisted_sandbox = AsyncMock(
             side_effect=RuntimeError("sandbox unavailable")
         )
         client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+
+        from src.api.services.skill_inventory_service import UserSkillInventoryView
 
         with patch("src.api.config.get_settings", return_value=fake_settings), patch(
             "src.agent.tools.skill_loader.SkillLoader",
@@ -986,13 +1476,16 @@ class TestConfigRouter:
         ), patch(
             "src.api.services.sandbox_service.get_sandbox_service",
             return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            return_value=UserSkillInventoryView(None, None, None),
         ):
             response = client.get("/config/skills")
 
         assert response.status_code == 200
         assert response.json()["sandbox_status"] == "unavailable"
         assert [skill["name"] for skill in response.json()["skills"]] == ["pdf"]
-        client.mock_db.rollback.assert_called_once()  # type: ignore[attr-defined]
+        assert client.mock_db.rollback.call_count >= 1  # type: ignore[attr-defined]
 
     def test_get_skills_marks_scan_timeout_as_partial_success(self, client, tmp_path):
         from src.agent.tools.skill_loader import Skill
@@ -1004,11 +1497,14 @@ class TestConfigRouter:
         ]
         sandbox_service = MagicMock()
         sandbox_service.get_cached.return_value = MagicMock(id="sbx-current")
+        sandbox_service.cached_is_current.return_value = False
         sandbox_service.recover_persisted_sandbox = AsyncMock()
         sandbox_service.discover_sandbox_skills = AsyncMock(
             side_effect=TimeoutError("scan timeout")
         )
         client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
+
+        from src.api.services.skill_inventory_service import UserSkillInventoryView
 
         with patch("src.api.config.get_settings", return_value=fake_settings), patch(
             "src.agent.tools.skill_loader.SkillLoader",
@@ -1016,6 +1512,9 @@ class TestConfigRouter:
         ), patch(
             "src.api.services.sandbox_service.get_sandbox_service",
             return_value=sandbox_service,
+        ), patch(
+            "src.api.services.skill_inventory_service.load_user_skill_inventory",
+            return_value=UserSkillInventoryView(None, None, None),
         ):
             response = client.get("/config/skills")
 
@@ -1041,6 +1540,68 @@ class TestConfigRouter:
         assert response.json()["enabled"] is False
         client.mock_db.commit.assert_called_once()  # type: ignore[attr-defined]
         assert sandbox_service.mock_calls == []
+
+    def test_toggle_skill_uses_trimmed_shared_key_contract(self, client):
+        client.mock_db.query.return_value.filter.return_value.first.return_value = None  # type: ignore[attr-defined]
+        key = "Self-Improving Agent (With Self-Reflection)"
+
+        response = client.put(
+            f"/config/skills/{quote(f'  {key}  ', safe='')}",
+            json={"enabled": False},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["skill_name"] == key
+        created = client.mock_db.add.call_args.args[0]  # type: ignore[attr-defined]
+        assert created.skill_name == key
+
+    def test_toggle_skill_accepts_128_characters_and_rejects_129(self, client):
+        client.mock_db.query.return_value.filter.return_value.first.return_value = None  # type: ignore[attr-defined]
+
+        accepted = client.put(
+            f"/config/skills/{'x' * 128}",
+            json={"enabled": True},
+        )
+        rejected = client.put(
+            f"/config/skills/{'x' * 129}",
+            json={"enabled": True},
+        )
+
+        assert accepted.status_code == 200
+        assert rejected.status_code == 422
+        assert rejected.json()["detail"] == (
+            "Skill key cannot exceed 128 characters"
+        )
+
+    def test_toggle_skill_rejects_unsafe_key_with_allowlisted_error(self, client):
+        response = client.put(
+            "/config/skills/unsafe%25key",
+            json={"enabled": True},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == (
+            "Skill key contains unsupported characters"
+        )
+
+    def test_toggle_skill_hides_unexpected_validator_message(self, client):
+        from src.agent.schema.skill_key import SkillKeyValidationError
+
+        secret = "SECRET_DYNAMIC_VALIDATION_DETAIL"
+        with patch(
+            "src.agent.schema.skill_key.normalize_skill_key",
+            side_effect=SkillKeyValidationError(secret),
+        ):
+            response = client.put(
+                "/config/skills/valid-looking-key",
+                json={"enabled": True},
+            )
+
+        assert response.status_code == 422
+        assert secret not in response.text
+        assert response.json()["detail"] == (
+            "Skill key contains unsupported characters"
+        )
 
 
 class TestEncodeFilename:

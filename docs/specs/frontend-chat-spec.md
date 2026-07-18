@@ -9,6 +9,7 @@
 - 发送用户消息（含附件、引用图片）
 - 消费后端 SSE（AG-UI 事件）增量构建 `RoundData[]`
 - 渲染消息流（user → reasoning → assistant）
+- 选择并发送仅作用于当前逻辑执行链的优先 Skill
 - 将助手回复中的会话文件引用抽取为回复底部的可点击文件卡片，同时保留 markdown 正文原样显示
 - 处理中断/恢复：断连重连、ask_user 中断、用户主动取消
 - 滚动控制：普通进入定位最新消息、搜索命中定位 round、流式底部跟随
@@ -26,6 +27,7 @@ RoundData {
   parent_run_id?: string | null
   user_message: string
   user_attachments?: AttachmentInfo[]
+  preferred_skills: PreferredSkillSnapshot[]
   final_response: string
   steps: StepData[]
   step_count: number
@@ -33,6 +35,11 @@ RoundData {
   created_at: string
   completed_at?: string
   interrupt?: InterruptDetails       // ask_user 中断
+}
+
+PreferredSkillSnapshot {
+  key: string
+  display_name: string
 }
 
 StepData {
@@ -53,6 +60,11 @@ AgentState {
   status: 'idle' | 'running' | 'waiting' | 'error'
   lastUpdated: number
   // ...其余字段通过 JSON Patch 增量更新
+}
+
+SkillDraft {
+  keys: string[]   // GET /api/config/skills 返回的稳定内部 key
+  revision: number // 乐观清空与失败恢复的并发保护版本
 }
 ```
 
@@ -118,6 +130,26 @@ catch (SSE error)
 
 `_ROUND_TERMINAL_STATUSES` 必须与后端 `Round.SUBSCRIBE_TERMINAL_STATUSES` 保持一致。
 
+#### 3.3.1 初始 POST 接受歧义状态机
+
+初始 `message/stream` POST 在响应头到达前发生网络错误时，必须按以下状态机处理：
+
+```text
+pre_accept_pending
+  ├─ 收到响应头 / stream_accepted ───────────────→ accepted
+  ├─ 确定性 HTTP 4xx/5xx ───────────────────────→ definite_rejected
+  ├─ 响应头前网络错误 ──────────────────────────→ ambiguous
+  │    ├─ history 命中同 idempotency_key ───────→ accepted（订阅 running 或收敛终态）
+  │    ├─ 3 次 history 全部成功且均无匹配 ──────→ definite_rejected
+  │    └─ 3 次中任一次失败且最终未命中 ─────────→ ambiguous_unknown
+  └─ 用户主动取消 ──────────────────────────────→ client_cancelled_unknown
+```
+
+- `ambiguous` 期间绝不重发 POST；固定使用原 `idempotency_key` 查询 history，当前确认预算为 3 次。
+- 只有 3 次查询全部成功且都无匹配，才能调用一次 `onRejectedBeforeAccept`、恢复乐观清空的草稿并提示请求失败。任一次查询失败都会使“无匹配”证据不完整；预算耗尽后保持 `ambiguous_unknown`，提示刷新查看，禁止恢复草稿、提示重新发送或用新幂等键自动发送。
+- 用户在响应头前取消：立即 abort POST，停止本地订阅，不启动 history 确认，不发出 `stream_accepted` / `RUN_ERROR` / 接受前拒绝回调，并保持乐观清空后的草稿，防止服务端其实已接受时重复发送。
+- 用户在等待 history 时取消：停止后续确认，忽略在途 history 的迟到结果；即使迟到结果命中 running Round，也不得建立 subscribe。该路径同样不恢复草稿、不自动重发，用户只能刷新查看服务端事实。
+
 ### 3.4 幂等冲突走订阅
 
 `sendMessage` 抛 `RoundExistsError(roundId, status)` 时：
@@ -162,6 +194,38 @@ catch (SSE error)
 - `handleResumeSubmit` 在调用 `resumeStream` 前向 `rounds` 数组追加一个新的 `running` 占位 round（`user_message` 用 `Q:/A:` 拼接的回答摘要）。
 - 旧 round 仍展示在历史中作为可读记录，但其状态在拉取历史时会是 `resumed`（不再是 `interrupted`）。前端断言、测试 fixture 与 UI 渲染分支需基于 `resumed` 而非 `interrupted`。
 - 这样保证刷新页面后，从后端拉到的多 round 结构与本地实时状态一致。
+
+### 3.9 本轮 Skill 偏好
+
+#### 选择器交互
+
+- `ChatInput` 仅在用户显式打开 Skill 选择器时加载普通 `GET /api/config/skills`，每次重新打开都从服务端 DB 快照刷新清单，列表只展示 `enabled === true` 的项目；不得在页面初始化时预取或使用 `refresh=true` 触发远程恢复。已有成功清单时采用 stale-while-refresh：立即展示旧清单并以轻量状态提示请求，不得重新用整面 loading 遮住列表。
+- 当前实现不跨组件实例缓存清单。组件实例内关闭后尚未完成的同一请求可在重开时复用，避免重复远程恢复沙箱；请求完成后的下一次重开仍须发起新刷新。若以后增加更长生命周期缓存，缓存与进行中的请求必须按认证用户隔离，并在登录用户、token 身份或 Skill 启停状态变化时立即失效，禁止跨账号复用私有 Skill 名称、描述或启停状态。
+- “尚未加载”“首次加载中”“已成功加载空列表”“后台刷新中”“首次加载失败”“后台刷新失败”必须是可区分状态。成功空列表或一次失败都不得因弹窗仍打开而触发自动请求循环；首次失败只能由用户显式重试，后台刷新失败须保留旧清单并提供重试入口；服务端返回 `inventory_state=stale` 时也必须保留清单并明确说明正在显示上次成功结果。
+- 列表用 `display_name` 展示名称（缺失时回退 `name`），用 `key` 作为选择、去重和请求标识；不得把展示名称提交给后端。
+- 搜索同时匹配 `display_name`、`name`、`key` 和 `description`，忽略大小写与首尾空白；每次重新打开选择器时清空上次搜索词。
+- 选择项以可移除标签显示，最多选择 50 项；已达到上限时不得继续新增，但仍允许取消现有选择。每个可切换行必须通过 `aria-pressed` 暴露当前选中态。
+- 桌面端选择器锚定在输入框上方，通过点击外部或按 `Escape` 关闭；移动端使用底部浮层并额外提供关闭按钮。关闭不清空已选择的 Skill。
+- 文案必须明确“优先考虑，不强制调用”；是否加载 Skill 仍由 Agent 根据当前请求相关性决定。
+
+#### 已发送消息展示
+
+- `Round` 在普通 direct Round 的用户消息旁展示只读“优先 Skill”标签，数据源为该 Round 的 `preferred_skills`。标签显示持久化的 `display_name`，需要辅助提示时可同时暴露稳定 `key`；不得重新查询当前 Skill 清单来替换历史展示名。
+- 标签表达“这次发送要求 Agent 优先考虑”，不表示该 Skill 已加载、被调用或实际参与生成结果。UI 不得使用“已使用”“已调用”等成功态文案或图标。
+- `preferred_skills=[]` 时不渲染标签容器。resume child Round 即使运行时继承了父逻辑执行链的偏好也保持空数组，前端不得在 Q/A 或工具审批 child 用户消息旁重复展示；标签只出现在最初的 direct Round。
+- 每个独立 direct Round 只展示自己当次发送的快照，不继承或合并前一 Round 的标签。后续 Skill 被禁用、改名或删除也不得改写已有历史标签。
+- 新消息尚未拿到服务端 Round 数据时，可用本次 composer 快照做 optimistic 展示；收到 `RUN_STARTED.preferredSkills`（显式空数组也算权威结果）后立即替换，刷新/断线恢复再以 `history/v2` 的持久化快照为准，确保无效 key 被清除且实时视图与历史一致。
+
+#### 会话草稿与发送
+
+- Skill 选择是输入草稿的一部分，按 session key 隔离保存；切换会话不得把 A 会话选择带到 B 会话。尚未创建 session 时使用独立的新会话草稿，创建成功后须迁移到实际 session，后续恢复也以实际目标 session 为准。
+- 发送时对当前草稿创建不可变快照，并将其作为 `preferred_skill_keys` 与正文、附件一并提交；空数组可省略。之后用户对选择器的编辑不得改变已经发出的请求。
+- 提交发送时乐观清空该目标 session 的 Skill 草稿。服务端确认 SSE 已接受（`stream_accepted` 或 `RUN_STARTED`）后保持清空；执行已被接受后的流式失败、中断或取消不得恢复旧选择。
+- composer 清空只影响下一条待发送草稿，不得删除或隐藏已经固化在当前 direct Round 用户消息旁的 `preferred_skills` 标签。
+- 若 POST 在收到响应头前发生网络错误，前端须按 §3.3.1 用同一 `idempotency_key` 查询历史：匹配到 running/终态 Round 即视为已接受，补发一次 `stream_accepted`，随后立即订阅或收敛终态；从历史恢复的失败终态也必须携带真实 `threadId`、`runId` 和末事件序号。只有 3 次 history 均成功且均无匹配时才恢复发送快照并报请求失败；任一次 history 失败则保持歧义、草稿保持清空并提示刷新。确定性的 HTTP 4xx/5xx 仍立即恢复；恢复回调最多执行一次。
+- 从 history 直接收敛已完成/失败终态时，必须先合成一个无 sequence 的 `RUN_STARTED`，携带该 Round 的 `preferred_skills`（旧数据按 `[]`），再派发 terminal；已知 run 的订阅终态兜底同样如此。Reducer 必须允许这个补偿事件按 server run id 命中已绑定 Round，以纠正 optimistic 展示名并清除无效 key。
+- 失败恢复必须带 revision 保护：若乐观清空后用户没有新编辑，精确恢复快照；若用户已新增或移除选择，则保留当前编辑，并把快照中缺失的 key 按原顺序无重复合并，不能用旧快照覆盖新编辑。
+- `ask_user` 或工具审批产生的 child resume round 由后端继承并重新解析原请求 Skill；前端 `resume` 不重复发送 `preferred_skill_keys`。用户之后独立发送的新消息只使用当时该 session 的新草稿。
 
 ## 4. 滚动策略
 
@@ -261,6 +325,17 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] 用户滚离底部且新回复正在生成时，底部按钮显示 live reply 指示
 - [ ] 助手文件提示行/路径保留在 markdown 正文，同时在回复底部渲染去重文件卡片；点击后打开 Files 抽屉并直接预览目标文件
 - [ ] 代码块内的文件名/命令不触发文件卡片
+- [ ] Skill 选择器仅在显式打开时加载并在重新打开时后台刷新；已有清单立即展示，未完成请求可复用，只展示 enabled 项
+- [ ] Skill 清单不跨组件实例/账号复用，退出后切换账号不泄露上一账号的私有 Skill；成功空列表与请求失败均不产生自动重载循环，刷新失败保留旧清单
+- [ ] Skill 使用 `display_name` 展示、`key` 提交；搜索重开清空；选择、标签移除、50 项上限、桌面点击外部/`Escape` 与移动端关闭按钮行为正确
+- [ ] 普通 direct Round 在用户消息旁按 `preferred_skills` 展示只读标签；空数组不展示，resume child 不重复展示，文案不暗示 Skill 已加载或调用
+- [ ] Skill 草稿按 session 隔离；A/B 会话切换互不污染，新会话创建后草稿迁移到实际 session
+- [ ] 发送携带快照中的 `preferred_skill_keys`，空选择不发送该字段；发送后目标 session 的选择清空
+- [ ] composer 清空后已发送 Round 的 Skill 标签仍保留；刷新或断线恢复后以 `history/v2` 的持久化 `display_name` 快照还原，独立多轮不继承或累积
+- [ ] 接受前 4xx/5xx 立即恢复 Skill 快照；网络歧义按同一幂等键查询 3 次 history，确认 Round 后不恢复，仅 3 次均成功且无匹配时恢复一次；任一次 history 失败则保持 ambiguous、提示刷新且不恢复/重发
+- [ ] 响应头前取消会 abort POST 且不查 history、不恢复草稿；等待 history 时取消会忽略迟到结果、不建立 subscribe、不恢复草稿
+- [ ] 接受前拒绝后若用户已修改 Skill 草稿，保留新编辑并无重复合并旧快照
+- [ ] ask_user 与工具审批 resume 延续原请求的 Skill 偏好；下一条独立消息不继承
 
 ## 11. 已知易错点
 

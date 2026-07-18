@@ -127,6 +127,67 @@ describe('SettingsCenter', () => {
     await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(1));
   });
 
+  it('普通进入读取快照，用户点击刷新时才要求远程重扫', async () => {
+    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
+
+    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(1));
+    expect(getSkills).toHaveBeenNthCalledWith(1, { refresh: undefined });
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新 Skill 清单' }));
+
+    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2));
+    expect(getSkills).toHaveBeenLastCalledWith({ refresh: true });
+  });
+
+  it('强制刷新期间重新进入 Skills tab 会复用刷新请求并应用其结果', async () => {
+    let resolveRefresh: ((value: SkillsResponse) => void) | null = null;
+    vi.mocked(getSkills)
+      .mockResolvedValueOnce({
+        skills: [{
+          name: 'old-skill',
+          description: 'Old snapshot',
+          category: 'general',
+          source: 'user',
+          enabled: true,
+        }],
+        sandbox_status: 'available',
+        inventory_state: 'current',
+      })
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveRefresh = resolve;
+      }));
+
+    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
+    expect(await screen.findByText('old-skill')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新 Skill 清单' }));
+    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByRole('button', { name: '角色设定' }));
+    fireEvent.click(screen.getByRole('button', { name: '技能' }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(getSkills).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resolveRefresh?.({
+        skills: [{
+          name: 'fresh-skill',
+          description: 'Fresh scan',
+          category: 'general',
+          source: 'user',
+          enabled: true,
+        }],
+        sandbox_status: 'available',
+        inventory_state: 'current',
+      });
+    });
+
+    expect(await screen.findByText('fresh-skill')).toBeInTheDocument();
+    expect(screen.queryByText('old-skill')).not.toBeInTheDocument();
+  });
+
   it('进入数据连接后才加载 MCP，并把表单 dirty 状态上报给外层', async () => {
     const onUnsavedChangesChange = vi.fn();
     render(<SettingsCenter onUnsavedChangesChange={onUnsavedChangesChange} />);
@@ -246,6 +307,34 @@ describe('SettingsCenter', () => {
     });
   });
 
+  it('使用 display_name 展示并以稳定 key 切换 Skill', async () => {
+    vi.mocked(getSkills).mockResolvedValue({
+      skills: [{
+        key: 'stable-pdf-key',
+        name: 'internal-pdf-name',
+        display_name: 'PDF 处理',
+        description: 'PDF documents',
+        category: 'document',
+        source: 'official',
+        enabled: true,
+      }],
+      sandbox_status: 'available',
+      inventory_state: 'current',
+    });
+    vi.mocked(toggleSkill).mockResolvedValue();
+
+    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
+
+    expect(await screen.findByText('PDF 处理')).toBeInTheDocument();
+    expect(screen.queryByText('internal-pdf-name')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('switch', { name: '禁用 PDF 处理' }));
+
+    await waitFor(() => {
+      expect(toggleSkill).toHaveBeenCalledWith('stable-pdf-key', false);
+      expect(screen.getByRole('switch', { name: '启用 PDF 处理' })).not.toBeDisabled();
+    });
+  });
+
   it('沙箱不可用时提示用户，同时保留官方技能', async () => {
     vi.mocked(getSkills).mockResolvedValue({
       skills: [
@@ -277,6 +366,37 @@ describe('SettingsCenter', () => {
     expect(screen.getByText('官方')).toBeInTheDocument();
   });
 
+  it('严格刷新失败时说明正在显示上次快照而不是声称仅有官方技能', async () => {
+    vi.mocked(getSkills).mockResolvedValue({
+      skills: [
+        {
+          name: 'pdf',
+          description: 'PDF documents',
+          category: 'document',
+          source: 'official',
+          enabled: true,
+        },
+        {
+          name: 'cached-user-skill',
+          description: 'Cached user skill',
+          category: 'user',
+          source: 'user',
+          enabled: true,
+        },
+      ],
+      sandbox_status: 'unavailable',
+      inventory_state: 'stale',
+    });
+
+    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
+
+    expect(await screen.findByText('cached-user-skill')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent(
+      '刷新失败，正在显示上次成功加载的 Skill 清单。',
+    );
+    expect(screen.queryByText('工作沙箱暂时不可用，目前仅显示官方技能。')).not.toBeInTheDocument();
+  });
+
   it('手动重试期间保留现有官方技能并在成功后加载用户技能', async () => {
     let resolveRetry: ((value: SkillsResponse) => void) | null = null;
     vi.mocked(getSkills)
@@ -300,7 +420,7 @@ describe('SettingsCenter', () => {
     fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
 
     expect(screen.getByText('pdf')).toBeInTheDocument();
-    expect(screen.getByText('正在恢复工作沙箱并加载技能…')).toBeInTheDocument();
+    expect(screen.getByText('正在加载技能清单…')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '重新加载' })).toBeDisabled();
 
     await act(async () => {
@@ -383,7 +503,7 @@ describe('SettingsCenter', () => {
       });
     });
 
-    expect(screen.getAllByText('正在恢复工作沙箱并加载技能…')).not.toHaveLength(0);
+    expect(screen.getAllByText('正在加载技能清单…')).not.toHaveLength(0);
     expect(screen.queryByText('stale-skill')).not.toBeInTheDocument();
 
     await act(async () => {

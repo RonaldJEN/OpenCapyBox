@@ -35,6 +35,17 @@ def _make_sandbox(read_results: dict[str, str | Exception]):
     return sandbox
 
 
+def test_agents_template_routes_connected_data_before_web_search():
+    from src.api.services.memory_service import MemoryService
+
+    content = MemoryService(MagicMock()).get_agents_template_content()
+    data_route = content.index("`tool_search`（按连接名或能力词发现）")
+    web_fallback = content.index("数据连接无匹配 / 调用失败")
+
+    assert data_route < web_fallback
+    assert "`search` / `batch_search`" in content[web_fallback:]
+
+
 @pytest.mark.asyncio
 async def test_sandbox_first_when_not_forced():
     """非 force 模式：沙箱有内容 → 保留沙箱版本并回写 DB"""

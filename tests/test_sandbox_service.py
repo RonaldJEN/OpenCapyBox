@@ -1137,10 +1137,12 @@ class TestDiscoverSandboxSkills:
         # read_file 依次返回兩個 SKILL.md 的內容
         skill_contents = {
             "/home/user/skills/industry-report/SKILL.md": (
-                "---\nname: industry-report\ndescription: 行业研究报告\n---\n## Usage\n"
+                "---\nname: industry-report\ndisplay_name: 行业报告"
+                "\ndescription: 行业研究报告\n---\n## Usage\n"
             ),
             "/home/user/skills/custom-tool/SKILL.md": (
-                "---\nname: custom-tool\ndescription: Custom tool\n---\n## Custom\n"
+                "---\nname: custom-tool\nmetadata:\n  display_name: Custom Tool UI"
+                "\ndescription: Custom tool\n---\n## Custom\n"
             ),
         }
 
@@ -1162,6 +1164,9 @@ class TestDiscoverSandboxSkills:
         assert "industry-report" in names
         assert "custom-tool" in names
         assert results[0]["sandbox_skill_dir"] == "/home/user/skills/industry-report"
+        by_name = {item["name"]: item for item in results}
+        assert by_name["industry-report"]["display_name"] == "行业报告"
+        assert by_name["custom-tool"]["display_name"] == "Custom Tool UI"
 
     @pytest.mark.asyncio
     async def test_discover_sandbox_skills_dedup_official(self, service, sandbox_with_skills):
@@ -1303,6 +1308,133 @@ class TestDiscoverSandboxSkills:
             "/home/user/skills/second/SKILL.md",
         ]
         assert [item["name"] for item in results] == ["first-skill", "second-skill"]
+
+    @pytest.mark.asyncio
+    async def test_discover_sandbox_skills_rejects_duplicate_user_keys_as_batch(
+        self, service, mock_sandbox
+    ):
+        service._cache["user-1"] = mock_sandbox
+        exec_result = MagicMock(exit_code=0, error=None)
+        exec_result.logs = MagicMock(
+            stdout=(
+                "/home/user/skills/first/SKILL.md\n"
+                "/home/user/skills/second/SKILL.md\n"
+            )
+        )
+        mock_sandbox.commands.run = AsyncMock(return_value=exec_result)
+        mock_sandbox.files.read_file = AsyncMock(
+            return_value="---\nname: duplicate\ndescription: Same key\n---\n"
+        )
+
+        assert await service.discover_sandbox_skills("user-1") == []
+        with pytest.raises(RuntimeError, match="用户 Skill 清单无效"):
+            await service.discover_sandbox_skills("user-1", strict=True)
+
+    @pytest.mark.asyncio
+    async def test_discover_sandbox_skills_rejects_unsafe_key_as_batch(
+        self, service, mock_sandbox
+    ):
+        service._cache["user-1"] = mock_sandbox
+        exec_result = MagicMock(exit_code=0, error=None)
+        exec_result.logs = MagicMock(
+            stdout="/home/user/skills/unsafe/SKILL.md\n"
+        )
+        mock_sandbox.commands.run = AsyncMock(return_value=exec_result)
+        mock_sandbox.files.read_file = AsyncMock(
+            return_value="---\nname: unsafe#key\ndescription: Unsafe\n---\n"
+        )
+
+        with pytest.raises(RuntimeError, match="用户 Skill 元数据无效"):
+            await service.discover_sandbox_skills("user-1", strict=True)
+
+    @pytest.mark.asyncio
+    async def test_strict_discovery_rejects_invalid_frontmatter_without_partial_publish(
+        self, service, mock_sandbox
+    ):
+        service._cache["user-1"] = mock_sandbox
+        exec_result = MagicMock(exit_code=0, error=None)
+        exec_result.logs = MagicMock(
+            stdout=(
+                "/home/user/skills/good/SKILL.md\n"
+                "/home/user/skills/missing-name/SKILL.md\n"
+            )
+        )
+        mock_sandbox.commands.run = AsyncMock(return_value=exec_result)
+
+        async def _read_file(path):
+            if "/good/" in path:
+                return "---\nname: good\ndescription: Good\n---\n"
+            return "---\ndescription: Missing name\n---\n"
+
+        mock_sandbox.files.read_file = AsyncMock(side_effect=_read_file)
+
+        with pytest.raises(RuntimeError, match="用户 Skill 元数据无效"):
+            await service.discover_sandbox_skills("user-1", strict=True)
+        assert await service.discover_sandbox_skills("user-1") == [{
+            "name": "good",
+            "display_name": "good",
+            "description": "Good",
+            "sandbox_skill_dir": "/home/user/skills/good",
+        }]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "frontmatter",
+        [
+            "---\nname: [broken\n---\n",
+            "---\nname: [not, a, string]\ndescription: Bad\n---\n",
+            "---\nname: bad-description\ndescription: [not, text]\n---\n",
+            "---\nname: bad-metadata\ndescription: Bad\nmetadata: scalar\n---\n",
+            "---\nname: bad-display\ndescription: Bad\ndisplay_name: 42\n---\n",
+        ],
+    )
+    async def test_strict_discovery_rejects_invalid_yaml_metadata_types(
+        self, service, mock_sandbox, frontmatter
+    ):
+        service._cache["user-1"] = mock_sandbox
+        exec_result = MagicMock(exit_code=0, error=None)
+        exec_result.logs = MagicMock(
+            stdout="/home/user/skills/invalid/SKILL.md\n"
+        )
+        mock_sandbox.commands.run = AsyncMock(return_value=exec_result)
+        mock_sandbox.files.read_file = AsyncMock(return_value=frontmatter)
+
+        with pytest.raises(RuntimeError, match="用户 Skill 元数据无效"):
+            await service.discover_sandbox_skills("user-1", strict=True)
+
+    @pytest.mark.asyncio
+    async def test_official_skills_do_not_consume_user_inventory_capacity(
+        self, service, mock_sandbox
+    ):
+        from src.api.services.skill_inventory_service import (
+            MAX_USER_SKILL_INVENTORY_ITEMS,
+        )
+
+        service._cache["user-1"] = mock_sandbox
+        paths = ["/home/user/skills/official/SKILL.md"] + [
+            f"/home/user/skills/user-{index}/SKILL.md"
+            for index in range(MAX_USER_SKILL_INVENTORY_ITEMS)
+        ]
+        exec_result = MagicMock(exit_code=0, error=None)
+        exec_result.logs = MagicMock(stdout="\n".join(paths))
+        mock_sandbox.commands.run = AsyncMock(return_value=exec_result)
+
+        async def _read_file(path):
+            if "/official/" in path:
+                name = "official"
+            else:
+                name = path.split("/")[-2]
+            return f"---\nname: {name}\ndescription: Test\n---\n"
+
+        mock_sandbox.files.read_file = AsyncMock(side_effect=_read_file)
+        results = await service.discover_sandbox_skills(
+            "user-1",
+            official_skill_names={"official"},
+            strict=True,
+        )
+
+        assert len(results) == MAX_USER_SKILL_INVENTORY_ITEMS
+        assert all(item["name"] != "official" for item in results)
 
 
 # ============== read_sandbox_skill_content ==============

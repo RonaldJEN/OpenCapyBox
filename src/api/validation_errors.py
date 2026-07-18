@@ -20,7 +20,13 @@ _PUBLIC_LOCATION_ROOTS = {"body", "cookie", "header", "path", "query"}
 # These names are consumed by the existing frontend to provide useful upload
 # and message-length guidance. Other nested strings may be user-controlled map
 # keys, so they are deliberately not reflected.
-_PUBLIC_LOCATION_FIELDS = {"content", "file", "idempotency_key", "text"}
+_PUBLIC_LOCATION_FIELDS = {
+    "content",
+    "file",
+    "idempotency_key",
+    "preferred_skill_keys",
+    "text",
+}
 
 
 def _public_location(location: Any) -> list[str | int]:

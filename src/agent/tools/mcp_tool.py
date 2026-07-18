@@ -79,6 +79,10 @@ class McpRemoteTool(Tool):
         return self._snapshot.server_name
 
     @property
+    def server_description(self) -> str | None:
+        return self._snapshot.server_description
+
+    @property
     def title(self) -> str | None:
         return self._snapshot.title
 

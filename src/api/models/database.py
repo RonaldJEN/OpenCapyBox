@@ -5,6 +5,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import OperationalError
 
+from src.agent.schema.skill_key import MAX_SKILL_KEY_LENGTH
 from src.api.config import get_settings
 from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS
 
@@ -30,6 +31,7 @@ def _import_models():
     from src.api.models.sandbox_profile import SandboxProfile as _  # noqa: F401
     from src.api.models.user_sandbox_config import UserSandboxConfig as _  # noqa: F401
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
+    from src.api.models.user_skill_inventory import UserSkillInventorySnapshot as _  # noqa: F401
     from src.api.models.conversation_message import ConversationMessage as _  # noqa: F401
     from src.api.models.interrupt_resolution import InterruptResolution as _  # noqa: F401
     from src.api.models.llm_call_record import LLMCallRecord as _  # noqa: F401
@@ -44,6 +46,7 @@ def _import_models():
         McpInstallation,
         McpToolVisibility,
         McpToolSnapshot,
+        McpToolSearchIndex,
         McpConfigVersion,
     )
     from src.api.models.tool_permission import (  # noqa: F401
@@ -305,6 +308,7 @@ _BOOL_TRUE = "TRUE"
 _PENDING_COLUMNS = [
     ("sessions", "model_id", "VARCHAR(50)"),
     ("rounds", "user_attachments", "TEXT"),
+    ("rounds", "preferred_skills", "TEXT"),
     ("rounds", "interrupt_payload", "TEXT"),
     ("rounds", "idempotency_key", "VARCHAR(64)"),
     ("conversation_messages", "is_synthetic", f"BOOLEAN DEFAULT {_BOOL_FALSE}"),
@@ -533,6 +537,23 @@ def _migrate_add_columns(target_engine=None):
                 if col["name"] == "model_id" and hasattr(col["type"], "length") and (col["type"].length or 0) < 100:
                     conn.execute(text("ALTER TABLE sessions ALTER COLUMN model_id TYPE VARCHAR(100)"))
                     logger.info("DB 迁移: sessions.model_id 从 VARCHAR(%s) 升级为 VARCHAR(100)", col["type"].length)
+
+        if inspector.has_table("user_skill_configs"):
+            for col in inspector.get_columns("user_skill_configs"):
+                if (
+                    col["name"] == "skill_name"
+                    and hasattr(col["type"], "length")
+                    and (col["type"].length or 0) < MAX_SKILL_KEY_LENGTH
+                ):
+                    conn.execute(text(
+                        "ALTER TABLE user_skill_configs ALTER COLUMN skill_name "
+                        f"TYPE VARCHAR({MAX_SKILL_KEY_LENGTH})"
+                    ))
+                    logger.info(
+                        "DB 迁移: user_skill_configs.skill_name 从 VARCHAR(%s) 升级为 VARCHAR(%s)",
+                        col["type"].length,
+                        MAX_SKILL_KEY_LENGTH,
+                    )
 
         # PostgreSQL: memory_embeddings.embedding 统一为目标 pgvector 维度
         if inspector.has_table("memory_embeddings"):

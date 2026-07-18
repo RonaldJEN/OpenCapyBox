@@ -333,6 +333,7 @@ function mergeActiveRound(localRound: RoundData, serverRound: RoundData): RoundD
     control_kind: localRound.control_kind ?? serverRound.control_kind,
     user_message: localRound.user_message || serverRound.user_message,
     user_attachments: localRound.user_attachments || serverRound.user_attachments,
+    preferred_skills: serverRound.preferred_skills ?? localRound.preferred_skills,
     final_response: localRound.final_response || serverRound.final_response,
     steps: localRound.steps.length > 0 ? localRound.steps : serverRound.steps,
     step_count: Math.max(localRound.step_count || 0, serverRound.step_count || 0),
@@ -547,8 +548,15 @@ function applyRunStarted(
   };
   const session = ensureSession(state, run.ownerSessionId);
   const rounds = session.rounds.map((round) => (
-    round.round_id === run.tempRoundId
-      ? { ...round, round_id: serverRunId, status: 'running' }
+    roundMatchesRun(round, run, serverRunId)
+      ? {
+          ...round,
+          round_id: serverRunId,
+          status: 'running',
+          preferred_skills: Array.isArray(envelope.event.preferredSkills)
+            ? envelope.event.preferredSkills
+            : round.preferred_skills,
+        }
       : round
   ));
   const nextState = putSession(state, run.ownerSessionId, {

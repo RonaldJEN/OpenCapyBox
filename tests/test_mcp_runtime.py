@@ -14,6 +14,7 @@ from src.api.services.mcp_runtime import (
     EffectiveMcpInstallation,
     McpCallCancelled,
     McpCallOutcomeUnknown,
+    McpConnectionSummary,
     McpInstallationUnavailable,
     McpRequiredServerUnavailable,
     McpRuntime,
@@ -37,6 +38,8 @@ def _installation(
     *,
     server_id="server-12345678",
     installation_id="install-1",
+    server_name="example",
+    server_description=None,
     required=False,
     enabled_tools=None,
     disabled_tools=frozenset(),
@@ -45,8 +48,9 @@ def _installation(
         installation_id=installation_id,
         server_id=server_id,
         user_id="user-1",
-        server_name="example",
+        server_name=server_name,
         url="https://mcp.example.test/mcp",
+        server_description=server_description,
         required=required,
         enabled_tools=(
             None if enabled_tools is None else frozenset(enabled_tools)
@@ -608,7 +612,10 @@ async def test_paginated_discovery_shares_transport_budget_across_pages(monkeypa
 
 @pytest.mark.asyncio
 async def test_resolve_catalog_projects_stable_names_and_persists_snapshot():
-    installation = _installation()
+    installation = _installation(
+        server_name="同花顺股票 MCP",
+        server_description="A 股实时行情、个股资料、财务和公告",
+    )
     repository = FakeRepository([installation])
     connector = FakeConnector()
     connector.tools[installation.installation_id] = [{
@@ -624,6 +631,13 @@ async def test_resolve_catalog_projects_stable_names_and_persists_snapshot():
     tool = catalog.tools[0]
     assert tool.model_name == "mcp__server12__read_report_v1_666cae62"
     assert tool.raw_name == "read/report.v1"
+    assert catalog.connections == (
+        McpConnectionSummary(
+            server_id=installation.server_id,
+            server_name="同花顺股票 MCP",
+            server_description="A 股实时行情、个股资料、财务和公告",
+        ),
+    )
     assert repository.saved[installation.installation_id][0].schema_hash == tool.schema_hash
 
 

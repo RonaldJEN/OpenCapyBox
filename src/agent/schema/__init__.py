@@ -57,6 +57,20 @@ from .agui_events import (
     RunFinishedOutcome,
 )
 
+from .run_context import (
+    AgentRunContext,
+    LLMRequestContext,
+    RequestedPreferredSkillsContext,
+    ResolvedPreferredSkillsContext,
+    ResolvedSkillRef,
+)
+from .skill_key import (
+    MAX_SKILL_KEY_LENGTH,
+    PUBLIC_SKILL_KEY_VALIDATION_ERRORS,
+    SkillKeyValidationError,
+    normalize_skill_key,
+)
+
 __all__ = [
     # 原有導出
     "FunctionCall",
@@ -108,4 +122,13 @@ __all__ = [
     "InterruptDetails",
     "ResumePayload",
     "RunFinishedOutcome",
+    "AgentRunContext",
+    "LLMRequestContext",
+    "RequestedPreferredSkillsContext",
+    "ResolvedPreferredSkillsContext",
+    "ResolvedSkillRef",
+    "MAX_SKILL_KEY_LENGTH",
+    "PUBLIC_SKILL_KEY_VALIDATION_ERRORS",
+    "SkillKeyValidationError",
+    "normalize_skill_key",
 ]

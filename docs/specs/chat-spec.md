@@ -1,7 +1,7 @@
 # 聊天与 Agent 执行 (Chat) — Spec
 
 > **模块归属**: `src/api/routes/chat.py`, `src/api/services/turn_orchestrator.py`, `src/api/services/agent_service.py`, `src/agent/agent.py`
-> **最后更新**: 2026-06-07
+> **最后更新**: 2026-07-17
 > **状态**: Draft
 
 ---
@@ -60,10 +60,11 @@
 | `outcome` | String(20) | nullable | 执行结果：`success` / `interrupt` |
 | `user_message` | Text | NOT NULL | 用户原始消息内容 |
 | `user_attachments` | Text | nullable | JSON 序列化的附件列表 |
+| `preferred_skills` | Text | nullable | JSON：`[{key, display_name}]`；普通 direct Round 在本次发送开始时解析出的有效“优先 Skill”展示快照，旧数据 `null` 按 `[]` 处理 |
 | `final_response` | Text | nullable | Agent 最终文本响应 |
 | `step_count` | Integer | default=0 | Agent 执行步数 |
 | `status` | String(20) | default=`"running"` | 当前状态（见下方状态机） |
-| `interrupt_payload` | Text | nullable | JSON：`{id, reason, payload}` |
+| `interrupt_payload` | Text | nullable | JSON：`{id, reason, payload, runtime_context?, preferred_skills_origin_user_message_id?}`；后两项由服务端写入 |
 | `idempotency_key` | String(64) | nullable | 前端生成的幂等键 |
 | `created_at` | DateTime | default=now, indexed | 创建时间 |
 | `completed_at` | DateTime | nullable | 终态达成时间 |
@@ -303,7 +304,8 @@ Content-Type: application/json
 
 {
   "content": ContentBlock[],
-  "idempotency_key": "uuid-string"     // 可选
+  "idempotency_key": "uuid-string",    // 可选
+  "preferred_skill_keys": ["pdf", "data_analysis"] // 可选，本轮优先 Skill
 }
 ```
 
@@ -315,6 +317,21 @@ Content-Type: application/json
 | `image_url` | `{type: "image_url", image_url: {url: string}}` | 图片（base64 data URI 或 URL） |
 | `video_url` | `{type: "video_url", video_url: {url: string}}` | 视频 |
 | `file` | `{type: "file", file: {path: string, name?: string, mime_type?: string, size?: number}}` | 文件附件，`path` 为会话工作区相对路径 |
+
+**`preferred_skill_keys` 契约与作用域**:
+
+- 值为 Skill 的稳定内部 `key` 数组；最多 50 项。每项先 trim，空项忽略，其余必须不超过 128 个 Unicode 字符；为兼容官方 Skill，允许人类可读 Unicode、空格和括号，禁止 `/`、`\`、`?`、`#`、`%` 及 Unicode General Category 为 `C*` 的控制/格式化/不可见字符。服务端按首次出现顺序去重；其他非法 key 使请求校验失败。
+- 该字段表达用户对**当前逻辑执行链**的偏好，不是强制工具调用指令。Agent 仅在与用户实际请求相关且本轮暴露 `get_skill` 时优先考虑这些 Skill；不得让 Skill 偏好覆盖用户请求。
+- 每次新 `message/stream` 独立解析该字段。未传或传空数组表示本次发送没有 Skill 偏好；不得从同一 session 的前序普通消息继承。
+- 服务端把请求转换为版本化上下文 `bsbox.preferred_skills.v1`（`{"mode":"preferred","keys":[...]}`），并在 run 启动前根据该用户当时可见且已启用的 Skill registry 重新解析。未知、已删除或已禁用的 key 被忽略，不导致整次发送失败。
+- 普通 `message/stream` direct Round 把本次解析后仍有效的 Skill 按顺序固化为 `preferred_skills: [{"key":"...","display_name":"..."}]`。这是发送当时的不可变展示快照：`key` 为稳定内部标识，`display_name` 为当时的展示名；不得在读取历史时用最新 registry 改写。空选择或全部 key 无效时保存/返回空数组。
+- direct 流的 `RUN_STARTED` 必须同步携带同一份权威快照 `preferredSkills: [{key, display_name}]`（包括显式空数组），让前端立即用解析结果替换 optimistic key；resume child 的 `RUN_STARTED.preferredSkills` 固定为空数组。重连订阅重放该事件时语义不变。
+- `preferred_skills` 只表示该 direct Round 的请求级“优先考虑”偏好，不证明 Agent 已加载 Skill、调用 `get_skill` 或实际使用了该 Skill。每个后续独立 direct Round 只记录自己当次提交并解析出的快照，不从前一 Round 继承或累积。
+- 解析后的上下文只投影到精确匹配的**原始 user message 锚点**的 provider 请求副本，作用于 `agent_step` / `tool_followup`；不得写回 `agent.messages`、`conversation_messages`、长期 system prompt，也不得注入标题生成、对话摘要或记忆提取请求。child resume 的回答消息不是该投影锚点。
+- 该上下文是用户通过 UI 控件提交的请求元数据，不是用户正文。provider 请求必须同时携带系统级解释策略；模型不得仅因该上下文出现就声称“用户提到/点名/要求加载了这些 Skill”，也不得在与正文无关时主动复述选择。仅在用户询问选择状态或需要解释实际 Skill 动作时才可提及。
+- 若本轮因 `ask_user` 或工具权限审批中断，原始请求 key 与服务端生成的 `preferred_skills_origin_user_message_id` 会同时写入热路径 pending interrupt 和持久化 `interrupt_payload`。`resume` 时按最新 registry 和启停状态重新解析，并把同一锚点原样继承到 child resume round；因此 R1 → R2 → R3 连续中断/恢复始终投影到 R1 的原始 user message，而不是逐级改为父 Round 的回答。该继承仅延续同一次被中断的执行意图，不得扩散到之后独立发送的新消息。
+- resume child Round 运行时继续继承并重新解析原请求偏好，但自身 `preferred_skills` 必须为空，不重复展示父 direct Round 已记录的标签，也不得覆盖父 Round 的发送时快照。
+- `preferred_skills_origin_user_message_id` 是服务端专用元数据，不属于 `bsbox.preferred_skills.v1` 的客户端 payload。发送和 resume 请求均不能提交或覆盖它；客户端在 runtime context 中夹带同名字段必须被忽略。旧中断记录缺少该字段时，仅可用命中中断的父 Round user message 作为兼容回退，并在下一次中断时持久化服务端确认的锚点。
 
 **file block 注入语义**:
 
@@ -348,6 +365,7 @@ SSE 事件流格式遵循 AG-UI 协议（详见 [第 4.6 节](#46-ag-ui-事件�
 |-------------|------|------|
 | 404 | 会话不存在 | `session_id` 无效或不属于当前用户 |
 | 410 | 会话已完成 | 会话处于终态，不再接受新消息 |
+| 422 | 请求校验失败 | `content` 或 `preferred_skill_keys` 超出数量/长度限制、字段类型非法 |
 | 429 | 当前运行任务数已达上限 | 用户 slot 已满，或同 session 已有 active run |
 | 503 | 服务不可用 | DB 锁冲突等内部错误 |
 
@@ -411,6 +429,8 @@ Agent 初始化和中断状态校验在 SSE generator 内执行；入口只做�
 | **冷启动历史重建** (Cold Restore Path) | resume 已完成过，之后服务重启/AgentPool 回收再加载整个 session | 读取 `interrupt_resolutions`，把 child Q/A 回填到 parent ask_user `tool_result`，并跳过对应 child resume user 消息；若回填失败，则保留 child user 消息避免语义丢失 |
 
 恢复请求都会创建新的 Round，其 `parent_run_id` 指向被 `interrupt_id` 命中的中断 Round，并在同一事务中写入 `interrupt_resolutions`。原 Round 只在命中该 `interrupt_id` 时迁移为 `resumed`，不得批量 resolve 同 session 的其他 interrupted rounds。
+
+若父 Round 携带 `preferred_skill_keys` 生成的版本化 runtime context，热路径 pending interrupt 与持久化 `interrupt_payload` 都必须保留该请求上下文及服务端生成的原始 user message 锚点。`resume` 请求本身不接收新的 `preferred_skill_keys` 或锚点；服务端从中断快照恢复原始 key 和锚点，并按 resume 当时可见且已启用的 Skill registry 重新解析。恢复后仍不可用的 key 静默忽略，解析结果仅作用于新建的 child resume round；该 child 若再次中断，必须继续写回同一锚点，不能改成当前父 Round 的 user message。
 
 #### 错误码
 
@@ -541,6 +561,25 @@ SSE 事件流。
 | HTTP 状态码 | 含义 |
 |-------------|------|
 | 404 | 会话不存在 |
+
+### 3.6 `GET /api/sessions/{session_id}/history/v2`
+
+按 Round/Step 结构返回会话历史。`HistoryResponseV2.rounds[]` 除既有 Round 字段外，必须包含：
+
+```json
+{
+  "preferred_skills": [
+    {"key": "pdf", "display_name": "PDF 处理"}
+  ]
+}
+```
+
+`preferred_skills` 类型为 `Array<{key: string, display_name: string}>`，并遵循以下投影规则：
+
+- 普通 direct Round 返回该次 `message/stream` 在运行开始时解析并持久化的有效 Skill 展示快照；没有有效偏好或读取旧版 `null` 数据时返回 `[]`。
+- resume child Round 固定返回 `[]`。其运行时虽然继承父逻辑执行链的偏好，但历史 UI 只在最初的 direct Round 用户消息旁展示一次，不能在每个 child 重复展示。
+- 该数组是不可变的历史展示数据，不是 Skill 使用审计；不能据此声称 Skill 已加载、已调用或对结果有贡献。
+- 各个独立 direct Round 的数组彼此隔离，不继承、不合并，也不根据当前启停状态、改名或删除情况重算。
 
 ---
 
@@ -896,7 +935,7 @@ Agent 调用 ask_user 工具
     │
     ▼
 保存中断状态到 Round:
-  - interrupt_payload = {id, reason, payload}
+  - interrupt_payload = {id, reason, payload, runtime_context?, preferred_skills_origin_user_message_id?}
   - status = "interrupted"
     │
     ▼
@@ -1132,6 +1171,12 @@ GET /subscribe?last_sequence={last_seq}
           ▼
         从 DB 回放所有剩余事件 → 关闭连接
 ```
+
+若初始 POST 在客户端收到响应头前断开，是否已创建 Round 属于歧义状态。前端不得重发 POST，而应在固定确认窗口内按原 `idempotency_key` 查询会话历史（当前最多 3 次）：命中 running Round 时立即从其 `round_id` 订阅，命中终态 Round 时直接收敛对应终态；该确认路径与正常 2xx 响应一样只发出一次 `stream_accepted`。
+
+只有规定的 3 次 history 请求**全部成功**且每次均无匹配 Round，才能确认请求未被接受、触发一次接受前拒绝回调并恢复乐观清空的草稿。只要任一次 history 请求失败，确认窗口耗尽后仍必须保持 `ambiguous`：提示“暂时无法确认请求是否已受理，请刷新页面查看结果”，不得恢复草稿、不得提示重新发送，也不得以新幂等键重发。确定性的接受前 HTTP 4xx/5xx 不进入该歧义分支，可立即按拒绝处理。
+
+用户在收到 POST 响应头前主动取消时，客户端立即中止 POST 并结束本地订阅，不查询 history、不发出接受/拒绝事件，也不恢复已乐观清空的草稿；请求在服务端是否落地仍未知，避免恢复后误重发。用户在等待 history 确认期间取消时，停止后续重试，忽略已在途 history 的迟到结果，不得因该结果订阅 Round 或恢复草稿。两种取消都保留“刷新查看”的安全边界，后续不得自动重发。
 
 ---
 

@@ -3,8 +3,38 @@
 import json
 from collections.abc import Sequence
 
+from sqlalchemy.types import UserDefinedType
+
 
 MEMORY_EMBEDDING_DIMENSIONS = 2560
+
+
+class PGVector(UserDefinedType):
+    """Shared PostgreSQL pgvector type with JSON-compatible Python values."""
+
+    cache_ok = True
+
+    def __init__(self, dimensions: int):
+        self.dimensions = dimensions
+
+    def get_col_spec(self, **kw):
+        return f"vector({self.dimensions})"
+
+    def bind_processor(self, dialect):
+        def process(value):
+            return serialize_pgvector(value)
+
+        return process
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return parse_embedding_vector(value)
+            return list(value)
+
+        return process
 
 
 def normalize_embedding_vector(

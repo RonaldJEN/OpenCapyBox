@@ -71,6 +71,7 @@ export interface RunStartedEvent extends AGUIBaseEvent {
   threadId: string;
   runId: string;
   parentRunId?: string;
+  preferredSkills?: PreferredSkillSnapshot[];
 }
 
 export interface RunFinishedEvent extends AGUIBaseEvent {
@@ -433,6 +434,11 @@ export interface AttachmentInfo {
   session_id?: string;
 }
 
+export interface PreferredSkillSnapshot {
+  key: string;
+  display_name: string;
+}
+
 // 对话轮次
 export interface RoundData {
   round_id: string;
@@ -442,6 +448,7 @@ export interface RoundData {
   last_event_sequence?: number;
   user_message: string;
   user_attachments?: AttachmentInfo[];
+  preferred_skills?: PreferredSkillSnapshot[];
   final_response: string;
   steps: StepData[];
   step_count: number;

@@ -116,6 +116,7 @@ class HistoryService:
         round_id: str,
         user_message: str,
         user_attachments: Optional[List[Dict]] = None,
+        preferred_skills: Optional[List[Dict[str, str]]] = None,
         idempotency_key: Optional[str] = None,
         parent_run_id: Optional[str] = None,
     ) -> Round:
@@ -129,6 +130,21 @@ class HistoryService:
             session_id=session_id,
             user_message=user_message,
             user_attachments=json.dumps(user_attachments or [], ensure_ascii=False),
+            preferred_skills=(
+                json.dumps(
+                    [
+                        {
+                            "key": item["key"],
+                            "display_name": item["display_name"],
+                        }
+                        for item in preferred_skills
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                if preferred_skills is not None
+                else None
+            ),
             status="running",
             idempotency_key=idempotency_key,
             parent_run_id=parent_run_id,
@@ -521,6 +537,26 @@ class HistoryService:
                 except json.JSONDecodeError:
                     attachments = []
 
+            preferred_skills: List[Dict[str, str]] = []
+            if round_obj.preferred_skills:
+                try:
+                    parsed_preferred_skills = json.loads(round_obj.preferred_skills)
+                    if isinstance(parsed_preferred_skills, list) and all(
+                        isinstance(item, dict)
+                        and isinstance(item.get("key"), str)
+                        and isinstance(item.get("display_name"), str)
+                        for item in parsed_preferred_skills
+                    ):
+                        preferred_skills = [
+                            {
+                                "key": item["key"],
+                                "display_name": item["display_name"],
+                            }
+                            for item in parsed_preferred_skills
+                        ]
+                except (json.JSONDecodeError, TypeError):
+                    preferred_skills = []
+
             # 解析 interrupt_payload（仅 interrupted 状态）
             interrupt_details = None
             if round_obj.status == "interrupted" and round_obj.interrupt_payload:
@@ -542,6 +578,7 @@ class HistoryService:
                     "last_event_sequence": last_event_sequence,
                     "user_message": round_obj.user_message,
                     "user_attachments": attachments,
+                    "preferred_skills": preferred_skills,
                     "final_response": round_obj.final_response,
                     "step_count": round_obj.step_count,
                     "status": round_obj.status,

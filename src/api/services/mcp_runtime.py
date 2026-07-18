@@ -142,6 +142,7 @@ class EffectiveMcpInstallation:
     user_id: str
     server_name: str
     url: str
+    server_description: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     required: bool = False
     source: str = "personal"
@@ -214,10 +215,20 @@ class McpToolSnapshot:
     description: str
     input_schema: dict[str, Any]
     title: str | None = None
+    server_description: str | None = None
     annotations: dict[str, Any] = field(default_factory=dict)
     schema_hash: str = ""
     connection_fingerprint: str = ""
     stale: bool = False
+
+
+@dataclass(frozen=True)
+class McpConnectionSummary:
+    """Compact user-visible MCP metadata used only for model tool routing."""
+
+    server_id: str
+    server_name: str
+    server_description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -228,6 +239,7 @@ class McpCatalogSnapshot:
     fingerprint: str
     tools: tuple[McpToolSnapshot, ...]
     errors: tuple[str, ...] = ()
+    connections: tuple[McpConnectionSummary, ...] = ()
 
 
 @dataclass
@@ -723,6 +735,14 @@ def _catalog_snapshot_size_bytes(snapshot: McpCatalogSnapshot) -> int:
         "user_id": snapshot.user_id,
         "fingerprint": snapshot.fingerprint,
         "errors": snapshot.errors,
+        "connections": [
+            {
+                "server_id": connection.server_id,
+                "server_name": connection.server_name,
+                "server_description": connection.server_description,
+            }
+            for connection in snapshot.connections
+        ],
         "tools": [
             {
                 "installation_id": tool.installation_id,
@@ -1363,6 +1383,12 @@ class _SqlAlchemyMcpRepository:
                 user_id=user_id,
                 server_name=str(server.name),
                 url=str(server.url),
+                server_description=(
+                    str(server.description).strip()
+                    if getattr(server, "description", None)
+                    and str(server.description).strip()
+                    else None
+                ),
                 headers=headers,
                 required=bool(getattr(server, "required", False)),
                 source=str(server.source),
@@ -1473,6 +1499,7 @@ class _SqlAlchemyMcpRepository:
                     raw_name=raw_name,
                     model_name=model_tool_name(installation.server_id, raw_name),
                     title=title,
+                    server_description=installation.server_description,
                     description=description,
                     input_schema=input_schema,
                     annotations=annotations,
@@ -1609,6 +1636,28 @@ class _SqlAlchemyMcpRepository:
                     for tool in tools
                 ],
                 key=lambda item: item[0],
+            )
+            from src.api.services.mcp_tool_search_service import (
+                McpToolSearchIndexTarget,
+                sync_mcp_tool_search_indexes,
+            )
+
+            sync_mcp_tool_search_indexes(
+                db,
+                installation_id=installation.installation_id,
+                targets=[
+                    McpToolSearchIndexTarget(
+                        installation_id=installation.installation_id,
+                        tool_name=tool.raw_name,
+                        server_name=installation.server_name,
+                        server_description=installation.server_description or "",
+                        title=tool.title or "",
+                        description=tool.description,
+                        schema_hash=tool.schema_hash,
+                        connection_fingerprint=tool.connection_fingerprint,
+                    )
+                    for tool in tools
+                ],
             )
             if existing_identity == new_identity:
                 db.query(SnapshotRow).filter(
@@ -2016,11 +2065,27 @@ class McpRuntime:
                 )
 
             self._assert_unique_model_names(tools)
+            visible_installation_ids = {
+                tool.installation_id for tool in tools
+            }
+            connections = tuple(sorted(
+                (
+                    McpConnectionSummary(
+                        server_id=item.server_id,
+                        server_name=item.server_name,
+                        server_description=item.server_description,
+                    )
+                    for item in current_installations
+                    if item.installation_id in visible_installation_ids
+                ),
+                key=lambda item: (item.server_name.casefold(), item.server_id),
+            ))
             snapshot = McpCatalogSnapshot(
                 user_id=user_id,
                 fingerprint=final_fingerprint,
                 tools=tuple(sorted(tools, key=lambda item: item.model_name)),
                 errors=tuple(errors),
+                connections=connections,
             )
             # Optional failures are a valid partial snapshot for this exact
             # config/refresh generation. Failed installations remain absent,
@@ -2073,6 +2138,7 @@ class McpRuntime:
                 raw_name=raw_name,
                 model_name=model_tool_name(installation.server_id, raw_name),
                 title=title,
+                server_description=installation.server_description,
                 description=description,
                 input_schema=input_schema,
                 annotations=annotations,

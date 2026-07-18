@@ -9,39 +9,12 @@
 import json
 
 from sqlalchemy import Column, String, Integer, Text, Boolean, DateTime, JSON
-from sqlalchemy.types import UserDefinedType
+
+from src.agent.schema.skill_key import MAX_SKILL_KEY_LENGTH
+
 from .database import Base
 from src.api.utils.timezone import now_naive
-from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS, normalize_embedding_vector, parse_embedding_vector, serialize_pgvector
-
-
-class PGVector(UserDefinedType):
-    """PostgreSQL pgvector 类型。"""
-
-    cache_ok = True
-
-    def __init__(self, dimensions: int):
-        self.dimensions = dimensions
-
-    def get_col_spec(self, **kw):
-        return f"vector({self.dimensions})"
-
-    def bind_processor(self, dialect):
-        def process(value):
-            return serialize_pgvector(value)
-
-        return process
-
-    def result_processor(self, dialect, coltype):
-        def process(value):
-            if value is None:
-                return None
-            # pgvector 返回字符串形式 "[0.1,0.2,...]"，直接解析为 list（写入时已保证维度正确）
-            if isinstance(value, str):
-                return parse_embedding_vector(value)
-            return list(value)
-
-        return process
+from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS, PGVector, normalize_embedding_vector
 
 
 class UserMemory(Base):
@@ -143,6 +116,6 @@ class UserSkillConfig(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(100), nullable=False, index=True)
-    skill_name = Column(String(100), nullable=False)
+    skill_name = Column(String(MAX_SKILL_KEY_LENGTH), nullable=False)
     enabled = Column(Boolean, default=True)
     updated_at = Column(DateTime, default=now_naive, onupdate=now_naive)

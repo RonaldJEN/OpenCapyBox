@@ -1,5 +1,7 @@
 """AgentService（Sandbox 版）測試"""
 
+from datetime import datetime, timedelta
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from types import SimpleNamespace
@@ -95,6 +97,7 @@ class TestAgentServiceCreateTools:
             fingerprint="refresh-bucket-7",
             tools=(),
             errors=("optional server offline",),
+            connections=("available-connection",),
         ))
         metadata = {}
         with (
@@ -121,6 +124,7 @@ class TestAgentServiceCreateTools:
 
         assert metadata["mcp_catalog_fingerprint"] == "refresh-bucket-7"
         assert metadata["mcp_catalog_retry_required"] is False
+        assert metadata["mcp_connections"] == ("available-connection",)
 
     @pytest.mark.asyncio
     async def test_skill_config_query_failure_keeps_skill_metadata_and_tool_available(
@@ -190,8 +194,11 @@ class TestAgentServiceCreateTools:
             return db
 
         sandbox_service = MagicMock()
+        sandbox_service.get_sandbox_id.return_value = "sandbox-1"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 1)
         sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[{
             "name": "my-skill",
+            "display_name": "My Skill Display",
             "description": "User skill",
             "sandbox_skill_dir": "/home/user/skills/my-skill",
         }])
@@ -207,6 +214,9 @@ class TestAgentServiceCreateTools:
         with patch("src.api.services.tool_factory.settings") as mock_settings, patch(
             "src.api.services.tool_factory.get_sandbox_service",
             return_value=sandbox_service,
+        ), patch(
+            "src.api.services.tool_factory.persist_user_skill_inventory",
+            return_value=True,
         ):
             mock_settings.bocha_search_appcode = None
             mock_settings.skills_dir = str(skills_dir)
@@ -227,6 +237,121 @@ class TestAgentServiceCreateTools:
         assert result.success is False
         assert "my-skill" in loader.disabled_skill_names
         assert loader.sandbox_skills["my-skill"].content == ""
+        assert loader.sandbox_skills["my-skill"].metadata == {
+            "display_name": "My Skill Display"
+        }
+
+    @pytest.mark.asyncio
+    async def test_user_skill_refresh_failure_preserves_existing_registry(
+        self, service, tmp_path
+    ):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = []
+        db_session_factory = MagicMock(return_value=db)
+        sandbox_service = MagicMock()
+        sandbox_service.get_sandbox_id.return_value = "sandbox-1"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 1)
+        sandbox_service.discover_sandbox_skills = AsyncMock(side_effect=[
+            [{
+                "name": "my-skill",
+                "description": "User skill",
+                "sandbox_skill_dir": "/home/user/skills/my-skill",
+            }],
+            RuntimeError("sandbox scan unavailable"),
+        ])
+
+        with patch("src.api.services.tool_factory.settings") as mock_settings, patch(
+            "src.api.services.tool_factory.get_sandbox_service",
+            return_value=sandbox_service,
+        ), patch(
+            "src.api.services.tool_factory.persist_user_skill_inventory",
+            return_value=True,
+        ):
+            mock_settings.bocha_search_appcode = None
+            mock_settings.skills_dir = str(skills_dir)
+            mock_settings.sandbox_background_command_timeout_seconds = 21600
+            from src.api.services.tool_factory import create_agent_tools
+
+            _, loader = await create_agent_tools(
+                sandbox=service.sandbox,
+                workspace_dir=service._workspace_dir,
+                mount="/home/user",
+                user_id=service.user_id,
+                db_session_factory=db_session_factory,
+            )
+            assert loader is not None
+            assert "my-skill" in loader.sandbox_skills
+
+            await loader.refresh_inventory()
+
+        assert "my-skill" in loader.sandbox_skills
+        refresh_call = sandbox_service.discover_sandbox_skills.await_args_list[1]
+        assert refresh_call.kwargs["strict"] is True
+
+    @pytest.mark.asyncio
+    async def test_user_skill_publish_cas_loser_uses_matching_winner_snapshot(
+        self, service, tmp_path
+    ):
+        from src.api.services.skill_inventory_service import (
+            SkillInventoryIdentity,
+            UserSkillInventoryView,
+        )
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = []
+        db_session_factory = MagicMock(return_value=db)
+        identity = SkillInventoryIdentity("sandbox-1", "profile-1", 1)
+        winner = [{
+            "name": "winner-skill",
+            "description": "Newer complete scan",
+            "sandbox_skill_dir": "/home/user/skills/winner-skill",
+        }]
+        sandbox_service = MagicMock()
+        sandbox_service.get_sandbox_id.return_value = "sandbox-1"
+        sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 1)
+        sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[{
+            "name": "loser-skill",
+            "description": "Older complete scan",
+            "sandbox_skill_dir": "/home/user/skills/loser-skill",
+        }])
+        scan_started_at = datetime(2026, 7, 17, 1, 0, 0)
+
+        with patch("src.api.services.tool_factory.settings") as mock_settings, patch(
+            "src.api.services.tool_factory.get_sandbox_service",
+            return_value=sandbox_service,
+        ), patch(
+            "src.api.services.tool_factory.persist_user_skill_inventory",
+            return_value=False,
+        ), patch(
+            "src.api.services.tool_factory.load_user_skill_inventory",
+            return_value=UserSkillInventoryView(
+                identity,
+                winner,
+                scan_started_at + timedelta(seconds=1),
+            ),
+        ), patch(
+            "src.api.services.tool_factory.now_naive",
+            return_value=scan_started_at,
+        ):
+            mock_settings.bocha_search_appcode = None
+            mock_settings.skills_dir = str(skills_dir)
+            mock_settings.sandbox_background_command_timeout_seconds = 21600
+            from src.api.services.tool_factory import create_agent_tools
+
+            _, loader = await create_agent_tools(
+                sandbox=service.sandbox,
+                workspace_dir=service._workspace_dir,
+                mount="/home/user",
+                user_id=service.user_id,
+                db_session_factory=db_session_factory,
+            )
+
+        assert loader is not None
+        assert set(loader.sandbox_skills) == {"winner-skill"}
 
 
 class TestAgentServiceRestoreHistory:
@@ -1030,6 +1155,49 @@ class TestAgentServiceInitializeAgent:
 
         runtime_provider = MockAgent.call_args.kwargs["runtime_prompt_provider"]
         assert "`pdf`" in runtime_provider()
+
+    @pytest.mark.asyncio
+    async def test_runtime_mcp_connections_are_compact_request_only_metadata(
+        self,
+        service,
+    ):
+        from src.api.services.mcp_runtime import McpConnectionSummary
+
+        connection = McpConnectionSummary(
+            server_id="server-1",
+            server_name="同花顺股票 MCP",
+            server_description="A 股实时行情、个股资料、财务和公告",
+        )
+
+        async def _create_tools(**kwargs):
+            kwargs["build_metadata"]["mcp_connections"] = (connection, connection)
+            return [], None
+
+        service._provision_default_files_if_needed = MagicMock()
+        service._load_system_prompt = MagicMock(return_value="stable system")
+        service._restore_history = MagicMock()
+
+        with patch("src.api.services.agent_service.settings") as mock_settings, patch(
+            "src.api.services.agent_service.create_agent_tools",
+            side_effect=_create_tools,
+        ), patch("src.api.services.agent_service.LLMClient") as MockLLM, patch(
+            "src.api.services.agent_service.Agent"
+        ) as MockAgent:
+            mock_settings.agent_max_steps = 10
+            mock_settings.agent_tool_timeout = 300
+            mock_settings.agent_subagent_max_parallel = 1
+            MockLLM.from_model_config.return_value = MagicMock()
+
+            await service.initialize_agent()
+
+        agent_kwargs = MockAgent.call_args.kwargs
+        runtime_provider = agent_kwargs["runtime_prompt_provider"]
+        assert runtime_provider() == (
+            "## 当前可用数据连接（仅供工具路由）\n"
+            "- 同花顺股票 MCP：A 股实时行情、个股资料、财务和公告"
+        )
+        assert "同花顺股票 MCP" not in agent_kwargs["system_prompt"]
+        assert "应先调用 tool_search" not in runtime_provider()
 
     @pytest.mark.asyncio
     async def test_initialize_agent_filters_multimodal_incompatible_fallbacks(self, service):

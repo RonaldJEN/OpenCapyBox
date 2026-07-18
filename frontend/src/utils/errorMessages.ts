@@ -2,7 +2,7 @@ export const MAX_TEXT_BLOCK_CHARS = 10000;
 export const UPLOAD_TARGET_UNCERTAIN_MESSAGE = '文件上传失败：无法确认目标文件是否已存在。为避免覆盖已有文件，本次上传已取消，请稍后重试。';
 
 interface ApiErrorLike {
-  response?: { data?: { detail?: unknown } };
+  response?: { data?: { detail?: unknown }; status?: unknown };
   message?: unknown;
   status?: unknown;
 }
@@ -28,11 +28,45 @@ export function messageTooLongLimitText(maxLength = MAX_TEXT_BLOCK_CHARS): strin
 
 function fieldLabelFromLoc(loc: unknown): string {
   if (!Array.isArray(loc)) return '';
+  if (loc.includes('preferred_skill_keys')) return '优先 Skill';
   if (loc.includes('text')) return '消息内容';
   if (loc.includes('content')) return '消息内容';
   if (loc.includes('idempotency_key')) return '请求标识';
   if (loc.includes('file')) return '文件';
   return '';
+}
+
+function isMessageContentLoc(loc: unknown): boolean {
+  return Array.isArray(loc)
+    && !loc.includes('preferred_skill_keys')
+    && (loc.includes('text') || loc.includes('content'));
+}
+
+function preferredSkillLimitMessage(record: ValidationErrorLike): string {
+  if (!Array.isArray(record.loc) || !record.loc.includes('preferred_skill_keys')) return '';
+  const maxLength = Number(record.ctx?.max_length);
+  if (!Number.isFinite(maxLength) || maxLength <= 0) return '';
+  if (record.type === 'string_too_long') {
+    return `优先 Skill：每项最多 ${maxLength} 字符`;
+  }
+  if (record.type === 'too_long') {
+    return `优先 Skill：最多 ${maxLength} 项`;
+  }
+  return '';
+}
+
+function isTooLongValidation(record: ValidationErrorLike): boolean {
+  return record.type === 'string_too_long'
+    || record.type === 'too_long'
+    || String(record.msg || '').includes('at most');
+}
+
+function hasMessageTooLongValidation(detail: unknown): boolean {
+  return Array.isArray(detail) && detail.some((item) => {
+    if (!item || typeof item !== 'object') return false;
+    const record = item as ValidationErrorLike;
+    return isMessageContentLoc(record.loc) && isTooLongValidation(record);
+  });
 }
 
 export function validationDetailToMessage(detail: unknown): string {
@@ -43,6 +77,8 @@ export function validationDetailToMessage(detail: unknown): string {
       .map((item) => {
         if (!item || typeof item !== 'object') return String(item);
         const record = item as ValidationErrorLike;
+        const preferredSkillLimit = preferredSkillLimitMessage(record);
+        if (preferredSkillLimit) return preferredSkillLimit;
         const label = fieldLabelFromLoc(record.loc);
         const msg = String(record.msg || '').trim();
         return label && msg ? `${label}: ${msg}` : msg;
@@ -61,10 +97,7 @@ export function detailToMessage(detail: unknown): string {
     const tooLong = detail.find((item) => {
       if (!item || typeof item !== 'object') return false;
       const record = item as ValidationErrorLike;
-      return (
-        record.type === 'string_too_long'
-        || String(record.msg || '').includes('at most')
-      );
+      return isMessageContentLoc(record.loc) && isTooLongValidation(record);
     }) as ValidationErrorLike | undefined;
     if (tooLong) {
       return messageTooLongLimitText(Number(tooLong.ctx?.max_length || MAX_TEXT_BLOCK_CHARS));
@@ -100,11 +133,12 @@ export function formatUploadError(err: unknown): string {
 }
 
 export function formatSendError(err: unknown): string {
+  const error = apiErrorLike(err);
   const message = extractErrorMessage(err);
-  const status = apiErrorLike(err).status;
+  const status = error.status ?? error.response?.status;
   if (
     status === 413
-    || (status === 422 && (message === '[object Object]' || message.includes('at most')))
+    || (status === 422 && hasMessageTooLongValidation(error.response?.data?.detail))
   ) {
     return '消息太长，已超过当前输入限制。请拆成多条发送，或保存为文件后上传。';
   }

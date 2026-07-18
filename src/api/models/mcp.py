@@ -17,6 +17,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -24,6 +25,7 @@ from sqlalchemy import (
 )
 
 from .database import Base
+from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS, PGVector
 from src.api.utils.timezone import now_naive
 
 
@@ -266,6 +268,46 @@ class McpToolSnapshot(Base):
     # snapshot and is never safe for fallback execution.
     connection_fingerprint = Column(String(64), nullable=True)
     discovered_at = Column(DateTime, default=now_naive, nullable=False, index=True)
+
+
+class McpToolSearchIndex(Base):
+    """Derived semantic-routing index keyed by stable MCP tool identity.
+
+    This table stays separate from the executable snapshot hot path. Snapshot
+    replacement can therefore retain an unchanged vector, while candidate-
+    scoped search can never turn a durable-but-hidden snapshot into a tool.
+    """
+
+    __tablename__ = "mcp_tool_search_indexes"
+    __table_args__ = (
+        Index(
+            "idx_mcp_tool_search_embedding_claim",
+            "embedding_model_fingerprint",
+            "lease_expires_at",
+            "retry_after",
+        ),
+    )
+
+    installation_id = Column(
+        String(36),
+        ForeignKey("mcp_installations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    tool_name = Column(String(255), primary_key=True)
+    search_document = Column(Text, nullable=False)
+    search_document_hash = Column(String(64), nullable=False, index=True)
+    schema_hash = Column(String(64), nullable=False)
+    connection_fingerprint = Column(String(64), nullable=False)
+    embedding = Column(
+        JSON().with_variant(PGVector(MEMORY_EMBEDDING_DIMENSIONS), "postgresql"),
+        nullable=True,
+    )
+    embedding_model_fingerprint = Column(String(64), nullable=True, index=True)
+    embedded_document_hash = Column(String(64), nullable=True)
+    claim_token = Column(String(64), nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
+    retry_after = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=now_naive, onupdate=now_naive, nullable=False)
 
 
 class McpConfigVersion(Base):

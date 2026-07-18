@@ -42,7 +42,10 @@ class TestHistoryServiceRound:
         result = history_service.create_round(
             session_id="session-123",
             round_id="round-456",
-            user_message="Hello"
+            user_message="Hello",
+            preferred_skills=[
+                {"key": "pdf", "display_name": "PDF 文档", "ignored": "drop"},
+            ],
         )
         
         mock_db.add.assert_called_once()
@@ -51,6 +54,9 @@ class TestHistoryServiceRound:
         assert added_round.id == "round-456"
         assert added_round.session_id == "session-123"
         assert added_round.user_message == "Hello"
+        assert json.loads(added_round.preferred_skills) == [
+            {"key": "pdf", "display_name": "PDF 文档"},
+        ]
         assert added_round.status == "running"
         mock_db.refresh.assert_called_once_with(added_round)
         mock_db.expunge.assert_called_once_with(added_round)
@@ -67,6 +73,40 @@ class TestHistoryServiceRound:
 
         added_round = mock_db.add.call_args[0][0]
         assert added_round.parent_run_id == "round-interrupted"
+
+    def test_idempotency_conflict_returns_original_preferred_skill_snapshot(
+        self, history_service, mock_db
+    ):
+        existing = Round(
+            id="round-existing",
+            session_id="session-123",
+            user_message="Original",
+            preferred_skills=json.dumps([
+                {"key": "pdf", "display_name": "Original PDF"},
+            ]),
+            idempotency_key="idem-1",
+        )
+        mock_db.commit.side_effect = IntegrityError(
+            "INSERT",
+            {},
+            Exception("unique constraint"),
+        )
+        mock_db.query.return_value.filter.return_value.first.return_value = existing
+
+        result = history_service.create_round(
+            session_id="session-123",
+            round_id="round-loser",
+            user_message="Duplicate",
+            preferred_skills=[
+                {"key": "xlsx", "display_name": "New XLSX"},
+            ],
+            idempotency_key="idem-1",
+        )
+
+        assert result is existing
+        assert json.loads(result.preferred_skills) == [
+            {"key": "pdf", "display_name": "Original PDF"},
+        ]
 
     def test_create_resume_round_marks_parent_and_creates_child(self, history_service, mock_db):
         """resume round 与父 round 状态更新应在同一次提交中完成。"""
@@ -88,6 +128,7 @@ class TestHistoryServiceRound:
         assert added_round.id == "round-resume"
         assert added_round.session_id == "session-123"
         assert added_round.parent_run_id == "round-interrupted"
+        assert added_round.preferred_skills is None
         assert added_round.status == "running"
         mock_db.commit.assert_called_once()
         mock_db.refresh.assert_called_once_with(added_round)
@@ -339,6 +380,13 @@ class TestHistoryServiceGetSessionRounds:
         mock_round.created_at = datetime.now()
         mock_round.completed_at = datetime.now()
         mock_round.user_attachments = None
+        mock_round.preferred_skills = json.dumps([
+            {
+                "key": "pdf",
+                "display_name": "PDF 文档",
+                "ignored": "not returned",
+            },
+        ])
         mock_round.parent_run_id = "round-parent"
         
         # 模拟 AG-UI 事件（用于重建 steps）
@@ -368,8 +416,47 @@ class TestHistoryServiceGetSessionRounds:
         assert rounds[0]["parent_run_id"] == "round-parent"
         assert rounds[0]["last_event_sequence"] == 2
         assert rounds[0]["user_message"] == "Hello"
+        assert rounds[0]["preferred_skills"] == [
+            {"key": "pdf", "display_name": "PDF 文档"},
+        ]
         # steps 從事件重建
         assert "steps" in rounds[0]
+
+    def test_get_session_rounds_old_or_corrupt_snapshot_defaults_to_empty(
+        self, history_service, mock_db
+    ):
+        history_service._get_subagent_child_round_ids = MagicMock(return_value=set())
+        history_service._get_tool_approval_resume_round_ids = MagicMock(return_value=set())
+        history_service._rebuild_steps_from_events = MagicMock(return_value=([], 0))
+        rows = []
+        for round_id, preferred_skills in (
+            ("old", None),
+            ("corrupt", "not-json"),
+            ("wrong-shape", '[{"key":"pdf"}]'),
+        ):
+            rows.append(MagicMock(
+                id=round_id,
+                user_message="Hello",
+                final_response="Hi",
+                step_count=0,
+                status="completed",
+                created_at=datetime.now(),
+                completed_at=datetime.now(),
+                user_attachments=None,
+                preferred_skills=preferred_skills,
+                parent_run_id=None,
+                idempotency_key=None,
+                interrupt_payload=None,
+            ))
+        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = rows
+
+        rounds = history_service.get_session_rounds("session-123")
+
+        assert [round_data["preferred_skills"] for round_data in rounds] == [
+            [],
+            [],
+            [],
+        ]
 
     def test_get_session_rounds_marks_durable_tool_approval_controls(
         self, history_service, mock_db
