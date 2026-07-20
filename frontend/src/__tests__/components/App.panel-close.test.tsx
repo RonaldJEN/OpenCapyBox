@@ -52,13 +52,35 @@ vi.mock('../../components/SessionList', () => ({
 }));
 
 vi.mock('../../components/ChatV2', () => ({
-  ChatV2: ({ sessionId, selectedModelId, activeSlotSessionIds }: { sessionId?: string; selectedModelId?: string; activeSlotSessionIds?: Set<string> }) => (
+  ChatV2: ({
+    sessionId,
+    selectedModelId,
+    activeSlotSessionIds,
+    onCreateSession,
+    onSessionCreated,
+  }: {
+    sessionId?: string;
+    selectedModelId?: string;
+    activeSlotSessionIds?: Set<string>;
+    onCreateSession?: (modelId?: string) => Promise<string>;
+    onSessionCreated?: (sessionId: string) => void;
+  }) => (
     <div
       data-testid="chat-v2"
       data-session-id={sessionId}
       data-selected-model-id={selectedModelId}
       data-active-slots={Array.from(activeSlotSessionIds ?? []).join(',')}
-    >chat</div>
+    >
+      chat
+      <button
+        type="button"
+        onClick={() => {
+          void onCreateSession?.().then((createdSessionId) => {
+            onSessionCreated?.(createdSessionId);
+          });
+        }}
+      >create-chat-session</button>
+    </div>
   ),
 }));
 
@@ -360,5 +382,27 @@ describe('App 配置抽屉交互', () => {
     expect(screen.getByTestId('executing-sessions')).toHaveTextContent('session-b');
     expect(screen.getByTestId('executing-sessions')).not.toHaveTextContent('session-a');
     expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-active-slots', 'session-b');
+  });
+
+  it('迟到的隐式建会话响应不应覆盖用户手动选择的会话', async () => {
+    let resolveCreateSession!: (response: { session_id: string; message: string }) => void;
+    vi.mocked(apiService.createSession).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveCreateSession = resolve;
+    }));
+
+    render(<App />);
+    fireEvent.click(screen.getByText('create-chat-session'));
+    expect(apiService.createSession).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByText('select-manual'));
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'manual-session');
+
+    await act(async () => {
+      resolveCreateSession({ session_id: 'late-created-session', message: 'created' });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'manual-session');
+    });
   });
 });

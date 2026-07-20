@@ -101,13 +101,31 @@ class TestModelConfig:
             self._make_config(max_tokens=-100)
 
     def test_supports_thinking_true(self):
-        """reasoning_format != 'none' 時 supports_thinking 為 True"""
-        cfg = self._make_config(reasoning_format="reasoning_content")
+        """OpenAI 变体显式启用 reasoning split 时公开支持思考。"""
+        cfg = self._make_config(reasoning_format="reasoning_content", reasoning_split=True)
         assert cfg.supports_thinking is True
 
     def test_supports_thinking_false(self):
         """reasoning_format == 'none' 時 supports_thinking 為 False"""
         cfg = self._make_config(reasoning_format="none")
+        assert cfg.supports_thinking is False
+
+    def test_openai_no_think_variant_is_false_even_with_legacy_reasoning_format(self):
+        """存量 DB 尚未同步 YAML 时，关闭两项开关的 OpenAI 变体仍不得宣称支持思考。"""
+        cfg = self._make_config(
+            reasoning_format="reasoning_content",
+            reasoning_split=False,
+            enable_thinking=False,
+        )
+        assert cfg.supports_thinking is False
+
+    def test_openai_enable_thinking_without_reasoning_split_is_false(self):
+        """OpenAI runtime only exposes thinking content when reasoning_split is enabled."""
+        cfg = self._make_config(
+            reasoning_format="reasoning_content",
+            reasoning_split=False,
+            enable_thinking=True,
+        )
         assert cfg.supports_thinking is False
 
     def test_resolve_api_key_literal(self):
@@ -325,6 +343,45 @@ class TestModelRegistryLoad:
         registry = ModelRegistry.load(path)
         cfg = registry.get("test-model")
         assert cfg.resolve_api_key() == "resolved"
+
+    def test_glm_no_think_model_from_project_yaml_disables_thinking(self):
+        """项目模型目录中的 No Thinking 变体必须公开为不支持思考。"""
+        project_yaml = Path(__file__).resolve().parent.parent / "models.yaml"
+        registry = ModelRegistry.load_yaml(project_yaml)
+
+        config = registry.get_or_raise("glm-5-no-think")
+
+        assert config.reasoning_format == "none"
+        assert config.supports_thinking is False
+
+    @pytest.mark.asyncio
+    async def test_glm_no_think_model_list_api_serializes_supports_thinking_false(self, monkeypatch):
+        """GET /api/models 的实际序列化结果与 models.yaml 的 No Thinking 配置一致。"""
+        from src.api.routes import models as models_route
+
+        project_yaml = Path(__file__).resolve().parent.parent / "models.yaml"
+        registry = ModelRegistry.load_yaml(project_yaml)
+        config = registry.get_or_raise("glm-5-no-think")
+        # 模拟已经 seed 的存量 DB 仍保留旧解析格式；有效开关均关闭时
+        # 用户模型 API 仍必须返回 false。
+        config.reasoning_format = "reasoning_content"
+
+        monkeypatch.setattr(models_route, "get_model_registry", lambda: registry)
+        monkeypatch.setattr(
+            models_route,
+            "list_accessible_model_configs",
+            lambda db, user_id, registry: [config],
+        )
+        monkeypatch.setattr(
+            models_route,
+            "resolve_default_model_for_user",
+            lambda db, user_id, *, kind="chat", registry=None: config,
+        )
+
+        payload = await models_route.list_models(user_id="test-user", db=object())
+
+        assert payload["models"] == [config.to_public_dict()]
+        assert payload["models"][0]["supports_thinking"] is False
 
 
 # ============================================================

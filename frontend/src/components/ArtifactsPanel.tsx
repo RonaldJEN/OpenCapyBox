@@ -194,7 +194,7 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
             <button
               type="button"
               onClick={onClose}
-              className="hover:bg-claude-hover p-2 rounded-full active:scale-90 transition-all"
+              className="hover:bg-claude-hover p-2 rounded-full active:scale-90 transition-[background-color,transform]"
               aria-label="关闭面板"
             >
               <X size={18} className="text-claude-muted" />
@@ -235,7 +235,7 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
             <button
               type="button"
               onClick={onClose}
-              className="hover:bg-claude-hover p-2 rounded-full active:scale-90 transition-all"
+              className="hover:bg-claude-hover p-2 rounded-full active:scale-90 transition-[background-color,transform]"
               aria-label="关闭面板"
             >
               <X size={18} className="text-claude-muted" />

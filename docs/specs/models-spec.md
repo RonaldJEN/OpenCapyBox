@@ -7,6 +7,7 @@
 - `models.yaml` 负责首次 seed 模型目录，并继续承载 embedding 模型配置。
 - 模型列表与详情查询必须按当前用户的模型权限过滤。
 - 模型行为配置：`reasoning_format`、`reasoning_split`、`enable_thinking`、多模态能力、上下文窗口与输出上限。
+- 对外 `supports_thinking` 表示当前模型变体实际启用且可展示的思考能力：`reasoning_format=none` 为 false；OpenAI 变体还须启用运行时实际用于拆分思考内容的 `reasoning_split`。单独设置 `enable_thinking` 不足以声明支持，因此存量目录中的 No Thinking 变体即使仍保留旧 reasoning format，也不得在前端宣称支持思考。
 - 默认模型配置：普通对话、Cron、Subagent 分别有默认模型；Cron/Subagent 未显式配置时继承普通默认模型。
 - 模型权限包：默认权限包自动应用给所有普通用户，管理员可为用户额外绑定权限包。
 - 不负责：LLM 调用实现、Token 计费、模型部署。

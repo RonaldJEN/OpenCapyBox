@@ -22,6 +22,14 @@ interface RoundProps {
   onOpenFileInPanel?: (file: FileInfo) => void;
 }
 
+const CANCELLED_RESPONSE_SENTINEL = 'Cancelled';
+
+function isCancelledResponseSentinel(content: string | null | undefined, status: string): boolean {
+  return status === 'cancelled'
+    && typeof content === 'string'
+    && content.normalize('NFKC').trim() === CANCELLED_RESPONSE_SENTINEL;
+}
+
 async function copyTextToClipboard(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
@@ -246,10 +254,19 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'max_steps_reached', 'interrupted', 'resumed', 'cancelled']);
   const isCompleted = TERMINAL_STATUSES.has(round.status);
   const effectiveStreaming = isStreaming && !isCompleted;
-  const latestStreamingContent = effectiveStreaming
-    ? [...round.steps].reverse().find((step) => step.assistant_content)?.assistant_content
-    : undefined;
-  const assistantContent = round.final_response || latestStreamingContent;
+  const latestStepContent = [...round.steps]
+    .reverse()
+    .find((step) => (
+      step.assistant_content
+      && !isCancelledResponseSentinel(step.assistant_content, round.status)
+    ))
+    ?.assistant_content;
+  const visibleFinalResponse = isCancelledResponseSentinel(round.final_response, round.status)
+    ? undefined
+    : round.final_response;
+  const visibleStepContent = latestStepContent || undefined;
+  const assistantContent = visibleFinalResponse
+    || ((effectiveStreaming || round.status === 'cancelled') ? visibleStepContent : undefined);
   const canCopyAssistantContent = round.status === 'completed' && !!round.final_response;
   const assistantFiles = assistantContent
     ? extractAssistantFiles(assistantContent, sessionId)
@@ -385,7 +402,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
                 </div>
               )}
               {canCopyAssistantContent && (
-                <AssistantActions content={round.final_response} />
+                <AssistantActions content={round.final_response ?? ''} />
               )}
             </div>
           )}
@@ -399,6 +416,11 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
           {round.status === 'max_steps_reached' && (
             <div className="text-xs text-claude-warning font-medium mt-2">
               达到最大步数限制
+            </div>
+          )}
+          {round.status === 'cancelled' && (
+            <div className="text-xs text-claude-muted font-medium mt-2">
+              已取消
             </div>
           )}
         </div>

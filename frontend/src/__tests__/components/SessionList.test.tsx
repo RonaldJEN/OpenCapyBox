@@ -85,7 +85,7 @@ describe('SessionList 組件', () => {
       expect(screen.getByText('測試會話 1')).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByText('測試會話 1'));
+    fireEvent.click(screen.getByRole('button', { name: '打开会话 測試會話 1' }));
     expect(mockOnSelect).toHaveBeenCalledWith('session-1');
   });
 
@@ -106,7 +106,7 @@ describe('SessionList 組件', () => {
       expect(screen.getByText('測試會話 1')).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByText('測試會話 1'));
+    fireEvent.click(screen.getByRole('button', { name: '打开会话 測試會話 1' }));
     expect(mockOnSelect).toHaveBeenCalledWith('session-1', { roundId: 'round-hit-1' });
   });
 
@@ -254,6 +254,8 @@ describe('SessionList 組件', () => {
     const callsBeforeClear = vi.mocked(apiService.getSessions).mock.calls.length;
     fireEvent.click(screen.getByLabelText('清空搜索'));
 
+    expect(screen.getByLabelText('搜索会话')).toHaveFocus();
+
     await waitFor(() => {
       expect(vi.mocked(apiService.getSessions).mock.calls.length).toBeGreaterThan(callsBeforeClear);
     });
@@ -359,5 +361,274 @@ describe('SessionList 組件', () => {
 
     expect(screen.getByText('新结果')).toBeInTheDocument();
     expect(screen.queryByText('旧结果')).not.toBeInTheDocument();
+  });
+
+  it('删除按钮应有可访问名称，并打开应用内确认弹窗而不选中会话', async () => {
+    const mockOnSelect = vi.fn();
+    const confirmSpy = vi.spyOn(window, 'confirm');
+    render(<SessionList onSessionSelect={mockOnSelect} />);
+
+    const deleteButton = await screen.findByRole('button', { name: '删除会话 測試會話 1' });
+    expect(deleteButton).toHaveAttribute('type', 'button');
+    expect(deleteButton).toHaveAttribute('title', '删除会话 測試會話 1');
+
+    fireEvent.click(deleteButton);
+
+    const dialog = screen.getByRole('alertdialog', { name: '删除会话“測試會話 1”？' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog).toHaveAccessibleDescription('删除后无法恢复。');
+    expect(screen.getByText('删除后无法恢复。')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '取消' })).toHaveFocus();
+    expect(mockOnSelect).not.toHaveBeenCalled();
+    expect(confirmSpy).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
+
+  it('删除确认弹窗应锁定焦点，并在 Escape 取消后恢复删除按钮焦点', async () => {
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    const deleteButton = await screen.findByRole('button', { name: '删除会话 測試會話 1' });
+    fireEvent.click(deleteButton);
+
+    const dialog = screen.getByRole('alertdialog');
+    const cancelButton = screen.getByRole('button', { name: '取消' });
+    const confirmButton = screen.getByRole('button', { name: '确认删除' });
+
+    confirmButton.focus();
+    fireEvent.keyDown(confirmButton, { key: 'Tab' });
+    expect(cancelButton).toHaveFocus();
+
+    fireEvent.keyDown(cancelButton, { key: 'Tab', shiftKey: true });
+    expect(confirmButton).toHaveFocus();
+
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+      expect(deleteButton).toHaveFocus();
+    });
+  });
+
+  it('点击遮罩应取消删除并恢复原删除按钮焦点', async () => {
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    const deleteButton = await screen.findByRole('button', { name: '删除会话 測試會話 1' });
+    fireEvent.click(deleteButton);
+    const dialog = screen.getByRole('alertdialog');
+    const overlay = dialog.parentElement;
+    expect(overlay).not.toBeNull();
+
+    fireEvent.click(overlay!);
+    await waitFor(() => {
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+      expect(deleteButton).toHaveFocus();
+    });
+  });
+
+  it('取消时目标行已因刷新消失，应聚焦相邻可用会话', async () => {
+    vi.mocked(apiService.getSessions)
+      .mockResolvedValueOnce({ sessions: mockSessions })
+      .mockResolvedValueOnce({ sessions: [mockSessions[1]] });
+    const { rerender } = render(
+      <SessionList refreshTrigger={0} onSessionSelect={vi.fn()} onNewChat={vi.fn()} />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除会话 測試會話 1' }));
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument();
+
+    rerender(
+      <SessionList refreshTrigger={1} onSessionSelect={vi.fn()} onNewChat={vi.fn()} />,
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: '打开会话 測試會話 1' })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '打开会话 測試會話 2' })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    await waitFor(() => {
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '打开会话 測試會話 2' })).toHaveFocus();
+    });
+  });
+
+  it('删除进行中应锁定弹窗并阻止重复提交，成功后聚焦下一条会话', async () => {
+    let resolveDelete!: () => void;
+    vi.mocked(apiService.deleteSession).mockImplementationOnce(
+      () => new Promise<void>((resolve) => {
+        resolveDelete = resolve;
+      }),
+    );
+    const mockOnSelect = vi.fn();
+    render(
+      <SessionList
+        currentSessionId="session-2"
+        onSessionSelect={mockOnSelect}
+        onNewChat={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除会话 測試會話 1' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    const dialog = screen.getByRole('alertdialog');
+    await waitFor(() => {
+      expect(dialog).toHaveAttribute('aria-busy', 'true');
+      expect(screen.getByRole('button', { name: '删除中…' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: '取消' })).toBeDisabled();
+    });
+
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    fireEvent.click(dialog.parentElement!);
+    fireEvent.click(screen.getByRole('button', { name: '删除中…' }));
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument();
+    expect(apiService.deleteSession).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveDelete();
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+      expect(screen.queryByText('測試會話 1')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '打开会话 測試會話 2' })).toHaveFocus();
+    });
+    expect(mockOnSelect).not.toHaveBeenCalled();
+  });
+
+  it('删除失败应显示可重试错误，关闭后恢复原删除按钮焦点', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(apiService.deleteSession).mockRejectedValueOnce(new Error('network error'));
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    const deleteButton = await screen.findByRole('button', { name: '删除会话 測試會話 1' });
+    fireEvent.click(deleteButton);
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('删除失败，请重试。');
+    expect(screen.getByRole('button', { name: '重试删除' })).toHaveFocus();
+    expect(screen.getByRole('alertdialog')).toHaveAttribute('aria-busy', 'false');
+
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    await waitFor(() => {
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+      expect(deleteButton).toHaveFocus();
+    });
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('失败后确认按钮应可重试删除', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(apiService.deleteSession)
+      .mockRejectedValueOnce(new Error('temporary error'))
+      .mockResolvedValueOnce();
+    render(<SessionList onSessionSelect={vi.fn()} onNewChat={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除会话 測試會話 1' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+    fireEvent.click(await screen.findByRole('button', { name: '重试删除' }));
+
+    await waitFor(() => {
+      expect(apiService.deleteSession).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    });
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('删除当前会话成功后应返回欢迎页', async () => {
+    vi.mocked(apiService.deleteSession).mockResolvedValueOnce();
+    const mockOnSelect = vi.fn();
+    render(
+      <SessionList
+        currentSessionId="session-1"
+        onSessionSelect={mockOnSelect}
+        onNewChat={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除会话 測試會話 1' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    await waitFor(() => {
+      expect(mockOnSelect).toHaveBeenCalledWith('');
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    });
+  });
+
+  it('删除列表末项后应聚焦上一条会话', async () => {
+    vi.mocked(apiService.deleteSession).mockResolvedValueOnce();
+    render(<SessionList onSessionSelect={vi.fn()} onNewChat={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除会话 測試會話 2' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '打开会话 測試會話 1' })).toHaveFocus();
+    });
+  });
+
+  it('删除唯一会话后应聚焦新建对话按钮', async () => {
+    vi.mocked(apiService.getSessions).mockResolvedValue({ sessions: [mockSessions[0]] });
+    vi.mocked(apiService.deleteSession).mockResolvedValueOnce();
+    render(<SessionList onSessionSelect={vi.fn()} onNewChat={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除会话 測試會話 1' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '新建对话' })).toHaveFocus();
+    });
+  });
+
+  it('删除接口成功后即使列表刷新挂起也应立即关闭弹窗并恢复焦点', async () => {
+    let getSessionsCalls = 0;
+    vi.mocked(apiService.getSessions).mockImplementation(() => {
+      getSessionsCalls += 1;
+      // 首次加载正常返回，后续刷新永久挂起以模拟刷新阻塞。
+      if (getSessionsCalls === 1) return Promise.resolve({ sessions: mockSessions });
+      return new Promise(() => {});
+    });
+    vi.mocked(apiService.deleteSession).mockResolvedValueOnce();
+    render(<SessionList onSessionSelect={vi.fn()} onNewChat={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除会话 測試會話 1' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    // 刷新挂起不得阻塞弹窗关闭与本地移除。
+    await waitFor(() => {
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+      expect(screen.queryByText('測試會話 1')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '打开会话 測試會話 2' })).toHaveFocus();
+    });
+  });
+
+  it('删除成功后迟到的陈旧刷新不得把已删除行重新加回', async () => {
+    let resolveRefresh: ((value: { sessions: typeof mockSessions }) => void) | undefined;
+    let getSessionsCalls = 0;
+    vi.mocked(apiService.getSessions).mockImplementation(() => {
+      getSessionsCalls += 1;
+      if (getSessionsCalls === 1) return Promise.resolve({ sessions: mockSessions });
+      return new Promise((resolve) => {
+        resolveRefresh = resolve;
+      });
+    });
+    vi.mocked(apiService.deleteSession).mockResolvedValueOnce();
+    render(<SessionList onSessionSelect={vi.fn()} onNewChat={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除会话 測試會話 1' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    await waitFor(() => {
+      expect(screen.queryByText('測試會話 1')).not.toBeInTheDocument();
+      expect(resolveRefresh).toBeDefined();
+    });
+
+    // 迟到的刷新返回仍含已删除会话的陈旧列表，守卫必须过滤掉它。
+    await act(async () => {
+      resolveRefresh!({ sessions: mockSessions });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText('測試會話 1')).not.toBeInTheDocument();
+      expect(screen.getByText('測試會話 2')).toBeInTheDocument();
+    });
   });
 });

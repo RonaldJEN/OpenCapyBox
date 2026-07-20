@@ -181,6 +181,32 @@ describe('chatRuntimeReducer', () => {
     expect(state.runs['run-a'].debugMetadata?.droppedAfterCancel).toBe(1);
   });
 
+  it('keeps cancelled terminal state when completed and failed events arrive late', () => {
+    let state = startRun();
+
+    state = stream(state, { type: 'TEXT_MESSAGE_CONTENT', messageId: 'm1', delta: 'before cancel' }, { sequence: 1 });
+    state = chatRuntimeReducer(state, { type: 'LOCAL_CANCELLED', sessionId: 'sess-a' });
+    state = stream(state, {
+      type: 'RUN_FINISHED',
+      threadId: 'sess-a',
+      runId: 'server-r1',
+      result: { finalResponse: 'late completed response' },
+      outcome: 'success',
+    }, { sequence: 2 });
+    state = stream(state, {
+      type: 'RUN_ERROR',
+      message: 'late failure',
+    }, { sequence: 3 });
+
+    const roundState = state.sessions['sess-a'].rounds[0];
+    expect(state.runs['run-a'].status).toBe('cancelled');
+    expect(roundState.status).toBe('cancelled');
+    expect(roundState.final_response).toBe('');
+    expect(roundState.steps[0].assistant_content).toBe('before cancel');
+    expect(state.sessions['sess-a'].error).toBe('');
+    expect(state.runs['run-a'].debugMetadata?.droppedAfterTerminal).toBe(2);
+  });
+
   it('dedupes a temp round when history finds the idempotency round', () => {
     let state = startRun();
 

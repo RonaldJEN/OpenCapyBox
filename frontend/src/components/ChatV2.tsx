@@ -47,6 +47,39 @@ const WELCOME_SUGGESTIONS = [
   '生成一份周报模板',
 ] as const;
 
+const NEW_SESSION_DRAFT_KEY = '__new_session__';
+
+interface MessageDraft {
+  draftId: string;
+  revision: number;
+  input: string;
+  attachedFiles: FileInfo[];
+}
+
+interface ComposerDraftState {
+  messageDrafts: Record<string, MessageDraft>;
+  skillDrafts: Record<string, SkillDraft>;
+}
+
+let fallbackDraftId = 0;
+
+function createMessageDraft(): MessageDraft {
+  const draftId = globalThis.crypto?.randomUUID?.()
+    ?? `draft-${Date.now()}-${fallbackDraftId++}`;
+  return {
+    draftId,
+    revision: 0,
+    input: '',
+    attachedFiles: [],
+  };
+}
+
+function isPristineMessageDraft(draft: MessageDraft): boolean {
+  return draft.revision === 0
+    && draft.input.length === 0
+    && draft.attachedFiles.length === 0;
+}
+
 interface ChatV2Props {
   sessionId: string;
   onTitleUpdated?: () => void;
@@ -57,6 +90,7 @@ interface ChatV2Props {
   onModelChange: (modelId: string) => void;
   availableModels?: ModelInfo[];
   onCreateSession?: (modelId?: string) => Promise<string>;
+  onSessionCreated?: (sessionId: string) => void;
   activeSlotSessionIds?: Set<string>;
   scrollTarget?: {
     sessionId: string;
@@ -132,6 +166,7 @@ function ChatV2View(props: ChatV2Props) {
     onModelChange,
     availableModels = [],
     onCreateSession,
+    onSessionCreated,
     activeSlotSessionIds,
     scrollTarget,
   } = props;
@@ -147,20 +182,19 @@ function ChatV2View(props: ChatV2Props) {
 
   const [disableInitialMotion, setDisableInitialMotion] = useState(false);
   const [highlightedRoundId, setHighlightedRoundId] = useState<string | null>(null);
-  const [input, setInput] = useState('');
-  const [skillDrafts, setSkillDrafts] = useState<Record<string, SkillDraft>>({});
+  const initialDraftKey = sessionId || NEW_SESSION_DRAFT_KEY;
+  const [composerDrafts, setComposerDrafts] = useState<ComposerDraftState>(() => ({
+    messageDrafts: { [initialDraftKey]: createMessageDraft() },
+    skillDrafts: {},
+  }));
   const [localError, setLocalError] = useState('');
-  const [creatingSession, setCreatingSession] = useState(false);
-  const [bootstrapMessage, setBootstrapMessage] = useState('');
-  const [sessionHandoffMessage, setSessionHandoffMessage] = useState('');
-  const [isSessionHandoff, setIsSessionHandoff] = useState(false);
+  const [creatingDraftId, setCreatingDraftId] = useState<string | null>(null);
   const [isFilesOpen, setIsFilesOpen] = useState(false);
   const [filePanelTarget, setFilePanelTarget] = useState<{ file: FileInfo; nonce: number } | null>(null);
   const [assistantFileMatches, setAssistantFileMatches] = useState<Record<string, FileInfo>>({});
   const [previewFile, setPreviewFile] = useState<FileInfo | null>(null);
   const [previewSessionId, setPreviewSessionId] = useState<string>('');
-  const [attachedFiles, setAttachedFiles] = useState<FileInfo[]>([]);
-  const [uploading, setUploading] = useState(false);
+  const [uploadingDraftIds, setUploadingDraftIds] = useState<Set<string>>(new Set());
   const [isDragging, setIsDragging] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [showScrollButton, setShowScrollButton] = useState(false);
@@ -175,17 +209,124 @@ function ChatV2View(props: ChatV2Props) {
   const prevRoundsLengthRef = useRef<number>(0);
   const isInitialLoadRef = useRef<boolean>(true);
   const sessionIdRef = useRef(sessionId);
+  const composerDraftsRef = useRef(composerDrafts);
+  const uploadsInFlightRef = useRef(new Set<string>());
   const roundElementRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const handledScrollTargetNonceRef = useRef<number | null>(null);
   const suppressAutoScrollRef = useRef<boolean>(false);
   const pendingSendSessionKeysRef = useRef<Set<string>>(new Set());
   const selectedModel = availableModels.find((m) => m.id === selectedModelId);
-  const currentSkillDraftKey = sessionId || '__new_session__';
-  const currentSkillDraft = skillDrafts[currentSkillDraftKey] || { keys: [], revision: 0 };
+  const currentDraftKey = sessionId || NEW_SESSION_DRAFT_KEY;
+  const currentMessageDraft = composerDrafts.messageDrafts[currentDraftKey] || {
+    draftId: `uninitialized:${currentDraftKey}`,
+    revision: 0,
+    input: '',
+    attachedFiles: [],
+  };
+  const currentSkillDraft = composerDrafts.skillDrafts[currentDraftKey] || { keys: [], revision: 0 };
+  const input = currentMessageDraft.input;
+  const attachedFiles = currentMessageDraft.attachedFiles;
+  const currentDraftId = currentMessageDraft.draftId;
+  const creatingCurrentDraft = creatingDraftId === currentDraftId;
+  const uploadingCurrentDraft = uploadingDraftIds.has(currentDraftId);
   const displayError = localError || runtimeError;
   const hasActiveSlot = activeSlotSessionIds?.has(sessionId) ?? false;
 
   sessionIdRef.current = sessionId;
+  composerDraftsRef.current = composerDrafts;
+
+  useEffect(() => {
+    setComposerDrafts((previous) => {
+      if (previous.messageDrafts[currentDraftKey]) return previous;
+      return {
+        ...previous,
+        messageDrafts: {
+          ...previous.messageDrafts,
+          [currentDraftKey]: createMessageDraft(),
+        },
+      };
+    });
+  }, [currentDraftKey]);
+
+  const addUploadingDraftId = (draftId: string) => {
+    setUploadingDraftIds((previous) => {
+      if (previous.has(draftId)) return previous;
+      const next = new Set(previous);
+      next.add(draftId);
+      return next;
+    });
+  };
+
+  const removeUploadingDraftId = (draftId: string) => {
+    setUploadingDraftIds((previous) => {
+      if (!previous.has(draftId)) return previous;
+      const next = new Set(previous);
+      next.delete(draftId);
+      return next;
+    });
+  };
+
+  const clearCreatingDraftId = (draftId: string) => {
+    setCreatingDraftId((previous) => (previous === draftId ? null : previous));
+  };
+
+  const updateMessageDraft = (
+    draftKey: string,
+    updater: (draft: MessageDraft) => MessageDraft,
+    expectedDraftId?: string,
+  ) => {
+    setComposerDrafts((previous) => {
+      const current = previous.messageDrafts[draftKey] || createMessageDraft();
+      if (expectedDraftId && current.draftId !== expectedDraftId) return previous;
+      const next = updater(current);
+      if (next === current) return previous;
+      return {
+        ...previous,
+        messageDrafts: {
+          ...previous.messageDrafts,
+          [draftKey]: next,
+        },
+      };
+    });
+  };
+
+  const migrateDraftsToSession = (
+    sourceKey: string,
+    targetSessionId: string,
+    expectedDraftId: string,
+  ) => {
+    if (sourceKey === targetSessionId) return;
+    setComposerDrafts((previous) => {
+      const sourceMessage = previous.messageDrafts[sourceKey];
+      if (!sourceMessage || sourceMessage.draftId !== expectedDraftId) return previous;
+
+      const targetMessage = previous.messageDrafts[targetSessionId];
+      const targetSkill = previous.skillDrafts[targetSessionId];
+      const targetMessageCompatible = !targetMessage
+        || targetMessage.draftId === expectedDraftId
+        || isPristineMessageDraft(targetMessage);
+      const targetSkillCompatible = !targetSkill
+        || (targetSkill.revision === 0 && targetSkill.keys.length === 0);
+      if (!targetMessageCompatible || !targetSkillCompatible) return previous;
+
+      const nextMessageDrafts = { ...previous.messageDrafts };
+      nextMessageDrafts[targetSessionId] = targetMessage?.draftId === expectedDraftId
+        && targetMessage.revision > sourceMessage.revision
+        ? targetMessage
+        : sourceMessage;
+      delete nextMessageDrafts[sourceKey];
+
+      const nextSkillDrafts = { ...previous.skillDrafts };
+      const sourceSkill = nextSkillDrafts[sourceKey];
+      if (sourceSkill) nextSkillDrafts[targetSessionId] = sourceSkill;
+      delete nextSkillDrafts[sourceKey];
+
+      return {
+        messageDrafts: nextMessageDrafts,
+        skillDrafts: nextSkillDrafts,
+      };
+    });
+  };
 
   useEffect(() => {
     if (!sessionId) {
@@ -269,12 +410,7 @@ function ChatV2View(props: ChatV2Props) {
 
   useEffect(() => {
     if (!sessionId) {
-      setInput('');
       setLocalError('');
-      setBootstrapMessage('');
-      setSessionHandoffMessage('');
-      setIsSessionHandoff(false);
-      setAttachedFiles([]);
       setPreviewFile(null);
       setPreviewSessionId('');
       setIsFilesOpen(false);
@@ -291,7 +427,6 @@ function ChatV2View(props: ChatV2Props) {
     }
 
     setDisableInitialMotion(true);
-    setBootstrapMessage('');
     isInitialLoadRef.current = true;
     suppressAutoScrollRef.current = true;
     roundElementRefs.current = {};
@@ -304,25 +439,6 @@ function ChatV2View(props: ChatV2Props) {
     setLocalError('');
     setStopping(false);
     void runtime.loadSessionHistory(sessionId, { hasActiveSlot });
-  }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (!sessionId) return;
-
-    if (!bootstrapMessage) {
-      setSessionHandoffMessage('');
-      setIsSessionHandoff(false);
-      return;
-    }
-
-    setSessionHandoffMessage(bootstrapMessage);
-    setIsSessionHandoff(true);
-    const timer = window.setTimeout(() => {
-      setIsSessionHandoff(false);
-      setSessionHandoffMessage('');
-    }, 520);
-
-    return () => window.clearTimeout(timer);
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -464,28 +580,45 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleFileUpload = async (files: FileList | File[] | null) => {
-    if (!files || files.length === 0) return;
-    setUploading(true);
+    const capturedDraftId = currentMessageDraft.draftId;
+    if (
+      !files
+      || files.length === 0
+      || uploadsInFlightRef.current.has(capturedDraftId)
+      || sending
+      || resuming
+      || creatingDraftId === capturedDraftId
+      || stopping
+      || pendingSendSessionKeysRef.current.has(currentDraftKey)
+    ) return;
+    const sourceDraftKey = currentDraftKey;
+    uploadsInFlightRef.current.add(capturedDraftId);
+    addUploadingDraftId(capturedDraftId);
     const uploadedFiles: FileInfo[] = [];
     try {
       let targetSessionId = sessionId;
       if (!targetSessionId) {
         if (!onCreateSession) {
           setLocalError('无法创建会话');
-          setUploading(false);
+          removeUploadingDraftId(capturedDraftId);
           return;
         }
-        setCreatingSession(true);
+        setCreatingDraftId(capturedDraftId);
         try {
           targetSessionId = await onCreateSession(selectedModelId || undefined);
         } catch (err) {
           console.error('Failed to create session for file upload:', err);
           setLocalError('创建会话失败，无法上传文件');
-          setCreatingSession(false);
-          setUploading(false);
+          clearCreatingDraftId(capturedDraftId);
+          removeUploadingDraftId(capturedDraftId);
           return;
         }
       }
+
+      const sourceDraft = composerDraftsRef.current.messageDrafts[sourceDraftKey];
+      if (!sourceDraft || sourceDraft.draftId !== capturedDraftId) return;
+      migrateDraftsToSession(sourceDraftKey, targetSessionId, capturedDraftId);
+      if (!sessionIdRef.current) onSessionCreated?.(targetSessionId);
 
       const uploadQueue = Array.from(files as ArrayLike<File>);
       for (const file of uploadQueue) {
@@ -495,13 +628,22 @@ function ChatV2View(props: ChatV2Props) {
         if (isImageFile(fileInfo)) fileInfo.data_url = await readFileAsDataUrl(file);
         uploadedFiles.push(fileInfo);
       }
-      setAttachedFiles((prev) => [...prev, ...uploadedFiles]);
+      updateMessageDraft(
+        targetSessionId,
+        (draft) => ({
+          ...draft,
+          revision: draft.revision + 1,
+          attachedFiles: [...draft.attachedFiles, ...uploadedFiles],
+        }),
+        capturedDraftId,
+      );
     } catch (err) {
       console.error('Failed to upload files:', err);
       setLocalError(formatUploadError(err));
     } finally {
-      setUploading(false);
-      setCreatingSession(false);
+      uploadsInFlightRef.current.delete(capturedDraftId);
+      removeUploadingDraftId(capturedDraftId);
+      clearCreatingDraftId(capturedDraftId);
     }
   };
 
@@ -533,7 +675,11 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleRemoveAttachment = (index: number) => {
-    setAttachedFiles(attachedFiles.filter((_, itemIndex) => itemIndex !== index));
+    updateMessageDraft(currentDraftKey, (draft) => ({
+      ...draft,
+      revision: draft.revision + 1,
+      attachedFiles: draft.attachedFiles.filter((_, itemIndex) => itemIndex !== index),
+    }));
   };
 
   const handlePreviewAttachment = async (file: AttachmentInfo | FileInfo) => {
@@ -594,50 +740,91 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleInputChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setInput(event.target.value);
+    const nextInput = event.target.value;
+    updateMessageDraft(currentDraftKey, (draft) => (
+      draft.input === nextInput
+        ? draft
+        : { ...draft, input: nextInput, revision: draft.revision + 1 }
+    ));
   };
 
   const handleSelectFile = (file: FileInfo, _newInput: string) => {
-    if (!attachedFiles.find((item) => item.name === file.name)) {
-      setAttachedFiles([...attachedFiles, file]);
-    }
+    updateMessageDraft(currentDraftKey, (draft) => {
+      if (draft.attachedFiles.some((item) => item.name === file.name)) return draft;
+      const normalizedFile = file.session_id
+        ? file
+        : { ...file, session_id: sessionId || undefined };
+      return {
+        ...draft,
+        revision: draft.revision + 1,
+        attachedFiles: [...draft.attachedFiles, normalizedFile],
+      };
+    });
   };
 
   const handleSelectedSkillKeysChange = (keys: string[]) => {
-    const draftKey = sessionId || '__new_session__';
-    setSkillDrafts((previous) => {
-      const current = previous[draftKey] || { keys: [], revision: 0 };
+    const draftKey = currentDraftKey;
+    setComposerDrafts((previous) => {
+      const current = previous.skillDrafts[draftKey] || { keys: [], revision: 0 };
       return {
         ...previous,
-        [draftKey]: { keys, revision: current.revision + 1 },
+        skillDrafts: {
+          ...previous.skillDrafts,
+          [draftKey]: { keys, revision: current.revision + 1 },
+        },
       };
     });
   };
 
   const handleSend = async () => {
-    const initialSessionKey = sessionId || '__new_session__';
+    const initialSessionKey = currentDraftKey;
+    const capturedDraftId = currentMessageDraft.draftId;
     if (
       (!input.trim() && attachedFiles.length === 0)
       || sending
-      || creatingSession
+      || creatingDraftId === capturedDraftId
       || stopping
+      || uploadingDraftIds.has(capturedDraftId)
+      || uploadsInFlightRef.current.has(capturedDraftId)
       || pendingSendSessionKeysRef.current.has(initialSessionKey)
     ) return;
-    const draftInput = input;
-    const draftAttachments = [...attachedFiles];
+    const messageSnapshot: MessageDraft = {
+      ...currentMessageDraft,
+      attachedFiles: [...currentMessageDraft.attachedFiles],
+    };
+    const draftInput = messageSnapshot.input;
+    const draftAttachments = messageSnapshot.attachedFiles;
     const skillSnapshot: SkillDraft = {
       keys: [...currentSkillDraft.keys],
       revision: currentSkillDraft.revision,
     };
+    const clearedMessageRevision = messageSnapshot.revision + 1;
     const clearedSkillRevision = skillSnapshot.revision + 1;
-    let restoreSkillDraftKey = initialSessionKey;
-    const restoreSkillSnapshot = () => {
-      setSkillDrafts((previous) => restoreFailedSkillDraft(
-        previous,
-        restoreSkillDraftKey,
-        skillSnapshot,
-        clearedSkillRevision,
-      ));
+    let restoreDraftKey = initialSessionKey;
+    const restoreSubmissionSnapshot = () => {
+      setComposerDrafts((previous) => {
+        const current = previous.messageDrafts[restoreDraftKey];
+        if (!current || current.draftId !== messageSnapshot.draftId) return previous;
+        const nextMessageDrafts = { ...previous.messageDrafts };
+        if (
+          current.revision === clearedMessageRevision
+        ) {
+          nextMessageDrafts[restoreDraftKey] = {
+            ...messageSnapshot,
+            revision: current.revision + 1,
+            attachedFiles: [...messageSnapshot.attachedFiles],
+          };
+        }
+        return {
+          messageDrafts: nextMessageDrafts,
+          skillDrafts: restoreFailedSkillDraft(
+            previous.skillDrafts,
+            restoreDraftKey,
+            skillSnapshot,
+            clearedSkillRevision,
+          ),
+        };
+      });
     };
     let contentBlocks: ChatContentBlock[] = [];
     try {
@@ -651,63 +838,68 @@ function ChatV2View(props: ChatV2Props) {
     try {
       const userMessage = buildDisplayMessage(draftInput, draftAttachments);
       const isStartingNewSession = !sessionId;
-      if (isStartingNewSession) {
-        setBootstrapMessage(userMessage);
-      }
-      setInput('');
-      setAttachedFiles([]);
-      setSkillDrafts((previous) => ({
-        ...previous,
-        [initialSessionKey]: { keys: [], revision: clearedSkillRevision },
-      }));
+      setComposerDrafts((previous) => {
+        const current = previous.messageDrafts[initialSessionKey];
+        if (!current || current.draftId !== messageSnapshot.draftId) return previous;
+        return {
+          messageDrafts: {
+            ...previous.messageDrafts,
+            [initialSessionKey]: {
+              ...current,
+              revision: clearedMessageRevision,
+              input: '',
+              attachedFiles: [],
+            },
+          },
+          skillDrafts: {
+            ...previous.skillDrafts,
+            [initialSessionKey]: { keys: [], revision: clearedSkillRevision },
+          },
+        };
+      });
       setDisableInitialMotion(false);
       setLocalError('');
 
       let targetSessionId = sessionId;
       if (!targetSessionId) {
         if (!onCreateSession) {
-          setBootstrapMessage('');
-          setInput(draftInput);
-          setAttachedFiles(draftAttachments);
-          restoreSkillSnapshot();
+          restoreSubmissionSnapshot();
           return;
         }
-        setCreatingSession(true);
+        setCreatingDraftId(capturedDraftId);
         try {
           targetSessionId = await onCreateSession(selectedModelId || undefined);
         } catch (err) {
           console.error('Failed to create session:', err);
           setLocalError('创建会话失败，请重试');
-          setBootstrapMessage('');
-          setInput(draftInput);
-          setAttachedFiles(draftAttachments);
-          restoreSkillSnapshot();
-          setCreatingSession(false);
+          restoreSubmissionSnapshot();
+          clearCreatingDraftId(capturedDraftId);
           return;
         }
       }
 
       targetSessionKey = targetSessionId;
       if (targetSessionKey !== initialSessionKey) {
-        restoreSkillDraftKey = targetSessionKey;
-        setSkillDrafts((previous) => {
-          if (previous[targetSessionKey]) return previous;
-          return {
-            ...previous,
-            [targetSessionKey]: { keys: [], revision: clearedSkillRevision },
-          };
-        });
+        const sourceDraft = composerDraftsRef.current.messageDrafts[initialSessionKey];
+        if (!sourceDraft || sourceDraft.draftId !== messageSnapshot.draftId) {
+          restoreSubmissionSnapshot();
+          if (isStartingNewSession) clearCreatingDraftId(capturedDraftId);
+          return;
+        }
+        restoreDraftKey = targetSessionKey;
+        migrateDraftsToSession(initialSessionKey, targetSessionKey, messageSnapshot.draftId);
+        if (!sessionIdRef.current) onSessionCreated?.(targetSessionKey);
       }
       pendingSendSessionKeysRef.current.add(targetSessionKey);
+      if (isStartingNewSession) clearCreatingDraftId(capturedDraftId);
       const sendPromise = runtime.sendMessage({
         sessionId: targetSessionId,
         displayMessage: userMessage,
         content: contentBlocks,
         attachments: draftAttachments,
         preferredSkillKeys: skillSnapshot.keys,
-        onRejectedBeforeAccept: restoreSkillSnapshot,
+        onRejectedBeforeAccept: restoreSubmissionSnapshot,
       });
-      if (isStartingNewSession) setCreatingSession(false);
       await sendPromise;
     } finally {
       pendingSendSessionKeysRef.current.delete(initialSessionKey);
@@ -730,10 +922,9 @@ function ChatV2View(props: ChatV2Props) {
     await runtime.resumeRun(sessionId, pendingInterrupt, answers);
   };
 
-  const inputDisabled = sending || creatingSession || resuming;
-  const sendingLabel = creatingSession ? '创建中' : resuming ? 'Resuming' : sending ? 'Running' : '';
+  const inputDisabled = sending || creatingCurrentDraft || resuming;
+  const sendingLabel = creatingCurrentDraft ? '创建中' : resuming ? 'Resuming' : sending ? 'Running' : '';
   const hasLiveReplyBelow = showScrollButton && (sending || resuming);
-  const isBootstrappingSession = !sessionId && (creatingSession || Boolean(bootstrapMessage));
 
   return (
     <div className="flex-1 flex h-screen bg-claude-bg relative">
@@ -768,21 +959,16 @@ function ChatV2View(props: ChatV2Props) {
                 setFilePanelTarget(null);
                 setIsFilesOpen(!isFilesOpen);
               }}
-              className={`h-9 px-3 rounded-xl border transition-all active:scale-95 flex items-center gap-2 ${
+              className={`h-9 px-3 rounded-xl border transition-[background-color,color,border-color,transform] active:scale-95 flex items-center gap-2 ${
                 isFilesOpen
                   ? 'border-[#2f6f54] bg-[#eef8f2] text-[#234d3c]'
                   : 'border-transparent text-claude-secondary hover:bg-claude-hover'
-              } ${isSessionHandoff ? 'animate-fade-in' : ''}`}
+              }`}
               title="会话资源"
             >
               <Folder size={16} />
               <span className="text-sm hidden sm:inline">Files</span>
             </button>
-          ) : isBootstrappingSession ? (
-            <div className="h-9 min-w-[88px] px-3 rounded-lg bg-claude-surface text-claude-secondary text-xs flex items-center justify-center gap-2">
-              <Loader2 className="w-3.5 h-3.5 animate-spin text-claude-accent" />
-              <span>开启中</span>
-            </div>
           ) : (
             <div className="w-[88px]" />
           )}
@@ -822,44 +1008,32 @@ function ChatV2View(props: ChatV2Props) {
               </div>
             </div>
           ) : rounds.length === 0 ? (
-            isBootstrappingSession ? (
-              <div className="flex h-full items-center justify-center px-4">
-                <div className="w-full max-w-3xl animate-slide-in-bottom">
-                  <div className="mb-4 flex items-center justify-end gap-2 text-sm text-claude-secondary">
-                    <Loader2 className="h-4 w-4 animate-spin text-claude-accent" />
-                    <span>正在开启对话</span>
-                  </div>
-                  {bootstrapMessage && (
-                    <div className="ml-auto max-w-[82%] rounded-2xl border border-claude-border bg-white px-4 py-3 text-[15px] leading-relaxed text-claude-text shadow-sm">
-                      {bootstrapMessage}
-                    </div>
-                  )}
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center max-w-lg px-6">
+                <h2 className="text-3xl font-medium text-claude-text mb-3">你好，有什么可以帮你的？</h2>
+                <p className="text-claude-secondary leading-relaxed mb-10">
+                  编写代码、分析数据、处理文件，或者解答技术问题。
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {WELCOME_SUGGESTIONS.map((suggestion, index) => (
+                    <button
+                      type="button"
+                      key={index}
+                      onClick={() => updateMessageDraft(currentDraftKey, (draft) => ({
+                        ...draft,
+                        input: suggestion,
+                        revision: draft.revision + 1,
+                      }))}
+                      className="px-4 py-3 bg-white border border-claude-border rounded-2xl text-sm text-claude-secondary hover:border-claude-border-strong hover:bg-claude-hover transition-colors text-left"
+                    >
+                      {suggestion}
+                    </button>
+                  ))}
                 </div>
               </div>
-            ) : (
-              <div className="flex items-center justify-center h-full">
-                <div className="text-center max-w-lg px-6">
-                  <h2 className="text-3xl font-medium text-claude-text mb-3">你好，有什么可以帮你的？</h2>
-                  <p className="text-claude-secondary leading-relaxed mb-10">
-                    编写代码、分析数据、处理文件，或者解答技术问题。
-                  </p>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {WELCOME_SUGGESTIONS.map((suggestion, index) => (
-                      <button
-                        type="button"
-                        key={index}
-                        onClick={() => setInput(suggestion)}
-                        className="px-4 py-3 bg-white border border-claude-border rounded-2xl text-sm text-claude-secondary hover:border-claude-border-strong hover:bg-claude-hover transition-colors text-left"
-                      >
-                        {suggestion}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )
+            </div>
           ) : (
-            <div className={`mx-auto px-4 md:px-8 py-6 space-y-6 max-w-3xl ${isSessionHandoff ? 'animate-slide-in-bottom' : ''}`}>
+            <div className="mx-auto px-4 md:px-8 py-6 space-y-6 max-w-3xl">
               {displayRoundGroups.map(({ round, sourceRoundIds }, index) => (
                 <div
                   key={round.round_id}
@@ -891,20 +1065,11 @@ function ChatV2View(props: ChatV2Props) {
             </div>
           )}
 
-          {!isFilesOpen && isSessionHandoff && sessionHandoffMessage && (
-            <div className="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 px-4">
-              <div className="session-handoff-overlay flex items-center gap-2 rounded-full border border-claude-border bg-white/95 px-3.5 py-2 text-sm text-claude-secondary shadow-sm backdrop-blur-sm">
-                <Loader2 className="h-4 w-4 animate-spin text-claude-accent" />
-                <span className="whitespace-nowrap">正在开启对话</span>
-              </div>
-            </div>
-          )}
-
           {!isFilesOpen && showScrollButton && (
             <button
               type="button"
               onClick={() => scrollToBottom(true)}
-              className={`fixed bottom-28 right-8 z-10 flex items-center gap-2 bg-white text-claude-text shadow-lg border border-claude-border transition-all hover:scale-105 active:scale-95 ${
+              className={`fixed bottom-28 right-8 z-10 flex items-center gap-2 bg-white text-claude-text shadow-lg border border-claude-border transition-[transform,box-shadow] hover:scale-105 active:scale-95 ${
                 hasLiveReplyBelow ? 'live-reply-pill rounded-full px-3.5 py-2.5 ring-2 ring-claude-accent/25 shadow-xl' : 'rounded-full p-2.5'
               }`}
               aria-label={hasLiveReplyBelow ? '新回复正在生成，回到底部' : '回到底部'}
@@ -977,19 +1142,24 @@ function ChatV2View(props: ChatV2Props) {
         {!isFilesOpen && (
           <ChatInput
             value={input}
-            onChange={setInput}
+            onChange={(value) => updateMessageDraft(currentDraftKey, (draft) => (
+              draft.input === value
+                ? draft
+                : { ...draft, input: value, revision: draft.revision + 1 }
+            ))}
             onSend={handleSend}
             onStop={(sending || resuming) ? handleStop : undefined}
             disabled={inputDisabled}
-            sendDisabled={stopping}
+            sendDisabled={stopping || uploadingCurrentDraft}
             sendingLabel={sendingLabel}
             placeholder={sessionId ? '输入指令...' : '输入你的问题，按 Enter 开始对话...'}
+            autoFocus={!sessionId}
             attachedFiles={attachedFiles}
             onRemoveAttachment={handleRemoveAttachment}
             onFileUpload={handleFileUpload}
             onInputDropHandled={() => setIsDragging(false)}
             onPreviewAttachment={sessionId ? handlePreviewAttachment : undefined}
-            uploading={uploading}
+            uploading={uploadingCurrentDraft}
             onInputChangeRaw={handleInputChange}
             onFileSelected={handleSelectFile}
             selectedSkillKeys={currentSkillDraft.keys}

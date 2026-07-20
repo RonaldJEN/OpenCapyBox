@@ -12,7 +12,11 @@ import { MAX_SELECTED_SKILLS } from '../utils/skillDrafts';
 const MAX_TEXTAREA_HEIGHT = 200;
 
 const skillKey = (skill: SkillInfo) => skill.key || skill.name;
-const skillDisplayName = (skill: SkillInfo) => skill.display_name || skill.name;
+const skillDisplayName = (skill: SkillInfo) => skill.display_name || skill.name || skillKey(skill);
+const normalizedSkillLabel = (value: string) => value.trim().replace(/\s+/g, ' ').toLowerCase();
+const shouldShowSkillKey = (skill: SkillInfo) => (
+  normalizedSkillLabel(skillDisplayName(skill)) !== normalizedSkillLabel(skillKey(skill))
+);
 
 interface ChatInputProps {
   /** 当前输入文本 */
@@ -30,6 +34,8 @@ interface ChatInputProps {
   sendingLabel?: string;
 
   placeholder?: string;
+  /** 进入欢迎页时将键盘焦点放到输入框 */
+  autoFocus?: boolean;
 
   // ---- 文件上传 ----
   attachedFiles?: FileInfo[];
@@ -60,6 +66,7 @@ export function ChatInput({
   sendDisabled = false,
   sendingLabel,
   placeholder = '输入消息...',
+  autoFocus = false,
   attachedFiles = [],
   onRemoveAttachment,
   onFileUpload,
@@ -85,6 +92,10 @@ export function ChatInput({
   const skillsLoadedRef = useRef(false);
   const skillsRequestRef = useRef<ReturnType<typeof getSkills> | null>(null);
   const skillPickerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (autoFocus) textareaRef.current?.focus();
+  }, [autoFocus]);
 
   useEffect(() => {
     if (!skillsOpen) return;
@@ -323,7 +334,7 @@ export function ChatInput({
             onDragOver={handleDragOverInput}
             onDragLeave={handleDragLeaveInput}
             onDrop={handleDropInput}
-            className={`flex flex-col bg-white rounded-3xl border transition-all duration-200 ${
+            className={`flex flex-col bg-white rounded-3xl border transition-[border-color,box-shadow,background-color] duration-200 ${
             hasContent
               ? 'border-claude-border-strong shadow-md ring-2 ring-claude-accent/10'
               : 'border-claude-border shadow-sm hover:border-claude-border-strong'
@@ -378,9 +389,11 @@ export function ChatInput({
                       onChange={(e) => onFileUpload(e.target.files)}
                     />
                     <button
+                      type="button"
                       onClick={() => fileInputRef.current?.click()}
                       disabled={uploading || disabled}
-                      className="p-1.5 text-claude-muted hover:text-claude-secondary hover:bg-claude-hover rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="p-1.5 text-claude-muted hover:text-claude-secondary hover:bg-claude-hover rounded-lg transition-[color,background-color,opacity] disabled:opacity-50 disabled:cursor-not-allowed"
+                      aria-label="上传文件"
                       title="上传文件"
                     >
                       {uploading ? (
@@ -398,7 +411,7 @@ export function ChatInput({
                       type="button"
                       onClick={toggleSkillsOpen}
                       disabled={disabled}
-                      className={`flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
+                      className={`flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs transition-[color,background-color,opacity] disabled:cursor-not-allowed disabled:opacity-50 ${
                         selectedSkillKeys.length > 0
                           ? 'bg-claude-accent/10 text-claude-secondary'
                           : 'text-claude-muted hover:bg-claude-hover hover:text-claude-secondary'
@@ -493,7 +506,9 @@ export function ChatInput({
                                 </span>
                                 <span className="min-w-0">
                                   <span className="block truncate text-sm font-medium text-claude-text">{skillDisplayName(skill)}</span>
-                                  <span className="block truncate text-[11px] text-claude-muted">{key}</span>
+                                  {shouldShowSkillKey(skill) && (
+                                    <span className="block truncate text-[11px] text-claude-muted">{key}</span>
+                                  )}
                                   <span className="mt-0.5 block line-clamp-2 text-xs text-claude-muted">{skill.description}</span>
                                 </span>
                               </button>
@@ -509,17 +524,22 @@ export function ChatInput({
               {/* 发送/停止按钮 — 圆形 */}
               {sendingLabel && onStop ? (
                 <button
+                  type="button"
                   onClick={onStop}
-                  className="w-8 h-8 rounded-full flex items-center justify-center transition-all bg-claude-error text-white hover:opacity-80 active:scale-95"
+                  className="w-8 h-8 rounded-full flex items-center justify-center transition-[opacity,transform] bg-claude-error text-white hover:opacity-80 active:scale-95"
+                  aria-label="停止生成"
                   title="停止生成"
                 >
                   <Square className="w-3.5 h-3.5 fill-current" />
                 </button>
               ) : (
                 <button
+                  type="button"
                   onClick={onSend}
                   disabled={!canSend}
-                  className={`w-8 h-8 rounded-full flex items-center justify-center transition-all ${
+                  aria-label="发送消息"
+                  title="发送消息"
+                  className={`w-8 h-8 rounded-full flex items-center justify-center transition-[background-color,color,opacity,transform] ${
                     canSend
                       ? 'bg-claude-text text-white hover:opacity-80 active:scale-95'
                       : 'bg-claude-border text-claude-muted cursor-not-allowed'

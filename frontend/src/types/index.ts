@@ -449,7 +449,7 @@ export interface RoundData {
   user_message: string;
   user_attachments?: AttachmentInfo[];
   preferred_skills?: PreferredSkillSnapshot[];
-  final_response: string;
+  final_response: string | null;
   steps: StepData[];
   step_count: number;
   status: string;

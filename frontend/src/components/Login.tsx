@@ -70,7 +70,7 @@ export function Login() {
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               required
-              className="w-full px-4 py-3 bg-white border border-claude-border rounded-xl focus:ring-2 focus:ring-claude-accent/20 focus:border-claude-accent transition-all outline-none text-claude-text placeholder-claude-muted"
+              className="w-full px-4 py-3 bg-white border border-claude-border rounded-xl focus:ring-2 focus:ring-claude-accent/20 focus:border-claude-accent transition-[border-color,box-shadow] outline-none text-claude-text placeholder-claude-muted"
               placeholder="请输入用户名"
               disabled={loading}
             />
@@ -86,7 +86,7 @@ export function Login() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
-              className="w-full px-4 py-3 bg-white border border-claude-border rounded-xl focus:ring-2 focus:ring-claude-accent/20 focus:border-claude-accent transition-all outline-none text-claude-text placeholder-claude-muted"
+              className="w-full px-4 py-3 bg-white border border-claude-border rounded-xl focus:ring-2 focus:ring-claude-accent/20 focus:border-claude-accent transition-[border-color,box-shadow] outline-none text-claude-text placeholder-claude-muted"
               placeholder="请输入密码"
               disabled={loading}
             />

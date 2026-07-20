@@ -170,8 +170,33 @@ describe('CronSchedule', () => {
       expect(screen.getByText('日程')).toBeInTheDocument();
     });
 
-    screen.getByText('✕').click();
+    const closeButton = screen.getByRole('button', { name: '关闭日程' });
+    expect(closeButton).toHaveAttribute('type', 'button');
+    expect(closeButton).toHaveAttribute('title', '关闭日程');
+    closeButton.click();
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('日历导航和任务表单关闭图标具有明确可访问名称', async () => {
+    render(<CronSchedule />);
+
+    await waitFor(() => {
+      expect(screen.getByText('日程')).toBeInTheDocument();
+    });
+
+    const previousWeek = screen.getByRole('button', { name: '上一周' });
+    const nextWeek = screen.getByRole('button', { name: '下一周' });
+    expect(previousWeek).toHaveAttribute('type', 'button');
+    expect(previousWeek).toHaveAttribute('title', '上一周');
+    expect(nextWeek).toHaveAttribute('type', 'button');
+    expect(nextWeek).toHaveAttribute('title', '下一周');
+
+    fireEvent.click(screen.getByRole('button', { name: '+ 新建任务' }));
+    const closeForm = screen.getByRole('button', { name: '关闭任务表单' });
+    expect(closeForm).toHaveAttribute('type', 'button');
+    expect(closeForm).toHaveAttribute('title', '关闭任务表单');
+    fireEvent.click(closeForm);
+    expect(screen.queryByRole('button', { name: '关闭任务表单' })).not.toBeInTheDocument();
   });
 
   it('周视图 inline 只保留运行，不提供启停和详情入口', async () => {

@@ -380,7 +380,15 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
             )}
           </button>
           {onClose && (
-            <button onClick={onClose} className="p-1 rounded hover:bg-claude-hover text-claude-muted">✕</button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="p-1 rounded hover:bg-claude-hover text-claude-muted"
+              aria-label="关闭日程"
+              title="关闭日程"
+            >
+              ✕
+            </button>
           )}
         </div>
       </div>
@@ -402,13 +410,25 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Week nav */}
           <div className="flex items-center justify-center gap-3 py-3 border-b border-claude-border">
-            <button onClick={() => setWeekOffset((o) => o - 1)} className="p-1.5 rounded-lg hover:bg-claude-hover text-claude-secondary">
+            <button
+              type="button"
+              onClick={() => setWeekOffset((o) => o - 1)}
+              className="p-1.5 rounded-lg hover:bg-claude-hover text-claude-secondary"
+              aria-label="上一周"
+              title="上一周"
+            >
               ‹
             </button>
             <span className="text-sm font-medium text-claude-text min-w-[200px] text-center">
               {formatDateRange(weekDays)}
             </span>
-            <button onClick={() => setWeekOffset((o) => o + 1)} className="p-1.5 rounded-lg hover:bg-claude-hover text-claude-secondary">
+            <button
+              type="button"
+              onClick={() => setWeekOffset((o) => o + 1)}
+              className="p-1.5 rounded-lg hover:bg-claude-hover text-claude-secondary"
+              aria-label="下一周"
+              title="下一周"
+            >
               ›
             </button>
             {weekOffset !== 0 && (

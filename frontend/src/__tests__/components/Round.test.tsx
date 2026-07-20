@@ -226,6 +226,132 @@ describe('Round 组件', () => {
     expect(screen.getByText('达到最大步数限制')).toBeInTheDocument();
   });
 
+  it('取消状态应该显示中性提示而不是错误', () => {
+    const round = createMockRound({
+      status: 'cancelled',
+      final_response: '',
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    expect(screen.getByText('已取消')).toBeInTheDocument();
+    expect(screen.queryByText('执行失败')).not.toBeInTheDocument();
+  });
+
+  it('取消发生在响应生成前时应该兼容 null 响应', () => {
+    const round = createMockRound({
+      status: 'cancelled',
+      final_response: null,
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    expect(screen.getByText('已取消')).toBeInTheDocument();
+    expect(screen.queryByText('执行失败')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
+  });
+
+  it('取消状态应该隐藏完整响应中的 Cancelled 占位内容', () => {
+    const round = createMockRound({
+      status: 'cancelled',
+      final_response: '  Cancelled\n',
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+    expect(screen.getByText('已取消')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
+  });
+
+  it('仅当取消响应完整等于 sentinel 时才隐藏正文', () => {
+    const round = createMockRound({
+      status: 'cancelled',
+      final_response: 'Cancelled after completing the cleanup.',
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    expect(screen.getByText('Cancelled after completing the cleanup.')).toBeInTheDocument();
+    expect(screen.getByText('已取消')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
+  });
+
+  it.each(['', 'Cancelled'])(
+    '取消响应为 %j 时应该保留已流式生成的有效正文',
+    (finalResponse) => {
+      const round = createMockRound({
+        status: 'cancelled',
+        final_response: finalResponse,
+        steps: [
+          {
+            step_number: 1,
+            thinking: '',
+            assistant_content: '取消前已经生成的有效正文。',
+            tool_calls: [],
+            tool_results: [],
+            status: 'completed',
+          },
+        ],
+      });
+
+      render(<Round round={round} isStreaming={false} />);
+
+      expect(screen.getByText('取消前已经生成的有效正文。')).toBeInTheDocument();
+      expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+      expect(screen.getByText('已取消')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
+    },
+  );
+
+  it('最后一步是取消占位符时应该继续显示更早的有效正文', () => {
+    const round = createMockRound({
+      status: 'cancelled',
+      final_response: '',
+      steps: [
+        {
+          step_number: 1,
+          thinking: '',
+          assistant_content: '取消前已经生成的有效正文。',
+          tool_calls: [],
+          tool_results: [],
+          status: 'completed',
+        },
+        {
+          step_number: 2,
+          thinking: '',
+          assistant_content: 'Cancelled',
+          tool_calls: [],
+          tool_results: [],
+          status: 'completed',
+        },
+      ],
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    expect(screen.getByText('取消前已经生成的有效正文。')).toBeInTheDocument();
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+    expect(screen.getByText('已取消')).toBeInTheDocument();
+  });
+
+  it('非取消状态应该保留内容恰为 Cancelled 的完整响应', () => {
+    const round = createMockRound({
+      status: 'completed',
+      final_response: 'Cancelled',
+      steps: [],
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    expect(screen.getByText('Cancelled')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '复制回复' })).toBeInTheDocument();
+  });
+
   it('没有最终响应时不应该渲染响应区域', () => {
     const round = createMockRound({ final_response: '' });
 

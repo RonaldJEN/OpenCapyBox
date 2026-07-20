@@ -28,7 +28,7 @@ RoundData {
   user_message: string
   user_attachments?: AttachmentInfo[]
   preferred_skills: PreferredSkillSnapshot[]
-  final_response: string
+  final_response: string | null
   steps: StepData[]
   step_count: number
   status: 'running' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'resumed' | 'max_steps_reached'
@@ -170,6 +170,24 @@ pre_accept_pending
 
 **判定**：`outcome === 'interrupt' && result?.reason === 'user_cancelled'`。outcome=interrupt 但无 reason 的保守处理为非取消。
 
+#### 3.5.1 取消态 `final_response` 渲染规则
+
+`RoundData.final_response` 类型为 `string | null`，取消态下允许为 `null`、空串或占位串。任何直接读取（如 `round.final_response.trim()`）都必须先处理 `null`。
+
+`Round.tsx` 通过 `isCancelledResponseSentinel(content, status)` 判定占位符，只有 `status === 'cancelled'` 且 `content` 经 `NFKC` 归一化并 `trim()` 后精确等于 `"Cancelled"` 时才成立。据此的渲染约定：
+
+| 场景 | `final_response` | 展示 |
+|---|---|---|
+| 正常完成 | 普通字符串 | 原样展示，显示复制按钮 |
+| 取消前已有有效助手正文 | 有效正文 | 继续展示该正文（`final_response` 无效时回退到最后一个非占位 step 的 `assistant_content`） |
+| 取消且完整正文即占位符 | `"Cancelled"` | 隐藏占位串，只展示"已取消" |
+| 取消且从未生成正文 | `null` / 空串 | 只展示"已取消" |
+
+补充约束：
+- 仅 `cancelled` 状态套用 sentinel 隐藏规则；正常完成态即使正文恰好等于 `"Cancelled"` 也必须原样展示，不得隐藏。
+- 取消态不显示复制按钮：`canCopyAssistantContent = status === 'completed' && !!final_response`。
+- 回退取正文时，step 级 `assistant_content` 同样按 sentinel 规则过滤占位串。
+
 ### 3.6 ask_user 中断恢复
 
 - `loadHistory()` 若发现最新 round `status === 'interrupted' && interrupt`：
@@ -219,6 +237,9 @@ pre_accept_pending
 #### 会话草稿与发送
 
 - Skill 选择是输入草稿的一部分，按 session key 隔离保存；切换会话不得把 A 会话选择带到 B 会话。尚未创建 session 时使用独立的新会话草稿，创建成功后须迁移到实际 session，后续恢复也以实际目标 session 为准。
+- 正文与附件使用独立的 `MessageDraft` 按相同 session key 隔离；草稿包含稳定 `draftId` 与递增 `revision`。正文编辑、附件增删递增 revision，session key 迁移不得改变 draftId。
+- 新会话仍以 `__new_session__` 作为客户端映射 key，但附件上传必须先取得真实 server session ID。上传等异步回调绑定发起时的 `draftId + serverSessionId`，不得根据回调执行时的当前活跃会话决定写入位置。
+- 从 `__new_session__` 迁移到真实 session 时，MessageDraft 与 SkillDraft 必须在同一转换路径协调迁移；目标已有较新草稿或 draftId 已变化时，迟到响应不得覆盖或重新创建旧草稿。
 - 发送时对当前草稿创建不可变快照，并将其作为 `preferred_skill_keys` 与正文、附件一并提交；空数组可省略。之后用户对选择器的编辑不得改变已经发出的请求。
 - 提交发送时乐观清空该目标 session 的 Skill 草稿。服务端确认 SSE 已接受（`stream_accepted` 或 `RUN_STARTED`）后保持清空；执行已被接受后的流式失败、中断或取消不得恢复旧选择。
 - composer 清空只影响下一条待发送草稿，不得删除或隐藏已经固化在当前 direct Round 用户消息旁的 `preferred_skills` 标签。
@@ -248,7 +269,7 @@ pre_accept_pending
 - 首次渲染历史：`disableInitialMotion = true`，加载完关闭一次性 flag。
 - 实时新内容：启用 `animate-fade-in`。
 - `suppressAutoScrollRef` 用于阻止历史加载窗口内的流式自动跟随；历史加载完成后，普通进入显式定位到底部，搜索进入交给 `scrollTarget` 处理。
-- 新会话首次发送前可显示 bootstrap message 过渡动画；session handoff 期间显示加载提示，避免空白闪烁。
+- 新会话首次发送时保持欢迎页，创建完成后直接进入对话，不显示额外的 bootstrap message 或 session handoff 动画。
 
 ## 6. 轮询契约
 
@@ -330,6 +351,8 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] Skill 使用 `display_name` 展示、`key` 提交；搜索重开清空；选择、标签移除、50 项上限、桌面点击外部/`Escape` 与移动端关闭按钮行为正确
 - [ ] 普通 direct Round 在用户消息旁按 `preferred_skills` 展示只读标签；空数组不展示，resume child 不重复展示，文案不暗示 Skill 已加载或调用
 - [ ] Skill 草稿按 session 隔离；A/B 会话切换互不污染，新会话创建后草稿迁移到实际 session
+- [ ] 正文与附件草稿按 session 隔离；切回会话可恢复，迟到上传只更新其捕获的 `draftId + serverSessionId`
+- [ ] 新会话的正文、附件与 Skill 协调迁移；重复或迟到的创建结果不得覆盖真实 session 下的较新草稿
 - [ ] 发送携带快照中的 `preferred_skill_keys`，空选择不发送该字段；发送后目标 session 的选择清空
 - [ ] composer 清空后已发送 Round 的 Skill 标签仍保留；刷新或断线恢复后以 `history/v2` 的持久化 `display_name` 快照还原，独立多轮不继承或累积
 - [ ] 接受前 4xx/5xx 立即恢复 Skill 快照；网络歧义按同一幂等键查询 3 次 history，确认 Round 后不恢复，仅 3 次均成功且无匹配时恢复一次；任一次 history 失败则保持 ambiguous、提示刷新且不恢复/重发

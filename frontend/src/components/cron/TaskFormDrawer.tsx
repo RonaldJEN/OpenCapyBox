@@ -159,7 +159,13 @@ const TaskFormDrawer: React.FC<Props> = ({ task, onClose, onSaved }) => {
           <h3 className="text-base font-semibold text-claude-text">
             {isEdit ? '编辑任务' : '新建任务'}
           </h3>
-          <button onClick={onClose} className="p-1 rounded hover:bg-claude-hover text-claude-muted">
+          <button
+            type="button"
+            onClick={onClose}
+            className="p-1 rounded hover:bg-claude-hover text-claude-muted"
+            aria-label="关闭任务表单"
+            title="关闭任务表单"
+          >
             ✕
           </button>
         </div>

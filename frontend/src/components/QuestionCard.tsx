@@ -161,7 +161,7 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
                 type="button"
                 disabled={disabled}
                 onClick={() => toggleOption(safeIndex, opt.label, currentQuestion.multiSelect)}
-                className={`w-full text-left px-3 py-2 rounded-lg border transition-all text-[13px] ${
+                className={`w-full text-left px-3 py-2 rounded-lg border transition-[background-color,border-color,box-shadow,opacity,transform] text-[13px] ${
                   selected
                     ? 'border-claude-text bg-claude-text/5 ring-1 ring-claude-text/20'
                     : 'border-claude-border hover:border-claude-border-strong hover:bg-claude-hover'
@@ -206,7 +206,7 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
           type="button"
           disabled={disabled || safeIndex === 0}
           onClick={handlePrev}
-          className={`inline-flex items-center justify-center gap-1 px-3 py-2 rounded-xl text-sm font-medium border transition-all ${
+          className={`inline-flex items-center justify-center gap-1 px-3 py-2 rounded-xl text-sm font-medium border transition-colors ${
             disabled || safeIndex === 0
               ? 'border-claude-border text-claude-muted bg-claude-surface cursor-not-allowed'
               : 'border-claude-border text-claude-secondary hover:border-claude-border-strong hover:bg-claude-hover'
@@ -221,7 +221,7 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
             type="button"
             disabled={disabled}
             onClick={handleSkip}
-            className={`px-3 py-2 rounded-xl text-sm font-medium border transition-all ${
+            className={`px-3 py-2 rounded-xl text-sm font-medium border transition-colors ${
               disabled
                 ? 'border-claude-border text-claude-muted bg-claude-surface cursor-not-allowed'
                 : 'border-claude-border text-claude-secondary hover:border-claude-border-strong hover:bg-claude-hover'
@@ -235,7 +235,7 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
               type="button"
               disabled={!canSubmit}
               onClick={() => submitAnswers()}
-              className={`inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all ${
+              className={`inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-[color,background-color,transform] ${
                 canSubmit
                   ? 'bg-claude-text text-white hover:bg-claude-text/90 active:scale-[0.98]'
                   : 'bg-claude-surface text-claude-muted cursor-not-allowed'
@@ -249,7 +249,7 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
               type="button"
               disabled={disabled}
               onClick={handleNext}
-              className={`inline-flex items-center justify-center gap-1 px-3 py-2 rounded-xl text-sm font-medium transition-all ${
+              className={`inline-flex items-center justify-center gap-1 px-3 py-2 rounded-xl text-sm font-medium transition-[color,background-color,transform] ${
                 disabled
                   ? 'bg-claude-surface text-claude-muted cursor-not-allowed'
                   : 'bg-claude-text text-white hover:bg-claude-text/90 active:scale-[0.98]'

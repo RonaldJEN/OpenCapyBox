@@ -303,10 +303,17 @@ function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentP
   const handleCreateSessionForChat = useCallback(async (modelId?: string): Promise<string> => {
     const response = await apiService.createSession(modelId);
     setRefreshTrigger((prev) => prev + 1); // 刷新侧边栏列表
-    setCurrentSessionId(response.session_id);
-    setSessionScrollTarget(null);
     return response.session_id;
   }, [setRefreshTrigger]);
+
+  const handleSessionCreatedForChat = useCallback((sessionId: string) => {
+    // The user may have selected another session while creation was in flight.
+    // Only activate the created session while the welcome composer is still active.
+    if (currentSessionIdRef.current) return;
+    currentSessionIdRef.current = sessionId;
+    setCurrentSessionId(sessionId);
+    setSessionScrollTarget(null);
+  }, []);
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -333,6 +340,7 @@ function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentP
           onModelChange={setSelectedModelId}
           availableModels={availableModels}
           onCreateSession={handleCreateSessionForChat}
+          onSessionCreated={handleSessionCreatedForChat}
           scrollTarget={sessionScrollTarget}
           activeSlotSessionIds={activeSlotSessionIds}
         />
@@ -359,7 +367,7 @@ function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentP
             </div>
           ) : (
             <div
-              className={`fixed inset-0 z-30 flex items-center justify-center p-6 transition-all duration-200 ease-out ${
+              className={`fixed inset-0 z-30 flex items-center justify-center p-6 transition-[opacity,transform] duration-200 ease-out ${
                 activePanel ? 'opacity-100 scale-100' : 'opacity-0 scale-[0.98] pointer-events-none'
               }`}
               onClick={requestCloseConfigPanel}

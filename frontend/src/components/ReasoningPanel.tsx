@@ -757,7 +757,7 @@ function TruncatedCodeBlock({ content, className = '' }: TruncatedCodeBlockProps
 
   return (
     <div className={`rounded-lg text-xs font-mono overflow-hidden relative ${className}`}>
-      <div className={`p-3 overflow-x-auto transition-all duration-300 ${isExpanded ? '' : 'max-h-[160px]'}`}>
+      <div className={`p-3 overflow-x-auto transition-[max-height] duration-300 ${isExpanded ? '' : 'max-h-[160px]'}`}>
         <pre className="whitespace-pre-wrap break-words">{content}</pre>
       </div>
 

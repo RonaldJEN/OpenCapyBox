@@ -246,30 +246,8 @@ body {
   animation: live-reply-pill 1.8s ease-in-out infinite;
 }
 
-@keyframes session-handoff {
-  0% {
-    opacity: 0;
-    transform: translateY(-6px) scale(0.98);
-  }
-  18%, 72% {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-  100% {
-    opacity: 0;
-    transform: translateY(-8px) scale(0.98);
-  }
-}
-
-.session-handoff-overlay {
-  animation: session-handoff 0.52s ease-out forwards;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .live-reply-pill {
-    animation: none;
-  }
-  .session-handoff-overlay {
     animation: none;
   }
 }

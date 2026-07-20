@@ -28,7 +28,7 @@ export function CodeBlock({ language, value }: CodeBlockProps) {
         <button
           type="button"
           onClick={handleCopy}
-          className="p-1.5 rounded-md text-claude-muted hover:text-claude-text hover:bg-claude-hover transition-all opacity-0 group-hover:opacity-100 focus:opacity-100"
+          className="p-1.5 rounded-md text-claude-muted hover:text-claude-text hover:bg-claude-hover transition-[color,background-color,opacity] opacity-0 group-hover:opacity-100 focus:opacity-100"
           title="复制"
         >
           {copied ? <Check size={14} className="text-claude-success" /> : <Copy size={14} />}

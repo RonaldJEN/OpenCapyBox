@@ -415,8 +415,8 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
     : 'flex-1 min-w-0 overflow-auto p-8 bg-claude-bg';
 
   const closeButtonClassName = inline
-    ? 'p-2.5 hover:bg-claude-hover rounded-full transition-all text-claude-muted'
-    : 'p-2.5 bg-black text-white rounded-full hover:opacity-80 transition-all active:scale-90 shadow-lg';
+    ? 'p-2.5 hover:bg-claude-hover rounded-full transition-colors text-claude-muted'
+    : 'p-2.5 bg-black text-white rounded-full hover:opacity-80 transition-[opacity,transform] active:scale-90 shadow-lg';
 
   const activeSpreadsheetSheet = spreadsheetSheets[activeSheetIndex];
 
@@ -470,7 +470,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
             <div className="flex bg-claude-surface rounded-xl p-1 mr-2">
               <button
                 onClick={() => setViewMode('rendered')}
-                className={`p-2 rounded-lg transition-all ${
+                className={`p-2 rounded-lg transition-[color,background-color,box-shadow] ${
                   viewMode === 'rendered' ? 'bg-white text-claude-text shadow-sm' : 'text-claude-muted'
                 }`}
                 title="渲染视图"
@@ -479,7 +479,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
               </button>
               <button
                 onClick={() => setViewMode('source')}
-                className={`p-2 rounded-lg transition-all ${
+                className={`p-2 rounded-lg transition-[color,background-color,box-shadow] ${
                   viewMode === 'source' ? 'bg-white text-claude-text shadow-sm' : 'text-claude-muted'
                 }`}
                 title="源代码"
@@ -490,7 +490,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
           )}
           <button
             onClick={handleDownload}
-            className="p-2.5 hover:bg-claude-hover rounded-full transition-all text-claude-muted"
+            className="p-2.5 hover:bg-claude-hover rounded-full transition-colors text-claude-muted"
             title="下载文件"
           >
             <Download size={18} />

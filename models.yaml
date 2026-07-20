@@ -139,7 +139,7 @@ models:
     model_name: "glm-5"
     max_tokens: 32768
     context_window: 128000
-    reasoning_format: reasoning_content
+    reasoning_format: none
     reasoning_split: false
     enable_thinking: false
     enabled: true

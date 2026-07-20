@@ -213,8 +213,12 @@ class ModelConfig:
 
     @property
     def supports_thinking(self) -> bool:
-        """是否支援思考過程"""
-        return self.reasoning_format != "none"
+        """当前模型变体是否实际启用了可展示的思考过程。"""
+        if self.reasoning_format == "none":
+            return False
+        if self.provider != "openai":
+            return True
+        return bool(self.reasoning_split)
 
     def to_public_dict(self) -> dict:
         """轉換為前端安全的字典（不含 api_key、api_base）"""

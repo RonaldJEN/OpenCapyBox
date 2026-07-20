@@ -254,6 +254,72 @@ describe('ChatInput preferred skills', () => {
     expect(pickerButton).toHaveAttribute('aria-expanded', 'false');
   });
 
+  it('展示名与 key 仅有大小写和空白差异时不重复显示 key，选择仍提交稳定 key', async () => {
+    vi.mocked(getSkills).mockResolvedValue({
+      sandbox_status: 'available' as const,
+      skills: [
+        {
+          key: 'arxiv watcher',
+          name: 'arxiv watcher',
+          display_name: '  ARXIV    WATCHER   ',
+          description: '跟踪论文',
+          category: 'research',
+          source: 'official' as const,
+          enabled: true,
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    const onSelectedSkillKeysChange = vi.fn();
+    render(
+      <ChatInput
+        value="hello"
+        onChange={() => undefined}
+        onSend={() => undefined}
+        selectedSkillKeys={[]}
+        onSelectedSkillKeysChange={onSelectedSkillKeysChange}
+      />,
+    );
+
+    await act(async () => {
+      await user.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+    });
+    const skillOption = await screen.findByRole('button', { name: /ARXIV\s+WATCHER/i });
+    expect(skillOption.querySelectorAll('span.block.truncate')).toHaveLength(1);
+    await act(async () => { await user.click(skillOption); });
+
+    expect(onSelectedSkillKeysChange).toHaveBeenCalledWith(['arxiv watcher']);
+  });
+
+  it('发送和停止按钮具有明确名称、提示和 button 类型', () => {
+    const onSend = vi.fn();
+    const onStop = vi.fn();
+    const view = render(
+      <ChatInput value="hello" onChange={() => undefined} onSend={onSend} />,
+    );
+
+    const sendButton = screen.getByRole('button', { name: '发送消息' });
+    expect(sendButton).toHaveAttribute('type', 'button');
+    expect(sendButton).toHaveAttribute('title', '发送消息');
+    fireEvent.click(sendButton);
+    expect(onSend).toHaveBeenCalledOnce();
+
+    view.rerender(
+      <ChatInput
+        value="hello"
+        onChange={() => undefined}
+        onSend={onSend}
+        onStop={onStop}
+        sendingLabel="生成中"
+      />,
+    );
+    const stopButton = screen.getByRole('button', { name: '停止生成' });
+    expect(stopButton).toHaveAttribute('type', 'button');
+    expect(stopButton).toHaveAttribute('title', '停止生成');
+    fireEvent.click(stopButton);
+    expect(onStop).toHaveBeenCalledOnce();
+  });
+
   it('卸载后重新挂载不会复用上一账号的 Skill 清单', async () => {
     const firstAccountResponse = {
       sandbox_status: 'available' as const,

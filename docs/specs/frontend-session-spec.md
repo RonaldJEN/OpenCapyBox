@@ -128,6 +128,33 @@ const handleExecutionEnd = (sessionId?: string) => {
 
 `App` 必须立即并周期性 reconcile `/running-sessions`，更新 `executingSessionIds` 与 `activeSlotSessionIds`。除首次恢复运行态外，不得自动切换当前会话。该收敛用于清理非当前会话后台完成后的侧栏执行标记。
 
+### 4.6 会话删除交互（应用内确认弹窗）
+
+删除会话必须走应用内 `alertdialog`（`ConfirmDialog`），**禁止**使用原生 `window.confirm`。
+
+**弹窗与可访问性**：
+- 通过 portal 渲染 `role="alertdialog"` + `aria-modal="true"`，绑定 `aria-labelledby` / `aria-describedby`，删除进行中置 `aria-busy`。
+- 打开时将 `#root` 置 `inert` 且 `aria-hidden="true"`，关闭时恢复原值。
+- 初始焦点落在"取消"按钮。
+- Tab / Shift+Tab 焦点限制在弹窗内循环。
+- Escape 或点击遮罩层触发取消。
+
+**删除进行中（`deletePending`）**：
+- 两个按钮均禁用；焦点从刚被禁用的按钮移回弹窗容器。
+- 禁止取消、禁止重复确认、Escape 与点击遮罩均不生效。
+
+**删除失败**：
+- 保留弹窗，展示"删除失败，请重试。"（`role="alert"`）。
+- 确认按钮文案从"确认删除"变为"重试删除"，焦点自动回到确认按钮以便重试。
+- 不从列表移除目标会话。
+
+**成功与焦点恢复**：
+- 删除接口成功即视为完成：立即在本地移除目标行、关闭弹窗并恢复焦点，**不得**等待 `loadSessions()` 完成后再关闭弹窗。列表刷新作为二级异步步骤（`void loadSessions()`）进行，刷新阻塞或挂起绝不能让弹窗停留在不可取消的"删除中"。
+- 已删除的 session id 记入 `recentlyDeletedIds` 守卫；`loadSessions()` 的结果必须过滤掉这些 id，确保迟到或陈旧的刷新不会把已删除行重新加回。
+- 焦点恢复顺序：原删除按钮 → 同一会话行 → 相邻会话行（按记录的 `adjacentSessionIds` 由近到远）→ 首行 → "新建对话"按钮。删除成功时前两级（已卸载）自然跳过，从相邻会话行开始。
+- 删除唯一会话时相邻与首行均不可用，最终聚焦"新建对话"按钮。
+- 删除当前会话后回到欢迎页（见 §4.3），焦点交由欢迎页输入框接管，不在列表内恢复。
+
 ## 5. 轮询契约
 
 | 轮询 | 间隔 | 实现 |
@@ -170,7 +197,7 @@ const handleExecutionEnd = (sessionId?: string) => {
 | 错误 | 表现 |
 |---|---|
 | `getSessions` 失败 | `console.error`，显示"加载失败"空态 |
-| `deleteSession` 失败 | `console.error`，不改变 UI |
+| `deleteSession` 失败 | `console.error`，保留确认弹窗，展示"删除失败，请重试。"，确认按钮变"重试删除"，允许重试或取消；不从列表移除目标会话（见 §4.6） |
 | `getRunningSessions` 失败 | `console.error`，不影响正常流程 |
 
 ## 9. 测试清单
@@ -178,6 +205,10 @@ const handleExecutionEnd = (sessionId?: string) => {
 - [ ] 首次进入由 App 自动检测全部运行中会话，并切换到第一个运行中会话
 - [ ] 切换会话时 `ModelSelector` 同步到新会话的 model_id
 - [ ] 删除当前会话回到欢迎页
+- [ ] 删除点击弹出应用内 `alertdialog`，初始焦点在"取消"，Escape/遮罩可取消
+- [ ] 删除进行中锁定两个按钮，Escape 与遮罩点击不生效
+- [ ] 删除失败保留弹窗并展示错误，确认按钮变"重试删除"且获得焦点
+- [ ] 删除成功后按"原按钮→同行→相邻行→首行→新建对话"顺序恢复焦点
 - [ ] 欢迎页输入第一条消息才创建会话
 - [ ] A/B 多会话并行时，侧栏同时显示多个执行标记
 - [ ] 非当前会话后台完成后，周期收敛会清理对应执行标记

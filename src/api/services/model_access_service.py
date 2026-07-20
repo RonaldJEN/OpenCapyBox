@@ -432,7 +432,7 @@ def admin_model_payload(db: DBSession, model: LLMModel) -> dict[str, Any]:
         "reasoning_format": model.reasoning_format,
         "reasoning_split": bool(model.reasoning_split),
         "enable_thinking": bool(model.enable_thinking),
-        "supports_thinking": model.reasoning_format != "none",
+        "supports_thinking": db_model_to_config(model).supports_thinking,
         "supports_image": bool(model.supports_image),
         "max_images": model.max_images,
         "supports_video": bool(model.supports_video),

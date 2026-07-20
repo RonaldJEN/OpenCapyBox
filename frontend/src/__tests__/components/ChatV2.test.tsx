@@ -357,11 +357,13 @@ describe('ChatV2 组件', () => {
 
   it('欢迎页 Enter 发送应该调用 onCreateSession', async () => {
     const onCreateSession = vi.fn().mockResolvedValue('new-session-id');
+    const onSessionCreated = vi.fn();
     render(
       <ChatV2
         sessionId=""
         {...defaultProps}
         onCreateSession={onCreateSession}
+        onSessionCreated={onSessionCreated}
       />
     );
 
@@ -371,10 +373,11 @@ describe('ChatV2 组件', () => {
 
     await waitFor(() => {
       expect(onCreateSession).toHaveBeenCalled();
+      expect(onSessionCreated).toHaveBeenCalledWith('new-session-id');
     });
   });
 
-  it('欢迎页首条消息创建会话时应保留过渡状态', async () => {
+  it('欢迎页首条消息创建会话时不应显示开启对话动画', async () => {
     let resolveCreate!: (value: string) => void;
     const onCreateSession = vi.fn(() => new Promise<string>((resolve) => {
       resolveCreate = resolve;
@@ -392,8 +395,9 @@ describe('ChatV2 组件', () => {
     fireEvent.change(textarea, { target: { value: '测试过渡消息' } });
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
 
-    expect(await screen.findByText('正在开启对话')).toBeInTheDocument();
-    expect(screen.getByText('测试过渡消息')).toBeInTheDocument();
+    expect(screen.queryByText('正在开启对话')).not.toBeInTheDocument();
+    expect(screen.queryByText('开启中')).not.toBeInTheDocument();
+    expect(screen.getByText('你好，有什么可以帮你的？')).toBeInTheDocument();
 
     await act(async () => {
       resolveCreate('new-session-id');
@@ -409,8 +413,8 @@ describe('ChatV2 组件', () => {
       );
     });
 
-    expect(await screen.findByText('正在开启对话')).toBeInTheDocument();
-    expect(screen.getByTitle('会话资源')).toHaveClass('animate-fade-in');
+    expect(screen.queryByText('正在开启对话')).not.toBeInTheDocument();
+    expect(screen.getByTitle('会话资源')).not.toHaveClass('animate-fade-in');
   });
 
   it('欢迎页创建会话失败应该显示错误', async () => {
@@ -429,6 +433,7 @@ describe('ChatV2 组件', () => {
 
     await waitFor(() => {
       expect(screen.getByText('创建会话失败，请重试')).toBeInTheDocument();
+      expect(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...')).toHaveValue('测试消息');
     });
   });
 
@@ -783,6 +788,304 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('正文草稿应按 session 隔离并在切回时恢复', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
+      rounds: [],
+      session_id: targetSessionId,
+      total: 0,
+    }));
+
+    const { rerender } = render(<ChatV2 sessionId="session-a" {...defaultProps} />);
+    const sessionATextarea = await screen.findByPlaceholderText('输入指令...');
+    fireEvent.change(sessionATextarea, { target: { value: 'A 会话草稿' } });
+
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledWith('session-b');
+      expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('');
+    });
+    fireEvent.change(screen.getByPlaceholderText('输入指令...'), { target: { value: 'B 会话草稿' } });
+
+    rerender(<ChatV2 sessionId="session-a" {...defaultProps} />);
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('A 会话草稿');
+    });
+  });
+
+  it('迟到的上传结果只能写回发起上传的 session 草稿', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
+      rounds: [],
+      session_id: targetSessionId,
+      total: 0,
+    }));
+    let resolveUpload!: (file: {
+      name: string;
+      path: string;
+      size: number;
+      modified: string;
+      type: string;
+    }) => void;
+    vi.mocked(apiService.uploadFile).mockImplementation(() => new Promise((resolve) => {
+      resolveUpload = resolve;
+    }));
+
+    const { container, rerender } = render(<ChatV2 sessionId="session-a" {...defaultProps} />);
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['A'], 'session-a.txt', { type: 'text/plain' })] },
+    });
+
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
+    await act(async () => {
+      resolveUpload({
+        name: 'session-a.txt',
+        path: 'session-a.txt',
+        size: 1,
+        modified: new Date().toISOString(),
+        type: 'text/plain',
+      });
+    });
+
+    expect(screen.queryByText('session-a.txt')).not.toBeInTheDocument();
+    rerender(<ChatV2 sessionId="session-a" {...defaultProps} />);
+    expect(await screen.findByText('session-a.txt')).toBeInTheDocument();
+  });
+
+  it('附件上传期间应锁定发送，避免上传回调写入发送后的草稿', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'session-a',
+      total: 0,
+    });
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    let resolveUpload!: (file: {
+      name: string;
+      path: string;
+      size: number;
+      modified: string;
+      type: string;
+    }) => void;
+    vi.mocked(apiService.uploadFile).mockImplementation(() => new Promise((resolve) => {
+      resolveUpload = resolve;
+    }));
+
+    const { container } = render(<ChatV2 sessionId="session-a" {...defaultProps} />);
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['pending'], 'pending.txt', { type: 'text/plain' })] },
+    });
+    const textarea = screen.getByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '不能抢跑发送' } });
+
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveUpload({
+        name: 'pending.txt',
+        path: 'pending.txt',
+        size: 7,
+        modified: new Date().toISOString(),
+        type: 'text/plain',
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('pending.txt')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
+    });
+  });
+
+  it('欢迎页并发上传只能触发一次隐式建会话', async () => {
+    let resolveCreateSession!: (sessionId: string) => void;
+    const onCreateSession = vi.fn(() => new Promise<string>((resolve) => {
+      resolveCreateSession = resolve;
+    }));
+    const onSessionCreated = vi.fn();
+    vi.mocked(apiService.uploadFile).mockResolvedValue({
+      name: 'first.txt',
+      path: 'first.txt',
+      size: 5,
+      modified: new Date().toISOString(),
+      type: 'text/plain',
+    });
+
+    const { container } = render(
+      <ChatV2
+        sessionId=""
+        {...defaultProps}
+        onCreateSession={onCreateSession}
+        onSessionCreated={onSessionCreated}
+      />,
+    );
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['first'], 'first.txt', { type: 'text/plain' })] },
+    });
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['second'], 'second.txt', { type: 'text/plain' })] },
+    });
+
+    expect(onCreateSession).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolveCreateSession('created-session');
+    });
+
+    await waitFor(() => {
+      expect(apiService.uploadFile).toHaveBeenCalledTimes(1);
+      expect(apiService.uploadFile).toHaveBeenCalledWith('created-session', expect.objectContaining({
+        name: 'first.txt',
+      }));
+      expect(onSessionCreated).toHaveBeenCalledTimes(1);
+      expect(onSessionCreated).toHaveBeenCalledWith('created-session');
+    });
+  });
+
+  it('迟到的隐式建会话响应不应抢回用户已切换的会话', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
+      rounds: [],
+      session_id: targetSessionId,
+      total: 0,
+    }));
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    let resolveCreateSession!: (sessionId: string) => void;
+    const onCreateSession = vi.fn(() => new Promise<string>((resolve) => {
+      resolveCreateSession = resolve;
+    }));
+    const onSessionCreated = vi.fn();
+
+    const { rerender } = render(
+      <ChatV2
+        sessionId=""
+        {...defaultProps}
+        onCreateSession={onCreateSession}
+        onSessionCreated={onSessionCreated}
+      />,
+    );
+    const textarea = screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...');
+    fireEvent.change(textarea, { target: { value: '后台继续发送' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    expect(onCreateSession).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <ChatV2
+        sessionId="session-b"
+        {...defaultProps}
+        onCreateSession={onCreateSession}
+        onSessionCreated={onSessionCreated}
+      />,
+    );
+    await act(async () => {
+      resolveCreateSession('created-session');
+    });
+
+    await waitFor(() => {
+      expect(apiService.sendMessageStreamV2).toHaveBeenCalledWith(
+        'created-session',
+        [{ type: 'text', text: '后台继续发送' }],
+        expect.any(Object),
+      );
+      expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('');
+    });
+    expect(onSessionCreated).not.toHaveBeenCalled();
+  });
+
+  it('欢迎页 createSession pending 时切换到其他会话，目标会话应可输入并发送', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
+      rounds: [],
+      session_id: targetSessionId,
+      total: 0,
+    }));
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    // createSession 一直 pending，模拟欢迎页首条消息建会话时后端慢响应
+    const onCreateSession = vi.fn(() => new Promise<string>(() => {}));
+
+    const { rerender } = render(
+      <ChatV2 sessionId="" {...defaultProps} onCreateSession={onCreateSession} />,
+    );
+    const welcomeTextarea = screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...');
+    fireEvent.change(welcomeTextarea, { target: { value: '欢迎页首条消息' } });
+    fireEvent.keyDown(welcomeTextarea, { key: 'Enter', shiftKey: false });
+    expect(onCreateSession).toHaveBeenCalledTimes(1);
+
+    // 欢迎页建会话仍在进行时切换到已有会话 B
+    rerender(
+      <ChatV2 sessionId="session-b" {...defaultProps} onCreateSession={onCreateSession} />,
+    );
+
+    const textareaB = await screen.findByPlaceholderText('输入指令...');
+    expect(textareaB).toBeEnabled();
+    fireEvent.change(textareaB, { target: { value: 'B 会话消息' } });
+    const sendButton = screen.getByRole('button', { name: '发送消息' });
+    expect(sendButton).toBeEnabled();
+    fireEvent.keyDown(textareaB, { key: 'Enter', shiftKey: false });
+
+    await waitFor(() => {
+      expect(apiService.sendMessageStreamV2).toHaveBeenCalledWith(
+        'session-b',
+        [{ type: 'text', text: 'B 会话消息' }],
+        expect.any(Object),
+      );
+    });
+  });
+
+  it('session-a 上传 pending 时切换到 session-b，B 应能正常发送和上传', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
+      rounds: [],
+      session_id: targetSessionId,
+      total: 0,
+    }));
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    // A 会话的上传一直 pending，B 会话的上传正常完成
+    vi.mocked(apiService.uploadFile).mockImplementation((targetSessionId: string) => {
+      if (targetSessionId === 'session-a') return new Promise(() => {});
+      return Promise.resolve({
+        name: 'b.txt',
+        path: 'b.txt',
+        size: 1,
+        modified: new Date().toISOString(),
+        type: 'text/plain',
+      });
+    });
+
+    const { container, rerender } = render(<ChatV2 sessionId="session-a" {...defaultProps} />);
+    const fileInputA = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInputA, {
+      target: { files: [new File(['A'], 'a.txt', { type: 'text/plain' })] },
+    });
+    await waitFor(() => {
+      expect(apiService.uploadFile).toHaveBeenCalledWith('session-a', expect.any(File));
+    });
+
+    // A 上传仍 pending 时切换到 session-b
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
+    const textareaB = await screen.findByPlaceholderText('输入指令...');
+
+    // B 不受 A 的 pending 上传影响，可发起自己的上传
+    const fileInputB = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInputB, {
+      target: { files: [new File(['B'], 'b.txt', { type: 'text/plain' })] },
+    });
+    await waitFor(() => {
+      expect(apiService.uploadFile).toHaveBeenCalledWith('session-b', expect.any(File));
+      expect(screen.getByText('b.txt')).toBeInTheDocument();
+    });
+
+    // B 上传完成后仍可正常发送
+    const sendButton = screen.getByRole('button', { name: '发送消息' });
+    fireEvent.change(textareaB, { target: { value: 'B 消息' } });
+    expect(sendButton).toBeEnabled();
+    fireEvent.keyDown(textareaB, { key: 'Enter', shiftKey: false });
+    await waitFor(() => {
+      expect(apiService.sendMessageStreamV2).toHaveBeenCalledWith(
+        'session-b',
+        expect.any(Array),
+        expect.any(Object),
+      );
+    });
+  });
+
   it('从已有会话点击新建后应回到欢迎空状态', async () => {
     const { rerender } = render(
       <ChatV2
@@ -805,6 +1108,47 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(screen.getByText('你好，有什么可以帮你的？')).toBeInTheDocument();
       expect(screen.queryByText('Round: round-1')).not.toBeInTheDocument();
+      expect(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...')).toHaveFocus();
+    });
+  });
+
+  it('隐式创建会话后应协调迁移正文、附件和 Skill 草稿', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
+      rounds: [],
+      session_id: targetSessionId,
+      total: 0,
+    }));
+    vi.mocked(apiService.uploadFile).mockResolvedValue({
+      name: 'combined.txt',
+      path: 'combined.txt',
+      size: 8,
+      modified: new Date().toISOString(),
+      type: 'text/plain',
+    });
+    const onCreateSession = vi.fn().mockResolvedValue('new-session');
+
+    const { container, rerender } = render(
+      <ChatV2 sessionId="" {...defaultProps} onCreateSession={onCreateSession} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+    fireEvent.click(await screen.findByText('PDF 处理'));
+    fireEvent.change(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...'), {
+      target: { value: '组合草稿' },
+    });
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['combined'], 'combined.txt', { type: 'text/plain' })] },
+    });
+
+    await waitFor(() => {
+      expect(apiService.uploadFile).toHaveBeenCalledWith('new-session', expect.any(File));
+    });
+    rerender(<ChatV2 sessionId="new-session" {...defaultProps} onCreateSession={onCreateSession} />);
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('组合草稿');
+      expect(screen.getByText('combined.txt')).toBeInTheDocument();
+      expect(screen.getByLabelText('已选择 Skill')).toHaveTextContent('PDF 处理');
     });
   });
 
@@ -922,6 +1266,7 @@ describe('ChatV2 组件', () => {
 
     await waitFor(() => {
       expect(screen.getByLabelText('已选择 Skill')).toHaveTextContent('PDF 处理');
+      expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('触发发送前拒绝');
     });
   });
 
