@@ -18,7 +18,7 @@ class TestScheduleToCron:
         assert schedule_to_cron({"kind": "daily", "time": "23:59"}) == "59 23 * * *"
 
     def test_weekdays(self):
-        assert schedule_to_cron({"kind": "weekdays", "time": "08:00"}) == "0 8 * * 0-4"
+        assert schedule_to_cron({"kind": "weekdays", "time": "08:00"}) == "0 8 * * 1-5"
 
     def test_weekly_sorts_and_dedups(self):
         expr = schedule_to_cron({"kind": "weekly", "time": "12:00", "days": [5, 1, 1, 3]})
@@ -26,7 +26,13 @@ class TestScheduleToCron:
 
     def test_weekly_full_week(self):
         expr = schedule_to_cron({"kind": "weekly", "time": "07:15", "days": [0, 1, 2, 3, 4, 5, 6]})
-        assert expr == "15 7 * * 0,1,2,3,4,5,6"
+        assert expr == "15 7 * * 1-6,0"
+
+    def test_weekly_tuesday_to_sunday_uses_standard_values(self):
+        expr = schedule_to_cron(
+            {"kind": "weekly", "time": "09:00", "days": [2, 3, 4, 5, 6, 0]}
+        )
+        assert expr == "0 9 * * 2-6,0"
 
     def test_monthly(self):
         assert schedule_to_cron({"kind": "monthly", "time": "09:30", "dayOfMonth": 15}) == "30 9 15 * *"
@@ -120,18 +126,57 @@ class TestNextFireAt:
         assert fires[0] == datetime(2025, 1, 2, 9, 0)
 
     def test_weekly_pattern(self):
-        # APScheduler day_of_week: 0=Mon..6=Sun，'1' 表示周二
-        # 2025-01-01 是周三，下一个周二是 2025-01-07
+        # Linux Cron day_of_week: 0/7=周日，1=周一
+        # 2025-01-01 是周三，下一个周一是 2025-01-06
         base = datetime(2025, 1, 1, 0, 0, 0)
         fires = next_fire_at("0 9 * * 1", n=2, base=base)
-        assert fires[0] == datetime(2025, 1, 7, 9, 0)
-        assert fires[1] == datetime(2025, 1, 14, 9, 0)
+        assert fires[0] == datetime(2025, 1, 6, 9, 0)
+        assert fires[1] == datetime(2025, 1, 13, 9, 0)
+
+    @pytest.mark.parametrize("dow", ["0", "7"])
+    def test_sunday_accepts_zero_and_seven(self, dow):
+        base = datetime(2025, 1, 4, 0, 0, 0)
+        assert next_fire_at(f"0 9 * * {dow}", n=1, base=base)[0] == datetime(
+            2025, 1, 5, 9, 0
+        )
+
+    def test_day_of_month_and_weekday_use_or_semantics(self):
+        # 2025-01-06 是周一但不是每月 15 日，仍应命中。
+        fires = next_fire_at("0 9 15 * 1", n=1, base=datetime(2025, 1, 5))
+        assert fires[0] == datetime(2025, 1, 6, 9, 0)
 
     def test_invalid_cron_raises(self):
         with pytest.raises(ScheduleError):
             next_fire_at("0 9 * *", n=1)  # 4 字段
         with pytest.raises(ScheduleError):
             next_fire_at("invalid expr here pls", n=1)
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "R * * * *",
+            "0 9 L * *",
+            "0 9 1W * *",
+            "0 9 * * 1#2",
+            "0 9 ? * 1",
+            "0 9 * * MON-FRI",
+        ],
+    )
+    def test_rejects_croniter_extensions_outside_numeric_vixie_subset(self, expr):
+        with pytest.raises(ScheduleError):
+            next_fire_at(expr, n=1)
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "*/15 * * * *",
+            "0 9 1-15/2 * *",
+            "0 9 * * 1,3,5",
+            "0 9 * * 0-7",
+        ],
+    )
+    def test_accepts_supported_numeric_vixie_syntax(self, expr):
+        assert next_fire_at(expr, n=1, base=datetime(2025, 1, 1))
 
     def test_returns_naive_datetime(self):
         fires = next_fire_at("0 9 * * *", n=1, base=datetime(2025, 1, 1))

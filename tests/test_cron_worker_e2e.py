@@ -72,7 +72,7 @@ async def test_two_workers_three_minutes_exactly_once(cron_db, monkeypatch):
 
     counter = {"count": 0}
 
-    async def fake_run_cron_job(user_id, job_name, run_id):
+    async def fake_run_cron_job(user_id, job_name, run_id, **_kwargs):
         counter["count"] += 1
 
     monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)

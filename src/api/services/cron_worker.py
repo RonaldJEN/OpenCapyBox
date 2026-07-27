@@ -15,14 +15,14 @@ import uuid
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 
-from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.exc import OperationalError
 
 from src.api.models.auth_user import AuthUser
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.database import SessionLocal
-from src.api.services.cron_service import parse_cron_fields, run_cron_job
+from src.api.services.cron_engine import CronEngine
+from src.api.services.cron_service import run_cron_job
 from src.api.utils.timezone import get_timezone, now_naive
 from src.api.config import get_settings
 
@@ -206,7 +206,7 @@ def _cleanup_old_fires() -> None:
         logger.exception("cron_fires 清理失败")
 
 
-def _load_enabled_job_snapshots() -> list[tuple[int, str, str, str]]:
+def _load_enabled_job_snapshots() -> list[tuple[int, str, str, str, int]]:
     """同步读取所有 enabled job 的轻量快照，供 dispatch 使用。"""
     with SessionLocal() as db:
         jobs = (
@@ -215,7 +215,10 @@ def _load_enabled_job_snapshots() -> list[tuple[int, str, str, str]]:
             .filter(CronJob.enabled == True, AuthUser.enabled == True)  # noqa: E712
             .all()
         )
-        return [(j.id, j.user_id, j.name, j.cron_expr) for j in jobs]
+        return [
+            (j.id, j.user_id, j.name, j.cron_expr, int(j.rule_version or 1))
+            for j in jobs
+        ]
 
 
 async def _dispatch_and_run(
@@ -225,12 +228,17 @@ async def _dispatch_and_run(
     # 同步 DB 调用一律放线程，避免阻塞事件循环（影响同进程的 SSE / 长连接 jitter）
     job_snapshots = await asyncio.to_thread(_load_enabled_job_snapshots)
 
-    for job_id, user_id, name, cron_expr in job_snapshots:
+    for job_id, user_id, name, cron_expr, rule_version in job_snapshots:
         # per-job 隔离：单个 job 的解析/匹配/抢占异常不能影响其他 job 的本分钟调度
         try:
             if not _cron_matches_minute(cron_expr, minute):
                 continue
-            won = await asyncio.to_thread(_try_insert_fire, job_id, minute)
+            won = await asyncio.to_thread(
+                _try_insert_fire,
+                job_id,
+                minute,
+                rule_version,
+            )
         except Exception:
             logger.exception(
                 "cron dispatch error job_id=%s user=%s name=%s expr=%s",
@@ -238,7 +246,7 @@ async def _dispatch_and_run(
             )
             continue
         if won:
-            _spawn(_run_by_id(job_id, worker_id))
+            _spawn(_run_by_id(job_id, worker_id, rule_version, minute))
 
 
 def _cron_matches_minute(expr: str, minute: datetime) -> bool:
@@ -246,19 +254,10 @@ def _cron_matches_minute(expr: str, minute: datetime) -> bool:
 
     `minute` 为本地时间的 naive datetime。
     """
-    fields = parse_cron_fields(expr)
-    if fields is None:
-        return False
-
-    tz = get_timezone()
-    trigger = CronTrigger(**fields, timezone=tz)
-    # 把 naive 本地时间补上本地时区信息，供 APScheduler 匹配
-    minute_local = minute.replace(tzinfo=tz)
-    next_fire = trigger.get_next_fire_time(None, minute_local - timedelta(seconds=1))
-    return next_fire is not None and next_fire == minute_local
+    return CronEngine.matches(expr, minute)
 
 
-def _try_insert_fire(job_id: int, minute: datetime) -> bool:
+def _try_insert_fire(job_id: int, minute: datetime, rule_version: int = 1) -> bool:
     """尝试插入去重记录：成功插入返回 True，唯一约束冲突返回 False。
 
     PostgreSQL 使用 ON CONFLICT DO NOTHING。
@@ -271,6 +270,7 @@ def _try_insert_fire(job_id: int, minute: datetime) -> bool:
                 id=str(uuid.uuid4()),
                 job_id=job_id,
                 scheduled_at=minute,
+                rule_version=rule_version,
             )
             stmt = pg_insert(CronFire).values(**values).on_conflict_do_nothing(
                 constraint="uq_cronfire_job_time"
@@ -305,6 +305,9 @@ async def _run(
     worker_id: str,
     run_id: str | None = None,
     scheduled_job_id: int | None = None,
+    expected_job_id: int | None = None,
+    expected_rule_version: int | None = None,
+    scheduled_at: datetime | None = None,
 ) -> None:
     """执行单个任务，cron 与手动触发共用。
 
@@ -316,7 +319,11 @@ async def _run(
 
     if scheduled_job_id is not None:
         # 自动调度路径：在真正执行前做二次校验，收敛竞态窗口。
-        latest = await asyncio.to_thread(_load_job_snapshot_if_enabled, scheduled_job_id)
+        latest = await asyncio.to_thread(
+            _load_job_snapshot_if_enabled,
+            scheduled_job_id,
+            expected_rule_version,
+        )
         if latest is None:
             logger.info(
                 "cron skip stale job before execute job_id=%s worker=%s (deleted or disabled)",
@@ -334,7 +341,15 @@ async def _run(
         source,
     )
     try:
-        await run_cron_job(user_id, job_name, actual_run_id)
+        await run_cron_job(
+            user_id,
+            job_name,
+            actual_run_id,
+            expected_job_id=expected_job_id or scheduled_job_id,
+            expected_rule_version=expected_rule_version,
+            scheduled_at=scheduled_at,
+            trigger_source=source,
+        )
     except Exception:
         logger.exception(
             "cron run failed user=%s job=%s run=%s",
@@ -347,12 +362,18 @@ async def _run(
 async def _run_by_id(
     job_id: int,
     worker_id: str,
+    expected_rule_version: int | None = None,
+    scheduled_at: datetime | None = None,
 ) -> None:
     """按 job_id 重新从 DB 拉取 job 并执行。
 
     防止快照到 _run 之间 job 已被删除或禁用导致空跑。
     """
-    snapshot = await asyncio.to_thread(_load_job_snapshot_if_enabled, job_id)
+    snapshot = await asyncio.to_thread(
+        _load_job_snapshot_if_enabled,
+        job_id,
+        expected_rule_version,
+    )
     if snapshot is None:
         logger.info(
             "cron skip stale job job_id=%s worker=%s (deleted or disabled)",
@@ -361,12 +382,22 @@ async def _run_by_id(
         )
         return
 
-    user_id, name = snapshot
-    await _run(user_id, name, worker_id, scheduled_job_id=job_id)
+    user_id, name, rule_version = snapshot
+    await _run(
+        user_id,
+        name,
+        worker_id,
+        scheduled_job_id=job_id,
+        expected_rule_version=rule_version,
+        scheduled_at=scheduled_at,
+    )
 
 
-def _load_job_snapshot_if_enabled(job_id: int) -> tuple[str, str] | None:
-    """同步读取单个 job 的 (user_id, name)，仅在 job 和用户账号均启用时返回。"""
+def _load_job_snapshot_if_enabled(
+    job_id: int,
+    expected_rule_version: int | None = None,
+) -> tuple[str, str, int] | None:
+    """读取启用任务；传入版本时只接受完全相同的调度规则。"""
     with SessionLocal() as db:
         job = (
             db.query(CronJob)
@@ -380,7 +411,10 @@ def _load_job_snapshot_if_enabled(job_id: int) -> tuple[str, str] | None:
         )
         if job is None:
             return None
-        return job.user_id, job.name
+        rule_version = int(job.rule_version or 1)
+        if expected_rule_version is not None and rule_version != expected_rule_version:
+            return None
+        return job.user_id, job.name, rule_version
 
 
 # ============== 公共 API ==============
@@ -391,6 +425,8 @@ async def trigger_manual_run(
     user_id: str,
     job_name: str,
     run_id: str,
+    job_id: int,
+    rule_version: int,
 ) -> asyncio.Task:
     """手动触发指定任务的后台执行。
 
@@ -401,6 +437,8 @@ async def trigger_manual_run(
         user_id: 任务所属用户
         job_name: 任务名称
         run_id: 调用方预先生成并已写入 CronJobRun 的执行 id
+        job_id: 触发时任务 id，用于防止同名任务删除重建后误执行
+        rule_version: 触发时调度规则版本
 
     Returns:
         受控的后台 Task，调用方通常无需 await。
@@ -419,4 +457,13 @@ async def trigger_manual_run(
             detail="cron worker 未启动，无法手动触发任务",
         )
 
-    return _spawn(_run(user_id, job_name, worker_id, run_id=run_id))
+    return _spawn(
+        _run(
+            user_id,
+            job_name,
+            worker_id,
+            run_id=run_id,
+            expected_job_id=job_id,
+            expected_rule_version=rule_version,
+        )
+    )

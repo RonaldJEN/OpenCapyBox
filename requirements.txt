@@ -58,6 +58,6 @@ pytest-json-report>=1.5.0
 coverage-badge>=1.1.0
 opensandbox>=0.1.0
 
-# 调度
-apscheduler>=3.10.0
+# 调度（Linux/Vixie 五字段 Cron）
+croniter>=6.0.0,<7.0.0
 socksio>=1.0.0

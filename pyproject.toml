@@ -33,8 +33,8 @@ dependencies = [
     "python-multipart>=0.0.6",
     # Sandbox
     "opensandbox>=0.1.0",
-    # Scheduler (Cron tasks)
-    "apscheduler>=3.10.0",
+    # Scheduler (Linux/Vixie 5-field Cron semantics)
+    "croniter>=6.0.0,<7.0.0",
     "ldap3>=2.9.1",
 ]
 

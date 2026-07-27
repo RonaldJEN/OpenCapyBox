@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { X, Download, AlertCircle, Code, Eye, Presentation, FileText, FileCode, FileImage, FileSpreadsheet, File } from 'lucide-react';
+import { useEffect, useRef, useState, type TableHTMLAttributes } from 'react';
+import { X, Download, AlertCircle, Code, Eye, Presentation, FileText, FileCode, FileImage, FileSpreadsheet, File, Archive, Folder } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -25,6 +25,7 @@ type PreviewCacheEntry =
   | { kind: 'docx'; html: string }
   | { kind: 'csv'; rows: string[][] }
   | { kind: 'spreadsheet'; sheets: SpreadsheetSheet[] }
+  | { kind: 'zip'; entries: ZipEntry[] }
   | { kind: 'binary'; blob: Blob };
 
 interface SpreadsheetSheet {
@@ -32,8 +33,13 @@ interface SpreadsheetSheet {
   rows: string[][];
 }
 
+interface ZipEntry {
+  path: string;
+  directory: boolean;
+}
+
 const markdownComponents = {
-  table: ({ children, ...props }: any) => (
+  table: ({ children, ...props }: TableHTMLAttributes<HTMLTableElement>) => (
     <div className="markdown-table-scroll">
       <table {...props}>{children}</table>
     </div>
@@ -41,6 +47,8 @@ const markdownComponents = {
 };
 
 const PREVIEW_CACHE_LIMIT = 30;
+const MAX_ZIP_PREVIEW_BYTES = 10 * 1024 * 1024;
+const MAX_ZIP_ENTRIES = 2000;
 const previewCache = new Map<string, PreviewCacheEntry>();
 
 function readPreviewCache(key: string): PreviewCacheEntry | null {
@@ -72,12 +80,14 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
   const [docxHtml, setDocxHtml] = useState('');
   const [tableData, setTableData] = useState<string[][]>([]);
   const [spreadsheetSheets, setSpreadsheetSheets] = useState<SpreadsheetSheet[]>([]);
+  const [zipEntries, setZipEntries] = useState<ZipEntry[]>([]);
   const [activeSheetIndex, setActiveSheetIndex] = useState(0);
   const [binaryPreviewUrl, setBinaryPreviewUrl] = useState('');
   const [htmlBlobUrl, setHtmlBlobUrl] = useState('');
   const [htmlFrameLoading, setHtmlFrameLoading] = useState(false);
   const [viewMode, setViewMode] = useState<'rendered' | 'source'>('rendered');
   const requestIdRef = useRef(0);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
 
   const getPreviewApiUrl = () => {
     if (!file) return '';
@@ -113,6 +123,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
     setDocxHtml('');
     setTableData([]);
     setSpreadsheetSheets([]);
+    setZipEntries([]);
     setActiveSheetIndex(0);
     setHtmlFrameLoading(false);
     setHtmlBlobUrl((prev) => {
@@ -133,10 +144,14 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
       void loadCsvContent(currentRequestId);
     } else if (isExcelFile(fileType)) {
       void loadSpreadsheetContent(currentRequestId);
+    } else if (isZipFile(fileType)) {
+      void loadZipContent(currentRequestId);
     } else if (isImageFile(fileType) || isPdfFile(fileType)) {
       void loadBinaryPreview(currentRequestId);
     }
-  }, [file]);
+  // Loader 函数有意使用本次 render 的 file/session 快照；requestIdRef 负责丢弃迟到响应。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file, sessionId, previewUrlBuilder]);
 
   useEffect(() => {
     return () => {
@@ -148,6 +163,20 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
       }
     };
   }, [binaryPreviewUrl, htmlBlobUrl]);
+
+  useEffect(() => {
+    if (inline || !file) return undefined;
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    closeButtonRef.current?.focus({ preventScroll: true });
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      previousFocus?.focus({ preventScroll: true });
+    };
+  }, [file, inline]);
 
   const fetchPreviewResponse = async () => {
     const response = await fetch(getPreviewApiUrl(), {
@@ -313,6 +342,51 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
     }
   };
 
+  const loadZipContent = async (requestId: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      if (file && file.size > MAX_ZIP_PREVIEW_BYTES) {
+        throw new Error('ZIP 文件超过 10 MB，请下载后解压查看');
+      }
+      const cacheKey = getPreviewCacheKey();
+      const cached = cacheKey ? readPreviewCache(cacheKey) : null;
+      if (cached?.kind === 'zip') {
+        if (requestId !== requestIdRef.current) return;
+        setZipEntries(cached.entries);
+        return;
+      }
+      const response = await fetchPreviewResponse();
+      const arrayBuffer = await response.arrayBuffer();
+      if (arrayBuffer.byteLength > MAX_ZIP_PREVIEW_BYTES) {
+        throw new Error('ZIP 文件超过 10 MB，请下载后解压查看');
+      }
+      const JSZip = (await import('jszip')).default;
+      const archive = await JSZip.loadAsync(arrayBuffer, { createFolders: true });
+      const rawEntries = Object.values(archive.files);
+      if (rawEntries.length > MAX_ZIP_ENTRIES) {
+        throw new Error(`ZIP 目录超过 ${MAX_ZIP_ENTRIES} 项，请下载后解压查看`);
+      }
+      const entries = rawEntries
+        .filter((entry) => {
+          const segments = entry.name.replace(/\\/g, '/').split('/').filter(Boolean);
+          return segments.length > 0
+            && !segments.some((segment) => segment === '..' || segment === '.');
+        })
+        .map((entry) => ({ path: entry.name, directory: entry.dir }))
+        .sort((a, b) => Number(b.directory) - Number(a.directory) || a.path.localeCompare(b.path));
+      if (requestId !== requestIdRef.current) return;
+      setZipEntries(entries);
+      if (cacheKey) writePreviewCache(cacheKey, { kind: 'zip', entries });
+    } catch (err) {
+      if (requestId !== requestIdRef.current) return;
+      console.error('Failed to load ZIP directory:', err);
+      setError(err instanceof Error ? err.message : '加载 ZIP 目录失败');
+    } finally {
+      if (requestId === requestIdRef.current) setLoading(false);
+    }
+  };
+
   const loadBinaryPreview = async (requestId: number) => {
     setLoading(true);
     setError('');
@@ -365,6 +439,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
   const isExcelFile = (type: string) => ['xlsx', 'xls'].includes(type.toLowerCase());
   const isSpreadsheetFile = (type: string) => ['xlsx', 'xls', 'csv'].includes(type.toLowerCase());
   const isPptxFile = (type: string) => ['pptx', 'ppt'].includes(type.toLowerCase());
+  const isZipFile = (type: string) => type.toLowerCase() === 'zip';
 
   const getLanguage = (type: string): string => {
     const langMap: Record<string, string> = {
@@ -382,6 +457,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
     if (isCodeFile(type) || isHtmlFile(type)) return <FileCode size={size} />;
     if (isTextFile(type) || isDocxFile(type) || isPdfFile(type) || isMarkdownFile(type)) return <FileText size={size} />;
     if (isPptxFile(type)) return <Presentation size={size} />;
+    if (isZipFile(type)) return <Archive size={size} />;
     return <File size={size} />;
   };
 
@@ -496,6 +572,7 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
             <Download size={18} />
           </button>
           <button
+            ref={closeButtonRef}
             onClick={onClose}
             className={closeButtonClassName}
             title={inline ? '关闭预览' : '关闭'}
@@ -640,6 +717,32 @@ export function FilePreview({ file, sessionId, onClose, previewUrlBuilder, onDow
               {renderTablePreview(activeSpreadsheetSheet?.rows || [])}
             </div>
           )
+        ) : isZipFile(fileType) ? (
+          <div className="mx-auto w-full max-w-3xl overflow-hidden rounded-2xl border border-black/[0.06] bg-white shadow-sm">
+            <div className="flex items-center justify-between border-b border-claude-border px-4 py-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-claude-text">
+                <Archive size={17} className="text-claude-accent" />
+                压缩包目录
+              </div>
+              <span className="text-xs text-claude-muted">{zipEntries.length} 项（只读）</span>
+            </div>
+            {zipEntries.length === 0 ? (
+              <div className="py-16 text-center text-sm text-claude-muted">压缩包为空</div>
+            ) : (
+              <ul className="max-h-[65vh] overflow-y-auto divide-y divide-claude-border/60">
+                {zipEntries.map((entry) => (
+                  <li key={`${entry.directory ? 'd' : 'f'}:${entry.path}`} className="flex items-center gap-3 px-4 py-2.5">
+                    {entry.directory
+                      ? <Folder size={15} className="shrink-0 text-claude-accent" />
+                      : <File size={15} className="shrink-0 text-claude-muted" />}
+                    <span className="min-w-0 break-all font-mono text-xs text-claude-text">
+                      {entry.path}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         ) : isPptxFile(fileType) ? (
           <div className="flex flex-col items-center justify-center py-12 px-6">
             <div className="mb-6 p-6 bg-[#FF9500]/10 rounded-full">

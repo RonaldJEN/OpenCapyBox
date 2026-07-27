@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 from src.api.routes import auth, sessions, config as config_routes
 from src.api.models.auth_login_event import AuthLoginEvent
 from src.api.models.database import Base, get_db
+from src.api.services.sandbox_service import SkillDiscoveryResult
 from tests.helpers import make_test_client, make_mock_settings, make_fake_execution
 
 
@@ -938,7 +939,6 @@ class TestConfigRouter:
             SkillInventoryIdentity,
             UserSkillInventoryView,
         )
-
         fake_settings = MagicMock()
         fake_settings.skills_dir = str(tmp_path)
         fake_loader = MagicMock()
@@ -1021,7 +1021,6 @@ class TestConfigRouter:
             SkillInventoryIdentity,
             UserSkillInventoryView,
         )
-
         fake_settings = MagicMock(skills_dir=str(tmp_path))
         fake_loader = MagicMock()
         fake_loader.discover_skills.return_value = [
@@ -1110,11 +1109,21 @@ class TestConfigRouter:
         sandbox_service.get_sandbox_id.return_value = "sbx-current"
         sandbox_service.get_cached_profile_fingerprint.return_value = ("profile-1", 3)
         sandbox_service.recover_persisted_sandbox = AsyncMock()
-        sandbox_service.discover_sandbox_skills = AsyncMock(return_value=[{
-            "name": "new-skill",
-            "description": "new",
-            "sandbox_skill_dir": "/home/user/skills/new-skill",
-        }])
+        sandbox_service.discover_sandbox_skills = AsyncMock(
+            return_value=SkillDiscoveryResult(
+                [{
+                    "name": "new-skill",
+                    "description": "new",
+                    "sandbox_skill_dir": "/home/user/skills/new-skill",
+                }],
+                [{
+                    "path": "/home/user/skills/broken/SKILL.md",
+                    "field": "name",
+                    "message": "name 缺失",
+                    "suggestion": "补充字符串 name。",
+                }],
+            )
+        )
         client.mock_db.query.return_value.filter.return_value.all.return_value = []  # type: ignore[attr-defined]
 
         with patch("src.api.config.get_settings", return_value=fake_settings), patch(
@@ -1134,8 +1143,10 @@ class TestConfigRouter:
 
         assert response.status_code == 200
         assert {skill["name"] for skill in response.json()["skills"]} == {"pdf", "new-skill"}
+        assert response.json()["skill_issues"][0]["path"].endswith("/broken/SKILL.md")
         publish.assert_called_once()
         sandbox_service.discover_sandbox_skills.assert_awaited_once()
+        sandbox_service.recover_persisted_sandbox.assert_not_awaited()
 
     def test_get_skills_cas_loser_returns_persisted_winner(self, client, tmp_path):
         from src.agent.tools.skill_loader import Skill

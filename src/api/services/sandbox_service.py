@@ -39,12 +39,29 @@ from src.api.config import get_settings
 from src.api.services.sandbox_profile_service import SandboxRuntimeConfig
 from src.api.services.skill_inventory_service import (
     SkillInventoryValidationError,
+    normalize_skill_scan_issues,
     normalize_user_skill_inventory,
 )
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 MAX_SKILL_DISCOVERY_CANDIDATES = 1024
+
+
+class SkillDiscoveryResult(list[dict[str, str]]):
+    """一次扫描的可用 Skill 与隔离问题。
+
+    继承 list 保持既有只消费技能列表的调用兼容；``issues`` 与列表由同一次
+    扫描直接返回，避免通过 user_id 级进程全局状态传递而被并发刷新串线。
+    """
+
+    def __init__(
+        self,
+        skills: list[dict[str, str]] | None = None,
+        issues: list[dict[str, str]] | None = None,
+    ) -> None:
+        super().__init__(skills or [])
+        self.issues = normalize_skill_scan_issues(issues or [])
 
 
 class SandboxTemporarilyUnavailable(RuntimeError):
@@ -1435,7 +1452,7 @@ class SandboxSessionService:
         official_skill_names: set[str] | None = None,
         *,
         strict: bool = False,
-    ) -> list[dict]:
+    ) -> SkillDiscoveryResult:
         """發現沙箱中用戶自行安裝的第三方 Skill。
 
         在沙箱內執行 ``find`` 命令定位所有 SKILL.md，讀取 frontmatter
@@ -1444,22 +1461,43 @@ class SandboxSessionService:
         Args:
             user_id: 用戶 ID
             official_skill_names: 官方 Skill 名稱集合（用於去重）
-            strict: 沙箱访问失败时是否抛出异常。API 列表端点使用严格模式
-                区分“没有用户 Skill”和“沙箱不可用”；Agent 发现保持容错。
+            strict: 仅沙箱级访问失败时抛出异常。单个 SKILL.md 的读取、
+                YAML 或字段错误始终被隔离，不会被误判为沙箱异常。
 
         Returns:
-            包含 ``name``, ``description``, ``sandbox_skill_dir`` 的字典列表。
-            容错模式下沙箱不可用或出错时返回空列表；严格模式下抛出异常。
+            ``SkillDiscoveryResult``：本次扫描的可用 Skill 列表及逐项隔离问题。
+            容错模式下沙箱不可用或出错时返回空结果；严格模式下抛出异常。
         """
         if official_skill_names is None:
             official_skill_names = set()
+        issues: list[dict[str, str]] = []
+
+        def add_issue(
+            path: str,
+            field: str,
+            message: str,
+            suggestion: str,
+        ) -> None:
+            issues.append({
+                "path": path,
+                "field": field,
+                "message": message,
+                "suggestion": suggestion,
+            })
+            logger.warning(
+                "discover_sandbox_skills: 已隔离异常 Skill (user=%s, path=%s, field=%s): %s",
+                user_id,
+                path,
+                field,
+                message,
+            )
 
         sandbox = self._cache.get(user_id)
         if not sandbox:
             logger.debug("discover_sandbox_skills: 沙箱不在快取中 (user=%s)", user_id)
             if strict:
                 raise RuntimeError("沙箱不在缓存中")
-            return []
+            return SkillDiscoveryResult()
 
         mount_path = self.get_mount_path(user_id)
         skills_root = posixpath.join(mount_path, "skills")
@@ -1484,7 +1522,9 @@ class SandboxSessionService:
                 stdout_text = "\n".join(
                     getattr(line, "text", str(line)) for line in stdout_text
                 )
-            paths = [p.strip() for p in stdout_text.strip().splitlines() if p.strip()]
+            paths = sorted(
+                p.strip() for p in stdout_text.strip().splitlines() if p.strip()
+            )
             max_candidates = (
                 MAX_SKILL_DISCOVERY_CANDIDATES + len(official_skill_names)
             )
@@ -1494,7 +1534,7 @@ class SandboxSessionService:
             logger.warning("discover_sandbox_skills: find 命令失敗 (user=%s): %s", user_id, e)
             if strict:
                 raise RuntimeError("用户 Skill 发现失败") from e
-            return []
+            return SkillDiscoveryResult()
 
         async def _read_skill(skill_md_path: str):
             content = await sandbox.files.read_file(skill_md_path)
@@ -1510,24 +1550,38 @@ class SandboxSessionService:
         results: list[dict] = []
         for skill_md_path, raw in zip(paths, raw_results):
             if isinstance(raw, BaseException):
-                logger.debug("discover_sandbox_skills: 讀取 %s 失敗: %s", skill_md_path, raw)
-                if strict:
-                    raise RuntimeError(
-                        f"读取用户 Skill 失败: {skill_md_path}"
-                    ) from raw
+                add_issue(
+                    skill_md_path,
+                    "file",
+                    f"SKILL.md 读取失败: {raw}",
+                    "检查文件权限、编码和文件是否完整后重新保存。",
+                )
                 continue
 
             content = raw
             frontmatter = self._extract_skill_frontmatter(content)
+            if frontmatter is None:
+                add_issue(
+                    skill_md_path,
+                    "frontmatter",
+                    "YAML frontmatter 缺失或格式不合法",
+                    "使用 --- 包裹合法 YAML，并至少提供字符串类型的 name 字段。",
+                )
+                continue
             name_value = frontmatter.get("name") if frontmatter else None
             description_value = frontmatter.get("description") if frontmatter else None
             metadata_value = frontmatter.get("metadata") if frontmatter else None
             display_name_value = None
+            invalid_field: str | None = None
             invalid_metadata = not isinstance(name_value, str)
+            if invalid_metadata:
+                invalid_field = "name"
             if description_value is not None and not isinstance(description_value, str):
                 invalid_metadata = True
+                invalid_field = invalid_field or "description"
             if metadata_value is not None and not isinstance(metadata_value, dict):
                 invalid_metadata = True
+                invalid_field = invalid_field or "metadata"
             if frontmatter:
                 display_candidates = [
                     frontmatter.get("display_name"),
@@ -1541,6 +1595,7 @@ class SandboxSessionService:
                 for candidate in display_candidates:
                     if candidate is not None and not isinstance(candidate, str):
                         invalid_metadata = True
+                        invalid_field = invalid_field or "display_name"
                     elif (
                         display_name_value is None
                         and isinstance(candidate, str)
@@ -1548,18 +1603,22 @@ class SandboxSessionService:
                     ):
                         display_name_value = candidate
             if invalid_metadata:
-                if strict:
-                    raise RuntimeError(
-                        f"用户 Skill 元数据无效: {skill_md_path}"
-                    )
+                add_issue(
+                    skill_md_path,
+                    invalid_field or "frontmatter",
+                    f"{invalid_field or 'frontmatter'} 必须使用规定的数据类型",
+                    "修正该字段后重新保存；name、description、display_name 必须是字符串，metadata 必须是对象。",
+                )
                 continue
             try:
                 name = normalize_skill_key(name_value)
             except ValueError as exc:
-                if strict:
-                    raise RuntimeError(
-                        f"用户 Skill 元数据无效: {skill_md_path}"
-                    ) from exc
+                add_issue(
+                    skill_md_path,
+                    "name",
+                    str(exc),
+                    "将 name 修改为合法且唯一的 Skill 标识。",
+                )
                 continue
             if name in official_skill_names:
                 logger.debug("discover_sandbox_skills: 跳過與官方同名的 skill: %s", name)
@@ -1573,31 +1632,38 @@ class SandboxSessionService:
             )
             skill_dir = posixpath.dirname(skill_md_path)
 
-            results.append({
+            candidate = {
                 "name": name,
                 "display_name": display_name,
                 "description": description,
                 "sandbox_skill_dir": skill_dir,
-            })
-
-        try:
-            results = normalize_user_skill_inventory(results)
-        except SkillInventoryValidationError as exc:
-            logger.warning(
-                "discover_sandbox_skills: 用户 Skill 清单无效 (user=%s): %s",
-                user_id,
-                exc,
-            )
-            if strict:
-                raise RuntimeError("用户 Skill 清单无效") from exc
-            return []
+            }
+            try:
+                normalized_candidate = normalize_user_skill_inventory([candidate])[0]
+            except SkillInventoryValidationError as exc:
+                add_issue(
+                    skill_md_path,
+                    "frontmatter",
+                    str(exc),
+                    "缩短超长字段并检查 name、description、display_name 的格式。",
+                )
+                continue
+            if any(item["name"] == normalized_candidate["name"] for item in results):
+                add_issue(
+                    skill_md_path,
+                    "name",
+                    f"Skill name 重复: {normalized_candidate['name']}",
+                    "为该 Skill 设置一个不重复的 name。",
+                )
+                continue
+            results.append(normalized_candidate)
 
         logger.info(
             "discover_sandbox_skills: 發現 %d 個用戶 Skill (user=%s)",
             len(results),
             user_id,
         )
-        return results
+        return SkillDiscoveryResult(results, issues)
 
     async def read_sandbox_skill_content(
         self,

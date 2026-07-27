@@ -75,6 +75,11 @@ class CronJobRun(Base):
     # 来自 CronJob 表的任务名
     job_name = Column(String(100), nullable=False)
     cron_expr = Column(String(50), nullable=False)
+    rule_version = Column(Integer, nullable=True)
+    # 本次调度原本计划触发的分钟；手动触发时为空。
+    scheduled_at = Column(DateTime, nullable=True)
+    # scheduled / manual
+    trigger_source = Column(String(20), nullable=False, default="scheduled")
     started_at = Column(DateTime, default=now_naive)
     completed_at = Column(DateTime, nullable=True)
     # running / success / failed
@@ -99,6 +104,9 @@ class CronJobRun(Base):
             "id": self.id,
             "job_name": self.job_name,
             "cron_expr": self.cron_expr,
+            "rule_version": self.rule_version,
+            "scheduled_at": self.scheduled_at.isoformat() if self.scheduled_at else None,
+            "trigger_source": self.trigger_source,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "status": self.status,

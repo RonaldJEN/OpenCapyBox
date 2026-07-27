@@ -288,10 +288,20 @@ class TestTriggerJob:
 
         mock_job = MagicMock()
         mock_job.user_id = "testuser"
+        mock_job.id = 17
         mock_job.name = "daily"
         mock_job.cron_expr = "0 9 * * *"
+        mock_job.rule_version = 4
         mock_db.query.return_value.filter.return_value.first.return_value = mock_job
 
+        # 模拟预创建 run 记录提交后，另一个事务立即修改同名任务。
+        # 路由后续必须继续使用 commit 前捕获的提交快照。
+        def mutate_job_after_commit():
+            mock_job.id = 99
+            mock_job.cron_expr = "0 18 * * *"
+            mock_job.rule_version = 5
+
+        mock_db.commit.side_effect = mutate_job_after_commit
         client.app.state.cron_worker_id = "worker-test"
 
         with patch(
@@ -314,6 +324,11 @@ class TestTriggerJob:
         assert call_args[1] == "testuser"
         assert call_args[2] == "daily"
         assert call_args[3] == body["run_id"]
+        assert call_args[4] == 17
+        assert call_args[5] == 4
+        run_record = mock_db.add.call_args.args[0]
+        assert run_record.cron_expr == "0 9 * * *"
+        assert run_record.rule_version == 4
 
     def test_marks_run_failed_when_worker_unavailable(self):
         """worker 未启动时，trigger_manual_run 抛 503 → run 记录必须被标记为 failed。
@@ -429,6 +444,7 @@ class TestCreateCronJob:
         assert body["job"]["name"] == "daily"
         assert set(body["job"].keys()) == {
             "id", "name", "cron_expr", "schedule", "description", "content", "enabled",
+            "rule_version",
         }
         assert "user_id" not in body["job"]
         assert "created_at" not in body["job"]
@@ -462,6 +478,19 @@ class TestCreateCronJob:
             })
         assert resp.status_code == 400
         assert "任务名" in resp.json()["detail"]
+
+    def test_400_for_never_firing_cron_without_persisting(self):
+        client, mock_db = _make_client()
+
+        resp = client.post("/cron/jobs", json={
+            "name": "never",
+            "cron_expr": "0 0 31 2 *",
+        })
+
+        assert resp.status_code == 400
+        assert "无法产生未来执行时间" in resp.json()["detail"]
+        mock_db.add.assert_not_called()
+        mock_db.commit.assert_not_called()
 
     def test_503_when_db_busy(self):
         from src.api.services.cron_service import CronJobBusyError

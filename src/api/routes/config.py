@@ -209,6 +209,7 @@ async def get_skills(
     sandbox_status = "not_created"
     inventory_state = "unavailable"
     inventory_discovered_at = None
+    skill_issues: list[dict[str, str]] = []
 
     # 只在本地 DB 查询期间占用连接；远程沙箱 I/O 前主动结束事务，
     # 避免并发打开设置页时把连接池耗尽。
@@ -240,36 +241,39 @@ async def get_skills(
             sandbox_status = "available"
             inventory_state = "current"
             inventory_discovered_at = inventory_view.discovered_at
+            skill_issues = inventory_view.issues or []
 
         async def _discover_user_skills() -> tuple[
             list[dict[str, str]],
             SkillInventoryIdentity,
             datetime,
+            list[dict[str, str]],
         ]:
             identity_before = cached_sandbox_identity(sandbox_service, user_id)
             if identity_before is None:
                 raise RuntimeError("沙箱缓存缺少完整代际指纹")
             observed_at = now_naive()
-            discovered = normalize_user_skill_inventory(
-                await asyncio.wait_for(
-                    sandbox_service.discover_sandbox_skills(
-                        user_id,
-                        official_names,
-                        strict=True,
-                    ),
-                    timeout=12,
-                )
+            discovery_result = await asyncio.wait_for(
+                sandbox_service.discover_sandbox_skills(
+                    user_id,
+                    official_names,
+                    strict=True,
+                ),
+                timeout=12,
             )
+            discovered = normalize_user_skill_inventory(discovery_result)
             identity_after = cached_sandbox_identity(sandbox_service, user_id)
             if identity_after != identity_before:
                 raise RuntimeError("扫描期间沙箱代际发生变化")
-            return discovered, identity_before, observed_at
+            issues = list(getattr(discovery_result, "issues", []))
+            return discovered, identity_before, observed_at, issues
 
         if sandbox_skills is None:
             scanned_result: tuple[
                 list[dict[str, str]],
                 SkillInventoryIdentity,
                 datetime,
+                list[dict[str, str]],
             ] | None = None
             try:
                 cached_is_current = sandbox_service.cached_is_current(user_id, candidate_id)
@@ -327,7 +331,12 @@ async def get_skills(
                         )
 
             if scanned_result is not None:
-                scanned_skills, scanned_identity, scan_observed_at = scanned_result
+                (
+                    scanned_skills,
+                    scanned_identity,
+                    scan_observed_at,
+                    scanned_issues,
+                ) = scanned_result
                 publish_failed = False
                 try:
                     published = replace_user_skill_inventory(
@@ -335,6 +344,7 @@ async def get_skills(
                         user_id=user_id,
                         identity=scanned_identity,
                         skills=scanned_skills,
+                        issues=scanned_issues,
                         observed_at=scan_observed_at,
                     )
                 except Exception:
@@ -352,6 +362,7 @@ async def get_skills(
                     sandbox_status = "available"
                     inventory_state = "current"
                     inventory_discovered_at = scan_observed_at
+                    skill_issues = scanned_issues
                 else:
                     # A persistence exception is not evidence that another
                     # scan won. A normal CAS loss is current only when the DB
@@ -378,10 +389,12 @@ async def get_skills(
                         sandbox_status = "available"
                         inventory_state = "current"
                         inventory_discovered_at = winner.discovered_at
+                        skill_issues = winner.issues or []
                     elif winner.skills is not None:
                         sandbox_skills = winner.skills
                         inventory_state = "stale"
                         inventory_discovered_at = winner.discovered_at
+                        skill_issues = winner.issues or []
             else:
                 # Recovery may have rebuilt/rebound the sandbox. Only a snapshot
                 # matching the binding *after* that attempt is safe to reuse.
@@ -390,6 +403,7 @@ async def get_skills(
                     sandbox_skills = fallback.skills
                     inventory_state = "stale"
                     inventory_discovered_at = fallback.discovered_at
+                    skill_issues = fallback.issues or []
 
         if sandbox_skills is not None:
             for skill in sandbox_skills:
@@ -427,6 +441,7 @@ async def get_skills(
         "skills": result,
         "sandbox_status": sandbox_status,
         "inventory_state": inventory_state,
+        "skill_issues": skill_issues,
         "inventory_discovered_at": (
             inventory_discovered_at.isoformat()
             if hasattr(inventory_discovered_at, "isoformat")

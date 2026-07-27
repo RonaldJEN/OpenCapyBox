@@ -14,6 +14,7 @@ from src.api.services.skill_inventory_service import (
     MAX_USER_SKILL_INVENTORY_JSON_BYTES,
     SkillInventoryIdentity,
     SkillInventoryValidationError,
+    decode_skill_scan_issues,
     decode_user_skill_inventory,
     load_user_skill_inventory,
     normalize_user_skill_inventory,
@@ -225,6 +226,43 @@ def test_corrupt_inventory_is_a_cache_miss():
     assert decode_user_skill_inventory("not-json") is None
     assert decode_user_skill_inventory('{"name":"not-a-list"}') is None
     assert decode_user_skill_inventory('[{"description":"missing name"}]') is None
+
+
+def test_corrupt_skill_issues_are_a_cache_miss():
+    assert decode_skill_scan_issues("not-json") is None
+    assert decode_skill_scan_issues('{"path":"not-a-list"}') is None
+    assert decode_skill_scan_issues('["not-an-issue"]') is None
+    assert decode_skill_scan_issues("[]") == []
+
+
+def test_corrupt_skill_issues_invalidate_the_paired_inventory_snapshot():
+    engine, session_factory = _session_factory()
+    try:
+        with session_factory() as db:
+            db.add(UserSandbox(
+                id="binding-1",
+                user_id="user-1",
+                sandbox_id="sandbox-1",
+            ))
+            db.commit()
+            assert replace_user_skill_inventory(
+                db,
+                user_id="user-1",
+                identity=SkillInventoryIdentity("sandbox-1", None, None),
+                skills=[{"name": "valid-skill"}],
+            ) is True
+
+            snapshot = db.get(UserSkillInventorySnapshot, "user-1")
+            assert snapshot is not None
+            snapshot.issues_json = "not-json"
+            db.commit()
+
+            view = load_user_skill_inventory(db, user_id="user-1")
+            assert view.skills is None
+            assert view.discovered_at is None
+            assert view.issues is None
+    finally:
+        engine.dispose()
 
 
 def test_inventory_validation_rejects_duplicate_keys_as_one_batch():

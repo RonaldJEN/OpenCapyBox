@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import * as XLSX from 'xlsx';
+import JSZip from 'jszip';
 import type { FileInfo } from '../../types';
 import { FilePreview } from '../../components/FilePreview';
 
@@ -347,5 +348,38 @@ describe('FilePreview custom source', () => {
 
     expect(screen.getByText('ID')).toBeInTheDocument();
     expect(screen.getByText('Alpha')).toBeInTheDocument();
+  });
+
+  it('renders a ZIP directory inline without opening a new page', async () => {
+    const zip = new JSZip();
+    zip.file('docs/readme.md', '# Read me');
+    zip.file('data/report.csv', 'name,value\nA,1');
+    const archive = await zip.generateAsync({ type: 'arraybuffer' });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(archive),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      <FilePreview
+        inline
+        file={{
+          name: 'bundle.zip',
+          path: 'bundle.zip',
+          size: archive.byteLength,
+          modified: '2026-07-27T12:00:00Z',
+          type: 'zip',
+          is_directory: false,
+        }}
+        sessionId="session-zip"
+        onClose={() => {}}
+      />,
+    );
+
+    expect(await screen.findByText('压缩包目录')).toBeInTheDocument();
+    expect(screen.getByText('docs/readme.md')).toBeInTheDocument();
+    expect(screen.getByText('data/report.csv')).toBeInTheDocument();
+    expect(screen.getByText(/只读/)).toBeInTheDocument();
   });
 });

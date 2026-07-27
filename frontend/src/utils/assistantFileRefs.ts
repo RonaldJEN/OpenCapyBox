@@ -12,6 +12,7 @@ const FILE_PREVIEW_EXTS = new Set([
   'js', 'ts', 'jsx', 'tsx', 'py', 'java', 'cpp', 'c', 'go', 'rs', 'sh', 'bash', 'sql', 'css', 'json', 'xml', 'yaml', 'yml', 'rb', 'php', 'swift', 'kt', 'scala', 'r', 'dart', 'lua',
   'docx', 'doc', 'csv', 'xlsx', 'xls', 'pptx', 'ppt',
   'jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp', 'pdf',
+  'zip',
 ]);
 
 /**
@@ -122,8 +123,34 @@ function extractPathCandidate(raw: string): string {
     .replace(/['"“”‘’]+$/, '');
 }
 
+function decodeAssistantPathCandidate(candidate: string): string | null {
+  try {
+    const decodedSegments: string[] = [];
+    for (const encodedSegment of candidate.replace(/\\/g, '/').split('/')) {
+      const decodedSegment = decodeURIComponent(encodedSegment);
+      // 百分号编码不能偷偷引入新的路径层级、Windows 分隔符或 NUL。
+      if (
+        decodedSegment.includes('/')
+        || decodedSegment.includes('\\')
+        || decodedSegment.includes('\0')
+      ) {
+        return null;
+      }
+      decodedSegments.push(decodedSegment);
+    }
+    return decodedSegments.join('/');
+  } catch {
+    // 畸形百分号编码不是合法 Markdown 文件路径。
+    return null;
+  }
+}
+
 function normalizeAssistantFilePath(candidate: string, sessionId: string): string | null {
-  const normalized = candidate.replace(/\\/g, '/').replace(/^\.\//, '');
+  const decoded = decodeAssistantPathCandidate(candidate);
+  if (decoded === null) {
+    return null;
+  }
+  const normalized = decoded.replace(/^\.\//, '');
   if (!normalized || URL_RE.test(normalized) || normalized.includes('\0')) {
     return null;
   }
@@ -155,4 +182,13 @@ function normalizeAssistantFilePath(candidate: string, sessionId: string): strin
 
 function isInlinePathCandidate(raw: string): boolean {
   return !/\s/.test(extractPathCandidate(raw));
+}
+
+/** 将 Markdown href 解析为当前会话内可预览文件；外链和越界路径返回 null。 */
+export function createAssistantFileInfoFromHref(
+  href: string,
+  sessionId?: string,
+): FileInfo | null {
+  if (!sessionId) return null;
+  return createFileInfoFromCandidate(href, sessionId);
 }

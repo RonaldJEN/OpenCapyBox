@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { StrictMode } from 'react';
-import CronSchedule, { cronToReadable } from '../../components/CronSchedule';
+import CronSchedule, { cronToReadable, taskVisibleOnDate } from '../../components/CronSchedule';
 
 // Mock configApi
 vi.mock('../../services/configApi', () => ({
   getCronJobs: vi.fn().mockResolvedValue([
     { name: 'daily_report', cron_expr: '0 9 * * *', schedule: null, content: '', description: '每天9点日报', enabled: true },
-    { name: 'weekday_check', cron_expr: '0 10 * * 0-4', schedule: null, content: '', description: '工作日检查', enabled: true },
+    { name: 'weekday_check', cron_expr: '0 10 * * 1-5', schedule: null, content: '', description: '工作日检查', enabled: true },
     { name: 'disabled_task', cron_expr: '*/30 * * * *', schedule: null, content: '', description: '已暂停', enabled: false },
   ]),
   getCronRuns: vi.fn().mockResolvedValue({
@@ -29,6 +29,7 @@ vi.mock('../../services/configApi', () => ({
   })),
   triggerCronJob: vi.fn().mockResolvedValue({ job_name: 'daily_report', run_id: 'fake-run-id', status: 'accepted', message: '后台任务已执行' }),
   getCronRunStatus: vi.fn().mockResolvedValue({ id: 'fake-run-id', job_name: 'daily_report', status: 'success', output: 'ok' }),
+  deleteCronJob: vi.fn().mockResolvedValue(undefined),
 }));
 
 describe('CronSchedule', () => {
@@ -62,11 +63,11 @@ describe('CronSchedule', () => {
     });
   });
 
-  it('工作日 cron 表达式 (0-4) 的任务在工作日显示', async () => {
+  it('工作日 cron 表达式 (1-5) 的任务在工作日显示', async () => {
     render(<CronSchedule />);
 
     await waitFor(() => {
-      // weekday_check 使用 0-4，应该在工作日列中显示
+      // weekday_check 使用 1-5，应该在工作日列中显示
       const cards = screen.getAllByText('工作日检查');
       expect(cards.length).toBeGreaterThan(0);
     });
@@ -427,6 +428,52 @@ describe('CronSchedule', () => {
     expect(within(targetRow).queryByRole('button', { name: '查看详情' })).not.toBeInTheDocument();
   });
 
+  it('删除任务使用站内确认弹窗，并明确说明后续停止、历史保留', async () => {
+    const { deleteCronJob } = await import('../../services/configApi');
+    render(<CronSchedule />);
+
+    fireEvent.click(await screen.findByText('列表'));
+    await screen.findByText(/3\s*个任务/);
+
+    const list = screen.getByTestId('schedule-list-cards');
+    const targetRow = list.querySelector('[data-task-name="daily_report"]') as HTMLElement;
+    const moreButton = within(targetRow).getByRole('button', { name: '更多操作' });
+    fireEvent.click(moreButton);
+    fireEvent.click(within(targetRow).getByRole('button', { name: '删除' }));
+
+    const dialog = screen.getByRole('alertdialog', { name: '删除这个任务？' });
+    expect(within(dialog).getByText('daily_report')).toBeInTheDocument();
+    expect(within(dialog).getByText('删除后不再自动执行')).toBeInTheDocument();
+    expect(within(dialog).getByText('已产生的结果不会删除')).toBeInTheDocument();
+    expect(window.confirm).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    expect(deleteCronJob).not.toHaveBeenCalled();
+    await waitFor(() => expect(moreButton).toHaveFocus());
+  });
+
+  it('确认删除后调用接口，失败时在弹窗内保留错误供重试', async () => {
+    const { deleteCronJob } = await import('../../services/configApi');
+    vi.mocked(deleteCronJob).mockRejectedValueOnce(new Error('网络暂时不可用'));
+    render(<CronSchedule />);
+
+    fireEvent.click(await screen.findByText('列表'));
+    await screen.findByText(/3\s*个任务/);
+
+    const list = screen.getByTestId('schedule-list-cards');
+    const targetRow = list.querySelector('[data-task-name="daily_report"]') as HTMLElement;
+    fireEvent.click(within(targetRow).getByRole('button', { name: '更多操作' }));
+    fireEvent.click(within(targetRow).getByRole('button', { name: '删除' }));
+    fireEvent.click(screen.getByRole('button', { name: '删除任务' }));
+
+    await waitFor(() => {
+      expect(deleteCronJob).toHaveBeenCalledWith('daily_report');
+      expect(screen.getByRole('alert')).toHaveTextContent('网络暂时不可用');
+    });
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument();
+  });
+
   it('列表更多操作菜单点击空白区域会自动收起', async () => {
     render(<CronSchedule />);
 
@@ -584,6 +631,13 @@ describe('CronSchedule', () => {
       expect(screen.getByText(/任务内容最多 8000 个字符/)).toBeInTheDocument();
     });
 
+    fireEvent.change(screen.getByRole('textbox', { name: '任务内容' }), {
+      target: { value: '修正后的任务内容' },
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(/任务内容最多 8000 个字符/)).not.toBeInTheDocument();
+    });
+
     alertSpy.mockRestore();
   });
 
@@ -659,21 +713,21 @@ describe('cronToReadable', () => {
   });
 
   it('工作日', () => {
-    expect(cronToReadable('0 10 * * 0-4')).toBe('工作日 10:00');
+    expect(cronToReadable('0 10 * * 1-5')).toBe('工作日 10:00');
   });
 
   it('周末', () => {
-    expect(cronToReadable('0 9 * * 5,6')).toBe('周末 09:00');
-    expect(cronToReadable('0 9 * * 6,5')).toBe('周末 09:00');
+    expect(cronToReadable('0 9 * * 6,0')).toBe('周末 09:00');
+    expect(cronToReadable('0 9 * * 0,6')).toBe('周末 09:00');
   });
 
   it('每周单天', () => {
-    expect(cronToReadable('0 9 * * 0')).toBe('每周一 09:00');
-    expect(cronToReadable('0 9 * * 6')).toBe('每周日 09:00');
+    expect(cronToReadable('0 9 * * 0')).toBe('每周日 09:00');
+    expect(cronToReadable('0 9 * * 6')).toBe('每周六 09:00');
   });
 
   it('每周多天', () => {
-    expect(cronToReadable('0 9 * * 1,3,5')).toBe('每周二、四、六 09:00');
+    expect(cronToReadable('0 9 * * 1,3,5')).toBe('每周一、三、五 09:00');
   });
 
   it('每月某日', () => {
@@ -689,5 +743,42 @@ describe('cronToReadable', () => {
   it('无法解析时原样返回', () => {
     expect(cronToReadable('invalid')).toBe('invalid');
     expect(cronToReadable('* * * * * *')).toBe('* * * * * *');
+  });
+});
+
+describe('标准 Cron 星期匹配', () => {
+  const monday = new Date(2026, 6, 27, 9, 0);
+  const saturday = new Date(2026, 6, 25, 9, 0);
+  const sunday = new Date(2026, 6, 26, 9, 0);
+
+  it('使用 0/7=周日、1=周一 到 6=周六', () => {
+    expect(taskVisibleOnDate('0 9 * * 1-5', monday)).toBe(true);
+    expect(taskVisibleOnDate('0 9 * * 1-5', saturday)).toBe(false);
+    expect(taskVisibleOnDate('0 9 * * 1-6', saturday)).toBe(true);
+    expect(taskVisibleOnDate('0 9 * * 2-6,0', monday)).toBe(false);
+    expect(taskVisibleOnDate('0 9 * * 2-6,0', sunday)).toBe(true);
+    expect(taskVisibleOnDate('0 9 * * 7', sunday)).toBe(true);
+  });
+
+  it('日与星期同时受限时使用 OR 语义', () => {
+    const mondayNotFifteenth = new Date(2025, 0, 6, 9, 0);
+    const fifteenthNotMonday = new Date(2025, 0, 15, 9, 0);
+    expect(taskVisibleOnDate('0 9 15 * 1', mondayNotFifteenth)).toBe(true);
+    expect(taskVisibleOnDate('0 9 15 * 1', fifteenthNotMonday)).toBe(true);
+  });
+
+  it('按字段范围匹配步进表达式', () => {
+    const tuesday = new Date(2026, 6, 28, 9, 0);
+    const wednesday = new Date(2026, 6, 29, 9, 0);
+    const januaryThird = new Date(2026, 0, 3, 9, 0);
+    const januarySecond = new Date(2026, 0, 2, 9, 0);
+    const februaryFirst = new Date(2026, 1, 1, 9, 0);
+
+    expect(taskVisibleOnDate('0 9 * * 1-5/2', monday)).toBe(true);
+    expect(taskVisibleOnDate('0 9 * * 1-5/2', tuesday)).toBe(false);
+    expect(taskVisibleOnDate('0 9 * * 1-5/2', wednesday)).toBe(true);
+    expect(taskVisibleOnDate('0 9 */2 * *', januaryThird)).toBe(true);
+    expect(taskVisibleOnDate('0 9 */2 * *', januarySecond)).toBe(false);
+    expect(taskVisibleOnDate('0 9 * */2 *', februaryFirst)).toBe(false);
   });
 });

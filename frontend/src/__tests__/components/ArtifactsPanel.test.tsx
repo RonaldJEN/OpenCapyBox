@@ -1,11 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '../utils/test-utils';
+import { act, render, screen, fireEvent, waitFor } from '../utils/test-utils';
 import { ArtifactsPanel } from '../../components/ArtifactsPanel';
 import { apiService } from '../../services/api';
 import { FileInfo } from '../../types';
 
 vi.mock('../../components/FilePreview', () => ({
-  FilePreview: ({ file, inline, onClose }: any) => (
+  FilePreview: ({
+    file,
+    inline,
+    onClose,
+  }: {
+    file?: FileInfo;
+    inline?: boolean;
+    onClose: () => void;
+  }) => (
     <div data-testid="file-preview-inline-mock" data-inline={String(inline)}>
       <span>Inline Preview: {file?.name}</span>
       <button onClick={onClose}>Close Inline Preview</button>
@@ -216,6 +224,80 @@ describe('ArtifactsPanel 组件', () => {
       expect(screen.getByText('data.xlsx')).toBeInTheDocument();
       expect(screen.getByText('script.py')).toBeInTheDocument();
     });
+  });
+
+  it('关闭预览后恢复文件列表滚动位置与触发焦点', async () => {
+    render(
+      <ArtifactsPanel
+        sessionId="test-session"
+        isOpen
+        onClose={vi.fn()}
+      />,
+    );
+
+    const fileLabel = await screen.findByText('report.pdf');
+    const list = screen.getByTestId('artifacts-file-list');
+    list.scrollTop = 180;
+    const trigger = fileLabel.closest('[tabindex="0"]') as HTMLElement;
+    fireEvent.click(trigger);
+    fireEvent.click(await screen.findByRole('button', { name: 'Close Inline Preview' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('artifacts-file-list').scrollTop).toBe(180);
+      expect(document.activeElement).toHaveAttribute('data-file-path', '/workspace/report.pdf');
+    });
+  });
+
+  it('切换 session 后旧根目录请求不得覆盖新会话文件', async () => {
+    let resolveSessionA!: (value: { files: FileInfo[]; total: number }) => void;
+    let resolveSessionB!: (value: { files: FileInfo[]; total: number }) => void;
+    vi.mocked(apiService.getSessionFiles).mockImplementation((sessionId) => (
+      new Promise((resolve) => {
+        if (sessionId === 'session-a') resolveSessionA = resolve;
+        else resolveSessionB = resolve;
+      })
+    ));
+
+    const { rerender } = render(
+      <ArtifactsPanel sessionId="session-a" isOpen onClose={vi.fn()} />,
+    );
+    await waitFor(() => expect(resolveSessionA).toBeTypeOf('function'));
+
+    rerender(<ArtifactsPanel sessionId="session-b" isOpen onClose={vi.fn()} />);
+    await waitFor(() => expect(resolveSessionB).toBeTypeOf('function'));
+
+    await act(async () => {
+      resolveSessionB({
+        files: [{ ...mockFiles[0], name: 'new-session.pdf', path: 'new-session.pdf' }],
+        total: 1,
+      });
+    });
+    expect(await screen.findByText('new-session.pdf')).toBeInTheDocument();
+
+    await act(async () => {
+      resolveSessionA({
+        files: [{ ...mockFiles[0], name: 'stale-session.pdf', path: 'stale-session.pdf' }],
+        total: 1,
+      });
+    });
+    expect(screen.queryByText('stale-session.pdf')).not.toBeInTheDocument();
+    expect(screen.getByText('new-session.pdf')).toBeInTheDocument();
+  });
+
+  it('文件和目录行支持 Enter/Space 键盘激活', async () => {
+    render(
+      <ArtifactsPanel
+        sessionId="test-session"
+        isOpen
+        onClose={vi.fn()}
+      />,
+    );
+
+    const fileTrigger = (await screen.findByText('report.pdf')).closest(
+      '[role="button"]',
+    ) as HTMLElement;
+    fireEvent.keyDown(fileTrigger, { key: 'Enter' });
+    expect(await screen.findByText('Inline Preview: report.pdf')).toBeInTheDocument();
   });
 
   it('空文件列表应该显示空目录提示', async () => {

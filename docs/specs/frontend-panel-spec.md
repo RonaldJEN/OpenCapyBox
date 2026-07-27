@@ -155,7 +155,7 @@ useEffect(() => {
 
 - `GET /api/config/agent-files/{name}`（name ∈ `memory|user|soul`）→ `{ content, version }`
 - `PUT /api/config/agent-files/{name}` body `{ content }` → `{ version }`
-- `GET /api/config/skills?refresh={bool}` → `{ skills: SkillInfo[], sandbox_status, inventory_state, inventory_discovered_at }`，其中 `SkillInfo.source` 为 `official | user`；缺省读取 DB 快照，显式刷新才要求远程严格扫描
+- `GET /api/config/skills?refresh={bool}` → `{ skills: SkillInfo[], skill_issues: SkillScanIssue[], sandbox_status, inventory_state, inventory_discovered_at }`，其中 `SkillInfo.source` 为 `official | user`；缺省读取 DB 快照，显式刷新才要求远程严格扫描
 - `PUT /api/config/skills/{name}` body `{ enabled }`
 
 ### 4.4 关键不变量
@@ -171,6 +171,7 @@ useEffect(() => {
 - **Skills 来源展示**：每项显示「官方」或「用户」来源标识；用户 Skill 不重复展示 `category=user` 标签。
 - **沙箱状态展示**：`not_created` 时提示尚未创建沙箱、当前仅展示官方 Skills；`inventory_state=stale` 时提示刷新失败且正在显示上次成功清单，不得声称仅有官方 Skills；其余 `unavailable` 时提示沙箱暂不可用、当前清单为部分结果；`available` 不显示降级提示。
 - **部分成功**：`GET /config/skills` 返回 200 且 `sandbox_status!=available` 时不得当作整页错误，仍应渲染返回的官方 Skills。
+- **损坏项隔离**：`skill_issues` 非空时在正常 Skill 列表上方显示警示，逐项展示 path、field、message 与 suggestion；不得因为存在损坏项隐藏或禁用其他合法 Skill。刷新后问题消失时同步移除警示。
 - **Skills 启停影响下一次请求**：后端在每次 LLM 请求前读取最新逻辑状态；不改变已发消息，也不删除沙箱文件。
 - **默认入口状态**：从「设置」入口进入默认「我的记忆 · 用户画像」。
 
@@ -253,11 +254,13 @@ useEffect(() => {
 | `application/pdf` | `<iframe>` |
 | `.csv` | 读取文本并渲染为表格 |
 | `.xls` / `.xlsx` | 使用 SheetJS `xlsx` 在浏览器端解析工作簿，按 sheet 渲染表格并提供 sheet tab 切换 |
+| `.zip` | 使用 JSZip 只读展示目录，不解压或执行条目内容；文件最大 10 MiB、目录最多 2000 项 |
 | 其他 | 占位图 + 下载按钮 |
 
 ### 7.3 关键不变量
 
-- **内容懒加载**：打开时才请求；大文件（> 5MB）默认仅显示下载按钮。
+- **内容懒加载**：打开时才请求；ZIP 目录预览限制为 10 MiB，超过后提示下载查看。
+- **普通大文件分流（待定）**：普通文件超过 5 MiB 时仅显示下载按钮的能力本期暂不实现，不作为当前验收项。
 - **session 隔离**：切 session 时，ArtifactsPanel 路径与选中文件重置到根目录；附件弹窗预览自动关闭。
 - **HTML 沙箱约束**：HTML 预览 iframe 仅允许 `allow-scripts`，严禁与 `allow-same-origin` 同时启用。
 - **禁止外部打开**：HTML 预览仅允许在沙箱 iframe 内查看，不提供“在浏览器中打开”入口，避免离开受限上下文。
@@ -298,7 +301,7 @@ useEffect(() => {
 
 1. **用 `padding-right` 避让抽屉** → 违反 frontend-spec §5.6，出现 reflow 抖动。
 2. **ArtifactsPanel 没做竞态防护** → 点击目录过快导致旧数据覆盖。
-3. **FilePreview 每次打开都重新请求大文件** → 未做"大文件仅下载"分流。
+3. **FilePreview 每次打开都重新请求大文件** → "大文件仅下载"分流待定，本期未实现。
 4. **抽屉 z-index 低于 Modal** → 点击抽屉里的按钮打开 FilePreview 后被抽屉遮住。
 5. **关闭动画未延迟卸载** → 动画被截断，抽屉瞬间消失。
 6. **Skill toggle 直接等后端响应再更新 UI** → 感觉卡顿；应乐观更新。

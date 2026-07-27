@@ -4,8 +4,8 @@
 - 从 CronJob DB 表管理定时任务定义（CRUD：HTTP 路由与 Agent 工具共用）
 - Runner：恢复用户沙箱 → 归一化 cron turn → TurnOrchestrator 执行 → 写 CronJobRun
 
-注：调度由 `cron_worker` 去中心化执行（不再依赖 APScheduler 持久注册），
-本模块仅暴露 `parse_cron_fields` 与 `run_cron_job` 供 worker 调用。
+注：调度由 `cron_worker` 去中心化执行，Cron 语义统一来自 `CronEngine`，
+本模块暴露 Cron CRUD 与 `run_cron_job`；表达式语义统一由 `CronEngine` 提供。
 """
 
 import json
@@ -14,8 +14,8 @@ import re
 import shlex
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 
-from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session as DBSession
 
@@ -25,8 +25,9 @@ from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.user_memory import CronJobRun
 from src.api.models.user_sandbox import UserSandbox
+from src.api.services.cron_engine import CronEngine, CronExpressionError
 from src.api.services.cron_schedule import schedule_to_cron, ScheduleError
-from src.api.utils.timezone import get_timezone, now_naive
+from src.api.utils.timezone import now_naive
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -134,27 +135,31 @@ def _resolve_cron_expr(schedule: dict | None, cron_expr: str | None) -> tuple[st
             expr = schedule_to_cron(schedule)
         except ScheduleError as e:
             raise CronJobValidationError(str(e)) from e
-        return expr, json.dumps(schedule, ensure_ascii=False)
-    if not cron_expr or not cron_expr.strip():
-        raise CronJobValidationError("必须提供 schedule 或 cron_expr")
-    expr = cron_expr.strip()
-    parts = expr.split()
-    if len(parts) != 5:
-        raise CronJobValidationError(
-            f"cron 表达式必须是 5 个字段（分 时 日 月 周），当前 {len(parts)} 个: {cron_expr!r}"
-        )
+        schedule_json = json.dumps(schedule, ensure_ascii=False)
+    else:
+        if not cron_expr or not cron_expr.strip():
+            raise CronJobValidationError("必须提供 schedule 或 cron_expr")
+        expr = cron_expr.strip()
+        try:
+            expr = CronEngine.validate(expr)
+        except CronExpressionError as e:
+            raise CronJobValidationError(f"cron 表达式解析失败: {e}") from e
+        schedule_json = None
+
+    # 语法合法不代表计划真的可执行，例如“2 月 31 日”。创建和更新都必须
+    # 在任何 DB 查询/写入前确认至少存在一次未来触发，避免保存永不执行的任务，
+    # 也避免 Agent 在 create_job 已提交后生成回执时才失败。
     try:
-        CronTrigger(
-            minute=parts[0],
-            hour=parts[1],
-            day=parts[2],
-            month=parts[3],
-            day_of_week=parts[4],
-            timezone=get_timezone(),
+        future_fires = CronEngine.next_fires(expr, count=1)
+    except CronExpressionError as e:
+        raise CronJobValidationError(
+            f"cron 表达式无法产生未来执行时间: {expr!r}"
+        ) from e
+    if not future_fires:
+        raise CronJobValidationError(
+            f"cron 表达式无法产生未来执行时间: {expr!r}"
         )
-    except Exception as e:
-        raise CronJobValidationError(f"cron 表达式解析失败: {expr!r}: {e}") from e
-    return expr, None
+    return expr, schedule_json
 
 
 class CronTask:
@@ -170,8 +175,10 @@ class CronTask:
         schedule: dict | None = None,
         content: str = "",
         job_id: int | None = None,
+        rule_version: int = 1,
     ):
         self.id = job_id
+        self.rule_version = rule_version
         self.name = name
         self.cron_expr = cron_expr
         self.description = description
@@ -188,14 +195,14 @@ class CronTask:
             "description": self.description,
             "content": self.content,
             "enabled": self.enabled,
+            "rule_version": self.rule_version,
         }
 
 
 def parse_cron_fields(cron_expr: str) -> dict | None:
-    """将 5 字段 cron 表达式解析为 CronTrigger 字段（用于单分钟匹配，非持久注册）。
+    """将 5 字段 cron 表达式拆为命名字段。
 
-    返回值仅供 `cron_worker` 在每分钟唤醒时构造一次性 CronTrigger 做匹配，
-    不喂给任何 scheduler 主进程或 jobstore。
+    保留此只读辅助函数供现有调用方使用；它不负责校验或调度语义。
 
     Returns:
         {"minute": ..., "hour": ..., "day": ..., "month": ..., "day_of_week": ...}
@@ -263,6 +270,7 @@ class CronService:
                     schedule=schedule_obj,
                     content=getattr(j, "content", "") or "",
                     job_id=j.id,
+                    rule_version=int(getattr(j, "rule_version", 1) or 1),
                 )
             )
         return result
@@ -332,6 +340,7 @@ class CronService:
             job = (
                 self.db.query(CronJob)
                 .filter(CronJob.user_id == user_id, CronJob.name == name)
+                .with_for_update()
                 .first()
             )
         if not job:
@@ -339,6 +348,8 @@ class CronService:
 
         if schedule is not None or cron_expr is not None:
             expr, schedule_json = _resolve_cron_expr(schedule, cron_expr)
+            if expr != job.cron_expr:
+                job.rule_version = int(job.rule_version or 1) + 1
             job.cron_expr = expr
             job.schedule = schedule_json
 
@@ -399,6 +410,13 @@ class CronService:
                 "id": r.id,
                 "job_name": r.job_name,
                 "cron_expr": r.cron_expr,
+                "rule_version": getattr(r, "rule_version", None),
+                "scheduled_at": (
+                    r.scheduled_at.isoformat()
+                    if getattr(r, "scheduled_at", None)
+                    else None
+                ),
+                "trigger_source": getattr(r, "trigger_source", "scheduled"),
                 "started_at": r.started_at.isoformat() if r.started_at else None,
                 "completed_at": r.completed_at.isoformat() if r.completed_at else None,
                 "status": r.status,
@@ -415,7 +433,16 @@ async def _get_renewed_cron_sandbox(sandbox_service, user_id: str, sandbox_id: s
     return await sandbox_service.get_or_resume_and_renew(user_id, sandbox_id)
 
 
-async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -> str | None:
+async def run_cron_job(
+    user_id: str,
+    job_name: str,
+    run_id: str | None = None,
+    *,
+    expected_job_id: int | None = None,
+    expected_rule_version: int | None = None,
+    scheduled_at: datetime | None = None,
+    trigger_source: str | None = None,
+) -> str | None:
     """执行单个 Cron 任务（从 CronJob DB 查任务定义）
 
     流程：查 DB 任务 → 恢复沙箱 → 创建内部 cron session → 统一 orchestrator 执行 → 记录结果
@@ -430,7 +457,7 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
     """
     from src.api.models.database import SessionLocal
 
-    source = "manual" if run_id else "scheduled"
+    source = trigger_source or ("manual" if run_id else "scheduled")
     if not run_id:
         run_id = str(uuid.uuid4())
 
@@ -449,9 +476,21 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
             .filter(CronJob.user_id == user_id, CronJob.name == job_name)
             .first()
         )
-        if not job:
+        if not job or (expected_job_id is not None and job.id != expected_job_id):
             logger.warning("Cron 任务不存在 (user=%s, job=%s)", user_id, job_name)
             _mark_run_failed(run_id, "任务不存在")
+            return None
+        rule_version = int(job.rule_version or 1)
+        if expected_rule_version is not None and rule_version != expected_rule_version:
+            logger.info(
+                "Cron 丢弃旧规则触发 (user=%s, job=%s, expected=%s, actual=%s)",
+                user_id,
+                job_name,
+                expected_rule_version,
+                rule_version,
+            )
+            if source == "manual":
+                _mark_run_failed(run_id, "任务调度规则已修改，请重新执行")
             return None
         # content 是新表单的"执行内容"字段，优先作为 prompt；
         # 老数据 content 为空时回退到 description（与之前行为一致）。
@@ -467,6 +506,9 @@ async def run_cron_job(user_id: str, job_name: str, run_id: str | None = None) -
                 user_id=user_id,
                 job_name=job_name,
                 cron_expr=cron_expr,
+                rule_version=rule_version,
+                scheduled_at=scheduled_at,
+                trigger_source=source,
                 status="running",
                 is_read=False,
             )

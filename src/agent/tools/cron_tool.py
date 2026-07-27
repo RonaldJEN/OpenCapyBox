@@ -13,9 +13,12 @@ logger = logging.getLogger(__name__)
 
 def _validate_cron_expr(cron_expr: str) -> str | None:
     """校验 5 字段 cron 表达式，返回错误信息或 None"""
-    parts = cron_expr.strip().split()
-    if len(parts) != 5:
-        return f"cron 表达式必须是 5 个字段（分 时 日 月 周），当前 {len(parts)} 个字段: '{cron_expr}'"
+    from src.api.services.cron_engine import CronEngine, CronExpressionError
+
+    try:
+        CronEngine.validate(cron_expr)
+    except CronExpressionError as exc:
+        return str(exc)
     return None
 
 
@@ -34,13 +37,16 @@ class ManageCronTool(Tool):
     def description(self) -> str:
         return (
             "Manage cron scheduled tasks. Actions:\n"
-            "- add: Create a new cron job (requires name, cron, description)\n"
+            "- add: Create a new cron job (requires name, description, and preferably schedule)\n"
             "- remove: Delete a cron job by name\n"
             "- list: List all cron jobs for this user\n"
             "- toggle: Enable/disable a cron job by name\n"
             "- history: View recent execution history\n\n"
-            "Cron expression uses 5 fields: minute hour day month day_of_week (0=Mon..6=Sun)\n"
-            "Examples: '0 9 * * *' (daily 9am), '0 9 * * 0' (Monday 9am), "
+            "Cron uses the Linux/Vixie 5-field standard: minute hour day month day_of_week.\n"
+            "day_of_week: 0/7=Sunday, 1=Monday, ..., 6=Saturday; 1-5=Monday-Friday.\n"
+            "When translating natural-language weekdays, prefer structured schedule, for example "
+            '{"kind":"weekly","time":"09:00","days":[2,3,4,5,6,0]} for Tuesday-Sunday.\n'
+            "Examples: '0 9 * * *' (daily 9am), '0 9 * * 1' (Monday 9am), "
             "'*/30 * * * *' (every 30 min)"
         )
 
@@ -60,7 +66,26 @@ class ManageCronTool(Tool):
                 },
                 "cron": {
                     "type": "string",
-                    "description": "5-field cron expression (required for add). Format: minute hour day month day_of_week",
+                    "description": "Linux/Vixie 5-field cron expression. Use only when structured schedule cannot express the plan.",
+                },
+                "schedule": {
+                    "type": "object",
+                    "description": "Preferred structured schedule. weekly.days uses 0=Sunday, 1=Monday, ..., 6=Saturday.",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["daily", "weekdays", "weekly", "monthly", "interval"],
+                        },
+                        "time": {"type": "string", "description": "HH:MM"},
+                        "days": {
+                            "type": "array",
+                            "items": {"type": "integer", "minimum": 0, "maximum": 6},
+                        },
+                        "dayOfMonth": {"type": "integer", "minimum": 1, "maximum": 31},
+                        "everyMinutes": {"type": "integer", "minimum": 1, "maximum": 59},
+                        "everyHours": {"type": "integer", "minimum": 1, "maximum": 23},
+                    },
+                    "required": ["kind"],
                 },
                 "description": {
                     "type": "string",
@@ -76,10 +101,11 @@ class ManageCronTool(Tool):
         name: str = "",
         cron: str = "",
         description: str = "",
+        schedule: dict[str, Any] | None = None,
     ) -> ToolResult:
         try:
             if action == "add":
-                return self._do_add(name, cron, description)
+                return self._do_add(name, cron, description, schedule)
             elif action == "remove":
                 return self._do_remove(name)
             elif action == "list":
@@ -94,11 +120,17 @@ class ManageCronTool(Tool):
             logger.error("manage_cron 执行失败: %s", e, exc_info=True)
             return ToolResult(success=False, error=str(e))
 
-    def _do_add(self, name: str, cron_expr: str, description: str) -> ToolResult:
+    def _do_add(
+        self,
+        name: str,
+        cron_expr: str,
+        description: str,
+        schedule: dict[str, Any] | None,
+    ) -> ToolResult:
         if not name or not name.strip():
             return ToolResult(success=False, error="任务名 name 不能为空")
-        if not cron_expr or not cron_expr.strip():
-            return ToolResult(success=False, error="cron 表达式不能为空")
+        if schedule is None and (not cron_expr or not cron_expr.strip()):
+            return ToolResult(success=False, error="schedule 与 cron 至少提供一个")
         if not description or not description.strip():
             return ToolResult(success=False, error="任务描述 description 不能为空")
 
@@ -115,16 +147,26 @@ class ManageCronTool(Tool):
                     # Agent 沿用 description 作为 prompt（与历史行为一致），
                     # content 留空让 run_cron_job 回退到 description。
                     content="",
-                    schedule=None,
-                    cron_expr=cron_expr.strip(),
+                    schedule=schedule,
+                    cron_expr=cron_expr.strip() if cron_expr else None,
                     enabled=True,
                 )
             except CronJobValidationError as e:
                 return ToolResult(success=False, error=str(e))
 
+            from src.api.services.cron_schedule import describe_schedule, next_fire_at
+
+            plan = describe_schedule(schedule, job.cron_expr)
+            fires = next_fire_at(job.cron_expr, n=5)
+            future = "、".join(t.strftime("%Y-%m-%d %H:%M") for t in fires)
             return ToolResult(
                 success=True,
-                content=f"已创建定时任务 '{job.name}' (cron: {job.cron_expr}): {job.description}",
+                content=(
+                    f"已创建定时任务 '{job.name}'\n"
+                    f"执行计划：{plan}\n"
+                    f"Cron：{job.cron_expr}\n"
+                    f"未来执行：{future}"
+                ),
             )
         finally:
             db.close()

@@ -80,7 +80,7 @@
 - `cached_is_current(user_id, sandbox_id=None) -> bool`
 - `push_skills(user_id, skills_dir) -> bool` — 批量上传（排除 node_modules, __pycache__, .git, .venv）
 - `push_skill(user_id, skills_dir, skill_name, enabled_check=None) -> bool` — 单个按需推送，幂等；可在推送前后复核逻辑启用状态
-- `discover_sandbox_skills(user_id, official_names, strict=False) -> list[dict]` — 默认容错返回空列表；设置页使用严格模式区分空清单与沙箱故障
+- `discover_sandbox_skills(user_id, official_names, strict=False) -> SkillDiscoveryResult` — 结果兼容技能列表并携带同一扫描的 `issues`；默认容错返回空结果，严格模式仅对沙箱级/扫描级故障抛错，单个损坏 `SKILL.md` 始终隔离
 - `read_sandbox_skill_content(user_id, skill_dir) -> str|None`
 
 ## 4. 行为语义与不变量
@@ -204,6 +204,8 @@ Profile 配置更新仅保留当前行的 `updated_at` 和 `version`，MVP 不�
 - `enabled_check` 在按需推送前后复核 DB 逻辑状态；已禁用时返回 False，不向 Agent 提供 Skill
 - 用户 Skill 按需读取前后都要刷新逻辑状态；若读取期间被禁用，丢弃正文且不得写入 SkillLoader 内容缓存
 - 禁用 Skill 不物理删除沙箱文件；启停只影响元数据暴露和 `get_skill`，保留文件供重新启用复用
+- Skill 枚举路径按字典序处理；单项读取、YAML/frontmatter、元数据字段或 key 错误写入当前 `SkillDiscoveryResult.issues` 并跳过该项，重复 key 稳定保留先出现的合法路径。
+- Skills 与 issues 必须由扫描函数作为同一个结果直接返回，禁止通过按 `user_id` 保存的进程全局“最近问题”旁路传递，避免同用户并发刷新串线。
 
 ### 既有沙箱连接与技能设置恢复
 

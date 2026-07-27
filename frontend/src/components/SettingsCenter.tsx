@@ -22,6 +22,7 @@ import {
   type AgentFileDetail,
   type SkillInfo,
   type SkillInventoryState,
+  type SkillScanIssue,
   type SkillSandboxStatus,
 } from '../services/configApi';
 
@@ -151,6 +152,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   const [skillsError, setSkillsError] = useState('');
   const [skillSandboxStatus, setSkillSandboxStatus] = useState<SkillSandboxStatus | null>(null);
   const [skillInventoryState, setSkillInventoryState] = useState<SkillInventoryState | null>(null);
+  const [skillIssues, setSkillIssues] = useState<SkillScanIssue[]>([]);
   const [togglingSkills, setTogglingSkills] = useState<Set<string>>(() => new Set());
   const [savedFlash, setSavedFlash] = useState<AgentFileName | ''>('');
   const filesRef = useRef(files);
@@ -268,6 +270,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
         });
         setSkillSandboxStatus(result.sandbox_status);
         setSkillInventoryState(result.inventory_state ?? null);
+        setSkillIssues(result.skill_issues ?? []);
       } catch (err) {
         if (seq !== skillsLoadSeqRef.current) return;
         setSkillsError(fileErrorMessage(err));
@@ -697,6 +700,25 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           >
             重新加载
           </button>
+        </div>
+      )}
+
+      {skillIssues.length > 0 && !skillsError && (
+        <div
+          role="alert"
+          className="mb-3 rounded-lg border border-[#efd0ca] bg-[#fff5f3] px-3 py-2 text-xs text-[#8f3f33]"
+        >
+          <div className="mb-1 font-semibold">
+            已隔离 {skillIssues.length} 个异常 Skill，其他 Skill 可继续使用
+          </div>
+          <ul className="space-y-1.5">
+            {skillIssues.map((issue) => (
+              <li key={`${issue.path}:${issue.field}`} className="break-words">
+                <code>{issue.path}</code>
+                <span> · {issue.field}：{issue.message}。{issue.suggestion}</span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 

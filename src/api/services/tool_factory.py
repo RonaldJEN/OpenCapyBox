@@ -299,13 +299,12 @@ async def create_agent_tools(
                 if inventory_identity is None:
                     raise RuntimeError("沙箱缓存缺少完整代际指纹")
                 inventory_observed_at = now_naive()
-                sandbox_skill_infos = normalize_user_skill_inventory(
-                    await sandbox_service.discover_sandbox_skills(
-                        user_id,
-                        official_names,
-                        strict=True,
-                    )
+                discovery_result = await sandbox_service.discover_sandbox_skills(
+                    user_id,
+                    official_names,
+                    strict=True,
                 )
+                sandbox_skill_infos = normalize_user_skill_inventory(discovery_result)
                 if cached_sandbox_identity(sandbox_service, user_id) != inventory_identity:
                     raise RuntimeError("扫描期间沙箱代际发生变化")
                 published = persist_user_skill_inventory(
@@ -313,6 +312,7 @@ async def create_agent_tools(
                     user_id=user_id,
                     identity=inventory_identity,
                     skills=sandbox_skill_infos,
+                    issues=getattr(discovery_result, "issues", []),
                     observed_at=inventory_observed_at,
                 )
                 registry_skill_infos = sandbox_skill_infos
@@ -378,13 +378,12 @@ async def create_agent_tools(
                     if inventory_identity is None:
                         raise RuntimeError("沙箱缓存缺少完整代际指纹")
                     inventory_observed_at = now_naive()
-                    sandbox_skill_infos = normalize_user_skill_inventory(
-                        await svc.discover_sandbox_skills(
-                            user_id,
-                            official_names,
-                            strict=True,
-                        )
+                    discovery_result = await svc.discover_sandbox_skills(
+                        user_id,
+                        official_names,
+                        strict=True,
                     )
+                    sandbox_skill_infos = normalize_user_skill_inventory(discovery_result)
                     if cached_sandbox_identity(svc, user_id) != inventory_identity:
                         raise RuntimeError("扫描期间沙箱代际发生变化")
                     published = persist_user_skill_inventory(
@@ -392,6 +391,7 @@ async def create_agent_tools(
                         user_id=user_id,
                         identity=inventory_identity,
                         skills=sandbox_skill_infos,
+                        issues=getattr(discovery_result, "issues", []),
                         observed_at=inventory_observed_at,
                     )
                     registry_skill_infos = sandbox_skill_infos

@@ -20,7 +20,18 @@ const KINDS: { value: Schedule['kind']; label: string }[] = [
   { value: 'interval', label: '间隔' },
 ];
 
-const WEEKDAY_LABELS = ['一', '二', '三', '四', '五', '六', '日'];
+const WEEKDAYS = [
+  { label: '一', value: 1 },
+  { label: '二', value: 2 },
+  { label: '三', value: 3 },
+  { label: '四', value: 4 },
+  { label: '五', value: 5 },
+  { label: '六', value: 6 },
+  { label: '日', value: 0 },
+] as const;
+const WEEKDAY_ORDER: Map<number, number> = new Map(
+  WEEKDAYS.map((day, index) => [day.value, index]),
+);
 
 /** 返回选择对应 kind 时的默认值 */
 export function defaultScheduleForKind(kind: Schedule['kind']): Schedule {
@@ -30,7 +41,7 @@ export function defaultScheduleForKind(kind: Schedule['kind']): Schedule {
     case 'weekdays':
       return { kind: 'weekdays', time: '09:00' };
     case 'weekly':
-      return { kind: 'weekly', time: '09:00', days: [0] };
+      return { kind: 'weekly', time: '09:00', days: [1] };
     case 'monthly':
       return { kind: 'monthly', time: '09:00', dayOfMonth: 1 };
     case 'interval':
@@ -90,16 +101,18 @@ const SchedulePicker: React.FC<Props> = ({ value, onChange }) => {
             <TimeInput value={value.time} onChange={(t) => onChange({ ...value, time: t })} />
           </div>
           <div className="flex flex-wrap gap-1">
-            {WEEKDAY_LABELS.map((label, idx) => {
-              const selected = value.days.includes(idx);
+            {WEEKDAYS.map(({ label, value: dayValue }) => {
+              const selected = value.days.includes(dayValue);
               return (
                 <button
-                  key={idx}
+                  key={dayValue}
                   type="button"
                   onClick={() => {
                     const next = selected
-                      ? value.days.filter((d) => d !== idx)
-                      : [...value.days, idx].sort((a, b) => a - b);
+                      ? value.days.filter((d) => d !== dayValue)
+                      : [...value.days, dayValue].sort(
+                          (a, b) => (WEEKDAY_ORDER.get(a) ?? 0) - (WEEKDAY_ORDER.get(b) ?? 0),
+                        );
                     onChange({ ...value, days: next });
                   }}
                   className={`w-8 h-8 text-xs rounded-full border ${

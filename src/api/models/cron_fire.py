@@ -33,4 +33,5 @@ class CronFire(Base):
     id = Column(String(36), primary_key=True)
     job_id = Column(Integer, ForeignKey("cron_jobs.id"), nullable=False, index=True)
     scheduled_at = Column(DateTime, nullable=False, index=True)
+    rule_version = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=now_naive)

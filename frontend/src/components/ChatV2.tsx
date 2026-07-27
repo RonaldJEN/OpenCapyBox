@@ -206,6 +206,9 @@ function ChatV2View(props: ChatV2Props) {
   const pendingAssistantFileRoundCountsRef = useRef<Record<string, number>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
+  const chatScrollTopBeforeFilesRef = useRef(0);
+  const filesWereOpenRef = useRef(false);
+  const focusBeforeFilesRef = useRef<HTMLElement | null>(null);
   const prevRoundsLengthRef = useRef<number>(0);
   const isInitialLoadRef = useRef<boolean>(true);
   const sessionIdRef = useRef(sessionId);
@@ -234,6 +237,29 @@ function ChatV2View(props: ChatV2Props) {
 
   sessionIdRef.current = sessionId;
   composerDraftsRef.current = composerDrafts;
+
+  const openFilesPanel = () => {
+    if (!isFilesOpen) {
+      chatScrollTopBeforeFilesRef.current = chatAreaRef.current?.scrollTop ?? 0;
+      focusBeforeFilesRef.current = document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    }
+    setIsFilesOpen(true);
+  };
+
+  const closeFilesPanel = () => {
+    setIsFilesOpen(false);
+    setFilePanelTarget(null);
+  };
+
+  useLayoutEffect(() => {
+    if (filesWereOpenRef.current && !isFilesOpen && chatAreaRef.current) {
+      chatAreaRef.current.scrollTop = chatScrollTopBeforeFilesRef.current;
+      focusBeforeFilesRef.current?.focus({ preventScroll: true });
+    }
+    filesWereOpenRef.current = isFilesOpen;
+  }, [isFilesOpen]);
 
   useEffect(() => {
     setComposerDrafts((previous) => {
@@ -732,7 +758,7 @@ function ChatV2View(props: ChatV2Props) {
         },
         nonce: (prev?.nonce ?? 0) + 1,
       }));
-      setIsFilesOpen(true);
+      openFilesPanel();
     } catch (err) {
       console.warn('Failed to verify assistant file target:', err);
       setLocalError(`无法确认文件是否存在：${normalizedFile.name}`);
@@ -957,7 +983,8 @@ function ChatV2View(props: ChatV2Props) {
               type="button"
               onClick={() => {
                 setFilePanelTarget(null);
-                setIsFilesOpen(!isFilesOpen);
+                if (isFilesOpen) closeFilesPanel();
+                else openFilesPanel();
               }}
               className={`h-9 px-3 rounded-xl border transition-[background-color,color,border-color,transform] active:scale-95 flex items-center gap-2 ${
                 isFilesOpen
@@ -980,8 +1007,7 @@ function ChatV2View(props: ChatV2Props) {
               sessionId={sessionId}
               isOpen={false}
               onClose={() => {
-                setIsFilesOpen(false);
-                setFilePanelTarget(null);
+                closeFilesPanel();
               }}
               targetFile={filePanelTarget?.file || null}
               targetFileNonce={filePanelTarget?.nonce}
@@ -993,8 +1019,7 @@ function ChatV2View(props: ChatV2Props) {
               sessionId={sessionId}
               isOpen={isFilesOpen}
               onClose={() => {
-                setIsFilesOpen(false);
-                setFilePanelTarget(null);
+                closeFilesPanel();
               }}
               targetFile={filePanelTarget?.file || null}
               targetFileNonce={filePanelTarget?.nonce}

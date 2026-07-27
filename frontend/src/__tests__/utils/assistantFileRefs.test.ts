@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { extractAssistantFiles } from '../../utils/assistantFileRefs';
+import {
+  createAssistantFileInfoFromHref,
+  extractAssistantFiles,
+} from '../../utils/assistantFileRefs';
 
 describe('assistantFileRefs', () => {
   it('将当前 session 的绝对文件位置解析为文件', () => {
@@ -97,10 +100,12 @@ describe('assistantFileRefs', () => {
     ]);
   });
 
-  it('不会把不支持预览的反引号内容当成文件', () => {
+  it('会把 ZIP 当成可在 Files 面板预览的文件', () => {
     const files = extractAssistantFiles('压缩包 `archive.zip` 已生成。', 'session-1');
 
-    expect(files).toEqual([]);
+    expect(files).toEqual([
+      expect.objectContaining({ name: 'archive.zip', path: 'archive.zip', type: 'zip' }),
+    ]);
   });
 
   it('不会解析 fenced code block 内的文件提示', () => {
@@ -125,5 +130,31 @@ describe('assistantFileRefs', () => {
     const files = extractAssistantFiles('文件位置： quick_sort.py');
 
     expect(files).toEqual([]);
+  });
+
+  it('解码 Markdown href 中的中文和空格文件名', () => {
+    expect(
+      createAssistantFileInfoFromHref(
+        'reports/%E6%8A%A5%E5%91%8A%20%E7%BB%88%E7%89%88.pdf',
+        'session-1',
+      ),
+    ).toMatchObject({
+      name: '报告 终版.pdf',
+      path: 'reports/报告 终版.pdf',
+      session_id: 'session-1',
+      type: 'pdf',
+    });
+  });
+
+  it('URI 解码后仍拒绝越界路径和编码分隔符', () => {
+    expect(
+      createAssistantFileInfoFromHref('%2e%2e/secret.pdf', 'session-1'),
+    ).toBeNull();
+    expect(
+      createAssistantFileInfoFromHref('reports%2Fsecret.pdf', 'session-1'),
+    ).toBeNull();
+    expect(
+      createAssistantFileInfoFromHref('reports/%00secret.pdf', 'session-1'),
+    ).toBeNull();
   });
 });

@@ -21,6 +21,8 @@ def _make_cron_service(*, query_return=None, first_return=None):
     from src.api.services.cron_service import CronService
 
     mock_db = make_query_db(first=first_return, all_results=query_return)
+    filtered_query = mock_db.query.return_value.filter.return_value
+    filtered_query.with_for_update.return_value = filtered_query
     # CronService 还会用到 .order_by().limit().all() 和 .order_by().offset().limit().all()
     if query_return is not None:
         mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = query_return
@@ -69,6 +71,12 @@ class TestResolveCronExpr:
 
         with pytest.raises(CronJobValidationError, match="cron 表达式解析失败"):
             _resolve_cron_expr(None, "70 25 * * *")
+
+    def test_rejects_valid_syntax_without_any_future_fire(self):
+        from src.api.services.cron_service import CronJobValidationError, _resolve_cron_expr
+
+        with pytest.raises(CronJobValidationError, match="无法产生未来执行时间"):
+            _resolve_cron_expr(None, "0 0 31 2 *")
 
 
 class TestCronTask:
@@ -260,6 +268,60 @@ class TestCronServiceDB:
             svc.update_job("user-1", "daily", enabled=False)
 
         mock_db.rollback.assert_called_once()
+
+    def test_create_job_rejects_never_firing_cron_before_db_access(self):
+        from src.api.services.cron_service import CronJobValidationError
+
+        svc, mock_db = _make_cron_service(first_return=None)
+
+        with pytest.raises(CronJobValidationError, match="无法产生未来执行时间"):
+            svc.create_job(
+                "user-1",
+                name="never",
+                cron_expr="0 0 31 2 *",
+            )
+
+        mock_db.query.assert_not_called()
+        mock_db.add.assert_not_called()
+        mock_db.commit.assert_not_called()
+
+    def test_update_job_increments_rule_version_only_when_cron_changes(self):
+        job = MagicMock()
+        job.name = "daily"
+        job.cron_expr = "0 9 * * *"
+        job.rule_version = 3
+        job.description = "d"
+        job.enabled = True
+
+        svc, _ = _make_cron_service(first_return=job)
+        svc.update_job("user-1", "daily", description="new")
+        assert job.rule_version == 3
+
+        svc.update_job("user-1", "daily", cron_expr="0 10 * * *")
+        assert job.rule_version == 4
+
+    def test_update_job_rejects_never_firing_cron_without_mutating_job(self):
+        from src.api.services.cron_service import CronJobValidationError
+
+        job = MagicMock()
+        job.name = "daily"
+        job.cron_expr = "0 9 * * *"
+        job.rule_version = 3
+        job.description = "d"
+        job.enabled = True
+
+        svc, mock_db = _make_cron_service(first_return=job)
+
+        with pytest.raises(CronJobValidationError, match="无法产生未来执行时间"):
+            svc.update_job(
+                "user-1",
+                "daily",
+                cron_expr="0 0 31 2 *",
+            )
+
+        assert job.cron_expr == "0 9 * * *"
+        assert job.rule_version == 3
+        mock_db.commit.assert_not_called()
 
     def test_update_job_busy_during_lookup_maps_to_busy_error(self):
         from sqlalchemy.exc import OperationalError
@@ -459,6 +521,70 @@ class TestRunCronJobFallback:
         assert result is None
         assert pre_run.status == "failed"
         assert pre_run.output == "用户不存在或已禁用"
+        mock_db.commit.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_manual_run_fails_when_job_was_recreated_with_same_name(self):
+        """同名任务被删除后重建时，手动执行不得落到新任务上。"""
+        from src.api.services.cron_service import run_cron_job
+
+        auth_user = MagicMock(enabled=True)
+        recreated_job = MagicMock(id=22, rule_version=1)
+        pre_run = MagicMock(id="pre-run-id", status="running")
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.side_effect = [
+            auth_user,
+            recreated_job,
+            pre_run,
+        ]
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+
+        with patch("src.api.models.database.SessionLocal", return_value=mock_db):
+            result = await run_cron_job(
+                "user-1",
+                "daily",
+                run_id="pre-run-id",
+                expected_job_id=11,
+                expected_rule_version=1,
+            )
+
+        assert result is None
+        assert pre_run.status == "failed"
+        assert pre_run.output == "任务不存在"
+        mock_db.commit.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_manual_run_fails_when_rule_version_changed(self):
+        """点击执行后规则被修改时，手动执行必须失败而不是执行新规则。"""
+        from src.api.services.cron_service import run_cron_job
+
+        auth_user = MagicMock(enabled=True)
+        changed_job = MagicMock(id=11, rule_version=4)
+        pre_run = MagicMock(id="pre-run-id", status="running")
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.side_effect = [
+            auth_user,
+            changed_job,
+            pre_run,
+        ]
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+
+        with patch("src.api.models.database.SessionLocal", return_value=mock_db):
+            result = await run_cron_job(
+                "user-1",
+                "daily",
+                run_id="pre-run-id",
+                expected_job_id=11,
+                expected_rule_version=3,
+            )
+
+        assert result is None
+        assert pre_run.status == "failed"
+        assert pre_run.output == "任务调度规则已修改，请重新执行"
         mock_db.commit.assert_called()
 
 

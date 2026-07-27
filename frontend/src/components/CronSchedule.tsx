@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { CalendarX2, History, Trash2 } from 'lucide-react';
 import {
   getCronJobs,
   getCronRuns,
@@ -13,26 +14,50 @@ import CronMessageCenter from './CronMessageCenter';
 import TaskFormDrawer from './cron/TaskFormDrawer';
 import WeekAgenda from './cron/WeekAgenda';
 import ScheduleList from './cron/ScheduleList';
+import { ConfirmDialog } from './ConfirmDialog';
 
 // ────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────
 
 /** 解析 cron 字段值为数字集合，支持通配符、步进、逗号和范围(1-5) */
-function parseCronField(field: string): Set<number> | null {
+function parseCronField(
+  field: string,
+  minimum: number,
+  maximum: number,
+): Set<number> | null {
   if (field === '*') return null; // null 表示"所有值都匹配"
-  if (field.includes('/')) return null; // */N 交给调用方处理
   const nums = new Set<number>();
   for (const part of field.split(',')) {
-    if (part.includes('-')) {
-      const [a, b] = part.split('-').map(Number);
-      if (!Number.isNaN(a) && !Number.isNaN(b)) {
-        for (let i = a; i <= b; i++) nums.add(i);
-      }
+    const [base, stepText, extra] = part.split('/');
+    const step = stepText === undefined ? 1 : Number(stepText);
+    if (extra !== undefined || !Number.isInteger(step) || step <= 0) return null;
+
+    let start: number;
+    let end: number;
+    if (base === '*') {
+      start = minimum;
+      end = maximum;
+    } else if (base.includes('-')) {
+      const range = base.split('-').map(Number);
+      if (
+        range.length !== 2
+        || range.some((value) => !Number.isInteger(value))
+      ) return null;
+      [start, end] = range;
     } else {
-      const n = Number(part);
-      if (!Number.isNaN(n)) nums.add(n);
+      start = Number(base);
+      end = start;
     }
+
+    if (
+      !Number.isInteger(start)
+      || !Number.isInteger(end)
+      || start < minimum
+      || end > maximum
+      || start > end
+    ) return null;
+    for (let value = start; value <= end; value += step) nums.add(value);
   }
   return nums;
 }
@@ -65,17 +90,20 @@ export function cronToReadable(expr: string): string {
     if (hasDom && !hasMon && !hasDow) {
       return `每月${dom}日 ${timeStr}`;
     }
-    // M H * * 0-4 → 工作日（与 APScheduler: 0=周一..6=周日 对齐）
-    if (!hasDom && !hasMon && dow === '0-4') {
+    // Linux/Vixie Cron：1=周一..5=周五
+    if (!hasDom && !hasMon && dow === '1-5') {
       return `工作日 ${timeStr}`;
     }
-    // M H * * 5,6 or 6,5 → 周末（周六/周日）
-    if (!hasDom && !hasMon && (dow === '5,6' || dow === '6,5')) {
+    // 周末：0/7=周日，6=周六
+    if (!hasDom && !hasMon && ['0,6', '6,0', '7,6', '6,7'].includes(dow)) {
       return `周末 ${timeStr}`;
     }
     // M H * * N,N,... → 每周多天
     if (!hasDom && !hasMon && hasDow) {
-      const dayNames = ['一', '二', '三', '四', '五', '六', '日'];
+      const dayNames = ['日', '一', '二', '三', '四', '五', '六', '日'];
+      if (dow === '2-6,0' || dow === '2-6,7') {
+        return `每周二至周日 ${timeStr}`;
+      }
       if (!dow.includes('-') && !dow.includes('/')) {
         const dayList = dow.split(',').map((d) => dayNames[Number(d)] ?? d).join('、');
         return `每周${dayList} ${timeStr}`;
@@ -96,24 +124,27 @@ export function cronToReadable(expr: string): string {
 }
 
 /** 根据 cron 表达式判断某一天是否应该显示该任务 */
-function taskVisibleOnDate(expr: string, date: Date): boolean {
+export function taskVisibleOnDate(expr: string, date: Date): boolean {
   const parts = expr.trim().split(/\s+/);
   if (parts.length !== 5) return true; // 无法解析就都显示
   const [, , dom, mon, dow] = parts;
 
-  // day-of-month 检查
-  const domSet = parseCronField(dom);
-  if (domSet && !domSet.has(date.getDate())) return false;
-  // month 检查
-  const monSet = parseCronField(mon);
+  // month 始终为 AND 条件
+  const monSet = parseCronField(mon, 1, 12);
   if (monSet && !monSet.has(date.getMonth() + 1)) return false;
-  // day-of-week 检查
-  const dowSet = parseCronField(dow);
-  if (dowSet) {
-    // 与 APScheduler 对齐：0=周一..6=周日
-    const dowMonFirst = (date.getDay() + 6) % 7;
-    if (!dowSet.has(dowMonFirst)) return false;
+
+  // Linux/Vixie Cron：日与星期都受限时使用 OR，否则匹配受限的一方。
+  const domSet = parseCronField(dom, 1, 31);
+  const dowSet = parseCronField(dow, 0, 7);
+  if (dowSet?.has(7)) {
+    dowSet.add(0);
+    dowSet.delete(7);
   }
+  const domMatches = domSet ? domSet.has(date.getDate()) : true;
+  const dowMatches = dowSet ? dowSet.has(date.getDay()) : true;
+  if (domSet && dowSet) return domMatches || dowMatches;
+  if (domSet) return domMatches;
+  if (dowSet) return dowMatches;
   return true;
 }
 
@@ -179,6 +210,10 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
   const [tab, setTab] = useState<'calendar' | 'manage'>('calendar');
   const [showMessages, setShowMessages] = useState(false);
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<CronTask | null>(null);
+  const [deletePending, setDeletePending] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const deleteReturnFocusTaskRef = useRef<string | null>(null);
   // 表单抽屉：null = 关闭；'new' = 新建；CronTask = 编辑
   const [formMode, setFormMode] = useState<'new' | CronTask | null>(null);
 
@@ -269,8 +304,7 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
       // 轮询执行状态，直到退出 running。
       const runId = result.run_id;
       const poll = async () => {
-        while (true) {
-          if (!mountedRef.current) return;
+        while (mountedRef.current) {
           await new Promise((r) => setTimeout(r, 2000));
           if (!mountedRef.current) return;
           try {
@@ -301,16 +335,47 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
     }
   }, []);
 
-  const handleDelete = useCallback(async (name: string) => {
-    if (!window.confirm(`确认删除任务「${name}」？历史执行记录会保留。`)) return;
+  const restoreDeleteTriggerFocus = useCallback(() => {
+    const taskName = deleteReturnFocusTaskRef.current;
+    deleteReturnFocusTaskRef.current = null;
+    if (!taskName) return;
+    requestAnimationFrame(() => {
+      const root = Array.from(document.querySelectorAll<HTMLElement>('[data-schedule-menu-root]'))
+        .find((element) => element.dataset.scheduleMenuRoot === taskName);
+      root?.querySelector<HTMLButtonElement>('button[aria-label="更多操作"]')?.focus();
+    });
+  }, []);
+
+  const handleDeleteRequest = useCallback((task: CronTask) => {
+    deleteReturnFocusTaskRef.current = task.name;
+    setDeleteError(null);
+    setDeleteTarget(task);
+  }, []);
+
+  const handleDeleteCancel = useCallback(() => {
+    if (deletePending) return;
+    setDeleteTarget(null);
+    setDeleteError(null);
+    restoreDeleteTriggerFocus();
+  }, [deletePending, restoreDeleteTriggerFocus]);
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!deleteTarget || deletePending) return;
+    const name = deleteTarget.name;
+    setDeletePending(true);
+    setDeleteError(null);
     try {
       await deleteCronJob(name);
+      deleteReturnFocusTaskRef.current = null;
+      setDeleteTarget(null);
       setNotice({ type: 'success', text: `已删除任务 ${name}` });
       await loadData();
     } catch (e) {
-      setNotice({ type: 'error', text: e instanceof Error ? e.message : '删除失败' });
+      setDeleteError(e instanceof Error ? e.message : '删除失败，请稍后重试');
+    } finally {
+      if (mountedRef.current) setDeletePending(false);
     }
-  }, [loadData]);
+  }, [deletePending, deleteTarget, loadData]);
 
   const [togglingSet, setTogglingSet] = useState<Set<string>>(new Set());
   const handleToggleEnabled = useCallback(async (task: CronTask) => {
@@ -462,7 +527,7 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
           cronToReadable={cronToReadable}
           cronTime={cronTime}
           onEdit={(task) => setFormMode(task)}
-          onDelete={handleDelete}
+          onDelete={handleDeleteRequest}
           onTrigger={handleTrigger}
           onToggleEnabled={handleToggleEnabled}
           triggeringSet={triggeringSet}
@@ -492,6 +557,51 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
           task={formMode === 'new' ? null : formMode}
           onClose={() => setFormMode(null)}
           onSaved={handleFormSaved}
+        />
+      )}
+
+      {deleteTarget && (
+        <ConfirmDialog
+          eyebrow="删除任务"
+          icon={<Trash2 size={18} strokeWidth={2.2} aria-hidden="true" />}
+          title="删除这个任务？"
+          description={
+            <>
+              “<span className="font-semibold text-[#37332d]">{deleteTarget.name}</span>”
+              将从日程中移除。
+            </>
+          }
+          details={
+            <div className="mt-4 overflow-hidden rounded-xl border border-[#e8e3d9] bg-white">
+              <div className="flex items-center gap-3 px-3.5 py-3">
+                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-50 text-red-600">
+                  <CalendarX2 size={16} aria-hidden="true" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[13px] font-semibold text-[#2d2923]">后续计划</p>
+                  <p className="mt-0.5 text-[12px] text-[#7c756b]">删除后不再自动执行</p>
+                </div>
+                <span className="rounded-md bg-red-50 px-2 py-1 text-[11px] font-semibold text-red-600">停止</span>
+              </div>
+              <div className="mx-3.5 h-px bg-[#eee9df]" />
+              <div className="flex items-center gap-3 px-3.5 py-3">
+                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600">
+                  <History size={16} aria-hidden="true" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[13px] font-semibold text-[#2d2923]">历史执行记录</p>
+                  <p className="mt-0.5 text-[12px] text-[#7c756b]">已产生的结果不会删除</p>
+                </div>
+                <span className="rounded-md bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-700">保留</span>
+              </div>
+            </div>
+          }
+          confirmLabel="删除任务"
+          busyLabel="正在删除…"
+          busy={deletePending}
+          error={deleteError}
+          onCancel={handleDeleteCancel}
+          onConfirm={() => void handleDeleteConfirm()}
         />
       )}
     </div>

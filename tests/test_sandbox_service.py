@@ -1163,8 +1163,8 @@ class TestDiscoverSandboxSkills:
         names = {r["name"] for r in results}
         assert "industry-report" in names
         assert "custom-tool" in names
-        assert results[0]["sandbox_skill_dir"] == "/home/user/skills/industry-report"
         by_name = {item["name"]: item for item in results}
+        assert by_name["industry-report"]["sandbox_skill_dir"] == "/home/user/skills/industry-report"
         assert by_name["industry-report"]["display_name"] == "行业报告"
         assert by_name["custom-tool"]["display_name"] == "Custom Tool UI"
 
@@ -1269,8 +1269,11 @@ class TestDiscoverSandboxSkills:
         assert len(results) == 1
         assert results[0]["name"] == "good-skill"
 
-        with pytest.raises(RuntimeError, match="读取用户 Skill 失败"):
-            await service.discover_sandbox_skills("user-1", strict=True)
+        strict_results = await service.discover_sandbox_skills("user-1", strict=True)
+        assert [item["name"] for item in strict_results] == ["good-skill"]
+        issues = strict_results.issues
+        assert issues[0]["path"] == "/home/user/skills/bad/SKILL.md"
+        assert issues[0]["field"] == "file"
 
     @pytest.mark.asyncio
     async def test_discover_sandbox_skills_reads_skill_files_concurrently(self, service, mock_sandbox):
@@ -1310,7 +1313,7 @@ class TestDiscoverSandboxSkills:
         assert [item["name"] for item in results] == ["first-skill", "second-skill"]
 
     @pytest.mark.asyncio
-    async def test_discover_sandbox_skills_rejects_duplicate_user_keys_as_batch(
+    async def test_discover_sandbox_skills_isolates_duplicate_user_key(
         self, service, mock_sandbox
     ):
         service._cache["user-1"] = mock_sandbox
@@ -1326,12 +1329,18 @@ class TestDiscoverSandboxSkills:
             return_value="---\nname: duplicate\ndescription: Same key\n---\n"
         )
 
-        assert await service.discover_sandbox_skills("user-1") == []
-        with pytest.raises(RuntimeError, match="用户 Skill 清单无效"):
-            await service.discover_sandbox_skills("user-1", strict=True)
+        results = await service.discover_sandbox_skills("user-1", strict=True)
+        assert [item["name"] for item in results] == ["duplicate"]
+        issues = results.issues
+        assert issues == [{
+            "path": "/home/user/skills/second/SKILL.md",
+            "field": "name",
+            "message": "Skill name 重复: duplicate",
+            "suggestion": "为该 Skill 设置一个不重复的 name。",
+        }]
 
     @pytest.mark.asyncio
-    async def test_discover_sandbox_skills_rejects_unsafe_key_as_batch(
+    async def test_discover_sandbox_skills_isolates_unsafe_key(
         self, service, mock_sandbox
     ):
         service._cache["user-1"] = mock_sandbox
@@ -1344,11 +1353,14 @@ class TestDiscoverSandboxSkills:
             return_value="---\nname: unsafe#key\ndescription: Unsafe\n---\n"
         )
 
-        with pytest.raises(RuntimeError, match="用户 Skill 元数据无效"):
-            await service.discover_sandbox_skills("user-1", strict=True)
+        result = await service.discover_sandbox_skills("user-1", strict=True)
+        assert result == []
+        issue = result.issues[0]
+        assert issue["path"] == "/home/user/skills/unsafe/SKILL.md"
+        assert issue["field"] == "name"
 
     @pytest.mark.asyncio
-    async def test_strict_discovery_rejects_invalid_frontmatter_without_partial_publish(
+    async def test_strict_discovery_isolates_invalid_frontmatter_and_keeps_good_skill(
         self, service, mock_sandbox
     ):
         service._cache["user-1"] = mock_sandbox
@@ -1368,14 +1380,16 @@ class TestDiscoverSandboxSkills:
 
         mock_sandbox.files.read_file = AsyncMock(side_effect=_read_file)
 
-        with pytest.raises(RuntimeError, match="用户 Skill 元数据无效"):
-            await service.discover_sandbox_skills("user-1", strict=True)
-        assert await service.discover_sandbox_skills("user-1") == [{
+        result = await service.discover_sandbox_skills("user-1", strict=True)
+        assert result == [{
             "name": "good",
             "display_name": "good",
             "description": "Good",
             "sandbox_skill_dir": "/home/user/skills/good",
         }]
+        issue = result.issues[0]
+        assert issue["path"] == "/home/user/skills/missing-name/SKILL.md"
+        assert issue["field"] == "name"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1388,7 +1402,7 @@ class TestDiscoverSandboxSkills:
             "---\nname: bad-display\ndescription: Bad\ndisplay_name: 42\n---\n",
         ],
     )
-    async def test_strict_discovery_rejects_invalid_yaml_metadata_types(
+    async def test_strict_discovery_isolates_invalid_yaml_metadata_types(
         self, service, mock_sandbox, frontmatter
     ):
         service._cache["user-1"] = mock_sandbox
@@ -1399,8 +1413,17 @@ class TestDiscoverSandboxSkills:
         mock_sandbox.commands.run = AsyncMock(return_value=exec_result)
         mock_sandbox.files.read_file = AsyncMock(return_value=frontmatter)
 
-        with pytest.raises(RuntimeError, match="用户 Skill 元数据无效"):
-            await service.discover_sandbox_skills("user-1", strict=True)
+        result = await service.discover_sandbox_skills("user-1", strict=True)
+        assert result == []
+        issue = result.issues[0]
+        assert issue["path"] == "/home/user/skills/invalid/SKILL.md"
+        assert issue["field"] in {
+            "frontmatter",
+            "name",
+            "description",
+            "metadata",
+            "display_name",
+        }
 
     @pytest.mark.asyncio
     async def test_official_skills_do_not_consume_user_inventory_capacity(

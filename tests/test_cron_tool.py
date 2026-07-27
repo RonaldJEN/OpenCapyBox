@@ -126,6 +126,22 @@ class TestManageCronToolAdd:
         assert result.success is False
         assert "5" in result.error
 
+    @pytest.mark.asyncio
+    async def test_add_never_firing_cron_does_not_persist_job(self, tool_and_db):
+        tool, mock_db = tool_and_db
+
+        result = await tool.execute(
+            action="add",
+            name="never",
+            cron="0 0 31 2 *",
+            description="这个任务永远不会触发",
+        )
+
+        assert result.success is False
+        assert "无法产生未来执行时间" in result.error
+        mock_db.add.assert_not_called()
+        mock_db.commit.assert_not_called()
+
 class TestManageCronToolRemove:
     """remove action 测试"""
 
@@ -339,13 +355,13 @@ class TestManageCronToolSchema:
         assert schema["type"] == "function"
         assert schema["function"]["name"] == "manage_cron"
 
-    def test_description_uses_monday_first_day_of_week(self):
+    def test_description_uses_linux_day_of_week(self):
         from src.agent.tools.cron_tool import ManageCronTool
 
         tool = ManageCronTool(db_session_factory=MagicMock(), user_id="test")
         desc = tool.description
-        assert "0=Mon..6=Sun" in desc
-        assert "'0 9 * * 0' (Monday 9am)" in desc
+        assert "0/7=Sunday, 1=Monday" in desc
+        assert "'0 9 * * 1' (Monday 9am)" in desc
 
     @pytest.mark.asyncio
     async def test_unknown_action(self):

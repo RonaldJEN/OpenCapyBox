@@ -12,7 +12,7 @@
 
 复用 memory-spec 中的 `user_memory`、`user_skill_configs` 表，并使用 `user_skill_inventory_snapshots` 保存用户 Skill 最近一次完整扫描快照。
 
-`user_skill_inventory_snapshots` 每用户至多一行，保存 sandbox/Profile 代际、仅含元数据的 `inventory_json`、revision 与扫描开始时间。无行表示从未成功完整扫描，`[]` 表示完整扫描成功且确实没有用户 Skill；Skill 正文和启停状态不得写入该快照。沙箱文件仍是用户 Skill 的事实源，DB 只服务于快速清单读取。
+`user_skill_inventory_snapshots` 每用户至多一行，保存 sandbox/Profile 代际、仅含可用 Skill 元数据的 `inventory_json`、逐项隔离诊断 `issues_json`、revision 与扫描开始时间。两份 JSON 必须属于同一次扫描并在同一事务中原子发布。无行表示从未成功完整扫描；`inventory_json=[]` 可表示目录确实为空，也可表示全部候选均损坏，此时由 `issues_json` 区分。Skill 正文和启停状态不得写入该快照。沙箱文件仍是用户 Skill 的事实源，DB 只服务于快速清单读取。
 
 ### Skill 元数据（文件系统）
 
@@ -53,7 +53,7 @@
 ### GET /api/config/skills
 
 - **Query**: `refresh=true` 可显式要求连接/恢复沙箱并严格重扫；缺省为 `false`。
-- **Response 200**: `{skills: [{key, name, display_name, description, category, source, enabled}], sandbox_status, inventory_state, inventory_discovered_at}`
+- **Response 200**: `{skills: [{key, name, display_name, description, category, source, enabled}], skill_issues: [{path, field, message, suggestion}], sandbox_status, inventory_state, inventory_discovered_at}`
 - `key`: Skill 的稳定内部标识；聊天接口 `preferred_skill_keys`、Skill 启停和运行时 `get_skill` 均以该标识对齐。当前兼容实现中与 `name` 相同。
 - `name`: Skill 元数据中的内部名称，保留供既有客户端兼容使用。
 - `display_name`: 面向用户展示的名称；未配置时回退为 `name`。前端不得把该展示值作为请求 key。
@@ -64,16 +64,19 @@
   - `unavailable`: 已有沙箱记录但本次连接、恢复或发现失败；接口仍返回 200 和官方 Skills，若当前代际仍有完整旧快照可同时返回用户 Skills 并标记 `inventory_state=stale`
 - `inventory_state`: `current`（当前代际完整快照或刚发布扫描）/ `stale`（本次刷新失败但安全复用当前代际旧快照）/ `unavailable`（无可安全使用的用户清单）
 - `inventory_discovered_at`: 当前返回快照对应的完整扫描开始时间；无用户清单时为 `null`
+- `skill_issues`: 与当前返回的用户 Skill inventory 同一扫描产生的逐项隔离诊断；不包含 Skill 正文或凭据。无问题时为 `[]`。最多保留 256 项且规范 JSON 不超过 256 KiB，超出部分截断，不影响合法 Skill 发布。
 - 合并：SkillLoader 文件系统发现 + UserSkillConfig DB 状态
 - 包含沙箱中用户自定义 Skill
 - 沙箱发现采用部分成功语义：沙箱不可用不应阻断官方 Skills 清单
 - sandbox/Profile 代际匹配且快照 JSON 完整时，缺省请求直接合并 DB 快照，不调用远程健康检查、恢复或扫描；损坏或代际不匹配的快照按 cache miss 处理，禁止跨 sandbox/Profile 泄露旧清单。
-- 缺少可用快照或 `refresh=true` 时才以严格模式发现用户 Skills：若同 ID、同 Profile 的进程内缓存仍可直接完成严格扫描，则跳过冗余远程健康检查；无兼容缓存或直接扫描失败时，先调用 `recover_persisted_sandbox` 再重试扫描：
+- 缺少可用快照或 `refresh=true` 时才以严格模式发现用户 Skills。此处“严格”表示沙箱级/扫描级失败必须抛错，不能伪装成成功空清单；单个 `SKILL.md` 损坏按下述隔离语义处理。若同 ID、同 Profile 的进程内缓存仍可直接完成严格扫描，则跳过冗余远程健康检查；无兼容缓存或直接扫描失败时，先调用 `recover_persisted_sandbox` 再重试扫描：
   - 只在控制面确认旧沙箱终止/失败/不存在，或 Profile 明确不匹配时允许候选重建并以 CAS 更新绑定；
   - 状态查询、connect、resume 或 Profile 指纹确认发生暂时性失败时不得重建，返回 `sandbox_status=unavailable`；
   - 远程恢复/发现前必须结束本地 DB 事务，完成远程 I/O 后再读取最新 `UserSkillConfig`，避免长事务占用连接并防止旧配置快照覆盖并发 toggle。
-- 一次完整用户 Skill inventory 最多 256 项；每项 `display_name` 最多 1024 UTF-8 bytes、`description` 最多 8192 bytes、`sandbox_skill_dir` 最多 1024 bytes，规范 JSON 总量最多 1 MiB。任一项 key 非法、trim 后 key 重复、字段/数量/总量超限或元数据结构非法，都会使整次严格扫描失败；不得静默丢弃坏项后发布部分清单，也不得清空上次成功快照。
-- 严格扫描必须携带扫描实际使用的不可变 `{sandbox_id, active_profile_id, active_profile_version}` 指纹；发布短事务对三项同时 CAS 后原子替换整份快照。成功空列表必须发布 `[]` 以移除已卸载项。扫描失败或部分读取失败不得清空旧快照。并发扫描按扫描开始时间防止较早但较慢的结果覆盖较新的结果。
+- 一次完整扫描最多发布 256 个可用用户 Skill；每项 `display_name` 最多 1024 UTF-8 bytes、`description` 最多 8192 bytes、`sandbox_skill_dir` 最多 1024 bytes，规范 inventory JSON 总量最多 1 MiB。
+- 单个候选发生文件读取失败、YAML/frontmatter 损坏、字段类型/长度非法、key 非法或重复时，必须隔离该候选并写入 `skill_issues`，其他合法 Skill 继续发布。候选路径按字典序处理，因此重复 key 稳定保留路径最小的合法项并隔离后续项。不得因为一个坏文件隐藏所有正常 Skill。
+- 沙箱不可连接/恢复、目录枚举失败或超时、候选数量超过扫描安全上限、sandbox/Profile 代际在扫描中变化、最终规范 inventory 自身不一致、DB 发布失败属于扫描级失败：不得发布本次结果，也不得清空上次成功快照。
+- 严格扫描必须携带扫描实际使用的不可变 `{sandbox_id, active_profile_id, active_profile_version}` 指纹；发布短事务对三项同时 CAS 后原子替换 `inventory_json` 与 `issues_json`。成功空列表及对应问题列表必须发布，以移除已卸载项或表达“全部候选已隔离”。并发扫描按扫描开始时间防止较早但较慢的结果覆盖较新的结果。
   - 发布函数正常返回 CAS 失败表示另一代际或更新扫描胜出：请求必须重新读取当前代际 winner，且仅在读到该完整 winner 时返回 `inventory_state=current`；禁止返回输家的扫描结果或跨代际复用旧快照。
   - 发布事务抛出异常不等同于 CAS 竞争失败，也不能证明 DB 中已有 winner。此时重新读取到的当前代际旧快照只能作为 `stale` 降级并返回 `sandbox_status=unavailable`；无安全旧快照时返回 `inventory_state=unavailable`。未发布的本次扫描和旧快照均不得误报为 `current`。
 - Agent 初始化与 `get_skill` miss 触发的严格完整扫描也更新同一快照。普通 GET 是 DB 清单读取；仅 cache miss 或 `refresh=true` 路径可能恢复/创建容器，因此不得预取强制刷新。

@@ -20,6 +20,7 @@ class UserSkillInventorySnapshot(Base):
     active_profile_id = Column(String(36), nullable=True)
     active_profile_version = Column(Integer, nullable=True)
     inventory_json = Column(Text, nullable=False)
+    issues_json = Column(Text, nullable=False, default="[]")
     revision = Column(Integer, nullable=False, default=1)
     # This is the scan start time. A later-started scan may publish first and
     # must not subsequently be overwritten by an older, slower scan.

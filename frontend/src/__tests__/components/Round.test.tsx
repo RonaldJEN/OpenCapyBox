@@ -714,4 +714,56 @@ describe('Round 组件', () => {
     expect(screen.queryByTestId('auth-image')).not.toBeInTheDocument();
     expect(screen.queryByAltText('chart')).not.toBeInTheDocument();
   });
+
+  it('助手 Markdown 本地文件链接在当前 Files 面板打开', () => {
+    const round = createMockRound({
+      final_response: '[查看压缩包](exports/bundle.zip)',
+      steps: [],
+    });
+    const onOpenFileInPanel = vi.fn();
+
+    render(
+      <Round
+        round={round}
+        isStreaming={false}
+        sessionId="s1"
+        onOpenFileInPanel={onOpenFileInPanel}
+      />,
+    );
+
+    const link = screen.getByRole('link', { name: '查看压缩包' });
+    expect(link).not.toHaveAttribute('target', '_blank');
+    fireEvent.click(link);
+    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'bundle.zip',
+      path: 'exports/bundle.zip',
+      session_id: 's1',
+      type: 'zip',
+    }));
+  });
+
+  it('助手 Markdown 中文及空格文件链接使用解码后的沙箱路径', () => {
+    const round = createMockRound({
+      final_response: '[查看报告](<exports/报告 终版.pdf>)',
+      steps: [],
+    });
+    const onOpenFileInPanel = vi.fn();
+
+    render(
+      <Round
+        round={round}
+        isStreaming={false}
+        sessionId="s1"
+        onOpenFileInPanel={onOpenFileInPanel}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('link', { name: '查看报告' }));
+    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
+      name: '报告 终版.pdf',
+      path: 'exports/报告 终版.pdf',
+      session_id: 's1',
+      type: 'pdf',
+    }));
+  });
 });

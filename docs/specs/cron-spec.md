@@ -27,6 +27,7 @@
 | description | Text | default=""（列表显示名） |
 | content | Text | NOT NULL default=""（传给 Agent 的执行提示词）。老数据为空时 runner 回退到 description |
 | enabled | Boolean | default=True, NOT NULL |
+| rule_version | Integer | default=1, NOT NULL。执行时间实际变化时递增 |
 | created_at | DateTime | default=now |
 | updated_at | DateTime | default=now, onupdate=now |
 
@@ -39,8 +40,8 @@ UniqueConstraint: (user_id, name)
 
 **`schedule` JSON 结构列5 种 kind**（完整定义见 `src/api/services/cron_schedule.py`）：
 - `{kind: "daily", time: "HH:MM"}`
-- `{kind: "weekdays", time: "HH:MM"}` —— 映射到 `day_of_week=0-4`（周一到周五）
-- `{kind: "weekly", time: "HH:MM", days: number[]}` —— 0=周一 .. 6=周日（与 APScheduler `day_of_week` 一致）
+- `{kind: "weekdays", time: "HH:MM"}` —— 映射到标准 Cron `1-5`（周一到周五）
+- `{kind: "weekly", time: "HH:MM", days: number[]}` —— 标准 Cron 数值：0=周日、1=周一、…、6=周六
 - `{kind: "monthly", time: "HH:MM", dayOfMonth: 1–31}`
 - `{kind: "interval", everyMinutes?: 1–59} 或 {everyHours?: 1–23}`（二选一）
 
@@ -51,6 +52,7 @@ UniqueConstraint: (user_id, name)
 | id | String(36) | PK |
 | job_id | Integer | FK → cron_jobs.id, NOT NULL, indexed |
 | scheduled_at | DateTime | NOT NULL, indexed |
+| rule_version | Integer | NOT NULL。认领时的规则版本 |
 | created_at | DateTime | default=now |
 
 UniqueConstraint: (job_id, scheduled_at) — 跨 worker 去重的核心机制
@@ -63,6 +65,9 @@ UniqueConstraint: (job_id, scheduled_at) — 跨 worker 去重的核心机制
 | user_id | String(100) | NOT NULL, indexed |
 | job_name | String(100) | NOT NULL |
 | cron_expr | String(50) | NOT NULL |
+| rule_version | Integer | nullable。执行采用的规则版本 |
+| scheduled_at | DateTime | nullable。计划触发时间 |
+| trigger_source | String(20) | default="scheduled"。scheduled/manual |
 | started_at | DateTime | default=now |
 | completed_at | DateTime | nullable |
 | status | String(20) | default="running". Values: running/success/failed |
@@ -77,14 +82,14 @@ All require Bearer auth.
 
 ### GET /api/cron/jobs
 
-- Response 200: `{jobs: [{id, name, cron_expr, schedule, description, content, enabled}]}`
+- Response 200: `{jobs: [{id, name, cron_expr, schedule, description, content, enabled, rule_version}]}`
   - `schedule` 为老数据时为 `null`；后端不反解析 `cron_expr`。
 
 ### POST /api/cron/jobs
 
 - Body: `{name (1-100, [A-Za-z0-9_-]), description? (<=500), content? (<=8000), schedule?, cron_expr?, enabled?: bool=true}`
   - `schedule` 与 `cron_expr` 二选一（`schedule` 优先）；两者都未提供 → 400。
-  - `cron_expr` 必须是 5 字段标准 cron；不是 → 400。
+  - `cron_expr` 必须是 5 字段标准 cron，且从当前时间起至少存在一次未来触发；语法非法或永不触发（如 `0 0 31 2 *`）→ 400，禁止写入 DB。
   - 重名 → 400。
 - Response 201: `{job: <同上表项>}`
 - Error 400 (校验失败), 503 (PostgreSQL 写冲突：死锁 / 序列化失败，建议重试)
@@ -104,7 +109,7 @@ All require Bearer auth.
 ### POST /api/cron/jobs/preview
 
 - Body: `{schedule?, cron_expr?, n?: 1-20=5}` —— 二选一。
-- Response 200: `{cron_expr: str, next_fires: ISO datetime[]}` —— 本地时区 naive datetime。
+- Response 200: `{schedule_text: str, cron_expr: str, next_fires: ISO datetime[]}` —— 本地时区 naive datetime。
 - 仅鉴权，不读/写任何以 user_id 为维度的数据。
 - Error 400 (未提供 / 同时提供 / schedule 非法 / cron 表达式非法)
 
@@ -156,13 +161,21 @@ All require Bearer auth.
 - **调度基准：本地时区**（`TIMEZONE_OFFSET` 环境变量，默认 UTC+8）。
 - 用户配置 `"0 9 * * *"` 会在**本地 9 点**触发，而非 UTC 9 点。
 - DB 中 `CronFire.scheduled_at` / `CronJobRun.started_at` 等字段均以**本地 naive datetime** 存储（由 `now_naive()` 产生）。
-- APScheduler `CronTrigger` 构造时必须传 `timezone=get_timezone()`。
+
+### Cron 标准
+
+- 全链路只接受项目定义的 Linux/Vixie 五字段数字语法，由 `CronEngine` 统一负责校验、匹配和未来时间计算：字段支持 `*`、数字、范围、列表以及 `*/N` / `A-B/N` 步进。
+- 创建或修改调度规则时，服务层必须在任何 DB 写入前计算至少一次未来触发；无法产生未来时间的表达式不得保存，HTTP 与 Agent 工具遵循同一校验。
+- 明确拒绝 croniter 扩展语法（包括 `R`、`L`、`W`、`#`、`?`）和英文月份/星期名，防止随机或扩展表达式造成保存预览与 worker 逐分钟匹配不一致。
+- 星期字段采用 `0/7=周日，1=周一，…，6=周六`；例如 `1-5` 为周一至周五，`2-6,0` 为周二至周日。
+- 日（day-of-month）与星期（day-of-week）同时受限时采用标准 Cron 的 OR 语义。
+- 不提供 APScheduler 星期编号或其他旧规则兼容层；数据库中的 `cron_expr` 直接按上述标准解释。
 
 ### 调度机制
 
-- 仅借用 `apscheduler.triggers.cron.CronTrigger` 做单分钟语义匹配，**未使用任何 scheduler 主进程或 jobstore**（无 `AsyncIOScheduler` / 文件锁主节点）；持久化与去重全部走 DB。
+- `CronEngine` 基于 `croniter` 做单分钟语义匹配和未来时间计算；持久化与去重全部走 DB。
 - Worker 每分钟唤醒一次（对齐到本地分钟边界 + 0-2s 随机 jitter）。若同进程事件循环被阻塞导致醒来时发现漏过分钟，补扫最近 `cron_dispatch_catch_up_max_minutes` 分钟（默认 60），并以原始分钟写入 `cron_fires.scheduled_at`；进程启动前的历史时间不回补
-- 查询所有 enabled CronJob，通过一次性 `CronTrigger` 匹配当前分钟（本地时区）
+- 查询所有 enabled CronJob，通过 `CronEngine.matches()` 匹配当前分钟（本地时区）
 - 匹配成功后使用 PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` 写入 cron_fires 表
   - 插入成功 = 本 worker 赢得执行权
   - 插入失败 (UNIQUE 冲突) = 其他 worker 已认领
@@ -173,9 +186,10 @@ All require Bearer auth.
 - dispatch 查询结果是**内存快照**。在 `_run` 实际执行前，必须按 `job_id` 重新从 DB 拉取：
   - job 不存在 → skip
   - `cron_jobs.enabled == False` → skip
+  - `cron_jobs.rule_version` 与认领时版本不一致 → skip
   - `auth_users` 中没有对应用户 → skip
   - `auth_users.enabled == False` → skip
-- 实现位置：`cron_worker._run_by_id`。
+- 实现位置：`cron_worker._run` 和 `run_cron_job()`。
 - 手动触发（`POST /api/cron/jobs/{name}/run`）不写 `cron_fires`，但 `run_cron_job()` 执行入口仍必须校验 `auth_users` 用户存在且启用；用户在触发后被禁用/删除时，预创建的 run 记录应转为 `failed`。
 
 ### 执行流程
@@ -214,6 +228,7 @@ All require Bearer auth.
 ### 手动触发与调度并发
 
 - 手动触发不写 `cron_fires`，允许与同分钟的自动调度并存。
+- 手动触发绑定提交时的 `job_id` 与 `rule_version`；后台真正开始前任务被删除重建或调度规则版本已变化时，不执行新任务，并将预创建记录标记为 `failed`，提示用户重新执行。
 - 手动触发与自动调度均不按用户串行排队；提交后立即进入后台执行。
 - 跨 worker 触发的同一作业同分钟去重约束见下方「多 worker 并发模型」。
 

@@ -20,6 +20,17 @@ MAX_SKILL_DISPLAY_NAME_BYTES = 1024
 MAX_SKILL_DESCRIPTION_BYTES = 8192
 MAX_SKILL_SANDBOX_DIR_BYTES = 1024
 MAX_USER_SKILL_INVENTORY_JSON_BYTES = 1024 * 1024
+MAX_SKILL_SCAN_ISSUES = 256
+MAX_SKILL_ISSUES_JSON_BYTES = 256 * 1024
+
+
+def _bounded_issue_text(value: object, *, default: str, max_bytes: int) -> str:
+    """Best-effort bound untrusted diagnostics without failing a valid scan."""
+    text = value if isinstance(value, str) else default
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return encoded.decode("utf-8")
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 class SkillInventoryValidationError(ValueError):
@@ -67,6 +78,74 @@ def _encode_inventory_json(skills: list[dict[str, str]]) -> str:
     return value
 
 
+def normalize_skill_scan_issues(
+    issues: Iterable[Mapping[str, object]],
+) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for raw in issues:
+        if len(normalized) >= MAX_SKILL_SCAN_ISSUES:
+            break
+        if not isinstance(raw, Mapping):
+            continue
+        item = {
+            "path": _bounded_issue_text(
+                raw.get("path"),
+                default="",
+                max_bytes=MAX_SKILL_SANDBOX_DIR_BYTES,
+            ),
+            "field": _bounded_issue_text(
+                raw.get("field"),
+                default="frontmatter",
+                max_bytes=256,
+            ),
+            "message": _bounded_issue_text(
+                raw.get("message"),
+                default="Skill 配置无效",
+                max_bytes=4096,
+            ),
+            "suggestion": _bounded_issue_text(
+                raw.get("suggestion"),
+                default="请检查 SKILL.md。",
+                max_bytes=4096,
+            ),
+        }
+        candidate = [*normalized, item]
+        encoded = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > MAX_SKILL_ISSUES_JSON_BYTES:
+            break
+        normalized.append(item)
+    return normalized
+
+
+def _encode_issues_json(issues: Iterable[Mapping[str, object]]) -> str:
+    return json.dumps(
+        normalize_skill_scan_issues(issues),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def decode_skill_scan_issues(value: object) -> list[dict[str, str]] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        encoded_size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
+    if encoded_size > MAX_SKILL_ISSUES_JSON_BYTES:
+        return None
+    try:
+        raw = json.loads(value)
+        if not isinstance(raw, list):
+            return None
+        normalized = normalize_skill_scan_issues(raw)
+        # 写入端只会发布规范化后的完整列表；读取时发生任何截断、默认值
+        # 补齐或非法项丢弃，都说明配对的诊断快照已损坏。
+        return normalized if normalized == raw else None
+    except (TypeError, ValueError, SkillInventoryValidationError):
+        return None
+
+
 @dataclass(frozen=True)
 class SkillInventoryIdentity:
     """Immutable sandbox/Profile generation that produced one complete scan."""
@@ -83,6 +162,7 @@ class UserSkillInventoryView:
     identity: SkillInventoryIdentity | None
     skills: list[dict[str, str]] | None
     discovered_at: datetime | None
+    issues: list[dict[str, str]] | None = None
 
 
 def inventory_view_is_current_winner(
@@ -131,11 +211,12 @@ def cached_sandbox_identity(
 def normalize_user_skill_inventory(
     skills: Iterable[Mapping[str, object]],
 ) -> list[dict[str, str]]:
-    """Validate and canonicalize one complete user Skill inventory.
+    """Validate and canonicalize the usable part of one complete scan.
 
-    Invalid entries, duplicate stable keys, and capacity overflows reject the
-    whole scan. Silently publishing a partial inventory would make the DB, UI,
-    and runtime disagree about which Skill a key identifies.
+    The sandbox scanner isolates unreadable or malformed files first and
+    publishes their diagnostics alongside this list. Anything reaching this
+    boundary must already be valid and unique; corruption here rejects the
+    publication because it indicates a scanner/programming error.
     """
 
     normalized: list[dict[str, str]] = []
@@ -250,17 +331,20 @@ def load_user_skill_inventory(
         .first()
     )
     if row is None:
-        return UserSkillInventoryView(None, None, None)
+        return UserSkillInventoryView(None, None, None, None)
 
     binding, snapshot = row
     identity = identity_from_binding(binding)
     if identity is None or not snapshot_matches_binding(snapshot, binding):
-        return UserSkillInventoryView(identity, None, None)
+        return UserSkillInventoryView(identity, None, None, None)
 
     skills = decode_user_skill_inventory(snapshot.inventory_json)
     if skills is None:
-        return UserSkillInventoryView(identity, None, None)
-    return UserSkillInventoryView(identity, skills, snapshot.discovered_at)
+        return UserSkillInventoryView(identity, None, None, None)
+    issues = decode_skill_scan_issues(getattr(snapshot, "issues_json", None))
+    if issues is None:
+        return UserSkillInventoryView(identity, None, None, None)
+    return UserSkillInventoryView(identity, skills, snapshot.discovered_at, issues)
 
 
 def replace_user_skill_inventory(
@@ -269,6 +353,7 @@ def replace_user_skill_inventory(
     user_id: str,
     identity: SkillInventoryIdentity,
     skills: Iterable[Mapping[str, object]],
+    issues: Iterable[Mapping[str, object]] = (),
     observed_at: datetime | None = None,
 ) -> bool:
     """Atomically publish one complete scan if its sandbox generation is current.
@@ -281,6 +366,7 @@ def replace_user_skill_inventory(
     observed_at = observed_at or now_naive()
     normalized = normalize_user_skill_inventory(skills)
     inventory_json = _encode_inventory_json(normalized)
+    issues_json = _encode_issues_json(issues)
 
     try:
         binding = (
@@ -323,6 +409,7 @@ def replace_user_skill_inventory(
                 active_profile_id=identity.active_profile_id,
                 active_profile_version=identity.active_profile_version,
                 inventory_json=inventory_json,
+                issues_json=issues_json,
                 revision=1,
                 discovered_at=observed_at,
             )
@@ -332,6 +419,7 @@ def replace_user_skill_inventory(
             snapshot.active_profile_id = identity.active_profile_id
             snapshot.active_profile_version = identity.active_profile_version
             snapshot.inventory_json = inventory_json
+            snapshot.issues_json = issues_json
             snapshot.revision = int(snapshot.revision or 0) + 1
             snapshot.discovered_at = observed_at
             snapshot.updated_at = now_naive()
@@ -348,6 +436,7 @@ def persist_user_skill_inventory(
     user_id: str,
     identity: SkillInventoryIdentity | None,
     skills: Iterable[Mapping[str, object]],
+    issues: Iterable[Mapping[str, object]] = (),
     observed_at: datetime | None = None,
 ) -> bool:
     """Open a short-lived DB session and publish a successful scan."""
@@ -361,6 +450,7 @@ def persist_user_skill_inventory(
             user_id=user_id,
             identity=identity,
             skills=skills,
+            issues=issues,
             observed_at=observed_at,
         )
     finally:

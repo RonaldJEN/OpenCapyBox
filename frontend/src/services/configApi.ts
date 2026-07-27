@@ -73,11 +73,19 @@ export interface SkillInfo {
 export type SkillSandboxStatus = 'available' | 'unavailable' | 'not_created';
 export type SkillInventoryState = 'current' | 'stale' | 'unavailable';
 
+export interface SkillScanIssue {
+  path: string;
+  field: string;
+  message: string;
+  suggestion: string;
+}
+
 export interface SkillsResponse {
   skills: SkillInfo[];
   sandbox_status: SkillSandboxStatus;
   inventory_state?: SkillInventoryState;
   inventory_discovered_at?: string | null;
+  skill_issues?: SkillScanIssue[];
 }
 
 export async function getSkills(
@@ -103,7 +111,7 @@ export async function toggleSkill(
 export type Schedule =
   | { kind: 'daily'; time: string }                                    // HH:MM
   | { kind: 'weekdays'; time: string }                                  // 周一-五
-  | { kind: 'weekly'; time: string; days: number[] }                   // 0=Mon..6=Sun
+  | { kind: 'weekly'; time: string; days: number[] }                   // 0=Sun, 1=Mon..6=Sat
   | { kind: 'monthly'; time: string; dayOfMonth: number }              // 1-31
   | { kind: 'interval'; everyMinutes?: number; everyHours?: number };
 
@@ -115,12 +123,16 @@ export interface CronTask {
   description: string;
   content: string;
   enabled: boolean;
+  rule_version?: number;
 }
 
 export interface CronJobRun {
   id: string;
   job_name: string;
   cron_expr: string;
+  rule_version?: number | null;
+  scheduled_at?: string | null;
+  trigger_source?: 'scheduled' | 'manual';
   started_at: string | null;
   completed_at: string | null;
   status: string;
@@ -175,6 +187,7 @@ export async function deleteCronJob(name: string): Promise<void> {
 
 export interface SchedulePreviewResult {
   cron_expr: string;
+  schedule_text: string;
   next_fires: string[];  // ISO datetime strings (本地 naive)
 }
 

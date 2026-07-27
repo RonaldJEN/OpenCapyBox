@@ -30,7 +30,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.api.models.database import get_db
 from src.api.deps import get_current_user, verify_access_token
-from src.api.services.cron_schedule import ScheduleError, next_fire_at
+from src.api.services.cron_schedule import (
+    ScheduleError,
+    describe_schedule,
+    next_fire_at,
+)
 from src.api.services.cron_service import (
     CronJobBusyError,
     CronJobNotFoundError,
@@ -94,6 +98,7 @@ def _job_response(job: object) -> dict:
         "description": getattr(job, "description", "") or "",
         "content": getattr(job, "content", "") or "",
         "enabled": bool(getattr(job, "enabled", False)),
+        "rule_version": int(getattr(job, "rule_version", 1) or 1),
     }
 
 
@@ -204,6 +209,7 @@ async def preview_schedule(
         raise HTTPException(status_code=400, detail=str(e))
     return {
         "cron_expr": expr,
+        "schedule_text": describe_schedule(payload.schedule, expr),
         "next_fires": [t.isoformat() for t in fires],
     }
 
@@ -286,6 +292,13 @@ async def get_run_status(
         "id": run.id,
         "job_name": run.job_name,
         "cron_expr": run.cron_expr,
+        "rule_version": getattr(run, "rule_version", None),
+        "scheduled_at": (
+            run.scheduled_at.isoformat()
+            if getattr(run, "scheduled_at", None)
+            else None
+        ),
+        "trigger_source": getattr(run, "trigger_source", "scheduled"),
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
         "status": run.status,
@@ -478,13 +491,22 @@ async def trigger_job(
     if not job:
         raise HTTPException(status_code=404, detail=f"任务 '{job_name}' 不存在")
 
+    # SQLAlchemy 默认会在 commit 后过期 ORM 实例。这里必须先固化提交时快照，
+    # 否则 commit 与后台触发之间若任务被并发修改，后续读取 job.rule_version
+    # 会重新查到新版本，导致执行记录与实际触发绑定到不同规则。
+    submitted_job_id = int(job.id)
+    submitted_rule_version = int(job.rule_version or 1)
+    submitted_cron_expr = job.cron_expr
+
     # 预创建执行记录，确保前端可立即开始轮询
     run_id = str(uuid.uuid4())
     run_record = CronJobRun(
         id=run_id,
         user_id=user_id,
         job_name=job_name,
-        cron_expr=job.cron_expr,
+        cron_expr=submitted_cron_expr,
+        rule_version=submitted_rule_version,
+        trigger_source="manual",
         status="running",
         is_read=False,
     )
@@ -492,7 +514,14 @@ async def trigger_job(
     db.commit()
 
     try:
-        await trigger_manual_run(request.app, user_id, job_name, run_id)
+        await trigger_manual_run(
+            request.app,
+            user_id,
+            job_name,
+            run_id,
+            submitted_job_id,
+            submitted_rule_version,
+        )
     except Exception as exc:
         # 任何异常（HTTPException / RuntimeError / 其他）都必须把预创建的 running
         # 记录立刻收拢为 failed，否则会一直挂到 startup 1 小时清理 → 前端永久转圈。

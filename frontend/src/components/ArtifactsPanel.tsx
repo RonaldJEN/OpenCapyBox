@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react';
 import { apiService } from '../services/api';
 import { FileInfo } from '../types';
 import {
@@ -33,8 +33,13 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
   const [pathHistory, setPathHistory] = useState<string[]>(['']);
   const [historyIndex, setHistoryIndex] = useState(0);
   const [selectedFile, setSelectedFile] = useState<FileInfo | null>(null);
-  // 用 ref 跟踪最新 path 防止竞态
-  const latestPathRef = useRef(currentPath);
+  // 每次目录请求使用独立序号；session/path 任一变化都会使旧响应失效。
+  const directoryRequestSeqRef = useRef(0);
+  const listScrollRef = useRef<HTMLDivElement>(null);
+  const savedListScrollTopRef = useRef(0);
+  const selectedTriggerRef = useRef<HTMLElement | null>(null);
+  const selectedTriggerPathRef = useRef('');
+  const restoreListOnNextRenderRef = useRef(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -45,15 +50,19 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
   // 面板打开或 session 切换时重置到根目录
   useEffect(() => {
     if (isOpen && sessionId) {
+      directoryRequestSeqRef.current += 1;
       setCurrentPath('');
       setPathHistory(['']);
       setHistoryIndex(0);
       setSelectedFile(null);
+      setItems([]);
+      setLoading(false);
     }
   }, [isOpen, sessionId]);
 
   useEffect(() => {
     if (isOpen && sessionId && targetFile) {
+      savedListScrollTopRef.current = listScrollRef.current?.scrollTop ?? 0;
       const normalizedTarget = normalizeTargetFile(targetFile);
       const parentPath = getParentPath(normalizedTarget.path);
       setCurrentPath(parentPath);
@@ -65,21 +74,24 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
 
   // currentPath 变化时加载目录
   const loadDir = useCallback(async (path: string) => {
-    latestPathRef.current = path;
+    const requestSeq = ++directoryRequestSeqRef.current;
+    const requestedSessionId = sessionId;
     setLoading(true);
     try {
-      const response = await apiService.getSessionFiles(sessionId, path || undefined);
-      // 防止旧请求覆盖新结果
-      if (latestPathRef.current === path) {
+      const response = await apiService.getSessionFiles(
+        requestedSessionId,
+        path || undefined,
+      );
+      if (directoryRequestSeqRef.current === requestSeq) {
         setItems(response.files);
       }
     } catch (error) {
       console.error('Failed to load directory:', error);
-      if (latestPathRef.current === path) {
+      if (directoryRequestSeqRef.current === requestSeq) {
         setItems([]);
       }
     } finally {
-      if (latestPathRef.current === path) {
+      if (directoryRequestSeqRef.current === requestSeq) {
         setLoading(false);
       }
     }
@@ -100,6 +112,18 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
       }
     }
   }, [items, selectedFile]);
+
+  useLayoutEffect(() => {
+    if (selectedFile || !restoreListOnNextRenderRef.current) return;
+    restoreListOnNextRenderRef.current = false;
+    if (listScrollRef.current) {
+      listScrollRef.current.scrollTop = savedListScrollTopRef.current;
+    }
+    const restoredTrigger = Array.from(
+      listScrollRef.current?.querySelectorAll<HTMLElement>('[data-file-path]') ?? [],
+    ).find((element) => element.dataset.filePath === selectedTriggerPathRef.current);
+    (restoredTrigger ?? selectedTriggerRef.current)?.focus({ preventScroll: true });
+  }, [selectedFile]);
 
   // --- 导航逻辑 ---
   const navigateTo = (subPath: string) => {
@@ -161,10 +185,18 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
     ? `~/sessions/${shortSessionId}/${currentPath}`
     : `~/sessions/${shortSessionId}`;
 
-  const handleItemClick = (item: FileInfo) => {
+  const closeSelectedFile = () => {
+    restoreListOnNextRenderRef.current = true;
+    setSelectedFile(null);
+  };
+
+  const handleItemClick = (item: FileInfo, trigger?: HTMLElement) => {
     if (item.is_directory) {
       navigateTo(item.path);
     } else {
+      savedListScrollTopRef.current = listScrollRef.current?.scrollTop ?? 0;
+      selectedTriggerRef.current = trigger ?? null;
+      selectedTriggerPathRef.current = item.path;
       setSelectedFile(item);
     }
   };
@@ -182,7 +214,7 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => setSelectedFile(null)}
+              onClick={closeSelectedFile}
               className="px-2 py-1 text-xs rounded-lg border border-claude-border bg-claude-surface text-claude-text hover:bg-claude-hover transition-colors"
               title="返回文件列表"
             >
@@ -250,12 +282,16 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
             inline
             sessionId={sessionId}
             file={selectedFile}
-            onClose={() => setSelectedFile(null)}
+            onClose={closeSelectedFile}
           />
         </div>
       ) : (
         <div className="flex-1 min-h-0 flex flex-col">
-          <div className="flex-1 overflow-y-auto p-3 space-y-1">
+          <div
+            ref={listScrollRef}
+            data-testid="artifacts-file-list"
+            className="flex-1 overflow-y-auto p-3 space-y-1"
+          >
             {loading ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="w-6 h-6 text-claude-muted animate-spin" />
@@ -271,8 +307,19 @@ export function ArtifactsPanel({ sessionId, isOpen, onClose, targetFile, targetF
                 return (
                   <div
                     key={item.path}
-                    onClick={() => handleItemClick(item)}
-                    className={`group flex items-center justify-between px-3 py-2.5 rounded-xl transition-colors cursor-pointer active:scale-[0.99] ${
+                    onClick={(event) => handleItemClick(item, event.currentTarget)}
+                    tabIndex={0}
+                    role="button"
+                    aria-label={`${item.is_directory ? '打开目录' : '预览文件'} ${item.name}`}
+                    onKeyDown={(event) => {
+                      if (event.target !== event.currentTarget) return;
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        handleItemClick(item, event.currentTarget);
+                      }
+                    }}
+                    data-file-path={item.path}
+                    className={`group flex items-center justify-between px-3 py-2.5 rounded-xl transition-colors cursor-pointer active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/50 ${
                       isSelected ? 'bg-claude-hover' : 'hover:bg-claude-hover'
                     }`}
                   >

@@ -1,13 +1,16 @@
-import { useEffect, useId, useRef } from 'react';
+import { useEffect, useId, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 
 interface ConfirmDialogProps {
   title: string;
-  description: string;
+  description: ReactNode;
   confirmLabel: string;
   busyLabel: string;
   busy: boolean;
   error?: string | null;
+  icon?: ReactNode;
+  eyebrow?: string;
+  details?: ReactNode;
   onCancel: () => void;
   onConfirm: () => void;
 }
@@ -19,6 +22,9 @@ export function ConfirmDialog({
   busyLabel,
   busy,
   error,
+  icon,
+  eyebrow,
+  details,
   onCancel,
   onConfirm,
 }: ConfirmDialogProps) {
@@ -108,14 +114,29 @@ export function ConfirmDialog({
         aria-busy={busy}
         tabIndex={-1}
         onKeyDown={handleKeyDown}
-        className="w-[min(420px,calc(100vw-32px))] rounded-2xl border border-[#e8e3d9] bg-[#fffdf9] p-5 text-[#1c1a16] shadow-[0_22px_70px_rgba(20,16,10,0.30)] outline-none"
+        className="w-[min(440px,calc(100vw-32px))] rounded-2xl border border-[#e5dfd4] bg-[#fffdf9] p-5 text-[#1c1a16] shadow-[0_24px_80px_rgba(20,16,10,0.26)] outline-none"
       >
-        <h2 id={titleId} className="text-[16px] font-bold text-[#1c1a16]">
-          {title}
-        </h2>
-        <p id={descriptionId} className="mt-2 text-[13.5px] leading-6 text-[#6f6960]">
-          {description}
-        </p>
+        <div className="flex items-start gap-3.5">
+          {icon ? (
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-red-200 bg-red-50 text-red-600">
+              {icon}
+            </div>
+          ) : null}
+          <div className="min-w-0 flex-1 pt-0.5">
+            {eyebrow ? (
+              <p className="mb-1 text-[11px] font-semibold tracking-[0.12em] text-red-600">
+                {eyebrow}
+              </p>
+            ) : null}
+            <h2 id={titleId} className="text-[17px] font-bold leading-6 text-[#1c1a16]">
+              {title}
+            </h2>
+            <p id={descriptionId} className="mt-1.5 text-[13.5px] leading-6 text-[#6f6960]">
+              {description}
+            </p>
+          </div>
+        </div>
+        {details}
         {error && (
           <p role="alert" className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-[13px] text-claude-error">
             {error}

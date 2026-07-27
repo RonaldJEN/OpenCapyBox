@@ -7,7 +7,10 @@ import { CodeBlock } from './CodeBlock';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { parseMessageContent } from '../utils/messageParser';
-import { extractAssistantFiles } from '../utils/assistantFileRefs';
+import {
+  createAssistantFileInfoFromHref,
+  extractAssistantFiles,
+} from '../utils/assistantFileRefs';
 import { getFileIcon, getFileExtLabel, getFileCategoryLabel, getFileBadgeClass, getFileIconClass, toFileInfo, buildSandboxFileUrl, isImageFile } from '../utils/fileUtils';
 import { AuthenticatedImage } from './AuthenticatedImage';
 
@@ -50,7 +53,15 @@ async function copyTextToClipboard(text: string): Promise<void> {
   }
 }
 
-function AssistantMarkdown({ content }: { content: string }) {
+function AssistantMarkdown({
+  content,
+  sessionId,
+  onOpenFile,
+}: {
+  content: string;
+  sessionId?: string;
+  onOpenFile?: (file: FileInfo) => void;
+}) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
@@ -107,16 +118,37 @@ function AssistantMarkdown({ content }: { content: string }) {
           }
           return null;
         },
-        a: ({ children, ...props }: any) => (
-          <a
-            className="text-blue-600 hover:underline underline-offset-2"
-            target="_blank"
-            rel="noopener noreferrer"
-            {...props}
-          >
-            {children}
-          </a>
-        ),
+        a: ({ children, href, ...props }: any) => {
+          const localFile = typeof href === 'string'
+            ? createAssistantFileInfoFromHref(href, sessionId)
+            : null;
+          if (localFile && onOpenFile) {
+            return (
+              <a
+                href={href}
+                className="text-blue-600 hover:underline underline-offset-2 cursor-pointer"
+                onClick={(event) => {
+                  event.preventDefault();
+                  onOpenFile(localFile);
+                }}
+                {...props}
+              >
+                {children}
+              </a>
+            );
+          }
+          return (
+            <a
+              href={href}
+              className="text-blue-600 hover:underline underline-offset-2"
+              target="_blank"
+              rel="noopener noreferrer"
+              {...props}
+            >
+              {children}
+            </a>
+          );
+        },
         blockquote: ({ children, ...props }: any) => (
           <blockquote
             className="border-l-2 border-claude-accent bg-claude-bg/60 pl-4 py-2 my-4 rounded-r-lg text-claude-secondary"
@@ -384,7 +416,11 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
           {/* 最终答案 OR 流式传输中的答案 */}
           {assistantContent && (
             <div className="prose max-w-none mt-4">
-              <AssistantMarkdown content={assistantContent} />
+              <AssistantMarkdown
+                content={assistantContent}
+                sessionId={sessionId}
+                onOpenFile={onOpenFileInPanel}
+              />
               {/* 流式传输光标 */}
               {!round.final_response && effectiveStreaming && (
                 <span className="inline-block w-0.5 h-5 bg-claude-muted ml-0.5 animate-blink align-middle" />

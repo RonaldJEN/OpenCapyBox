@@ -94,6 +94,20 @@ class TestCronMatching:
         assert cron_worker._cron_matches_minute("0 4 * * *", dt) is True
         assert cron_worker._cron_matches_minute("1 4 * * *", dt) is False
 
+    @pytest.mark.parametrize(
+        ("expr", "when", "expected"),
+        [
+            ("0 9 * * 1-5", datetime(2026, 7, 27, 9), True),   # 周一
+            ("0 9 * * 1-5", datetime(2026, 7, 25, 9), False),  # 周六
+            ("0 9 * * 1-6", datetime(2026, 7, 25, 9), True),   # 周六
+            ("0 9 * * 2-6,0", datetime(2026, 7, 27, 9), False),
+            ("0 9 * * 2-6,0", datetime(2026, 7, 26, 9), True),  # 周日
+            ("0 9 * * 7", datetime(2026, 7, 26, 9), True),
+        ],
+    )
+    def test_standard_linux_weekdays(self, expr, when, expected):
+        assert cron_worker._cron_matches_minute(expr, when) is expected
+
 
 class TestDispatchCatchUp:
     def test_due_minutes_after_includes_all_missed_minutes(self):
@@ -340,7 +354,7 @@ class TestRunBehavior:
     async def test_run_parallel_for_same_user(self, monkeypatch):
         timeline = []
 
-        async def fake_run_cron_job(user_id, job_name, run_id):
+        async def fake_run_cron_job(user_id, job_name, run_id, **kwargs):
             timeline.append(("start", job_name, time.perf_counter()))
             await asyncio.sleep(0.03)
             timeline.append(("end", job_name, time.perf_counter()))
@@ -359,7 +373,7 @@ class TestRunBehavior:
 
     @pytest.mark.asyncio
     async def test_run_parallel_for_different_users(self, monkeypatch):
-        async def fake_run_cron_job(user_id, job_name, run_id):
+        async def fake_run_cron_job(user_id, job_name, run_id, **kwargs):
             await asyncio.sleep(0.03)
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
@@ -377,7 +391,7 @@ class TestRunBehavior:
     async def test_run_uses_provided_run_id(self, monkeypatch):
         calls = []
 
-        async def fake_run_cron_job(user_id, job_name, run_id):
+        async def fake_run_cron_job(user_id, job_name, run_id, **kwargs):
             calls.append(run_id)
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
@@ -419,7 +433,7 @@ class TestRunByIdRevalidation:
     async def test_run_by_id_skips_when_job_deleted(self, cron_db, monkeypatch):
         calls = []
 
-        async def fake_run_cron_job(user_id, job_name, run_id):
+        async def fake_run_cron_job(user_id, job_name, run_id, **kwargs):
             calls.append((user_id, job_name))
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
@@ -441,7 +455,7 @@ class TestRunByIdRevalidation:
 
         calls = []
 
-        async def fake_run_cron_job(user_id, job_name, run_id):
+        async def fake_run_cron_job(user_id, job_name, run_id, **kwargs):
             calls.append((user_id, job_name))
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
@@ -463,7 +477,7 @@ class TestRunByIdRevalidation:
 
         calls = []
 
-        async def fake_run_cron_job(user_id, job_name, run_id):
+        async def fake_run_cron_job(user_id, job_name, run_id, **kwargs):
             calls.append((user_id, job_name))
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
@@ -484,7 +498,7 @@ class TestRunByIdRevalidation:
 
         calls = []
 
-        async def fake_run_cron_job(user_id, job_name, run_id):
+        async def fake_run_cron_job(user_id, job_name, run_id, **kwargs):
             calls.append((user_id, job_name))
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
@@ -498,14 +512,14 @@ class TestRunByIdRevalidation:
         """首次快照命中后，若执行前任务被禁用，应再次跳过。"""
         calls = []
 
-        async def fake_run_cron_job(user_id, job_name, run_id):
+        async def fake_run_cron_job(user_id, job_name, run_id, **kwargs):
             calls.append((user_id, job_name, run_id))
 
         monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
 
-        snapshots = [("u1", "race-job"), None]
+        snapshots = [("u1", "race-job", 1), None]
 
-        def fake_load_snapshot_if_enabled(job_id):
+        def fake_load_snapshot_if_enabled(job_id, expected_rule_version=None):
             return snapshots.pop(0)
 
         monkeypatch.setattr(
@@ -515,6 +529,35 @@ class TestRunByIdRevalidation:
         )
 
         await cron_worker._run_by_id(42, "w1")
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_run_by_id_drops_old_rule_version(self, cron_db, monkeypatch):
+        job = _insert_job(
+            cron_db,
+            user_id="u1",
+            name="changed-rule",
+            cron_expr="0 10 * * *",
+            enabled=True,
+        )
+        with cron_db() as db:
+            persisted = db.query(CronJob).filter(CronJob.id == job.id).first()
+            persisted.rule_version = 2
+            db.commit()
+
+        calls = []
+
+        async def fake_run_cron_job(user_id, job_name, run_id, **kwargs):
+            calls.append((user_id, job_name))
+
+        monkeypatch.setattr(cron_worker, "run_cron_job", fake_run_cron_job)
+        await cron_worker._run_by_id(
+            job.id,
+            "w1",
+            expected_rule_version=1,
+            scheduled_at=datetime(2026, 7, 27, 9),
+        )
 
         assert calls == []
 
@@ -614,7 +657,12 @@ class TestTriggerManualRun:
         app = SimpleNamespace(state=SimpleNamespace())
         with pytest.raises(HTTPException) as exc_info:
             await cron_worker.trigger_manual_run(
-                app, user_id="u1", job_name="job1", run_id="r1"
+                app,
+                user_id="u1",
+                job_name="job1",
+                run_id="r1",
+                job_id=1,
+                rule_version=1,
             )
         assert exc_info.value.status_code == 503
 
@@ -622,11 +670,20 @@ class TestTriggerManualRun:
     async def test_spawns_task_when_worker_running(self, monkeypatch):
         called = {}
 
-        async def fake_run(user_id, job_name, worker_id, run_id=None):
+        async def fake_run(
+            user_id,
+            job_name,
+            worker_id,
+            run_id=None,
+            expected_job_id=None,
+            expected_rule_version=None,
+        ):
             called["user_id"] = user_id
             called["name"] = job_name
             called["worker_id"] = worker_id
             called["run_id"] = run_id
+            called["expected_job_id"] = expected_job_id
+            called["expected_rule_version"] = expected_rule_version
 
         monkeypatch.setattr(cron_worker, "_run", fake_run)
 
@@ -636,7 +693,12 @@ class TestTriggerManualRun:
             )
         )
         task = await cron_worker.trigger_manual_run(
-            app, user_id="u1", job_name="job1", run_id="r1"
+            app,
+            user_id="u1",
+            job_name="job1",
+            run_id="r1",
+            job_id=9,
+            rule_version=3,
         )
         await task
         assert called == {
@@ -644,4 +706,6 @@ class TestTriggerManualRun:
             "name": "job1",
             "worker_id": "w-test",
             "run_id": "r1",
+            "expected_job_id": 9,
+            "expected_rule_version": 3,
         }

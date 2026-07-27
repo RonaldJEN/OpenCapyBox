@@ -45,7 +45,7 @@ interface Props {
   /** 从 cron 表达式提取固定时间（HH:MM），供排序使用。 */
   cronTime: (expr: string) => string | null;
   onEdit: (task: CronTask) => void;
-  onDelete: (name: string) => void;
+  onDelete: (task: CronTask) => void;
   onTrigger: (name: string) => void;
   onToggleEnabled: (task: CronTask) => void;
   triggeringSet: Set<string>;
@@ -352,7 +352,7 @@ interface TaskActionsProps {
   onMenuOpenChange: (open: boolean) => void;
   onToggleEnabled: (task: CronTask) => void;
   onEdit: (task: CronTask) => void;
-  onDelete: (name: string) => void;
+  onDelete: (task: CronTask) => void;
   onTrigger: (name: string) => void;
   compact?: boolean;
 }
@@ -461,7 +461,7 @@ const TaskActions: React.FC<TaskActionsProps> = ({
           tone="danger"
           onClick={() => {
             onMenuOpenChange(false);
-            onDelete(task.name);
+            onDelete(task);
           }}
         />
       </div>

@@ -6,13 +6,15 @@
  * - 编辑回显仅依赖 schedule（不反解析 cron_expr）；老数据 schedule=null 时
  *   降级显示原始 cron_expr 只读。
  */
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 
 import {
   createCronJob,
+  previewSchedule,
   updateCronJob,
   type CronTask,
   type Schedule,
+  type SchedulePreviewResult,
 } from '../../services/configApi';
 import SchedulePicker, { defaultScheduleForKind } from './SchedulePicker';
 
@@ -105,6 +107,42 @@ const TaskFormDrawer: React.FC<Props> = ({ task, onClose, onSaved }) => {
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<SchedulePreviewResult | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setError(null);
+  }, [name, content, schedule, enabled]);
+
+  useEffect(() => {
+    const payload = schedule !== null
+      ? { schedule, n: 5 }
+      : task?.cron_expr
+        ? { cron_expr: task.cron_expr, n: 5 }
+        : null;
+    if (!payload) {
+      setPreview(null);
+      return undefined;
+    }
+    let active = true;
+    const timer = window.setTimeout(() => {
+      previewSchedule(payload)
+        .then((result) => {
+          if (!active) return;
+          setPreview(result);
+          setPreviewError(null);
+        })
+        .catch((e: unknown) => {
+          if (!active) return;
+          setPreview(null);
+          setPreviewError(normalizeSaveError(e));
+        });
+    }, 250);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [schedule, task?.cron_expr]);
 
   const canSubmit = useMemo(() => {
     if (!isEdit && !NAME_RE.test(name)) return false;
@@ -220,6 +258,30 @@ const TaskFormDrawer: React.FC<Props> = ({ task, onClose, onSaved }) => {
               <SchedulePicker value={schedule} onChange={setSchedule} />
             )}
           </div>
+
+          {(preview || previewError) && (
+            <div className="rounded border border-claude-border bg-claude-surface p-3 space-y-2">
+              <div className="text-xs font-medium text-claude-text">保存前确认</div>
+              {preview ? (
+                <>
+                  <div className="text-xs text-claude-secondary">
+                    执行计划：<span className="text-claude-text">{preview.schedule_text}</span>
+                  </div>
+                  <div className="text-xs text-claude-secondary">
+                    Cron：<code className="text-claude-text">{preview.cron_expr}</code>
+                  </div>
+                  <div className="text-xs text-claude-secondary">未来五次执行：</div>
+                  <ol className="pl-5 text-xs text-claude-text list-decimal space-y-0.5">
+                    {preview.next_fires.map((fire) => (
+                      <li key={fire}>{new Date(fire).toLocaleString()}</li>
+                    ))}
+                  </ol>
+                </>
+              ) : (
+                <div className="text-xs text-red-600">{previewError}</div>
+              )}
+            </div>
+          )}
 
           {/* Enabled */}
           <label className="flex items-center gap-2 cursor-pointer">

@@ -17,11 +17,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from apscheduler.triggers.cron import CronTrigger
-
-from src.api.utils.timezone import get_timezone, now_naive
+from src.api.services.cron_engine import CronEngine, CronExpressionError
 
 
 class ScheduleError(ValueError):
@@ -49,7 +47,7 @@ def schedule_to_cron(schedule: dict) -> str:
 
     示例：
         {"kind": "daily", "time": "09:30"}                          → "30 9 * * *"
-        {"kind": "weekdays", "time": "09:30"}                       → "30 9 * * 0-4"
+        {"kind": "weekdays", "time": "09:30"}                       → "30 9 * * 1-5"
         {"kind": "weekly", "time": "09:30", "days": [1,3,5]}        → "30 9 * * 1,3,5"
         {"kind": "monthly", "time": "09:30", "dayOfMonth": 15}      → "30 9 15 * *"
         {"kind": "interval", "everyMinutes": 30}                    → "*/30 * * * *"
@@ -68,23 +66,38 @@ def schedule_to_cron(schedule: dict) -> str:
 
     if kind == "weekdays":
         h, m = _validate_time(schedule.get("time", ""))
-        # APScheduler day_of_week: 0=周一 .. 6=周日
-        return f"{m} {h} * * 0-4"
+        return f"{m} {h} * * 1-5"
 
     if kind == "weekly":
         h, m = _validate_time(schedule.get("time", ""))
         days = schedule.get("days")
-        # 注意：与 APScheduler CronTrigger 对齐 → 0=周一 .. 6=周日
         if not isinstance(days, list) or not days:
-            raise ScheduleError("weekly 必须提供非空 days 列表 (0=周一 .. 6=周日)")
+            raise ScheduleError("weekly 必须提供非空 days 列表 (0=周日, 1=周一 .. 6=周六)")
         norm_days: list[int] = []
         for d in days:
             if not isinstance(d, int) or not (0 <= d <= 6):
                 raise ScheduleError(f"weekly.days 元素必须为 0-6 整数: {d!r}")
             if d not in norm_days:
                 norm_days.append(d)
-        norm_days.sort()
-        return f"{m} {h} * * {','.join(str(d) for d in norm_days)}"
+        # 前端按周一到周日提交，保留该顺序；连续三天及以上压缩为范围。
+        order = [1, 2, 3, 4, 5, 6, 0]
+        ordered = [d for d in order if d in norm_days]
+        chunks: list[str] = []
+        run: list[int] = []
+        for day in ordered:
+            if day == 0:
+                if run:
+                    chunks.append(_format_day_run(run))
+                    run = []
+                chunks.append("0")
+            elif not run or day == run[-1] + 1:
+                run.append(day)
+            else:
+                chunks.append(_format_day_run(run))
+                run = [day]
+        if run:
+            chunks.append(_format_day_run(run))
+        return f"{m} {h} * * {','.join(chunks)}"
 
     if kind == "monthly":
         h, m = _validate_time(schedule.get("time", ""))
@@ -111,45 +124,57 @@ def schedule_to_cron(schedule: dict) -> str:
     raise ScheduleError(f"未知 schedule.kind: {kind!r}")
 
 
+def _format_day_run(days: list[int]) -> str:
+    if len(days) >= 3:
+        return f"{days[0]}-{days[-1]}"
+    return ",".join(str(day) for day in days)
+
+
+_DAY_NAMES = {
+    0: "周日",
+    1: "周一",
+    2: "周二",
+    3: "周三",
+    4: "周四",
+    5: "周五",
+    6: "周六",
+}
+
+
+def describe_schedule(schedule: dict | None, cron_expr: str | None = None) -> str:
+    """生成保存确认和工具回执使用的自然语言计划。"""
+    if not schedule:
+        return f"自定义计划（{cron_expr or ''}）"
+    kind = schedule.get("kind")
+    time_str = schedule.get("time", "")
+    if kind == "daily":
+        return f"每天 {time_str}"
+    if kind == "weekdays":
+        return f"周一至周五 {time_str}"
+    if kind == "weekly":
+        days = schedule.get("days") or []
+        ordered = [day for day in [1, 2, 3, 4, 5, 6, 0] if day in days]
+        if ordered == [2, 3, 4, 5, 6, 0]:
+            return f"周二至周日 {time_str}"
+        return f"{'、'.join(_DAY_NAMES[day] for day in ordered)} {time_str}"
+    if kind == "monthly":
+        return f"每月 {schedule.get('dayOfMonth')} 日 {time_str}"
+    if kind == "interval":
+        if schedule.get("everyMinutes") is not None:
+            return f"每 {schedule['everyMinutes']} 分钟"
+        return f"每 {schedule.get('everyHours')} 小时"
+    return f"自定义计划（{cron_expr or ''}）"
+
+
 def next_fire_at(cron_expr: str, n: int = 5, base: datetime | None = None) -> list[datetime]:
     """计算 cron 表达式接下来 n 次触发时间（本地时区 naive datetime）。
 
-    用于前端表单"未来 5 次执行预览"。借用 APScheduler 的 CronTrigger.get_next_fire_time。
+    用于前端表单"未来 5 次执行预览"。
 
     Raises:
         ScheduleError: cron 表达式非法。
     """
-    if n <= 0:
-        return []
-    parts = cron_expr.strip().split()
-    if len(parts) != 5:
-        raise ScheduleError(f"cron 表达式必须是 5 个字段: {cron_expr!r}")
-
-    tz = get_timezone()
     try:
-        trigger = CronTrigger(
-            minute=parts[0],
-            hour=parts[1],
-            day=parts[2],
-            month=parts[3],
-            day_of_week=parts[4],
-            timezone=tz,
-        )
-    except Exception as e:
-        raise ScheduleError(f"cron 表达式解析失败: {cron_expr!r}: {e}") from e
-
-    # 起始点：base 或当前本地时间，加 1 秒避开"当前正好命中"的边界
-    if base is None:
-        base = now_naive()
-    base_aware = base.replace(tzinfo=tz) + timedelta(seconds=1)
-
-    fires: list[datetime] = []
-    cur = base_aware
-    for _ in range(n):
-        nxt = trigger.get_next_fire_time(None, cur)
-        if nxt is None:
-            break
-        # 转回 naive 本地时间
-        fires.append(nxt.replace(tzinfo=None))
-        cur = nxt + timedelta(seconds=1)
-    return fires
+        return CronEngine.next_fires(cron_expr, base=base, count=n)
+    except CronExpressionError as exc:
+        raise ScheduleError(str(exc)) from exc
