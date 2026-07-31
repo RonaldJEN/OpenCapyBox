@@ -26,10 +26,8 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session as DBSession
 
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-
 from src.api.models.database import get_db
-from src.api.deps import get_current_user, verify_access_token
+from src.api.deps import get_current_user
 from src.api.services.cron_schedule import (
     ScheduleError,
     describe_schedule,
@@ -45,8 +43,6 @@ from src.api.services.cron_worker import trigger_manual_run
 from src.api.utils.sandbox_helpers import extract_command_stdout
 from src.api.models.user_memory import CronJobRun
 from src.api.utils.timezone import now_naive
-
-_bearer_optional = HTTPBearer(auto_error=False)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -376,21 +372,10 @@ async def list_run_files(
 async def download_run_file(
     run_id: str,
     file_path: str,
-    token: str | None = Query(None, description="Bearer token (用于浏览器直接下载)"),
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_optional),
+    user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    """下载/预览某次执行的产物文件
-
-    支持两种鉴权方式（浏览器 <a> 链接无法带 header）：
-    1. Authorization: Bearer <token>（标准方式）
-    2. ?token=<token>（URL 直接下载）
-    """
-    # 鉴权：header 优先，query param 兜底
-    raw_token = (credentials.credentials if credentials and credentials.scheme.lower() == "bearer" else None) or token
-    if not raw_token:
-        raise HTTPException(status_code=401, detail="未提供访问令牌")
-    user_id = verify_access_token(raw_token)
+    """使用统一用户鉴权下载或预览某次执行的产物文件。"""
     run = (
         db.query(CronJobRun)
         .filter(CronJobRun.id == run_id, CronJobRun.user_id == user_id)
