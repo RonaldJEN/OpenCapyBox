@@ -240,6 +240,10 @@ class Settings(BaseSettings):
     # 单次 tools/call 从 DNS、握手到结果返回的独立全流程墙钟期限。
     # 此安全边界始终开启，不受可关闭的 AGENT_TOOL_TIMEOUT 影响。
     mcp_call_timeout_seconds: float = 300.0
+    # 只重试尚未跨过 tools/call dispatch 边界的连接/初始化失败。
+    # attempts 包含首次尝试，避免任何已发送的远端操作被重复执行。
+    mcp_connect_retry_attempts: int = 3
+    mcp_connect_retry_base_delay_seconds: float = 0.5
     mcp_max_concurrent_discoveries_per_user: int = 8
     mcp_max_concurrent_discoveries_global: int = 16  # 单进程内、跨用户发现并发上限
     mcp_max_installations_per_user: int = 32
@@ -362,6 +366,22 @@ class Settings(BaseSettings):
     def validate_mcp_wall_clock_timeouts(cls, value: float) -> float:
         if not 0 < value <= 600:
             raise ValueError("MCP wall-clock timeouts must be > 0 and <= 600")
+        return value
+
+    @field_validator("mcp_connect_retry_attempts")
+    @classmethod
+    def validate_mcp_connect_retry_attempts(cls, value: int) -> int:
+        if value <= 0 or value > 10:
+            raise ValueError("mcp_connect_retry_attempts must be > 0 and <= 10")
+        return value
+
+    @field_validator("mcp_connect_retry_base_delay_seconds")
+    @classmethod
+    def validate_mcp_connect_retry_base_delay_seconds(cls, value: float) -> float:
+        if not 0 <= value <= 30:
+            raise ValueError(
+                "mcp_connect_retry_base_delay_seconds must be >= 0 and <= 30"
+            )
         return value
 
     @field_validator(

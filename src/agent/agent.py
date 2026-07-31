@@ -26,8 +26,9 @@ from .schema.run_context import (
 from .tools.base import Tool, ToolExposure, ToolResult, ToolRuntimeContext
 from .tools.ask_user_tool import ASK_USER_TOOL_NAME
 from .tools.tool_discovery import (
+    DeferredToolCatalogStale,
+    MCP_TOOL_SEARCH_NAME,
     MAX_TOOL_SEARCH_DESCRIPTION_BYTES,
-    TOOL_SEARCH_NAME,
     DeferredToolRetriever,
     ToolDiscoveryTool,
     ToolSearchDocument,
@@ -43,6 +44,9 @@ from .schema.agui_events import (
 logger = logging.getLogger(__name__)
 
 _TOOL_UNAVAILABLE_MESSAGE = "Tool is unavailable in this conversation"
+_DEFERRED_TOOL_RECOVERED_MESSAGE = (
+    "工具已重新加载，将从下一步骤开始可用；请重试该调用。"
+)
 _MAX_DEFERRED_TOOLS_PER_SESSION = 32
 _MAX_DEFERRED_TOOL_SESSIONS = 128
 
@@ -189,9 +193,9 @@ class Agent:
         # claimed human approval can still resume through its durable record.
         self._activated_deferred_tools: dict[str, dict[str, None]] = {}
         if any(tool.exposure == ToolExposure.DEFERRED for tool in self.tools.values()):
-            if TOOL_SEARCH_NAME in self.tools:
+            if MCP_TOOL_SEARCH_NAME in self.tools:
                 raise ValueError(
-                    f"{TOOL_SEARCH_NAME!r} is reserved when deferred tools are registered"
+                    f"{MCP_TOOL_SEARCH_NAME!r} is reserved when deferred tools are registered"
                 )
             discovery_tool = ToolDiscoveryTool(self._discover_deferred_tools)
             self.tools[discovery_tool.name] = discovery_tool
@@ -660,19 +664,24 @@ class Agent:
         has_mcp_candidates = any(
             tool.tool_ref.provider == "mcp" for tool in deferred_tools
         )
+        mcp_catalog_stale = False
 
         def mcp_catalog_is_current() -> bool:
+            nonlocal mcp_catalog_stale
             guard = self._deferred_tool_catalog_is_current
             if guard is None or not has_mcp_candidates:
                 return True
             try:
-                return bool(guard())
+                current = bool(guard())
             except Exception:
                 logger.warning(
                     "Deferred MCP catalog freshness check failed; hiding MCP candidates",
                     exc_info=True,
                 )
-                return False
+                current = False
+            if not current:
+                mcp_catalog_stale = True
+            return current
 
         # Exact-name discovery must obey the same live publication boundary as
         # semantic retrieval. A stale Agent may keep non-MCP deferred tools,
@@ -818,6 +827,8 @@ class Agent:
         ]
 
         selected = matches[:limit]
+        if not selected and mcp_catalog_stale:
+            raise DeferredToolCatalogStale
         if selected:
             active = self._activated_deferred_tools.get(session_id)
             if active is None:
@@ -843,6 +854,42 @@ class Agent:
             }
             for tool in selected
         ]
+
+    async def _recover_deferred_tool_for_next_step(
+        self,
+        *,
+        tool: Tool,
+        session_id: str,
+    ) -> bool:
+        """Cold-recover one exact deferred tool without executing its stale call."""
+
+        if tool.exposure != ToolExposure.DEFERRED:
+            return False
+        try:
+            matches = await self._discover_deferred_tools(
+                session_id=session_id,
+                query="",
+                names=[tool.name],
+                limit=1,
+            )
+        except Exception:
+            logger.warning(
+                "Deferred tool cold recovery failed: user=%s session=%s tool=%s",
+                self.user_id,
+                session_id,
+                tool.name,
+                exc_info=True,
+            )
+            return False
+        recovered = any(item.get("model_name") == tool.name for item in matches)
+        logger.info(
+            "Deferred tool cold recovery: user=%s session=%s tool=%s recovered=%s",
+            self.user_id,
+            session_id,
+            tool.name,
+            recovered,
+        )
+        return recovered
 
     def _visible_tools_for_request(self, session_id: str) -> list[Tool]:
         exposure_visible = [
@@ -3164,8 +3211,26 @@ Rules:
                     tool = self.tools.get(function_name)
                     # Only tools projected in the exact request that produced
                     # this response may run. This prevents same-response
-                    # tool_search activation and hallucinated special tools.
-                    if tool is None or function_name not in request_tools_snapshot:
+                    # mcp_tool_search activation and hallucinated special tools.
+                    # A known deferred name may come from durable conversation
+                    # history after an Agent/transport cold rebuild. Re-run the
+                    # exact discovery checks, but keep this stale call blocked;
+                    # the refreshed schema is projected only on the next step.
+                    deferred_recovered = False
+                    if (
+                        tool is not None
+                        and tool.exposure == ToolExposure.DEFERRED
+                        and function_name not in request_tools_snapshot
+                    ):
+                        deferred_recovered = (
+                            await self._recover_deferred_tool_for_next_step(
+                                tool=tool,
+                                session_id=thread_id,
+                            )
+                        )
+                    if deferred_recovered:
+                        exposure_error = _DEFERRED_TOOL_RECOVERED_MESSAGE
+                    elif tool is None or function_name not in request_tools_snapshot:
                         exposure_error = _TOOL_UNAVAILABLE_MESSAGE
                     else:
                         exposure_error = self._exposure_execution_error(

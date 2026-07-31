@@ -1164,14 +1164,14 @@ def test_permission_inventory_hides_disabled_official_tools(
     assert create.status_code == 404
 
 
-def test_permission_inventory_exposes_dynamic_tool_search(
+def test_permission_inventory_exposes_mcp_tool_search(
     permission_client: TestClient,
 ):
     created = permission_client.post(
         "/permissions/rules",
         json={
             "provider": "builtin",
-            "tool_name": "tool_search",
+            "tool_name": "mcp_tool_search",
             "effect": "deny",
         },
     )
@@ -1179,15 +1179,15 @@ def test_permission_inventory_exposes_dynamic_tool_search(
 
     inventory = permission_client.get("/permissions/tools")
     assert inventory.status_code == 200, inventory.text
-    tool_search = next(
+    mcp_tool_search = next(
         item
         for item in inventory.json()["tools"]
-        if item["tool_ref"] == "builtin:tool_search"
+        if item["tool_ref"] == "builtin:mcp_tool_search"
     )
-    assert tool_search["tool_name"] == "tool_search"
-    assert tool_search["description"] == "搜索并加载按需工具"
-    assert tool_search["effect"] == "deny"
-    assert tool_search["matched_rule_id"] == created.json()["id"]
+    assert mcp_tool_search["tool_name"] == "mcp_tool_search"
+    assert mcp_tool_search["description"] == "搜索并加载 MCP 工具"
+    assert mcp_tool_search["effect"] == "deny"
+    assert mcp_tool_search["matched_rule_id"] == created.json()["id"]
 
 
 def test_permission_inventory_batches_policy_queries_and_truncates_descriptions(

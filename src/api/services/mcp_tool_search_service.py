@@ -12,8 +12,10 @@ import weakref
 from collections import Counter
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import lru_cache
 from typing import Awaitable, Callable
 
+import jieba
 from sqlalchemy import bindparam, cast, or_, tuple_
 from sqlalchemy.orm import load_only
 
@@ -42,14 +44,15 @@ _MAX_SERVER_NAME_BYTES = 255
 _MAX_SERVER_DESCRIPTION_BYTES = 1024
 _MAX_TOOL_NAME_BYTES = 255
 _MAX_TOOL_TITLE_BYTES = 512
-_RRF_K = 60
+_RRF_K = 10
+_SPARSE_RRF_WEIGHT = 0.25
+_DENSE_RRF_WEIGHT = 1.0
 _SEMANTIC_MIN_SCORE = 0.25
 _INDEX_LEASE_SECONDS = 120
 _INDEX_RETRY_SECONDS = 60
-_EMBEDDING_DOCUMENTS_PER_REQUEST = 64
+_EMBEDDING_DOCUMENTS_PER_REQUEST = 8
 _INDEX_WARMUP_DOCUMENTS_PER_SEARCH = 256
 _MAX_CONCURRENT_INDEX_WARMUPS = 2
-_INDEX_WARMUP_SLOT_WAIT_SECONDS = 0.05
 
 _INDEX_WARMUP_SEMAPHORES: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop,
@@ -65,18 +68,6 @@ def _index_warmup_semaphore() -> asyncio.Semaphore:
     if semaphore is None:
         semaphore = asyncio.Semaphore(_MAX_CONCURRENT_INDEX_WARMUPS)
         _INDEX_WARMUP_SEMAPHORES[loop] = semaphore
-    return semaphore
-
-
-async def _try_acquire_index_warmup_slot() -> asyncio.Semaphore | None:
-    semaphore = _index_warmup_semaphore()
-    try:
-        await asyncio.wait_for(
-            semaphore.acquire(),
-            timeout=_INDEX_WARMUP_SLOT_WAIT_SECONDS,
-        )
-    except TimeoutError:
-        return None
     return semaphore
 
 
@@ -259,11 +250,48 @@ def _prepare_candidate(document: ToolSearchDocument) -> _PreparedCandidate:
     )
 
 
+def _segment_terms(value: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for chunk in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", value.casefold()):
+        if "\u4e00" <= chunk[0] <= "\u9fff":
+            tokens.extend(
+                term.strip()
+                for term in jieba.cut_for_search(chunk)
+                if term.strip()
+            )
+        else:
+            tokens.append(chunk)
+    return tuple(tokens)
+
+
+@lru_cache(maxsize=16_384)
+def _tokenize_cached(value: str) -> tuple[str, ...]:
+    """Cache segmentation only for bounded, reusable tool metadata."""
+
+    return _segment_terms(value)
+
+
 def _tokenize(value: str) -> list[str]:
-    return re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", value.casefold())
+    """Tokenize one query without retaining user text in the process cache."""
+
+    return list(_segment_terms(value))
 
 
-def _keyword_ranking(candidates: list[_PreparedCandidate], query: str) -> list[str]:
+def _warm_sparse_cache(candidates: list[ToolSearchDocument]) -> None:
+    for document in candidates:
+        for value in (
+            document.tool_name,
+            document.title,
+            document.server_name,
+            document.server_description,
+            document.description,
+        ):
+            _tokenize_cached(value)
+
+
+def _sparse_ranking(candidates: list[_PreparedCandidate], query: str) -> list[str]:
+    """Rank the current candidate set with field-weighted BM25."""
+
     query_terms = list(dict.fromkeys(_tokenize(query)))
     if not query_terms or not candidates:
         return []
@@ -279,7 +307,7 @@ def _keyword_ranking(candidates: list[_PreparedCandidate], query: str) -> list[s
             (document.server_description, 1),
             (document.description, 1),
         ):
-            for term, count in Counter(_tokenize(value)).items():
+            for term, count in Counter(_tokenize_cached(value)).items():
                 counts[term] += count * weight
         weighted_terms.append(counts)
 
@@ -320,15 +348,18 @@ def _keyword_ranking(candidates: list[_PreparedCandidate], query: str) -> list[s
 
 
 def _rrf_ranking(
-    keyword_names: list[str],
-    semantic_names: list[str],
+    sparse_names: list[str],
+    dense_names: list[str],
     *,
     limit: int,
 ) -> list[str]:
     scores: dict[str, float] = {}
-    for ranking in (keyword_names, semantic_names):
+    for ranking, weight in (
+        (sparse_names, _SPARSE_RRF_WEIGHT),
+        (dense_names, _DENSE_RRF_WEIGHT),
+    ):
         for rank, model_name in enumerate(ranking, start=1):
-            scores[model_name] = scores.get(model_name, 0.0) + 1.0 / (
+            scores[model_name] = scores.get(model_name, 0.0) + weight / (
                 _RRF_K + rank
             )
     return [
@@ -511,6 +542,54 @@ class SqlAlchemyMcpToolSearchRepository:
                 ).update(values, synchronize_session=False)
             db.commit()
 
+    def index_complete(
+        self,
+        candidates: list[_PreparedCandidate],
+        *,
+        model_fingerprint: str,
+    ) -> bool:
+        keyed = {candidate.key: candidate for candidate in candidates if candidate.key}
+        if len(keyed) != len(candidates):
+            return False
+        if not keyed:
+            return True
+        with self._session_factory() as db:
+            rows = (
+                db.query(
+                    McpToolSearchIndex.installation_id,
+                    McpToolSearchIndex.tool_name,
+                    McpToolSearchIndex.search_document_hash,
+                    McpToolSearchIndex.embedded_document_hash,
+                    McpToolSearchIndex.schema_hash,
+                    McpToolSearchIndex.connection_fingerprint,
+                )
+                .filter(
+                    self._key_filter(list(keyed)),
+                    McpToolSearchIndex.embedding.isnot(None),
+                    McpToolSearchIndex.embedding_model_fingerprint
+                    == model_fingerprint,
+                )
+                .all()
+            )
+        valid_keys: set[tuple[str, str]] = set()
+        for row in rows:
+            key = (str(row.installation_id), str(row.tool_name))
+            candidate = keyed.get(key)
+            if candidate is None:
+                continue
+            document = candidate.document
+            if (
+                str(row.search_document_hash or "")
+                == candidate.search_document_hash
+                and str(row.embedded_document_hash or "")
+                == candidate.search_document_hash
+                and str(row.schema_hash or "") == document.schema_hash
+                and str(row.connection_fingerprint or "")
+                == document.connection_fingerprint
+            ):
+                valid_keys.add(key)
+        return len(valid_keys) == len(keyed)
+
     def vector_ranking(
         self,
         query_vector: list[float],
@@ -519,6 +598,24 @@ class SqlAlchemyMcpToolSearchRepository:
         model_fingerprint: str,
         min_score: float,
     ) -> list[str]:
+        return [
+            model_name
+            for model_name, _score in self.vector_scoring(
+                query_vector,
+                candidates,
+                model_fingerprint=model_fingerprint,
+                min_score=min_score,
+            )
+        ]
+
+    def vector_scoring(
+        self,
+        query_vector: list[float],
+        candidates: list[_PreparedCandidate],
+        *,
+        model_fingerprint: str,
+        min_score: float,
+    ) -> list[tuple[str, float]]:
         keyed = {candidate.key: candidate for candidate in candidates if candidate.key}
         if not keyed:
             return []
@@ -573,7 +670,7 @@ class SqlAlchemyMcpToolSearchRepository:
             if math.isfinite(score) and score >= min_score:
                 ranked.append((score, document.model_name))
         ranked.sort(key=lambda item: (-item[0], item[1]))
-        return [model_name for _score, model_name in ranked]
+        return [(model_name, score) for score, model_name in ranked]
 
 
 class McpToolSearchService:
@@ -592,6 +689,7 @@ class McpToolSearchService:
         self._repository = repository
         self._embedding_provider = embedding_provider or self._generate_embeddings
         self._config_provider = config_provider or resolve_embedding_request_config
+        self._warmup_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
     async def _generate_embeddings(
@@ -599,6 +697,89 @@ class McpToolSearchService:
         config: EmbeddingRequestConfig,
     ) -> list[list[float] | None]:
         return await generate_embeddings(texts, config=config)
+
+    def schedule_warmup(self, candidates: list[ToolSearchDocument]) -> None:
+        """Precompute tool vectors after a successful MCP catalog refresh."""
+
+        if not candidates:
+            return
+        task = asyncio.create_task(self.warm_candidates(candidates))
+        self._warmup_tasks.add(task)
+
+        def _finished(done: asyncio.Task[None]) -> None:
+            self._warmup_tasks.discard(done)
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.warning("MCP 工具索引后台预热失败", exc_info=True)
+
+        task.add_done_callback(_finished)
+
+    async def warm_candidates(
+        self,
+        candidates: list[ToolSearchDocument],
+    ) -> None:
+        """Warm sparse tokens and generate missing dense document vectors."""
+
+        _warm_sparse_cache(candidates)
+        prepared_by_key = {
+            candidate.key: candidate
+            for candidate in (_prepare_candidate(item) for item in candidates)
+            if candidate.key is not None
+        }
+        prepared = list(prepared_by_key.values())
+        if not prepared:
+            return
+        try:
+            config = self._config_provider()
+        except Exception:
+            logger.warning("Embedding 配置不可用，跳过 MCP 工具索引预热")
+            return
+        if config is None:
+            return
+
+        semaphore = _index_warmup_semaphore()
+        async with semaphore:
+            while True:
+                claims = self._repository.claim_missing(
+                    prepared,
+                    model_fingerprint=config.identity,
+                )
+                if not claims:
+                    return
+                claim_batches = [
+                    claims[index : index + _EMBEDDING_DOCUMENTS_PER_REQUEST]
+                    for index in range(0, len(claims), _EMBEDDING_DOCUMENTS_PER_REQUEST)
+                ]
+                vectors: list[list[float] | None] = []
+                for batch in claim_batches:
+                    try:
+                        generated = await self._embedding_provider(
+                            [claim.candidate.search_document for claim in batch],
+                            config,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "MCP 工具索引 embedding 批次失败，稍后重试: %s",
+                            exc,
+                        )
+                        values: list[object] = [None] * len(batch)
+                    else:
+                        if len(generated) == len(batch):
+                            values = list(generated)
+                        else:
+                            logger.warning(
+                                "MCP 工具索引 embedding 批次结果数量异常，稍后重试"
+                            )
+                            values = [None] * len(batch)
+                    vectors.extend(_normalize_valid_vector(value) for value in values)
+                self._repository.finalize_claims(
+                    claims,
+                    vectors,
+                    model_fingerprint=config.identity,
+                )
 
     async def rank(
         self,
@@ -608,7 +789,7 @@ class McpToolSearchService:
         limit: int,
     ) -> list[str]:
         prepared = [_prepare_candidate(candidate) for candidate in candidates]
-        keyword_names = _keyword_ranking(prepared, query)
+        sparse_names = _sparse_ranking(prepared, query)
         bounded_limit = max(1, min(int(limit), len(prepared))) if prepared else 0
         if not prepared or bounded_limit == 0:
             return []
@@ -616,110 +797,42 @@ class McpToolSearchService:
         try:
             config = self._config_provider()
         except Exception:
-            logger.warning("Embedding 配置不可用，MCP 工具检索降级为关键词排序")
+            logger.warning("Embedding 配置不可用，MCP 工具检索降级为 BM25")
             config = None
         if config is None:
-            return keyword_names[:bounded_limit]
+            return sparse_names[:bounded_limit]
 
-        warmup_semaphore: asyncio.Semaphore | None = None
         try:
-            warmup_semaphore = await _try_acquire_index_warmup_slot()
-            claims = (
-                self._repository.claim_missing(
-                    prepared,
-                    model_fingerprint=config.identity,
-                )
-                if warmup_semaphore is not None
-                else []
-            )
-            if warmup_semaphore is not None and not claims:
-                warmup_semaphore.release()
-                warmup_semaphore = None
-            document_claim_batches = [
-                claims[index : index + _EMBEDDING_DOCUMENTS_PER_REQUEST]
-                for index in range(0, len(claims), _EMBEDDING_DOCUMENTS_PER_REQUEST)
-            ]
-            embedding_inputs_by_batch = [[query]] + [
-                [claim.candidate.search_document for claim in claim_batch]
-                for claim_batch in document_claim_batches
-            ]
-            generated_batches = await asyncio.gather(
-                *(
-                    self._embedding_provider(inputs, config)
-                    for inputs in embedding_inputs_by_batch
-                ),
-                return_exceptions=True,
-            )
-
-            query_generated = generated_batches[0]
-            if isinstance(query_generated, BaseException):
-                if not isinstance(query_generated, Exception):
-                    raise query_generated
-                logger.warning(
-                    "MCP 工具查询 embedding 失败，降级为关键词排序: %s",
-                    query_generated,
-                )
-                query_vector = None
-            elif len(query_generated) != 1:
-                logger.warning("MCP 工具查询 embedding 结果数量异常，降级为关键词排序")
+            if not self._repository.index_complete(
+                prepared,
+                model_fingerprint=config.identity,
+            ):
+                return sparse_names[:bounded_limit]
+            query_generated = await self._embedding_provider([query], config)
+            if len(query_generated) != 1:
+                logger.warning("MCP 工具查询 embedding 结果数量异常，降级为 BM25")
                 query_vector = None
             else:
                 query_vector = _normalize_valid_vector(query_generated[0])
-
-            document_vectors: list[list[float] | None] = []
-            for claim_batch, inputs, generated in zip(
-                document_claim_batches,
-                embedding_inputs_by_batch[1:],
-                generated_batches[1:],
-            ):
-                if isinstance(generated, BaseException):
-                    if not isinstance(generated, Exception):
-                        raise generated
-                    logger.warning(
-                        "MCP 工具索引 embedding 批次失败，稍后重试: %s",
-                        generated,
-                    )
-                    values: list[object] = [None] * len(inputs)
-                elif len(generated) != len(inputs):
-                    logger.warning(
-                        "MCP 工具索引 embedding 批次结果数量异常，稍后重试"
-                    )
-                    values = [None] * len(inputs)
-                else:
-                    values = list(generated)
-                document_vectors.extend(
-                    _normalize_valid_vector(value) for value in values
-                )
-            self._repository.finalize_claims(
-                claims,
-                document_vectors,
-                model_fingerprint=config.identity,
-            )
-            if warmup_semaphore is not None:
-                warmup_semaphore.release()
-                warmup_semaphore = None
             if query_vector is None:
-                return keyword_names[:bounded_limit]
-            semantic_names = self._repository.vector_ranking(
+                return sparse_names[:bounded_limit]
+            dense_names = self._repository.vector_ranking(
                 query_vector,
                 prepared,
                 model_fingerprint=config.identity,
                 min_score=_SEMANTIC_MIN_SCORE,
             )
         except Exception:
-            logger.warning("MCP 工具语义检索失败，降级为关键词排序", exc_info=True)
-            return keyword_names[:bounded_limit]
-        finally:
-            if warmup_semaphore is not None:
-                warmup_semaphore.release()
+            logger.warning("MCP 工具语义检索失败，降级为 BM25", exc_info=True)
+            return sparse_names[:bounded_limit]
 
         allowed_names = {candidate.document.model_name for candidate in prepared}
-        semantic_names = [
-            name for name in semantic_names if name in allowed_names
+        dense_names = [
+            name for name in dense_names if name in allowed_names
         ]
         return _rrf_ranking(
-            keyword_names,
-            semantic_names,
+            sparse_names,
+            dense_names,
             limit=bounded_limit,
         )
 

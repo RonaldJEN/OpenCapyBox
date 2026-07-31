@@ -234,7 +234,7 @@
 ```json
 {
   "type": "TOOL_CALL_CHUNK",
-  "toolCallId": "tool_search_001",
+  "toolCallId": "mcp_tool_search_001",
   "toolCallName": "web_search",
   "delta": "{\"query\":\"AG-UI protocol\",\"limit\":10}",
   "timestamp": 1699000110000

@@ -19,6 +19,7 @@ dependencies = [
     "cryptography>=42.0.0",
     "jsonschema>=4.23.0,<5.0.0",
     "mcp>=1.24.0,<2.0.0",
+    "jieba>=0.42.1,<0.43.0",
     "tiktoken>=0.5.0",
     "prompt-toolkit>=3.0.0",
     # LLM Clients

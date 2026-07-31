@@ -11,6 +11,8 @@ from src.api.services.embedding_service import (
 from src.api.services.mcp_tool_search_service import (
     McpToolSearchService,
     _prepare_candidate,
+    _rrf_ranking,
+    _tokenize,
 )
 
 
@@ -35,16 +37,17 @@ def _document(
 
 
 class FakeRepository:
-    def __init__(self, semantic_names=None, claims=None):
+    def __init__(self, semantic_names=None, claims=None, *, complete=True):
         self.semantic_names = list(semantic_names or [])
         self.claims = list(claims or [])
+        self.complete = complete
         self.claim_calls = 0
         self.vector_calls = 0
         self.finalized = []
 
     def claim_missing(self, candidates, *, model_fingerprint):
         self.claim_calls += 1
-        return list(self.claims)
+        return list(self.claims) if self.claim_calls == 1 else []
 
     def finalize_claims(self, claims, vectors, *, model_fingerprint):
         self.finalized.append((claims, vectors, model_fingerprint))
@@ -59,6 +62,9 @@ class FakeRepository:
     ):
         self.vector_calls += 1
         return list(self.semantic_names)
+
+    def index_complete(self, candidates, *, model_fingerprint):
+        return self.complete
 
 
 def _embedding_config() -> EmbeddingRequestConfig:
@@ -137,7 +143,8 @@ async def test_hybrid_search_rrf_rewards_overlap_between_rankings():
         limit=3,
     )
 
-    assert ranked == ["b", "a", "c"]
+    assert ranked[0] == "b"
+    assert set(ranked) == {"a", "b", "c"}
 
 
 @pytest.mark.asyncio
@@ -204,7 +211,7 @@ async def test_hybrid_search_discards_unknown_vector_result():
 
 
 @pytest.mark.asyncio
-async def test_hybrid_search_batches_cold_index_documents():
+async def test_registration_warmup_batches_tool_index_documents():
     documents = [
         _document(f"tool-{index}", f"capability {index}")
         for index in range(130)
@@ -228,15 +235,37 @@ async def test_hybrid_search_batches_cold_index_documents():
         config_provider=_embedding_config,
     )
 
-    ranked = await service.rank("semantic query", documents, limit=1)
+    await service.warm_candidates(documents)
 
-    assert ranked == ["tool-129"]
     request_sizes = [len(call.args[0]) for call in provider.await_args_list]
-    assert request_sizes[0] == 1
-    assert sorted(request_sizes[1:]) == [2, 64, 64]
+    assert sorted(request_sizes) == [2] + ([8] * 16)
     assert len(repository.finalized) == 1
     assert len(repository.finalized[0][0]) == 130
     assert len(repository.finalized[0][1]) == 130
+
+
+@pytest.mark.asyncio
+async def test_incomplete_tool_index_uses_lexical_without_query_embedding():
+    repository = FakeRepository(["semantic-only"], complete=False)
+    provider = AsyncMock(return_value=[[1.0, 0.0, 0.0]])
+    service = McpToolSearchService(
+        repository,
+        embedding_provider=provider,
+        config_provider=_embedding_config,
+    )
+
+    ranked = await service.rank(
+        "stock realtime",
+        [
+            _document("history", "stock history"),
+            _document("realtime", "stock realtime quotes"),
+        ],
+        limit=2,
+    )
+
+    assert ranked == ["realtime", "history"]
+    provider.assert_not_awaited()
+    assert repository.vector_calls == 0
 
 
 @pytest.mark.asyncio
@@ -267,6 +296,57 @@ async def test_hybrid_search_invalid_query_vectors_fall_back_to_lexical(generate
     )
 
     assert ranked == ["realtime", "history"]
+
+
+def test_chinese_sparse_tokenizer_uses_jieba_search_terms():
+    tokens = _tokenize("调研上市公司的员工持股计划")
+
+    assert "上市公司" in tokens
+    assert "员工" in tokens
+    assert "持股" in tokens
+    assert "计划" in tokens
+    assert "公" not in tokens
+
+
+def test_rrf_sparse_signal_boosts_dense_candidate_into_top_k():
+    sparse = ["overlap", "sparse-2", "sparse-3", "sparse-4", "sparse-5"]
+    dense = [
+        "dense-1",
+        "dense-2",
+        "dense-3",
+        "dense-4",
+        "dense-5",
+        "overlap",
+    ]
+
+    ranked = _rrf_ranking(sparse, dense, limit=5)
+
+    assert "overlap" in ranked
+    assert "dense-5" not in ranked
+
+
+@pytest.mark.asyncio
+async def test_generic_sparse_search_does_not_require_domain_rules():
+    service = McpToolSearchService(
+        FakeRepository(),
+        config_provider=lambda: None,
+    )
+    document = ToolSearchDocument(
+        model_name="docs-search",
+        provider="mcp",
+        tool_name="docs-search",
+        installation_id="docs-installation",
+        server_name="Acme Knowledge",
+        server_description="企业知识库",
+        title="文档检索",
+        description="搜索内部文档、制度和项目资料",
+        schema_hash="schema-docs-search",
+        connection_fingerprint="docs-connection",
+    )
+
+    ranked = await service.rank("在 Acme Knowledge 里搜索项目资料", [document], limit=5)
+
+    assert ranked == ["docs-search"]
 
 
 @pytest.mark.asyncio

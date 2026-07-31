@@ -122,12 +122,14 @@
 - 网络发现完成、写缓存前再次采样 config generation 并重读完整 effective-installation 集合；前后不一致即拒绝混合代际目录
 - 成功贡献至少一个可见工具的连接会附带紧凑路由摘要（连接名 + 配置说明），由 Agent 仅在请求级 system 副本中列出；不得包含 URL、凭证或远端工具 schema，也不得写入长期消息历史
 
-#### 4.3.1 `tool_search` 混合检索
+#### 4.3.1 `mcp_tool_search` 混合检索
 - 候选集合的唯一权威来源是当前 Agent 已装配且 exposure 为 `DEFERRED` 的工具；数据库中的旧快照、已隐藏工具、其他用户或其他 Agent 的索引行不能自行成为候选
-- 精确 `model_name` 始终优先；自然语言 query 使用字段加权 BM25 与 pgvector 余弦相似度并行排序，再以 RRF 融合。关键词匹配采用部分召回，不要求所有词同时命中
+- 精确 `model_name` 始终优先；自然语言 query 使用 jieba 搜索模式分词后的字段加权 BM25（sparse）与 pgvector 余弦相似度（dense）并行排序，再以加权 RRF 融合。关键词匹配采用部分召回，不要求所有词同时命中
+- 通用检索层不得写入特定 MCP、行业、工具或自然语言意图词表，也不得以业务关键词白名单/黑名单过滤候选；新 MCP 仅依赖其注册名称、连接说明、工具标题和工具描述参与同一套检索
+- 当前 RRF 参数由三组 Recall@5 样本联合网格搜索得到：`k=10`、sparse 权重 `0.25`、dense 权重 `1.0`；sparse 主要提升与 dense 同时命中的精确候选，避免长工具说明仅凭词频垄断 Top 5
 - 调用 embedding 前先校验 Agent 的 MCP catalog fingerprint，并按当前用户/session 批量过滤 DENY，以及非交互 Agent 无法处理的 ASK；异步检索返回后再次校验目录代次与权限，且丢弃不属于原候选集合的任何 ID，最后才应用 `limit` 并激活工具
-- 快照事务只同步派生索引的文档与身份，不在锁内发起网络请求；缺失向量由检索服务通过 `FOR UPDATE SKIP LOCKED` 租约渐进生成，单次搜索最多预热 256 个文档、每个 embedding 请求最多 64 个文档，未变化的向量可跨快照刷新保留
-- embedding 请求只发送用户 query 与上述有界检索文档；使用配置的 embedding 服务，因此其数据边界与记忆语义检索相同
+- 快照事务只同步派生索引的文档与身份，不在锁内发起网络请求；目录注册或刷新成功后，后台任务预热 jieba 工具元数据缓存，并通过 `FOR UPDATE SKIP LOCKED` 租约生成缺失的工具文档向量，每个 embedding 请求最多 8 个文档，未变化的向量可跨快照刷新保留
+- 在线搜索不重新生成工具文档向量；只有完整索引可用时才为当前 query 生成一次 embedding 并执行 dense 检索。embedding 使用配置的共享服务，因此其数据边界与记忆语义检索相同
 - embedding 未配置、索引尚未完成、API/向量数据库失败或结果不合法时，稳定降级为纯关键词排序；向量写入不递增 MCP config version，避免 Agent 重建风暴
 
 ### 4.4 快照与执行绑定
@@ -136,6 +138,10 @@
 - `schema_hash` + `connection_fingerprint` 构成权限「记住选择」的绑定条件（见 tool-permission-spec §4.3）
 - `tools/list` 网络 I/O 不持数据库锁；返回后按 server → installation 顺序获取行锁，锁内重新解析当前有效 server/credential/installation 并比较 discovery 时的 `execution_fingerprint`
 - `replace_tool_snapshots` 是 CAS：仅当前指纹与全部待写快照身份一致时替换并返回 `true`；连接在 discovery 期间变化则返回 `false`，调用方必须抛 stale，且不得返回或缓存迟到的旧目录
+- 每次 `tools/call` 使用独立 Streamable HTTP session。连接、TLS 或 initialize 在 dispatch 前失败时按配置进行指数退避尝试：默认共 3 次、最多 10 次（均含首次尝试），并始终受外层 discovery / call 墙钟期限约束；进入 `session.call_tool` 后即视为可能已发送，响应 SSE 断开、超时或取消均不得重放业务调用
+- transport 退出与 HTTP client 关闭使用有界清理；断流 session ID 不得被后续调用复用。下一次调用必须重新解析 DNS、建立连接并 initialize
+- `tools/list` 是只读发现操作，响应流中断时可用全新 session 整体重试；只有完整成功的结果才能进入快照 CAS
+- Agent 冷重建后若模型调用当前目录中存在但未激活的 deferred 工具，允许按精确名称复用同一发现、目录新鲜度与权限检查来恢复；触发恢复的旧调用仍被阻止，完整 schema 只从下一模型步骤开始暴露
 
 ### 4.5 测试探针的并发一致性
 - 探针发起前提交并释放行锁，**绝不跨网络 I/O 持有锁**
@@ -164,9 +170,13 @@
 | 迟到 discovery 的 execution fingerprint 已变化 | CAS 拒绝快照，结果不返回、不缓存，后续按新代次重试 |
 | optional MCP 发现失败/超时/超预算/名称碰撞 | 跳过该整服务并记录脱敏错误；required 与其他 optional 继续可用 |
 | required 集合自身超出目录限制或 deadline | 整体失败并抛 `McpRequiredServerUnavailable` |
-| embedding 未配置、超时、返回无效向量或 pgvector 查询失败 | `tool_search` 降级为字段加权关键词排序，不影响 MCP 目录与工具执行 |
+| embedding 未配置、超时、返回无效向量或 pgvector 查询失败 | `mcp_tool_search` 降级为字段加权关键词排序，不影响 MCP 目录与工具执行 |
 | 检索器返回隐藏、跨用户或不在当前 Agent 目录中的工具 ID | 丢弃该结果；不得展示、激活或执行 |
 | embedding 等待期间 MCP catalog fingerprint 变化 | 本次不返回或激活旧 Agent 中的 MCP 工具，等待 Agent 按新目录重建 |
+| 连接 / TLS / initialize 在 dispatch 前失败 | 新 session 指数退避重试；耗尽后返回“连接暂时不可用，可安全重试” |
+| `tools/call` dispatch 后响应 SSE 中断 | 关闭并丢弃当前 session，返回 outcome unknown，绝不自动重试该调用；后续调用使用全新 session |
+| `tools/list` 响应中断 | 丢弃本次不完整结果，以全新 session 有界重试，不写半截快照 |
+| Agent 冷重建后调用已知 deferred 工具 | 精确再发现成功则下一步骤恢复；隐藏、DENY、已删除或旧目录工具继续不可用 |
 | `expected_revision` 不匹配 | 409，前端重载后需重新编辑 |
 | 凭证损坏无法解密 | 该 installation 标记 configuration_error，工具不暴露（fail-closed） |
 | 导入超过 100 个 | 校验失败，整体拒绝 |

@@ -17,7 +17,7 @@ import logging
 import re
 import weakref
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from time import time
@@ -65,6 +65,7 @@ _MAX_INSTALLATION_CATALOG_BYTES = 4 * 1024 * 1024
 _MAX_TOOL_CURSOR_BYTES = 4096
 _MAX_MCP_CALL_TIMEOUT_SECONDS = 600.0
 _CALL_CANCEL_DRAIN_TIMEOUT_SECONDS = 1.0
+_TRANSPORT_CLEANUP_TIMEOUT_SECONDS = 0.8
 _MCP_SETTINGS = get_settings()
 _MAX_CONCURRENT_MCP_DISCOVERIES = int(
     _MCP_SETTINGS.mcp_max_concurrent_discoveries_per_user
@@ -99,6 +100,10 @@ def _global_discovery_semaphore() -> asyncio.Semaphore:
 
 class McpRuntimeError(RuntimeError):
     """Base error raised by the MCP runtime boundary."""
+
+
+class McpConnectionUnavailable(McpRuntimeError):
+    """A transport failed before an MCP operation crossed its dispatch boundary."""
 
 
 class McpRequiredServerUnavailable(McpRuntimeError):
@@ -240,6 +245,7 @@ class McpCatalogSnapshot:
     tools: tuple[McpToolSnapshot, ...]
     errors: tuple[str, ...] = ()
     connections: tuple[McpConnectionSummary, ...] = ()
+    configuration_fingerprint: str = ""
 
 
 @dataclass
@@ -259,6 +265,8 @@ class McpRepository(Protocol):
     ) -> EffectiveMcpInstallation | None: ...
 
     def catalog_fingerprint(self, user_id: str) -> str: ...
+
+    def catalog_configuration_fingerprint(self, user_id: str) -> str: ...
 
     def load_tool_snapshots(self, installation: EffectiveMcpInstallation) -> list[McpToolSnapshot]: ...
 
@@ -734,6 +742,7 @@ def _catalog_snapshot_size_bytes(snapshot: McpCatalogSnapshot) -> int:
     return _json_size_bytes({
         "user_id": snapshot.user_id,
         "fingerprint": snapshot.fingerprint,
+        "configuration_fingerprint": snapshot.configuration_fingerprint,
         "errors": snapshot.errors,
         "connections": [
             {
@@ -997,9 +1006,33 @@ def _secure_http_client(
 class _SdkSessionConnector:
     """Thin compatibility adapter for the official MCP Python SDK v1.x."""
 
-    def __init__(self, *, connect_timeout: float = 15.0, read_timeout: float = 300.0):
+    def __init__(
+        self,
+        *,
+        connect_timeout: float = 15.0,
+        read_timeout: float = 300.0,
+        connect_retry_attempts: int | None = None,
+        connect_retry_base_delay_seconds: float | None = None,
+    ):
+        settings = get_settings()
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
+        self.connect_retry_attempts = int(
+            connect_retry_attempts
+            if connect_retry_attempts is not None
+            else settings.mcp_connect_retry_attempts
+        )
+        self.connect_retry_base_delay_seconds = float(
+            connect_retry_base_delay_seconds
+            if connect_retry_base_delay_seconds is not None
+            else settings.mcp_connect_retry_base_delay_seconds
+        )
+        if not 0 < self.connect_retry_attempts <= 10:
+            raise ValueError("connect_retry_attempts must be > 0 and <= 10")
+        if not 0 <= self.connect_retry_base_delay_seconds <= 30:
+            raise ValueError(
+                "connect_retry_base_delay_seconds must be >= 0 and <= 30"
+            )
 
     @staticmethod
     def _sdk():
@@ -1038,7 +1071,7 @@ class _SdkSessionConnector:
                 timeout=self.connect_timeout,
             )
         except asyncio.TimeoutError as exc:
-            raise McpRuntimeError("MCP DNS resolution timed out") from exc
+            raise McpConnectionUnavailable("MCP DNS resolution timed out") from exc
         timeout = httpx.Timeout(
             timeout=self.read_timeout,
             connect=self.connect_timeout,
@@ -1091,21 +1124,139 @@ class _SdkSessionConnector:
                 "MCP SDK transport cannot inject the required secure HTTP client"
             )
 
+        stack = AsyncExitStack()
+        operation_ready = False
+        pending_cancel: asyncio.CancelledError | None = None
+        cleanup_errors: tuple[BaseException, ...] = ()
         try:
-            async with transport_context as streams:
+            try:
+                streams = await stack.enter_async_context(transport_context)
                 read_stream, write_stream = streams[0], streams[1]
-                async with ClientSession(
+                session = await stack.enter_async_context(ClientSession(
                     read_stream,
                     write_stream,
                     read_timeout_seconds=timedelta(seconds=self.read_timeout),
-                ) as session:
-                    await session.initialize()
-                    yield session
+                ))
+                await session.initialize()
+            except asyncio.CancelledError as exc:
+                pending_cancel = exc
+            except Exception as exc:
+                raise McpConnectionUnavailable(
+                    "MCP connection or initialization failed"
+                ) from exc
+            if pending_cancel is None:
+                operation_ready = True
+                yield session
+        except asyncio.CancelledError as exc:
+            pending_cancel = exc
+        except Exception as exc:
+            logger.warning(
+                "MCP session failed installation=%s phase=%s response_bytes=%d error=%s",
+                installation.installation_id,
+                "operation" if operation_ready else "connect",
+                response_budget.consumed,
+                _sanitize_mcp_exception(installation, exc),
+            )
+            raise
         finally:
-            if async_client is not None:
-                await async_client.aclose()
+            cleanup_errors = await self._close_session_resources(
+                stack=stack,
+                async_client=async_client,
+                installation=installation,
+                response_bytes=response_budget.consumed,
+            )
+        if pending_cancel is not None:
+            # The MCP SDK uses AnyIO task groups.  When its transport task
+            # fails during connect/initialize, AnyIO first cancels the owner
+            # task and only exposes the real transport exception while the
+            # context stack closes.  Treat that cleanup exception as the
+            # pre-dispatch connection failure it actually is so discovery can
+            # retry and connection tests return a classified error instead of
+            # leaking an HTTP 500.  A clean stack close means the caller
+            # cancelled the operation and must remain a real cancellation.
+            if not operation_ready:
+                transport_error = next(
+                    (
+                        error
+                        for error in cleanup_errors
+                        if self._is_retryable_connection_error(error)
+                    ),
+                    None,
+                )
+                if transport_error is not None:
+                    raise McpConnectionUnavailable(
+                        "MCP connection or initialization failed"
+                    ) from transport_error
+            raise pending_cancel
 
-    async def list_tools(self, installation: EffectiveMcpInstallation) -> list[Any]:
+    async def _close_session_resources(
+        self,
+        *,
+        stack: AsyncExitStack,
+        async_client: httpx.AsyncClient | None,
+        installation: EffectiveMcpInstallation,
+        response_bytes: int,
+    ) -> tuple[BaseException, ...]:
+        """Bound cleanup so a broken remote DELETE/SSE close cannot poison a worker."""
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _TRANSPORT_CLEANUP_TIMEOUT_SECONDS
+        errors: list[BaseException] = []
+
+        async def close_one(label: str, close: Callable[[], Any]) -> None:
+            remaining = max(0.0, deadline - loop.time())
+            try:
+                async with asyncio.timeout(remaining):
+                    await close()
+            except TimeoutError as exc:
+                errors.append(exc)
+                logger.warning(
+                    "MCP cleanup timed out installation=%s resource=%s response_bytes=%d",
+                    installation.installation_id,
+                    label,
+                    response_bytes,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                errors.append(exc)
+                logger.warning(
+                    "MCP cleanup failed installation=%s resource=%s "
+                    "response_bytes=%d error=%s",
+                    installation.installation_id,
+                    label,
+                    response_bytes,
+                    _sanitize_mcp_exception(installation, exc),
+                )
+
+        await close_one("session", stack.aclose)
+        if async_client is not None and not async_client.is_closed:
+            await close_one("http_client", async_client.aclose)
+        return tuple(errors)
+
+    async def _retry_delay(
+        self,
+        installation: EffectiveMcpInstallation,
+        *,
+        attempt: int,
+        operation: str,
+        exc: BaseException,
+    ) -> None:
+        delay = self.connect_retry_base_delay_seconds * (2 ** max(0, attempt - 1))
+        logger.warning(
+            "MCP reconnecting installation=%s operation=%s attempt=%d/%d "
+            "delay_seconds=%.3f error=%s",
+            installation.installation_id,
+            operation,
+            attempt + 1,
+            self.connect_retry_attempts,
+            delay,
+            _sanitize_mcp_exception(installation, exc),
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def _list_tools_once(self, installation: EffectiveMcpInstallation) -> list[Any]:
         all_tools: list[Any] = []
         catalog_bytes = 0
         cursor: str | None = None
@@ -1142,6 +1293,47 @@ class _SdkSessionConnector:
                     return all_tools
         raise McpRuntimeError(f"MCP server {installation.server_name!r} tool pagination did not terminate")
 
+    async def list_tools(self, installation: EffectiveMcpInstallation) -> list[Any]:
+        last_error: BaseException | None = None
+        for attempt in range(1, self.connect_retry_attempts + 1):
+            try:
+                return await self._list_tools_once(installation)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if (
+                    attempt >= self.connect_retry_attempts
+                    or not self._is_retryable_connection_error(exc)
+                ):
+                    raise
+                await self._retry_delay(
+                    installation,
+                    attempt=attempt,
+                    operation="tools/list",
+                    exc=exc,
+                )
+        assert last_error is not None
+        raise last_error
+
+    @classmethod
+    def _is_retryable_connection_error(cls, exc: BaseException) -> bool:
+        if isinstance(exc, McpConnectionUnavailable):
+            return True
+        if isinstance(exc, (httpx.TransportError, ConnectionError, TimeoutError, OSError, EOFError)):
+            return True
+        # The MCP SDK converts an abruptly closed read stream into McpError
+        # instead of preserving the underlying httpx exception.
+        sdk_error = getattr(exc, "error", None)
+        sdk_message = str(getattr(sdk_error, "message", "") or "").casefold()
+        if sdk_message in {"connection closed", "connection closed."}:
+            return True
+        nested = getattr(exc, "exceptions", None)
+        if isinstance(nested, tuple) and nested:
+            return all(cls._is_retryable_connection_error(item) for item in nested)
+        cause = exc.__cause__ or exc.__context__
+        return cause is not None and cause is not exc and cls._is_retryable_connection_error(cause)
+
     async def call_tool(
         self,
         installation: EffectiveMcpInstallation,
@@ -1150,17 +1342,53 @@ class _SdkSessionConnector:
         *,
         on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
-        # Intentionally exactly one request: writes must never be retried here.
-        async with self._session(
-            installation,
-            response_budget_bytes=_MAX_CALL_SESSION_RESPONSE_BYTES,
-        ) as session:
-            # Everything before this point is local setup/handshake.  Once the
-            # SDK call begins we conservatively assume the server may execute
-            # the request even if cancellation or a read error follows.
-            if on_dispatch is not None:
-                on_dispatch()
-            return await session.call_tool(raw_name, arguments=arguments)
+        # Retry only fresh connection/initialize failures. Once the SDK call is
+        # entered the remote operation may have executed, so it is never replayed.
+        last_error: BaseException | None = None
+        for attempt in range(1, self.connect_retry_attempts + 1):
+            dispatched = False
+            try:
+                async with self._session(
+                    installation,
+                    response_budget_bytes=_MAX_CALL_SESSION_RESPONSE_BYTES,
+                ) as session:
+                    # Everything before this point is local setup/handshake.
+                    # Once the SDK call begins we conservatively assume the
+                    # server may execute the request.
+                    if on_dispatch is not None:
+                        on_dispatch()
+                    dispatched = True
+                    return await session.call_tool(raw_name, arguments=arguments)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if dispatched:
+                    logger.warning(
+                        "MCP response stream failed after dispatch "
+                        "installation=%s operation=tools/call attempt=%d/%d",
+                        installation.installation_id,
+                        attempt,
+                        self.connect_retry_attempts,
+                    )
+                    raise
+                if (
+                    attempt >= self.connect_retry_attempts
+                    or not self._is_retryable_connection_error(exc)
+                ):
+                    raise McpConnectionUnavailable(
+                        "MCP 连接暂时不可用，可安全重试。"
+                    ) from exc
+                await self._retry_delay(
+                    installation,
+                    attempt=attempt,
+                    operation="tools/call-connect",
+                    exc=exc,
+                )
+        assert last_error is not None
+        raise McpConnectionUnavailable(
+            "MCP 连接暂时不可用，可安全重试。"
+        ) from last_error
 
 
 class _SqlAlchemyMcpRepository:
@@ -1423,7 +1651,12 @@ class _SqlAlchemyMcpRepository:
             db.rollback()
             return rows[0] if rows else None
 
-    def catalog_fingerprint(self, user_id: str) -> str:
+    def _catalog_fingerprint_payload(
+        self,
+        user_id: str,
+        *,
+        include_refresh_bucket: bool,
+    ) -> dict[str, Any]:
         McpConfigVersion, _, _, _, _, _ = self._models()
         with self._session_factory() as db:
             if self._provision_required_installations(db, user_id):
@@ -1439,12 +1672,28 @@ class _SqlAlchemyMcpRepository:
                 "versions": versions,
                 "installations": [item.connection_fingerprint for item in installations],
             }
-            if installations:
+            if include_refresh_bucket and installations:
                 payload["refresh_bucket"] = int(
                     self._clock() // self._catalog_refresh_seconds
                 )
             db.rollback()
-            return _stable_hash(payload)
+            return payload
+
+    def catalog_fingerprint(self, user_id: str) -> str:
+        """Cache generation, including the periodic tools/list refresh bucket."""
+
+        return _stable_hash(self._catalog_fingerprint_payload(
+            user_id,
+            include_refresh_bucket=True,
+        ))
+
+    def catalog_configuration_fingerprint(self, user_id: str) -> str:
+        """Durable publication generation, excluding time-based refreshes."""
+
+        return _stable_hash(self._catalog_fingerprint_payload(
+            user_id,
+            include_refresh_bucket=False,
+        ))
 
     def load_tool_snapshots(self, installation: EffectiveMcpInstallation) -> list[McpToolSnapshot]:
         _, _, _, _, SnapshotRow, _ = self._models()
@@ -1716,11 +1965,15 @@ class McpRuntime:
         cache_max_bytes: int | None = None,
         cache_idle_ttl_seconds: float | None = None,
         call_timeout_seconds: float | None = None,
+        tool_index_warmup_scheduler: (
+            Callable[[list[McpToolSnapshot]], None] | None
+        ) = None,
         clock: Callable[[], float] = time,
     ):
         settings = get_settings()
         self.repository = repository or _SqlAlchemyMcpRepository()
         self.connector = connector or _SdkSessionConnector()
+        self._tool_index_warmup_scheduler = tool_index_warmup_scheduler
         self._cache_max_users = int(
             cache_max_users
             if cache_max_users is not None
@@ -1834,6 +2087,19 @@ class McpRuntime:
         return lock
 
     def catalog_fingerprint(self, user_id: str) -> str:
+        return self.repository.catalog_fingerprint(user_id)
+
+    def catalog_configuration_fingerprint(self, user_id: str) -> str:
+        """Return the durable identity used to fence an in-flight Agent."""
+
+        resolver = getattr(
+            self.repository,
+            "catalog_configuration_fingerprint",
+            None,
+        )
+        if callable(resolver):
+            return resolver(user_id)
+        # Compatibility for injected repositories that predate the split.
         return self.repository.catalog_fingerprint(user_id)
 
     def last_resolved_fingerprint(self, user_id: str) -> str | None:
@@ -2051,13 +2317,21 @@ class McpRuntime:
             # Sample the generation around a fresh effective-installation read
             # so config changes cannot make a mixed old/new catalog look current.
             final_fingerprint_before = self.catalog_fingerprint(user_id)
+            final_configuration_fingerprint_before = (
+                self.catalog_configuration_fingerprint(user_id)
+            )
             current_installations = sorted(
                 self.repository.list_effective_installations(user_id),
                 key=installation_key,
             )
+            final_configuration_fingerprint = (
+                self.catalog_configuration_fingerprint(user_id)
+            )
             final_fingerprint = self.catalog_fingerprint(user_id)
             if (
                 final_fingerprint_before != final_fingerprint
+                or final_configuration_fingerprint_before
+                != final_configuration_fingerprint
                 or current_installations != all_installations
             ):
                 raise McpToolSnapshotStale(
@@ -2086,6 +2360,7 @@ class McpRuntime:
                 tools=tuple(sorted(tools, key=lambda item: item.model_name)),
                 errors=tuple(errors),
                 connections=connections,
+                configuration_fingerprint=final_configuration_fingerprint,
             )
             # Optional failures are a valid partial snapshot for this exact
             # config/refresh generation. Failed installations remain absent,
@@ -2155,6 +2430,8 @@ class McpRuntime:
             tool for tool in projected if installation.publishes_tool(tool.raw_name)
         ]
         self._assert_unique_model_names(visible)
+        if self._tool_index_warmup_scheduler is not None:
+            self._tool_index_warmup_scheduler(visible)
         return visible
 
     @staticmethod
@@ -2377,7 +2654,31 @@ _GLOBAL_MCP_RUNTIME: McpRuntime | None = None
 def get_mcp_runtime() -> McpRuntime:
     global _GLOBAL_MCP_RUNTIME
     if _GLOBAL_MCP_RUNTIME is None:
-        _GLOBAL_MCP_RUNTIME = McpRuntime()
+        def _schedule_tool_index_warmup(tools: list[McpToolSnapshot]) -> None:
+            from src.agent.tools.tool_discovery import ToolSearchDocument
+            from src.api.services.mcp_tool_search_service import (
+                get_mcp_tool_search_service,
+            )
+
+            get_mcp_tool_search_service().schedule_warmup([
+                ToolSearchDocument(
+                    model_name=tool.model_name,
+                    provider="mcp",
+                    tool_name=tool.raw_name,
+                    installation_id=tool.installation_id,
+                    server_name=tool.server_name,
+                    server_description=tool.server_description or "",
+                    title=tool.title or "",
+                    description=tool.description,
+                    schema_hash=tool.schema_hash,
+                    connection_fingerprint=tool.connection_fingerprint,
+                )
+                for tool in tools
+            ])
+
+        _GLOBAL_MCP_RUNTIME = McpRuntime(
+            tool_index_warmup_scheduler=_schedule_tool_index_warmup,
+        )
     return _GLOBAL_MCP_RUNTIME
 
 

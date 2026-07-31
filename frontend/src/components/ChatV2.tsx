@@ -574,7 +574,7 @@ function ChatV2View(props: ChatV2Props) {
       setHighlightedRoundId((current) => (current === scrollTarget.roundId ? null : current));
     }, 1800);
     return () => clearTimeout(timer);
-  }, [scrollTarget?.nonce, scrollTarget?.roundId, scrollTarget?.sessionId, sessionId, loading, rounds]);
+  }, [scrollTarget, sessionId, loading, rounds]);
 
   useEffect(() => {
     if (suppressAutoScrollRef.current) return;

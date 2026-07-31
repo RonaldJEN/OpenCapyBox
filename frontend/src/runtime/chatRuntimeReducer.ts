@@ -491,22 +491,27 @@ function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): Ch
           ...nextRun.buffers,
           toolArgsByToolCallId: {
             ...nextRun.buffers.toolArgsByToolCallId,
-            [event.toolCallId]: '',
+            [event.toolCallId]: Object.prototype.hasOwnProperty.call(
+              nextRun.buffers.toolArgsByToolCallId,
+              event.toolCallId,
+            )
+              ? nextRun.buffers.toolArgsByToolCallId[event.toolCallId]
+              : '',
           },
         },
       };
-      nextState = updateLastStep(nextState, nextRun, (step) => ({
-        ...step,
-        tool_calls: [
-          ...step.tool_calls,
-          { id: event.toolCallId, name: event.toolCallName, input: {}, started_at_ts: event.timestamp },
-        ],
-      }));
+      nextState = upsertToolCallStart(
+        nextState,
+        nextRun,
+        event.toolCallId,
+        event.toolCallName,
+        event.timestamp,
+      );
       nextState = updateAgentToolLog(nextState, nextRun, {
         toolCallId: event.toolCallId,
         toolName: event.toolCallName,
         status: 'running',
-        startedAt: Date.now(),
+        startedAt: event.timestamp ?? envelope.receivedAt,
       });
       break;
     case 'TOOL_CALL_ARGS':
@@ -541,24 +546,24 @@ function applyRunStarted(
   if (!serverRunId) {
     return putRun(state, run.clientRunKey, { ...run, status: 'streaming' });
   }
+
+  const ownershipTransfer = transferRunOwnership(state, serverRunId, run);
+  state = ownershipTransfer.state;
+  run = ownershipTransfer.run;
+
   const nextRun: ChatRunRuntimeState = {
     ...run,
     serverRunId,
     status: 'streaming',
   };
   const session = ensureSession(state, run.ownerSessionId);
-  const rounds = session.rounds.map((round) => (
-    roundMatchesRun(round, run, serverRunId)
-      ? {
-          ...round,
-          round_id: serverRunId,
-          status: 'running',
-          preferred_skills: Array.isArray(envelope.event.preferredSkills)
-            ? envelope.event.preferredSkills
-            : round.preferred_skills,
-        }
-      : round
-  ));
+  const rounds = reconcileRunStartedRounds(
+    session.rounds,
+    run,
+    ownershipTransfer.previousRun,
+    serverRunId,
+    envelope.event.preferredSkills,
+  );
   const nextState = putSession(state, run.ownerSessionId, {
     ...session,
     rounds,
@@ -580,6 +585,157 @@ function applyRunStarted(
       [serverRunId]: run.tempRoundId,
     },
   };
+}
+
+function transferRunOwnership(
+  state: ChatRuntimeState,
+  serverRunId: string,
+  incomingRun: ChatRunRuntimeState,
+): {
+  state: ChatRuntimeState;
+  run: ChatRunRuntimeState;
+  previousRun?: ChatRunRuntimeState;
+} {
+  const previousRunKey = state.serverRunIdToClientRunKey[serverRunId];
+  if (!previousRunKey || previousRunKey === incomingRun.clientRunKey) {
+    return { state, run: incomingRun };
+  }
+
+  const previousRun = state.runs[previousRunKey];
+  if (!previousRun || previousRun.ownerSessionId !== incomingRun.ownerSessionId) {
+    return { state, run: incomingRun };
+  }
+
+  const mergedRun: ChatRunRuntimeState = {
+    ...incomingRun,
+    serverRunId,
+    lastSequence: Math.max(previousRun.lastSequence, incomingRun.lastSequence),
+    buffers: {
+      textByMessageId: {
+        ...previousRun.buffers.textByMessageId,
+        ...incomingRun.buffers.textByMessageId,
+      },
+      thinkingByMessageId: {
+        ...previousRun.buffers.thinkingByMessageId,
+        ...incomingRun.buffers.thinkingByMessageId,
+      },
+      toolArgsByToolCallId: {
+        ...previousRun.buffers.toolArgsByToolCallId,
+        ...incomingRun.buffers.toolArgsByToolCallId,
+      },
+      currentTextMessageId:
+        incomingRun.buffers.currentTextMessageId
+        ?? previousRun.buffers.currentTextMessageId,
+      currentThinkingMessageId:
+        incomingRun.buffers.currentThinkingMessageId
+        ?? previousRun.buffers.currentThinkingMessageId,
+    },
+    createdAt: Math.min(previousRun.createdAt, incomingRun.createdAt),
+    updatedAt: Math.max(previousRun.updatedAt, incomingRun.updatedAt),
+  };
+
+  const session = ensureSession(state, incomingRun.ownerSessionId);
+  const agentStateByRunKey = { ...session.agentStateByRunKey };
+  const previousAgentState = agentStateByRunKey[previousRunKey];
+  const incomingAgentState = agentStateByRunKey[incomingRun.clientRunKey];
+  if (previousRun.lastSequence > incomingRun.lastSequence && previousAgentState) {
+    agentStateByRunKey[incomingRun.clientRunKey] = previousAgentState;
+  } else if (!incomingAgentState && previousAgentState) {
+    agentStateByRunKey[incomingRun.clientRunKey] = previousAgentState;
+  }
+  delete agentStateByRunKey[previousRunKey];
+
+  const runs = { ...state.runs };
+  delete runs[previousRunKey];
+  runs[incomingRun.clientRunKey] = mergedRun;
+
+  const serverRunIdToClientRunKey = { ...state.serverRunIdToClientRunKey };
+  for (const [mappedServerRunId, clientRunKey] of Object.entries(serverRunIdToClientRunKey)) {
+    if (clientRunKey === previousRunKey) {
+      serverRunIdToClientRunKey[mappedServerRunId] = incomingRun.clientRunKey;
+    }
+  }
+  serverRunIdToClientRunKey[serverRunId] = incomingRun.clientRunKey;
+
+  const idempotencyKeyToClientRunKey = { ...state.idempotencyKeyToClientRunKey };
+  for (const [idempotencyKey, clientRunKey] of Object.entries(idempotencyKeyToClientRunKey)) {
+    if (clientRunKey === previousRunKey) {
+      idempotencyKeyToClientRunKey[idempotencyKey] = incomingRun.clientRunKey;
+    }
+  }
+
+  const nextSession: ChatSessionRuntimeState = {
+    ...session,
+    activeRunKeys: unique([
+      ...session.activeRunKeys.map((runKey) => (
+        runKey === previousRunKey ? incomingRun.clientRunKey : runKey
+      )),
+      incomingRun.clientRunKey,
+    ]),
+    agentStateByRunKey,
+    visibleAgentStateRunKey:
+      session.visibleAgentStateRunKey === previousRunKey
+        ? incomingRun.clientRunKey
+        : session.visibleAgentStateRunKey,
+  };
+
+  return {
+    state: putSession({
+      ...state,
+      runs,
+      serverRunIdToClientRunKey,
+      idempotencyKeyToClientRunKey,
+    }, incomingRun.ownerSessionId, nextSession),
+    run: mergedRun,
+    previousRun,
+  };
+}
+
+function reconcileRunStartedRounds(
+  rounds: RoundData[],
+  run: ChatRunRuntimeState,
+  previousRun: ChatRunRuntimeState | undefined,
+  serverRunId: string,
+  preferredSkills: unknown,
+): RoundData[] {
+  const matchingRoundIds = new Set([
+    serverRunId,
+    run.tempRoundId,
+    run.serverRunId,
+    previousRun?.tempRoundId,
+    previousRun?.serverRunId,
+  ].filter((roundId): roundId is string => Boolean(roundId)));
+  const matchingIndexes = rounds
+    .map((round, index) => (matchingRoundIds.has(round.round_id) ? index : -1))
+    .filter((index) => index >= 0);
+
+  if (matchingIndexes.length === 0) {
+    return rounds;
+  }
+
+  const localRound = rounds.find((round) => round.round_id === run.tempRoundId);
+  const serverRound = rounds.find((round) => round.round_id === serverRunId)
+    || rounds[matchingIndexes[0]];
+  const mergedRound = localRound && localRound !== serverRound
+    ? mergeActiveRound(localRound, serverRound)
+    : { ...(localRound || serverRound) };
+  const reconciledRound: RoundData = {
+    ...mergedRound,
+    round_id: serverRunId,
+    status: 'running',
+    preferred_skills: Array.isArray(preferredSkills)
+      ? preferredSkills
+      : mergedRound.preferred_skills,
+  };
+  const targetIndex = matchingIndexes[0];
+  const matchedIndexSet = new Set(matchingIndexes);
+
+  return rounds.flatMap((round, index) => {
+    if (index === targetIndex) {
+      return [reconciledRound];
+    }
+    return matchedIndexSet.has(index) ? [] : [round];
+  });
 }
 
 function applyRunFinished(
@@ -757,7 +913,19 @@ function applyRunningSessionsSnapshot(
 
   for (const item of runningSessions) {
     const session = ensureSession(nextState, item.session_id);
-    const runKey = item.round_id ? `run:${item.round_id}` : `init:${item.session_id}`;
+    const mappedRunKey = item.round_id
+      ? nextState.serverRunIdToClientRunKey[item.round_id]
+      : undefined;
+    const matchingActiveRunKey = item.round_id
+      ? session.activeRunKeys.find((key) => {
+          const run = nextState.runs[key];
+          return run?.ownerSessionId === item.session_id
+            && (run.serverRunId === item.round_id || run.tempRoundId === item.round_id);
+        })
+      : undefined;
+    const runKey = mappedRunKey
+      || matchingActiveRunKey
+      || (item.round_id ? `run:${item.round_id}` : `init:${item.session_id}`);
     if (!nextState.runs[runKey]) {
       nextState = putRun(nextState, runKey, createRun({
         ownerSessionId: item.session_id,
@@ -766,6 +934,20 @@ function applyRunningSessionsSnapshot(
         source: item.round_id ? 'history' : 'init',
         status: item.round_id ? 'streaming' : 'starting',
       }));
+    }
+    if (item.round_id) {
+      const run = nextState.runs[runKey];
+      nextState = putRun(nextState, runKey, {
+        ...run,
+        serverRunId: item.round_id,
+      });
+      nextState = {
+        ...nextState,
+        serverRunIdToClientRunKey: {
+          ...nextState.serverRunIdToClientRunKey,
+          [item.round_id]: runKey,
+        },
+      };
     }
     nextState = putSession(nextState, item.session_id, {
       ...session,
@@ -846,11 +1028,39 @@ function updateAgentToolLog(
   run: ChatRunRuntimeState,
   log: AgentState['toolLogs'][number],
 ): ChatRuntimeState {
-  return updateAgentStateDeltaValue(state, run, (prev) => ({
-    ...prev,
-    toolLogs: [...prev.toolLogs, log],
-    lastUpdated: Date.now(),
-  }));
+  return updateAgentStateDeltaValue(state, run, (prev) => {
+    const index = prev.toolLogs.findIndex((item) => item.toolCallId === log.toolCallId);
+    if (index < 0) {
+      return {
+        ...prev,
+        toolLogs: [...prev.toolLogs, log],
+        lastUpdated: Date.now(),
+      };
+    }
+
+    const statusRank = {
+      running: 0,
+      pending: 1,
+      completed: 2,
+      failed: 2,
+    } as const;
+    const existing = prev.toolLogs[index];
+    const toolLogs = [...prev.toolLogs];
+    toolLogs[index] = {
+      ...existing,
+      ...log,
+      status: statusRank[existing.status] >= statusRank[log.status]
+        ? existing.status
+        : log.status,
+      startedAt: existing.startedAt ?? log.startedAt,
+      completedAt: existing.completedAt ?? log.completedAt,
+    };
+    return {
+      ...prev,
+      toolLogs,
+      lastUpdated: Date.now(),
+    };
+  });
 }
 
 function updateRound(
@@ -874,6 +1084,91 @@ function updateLastStep(
     const ensured = ensureStep(round);
     const steps = [...ensured.steps];
     steps[steps.length - 1] = updater(steps[steps.length - 1]);
+    return { ...ensured, steps };
+  });
+}
+
+function updateStepContainingToolCall(
+  round: RoundData,
+  toolCallId: string,
+  updater: (step: StepData) => StepData,
+): RoundData {
+  let found = false;
+  const steps = round.steps.map((step) => {
+    if (found || !step.tool_calls.some((toolCall) => toolCall.id === toolCallId)) {
+      return step;
+    }
+    found = true;
+    return updater(step);
+  });
+  return found ? { ...round, steps } : round;
+}
+
+function updateToolCallById(
+  state: ChatRuntimeState,
+  run: ChatRunRuntimeState,
+  toolCallId: string,
+  updater: (toolCall: StepData['tool_calls'][number]) => StepData['tool_calls'][number],
+): ChatRuntimeState {
+  return updateRound(state, run, (round) => updateStepContainingToolCall(
+    round,
+    toolCallId,
+    (step) => {
+      const toolIndex = step.tool_calls.findIndex((toolCall) => toolCall.id === toolCallId);
+      const toolCalls = [...step.tool_calls];
+      toolCalls[toolIndex] = updater(toolCalls[toolIndex]);
+      return { ...step, tool_calls: toolCalls };
+    },
+  ));
+}
+
+function upsertToolCallStart(
+  state: ChatRuntimeState,
+  run: ChatRunRuntimeState,
+  toolCallId: string,
+  toolCallName: string,
+  timestamp?: number,
+): ChatRuntimeState {
+  return updateRound(state, run, (round) => {
+    const ensured = ensureStep(round);
+    let found = false;
+    const steps = ensured.steps.map((step) => {
+      if (found) {
+        return step;
+      }
+      const toolIndex = step.tool_calls.findIndex((toolCall) => toolCall.id === toolCallId);
+      if (toolIndex < 0) {
+        return step;
+      }
+      found = true;
+      const toolCalls = [...step.tool_calls];
+      const existing = toolCalls[toolIndex];
+      toolCalls[toolIndex] = {
+        ...existing,
+        name: toolCallName || existing.name,
+        started_at_ts: existing.started_at_ts ?? timestamp,
+      };
+      return { ...step, tool_calls: toolCalls };
+    });
+
+    if (found) {
+      return { ...ensured, steps };
+    }
+
+    const lastStepIndex = steps.length - 1;
+    const lastStep = steps[lastStepIndex];
+    steps[lastStepIndex] = {
+      ...lastStep,
+      tool_calls: [
+        ...lastStep.tool_calls,
+        {
+          id: toolCallId,
+          name: toolCallName,
+          input: {},
+          started_at_ts: timestamp,
+        },
+      ],
+    };
     return { ...ensured, steps };
   });
 }
@@ -1027,13 +1322,10 @@ function updateToolArgs(
   const argsString = run.buffers.toolArgsByToolCallId[toolCallId] || '';
   try {
     const parsedArgs = JSON.parse(argsString);
-    return updateLastStep(state, run, (step) => {
-      const toolIndex = step.tool_calls.findIndex((toolCall) => toolCall.id === toolCallId);
-      if (toolIndex < 0) return step;
-      const toolCalls = [...step.tool_calls];
-      toolCalls[toolIndex] = { ...toolCalls[toolIndex], input: parsedArgs };
-      return { ...step, tool_calls: toolCalls };
-    });
+    return updateToolCallById(state, run, toolCallId, (toolCall) => ({
+      ...toolCall,
+      input: parsedArgs,
+    }));
   } catch {
     return state;
   }
@@ -1045,18 +1337,21 @@ function updateToolEnd(
   toolCallId: string,
   timestamp?: number,
 ): ChatRuntimeState {
-  let nextState = updateLastStep(state, run, (step) => {
-    const toolIndex = step.tool_calls.findIndex((toolCall) => toolCall.id === toolCallId);
-    if (toolIndex < 0) return step;
-    const toolCalls = [...step.tool_calls];
-    toolCalls[toolIndex] = { ...toolCalls[toolIndex], ended_at_ts: timestamp };
-    return { ...step, tool_calls: toolCalls };
-  });
+  let nextState = updateToolCallById(state, run, toolCallId, (toolCall) => ({
+    ...toolCall,
+    ended_at_ts: toolCall.ended_at_ts ?? timestamp,
+  }));
   nextState = updateAgentStateDeltaValue(nextState, run, (prev) => ({
     ...prev,
     toolLogs: prev.toolLogs.map((log) => (
       log.toolCallId === toolCallId
-        ? { ...log, status: 'pending', args: run.buffers.toolArgsByToolCallId[toolCallId] }
+        ? {
+            ...log,
+            status: log.status === 'completed' || log.status === 'failed'
+              ? log.status
+              : 'pending',
+            args: run.buffers.toolArgsByToolCallId[toolCallId],
+          }
         : log
     )),
     lastUpdated: Date.now(),
@@ -1087,23 +1382,40 @@ function updateToolResult(
   } catch {
     // keep raw content
   }
-  let nextState = updateLastStep(state, run, (step) => ({
-    ...step,
-    tool_results: [
-      ...step.tool_results,
-      {
-        ...resultObj,
-        tool_call_id: toolCallId,
-        received_at_ts: timestamp,
-        execution_time_ms: executionTimeMs,
-      },
-    ],
-  }));
+  const toolResult: ToolResult = {
+    ...resultObj,
+    tool_call_id: toolCallId,
+    received_at_ts: timestamp,
+    execution_time_ms: executionTimeMs,
+  };
+  let nextState = updateRound(state, run, (round) => updateStepContainingToolCall(
+    round,
+    toolCallId,
+    (step) => {
+      const resultIndex = step.tool_results.findIndex(
+        (result) => result.tool_call_id === toolCallId,
+      );
+      if (resultIndex < 0) {
+        return {
+          ...step,
+          tool_results: [...step.tool_results, toolResult],
+        };
+      }
+      const toolResults = [...step.tool_results];
+      toolResults[resultIndex] = toolResult;
+      return { ...step, tool_results: toolResults };
+    },
+  ));
   nextState = updateAgentStateDeltaValue(nextState, run, (prev) => ({
     ...prev,
     toolLogs: prev.toolLogs.map((log) => (
       log.toolCallId === toolCallId
-        ? { ...log, status: 'completed', result: content, completedAt: Date.now() }
+        ? {
+            ...log,
+            status: 'completed',
+            result: content,
+            completedAt: log.completedAt ?? timestamp ?? Date.now(),
+          }
         : log
     )),
     lastUpdated: Date.now(),

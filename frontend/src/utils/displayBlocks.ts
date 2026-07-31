@@ -310,7 +310,9 @@ export function transformToDisplayBlocks(
     if (step.tool_calls.length > 0) {
       for (let j = 0; j < step.tool_calls.length; j++) {
         const tc = step.tool_calls[j];
-        const tr = step.tool_results[j];
+        const tr = tc.id
+          ? step.tool_results.find((result) => result.tool_call_id === tc.id)
+          : step.tool_results[j];
         const filePath = extractFilePath(tc.name, tc.input);
         const diffStats = extractDiffStats(tc.name, tr);
 

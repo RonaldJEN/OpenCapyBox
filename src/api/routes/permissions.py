@@ -53,7 +53,7 @@ _BUILTIN_TOOLS: tuple[tuple[str, str], ...] = (
     ("ask_user", "向用户提问"),
     ("sub_agent", "委托子 Agent"),
     ("get_skill", "加载技能"),
-    ("tool_search", "搜索并加载按需工具"),
+    ("mcp_tool_search", "搜索并加载 MCP 工具"),
     ("glm_search", "联网搜索"),
     ("glm_batch_search", "批量联网搜索"),
 )

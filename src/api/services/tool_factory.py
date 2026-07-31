@@ -161,6 +161,7 @@ async def create_agent_tools(
     skill_loader_ref: Optional[SkillLoader] = None
     if build_metadata is not None:
         build_metadata["mcp_catalog_fingerprint"] = None
+        build_metadata["mcp_catalog_configuration_fingerprint"] = None
         build_metadata["mcp_catalog_retry_required"] = False
         build_metadata["mcp_connections"] = ()
 
@@ -474,7 +475,7 @@ async def create_agent_tools(
 
     # Database-backed Streamable HTTP MCP tools. Each Agent receives an
     # immutable discovery snapshot, but McpRemoteTool marks these schemas as
-    # DEFERRED; Agent injects the small tool_search gateway instead of
+    # DEFERRED; Agent injects the small mcp_tool_search gateway instead of
     # sending the full remote catalog on the initial model request. Every
     # actual call is still re-authorized against live connection and policy
     # state.
@@ -494,6 +495,10 @@ async def create_agent_tools(
     else:
         if build_metadata is not None:
             build_metadata["mcp_catalog_fingerprint"] = mcp_catalog.fingerprint
+            build_metadata["mcp_catalog_configuration_fingerprint"] = (
+                getattr(mcp_catalog, "configuration_fingerprint", None)
+                or mcp_catalog.fingerprint
+            )
             # Optional failures are cached as a partial catalog for this exact
             # config/refresh fingerprint. Rebuilding every chat would hammer an
             # offline server; the next refresh bucket or config version retries.

@@ -49,6 +49,7 @@ from src.api.services.mcp_security import (
 from src.api.services.mcp_runtime import (
     mcp_execution_fingerprint,
     mcp_tool_schema_hash,
+    model_tool_name,
     validate_mcp_tool_metadata,
     validate_mcp_tool_name,
 )
@@ -1399,12 +1400,19 @@ def _save_tool_snapshots(
     connection_fingerprint: str,
     server_name: str,
     server_description: str | None,
-) -> None:
+) -> list[Any]:
+    from src.agent.tools.tool_discovery import ToolSearchDocument
+
     db.query(McpToolSnapshot).filter(
         McpToolSnapshot.installation_id == installation.id
     ).delete(synchronize_session=False)
     discovered_at = now_naive()
     search_targets = []
+    warmup_candidates = []
+    enabled_tools, disabled_tools, _revision = _tool_visibility_policy(
+        db,
+        installation,
+    )
     for tool in tools:
         raw = _jsonable(tool)
         if not isinstance(raw, dict):
@@ -1467,6 +1475,22 @@ def _save_tool_snapshots(
             schema_hash=schema_hash,
             connection_fingerprint=connection_fingerprint,
         ))
+        if (
+            (enabled_tools is None or name in enabled_tools)
+            and name not in disabled_tools
+        ):
+            warmup_candidates.append(ToolSearchDocument(
+                model_name=model_tool_name(str(installation.server_id), name),
+                provider="mcp",
+                tool_name=name,
+                installation_id=str(installation.id),
+                server_name=server_name,
+                server_description=server_description or "",
+                title=title or "",
+                description=description,
+                schema_hash=schema_hash,
+                connection_fingerprint=connection_fingerprint,
+            ))
 
     from src.api.services.mcp_tool_search_service import sync_mcp_tool_search_indexes
 
@@ -1475,6 +1499,7 @@ def _save_tool_snapshots(
         installation_id=str(installation.id),
         targets=search_targets,
     )
+    return warmup_candidates
 
 
 async def test_admin_server(db: DBSession, server_id: str) -> dict[str, Any]:
@@ -1569,6 +1594,7 @@ async def test_user_server(
     db.rollback()
     started = perf_counter()
     tools: list[Any] = []
+    warmup_candidates: list[Any] = []
     safe_error: str | None = None
     try:
         tools, latency_ms = await probe_mcp_server(probe_server, probe_credential)
@@ -1633,7 +1659,7 @@ async def test_user_server(
             # fingerprint check and the last_tested_at/last_error write below
             # (mcp-spec §4.5: hold the same lock through commit).
             with db.begin_nested():
-                _save_tool_snapshots(
+                warmup_candidates = _save_tool_snapshots(
                     db,
                     current_installation,
                     tools,
@@ -1652,6 +1678,12 @@ async def test_user_server(
         current_server.last_tested_at = now_naive()
         current_server.last_error = safe_error
     db.commit()
+    if safe_error is None and warmup_candidates:
+        from src.api.services.mcp_tool_search_service import (
+            get_mcp_tool_search_service,
+        )
+
+        get_mcp_tool_search_service().schedule_warmup(warmup_candidates)
     return {
         "ok": safe_error is None,
         "tools_count": len(tools) if safe_error is None else 0,

@@ -39,10 +39,13 @@ def test_agents_template_routes_connected_data_before_web_search():
     from src.api.services.memory_service import MemoryService
 
     content = MemoryService(MagicMock()).get_agents_template_content()
-    data_route = content.index("`tool_search`（按连接名或能力词发现）")
+    data_route = content.index("`mcp_tool_search`（按连接名或能力词发现）")
+    skill_route = content.index("`get_skill(skill_name)`")
     web_fallback = content.index("数据连接无匹配 / 调用失败")
 
+    assert data_route < skill_route
     assert data_route < web_fallback
+    assert "按请求语义自动匹配已连接数据源" in content
     assert "`search` / `batch_search`" in content[web_fallback:]
 
 

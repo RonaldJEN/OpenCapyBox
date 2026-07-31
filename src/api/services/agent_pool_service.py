@@ -932,6 +932,23 @@ class AgentPoolService:
             logger.info("已异步失效用户 Agent 缓存: user=%s, sessions=%d", user_id, removed)
         return removed
 
+    async def invalidate_all_async(self, *, preserve_running: bool = True) -> int:
+        """Invalidate every process-local Agent after a global catalog change.
+
+        Running turns are marked for lazy rebuild by default, so an
+        administrator changing the official MCP catalog never interrupts an
+        already dispatched tool call.
+        """
+
+        user_ids = list(self._user_sessions)
+        removed = 0
+        for user_id in user_ids:
+            removed += await self.invalidate_user_async(
+                user_id,
+                preserve_running=preserve_running,
+            )
+        return removed
+
     def get_stats(self) -> dict:
         """獲取緩存統計信息
 

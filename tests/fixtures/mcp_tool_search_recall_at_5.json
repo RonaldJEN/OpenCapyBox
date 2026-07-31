@@ -1,0 +1,316 @@
+{
+  "name": "MCP deferred tool search Recall@5 benchmark",
+  "version": 1,
+  "metric": "recall_at_5",
+  "pass_rule": {
+    "positive": "top_5_model_tools intersects expected_any",
+    "negative": "top_5_model_tools is empty"
+  },
+  "cases": [
+    {
+      "id": "company_deep_01",
+      "category": "company_deep_analysis",
+      "query": "我第一次研究宁德时代，帮我把业务、竞争力、财务表现和主要风险完整梳理一下",
+      "expected_any": ["stock-one-page", "stock-investment-logic"]
+    },
+    {
+      "id": "company_deep_02",
+      "category": "company_deep_analysis",
+      "query": "中际旭创这家公司到底是做什么的，收入从哪来，未来增长靠什么",
+      "expected_any": ["stock-one-page", "stock-investment-logic"]
+    },
+    {
+      "id": "company_deep_03",
+      "category": "company_deep_analysis",
+      "query": "给我做一份药明康德的完整案头研究，重点看商业模式、客户结构和风险",
+      "expected_any": ["stock-one-page"]
+    },
+    {
+      "id": "company_deep_04",
+      "category": "company_deep_analysis",
+      "query": "老板明天要见隆基绿能，先让我快速了解这家公司现在的经营状况和核心问题",
+      "expected_any": ["stock-one-page", "stock-survey-outline"]
+    },
+    {
+      "id": "company_deep_05",
+      "category": "company_deep_analysis",
+      "query": "全面拆解一下三一重工，产品、海外业务、行业位置和周期风险都要看",
+      "expected_any": ["stock-one-page", "stock-investment-logic"]
+    },
+    {
+      "id": "investment_logic_01",
+      "category": "investment_logic",
+      "query": "贵州茅台现在还值得长期跟踪吗，最关键的支撑逻辑是什么",
+      "expected_any": ["stock-investment-logic"]
+    },
+    {
+      "id": "investment_logic_02",
+      "category": "investment_logic",
+      "query": "小米集团接下来有哪些催化剂，哪些因素可能导致逻辑被证伪",
+      "expected_any": ["stock-investment-logic"]
+    },
+    {
+      "id": "investment_logic_03",
+      "category": "investment_logic",
+      "query": "阳光电源当前最重要的多空矛盾是什么",
+      "expected_any": ["stock-investment-logic", "view-challenge"]
+    },
+    {
+      "id": "investment_logic_04",
+      "category": "investment_logic",
+      "query": "最近中国船舶为什么涨，背后的基本面逻辑能持续多久",
+      "expected_any": ["stock-investment-logic", "qa-text"]
+    },
+    {
+      "id": "company_compare_01",
+      "category": "company_comparison",
+      "query": "比亚迪最应该和哪几家公司对标，商业模式分别有什么差异",
+      "expected_any": ["comparable-companies"]
+    },
+    {
+      "id": "company_compare_02",
+      "category": "company_comparison",
+      "query": "对比中芯国际和华虹半导体的产品结构、制程、客户与盈利能力",
+      "expected_any": ["comparable-companies"]
+    },
+    {
+      "id": "company_compare_03",
+      "category": "company_comparison",
+      "query": "宁德时代在海外有哪些真正可比的电池公司",
+      "expected_any": ["comparable-companies"]
+    },
+    {
+      "id": "company_compare_04",
+      "category": "company_comparison",
+      "query": "贵州茅台和五粮液谁的渠道质量、品牌力和增长空间更好",
+      "expected_any": ["comparable-companies"]
+    },
+    {
+      "id": "company_research_01",
+      "category": "company_research",
+      "query": "下周要去调研海康威视，见管理层最应该问哪些问题",
+      "expected_any": ["stock-survey-outline"]
+    },
+    {
+      "id": "company_research_02",
+      "category": "company_research",
+      "query": "帮我准备一份汇川技术专家访谈的问题清单",
+      "expected_any": ["stock-survey-outline"]
+    },
+    {
+      "id": "company_research_03",
+      "category": "company_research",
+      "query": "如果要对迈瑞医疗做基本面尽调，需要确认哪些关键假设",
+      "expected_any": ["stock-survey-outline", "stock-investment-logic"]
+    },
+    {
+      "id": "company_research_04",
+      "category": "company_research",
+      "query": "为腾讯下一次业绩会准备十个有信息量的问题",
+      "expected_any": ["stock-survey-outline"]
+    },
+    {
+      "id": "earnings_review_01",
+      "category": "earnings_review",
+      "query": "点评一下中芯国际最新一季的业绩，哪些指标超预期，哪些不及预期",
+      "expected_any": ["agent-performance-comment"]
+    },
+    {
+      "id": "earnings_review_02",
+      "category": "earnings_review",
+      "query": "这家公司收入增长但利润下降，结合最新财报解释一下原因：比亚迪",
+      "expected_any": ["agent-performance-comment"]
+    },
+    {
+      "id": "earnings_review_03",
+      "category": "earnings_review",
+      "query": "贵州茅台年报表现怎么样，和市场此前预期相比有什么差异",
+      "expected_any": ["agent-performance-comment"]
+    },
+    {
+      "id": "earnings_review_04",
+      "category": "earnings_review",
+      "query": "把易德龙最近一期定期报告的核心变化和后续关注点讲清楚",
+      "expected_any": ["agent-performance-comment", "stock-report"]
+    },
+    {
+      "id": "industry_analysis_01",
+      "category": "industry_analysis",
+      "query": "系统梳理人形机器人行业，产业链、竞争格局、市场空间和风险都要覆盖",
+      "expected_any": ["industry-one-pager"]
+    },
+    {
+      "id": "industry_analysis_02",
+      "category": "industry_analysis",
+      "query": "白酒行业目前处在什么阶段，库存、批价和竞争格局如何",
+      "expected_any": ["industry-one-pager", "qa-text"]
+    },
+    {
+      "id": "industry_analysis_03",
+      "category": "industry_analysis",
+      "query": "光模块产业链上中下游分别有哪些环节，核心壁垒是什么",
+      "expected_any": ["industry-one-pager"]
+    },
+    {
+      "id": "theme_stock_01",
+      "category": "thematic_stock_selection",
+      "query": "AI眼镜产业链里有哪些真正受益的A股公司",
+      "expected_any": ["theme-stock-pick", "search_stocks"]
+    },
+    {
+      "id": "theme_stock_02",
+      "category": "thematic_stock_selection",
+      "query": "云南缺电可能影响哪些上市公司，帮我筛出相关标的",
+      "expected_any": ["theme-stock-pick", "qa-text"]
+    },
+    {
+      "id": "theme_stock_03",
+      "category": "thematic_stock_selection",
+      "query": "找一批半导体设备国产替代方向的公司，说明各自对应的环节",
+      "expected_any": ["theme-stock-pick", "search_stocks"]
+    },
+    {
+      "id": "view_challenge_01",
+      "category": "viewpoint_challenge",
+      "query": "有人认为新能源车价格战已经结束、行业利润率马上修复，请从反面论证",
+      "expected_any": ["view-challenge"]
+    },
+    {
+      "id": "view_challenge_02",
+      "category": "viewpoint_challenge",
+      "query": "我觉得茅台的高端需求永远不会下降，帮我找出这个判断的漏洞",
+      "expected_any": ["view-challenge"]
+    },
+    {
+      "id": "view_challenge_03",
+      "category": "viewpoint_challenge",
+      "query": "市场说AI资本开支没有周期性，这个观点有哪些可能忽略的风险",
+      "expected_any": ["view-challenge"]
+    },
+    {
+      "id": "research_qa_01",
+      "category": "research_qa",
+      "query": "近期集采政策变化会怎样影响医疗器械公司的盈利",
+      "expected_any": ["qa-text"]
+    },
+    {
+      "id": "research_qa_02",
+      "category": "research_qa",
+      "query": "总结最近几次宁德时代路演中管理层对海外业务的主要判断",
+      "expected_any": ["qa-text", "recall-knowledge"]
+    },
+    {
+      "id": "research_recall_01",
+      "category": "research_recall",
+      "query": "只帮我找原始材料：英伟达最近的外资研报和业绩会纪要",
+      "expected_any": ["recall-knowledge"]
+    },
+    {
+      "id": "research_recall_02",
+      "category": "research_recall",
+      "query": "检索过去半年券商对光伏玻璃供需的观点，不用先总结",
+      "expected_any": ["recall-knowledge"]
+    },
+    {
+      "id": "research_recall_03",
+      "category": "research_recall",
+      "query": "找出管理层曾经提到海外产能爬坡进度的原文和出处",
+      "expected_any": ["recall-knowledge"]
+    },
+    {
+      "id": "market_data_01",
+      "category": "market_data",
+      "query": "贵州茅台现在多少钱，今天涨跌幅是多少",
+      "expected_any": ["stock_highfreq_quotes"]
+    },
+    {
+      "id": "financial_data_01",
+      "category": "financial_data",
+      "query": "查询贵州茅台最新ROE、毛利率、净利率和资产负债率",
+      "expected_any": ["get_stock_financials", "get_risk_indicators"]
+    },
+    {
+      "id": "shareholder_data_01",
+      "category": "shareholder_data",
+      "query": "宁德时代最近几个季度的前十大股东有什么变化",
+      "expected_any": ["get_stock_shareholders"]
+    },
+    {
+      "id": "company_event_01",
+      "category": "company_events",
+      "query": "这家公司最近有没有被监管问询、股东减持或重要诉讼：东方财富",
+      "expected_any": ["get_stock_events"]
+    },
+    {
+      "id": "stock_fund_01",
+      "category": "fund_selection",
+      "query": "哪些基金同时重仓中际旭创、工业富联和新易盛",
+      "expected_any": ["stock-fund-select"]
+    },
+    {
+      "id": "theme_fund_01",
+      "category": "fund_selection",
+      "query": "帮我找重点配置AI算力方向的主动基金",
+      "expected_any": ["theme-fund-select"]
+    },
+    {
+      "id": "research_drawing_01",
+      "category": "research_visualization",
+      "query": "把黄金产业链和主要价格驱动因素整理成一张研究图",
+      "expected_any": ["research-chart-draw"]
+    },
+    {
+      "id": "chart_search_01",
+      "category": "research_visualization",
+      "query": "从研报和公告里找几张新能源汽车出口量趋势图",
+      "expected_any": ["search-image-chart"]
+    },
+    {
+      "id": "watchlist_01",
+      "category": "watchlist",
+      "query": "看看我在Alpha派里收藏了哪些股票，按分组列出来",
+      "expected_any": ["watchlist"]
+    },
+    {
+      "id": "stock_report_01",
+      "category": "company_reports",
+      "query": "列出易德龙最近发布的季报、年报和业绩快报",
+      "expected_any": ["stock-report"]
+    },
+    {
+      "id": "negative_01",
+      "category": "hard_negative",
+      "query": "把产品研发项目的进度、问题和下周计划整理成一页A4纸汇报，给管理层看",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "negative_02",
+      "category": "hard_negative",
+      "query": "对比甲乙两家装修公司的报价单，列出材料、工期和售后服务的差异",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "negative_03",
+      "category": "hard_negative",
+      "query": "帮我设计一份员工食堂满意度调研问卷，重点了解菜品、价格和卫生",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "negative_04",
+      "category": "hard_negative",
+      "query": "分析这次新品发布活动失败的核心逻辑，找出执行问题和改进方向",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "negative_05",
+      "category": "hard_negative",
+      "query": "把公司年会的预算和实际支出做成一张对比图，并标出超支项目",
+      "expected_any": [],
+      "negative": true
+    }
+  ]
+}

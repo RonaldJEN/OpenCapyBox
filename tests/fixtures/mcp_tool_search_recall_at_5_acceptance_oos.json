@@ -1,0 +1,105 @@
+{
+  "name": "MCP deferred tool search Recall@5 acceptance out-of-sample benchmark",
+  "version": 1,
+  "metric": "recall_at_5",
+  "frozen": true,
+  "pass_rule": {
+    "positive": "top_5_model_tools intersects expected_any",
+    "negative": "top_5_model_tools is empty"
+  },
+  "cases": [
+    {
+      "id": "accept_overview",
+      "category": "company_deep_analysis",
+      "query": "完整梳理一下安克创新的业务、竞争优势、财务表现和主要风险",
+      "expected_any": ["stock-one-page", "stock-investment-logic"]
+    },
+    {
+      "id": "accept_logic",
+      "category": "investment_logic",
+      "query": "海尔智家未来有哪些催化剂，出现什么情况会让当前判断被证伪",
+      "expected_any": ["stock-investment-logic", "view-challenge"]
+    },
+    {
+      "id": "accept_compare",
+      "category": "company_comparison",
+      "query": "为地平线机器人寻找业务最接近的对标公司",
+      "expected_any": ["comparable-companies"]
+    },
+    {
+      "id": "accept_research",
+      "category": "company_research",
+      "query": "准备调研新产业生物，列一份管理层问题清单",
+      "expected_any": ["stock-survey-outline"]
+    },
+    {
+      "id": "accept_earnings",
+      "category": "earnings_review",
+      "query": "点评美团最新一季业绩，说明超预期和不及预期的部分",
+      "expected_any": ["agent-performance-comment"]
+    },
+    {
+      "id": "accept_industry",
+      "category": "industry_analysis",
+      "query": "分析智能驾驶产业链、市场空间、竞争格局和主要风险",
+      "expected_any": ["industry-one-pager"]
+    },
+    {
+      "id": "accept_theme",
+      "category": "thematic_stock_selection",
+      "query": "筛出核聚变主题下真正受益的A股标的",
+      "expected_any": ["theme-stock-pick", "search_stocks"]
+    },
+    {
+      "id": "accept_challenge",
+      "category": "viewpoint_challenge",
+      "query": "请从反面论证港口行业盈利会持续上升这个观点",
+      "expected_any": ["view-challenge"]
+    },
+    {
+      "id": "accept_qa",
+      "category": "research_qa",
+      "query": "医保政策变化会怎样影响创新药企业盈利",
+      "expected_any": ["qa-text"]
+    },
+    {
+      "id": "accept_recall",
+      "category": "research_recall",
+      "query": "只返回关于硅料价格的研报、纪要和公告原始材料",
+      "expected_any": ["recall-knowledge"]
+    },
+    {
+      "id": "accept_market",
+      "category": "market_data",
+      "query": "查询迈瑞医疗今天的实时股价和涨跌幅",
+      "expected_any": ["stock_highfreq_quotes"]
+    },
+    {
+      "id": "accept_draw",
+      "category": "research_visualization",
+      "query": "画一张研究图说明汇率变化对出口公司的收入和利润影响",
+      "expected_any": ["research-chart-draw"]
+    },
+    {
+      "id": "accept_negative_01",
+      "category": "hard_negative",
+      "query": "完整梳理公司团建活动的时间、地点、分工和风险",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "accept_negative_02",
+      "category": "hard_negative",
+      "query": "准备调研员工对办公环境的满意度，列一份问题清单",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "accept_negative_03",
+      "category": "hard_negative",
+      "query": "画一张研究图说明家庭一周的饮食和运动安排",
+      "expected_any": [],
+      "negative": true
+    }
+  ]
+}

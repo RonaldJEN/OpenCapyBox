@@ -149,7 +149,7 @@ OpenCapyBox 支持通过 [MCP（Model Context Protocol）](https://modelcontextp
 
 - MCP 凭证使用独立的 `MCP_SECRET_KEY` 加密保存，API 不回显 Secret；生产模式会拒绝缺失、示例值、短密钥、复用 `AUTH_SECRET_KEY` 以及公开示例账号。
 - 每个官方或个人连接都可独立启停具体工具；allowlist / denylist 只决定工具是否发布给 Agent，不授予执行权限。工具发现后使用稳定模型名称，并在每次调用前重新校验连接状态、归属与最新发布策略；`tools/call` 有独立且不可关闭的墙钟超时，越过发送边界后若结果不确定会标记为 `unknown`，绝不自动重试。
-- MCP 工具默认采用 Deferred 暴露：初始请求不注入完整远端 schema，Agent 通过 `tool_search` 按需发现后才加载，隐藏工具和权限 `DENY` 工具不会出现在搜索结果中。
+- MCP 工具默认采用 Deferred 暴露：初始请求不注入完整远端 schema，Agent 通过 `mcp_tool_search` 按需发现后才加载，隐藏工具和权限 `DENY` 工具不会出现在搜索结果中。
 - 对存在有效 MCP 连接的用户，目录指纹会按 `MCP_CATALOG_REFRESH_SECONDS` 周期轮转（默认 300 秒），即使 URL 和凭证未变化，下次重建 Agent 也会重新请求 `tools/list`。发现失败时不会把数据库中的旧 schema 快照暴露成可执行工具，并保留后续重试语义。
 - MCP 与权限管控分离：连接与工具发布决定“工具是否可见”，`ALLOW / ASK / DENY` 决定“这次是否可执行”。官方与个人 MCP 工具均默认 `ALLOW`；用户仍可改为每次询问或拒绝，管理员规则是不可被用户放宽的上限。
 
@@ -480,6 +480,8 @@ DATABASE_URL=postgresql://user:password@host:5432/opencapybox
 TEST_DATABASE_URL=postgresql://user:password@host:5432/opencapybox_test
 AUTH_SECRET_KEY=<至少 32 个随机字符>    # 生产环境必填
 MCP_SECRET_KEY=<另一组至少 32 个随机字符> # 生产环境必填，且不得与 AUTH_SECRET_KEY 相同
+MCP_CONNECT_RETRY_ATTEMPTS=3 # 包含首次发送前连接尝试
+MCP_CONNECT_RETRY_BASE_DELAY_SECONDS=0.5
 AUTH_TOKEN_EXPIRE_MINUTES=720
 
 # === Agent ===

@@ -14,6 +14,7 @@ from src.api.services.mcp_runtime import (
     EffectiveMcpInstallation,
     McpCallCancelled,
     McpCallOutcomeUnknown,
+    McpConnectionUnavailable,
     McpConnectionSummary,
     McpInstallationUnavailable,
     McpRequiredServerUnavailable,
@@ -344,6 +345,36 @@ async def test_streamable_http_response_has_a_hard_byte_limit():
 
 
 @pytest.mark.asyncio
+async def test_streamable_http_reads_103_sse_events_with_55k_tokens_under_limit():
+    event_count = 103
+    token_count = 55_000
+    tokens_per_event, remainder = divmod(token_count, event_count)
+    chunks = [
+        (
+            f"id: {index}\nevent: message\ndata: "
+            + ("token " * (tokens_per_event + (index < remainder)))
+            + "\n\n"
+        ).encode()
+        for index in range(event_count)
+    ]
+    response_bytes = sum(map(len, chunks))
+    source = _ChunkStream(chunks)
+    budget = mcp_runtime_module._CumulativeResponseByteBudget(response_bytes + 1)
+    stream = _LimitedResponseStream(
+        source,
+        limit=response_bytes + 1,
+        cumulative_budget=budget,
+    )
+
+    received = b"".join([chunk async for chunk in stream])
+
+    assert received.count(b"event: message") == event_count
+    assert received.count(b"token ") == token_count
+    assert budget.consumed == response_bytes
+    assert source.closed is False
+
+
+@pytest.mark.asyncio
 async def test_compressed_streamable_response_fails_closed_before_decompression():
     source = _ChunkStream([b"compressed"])
     transport = _LimitedAsyncTransport(
@@ -417,6 +448,329 @@ async def test_sdk_dns_resolution_is_async_and_bounded(monkeypatch):
     with pytest.raises(McpRuntimeError, match="DNS resolution timed out"):
         async with connector._session(_installation()):
             pass
+
+
+@pytest.mark.asyncio
+async def test_sdk_call_retries_connection_before_dispatch_only(monkeypatch):
+    connector = _SdkSessionConnector(
+        connect_retry_attempts=3,
+        connect_retry_base_delay_seconds=0,
+    )
+    attempts = []
+    dispatches = []
+
+    class SuccessfulSession:
+        async def call_tool(self, raw_name, arguments):
+            return {"raw_name": raw_name, "arguments": arguments}
+
+    @asynccontextmanager
+    async def flaky_session(_installation, **_kwargs):
+        attempts.append(object())
+        if len(attempts) < 3:
+            raise McpConnectionUnavailable("initialize reset")
+        yield SuccessfulSession()
+
+    monkeypatch.setattr(connector, "_session", flaky_session)
+
+    result = await connector.call_tool(
+        _installation(),
+        "read",
+        {"symbol": "600000"},
+        on_dispatch=lambda: dispatches.append(object()),
+    )
+
+    assert result == {"raw_name": "read", "arguments": {"symbol": "600000"}}
+    assert len(attempts) == 3
+    assert len(dispatches) == 1
+
+
+@pytest.mark.asyncio
+async def test_sdk_call_never_retries_response_stream_failure_after_dispatch(monkeypatch):
+    connector = _SdkSessionConnector(
+        connect_retry_attempts=3,
+        connect_retry_base_delay_seconds=0,
+    )
+    attempts = []
+    dispatches = []
+
+    class BrokenSession:
+        async def call_tool(self, raw_name, arguments):
+            raise httpx.ReadError("SSE stream reset")
+
+    @asynccontextmanager
+    async def broken_session(_installation, **_kwargs):
+        attempts.append(object())
+        yield BrokenSession()
+
+    monkeypatch.setattr(connector, "_session", broken_session)
+
+    with pytest.raises(httpx.ReadError, match="SSE stream reset"):
+        await connector.call_tool(
+            _installation(),
+            "write",
+            {"value": 1},
+            on_dispatch=lambda: dispatches.append(object()),
+        )
+
+    assert len(attempts) == 1
+    assert len(dispatches) == 1
+
+
+@pytest.mark.asyncio
+async def test_sdk_next_call_uses_fresh_session_after_stream_failure(monkeypatch):
+    connector = _SdkSessionConnector(
+        connect_retry_attempts=3,
+        connect_retry_base_delay_seconds=0,
+    )
+    session_ids = []
+
+    class PerCallSession:
+        def __init__(self, session_id):
+            self.session_id = session_id
+
+        async def call_tool(self, raw_name, arguments):
+            if self.session_id == 1:
+                raise httpx.ReadError("SSE stream reset")
+            return {"session_id": self.session_id}
+
+    @asynccontextmanager
+    async def fresh_session(_installation, **_kwargs):
+        session_id = len(session_ids) + 1
+        session_ids.append(session_id)
+        yield PerCallSession(session_id)
+
+    monkeypatch.setattr(connector, "_session", fresh_session)
+
+    with pytest.raises(httpx.ReadError):
+        await connector.call_tool(_installation(), "read", {})
+    result = await connector.call_tool(_installation(), "read", {})
+
+    assert result == {"session_id": 2}
+    assert session_ids == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_sdk_tools_list_retries_readonly_stream_with_fresh_session(monkeypatch):
+    connector = _SdkSessionConnector(
+        connect_retry_attempts=3,
+        connect_retry_base_delay_seconds=0,
+    )
+    session_ids = []
+
+    class SdkConnectionClosed(Exception):
+        error = SimpleNamespace(message="Connection closed")
+
+    class PerAttemptSession:
+        def __init__(self, session_id):
+            self.session_id = session_id
+
+        async def list_tools(self, cursor=None):
+            if self.session_id == 1:
+                raise SdkConnectionClosed("Connection closed")
+            return SimpleNamespace(
+                tools=[{"name": "recovered", "inputSchema": {}}],
+                nextCursor=None,
+            )
+
+    @asynccontextmanager
+    async def fresh_session(_installation, **_kwargs):
+        session_id = len(session_ids) + 1
+        session_ids.append(session_id)
+        yield PerAttemptSession(session_id)
+
+    monkeypatch.setattr(connector, "_session", fresh_session)
+
+    tools = await connector.list_tools(_installation())
+
+    assert [tool["name"] for tool in tools] == ["recovered"]
+    assert session_ids == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_sdk_broken_session_cleanup_is_time_bounded(monkeypatch):
+    connector = _SdkSessionConnector(
+        connect_retry_attempts=1,
+        connect_retry_base_delay_seconds=0,
+    )
+    cleanup_cancelled = asyncio.Event()
+
+    class HangingStack:
+        async def aclose(self):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_cancelled.set()
+
+    monkeypatch.setattr(
+        mcp_runtime_module,
+        "_TRANSPORT_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    started_at = asyncio.get_running_loop().time()
+
+    await connector._close_session_resources(
+        stack=HangingStack(),
+        async_client=None,
+        installation=_installation(),
+        response_bytes=1234,
+    )
+    await asyncio.sleep(0)
+
+    assert asyncio.get_running_loop().time() - started_at < 0.1
+    assert cleanup_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_sdk_session_cleanup_runs_in_the_session_owner_task():
+    connector = _SdkSessionConnector(
+        connect_retry_attempts=1,
+        connect_retry_base_delay_seconds=0,
+    )
+    owner_task = asyncio.current_task()
+    cleanup_tasks = []
+
+    class TaskBoundStack:
+        async def aclose(self):
+            cleanup_tasks.append(asyncio.current_task())
+
+    await connector._close_session_resources(
+        stack=TaskBoundStack(),
+        async_client=None,
+        installation=_installation(),
+        response_bytes=0,
+    )
+
+    assert cleanup_tasks == [owner_task]
+
+
+@pytest.mark.asyncio
+async def test_sdk_initialize_taskgroup_failure_is_retried_as_connection_error(
+    monkeypatch,
+):
+    connector = _SdkSessionConnector(
+        connect_retry_attempts=3,
+        connect_retry_base_delay_seconds=0,
+    )
+    attempts = 0
+
+    class CancelledInitSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def initialize(self):
+            raise asyncio.CancelledError("Cancelled via cancel scope test")
+
+    @asynccontextmanager
+    async def failing_transport(
+        url,
+        http_client=None,
+        terminate_on_close=True,
+    ):
+        nonlocal attempts
+        attempts += 1
+        try:
+            yield (object(), object(), lambda: None)
+        finally:
+            raise ExceptionGroup(
+                "transport task failed",
+                [httpx.ConnectError("direct egress unavailable")],
+            )
+
+    endpoint = ResolvedMcpEndpoint(
+        url="https://mcp.example.test/mcp",
+        hostname="mcp.example.test",
+        port=443,
+        addresses=("93.184.216.34",),
+    )
+    monkeypatch.setattr(
+        _SdkSessionConnector,
+        "_sdk",
+        staticmethod(lambda: (CancelledInitSession, failing_transport)),
+    )
+    monkeypatch.setattr(
+        "src.api.services.mcp_runtime.resolve_mcp_endpoint",
+        lambda *args, **kwargs: endpoint,
+    )
+    monkeypatch.setattr(
+        "src.api.services.mcp_runtime._secure_http_client",
+        lambda *args, **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, request=request)
+            )
+        ),
+    )
+
+    with pytest.raises(McpConnectionUnavailable, match="initialization failed"):
+        await connector.list_tools(_installation())
+
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_sdk_initialize_external_cancellation_is_not_retried(monkeypatch):
+    connector = _SdkSessionConnector(
+        connect_retry_attempts=3,
+        connect_retry_base_delay_seconds=0,
+    )
+    attempts = 0
+
+    class CancelledInitSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def initialize(self):
+            raise asyncio.CancelledError("cancelled by caller")
+
+    @asynccontextmanager
+    async def clean_transport(
+        url,
+        http_client=None,
+        terminate_on_close=True,
+    ):
+        nonlocal attempts
+        attempts += 1
+        yield (object(), object(), lambda: None)
+
+    endpoint = ResolvedMcpEndpoint(
+        url="https://mcp.example.test/mcp",
+        hostname="mcp.example.test",
+        port=443,
+        addresses=("93.184.216.34",),
+    )
+    monkeypatch.setattr(
+        _SdkSessionConnector,
+        "_sdk",
+        staticmethod(lambda: (CancelledInitSession, clean_transport)),
+    )
+    monkeypatch.setattr(
+        "src.api.services.mcp_runtime.resolve_mcp_endpoint",
+        lambda *args, **kwargs: endpoint,
+    )
+    monkeypatch.setattr(
+        "src.api.services.mcp_runtime._secure_http_client",
+        lambda *args, **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, request=request)
+            )
+        ),
+    )
+
+    with pytest.raises(asyncio.CancelledError, match="cancelled by caller"):
+        await connector.list_tools(_installation())
+
+    assert attempts == 1
 
 
 @pytest.mark.asyncio
@@ -1127,6 +1481,37 @@ async def test_discovery_rejects_tool_metadata_that_exceeds_db_columns(remote_to
         await runtime._discover_installation(installation)
 
     assert repository.saved == {}
+
+
+@pytest.mark.asyncio
+async def test_discovery_schedules_visible_tool_index_warmup():
+    installation = _installation(disabled_tools={"hidden"})
+    repository = FakeRepository([installation])
+    connector = FakeConnector()
+    connector.tools[installation.installation_id] = [
+        {
+            "name": "visible",
+            "description": "Visible capability",
+            "inputSchema": {"type": "object"},
+        },
+        {
+            "name": "hidden",
+            "description": "Hidden capability",
+            "inputSchema": {"type": "object"},
+        },
+    ]
+    scheduled = []
+    runtime = McpRuntime(
+        repository=repository,
+        connector=connector,
+        tool_index_warmup_scheduler=lambda tools: scheduled.append(list(tools)),
+    )
+
+    discovered = await runtime._discover_installation(installation)
+
+    assert [tool.raw_name for tool in discovered] == ["visible"]
+    assert len(scheduled) == 1
+    assert [tool.raw_name for tool in scheduled[0]] == ["visible"]
 
 
 @pytest.mark.asyncio
@@ -1878,6 +2263,40 @@ async def test_remote_tool_converts_result_and_supplies_turn_cancel_context():
     assert result.success is True
     assert result.content == "ok"
     assert tool.tool_ref.name == "echo"
+
+
+@pytest.mark.asyncio
+async def test_large_text_result_does_not_poison_followup_mcp_call():
+    installation = _installation()
+    repository = FakeRepository([installation])
+    connector = FakeConnector()
+    large_text = "payload " * 55_000
+    connector.result = {"content": [{"type": "text", "text": large_text}]}
+    runtime = McpRuntime(repository=repository, connector=connector)
+    snapshot = McpToolSnapshot(
+        installation_id=installation.installation_id,
+        server_id=installation.server_id,
+        server_name="example",
+        source="official",
+        raw_name="large-read",
+        model_name=model_tool_name(installation.server_id, "large-read"),
+        description="large read",
+        input_schema={"type": "object"},
+        schema_hash="schema-v1",
+        connection_fingerprint=installation.execution_fingerprint,
+    )
+    _bind_snapshot(repository, snapshot)
+    tool = McpRemoteTool(user_id="user-1", snapshot=snapshot, runtime=runtime)
+
+    large_result = await tool.execute()
+    connector.result = {"content": [{"type": "text", "text": "follow-up-ok"}]}
+    followup_result = await tool.execute()
+
+    assert large_result.success is True
+    assert large_result.content == large_text
+    assert followup_result.success is True
+    assert followup_result.content == "follow-up-ok"
+    assert len(connector.calls) == 2
 
 
 @pytest.mark.asyncio

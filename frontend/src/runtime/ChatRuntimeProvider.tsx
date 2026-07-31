@@ -41,6 +41,11 @@ interface StreamRegistryEntry {
   retryTimer?: ReturnType<typeof setTimeout>;
 }
 
+interface RunOwnershipRegistry {
+  serverRoundIdToClientRunKey: Record<string, string>;
+  idempotencyKeyToClientRunKey: Record<string, string>;
+}
+
 interface LoadHistoryOptions {
   hasActiveSlot?: boolean;
 }
@@ -79,6 +84,46 @@ function randomId(prefix: string): string {
   return `${prefix}-${random}`;
 }
 
+function findClientRunKeyForRound(
+  state: ChatRuntimeState,
+  sessionId: string,
+  round: Pick<RoundData, 'round_id' | 'idempotency_key'>,
+  ownership: RunOwnershipRegistry,
+): string | undefined {
+  const ownedRunKey = ownership.serverRoundIdToClientRunKey[round.round_id]
+    || (
+      round.idempotency_key
+        ? ownership.idempotencyKeyToClientRunKey[round.idempotency_key]
+        : undefined
+    );
+  if (ownedRunKey) {
+    return ownedRunKey;
+  }
+
+  const mappedRunKey = state.serverRunIdToClientRunKey[round.round_id];
+  if (mappedRunKey && state.runs[mappedRunKey]?.ownerSessionId === sessionId) {
+    return mappedRunKey;
+  }
+
+  const session = state.sessions[sessionId];
+  if (!session) {
+    return undefined;
+  }
+
+  return session.activeRunKeys.find((runKey) => {
+    const run = state.runs[runKey];
+    if (!run || run.ownerSessionId !== sessionId) {
+      return false;
+    }
+    return run.serverRunId === round.round_id
+      || run.tempRoundId === round.round_id
+      || (
+        Boolean(round.idempotency_key)
+        && run.idempotencyKey === round.idempotency_key
+      );
+  });
+}
+
 export function ChatRuntimeProvider({
   children,
   onTitleUpdated,
@@ -90,6 +135,10 @@ export function ChatRuntimeProvider({
   stateRef.current = state;
 
   const streamRegistryRef = useRef<Record<string, StreamRegistryEntry>>({});
+  const runOwnershipRef = useRef<RunOwnershipRegistry>({
+    serverRoundIdToClientRunKey: {},
+    idempotencyKeyToClientRunKey: {},
+  });
   const historyRequestSeqRef = useRef<Record<string, number>>({});
   const initPollTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const terminalRunKeysRef = useRef<Set<string>>(new Set());
@@ -136,6 +185,24 @@ export function ChatRuntimeProvider({
     ) {
       console.debug('Dropping stale stream event', envelope.clientRunKey, envelope.event?.type);
       return;
+    }
+
+    if (envelope.event?.type === 'RUN_STARTED') {
+      const serverRoundId = envelope.event.runId || envelope.serverRunId;
+      if (serverRoundId) {
+        const previousRunKey = runOwnershipRef.current
+          .serverRoundIdToClientRunKey[serverRoundId];
+        if (previousRunKey && previousRunKey !== envelope.clientRunKey) {
+          const previousTransport = streamRegistryRef.current[previousRunKey];
+          if (previousTransport?.retryTimer) {
+            clearTimeout(previousTransport.retryTimer);
+          }
+          previousTransport?.abort?.();
+          delete streamRegistryRef.current[previousRunKey];
+        }
+        runOwnershipRef.current.serverRoundIdToClientRunKey[serverRoundId] =
+          envelope.clientRunKey;
+      }
     }
 
     if (envelope.event?.type === 'CUSTOM' && envelope.event.name === 'title_updated') {
@@ -192,6 +259,10 @@ export function ChatRuntimeProvider({
         entry.abort?.();
       }
       streamRegistryRef.current = {};
+      runOwnershipRef.current = {
+        serverRoundIdToClientRunKey: {},
+        idempotencyKeyToClientRunKey: {},
+      };
     };
   }, []);
 
@@ -199,8 +270,17 @@ export function ChatRuntimeProvider({
     sessionId: string,
     roundId: string,
     lastSequence: number = 0,
+    existingClientRunKey?: string,
   ) => {
-    const clientRunKey = `run:${roundId}`;
+    const clientRunKey = existingClientRunKey
+      || findClientRunKeyForRound(
+        stateRef.current,
+        sessionId,
+        { round_id: roundId },
+        runOwnershipRef.current,
+      )
+      || `run:${roundId}`;
+    runOwnershipRef.current.serverRoundIdToClientRunKey[roundId] = clientRunKey;
     const existing = streamRegistryRef.current[clientRunKey];
     if (existing?.subscription || existing?.retryTimer) {
       return;
@@ -308,8 +388,19 @@ export function ChatRuntimeProvider({
 
       const runningRound = response.rounds.find((round) => round.status === 'running');
       if (runningRound) {
+        const existingClientRunKey = findClientRunKeyForRound(
+          stateRef.current,
+          sessionId,
+          runningRound,
+          runOwnershipRef.current,
+        );
         clearInitPoll(sessionId);
-        startSubscribeForRound(sessionId, runningRound.round_id, runningRound.last_event_sequence || 0);
+        startSubscribeForRound(
+          sessionId,
+          runningRound.round_id,
+          runningRound.last_event_sequence || 0,
+          existingClientRunKey,
+        );
         return;
       }
 
@@ -371,6 +462,7 @@ export function ChatRuntimeProvider({
       created_at: new Date().toISOString(),
     };
 
+    runOwnershipRef.current.idempotencyKeyToClientRunKey[idempotencyKey] = clientRunKey;
     dispatch({
       type: 'LOCAL_RUN_STARTED',
       sessionId,

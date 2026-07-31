@@ -311,6 +311,30 @@ describe('transformToDisplayBlocks', () => {
     expect(tg.dominantCategory).toBe('read');
   });
 
+  it('并行工具结果乱序时应按 tool_call_id 关联', () => {
+    const steps = [
+      makeStep({
+        tool_calls: [
+          { id: 'call-a', name: 'mcp_tool_search', input: { query: 'alpha' } },
+          { id: 'call-b', name: 'mcp_tool_search', input: { query: 'beta' } },
+        ],
+        tool_results: [
+          { tool_call_id: 'call-b', success: true, content: 'beta result' },
+          { tool_call_id: 'call-a', success: true, content: 'alpha result' },
+        ],
+      }),
+    ];
+
+    const blocks = transformToDisplayBlocks(steps);
+    const group = blocks[0] as ToolGroupBlock;
+
+    expect(group.summary).toBe('Searched 2 times');
+    expect(group.items.map((item) => item.result?.content)).toEqual([
+      'alpha result',
+      'beta result',
+    ]);
+  });
+
   it('sub_agent 工具组应有专用摘要和 dominantCategory', () => {
     const steps = [
       makeStep({

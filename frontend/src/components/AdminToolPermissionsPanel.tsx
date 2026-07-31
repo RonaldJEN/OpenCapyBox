@@ -53,7 +53,7 @@ const BUILTIN_TOOLS = [
   'ask_user',
   'sub_agent',
   'get_skill',
-  'tool_search',
+  'mcp_tool_search',
   'glm_search',
   'glm_batch_search',
 ] as const;

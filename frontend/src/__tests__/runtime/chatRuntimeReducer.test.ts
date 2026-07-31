@@ -147,6 +147,97 @@ describe('chatRuntimeReducer', () => {
     expect(calls.find((call) => call.id === 'tool-b')?.input).toEqual({ path: 'a.md' });
   });
 
+  it('projects replayed tool lifecycle events once by tool call id', () => {
+    let state = startRun();
+
+    state = stream(state, { type: 'STEP_STARTED', stepName: 'step_1' }, { sequence: 1 });
+    state = stream(state, {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'tool-a',
+      toolCallName: 'mcp_tool_search',
+      timestamp: 1000,
+    }, { sequence: 2 });
+    state = stream(
+      state,
+      { type: 'TOOL_CALL_ARGS', toolCallId: 'tool-a', delta: '{"query":"capy"}' },
+      { sequence: 3, isAggregate: true },
+    );
+    state = stream(state, {
+      type: 'TOOL_CALL_END',
+      toolCallId: 'tool-a',
+      timestamp: 1500,
+    }, { sequence: 4 });
+    state = stream(state, {
+      type: 'TOOL_CALL_RESULT',
+      toolCallId: 'tool-a',
+      content: '{"output":"first result"}',
+      timestamp: 2000,
+    }, { sequence: 5 });
+
+    state = stream(state, { type: 'STEP_STARTED', stepName: 'step_2' }, { sequence: 6 });
+    state = stream(state, {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'tool-a',
+      toolCallName: 'mcp_tool_search',
+      timestamp: 1000,
+    }, { sequence: 7 });
+    state = stream(
+      state,
+      { type: 'TOOL_CALL_ARGS', toolCallId: 'tool-a', delta: '{"query":"capy"}' },
+      { sequence: 8, isAggregate: true },
+    );
+    state = stream(state, {
+      type: 'TOOL_CALL_END',
+      toolCallId: 'tool-a',
+      timestamp: 1500,
+    }, { sequence: 9 });
+    state = stream(state, {
+      type: 'TOOL_CALL_RESULT',
+      toolCallId: 'tool-a',
+      content: '{"output":"first result"}',
+      timestamp: 2000,
+    }, { sequence: 10 });
+
+    const steps = state.sessions['sess-a'].rounds[0].steps;
+    expect(steps[0].tool_calls).toEqual([{
+      id: 'tool-a',
+      name: 'mcp_tool_search',
+      input: { query: 'capy' },
+      started_at_ts: 1000,
+      ended_at_ts: 1500,
+    }]);
+    expect(steps[0].tool_results).toHaveLength(1);
+    expect(steps[0].tool_results[0]).toMatchObject({
+      tool_call_id: 'tool-a',
+      success: true,
+      content: 'first result',
+    });
+    expect(steps[1].tool_calls).toEqual([]);
+    expect(steps[1].tool_results).toEqual([]);
+    expect(state.runs['run-a'].buffers.toolArgsByToolCallId['tool-a']).toBe('{"query":"capy"}');
+    expect(state.sessions['sess-a'].agentStateByRunKey['run-a'].toolLogs).toHaveLength(1);
+    expect(state.sessions['sess-a'].agentStateByRunKey['run-a'].toolLogs[0].status).toBe('completed');
+  });
+
+  it('keeps distinct same-name tool calls as separate entities', () => {
+    let state = startRun();
+
+    state = stream(state, { type: 'STEP_STARTED', stepName: 'step_1' }, { sequence: 1 });
+    state = stream(state, {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'tool-a',
+      toolCallName: 'mcp_tool_search',
+    }, { sequence: 2 });
+    state = stream(state, {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'tool-b',
+      toolCallName: 'mcp_tool_search',
+    }, { sequence: 3 });
+
+    const calls = state.sessions['sess-a'].rounds[0].steps[0].tool_calls;
+    expect(calls.map((call) => call.id)).toEqual(['tool-a', 'tool-b']);
+  });
+
   it('keeps terminal events idempotent after a run has finished', () => {
     let state = startRun();
 
@@ -356,6 +447,144 @@ describe('chatRuntimeReducer', () => {
 
     expect(state.runs['run:server-r1'].lastSequence).toBe(7);
     expect(state.runs['run:server-r1'].serverRunId).toBe('server-r1');
+  });
+
+  it('reuses the direct run identity when the running-session snapshot sees its server round', () => {
+    let state = startRun();
+
+    state = stream(state, {
+      type: 'RUN_STARTED',
+      threadId: 'sess-a',
+      runId: 'server-r1',
+    }, { sequence: 1 });
+    state = chatRuntimeReducer(state, {
+      type: 'RUNNING_SESSIONS_SNAPSHOT',
+      runningSessions: [{ session_id: 'sess-a', round_id: 'server-r1' }],
+      receivedAt: Date.parse('2026-01-01T00:00:04.000Z'),
+    });
+
+    expect(state.sessions['sess-a'].activeRunKeys).toEqual(['run-a']);
+    expect(state.runs['run:server-r1']).toBeUndefined();
+    expect(state.serverRunIdToClientRunKey['server-r1']).toBe('run-a');
+  });
+
+  it('transfers a history placeholder to a resumed run and clears execution at terminal', () => {
+    let state = chatRuntimeReducer(initialChatRuntimeState, {
+      type: 'LOCAL_RUN_STARTED',
+      sessionId: 'sess-a',
+      clientRunKey: 'resume-a',
+      tempRoundId: 'resume-temp-r1',
+      source: 'resume',
+      round: round({
+        round_id: 'resume-temp-r1',
+        control_kind: 'tool_approval',
+        user_message: 'Tool approval: approve_once',
+      }),
+    });
+
+    state = chatRuntimeReducer(state, {
+      type: 'HISTORY_LOADED',
+      sessionId: 'sess-a',
+      rounds: [
+        round({
+          round_id: 'server-r1',
+          user_message: 'server resume',
+          status: 'running',
+          last_event_sequence: 7,
+        }),
+      ],
+      loadedAt: Date.parse('2026-01-01T00:00:03.000Z'),
+      source: 'history',
+    });
+
+    expect(state.sessions['sess-a'].activeRunKeys).toEqual([
+      'resume-a',
+      'run:server-r1',
+    ]);
+    expect(state.runs['run:server-r1'].source).toBe('history');
+
+    state = stream(state, {
+      type: 'RUN_STARTED',
+      threadId: 'sess-a',
+      runId: 'server-r1',
+    }, {
+      clientRunKey: 'resume-a',
+      source: 'resume',
+      sequence: 8,
+    });
+
+    expect(state.sessions['sess-a'].activeRunKeys).toEqual(['resume-a']);
+    expect(state.runs['run:server-r1']).toBeUndefined();
+    expect(state.runs['resume-a']).toMatchObject({
+      serverRunId: 'server-r1',
+      source: 'resume',
+      status: 'streaming',
+      lastSequence: 8,
+    });
+    expect(state.serverRunIdToClientRunKey['server-r1']).toBe('resume-a');
+    expect(state.sessions['sess-a'].rounds).toHaveLength(1);
+    expect(state.sessions['sess-a'].rounds[0]).toMatchObject({
+      round_id: 'server-r1',
+      control_kind: 'tool_approval',
+      user_message: 'Tool approval: approve_once',
+      status: 'running',
+    });
+
+    state = stream(state, {
+      type: 'RUN_FINISHED',
+      threadId: 'sess-a',
+      runId: 'server-r1',
+      result: { finalResponse: 'done' },
+      outcome: 'success',
+    }, {
+      clientRunKey: 'resume-a',
+      source: 'resume',
+      sequence: 9,
+    });
+
+    expect(state.sessions['sess-a'].activeRunKeys).toEqual([]);
+    expect(state.runs['resume-a'].status).toBe('finished');
+    expect(state.sessions['sess-a'].rounds).toHaveLength(1);
+    expect(state.sessions['sess-a'].rounds[0]).toMatchObject({
+      round_id: 'server-r1',
+      final_response: 'done',
+      status: 'completed',
+    });
+  });
+
+  it('transfers a running-session placeholder to the real resumed run', () => {
+    let state = chatRuntimeReducer(initialChatRuntimeState, {
+      type: 'LOCAL_RUN_STARTED',
+      sessionId: 'sess-a',
+      clientRunKey: 'resume-a',
+      tempRoundId: 'resume-temp-r1',
+      source: 'resume',
+      round: round({ round_id: 'resume-temp-r1' }),
+    });
+    state = chatRuntimeReducer(state, {
+      type: 'RUNNING_SESSIONS_SNAPSHOT',
+      runningSessions: [{ session_id: 'sess-a', round_id: 'server-r1' }],
+      receivedAt: Date.parse('2026-01-01T00:00:04.000Z'),
+    });
+
+    expect(state.sessions['sess-a'].activeRunKeys).toEqual([
+      'resume-a',
+      'run:server-r1',
+    ]);
+
+    state = stream(state, {
+      type: 'RUN_STARTED',
+      threadId: 'sess-a',
+      runId: 'server-r1',
+    }, {
+      clientRunKey: 'resume-a',
+      source: 'resume',
+      sequence: 1,
+    });
+
+    expect(state.sessions['sess-a'].activeRunKeys).toEqual(['resume-a']);
+    expect(state.runs['run:server-r1']).toBeUndefined();
+    expect(state.serverRunIdToClientRunKey['server-r1']).toBe('resume-a');
   });
 
   it('retains locally started direct runs when a running snapshot is empty', () => {

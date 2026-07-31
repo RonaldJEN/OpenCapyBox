@@ -9,9 +9,16 @@ import pytest
 from src.agent.agent import Agent
 from src.agent.schema import FunctionCall, LLMResponse, ToolCall
 from src.agent.tools.ask_user_tool import AskUserQuestionTool
-from src.agent.tools.base import ToolExposure, ToolRef as AgentToolRef
+from src.agent.tools.base import (
+    ToolExposure,
+    ToolRef as AgentToolRef,
+    ToolRuntimeContext,
+)
 from src.agent.tools.mcp_tool import McpRemoteTool
-from src.agent.tools.tool_discovery import TOOL_SEARCH_NAME
+from src.agent.tools.tool_discovery import (
+    DeferredToolCatalogStale,
+    MCP_TOOL_SEARCH_NAME,
+)
 from tests.helpers import MockLLMClient, MockTool
 
 
@@ -128,9 +135,12 @@ def test_exposure_projection_keeps_deferred_and_hidden_out_of_initial_request(tm
     assert [tool.name for tool in agent._visible_tools_for_request("session-a")] == [
         "direct",
         "model_only",
-        TOOL_SEARCH_NAME,
+        MCP_TOOL_SEARCH_NAME,
     ]
-    assert "enabled MCP data connections" in agent.tools[TOOL_SEARCH_NAME].description
+    assert "enabled MCP" in agent.tools[MCP_TOOL_SEARCH_NAME].description
+    assert "Proactively match the user's request" in (
+        agent.tools[MCP_TOOL_SEARCH_NAME].description
+    )
 
 
 @pytest.mark.asyncio
@@ -147,7 +157,7 @@ async def test_discovery_exposes_only_matching_deferred_schema_on_next_step(tmp_
     )
     llm = CapturingLLM()
     llm.stream_responses = [
-        _tool_call(TOOL_SEARCH_NAME, {"query": "weather"}),
+        _tool_call(MCP_TOOL_SEARCH_NAME, {"query": "weather"}),
         _tool_call(weather.name, {"param1": "Shanghai"}),
         LLMResponse(content="done", tool_calls=[], finish_reason="stop"),
     ]
@@ -155,7 +165,7 @@ async def test_discovery_exposes_only_matching_deferred_schema_on_next_step(tmp_
 
     [event async for event in agent.run_agui("session-a", "run-a")]
 
-    assert llm.tool_names_by_call[0] == [TOOL_SEARCH_NAME]
+    assert llm.tool_names_by_call[0] == [MCP_TOOL_SEARCH_NAME]
     assert weather.name in llm.tool_names_by_call[1]
     assert spreadsheet.name not in llm.tool_names_by_call[1]
     assert weather.execute_count == 1
@@ -178,7 +188,7 @@ async def test_discovery_does_not_enable_same_response_deferred_execution(tmp_pa
                     id="call-search",
                     type="function",
                     function=FunctionCall(
-                        name=TOOL_SEARCH_NAME,
+                        name=MCP_TOOL_SEARCH_NAME,
                         arguments={"query": "weather"},
                     ),
                 ),
@@ -199,7 +209,7 @@ async def test_discovery_does_not_enable_same_response_deferred_execution(tmp_pa
 
     events = [event async for event in agent.run_agui("session-a", "run-a")]
 
-    assert llm.tool_names_by_call[0] == [TOOL_SEARCH_NAME]
+    assert llm.tool_names_by_call[0] == [MCP_TOOL_SEARCH_NAME]
     assert deferred.name in llm.tool_names_by_call[1]
     assert deferred.name in agent._activated_deferred_tools["session-a"]
     assert deferred.execute_count == 0
@@ -209,14 +219,15 @@ async def test_discovery_does_not_enable_same_response_deferred_execution(tmp_pa
         if getattr(event, "tool_call_id", None) == "call-deferred"
         and hasattr(event, "content")
     )
-    assert deferred_result.content == "Tool is unavailable in this conversation"
+    assert deferred_result.content == "工具已重新加载，将从下一步骤开始可用；请重试该调用。"
 
 
 @pytest.mark.asyncio
-async def test_deferred_tool_cannot_execute_before_discovery(tmp_path):
+async def test_known_deferred_tool_cold_recovers_then_executes_on_next_step(tmp_path):
     deferred = ExposureTool("mcp__server__danger", ToolExposure.DEFERRED)
     llm = CapturingLLM()
     llm.stream_responses = [
+        _tool_call(deferred.name, {"param1": "value"}),
         _tool_call(deferred.name, {"param1": "value"}),
         LLMResponse(content="blocked", tool_calls=[], finish_reason="stop"),
     ]
@@ -224,18 +235,49 @@ async def test_deferred_tool_cannot_execute_before_discovery(tmp_path):
 
     [event async for event in agent.run_agui("session-a", "run-a")]
 
+    assert deferred.execute_count == 1
+    assert deferred.name not in llm.tool_names_by_call[0]
+    assert deferred.name in llm.tool_names_by_call[1]
+    assert deferred.name in agent._activated_deferred_tools["session-a"]
+    assert any(
+        message.role == "tool"
+        and message.name == deferred.name
+        and message.content == "工具已重新加载，将从下一步骤开始可用；请重试该调用。"
+        for message in agent.messages
+    )
+    assert all(
+        deferred.name not in str(message.content)
+        and MCP_TOOL_SEARCH_NAME not in str(message.content)
+        for message in agent.messages
+        if message.role == "tool"
+    )
+
+
+@pytest.mark.asyncio
+async def test_denied_deferred_tool_is_not_cold_recovered(tmp_path):
+    deferred = ExposureTool("mcp__server__denied", ToolExposure.DEFERRED)
+    llm = CapturingLLM()
+    llm.stream_responses = [
+        _tool_call(deferred.name, {"param1": "value"}),
+        LLMResponse(content="blocked", tool_calls=[], finish_reason="stop"),
+    ]
+    agent = _agent(tmp_path, [deferred], llm=llm, user_id="alice")
+
+    denied = SimpleNamespace(effect="deny", reason="test deny", matched_rule_id=None)
+    with patch.object(
+        agent,
+        "_resolve_tool_permissions",
+        side_effect=lambda tools, *, session_id: [denied for _tool in tools],
+    ):
+        [event async for event in agent.run_agui("session-a", "run-a")]
+
     assert deferred.execute_count == 0
+    assert "session-a" not in agent._activated_deferred_tools
     assert any(
         message.role == "tool"
         and message.name == deferred.name
         and message.content == "Tool is unavailable in this conversation"
         for message in agent.messages
-    )
-    assert all(
-        deferred.name not in str(message.content)
-        and TOOL_SEARCH_NAME not in str(message.content)
-        for message in agent.messages
-        if message.role == "tool"
     )
 
 
@@ -454,17 +496,48 @@ async def test_semantic_discovery_discards_mcp_catalog_that_changes_during_await
         deferred_tool_catalog_is_current=is_current,
     )
 
-    matches = await agent._discover_deferred_tools(
-        session_id="session-a",
-        query="share price",
-        names=[candidate.name],
-        limit=1,
-    )
+    with pytest.raises(DeferredToolCatalogStale):
+        await agent._discover_deferred_tools(
+            session_id="session-a",
+            query="share price",
+            names=[candidate.name],
+            limit=1,
+        )
 
     assert state["checks"] == 2
     assert retriever.candidate_names == [candidate.name]
-    assert matches == []
     assert "session-a" not in agent._activated_deferred_tools
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_search_reports_catalog_reload_instead_of_false_no_match(
+    tmp_path,
+):
+    candidate = ExposureMcpTool(
+        "mcp__market__quote",
+        "installation-1",
+        [],
+        exposure=ToolExposure.DEFERRED,
+        description="realtime stock quote",
+    )
+    agent = _agent(
+        tmp_path,
+        [candidate],
+        deferred_tool_catalog_is_current=lambda: False,
+    )
+    tool = agent.tools[MCP_TOOL_SEARCH_NAME]
+    tool.set_runtime_context(ToolRuntimeContext(
+        thread_id="session-a",
+        run_id="run-a",
+        tool_call_id="call-a",
+        tool_name=MCP_TOOL_SEARCH_NAME,
+    ))
+
+    result = await tool.execute(query="stock quote")
+
+    assert result.success is True
+    assert "reloaded automatically on the next user step" in result.content
+    assert "No available deferred tools matched" not in result.content
 
 
 @pytest.mark.asyncio

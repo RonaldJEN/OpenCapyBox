@@ -50,12 +50,26 @@ def test_mcp_call_timeout_is_independent_and_enabled_by_default():
     settings = Settings(agent_tool_timeout=0)
     assert settings.agent_tool_timeout == 0
     assert settings.mcp_call_timeout_seconds == 300.0
+    assert settings.mcp_connect_retry_attempts == 3
+    assert settings.mcp_connect_retry_base_delay_seconds == 0.5
 
 
 @pytest.mark.parametrize("value", [0, -1, 601, float("nan"), float("inf")])
 def test_mcp_call_timeout_cannot_be_disabled_or_unbounded(value: float):
     with pytest.raises(ValidationError, match="must be > 0 and <= 600"):
         Settings(mcp_call_timeout_seconds=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, 11])
+def test_mcp_connect_retry_attempts_are_bounded(value: int):
+    with pytest.raises(ValidationError, match="must be > 0 and <= 10"):
+        Settings(mcp_connect_retry_attempts=value)
+
+
+@pytest.mark.parametrize("value", [-1, 31, float("nan"), float("inf")])
+def test_mcp_connect_retry_delay_is_bounded(value: float):
+    with pytest.raises(ValidationError, match="must be >= 0 and <= 30"):
+        Settings(mcp_connect_retry_base_delay_seconds=value)
 
 
 @pytest.mark.parametrize("value", [0, -1, 86401])

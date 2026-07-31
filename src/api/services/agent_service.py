@@ -104,7 +104,10 @@ def _render_mcp_connections_runtime_prompt(connections: object) -> str:
         return ""
 
     entries.sort(key=lambda item: (item[0].casefold(), item[1].casefold()))
-    lines = ["## 当前可用数据连接（仅供工具路由）"]
+    lines = [
+        "## 数据连接",
+        "按请求语义自动匹配并优先调用 `mcp_tool_search`：",
+    ]
     lines.extend(
         f"- {name}：{description}" if description else f"- {name}"
         for name, description in entries
@@ -145,6 +148,7 @@ class AgentService:
         self._pending_interrupt_round_ids: dict[str, str] = {}
         self.skill_loader = None  # 保存 skill_loader 引用
         self.mcp_catalog_fingerprint: str | None = None
+        self.mcp_catalog_configuration_fingerprint: str | None = None
         self.mcp_catalog_retry_required = False
         self.cancel_token: asyncio.Event | None = None  # per-run 取消令牌
         self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
@@ -265,6 +269,17 @@ class AgentService:
             if isinstance(exact_mcp_fingerprint, str) and exact_mcp_fingerprint
             else None
         )
+        exact_mcp_configuration_fingerprint = tool_build_metadata.get(
+            "mcp_catalog_configuration_fingerprint"
+        )
+        self.mcp_catalog_configuration_fingerprint = (
+            exact_mcp_configuration_fingerprint
+            if (
+                isinstance(exact_mcp_configuration_fingerprint, str)
+                and exact_mcp_configuration_fingerprint
+            )
+            else self.mcp_catalog_fingerprint
+        )
         self.mcp_catalog_retry_required = (
             tool_build_metadata.get("mcp_catalog_retry_required") is True
         )
@@ -302,16 +317,23 @@ class AgentService:
             )
 
             deferred_tool_retriever = get_mcp_tool_search_service()
-            expected_mcp_fingerprint = self.mcp_catalog_fingerprint
+            expected_mcp_configuration_fingerprint = (
+                self.mcp_catalog_configuration_fingerprint
+            )
             mcp_runtime = get_mcp_runtime()
 
             def _mcp_catalog_is_current() -> bool:
-                if not self.user_id or not expected_mcp_fingerprint:
+                if (
+                    not self.user_id
+                    or not expected_mcp_configuration_fingerprint
+                ):
                     return False
                 try:
                     return (
-                        mcp_runtime.catalog_fingerprint(self.user_id)
-                        == expected_mcp_fingerprint
+                        mcp_runtime.catalog_configuration_fingerprint(
+                            self.user_id
+                        )
+                        == expected_mcp_configuration_fingerprint
                     )
                 except Exception:
                     logger.warning(

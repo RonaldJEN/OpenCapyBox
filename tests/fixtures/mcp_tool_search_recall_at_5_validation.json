@@ -1,0 +1,198 @@
+{
+  "name": "MCP deferred tool search Recall@5 validation benchmark",
+  "version": 1,
+  "metric": "recall_at_5",
+  "frozen": true,
+  "pass_rule": {
+    "positive": "top_5_model_tools intersects expected_any",
+    "negative": "top_5_model_tools is empty"
+  },
+  "cases": [
+    {
+      "id": "holdout_company_deep_01",
+      "category": "company_deep_analysis",
+      "query": "从零开始研究海尔智家，帮我弄清楚它靠什么赚钱、竞争优势在哪里、财务质量如何",
+      "expected_any": ["stock-one-page", "stock-investment-logic"]
+    },
+    {
+      "id": "holdout_company_deep_02",
+      "category": "company_deep_analysis",
+      "query": "我需要快速摸清紫金矿业的业务版图、成本曲线、成长来源与潜在风险",
+      "expected_any": ["stock-one-page", "stock-investment-logic"]
+    },
+    {
+      "id": "holdout_logic_01",
+      "category": "investment_logic",
+      "query": "泡泡玛特的长期投资故事成立需要哪些关键条件",
+      "expected_any": ["stock-investment-logic"]
+    },
+    {
+      "id": "holdout_logic_02",
+      "category": "investment_logic",
+      "query": "市场看好寒武纪的依据是什么，接下来什么变化会破坏这个判断",
+      "expected_any": ["stock-investment-logic", "view-challenge"]
+    },
+    {
+      "id": "holdout_compare_01",
+      "category": "company_comparison",
+      "query": "横向比较美的集团、格力电器和海尔智家的产品结构与经营效率",
+      "expected_any": ["comparable-companies"]
+    },
+    {
+      "id": "holdout_compare_02",
+      "category": "company_comparison",
+      "query": "做光伏逆变器研究时，阳光电源应该选择哪些国内外可比企业",
+      "expected_any": ["comparable-companies"]
+    },
+    {
+      "id": "holdout_research_01",
+      "category": "company_research",
+      "query": "准备参加兆易创新电话会，帮我列一套能问出增量信息的问题",
+      "expected_any": ["stock-survey-outline"]
+    },
+    {
+      "id": "holdout_research_02",
+      "category": "company_research",
+      "query": "去现场走访牧原股份之前，需要重点核实哪些经营数据和管理层假设",
+      "expected_any": ["stock-survey-outline", "stock-investment-logic"]
+    },
+    {
+      "id": "holdout_earnings_01",
+      "category": "earnings_review",
+      "query": "拆解腾讯最新季度业绩，收入、利润和各业务板块有哪些超预期变化",
+      "expected_any": ["agent-performance-comment"]
+    },
+    {
+      "id": "holdout_earnings_02",
+      "category": "earnings_review",
+      "query": "复盘京东刚发布的财报，利润改善到底来自经营还是一次性因素",
+      "expected_any": ["agent-performance-comment"]
+    },
+    {
+      "id": "holdout_industry_01",
+      "category": "industry_analysis",
+      "query": "研究低空经济产业，需要梳理产业链位置、市场容量、政策驱动与主要玩家",
+      "expected_any": ["industry-one-pager"]
+    },
+    {
+      "id": "holdout_industry_02",
+      "category": "industry_analysis",
+      "query": "铜行业供需格局接下来怎么看，矿端、冶炼端和终端需求分别有哪些变量",
+      "expected_any": ["industry-one-pager", "qa-text"]
+    },
+    {
+      "id": "holdout_theme_01",
+      "category": "thematic_stock_selection",
+      "query": "寻找液冷服务器主题下有实际订单和技术壁垒的上市公司",
+      "expected_any": ["theme-stock-pick", "search_stocks"]
+    },
+    {
+      "id": "holdout_theme_02",
+      "category": "thematic_stock_selection",
+      "query": "人民币升值最受益的A股方向和代表性标的有哪些",
+      "expected_any": ["theme-stock-pick", "search_stocks", "qa-text"]
+    },
+    {
+      "id": "holdout_challenge_01",
+      "category": "viewpoint_challenge",
+      "query": "普遍观点认为机器人会快速进入家庭，请专门寻找反例和落地障碍",
+      "expected_any": ["view-challenge"]
+    },
+    {
+      "id": "holdout_qa_01",
+      "category": "research_qa",
+      "query": "出口退税调整可能怎样传导到光伏组件企业的订单和盈利",
+      "expected_any": ["qa-text"]
+    },
+    {
+      "id": "holdout_recall_01",
+      "category": "research_recall",
+      "query": "帮我搜集近一年关于存储芯片涨价的卖方报告和公司交流纪要",
+      "expected_any": ["recall-knowledge"]
+    },
+    {
+      "id": "holdout_market_01",
+      "category": "market_data",
+      "query": "招商银行今天最新成交价、涨幅和成交量是多少",
+      "expected_any": ["stock_highfreq_quotes"]
+    },
+    {
+      "id": "holdout_financial_01",
+      "category": "financial_data",
+      "query": "拉取万华化学最近一期的收入、归母净利润、ROE和PE",
+      "expected_any": ["get_stock_financials"]
+    },
+    {
+      "id": "holdout_shareholder_01",
+      "category": "shareholder_data",
+      "query": "看看小米集团主要股东持股比例最近有没有明显变动",
+      "expected_any": ["get_stock_shareholders"]
+    },
+    {
+      "id": "holdout_event_01",
+      "category": "company_events",
+      "query": "韦尔股份近期是否发生高管减持、解禁、监管处罚或诉讼",
+      "expected_any": ["get_stock_events"]
+    },
+    {
+      "id": "holdout_fund_01",
+      "category": "fund_selection",
+      "query": "找出主要配置创新药产业链的公募基金",
+      "expected_any": ["theme-fund-select"]
+    },
+    {
+      "id": "holdout_visual_01",
+      "category": "research_visualization",
+      "query": "画一张AI算力从芯片、服务器到数据中心的产业关系图",
+      "expected_any": ["research-chart-draw"]
+    },
+    {
+      "id": "holdout_report_01",
+      "category": "company_reports",
+      "query": "查询沪电股份最近两年的定期报告和业绩快报清单",
+      "expected_any": ["stock-report"]
+    },
+    {
+      "id": "holdout_negative_01",
+      "category": "hard_negative",
+      "query": "给新员工制作一页纸入职指南，包含考勤、报销和常用联系人",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "holdout_negative_02",
+      "category": "hard_negative",
+      "query": "比较三家婚庆公司的套餐内容、服务流程和客户评价",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "holdout_negative_03",
+      "category": "hard_negative",
+      "query": "为校园咖啡店做一次消费者调研，先拟二十个访谈问题",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "holdout_negative_04",
+      "category": "hard_negative",
+      "query": "分析这款手机应用留存率下降的原因，并提出产品改版思路",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "holdout_negative_05",
+      "category": "hard_negative",
+      "query": "把年度招聘计划的预算、实际人数和完成率做成可视化图表",
+      "expected_any": [],
+      "negative": true
+    },
+    {
+      "id": "holdout_negative_06",
+      "category": "hard_negative",
+      "query": "找出这份项目复盘材料中的反方观点，帮我准备内部辩论",
+      "expected_any": [],
+      "negative": true
+    }
+  ]
+}

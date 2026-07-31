@@ -1027,6 +1027,22 @@ class TestAgentPoolServiceUserSessions:
         assert "session-C" in pool._cache
 
     @pytest.mark.asyncio
+    async def test_invalidate_all_async_invalidates_every_cached_user(self):
+        """全局 MCP 目录变化应让当前 Worker 的所有旧 Agent 快照失效。"""
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        _inject_pool_session(pool, "session-A", "user-1")
+        _inject_pool_session(pool, "session-B", "user-1")
+        _inject_pool_session(pool, "session-C", "user-2")
+
+        removed = await pool.invalidate_all_async()
+
+        assert removed == 3
+        assert pool._cache == {}
+        assert pool._user_sessions == {}
+
+    @pytest.mark.asyncio
     async def test_invalidate_user_async_marks_running_session_without_interrupt(self):
         """配置失效遇到 running Agent 时只标记懒失效，不 interrupt 当前后台命令。"""
         from src.api.services.agent_pool_service import AgentPoolService

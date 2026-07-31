@@ -11,7 +11,7 @@ from typing import Any
 from .base import Tool, ToolExposure, ToolResult, ToolRuntimeContext
 
 
-TOOL_SEARCH_NAME = "tool_search"
+MCP_TOOL_SEARCH_NAME = "mcp_tool_search"
 _MAX_DISCOVERY_RESULTS = 20
 MAX_TOOL_SEARCH_DESCRIPTION_BYTES = 2 * 1024
 
@@ -54,6 +54,10 @@ class DeferredToolRetriever(Protocol):
     ) -> list[str]: ...
 
 
+class DeferredToolCatalogStale(RuntimeError):
+    """The Agent's MCP publication changed while discovery was in flight."""
+
+
 class ToolDiscoveryTool(Tool):
     """Search deferred tools and expose ranked matches on the next model step."""
 
@@ -68,16 +72,14 @@ class ToolDiscoveryTool(Tool):
 
     @property
     def name(self) -> str:
-        return TOOL_SEARCH_NAME
+        return MCP_TOOL_SEARCH_NAME
 
     @property
     def description(self) -> str:
         return (
-            "Search tools from the user's enabled MCP data connections that "
-            "are not included in the initial tool list. Search by connection "
-            "name or a natural-language capability description. "
-            "Matching tools returned by this call become available with their "
-            "full schemas starting on the next step of this conversation."
+            "Proactively match the user's request against enabled MCP "
+            "connection names and capability descriptions. Matching deferred "
+            "tools become available with full schemas on the next step."
         )
 
     @property
@@ -149,12 +151,23 @@ class ToolDiscoveryTool(Tool):
         if not isinstance(limit, int) or isinstance(limit, bool):
             return ToolResult(success=False, error="limit must be an integer")
         bounded_limit = max(1, min(limit, _MAX_DISCOVERY_RESULTS))
-        matches = await self._discover(
-            session_id=context.thread_id,
-            query=query,
-            names=exact_names,
-            limit=bounded_limit,
-        )
+        try:
+            matches = await self._discover(
+                session_id=context.thread_id,
+                query=query,
+                names=exact_names,
+                limit=bounded_limit,
+            )
+        except DeferredToolCatalogStale:
+            return ToolResult(
+                success=True,
+                content=(
+                    "The enabled MCP connections or tool schemas changed while "
+                    "this step was running. The latest tools will be reloaded "
+                    "automatically on the next user step; do not retry "
+                    "mcp_tool_search in this step."
+                ),
+            )
         if not matches:
             return ToolResult(
                 success=True,
@@ -173,8 +186,9 @@ class ToolDiscoveryTool(Tool):
 
 
 __all__ = [
-    "TOOL_SEARCH_NAME",
+    "MCP_TOOL_SEARCH_NAME",
     "MAX_TOOL_SEARCH_DESCRIPTION_BYTES",
+    "DeferredToolCatalogStale",
     "DeferredToolRetriever",
     "ToolDiscoveryTool",
     "ToolSearchDocument",

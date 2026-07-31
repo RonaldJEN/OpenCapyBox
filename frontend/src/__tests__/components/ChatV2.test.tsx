@@ -5,6 +5,10 @@ import { ChatV2 } from '../../components/ChatV2';
 import { apiService } from '../../services/api';
 import { RoundData } from '../../types';
 import { makeChatV2DefaultProps } from '../utils/chatv2-helpers';
+import {
+  ChatRuntimeProvider,
+  useChatRuntime,
+} from '../../runtime/ChatRuntimeProvider';
 
 const ABORT_WARNING = '远端副作用可能已经发生，请确认后再重试。';
 const ABORT_RESPONSE = {
@@ -197,6 +201,34 @@ vi.mock('../../components/QuestionCard', () => ({
     </div>
   ),
 }));
+
+function RuntimeStreamOwnershipHarness() {
+  const runtime = useChatRuntime();
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => {
+          void runtime.sendMessage({
+            sessionId: 'test-session',
+            displayMessage: 'hello',
+            content: [{ type: 'text', text: 'hello' }],
+          });
+        }}
+      >
+        start direct run
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          void runtime.loadSessionHistory('test-session');
+        }}
+      >
+        reload history
+      </button>
+    </>
+  );
+}
 
 describe('ChatV2 组件', () => {
   const mockRounds: RoundData[] = [
@@ -1837,6 +1869,72 @@ describe('ChatV2 组件', () => {
         expect.any(Object),
         7,
       );
+    });
+  });
+
+  it('历史刷新看到同一 running round 时不应为 direct run 再开一条订阅', async () => {
+    let directCallbacks: any;
+    let finishDirect!: () => void;
+    let resolveHistory!: (value: {
+      rounds: RoundData[];
+      session_id: string;
+      total: number;
+    }) => void;
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(
+      async (_sessionId, _content, callbacks) => {
+        directCallbacks = callbacks;
+        callbacks.onRunStarted?.('test-session', 'round-direct');
+        await new Promise<void>((resolve) => {
+          finishDirect = resolve;
+        });
+      },
+    );
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(() => (
+      new Promise((resolve) => {
+        resolveHistory = resolve;
+      })
+    ));
+    const runningHistory = {
+      rounds: [{
+        round_id: 'round-direct',
+        user_message: 'hello',
+        final_response: '',
+        steps: [],
+        step_count: 0,
+        status: 'running',
+        created_at: new Date().toISOString(),
+        last_event_sequence: 1,
+      }],
+      session_id: 'test-session',
+      total: 1,
+    };
+
+    render(
+      <ChatRuntimeProvider>
+        <RuntimeStreamOwnershipHarness />
+      </ChatRuntimeProvider>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'reload history' }));
+      fireEvent.click(screen.getByRole('button', { name: 'start direct run' }));
+      resolveHistory(runningHistory);
+      await Promise.resolve();
+    });
+
+    expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1);
+    expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(1);
+    expect(apiService.subscribeToRound).not.toHaveBeenCalled();
+
+    await act(async () => {
+      directCallbacks.onRunFinished(
+        'test-session',
+        'round-direct',
+        { finalResponse: 'done' },
+        'success',
+        undefined,
+      );
+      finishDirect();
     });
   });
 

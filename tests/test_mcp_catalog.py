@@ -469,6 +469,7 @@ async def test_pgvector_tool_search_is_restricted_to_current_candidates(
         config_provider=lambda: config,
     )
 
+    await service.warm_candidates(candidates)
     ranked = await service.rank("semantic-only", candidates, limit=10)
 
     assert ranked == ["close"]
@@ -564,6 +565,116 @@ def test_admin_crud_never_returns_secret(mcp_client: TestClient):
     deleted = mcp_client.delete(f"/admin/mcp/servers/{created['id']}")
     assert deleted.status_code == 200
     assert deleted.json() == {"id": created["id"], "deleted": True}
+
+
+def test_admin_catalog_mutations_invalidate_all_local_agents(mcp_client: TestClient):
+    pool = AsyncMock()
+    pool.invalidate_all_async.return_value = 2
+
+    with patch("src.api.routes.admin_mcp.get_agent_pool", return_value=pool):
+        created = _create_official(
+            mcp_client,
+            name="official-cache-invalidation",
+            auth_type="none",
+            bearer_token=None,
+        )
+        patched = mcp_client.patch(
+            f"/admin/mcp/servers/{created['id']}",
+            json={"description": "updated routing description"},
+        )
+        deleted = mcp_client.delete(f"/admin/mcp/servers/{created['id']}")
+
+    assert patched.status_code == 200, patched.text
+    assert deleted.status_code == 200, deleted.text
+    assert pool.invalidate_all_async.await_count == 3
+    assert all(
+        call.args == () and call.kwargs == {}
+        for call in pool.invalidate_all_async.await_args_list
+    )
+
+
+def test_user_catalog_mutations_invalidate_existing_conversation_agents(
+    mcp_client: TestClient,
+):
+    official = _create_official(
+        mcp_client,
+        name="official-user-cache-invalidation",
+        auth_type="none",
+        bearer_token=None,
+    )
+    pool = AsyncMock()
+    pool.invalidate_user_async.return_value = 1
+    remote_tools = [
+        {
+            "name": "search",
+            "description": "Search reports",
+            "inputSchema": {"type": "object"},
+        }
+    ]
+
+    with patch("src.api.routes.mcp.get_agent_pool", return_value=pool):
+        created = mcp_client.post(
+            "/mcp/servers",
+            json={
+                "name": "personal-cache-invalidation",
+                "url": "https://93.184.216.34/mcp",
+            },
+        )
+        assert created.status_code == 201, created.text
+        server_id = created.json()["id"]
+
+        patched = mcp_client.patch(
+            f"/mcp/servers/{server_id}",
+            json={"description": "company research and investment logic"},
+        )
+        assert patched.status_code == 200, patched.text
+
+        with patch(
+            "src.api.services.mcp_service.probe_mcp_server",
+            new=AsyncMock(return_value=(remote_tools, 5)),
+        ):
+            tested = mcp_client.post(f"/mcp/servers/{server_id}/test")
+        assert tested.status_code == 200, tested.text
+        assert tested.json()["ok"] is True
+
+        tools = mcp_client.get(f"/mcp/servers/{server_id}/tools").json()
+        visibility = mcp_client.put(
+            f"/mcp/servers/{server_id}/tools/visibility",
+            json={
+                "expected_revision": tools["visibility_revision"],
+                "disabled_tools": ["search"],
+            },
+        )
+        assert visibility.status_code == 200, visibility.text
+
+        imported = mcp_client.post(
+            "/mcp/import",
+            json={
+                "mcpServers": {
+                    "imported-cache-invalidation": {
+                        "type": "streamable-http",
+                        "url": "https://93.184.216.35/mcp",
+                    }
+                }
+            },
+        )
+        assert imported.status_code == 200, imported.text
+        assert imported.json()["imported"] == 1
+
+        connected = mcp_client.put(
+            f"/mcp/servers/{official['id']}/connection",
+            json={"enabled": True},
+        )
+        assert connected.status_code == 200, connected.text
+
+        deleted = mcp_client.delete(f"/mcp/servers/{server_id}")
+        assert deleted.status_code == 200, deleted.text
+
+    assert pool.invalidate_user_async.await_count == 7
+    assert all(
+        call.args == ("alice",) and call.kwargs == {}
+        for call in pool.invalidate_user_async.await_args_list
+    )
 
 
 def test_user_catalog_redacts_platform_only_official_connection_details(
@@ -784,8 +895,13 @@ def test_catalog_fingerprint_refresh_bucket_only_applies_with_effective_installa
     )
 
     empty_first = repository.catalog_fingerprint("alice")
+    empty_configuration = repository.catalog_configuration_fingerprint("alice")
     now[0] = 610.0
     assert repository.catalog_fingerprint("alice") == empty_first
+    assert (
+        repository.catalog_configuration_fingerprint("alice")
+        == empty_configuration
+    )
 
     created = mcp_client.post(
         "/mcp/servers",
@@ -799,10 +915,19 @@ def test_catalog_fingerprint_refresh_bucket_only_applies_with_effective_installa
 
     now[0] = 10.0
     bucket_zero = repository.catalog_fingerprint("alice")
+    configured = repository.catalog_configuration_fingerprint("alice")
     now[0] = 299.0
     assert repository.catalog_fingerprint("alice") == bucket_zero
     now[0] = 300.0
     assert repository.catalog_fingerprint("alice") != bucket_zero
+    assert repository.catalog_configuration_fingerprint("alice") == configured
+
+    updated = mcp_client.patch(
+        f"/mcp/servers/{created.json()['id']}",
+        json={"description": "new routing metadata"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert repository.catalog_configuration_fingerprint("alice") != configured
 
 
 def test_effective_installation_carries_configured_routing_description(

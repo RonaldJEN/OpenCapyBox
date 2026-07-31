@@ -149,7 +149,7 @@ OpenCapyBox supports external tools through [MCP (Model Context Protocol)](https
 
 - Credentials are encrypted at rest with an independent `MCP_SECRET_KEY`, and API responses never echo secrets. Production startup rejects missing, example, short, or reused signing/encryption keys and public example accounts.
 - Each official or personal connection has an independent per-tool allowlist/denylist. This controls publication to the Agent, not execution permission. Discovered tools receive stable model-visible names; ownership, connection state, and the latest publication policy are rechecked before every call. `tools/call` has an independent non-disableable wall-clock deadline; an indeterminate result after the dispatch boundary is marked `unknown` and is never retried automatically.
-- MCP tools use Deferred exposure by default: remote schemas are omitted from the initial request and loaded on demand through `tool_search`. Hidden tools and permission-`DENY` tools are excluded from discovery results.
+- MCP tools use Deferred exposure by default: remote schemas are omitted from the initial request and loaded on demand through `mcp_tool_search`. Hidden tools and permission-`DENY` tools are excluded from discovery results.
 - For users with effective MCP connections, the catalog fingerprint rotates every `MCP_CATALOG_REFRESH_SECONDS` (300 seconds by default), so the next Agent build fetches `tools/list` again even when the URL and credential are unchanged. If discovery fails, stored schema snapshots are not exposed as executable tools; the failure remains retryable.
 - MCP connectivity/publication and tool permissions are separate domains: availability determines whether a tool is visible, while `ALLOW / ASK / DENY` decides whether a call may run. Official and personal MCP tools both default to `ALLOW`; users may still require approval or deny execution, and administrator rules form a ceiling users cannot relax.
 
@@ -481,6 +481,8 @@ DATABASE_URL=postgresql://user:password@host:5432/opencapybox
 TEST_DATABASE_URL=postgresql://user:password@host:5432/opencapybox_test
 AUTH_SECRET_KEY=<32+ random characters> # Required in production
 MCP_SECRET_KEY=<different 32+ random characters> # Required in production and must differ from AUTH_SECRET_KEY
+MCP_CONNECT_RETRY_ATTEMPTS=3 # Includes the initial pre-dispatch connection attempt
+MCP_CONNECT_RETRY_BASE_DELAY_SECONDS=0.5
 AUTH_TOKEN_EXPIRE_MINUTES=720
 
 # === Agent ===

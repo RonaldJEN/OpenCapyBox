@@ -95,6 +95,7 @@ class TestAgentServiceCreateTools:
         runtime = MagicMock()
         runtime.resolve_catalog = AsyncMock(return_value=SimpleNamespace(
             fingerprint="refresh-bucket-7",
+            configuration_fingerprint="configuration-3",
             tools=(),
             errors=("optional server offline",),
             connections=("available-connection",),
@@ -123,6 +124,10 @@ class TestAgentServiceCreateTools:
             )
 
         assert metadata["mcp_catalog_fingerprint"] == "refresh-bucket-7"
+        assert (
+            metadata["mcp_catalog_configuration_fingerprint"]
+            == "configuration-3"
+        )
         assert metadata["mcp_catalog_retry_required"] is False
         assert metadata["mcp_connections"] == ("available-connection",)
 
@@ -1193,11 +1198,15 @@ class TestAgentServiceInitializeAgent:
         agent_kwargs = MockAgent.call_args.kwargs
         runtime_provider = agent_kwargs["runtime_prompt_provider"]
         assert runtime_provider() == (
-            "## 当前可用数据连接（仅供工具路由）\n"
+            "## 数据连接\n"
+            "按请求语义自动匹配并优先调用 `mcp_tool_search`：\n"
             "- 同花顺股票 MCP：A 股实时行情、个股资料、财务和公告"
         )
         assert "同花顺股票 MCP" not in agent_kwargs["system_prompt"]
-        assert "应先调用 tool_search" not in runtime_provider()
+        assert (
+            "按请求语义自动匹配并优先调用 `mcp_tool_search`"
+            in runtime_provider()
+        )
 
     @pytest.mark.asyncio
     async def test_initialize_agent_filters_multimodal_incompatible_fallbacks(self, service):
