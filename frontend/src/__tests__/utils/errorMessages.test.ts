@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  extractBlobAwareErrorMessage,
   formatHttpErrorMessage,
   formatSendError,
 } from '../../utils/errorMessages';
@@ -53,5 +54,31 @@ describe('send validation error formatting', () => {
 
     expect(message).toContain('消息太长');
     expect(message).toContain('10000');
+  });
+});
+
+describe('blob response error formatting', () => {
+  it('extracts FastAPI detail from a blob error response', async () => {
+    const message = await extractBlobAwareErrorMessage({
+      response: {
+        status: 400,
+        data: new Blob([
+          JSON.stringify({ detail: '导出结果过多，请缩小筛选范围' }),
+        ], { type: 'application/json' }),
+      },
+    });
+
+    expect(message).toBe('导出结果过多，请缩小筛选范围');
+  });
+
+  it('falls back to the plain blob body', async () => {
+    const message = await extractBlobAwareErrorMessage({
+      response: {
+        status: 503,
+        data: new Blob(['审计服务不可用'], { type: 'text/plain' }),
+      },
+    });
+
+    expect(message).toBe('审计服务不可用');
   });
 });

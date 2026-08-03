@@ -161,6 +161,7 @@ ehthumbs.db
 [Dd]esktop.ini
 \.BIN/
 *.lnk
+Microsoft/Windows/PowerShell/ModuleAnalysisCache
 
 # Linux
 .fuse_hidden*

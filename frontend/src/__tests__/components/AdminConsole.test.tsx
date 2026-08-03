@@ -8,6 +8,7 @@ import {
   createAdminSimpleUser,
   deleteAdminModel,
   deleteAdminUser,
+  exportAdminUsers,
   getAdminLLMCallRecordDetail,
   getAdminOverview,
   getAdminRoundsTree,
@@ -45,6 +46,7 @@ vi.mock('../../services/adminApi', () => ({
   createAdminLdapUser: vi.fn(),
   deleteAdminModel: vi.fn(),
   deleteAdminUser: vi.fn(),
+  exportAdminUsers: vi.fn(),
   getAdminModels: vi.fn(),
   getAdminModelPermissionGroups: vi.fn(),
   getAdminOverview: vi.fn(),
@@ -78,6 +80,10 @@ vi.mock('../../components/AdminMcpCatalogPanel', () => ({
 
 vi.mock('../../components/AdminToolPermissionsPanel', () => ({
   default: () => <div>平台工具权限面板</div>,
+}));
+
+vi.mock('../../components/AdminAuditLogPanel', () => ({
+  default: () => <div>管理员操作日志面板</div>,
 }));
 
 const mockNavigate = vi.fn();
@@ -307,6 +313,7 @@ describe('AdminConsole 组件', () => {
       defaults_reassigned: [],
     });
     vi.mocked(deleteAdminUser).mockResolvedValue({ user_id: 'demo', deleted: true });
+    vi.mocked(exportAdminUsers).mockResolvedValue(new Blob(['user_id\r\ndemo'], { type: 'text/csv' }));
     vi.mocked(createAdminSandboxProfile).mockResolvedValue(makeSandboxProfile());
     vi.mocked(updateAdminSandboxProfile).mockResolvedValue(makeSandboxProfile());
     vi.mocked(setAdminSandboxProfileDefault).mockResolvedValue(makeSandboxProfile());
@@ -376,6 +383,15 @@ describe('AdminConsole 组件', () => {
 
     expect(await screen.findByText('平台工具权限面板')).toBeInTheDocument();
     expect(screen.queryByText('官方 MCP 目录面板')).not.toBeInTheDocument();
+  });
+
+  it('操作日志导航应懒加载独立只读面板', async () => {
+    render(<AdminConsole />);
+    await waitFor(() => expect(getAdminOverview).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole('button', { name: '操作日志' }));
+
+    expect(await screen.findByText('管理员操作日志面板')).toBeInTheDocument();
   });
 
   it('系统监控应展示数据库运行态诊断', async () => {
@@ -899,7 +915,10 @@ describe('AdminConsole 组件', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /导出/ }));
 
-      expect(createObjectURLMock).toHaveBeenCalledTimes(1);
+      await waitFor(() => {
+        expect(exportAdminUsers).toHaveBeenCalledWith(['demo']);
+        expect(createObjectURLMock).toHaveBeenCalledTimes(1);
+      });
       expect(createObjectURLMock.mock.calls[0][0]).toBeInstanceOf(Blob);
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectURLMock).toHaveBeenCalledWith('blob:users-csv');
@@ -916,6 +935,34 @@ describe('AdminConsole 组件', () => {
         delete (URL as { revokeObjectURL?: unknown }).revokeObjectURL;
       }
     }
+  });
+
+  it('用户导出失败时展示 Blob 中的后端错误详情', async () => {
+    vi.mocked(getAdminUsers).mockResolvedValue({
+      summary: {
+        users_total: 1,
+        admins_total: 0,
+        active_total: 1,
+        running_total: 0,
+      },
+      users: [makeAdminUser()],
+    });
+    vi.mocked(exportAdminUsers).mockRejectedValueOnce({
+      response: {
+        status: 404,
+        data: new Blob([
+          JSON.stringify({ detail: '用户不存在: demo' }),
+        ], { type: 'application/json' }),
+      },
+    });
+    render(<AdminConsole />);
+    await waitFor(() => expect(getAdminOverview).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: /用户管理/ }));
+    await screen.findByText('demo');
+
+    fireEvent.click(screen.getByRole('button', { name: /导出/ }));
+
+    expect(await screen.findByText('用户不存在: demo')).toBeInTheDocument();
   });
 
   it('用户管理页可查看登录历史', async () => {

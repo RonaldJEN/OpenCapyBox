@@ -20,6 +20,7 @@ import {
   Server,
   Shield,
   ShieldCheck,
+  ScrollText,
   Trash2,
   Users,
   X,
@@ -32,6 +33,7 @@ import {
   createAdminSandboxProfile,
   createAdminSimpleUser,
   deleteAdminUser,
+  exportAdminUsers,
   getAdminLLMCallRecordDetail,
   getAdminOverview,
   getAdminRoundsTree,
@@ -64,12 +66,14 @@ import {
   type AdminUserLoginEventsResponse,
   type AdminUsersResponse,
 } from '../services/adminApi';
+import { extractBlobAwareErrorMessage, extractErrorMessage } from '../utils/errorMessages';
 import './AdminConsole.css';
 
 const LazyAdminMcpCatalogPanel = lazy(() => import('./AdminMcpCatalogPanel'));
 const LazyAdminToolPermissionsPanel = lazy(() => import('./AdminToolPermissionsPanel'));
+const LazyAdminAuditLogPanel = lazy(() => import('./AdminAuditLogPanel'));
 
-type AdminTab = 'overview' | 'rounds' | 'users' | 'sandboxes' | 'models' | 'mcp' | 'permissions' | 'system';
+type AdminTab = 'overview' | 'rounds' | 'users' | 'sandboxes' | 'models' | 'mcp' | 'permissions' | 'audit' | 'system';
 type UserCreateMode = 'simple' | 'ldap';
 type UserStatusFilter = 'all' | 'enabled' | 'disabled';
 type UserRoleFilter = 'all' | 'admin' | 'user';
@@ -97,6 +101,7 @@ const NAV_ITEMS: Array<{ id: AdminTab; label: string; icon: ComponentType<{ size
   { id: 'models', label: '模型权限', icon: KeyRound },
   { id: 'mcp', label: '官方 MCP', icon: Cable },
   { id: 'permissions', label: '工具权限', icon: Shield },
+  { id: 'audit', label: '操作日志', icon: ScrollText },
   { id: 'system', label: '系统监控', icon: Gauge },
 ];
 
@@ -418,78 +423,15 @@ function tokenPercent(used: number, limit: number | null): number {
   return limit === null || limit === 0 ? 0 : Math.min(100, Math.round((used / limit) * 100));
 }
 
-function escapeCsvCell(value: string | number | boolean | null | undefined): string {
-  const text = value === null || value === undefined ? '' : String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-}
-
 function apiErrorStatus(error: unknown): number | undefined {
   return (error as { response?: { status?: number } })?.response?.status;
 }
 
 function apiErrorDetail(error: unknown): string {
-  const detail = (error as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
-  return typeof detail === 'string' ? detail : '';
+  return extractErrorMessage(error);
 }
 
-function buildUsersCsv(users: AdminUserItem[]): string {
-  const headers = [
-    'user_id',
-    'username',
-    'auth_type',
-    'enabled',
-    'role',
-    'status',
-    'sessions_count',
-    'rounds_count',
-    'running_rounds',
-    'total_tokens',
-    'weekly_tokens_used',
-    'monthly_tokens_used',
-    'token_limit_per_week',
-    'token_limit_per_month',
-    'sandbox_profile_name',
-    'sandbox_profile_source',
-    'sandbox_profile_error',
-    'sandbox_id',
-    'sandbox_status',
-    'sandbox_needs_recreate',
-    'last_active_at',
-    'last_login_at',
-    'last_login_ip',
-  ];
-  const rows = users.map((user) => [
-    user.user_id,
-    user.username,
-    user.auth_type,
-    user.enabled,
-    user.role,
-    user.status,
-    user.sessions_count,
-    user.rounds_count,
-    user.running_rounds,
-    user.total_tokens,
-    user.weekly_tokens_used,
-    user.monthly_tokens_used,
-    user.token_limit_per_week,
-    user.token_limit_per_month,
-    user.sandbox_profile_name,
-    user.sandbox_profile_source,
-    user.sandbox_profile_error,
-    user.sandbox_id,
-    user.sandbox_status,
-    user.sandbox_needs_recreate,
-    user.last_active_at,
-    user.last_login_at,
-    user.last_login_ip,
-  ]);
-  return [headers, ...rows]
-    .map((row) => row.map((cell) => escapeCsvCell(cell)).join(','))
-    .join('\r\n');
-}
-
-function downloadTextFile(filename: string, content: string) {
-  const blob = new Blob(['\ufeff', content], { type: 'text/csv;charset=utf-8' });
+function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
@@ -514,6 +456,7 @@ export default function AdminConsole() {
   const [modelRefreshToken, setModelRefreshToken] = useState(0);
   const [mcpRefreshToken, setMcpRefreshToken] = useState(0);
   const [permissionRefreshToken, setPermissionRefreshToken] = useState(0);
+  const [auditRefreshToken, setAuditRefreshToken] = useState(0);
   const [adminMcpDirty, setAdminMcpDirty] = useState(false);
   const [pendingAdminTab, setPendingAdminTab] = useState<AdminTab | null>(null);
   const adminMcpDiscardDialogRef = useRef<HTMLElement>(null);
@@ -937,6 +880,12 @@ export default function AdminConsole() {
   }, [runSandboxAction]);
 
   const refreshActiveTab = useCallback(async () => {
+    // The audit panel owns its filters and cursor. Let it load on mount, and
+    // refresh it through a token so the global spinner does not unmount it.
+    if (activeTab === 'audit') {
+      setError('');
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -986,6 +935,14 @@ export default function AdminConsole() {
       setLoading(false);
     }
   }, [activeTab, overviewDays, roundPage, roundPageSize, debouncedRoundSearch, roundStatus]);
+
+  const handleRefreshClick = useCallback(() => {
+    if (activeTab === 'audit') {
+      setAuditRefreshToken((prev) => prev + 1);
+      return;
+    }
+    void refreshActiveTab();
+  }, [activeTab, refreshActiveTab]);
 
   useEffect(() => {
     setRoundPage(1);
@@ -1056,7 +1013,7 @@ export default function AdminConsole() {
             <div className="admin-topbar-sub">管理后台数据每次进入模块时实时拉取</div>
           </div>
           <div style={{ flex: 1 }} />
-          <button className="admin-button" onClick={refreshActiveTab}>
+          <button className="admin-button" onClick={handleRefreshClick}>
             <RefreshCw size={14} />
             刷新
           </button>
@@ -1143,6 +1100,12 @@ export default function AdminConsole() {
           {!loading && !error && activeTab === 'permissions' ? (
             <Suspense fallback={<div className="admin-card admin-empty-card">正在加载工具权限...</div>}>
               <LazyAdminToolPermissionsPanel refreshToken={permissionRefreshToken} />
+            </Suspense>
+          ) : null}
+
+          {!loading && !error && activeTab === 'audit' ? (
+            <Suspense fallback={<div className="admin-card admin-empty-card">正在加载操作日志...</div>}>
+              <LazyAdminAuditLogPanel refreshToken={auditRefreshToken} />
             </Suspense>
           ) : null}
 
@@ -1870,6 +1833,8 @@ function UsersPanel({
   const [loginEvents, setLoginEvents] = useState<AdminUserLoginEventsResponse | null>(null);
   const [loginEventsLoading, setLoginEventsLoading] = useState(false);
   const [loginEventsError, setLoginEventsError] = useState('');
+  const [exportingUsers, setExportingUsers] = useState(false);
+  const [exportUsersError, setExportUsersError] = useState('');
 
   useEffect(() => {
     const nextDrafts: Record<string, { weeklyLimit: string; monthlyLimit: string }> = {};
@@ -1911,9 +1876,22 @@ function UsersPanel({
       });
   }, [authFilter, roleFilter, searchQuery, sortKey, statusFilter, users]);
 
-  const handleExportVisibleUsers = () => {
-    const day = new Date().toISOString().slice(0, 10);
-    downloadTextFile(`opencapybox-users-${day}.csv`, buildUsersCsv(visibleUsers));
+  const handleExportVisibleUsers = async () => {
+    setExportingUsers(true);
+    setExportUsersError('');
+    try {
+      const blob = await exportAdminUsers(visibleUsers.map((user) => user.user_id));
+      const day = new Date().toISOString().slice(0, 10);
+      downloadBlob(`opencapybox-users-${day}.csv`, blob);
+    } catch (exportError) {
+      console.error('Failed to export admin users:', exportError);
+      setExportUsersError(
+        (await extractBlobAwareErrorMessage(exportError))
+        || '用户数据导出失败，请稍后重试',
+      );
+    } finally {
+      setExportingUsers(false);
+    }
   };
 
   const handleCreateSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -1969,6 +1947,7 @@ function UsersPanel({
 
       {actionError ? <div className="admin-error admin-inline-message">{actionError}</div> : null}
       {actionMessage ? <div className="admin-toast" role="status">{actionMessage}</div> : null}
+      {exportUsersError ? <div className="admin-error admin-inline-message">{exportUsersError}</div> : null}
 
       <div className="admin-card admin-users-card">
         <div className="admin-card-header">
@@ -2029,9 +2008,14 @@ function UsersPanel({
                 <option value="tokens">Token 用量</option>
               </select>
             </label>
-            <button className="admin-button admin-icon-button" type="button" onClick={handleExportVisibleUsers}>
+            <button
+              className="admin-button admin-icon-button"
+              type="button"
+              onClick={() => void handleExportVisibleUsers()}
+              disabled={exportingUsers || visibleUsers.length === 0}
+            >
               <Download size={14} />
-              导出
+              {exportingUsers ? '导出中...' : '导出'}
             </button>
           </div>
         </div>

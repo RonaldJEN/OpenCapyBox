@@ -22,6 +22,7 @@ def _import_models():
     from src.api.models import subagent_run as _  # noqa: F401
     from src.api.models.auth_user import AuthUser as _  # noqa: F401
     from src.api.models.auth_login_event import AuthLoginEvent as _  # noqa: F401
+    from src.api.models.admin_operation_log import AdminOperationLog as _  # noqa: F401
     from src.api.models.llm_model import LLMModel, LLMModelSettings  # noqa: F401
     from src.api.models.model_permission import (  # noqa: F401
         ModelPermissionGroup,

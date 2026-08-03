@@ -21,6 +21,7 @@ from .channel_session_binding import ChannelSessionBinding
 from .subagent_run import SubagentRun
 from .auth_user import AuthUser
 from .auth_login_event import AuthLoginEvent
+from .admin_operation_log import AdminOperationLog
 from .user_skill_inventory import UserSkillInventorySnapshot
 from .llm_model import LLMModel, LLMModelSettings
 from .model_permission import ModelPermissionGroup, ModelPermissionGroupModel, UserModelPermissionGroup
@@ -53,6 +54,7 @@ __all__ = [
     "SubagentRun",
     "AuthUser",
     "AuthLoginEvent",
+    "AdminOperationLog",
     "UserSkillInventorySnapshot",
     "LLMModel",
     "LLMModelSettings",

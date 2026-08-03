@@ -662,3 +662,72 @@ export async function getAdminSystem(hours: number = 24): Promise<AdminSystemRes
   const resp = await client.get<AdminSystemResponse>('/admin/system', { params: { hours } });
   return resp.data;
 }
+
+export type AdminOperationLogOutcome = 'started' | 'succeeded' | 'failed';
+export type AdminOperationLogRiskLevel = 'high' | 'normal';
+
+export interface AdminOperationLogItem {
+  id: number;
+  request_id: string;
+  actor_user_id: string;
+  action: string;
+  risk_level: AdminOperationLogRiskLevel;
+  target_type: string | null;
+  target_id: string | null;
+  target_user_id: string | null;
+  session_id: string | null;
+  step_record_id: number | null;
+  outcome: AdminOperationLogOutcome;
+  http_method: string;
+  route_template: string;
+  status_code: number | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  changed_fields: unknown;
+  details: unknown;
+  started_at: string;
+  completed_at: string | null;
+}
+
+export interface AdminOperationLogFilters {
+  from?: string;
+  to?: string;
+  action?: string;
+  target_user_id?: string;
+  session_id?: string;
+  outcome?: AdminOperationLogOutcome;
+  risk_level?: AdminOperationLogRiskLevel;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface AdminOperationLogsResponse {
+  items: AdminOperationLogItem[];
+  next_cursor: string | null;
+}
+
+export async function getAdminOperationLogs(
+  params: AdminOperationLogFilters,
+): Promise<AdminOperationLogsResponse> {
+  const resp = await client.get<AdminOperationLogsResponse>('/admin/operation-logs', { params });
+  return resp.data;
+}
+
+export async function exportAdminOperationLogs(
+  params: Omit<AdminOperationLogFilters, 'cursor' | 'limit'>,
+): Promise<Blob> {
+  const resp = await client.get<Blob>('/admin/operation-logs/export', {
+    params,
+    responseType: 'blob',
+  });
+  return resp.data;
+}
+
+export async function exportAdminUsers(userIds: string[]): Promise<Blob> {
+  const resp = await client.post<Blob>(
+    '/admin/users/export',
+    { user_ids: userIds },
+    { responseType: 'blob' },
+  );
+  return resp.data;
+}

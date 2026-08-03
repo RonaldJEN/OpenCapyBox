@@ -108,7 +108,7 @@ class TestGetCurrentUser:
     async def test_get_current_admin_user_success(self, db):
         from src.api.deps import get_current_admin_user
 
-        result = await get_current_admin_user(user_id="admin", db=db)
+        result = await get_current_admin_user(request=None, user_id="admin", db=db)
         assert result == "admin"
 
     @pytest.mark.asyncio
@@ -116,7 +116,7 @@ class TestGetCurrentUser:
         from src.api.deps import get_current_admin_user
 
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_admin_user(user_id="demo", db=db)
+            await get_current_admin_user(request=None, user_id="demo", db=db)
 
         assert exc_info.value.status_code == 403
         assert "管理员权限" in exc_info.value.detail

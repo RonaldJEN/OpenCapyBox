@@ -124,6 +124,7 @@ async def get_current_user(
 
 
 async def get_current_admin_user(
+    request: Request,
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ) -> str:
@@ -134,4 +135,10 @@ async def get_current_admin_user(
         if exc.status_code == 403:
             raise _forbidden(exc.detail) from exc
         raise
+    if request is not None:
+        # Import lazily so the authentication primitives stay usable while
+        # database models are being initialized.
+        from src.api.services.admin_operation_audit import begin_admin_audit
+
+        begin_admin_audit(request, user_id)
     return user_id

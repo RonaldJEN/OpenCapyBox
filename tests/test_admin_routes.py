@@ -196,6 +196,56 @@ class TestAdminRouter:
         assert resp.json() == payload
         assert mocked.call_count == 1
 
+    def test_user_export_is_generated_by_backend_in_requested_order(self):
+        client = _make_client(admin_enabled=True)
+        payload = {
+            "summary": {
+                "users_total": 2,
+                "admins_total": 1,
+                "active_total": 2,
+                "running_total": 0,
+            },
+            "users": [
+                {"user_id": "alice", "username": "=Alice", "role": "user"},
+                {"user_id": "admin", "username": "Admin", "role": "admin"},
+            ],
+        }
+
+        with patch("src.api.routes.admin._build_users_payload", return_value=payload):
+            resp = client.post(
+                "/admin/users/export",
+                json={"user_ids": ["admin", "alice"]},
+            )
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/csv")
+        text = resp.content.decode("utf-8-sig")
+        rows = text.splitlines()
+        assert rows[0].startswith("user_id,username,auth_type")
+        assert rows[1].startswith("admin,Admin,")
+        assert rows[2].startswith("alice,'=Alice,")
+
+    def test_user_export_rejects_unknown_user(self):
+        client = _make_client(admin_enabled=True)
+        payload = {
+            "summary": {
+                "users_total": 1,
+                "admins_total": 1,
+                "active_total": 1,
+                "running_total": 0,
+            },
+            "users": [{"user_id": "admin", "username": "Admin", "role": "admin"}],
+        }
+
+        with patch("src.api.routes.admin._build_users_payload", return_value=payload):
+            resp = client.post(
+                "/admin/users/export",
+                json={"user_ids": ["missing"]},
+            )
+
+        assert resp.status_code == 404
+        assert "用户不存在" in resp.json()["detail"]
+
     def test_user_login_events_delegates_to_builder(self):
         client = _make_client(admin_enabled=True)
         payload = {

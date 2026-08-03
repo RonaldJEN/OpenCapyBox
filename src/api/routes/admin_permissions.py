@@ -1,16 +1,21 @@
 """Administrator-managed tool permission ceilings."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.deps import get_current_admin_user
 from src.api.models.database import get_db
 from src.api.models.tool_permission import ToolPermissionRule
 from src.api.schemas.tool_permission import ToolPermissionRuleCreate, ToolPermissionRulePatch
+from src.api.services.admin_operation_audit import (
+    AdminAuditRoute,
+    admin_audit_action,
+    enrich_admin_audit,
+)
 from src.api.services.tool_permission_service import ToolRef, create_permission_rule, rule_to_payload
 
 
-router = APIRouter()
+router = APIRouter(route_class=AdminAuditRoute)
 
 
 def _get_managed_rule(db: DBSession, rule_id: str) -> ToolPermissionRule:
@@ -29,7 +34,9 @@ def _get_managed_rule(db: DBSession, rule_id: str) -> ToolPermissionRule:
 
 
 @router.get("")
+@admin_audit_action("tool_permission.list")
 async def list_managed_tool_permissions(
+    request: Request,
     _admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
@@ -42,15 +49,25 @@ async def list_managed_tool_permissions(
         .order_by(ToolPermissionRule.priority.desc(), ToolPermissionRule.created_at.asc())
         .all()
     )
+    enrich_admin_audit(request, details={"returned_count": len(rows)})
     return {"rules": [rule_to_payload(row) for row in rows]}
 
 
 @router.post("")
+@admin_audit_action(
+    "tool_permission.create",
+    target_type="tool_permission_rule",
+)
 async def create_managed_tool_permission(
+    request: Request,
     payload: ToolPermissionRuleCreate,
     admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
+    enrich_admin_audit(
+        request,
+        changed_fields=sorted(payload.model_fields_set),
+    )
     if payload.provider == "mcp":
         from src.api.models.mcp import McpServer
 
@@ -72,16 +89,24 @@ async def create_managed_tool_permission(
         created_by=admin_user_id,
         managed=True,
     )
+    enrich_admin_audit(request, target_id=rule.id)
     return rule_to_payload(rule)
 
 
 @router.patch("/{rule_id}")
+@admin_audit_action(
+    "tool_permission.update",
+    target_type="tool_permission_rule",
+    target_param="rule_id",
+)
 async def patch_managed_tool_permission(
+    request: Request,
     rule_id: str,
     payload: ToolPermissionRulePatch,
     _admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
+    enrich_admin_audit(request, changed_fields=sorted(payload.model_fields_set))
     rule = _get_managed_rule(db, rule_id)
     for key, value in payload.model_dump(exclude_unset=True).items():
         setattr(rule, key, value)
@@ -91,11 +116,18 @@ async def patch_managed_tool_permission(
 
 
 @router.delete("/{rule_id}")
+@admin_audit_action(
+    "tool_permission.delete",
+    target_type="tool_permission_rule",
+    target_param="rule_id",
+)
 async def delete_managed_tool_permission(
+    request: Request,
     rule_id: str,
     _admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
+    enrich_admin_audit(request, changed_fields=["deleted"])
     rule = _get_managed_rule(db, rule_id)
     db.delete(rule)
     db.commit()

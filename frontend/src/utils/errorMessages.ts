@@ -2,7 +2,7 @@ export const MAX_TEXT_BLOCK_CHARS = 10000;
 export const UPLOAD_TARGET_UNCERTAIN_MESSAGE = '文件上传失败：无法确认目标文件是否已存在。为避免覆盖已有文件，本次上传已取消，请稍后重试。';
 
 interface ApiErrorLike {
-  response?: { data?: { detail?: unknown }; status?: unknown };
+  response?: { data?: unknown; status?: unknown };
   message?: unknown;
   status?: unknown;
 }
@@ -16,6 +16,22 @@ interface ValidationErrorLike {
 
 function apiErrorLike(error: unknown): ApiErrorLike {
   return error && typeof error === 'object' ? error as ApiErrorLike : {};
+}
+
+function responseDetail(data: unknown): unknown {
+  return data && typeof data === 'object'
+    ? (data as { detail?: unknown }).detail
+    : undefined;
+}
+
+async function blobText(blob: Blob): Promise<string> {
+  if (typeof blob.text === 'function') return blob.text();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.onerror = () => reject(reader.error || new Error('读取错误响应失败'));
+    reader.readAsText(blob);
+  });
 }
 
 export function messageTooLongText(length: number): string {
@@ -108,17 +124,26 @@ export function detailToMessage(detail: unknown): string {
 
 export function extractErrorMessage(err: unknown): string {
   const error = apiErrorLike(err);
-  const responseDetail = error.response?.data?.detail;
-  const detailMessage = detailToMessage(responseDetail);
+  const detailMessage = detailToMessage(responseDetail(error.response?.data));
   if (detailMessage) return detailMessage;
   if (typeof error.message === 'string') return error.message;
   return '';
 }
 
+export async function extractBlobAwareErrorMessage(err: unknown): Promise<string> {
+  const error = apiErrorLike(err);
+  const data = error.response?.data;
+  if (typeof Blob !== 'undefined' && data instanceof Blob) {
+    const rawText = await blobText(data);
+    const status = Number(error.response?.status);
+    return formatHttpErrorMessage(Number.isFinite(status) ? status : 0, rawText);
+  }
+  return extractErrorMessage(err);
+}
+
 export function extractValidationErrorMessage(err: unknown): string {
   const error = apiErrorLike(err);
-  const responseDetail = error.response?.data?.detail;
-  const detailMessage = validationDetailToMessage(responseDetail);
+  const detailMessage = validationDetailToMessage(responseDetail(error.response?.data));
   if (detailMessage) return detailMessage;
   if (typeof error.message === 'string') return error.message;
   return '';
@@ -138,7 +163,7 @@ export function formatSendError(err: unknown): string {
   const status = error.status ?? error.response?.status;
   if (
     status === 413
-    || (status === 422 && hasMessageTooLongValidation(error.response?.data?.detail))
+    || (status === 422 && hasMessageTooLongValidation(responseDetail(error.response?.data)))
   ) {
     return '消息太长，已超过当前输入限制。请拆成多条发送，或保存为文件后上传。';
   }

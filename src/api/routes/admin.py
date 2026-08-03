@@ -7,12 +7,14 @@
 - 系统监控
 """
 
+import csv
+import io
 import logging
 import json
 from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, func, or_, text
 from sqlalchemy.exc import IntegrityError
@@ -65,9 +67,14 @@ from src.api.services.model_access_service import (
     set_user_groups,
     user_model_groups_payload,
 )
+from src.api.services.admin_operation_audit import (
+    AdminAuditRoute,
+    admin_audit_action,
+    enrich_admin_audit,
+)
 from src.api.utils.timezone import now_naive
 
-router = APIRouter()
+router = APIRouter(route_class=AdminAuditRoute)
 logger = logging.getLogger(__name__)
 
 
@@ -320,6 +327,22 @@ class AdminResetPasswordPayload(BaseModel):
         if not value.strip():
             raise ValueError("密码不能为空")
         return value
+
+
+class AdminUserExportPayload(BaseModel):
+    user_ids: list[str] = Field(..., min_length=1, max_length=10000)
+
+    @field_validator("user_ids")
+    @classmethod
+    def _normalize_user_ids(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value if item and item.strip()]
+        if not normalized or len(normalized) != len(value):
+            raise ValueError("user_ids 不能包含空值")
+        if any(len(item) > 100 for item in normalized):
+            raise ValueError("user_id 长度不能超过 100")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("user_ids 不能重复")
+        return normalized
 
 
 def _iso(dt) -> str | None:
@@ -1682,6 +1705,63 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
     }
 
 
+_USER_EXPORT_FIELDS = (
+    "user_id",
+    "username",
+    "auth_type",
+    "enabled",
+    "role",
+    "status",
+    "sessions_count",
+    "rounds_count",
+    "running_rounds",
+    "total_tokens",
+    "weekly_tokens_used",
+    "monthly_tokens_used",
+    "token_limit_per_week",
+    "token_limit_per_month",
+    "sandbox_profile_name",
+    "sandbox_profile_source",
+    "sandbox_profile_error",
+    "sandbox_id",
+    "sandbox_status",
+    "sandbox_needs_recreate",
+    "last_active_at",
+    "last_login_at",
+    "last_login_ip",
+)
+
+
+def _safe_csv_value(value: Any) -> Any:
+    """Prevent spreadsheet programs from evaluating user-controlled cells."""
+
+    if value is None:
+        return ""
+    if isinstance(value, str) and value.lstrip(" \t\r\n").startswith(
+        ("=", "+", "-", "@")
+    ):
+        return "'" + value
+    return value
+
+
+def _build_users_export_csv(db: DBSession, user_ids: list[str]) -> bytes:
+    users = _build_users_payload(db)["users"]
+    by_id = {item["user_id"]: item for item in users}
+    missing = [user_id for user_id in user_ids if user_id not in by_id]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"用户不存在: {missing[0]}")
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(_USER_EXPORT_FIELDS)
+    for user_id in user_ids:
+        item = by_id[user_id]
+        writer.writerow(
+            [_safe_csv_value(item.get(field)) for field in _USER_EXPORT_FIELDS]
+        )
+    return ("\ufeff" + output.getvalue()).encode("utf-8")
+
+
 def _build_user_login_events_payload(db: DBSession, *, user_id: str, limit: int) -> dict[str, Any]:
     user = db.query(AuthUser).filter(AuthUser.user_id == user_id).first()
     if not user:
@@ -1857,6 +1937,7 @@ def _build_system_payload(db: DBSession, hours: int) -> dict[str, Any]:
 
 
 @router.get("/overview")
+@admin_audit_action("overview.read", target_type="overview")
 async def get_admin_overview(
     days: int = Query(7, ge=1, le=90),
     _: str = Depends(get_current_admin_user),
@@ -1866,7 +1947,14 @@ async def get_admin_overview(
     return _build_overview_payload(db, days)
 
 @router.get("/rounds-tree")
+@admin_audit_action(
+    "session.list",
+    target_type="session_collection",
+    query_action_param="search",
+    query_action="session.search",
+)
 async def get_admin_rounds_tree(
+    request: Request,
     limit: int = Query(30, ge=1, le=200),
     offset: int = Query(0, ge=0),
     status: str = Query(
@@ -1879,7 +1967,11 @@ async def get_admin_rounds_tree(
     db: DBSession = Depends(get_db),
 ):
     """按 Session 聚合的 rounds 监控树，含 round 内 step 级 LLM 调用明细。"""
-    return _build_rounds_tree_payload(
+    if search:
+        # Classify the request before the data query so a downstream failure
+        # is still recorded as a search rather than a plain list operation.
+        enrich_admin_audit(request, action="session.search")
+    result = _build_rounds_tree_payload(
         db,
         limit=limit,
         offset=offset,
@@ -1887,10 +1979,29 @@ async def get_admin_rounds_tree(
         user_id=user_id,
         search=search,
     )
+    enrich_admin_audit(
+        request,
+        target_user_id=user_id,
+        details={
+            "status": status,
+            "has_search": bool(search),
+            "limit": limit,
+            "offset": offset,
+            "returned_count": len(result["sessions"]),
+        },
+    )
+    return result
 
 
 @router.get("/sessions/{session_id}/rounds")
+@admin_audit_action(
+    "session.view",
+    target_type="session",
+    target_param="session_id",
+    session_param="session_id",
+)
 async def get_admin_session_rounds(
+    request: Request,
     session_id: str,
     status: str = Query(
         "all",
@@ -1901,49 +2012,136 @@ async def get_admin_session_rounds(
     db: DBSession = Depends(get_db),
 ):
     """懒加载单个 Session 下的 Round 和 step 级轻量明细。"""
-    return _build_session_rounds_payload(
+    result = _build_session_rounds_payload(
         db,
         session_id=session_id,
         status=status,
         search=search,
     )
+    owner_user_id = db.query(Session.user_id).filter(Session.id == session_id).scalar()
+    enrich_admin_audit(
+        request,
+        target_user_id=owner_user_id,
+        session_id=session_id,
+        details={
+            "status": status,
+            "has_search": bool(search),
+            "returned_count": len(result["rounds"]),
+        },
+    )
+    return result
 
 
 @router.put("/llm-call-records/{llm_record_id}/review")
+@admin_audit_action(
+    "step.review.update",
+    target_type="step",
+    target_param="llm_record_id",
+    step_param="llm_record_id",
+)
 async def update_admin_llm_call_review(
+    request: Request,
     llm_record_id: int,
     payload: ManualReviewUpdatePayload,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """更新 step 级 LLM 调用记录的人工审阅状态。"""
-    return _update_llm_record_review_status(
+    audit_row = (
+        db.query(
+            LLMCallRecord.manual_review_status,
+            LLMCallRecord.session_id,
+            Session.user_id,
+        )
+        .join(Session, Session.id == LLMCallRecord.session_id)
+        .filter(LLMCallRecord.id == llm_record_id)
+        .first()
+    )
+    result = _update_llm_record_review_status(
         db,
         llm_record_id=llm_record_id,
         manual_review_status=payload.manual_review_status,
     )
+    if audit_row:
+        enrich_admin_audit(
+            request,
+            target_user_id=audit_row.user_id,
+            session_id=audit_row.session_id,
+            step_record_id=llm_record_id,
+            changed_fields={
+                "manual_review_status": {
+                    "before": audit_row.manual_review_status,
+                    "after": payload.manual_review_status,
+                }
+            },
+        )
+    return result
 
 
 @router.get("/llm-call-records/{llm_record_id}")
+@admin_audit_action(
+    "step.view",
+    target_type="step",
+    target_param="llm_record_id",
+    step_param="llm_record_id",
+)
 async def get_admin_llm_call_record_detail(
+    request: Request,
     llm_record_id: int,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """获取单条 step 级 LLM 调用详情（按需加载）。"""
-    return _build_llm_record_detail_payload(db, llm_record_id)
+    result = _build_llm_record_detail_payload(db, llm_record_id)
+    audit_row = (
+        db.query(LLMCallRecord.session_id, Session.user_id)
+        .join(Session, Session.id == LLMCallRecord.session_id)
+        .filter(LLMCallRecord.id == llm_record_id)
+        .first()
+    )
+    if audit_row:
+        enrich_admin_audit(
+            request,
+            target_user_id=audit_row.user_id,
+            session_id=audit_row.session_id,
+            step_record_id=llm_record_id,
+        )
+    return result
 
 
 @router.get("/users")
+@admin_audit_action("user.list", target_type="user_collection")
 async def get_admin_users(
+    request: Request,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """管理端用户列表与角色信息。"""
-    return _build_users_payload(db)
+    result = _build_users_payload(db)
+    enrich_admin_audit(request, details={"returned_count": len(result["users"])})
+    return result
+
+
+@router.post("/users/export")
+@admin_audit_action("user.export", target_type="user_collection")
+async def export_admin_users(
+    request: Request,
+    payload: AdminUserExportPayload,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    """由后端重新查询并导出当前管理端选中的用户。"""
+    content = _build_users_export_csv(db, payload.user_ids)
+    enrich_admin_audit(request, details={"exported_count": len(payload.user_ids)})
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="opencapybox-users.csv"'},
+    )
 
 
 @router.get("/sandbox-profiles")
+@admin_audit_action("sandbox.list", target_type="sandbox_collection")
 async def get_admin_sandbox_profiles(
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
@@ -1953,18 +2151,35 @@ async def get_admin_sandbox_profiles(
 
 
 @router.post("/sandbox-profiles")
+@admin_audit_action("sandbox.create", target_type="sandbox")
 async def create_admin_sandbox_profile(
+    request: Request,
     payload: AdminSandboxProfilePayload,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """注册一个新的 OpenSandbox 后端。"""
     profile = _create_sandbox_profile(db, payload)
-    return sandbox_profile_to_payload(profile, bound_users=0)
+    result = sandbox_profile_to_payload(profile, bound_users=0)
+    changed_fields = payload.model_dump(exclude={"api_key"})
+    changed_fields["api_key_changed"] = True
+    enrich_admin_audit(
+        request,
+        target_id=profile.id,
+        changed_fields=changed_fields,
+        details={"api_key_changed": True},
+    )
+    return result
 
 
 @router.patch("/sandbox-profiles/{profile_id}")
+@admin_audit_action(
+    "sandbox.update",
+    target_type="sandbox",
+    target_param="profile_id",
+)
 async def update_admin_sandbox_profile(
+    request: Request,
     profile_id: str,
     payload: AdminSandboxProfilePatchPayload,
     _: str = Depends(get_current_admin_user),
@@ -1973,10 +2188,25 @@ async def update_admin_sandbox_profile(
     """更新 OpenSandbox 后端配置；运行参数变更会递增 version。"""
     profile = _update_sandbox_profile(db, profile_id, payload)
     counts = _sandbox_profile_bound_counts(db)
+    changed_fields = payload.model_dump(exclude_unset=True, exclude={"api_key"})
+    if "api_key" in payload.model_fields_set:
+        changed_fields["api_key_changed"] = bool(payload.api_key)
+    enrich_admin_audit(
+        request,
+        changed_fields=changed_fields,
+        details={"api_key_changed": bool(payload.api_key)}
+        if "api_key" in payload.model_fields_set
+        else None,
+    )
     return sandbox_profile_to_payload(profile, bound_users=counts.get(profile.id, 0))
 
 
 @router.patch("/sandbox-profiles/{profile_id}/default")
+@admin_audit_action(
+    "sandbox.default.set",
+    target_type="sandbox",
+    target_param="profile_id",
+)
 async def set_admin_sandbox_profile_default(
     profile_id: str,
     _: str = Depends(get_current_admin_user),
@@ -1989,20 +2219,38 @@ async def set_admin_sandbox_profile_default(
 
 
 @router.patch("/sandbox-profiles/{profile_id}/enabled")
+@admin_audit_action(
+    "sandbox.enabled.update",
+    target_type="sandbox",
+    target_param="profile_id",
+)
 async def set_admin_sandbox_profile_enabled(
+    request: Request,
     profile_id: str,
     payload: AdminSandboxProfileEnabledPayload,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """启用或禁用 OpenSandbox 后端。禁用不做实时 kill。"""
+    previous = db.query(SandboxProfile.enabled).filter(SandboxProfile.id == profile_id).scalar()
     profile = _set_sandbox_profile_enabled(db, profile_id, payload.enabled)
     counts = _sandbox_profile_bound_counts(db)
+    enrich_admin_audit(
+        request,
+        changed_fields={"enabled": {"before": bool(previous), "after": bool(payload.enabled)}},
+    )
     return sandbox_profile_to_payload(profile, bound_users=counts.get(profile.id, 0))
 
 
 @router.patch("/users/{user_id}/sandbox-profile")
+@admin_audit_action(
+    "user.sandbox.update",
+    target_type="user",
+    target_param="user_id",
+    target_user_param="user_id",
+)
 async def update_admin_user_sandbox_profile(
+    request: Request,
     user_id: str,
     payload: AdminUserSandboxProfilePayload,
     admin_user_id: str = Depends(get_current_admin_user),
@@ -2021,6 +2269,17 @@ async def update_admin_user_sandbox_profile(
         desired_profile_id=desired_profile_id,
     )
     needs_recreate = bool(payload.force_recreate or assignment_changed or active_profile_stale)
+    enrich_admin_audit(
+        request,
+        target_user_id=user_id,
+        changed_fields={
+            "sandbox_profile_id": {
+                "before": current_profile_id,
+                "after": desired_profile_id,
+            },
+            "force_recreate": bool(payload.force_recreate),
+        },
+    )
     if not needs_recreate:
         return get_user_sandbox_config_payload(db, user_id)
 
@@ -2045,17 +2304,27 @@ async def update_admin_user_sandbox_profile(
 
 
 @router.get("/users/{user_id}/login-events")
+@admin_audit_action(
+    "user.login_history.view",
+    target_type="user",
+    target_param="user_id",
+    target_user_param="user_id",
+)
 async def get_admin_user_login_events(
+    request: Request,
     user_id: str,
     limit: int = Query(50, ge=1, le=200),
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """查看指定用户的登录审计历史。"""
-    return _build_user_login_events_payload(db, user_id=user_id, limit=limit)
+    result = _build_user_login_events_payload(db, user_id=user_id, limit=limit)
+    enrich_admin_audit(request, details={"returned_count": len(result["events"])})
+    return result
 
 
 @router.get("/models")
+@admin_audit_action("model.list", target_type="model_collection")
 async def get_admin_models(
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
@@ -2066,48 +2335,84 @@ async def get_admin_models(
 
 
 @router.post("/models")
+@admin_audit_action("model.create", target_type="model")
 async def create_admin_model(
+    request: Request,
     payload: AdminModelPayload,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """新增一个模型到 DB 模型目录。"""
-    return _create_admin_model(db, payload)
+    result = _create_admin_model(db, payload)
+    changed_fields = payload.model_dump(exclude={"api_key"})
+    changed_fields["api_key_changed"] = True
+    enrich_admin_audit(
+        request,
+        target_id=payload.model_id,
+        changed_fields=changed_fields,
+        details={"api_key_changed": True},
+    )
+    return result
 
 
 @router.patch("/models/settings")
+@admin_audit_action("model.settings.update", target_type="model_settings")
 async def update_admin_model_settings(
+    request: Request,
     payload: AdminModelSettingsPayload,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """更新普通/Cron/Subagent 默认模型。"""
-    return _update_model_settings(db, payload)
+    result = _update_model_settings(db, payload)
+    enrich_admin_audit(request, changed_fields=payload.model_dump())
+    return result
 
 
 @router.patch("/models/{model_id}")
+@admin_audit_action("model.update", target_type="model", target_param="model_id")
 async def update_admin_model(
+    request: Request,
     model_id: str,
     payload: AdminModelPatchPayload,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """更新模型配置；api_key 留空表示不修改。"""
-    return _update_admin_model(db, model_id, payload)
+    result = _update_admin_model(db, model_id, payload)
+    changed_fields = payload.model_dump(exclude_unset=True, exclude={"api_key"})
+    if "api_key" in payload.model_fields_set:
+        changed_fields["api_key_changed"] = bool(payload.api_key)
+    enrich_admin_audit(
+        request,
+        changed_fields=changed_fields,
+        details={"api_key_changed": bool(payload.api_key)}
+        if "api_key" in payload.model_fields_set
+        else None,
+    )
+    return result
 
 
 @router.delete("/models/{model_id}")
+@admin_audit_action("model.delete", target_type="model", target_param="model_id")
 async def delete_admin_model(
+    request: Request,
     model_id: str,
     replacement_model_id: str | None = Query(None),
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """从 DB 模型目录删除未被默认配置或历史会话引用的模型。"""
-    return _delete_admin_model(db, model_id, replacement_model_id=replacement_model_id)
+    result = _delete_admin_model(db, model_id, replacement_model_id=replacement_model_id)
+    enrich_admin_audit(
+        request,
+        details={"has_replacement_model": bool(replacement_model_id)},
+    )
+    return result
 
 
 @router.get("/model-permission-groups")
+@admin_audit_action("model_group.list", target_type="model_group_collection")
 async def get_admin_model_permission_groups(
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
@@ -2117,44 +2422,74 @@ async def get_admin_model_permission_groups(
 
 
 @router.post("/model-permission-groups")
+@admin_audit_action("model_group.create", target_type="model_group")
 async def create_admin_model_permission_group(
+    request: Request,
     payload: AdminPermissionGroupPayload,
     admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """创建业务模型权限包。"""
-    return _create_permission_group(db, payload, admin_user_id)
+    result = _create_permission_group(db, payload, admin_user_id)
+    enrich_admin_audit(
+        request,
+        target_id=result.get("id"),
+        changed_fields=payload.model_dump(),
+    )
+    return result
 
 
 @router.patch("/model-permission-groups/{group_id}")
+@admin_audit_action(
+    "model_group.update",
+    target_type="model_group",
+    target_param="group_id",
+)
 async def update_admin_model_permission_group(
+    request: Request,
     group_id: str,
     payload: AdminPermissionGroupPatchPayload,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """更新模型权限包名称或描述。默认包不能重命名。"""
-    return _update_permission_group(db, group_id, payload)
+    result = _update_permission_group(db, group_id, payload)
+    enrich_admin_audit(request, changed_fields=payload.model_dump(exclude_unset=True))
+    return result
 
 
 @router.put("/model-permission-groups/{group_id}/models")
+@admin_audit_action(
+    "model_group.models.update",
+    target_type="model_group",
+    target_param="group_id",
+)
 async def update_admin_model_permission_group_models(
+    request: Request,
     group_id: str,
     payload: AdminModelIdsPayload,
     admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """设置某个权限包包含的模型。"""
-    return set_group_models(
+    result = set_group_models(
         db,
         group_id=group_id,
         model_ids=payload.model_ids,
         admin_user_id=admin_user_id,
     )
+    enrich_admin_audit(request, changed_fields={"model_count": len(payload.model_ids)})
+    return result
 
 
 @router.put("/model-permission-groups/{group_id}/users")
+@admin_audit_action(
+    "model_group.users.update",
+    target_type="model_group",
+    target_param="group_id",
+)
 async def update_admin_model_permission_group_users(
+    request: Request,
     group_id: str,
     payload: AdminUserIdsPayload,
     admin_user_id: str = Depends(get_current_admin_user),
@@ -2180,11 +2515,14 @@ async def update_admin_model_permission_group_users(
     group.updated_at = now_naive()
     db.commit()
     db.refresh(group)
+    enrich_admin_audit(request, changed_fields={"user_count": len(normalized)})
     return group_to_payload(db, group)
 
 
 @router.post("/users/simple")
+@admin_audit_action("user.create", target_type="user")
 async def create_admin_simple_user(
+    request: Request,
     payload: AdminCreateSimpleUserPayload,
     admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
@@ -2208,11 +2546,24 @@ async def create_admin_simple_user(
             sandbox_profile_id=sandbox_profile_id,
             updated_by=admin_user_id,
         )
-    return auth_user_to_payload(user)
+    result = auth_user_to_payload(user)
+    created_user_id = result.get("user_id")
+    changed_fields = payload.model_dump(exclude={"password"})
+    changed_fields["password_changed"] = True
+    enrich_admin_audit(
+        request,
+        target_id=created_user_id,
+        target_user_id=created_user_id,
+        changed_fields=changed_fields,
+        details={"password_changed": True},
+    )
+    return result
 
 
 @router.post("/users/ldap")
+@admin_audit_action("user.create", target_type="user")
 async def create_admin_ldap_user(
+    request: Request,
     payload: AdminCreateLdapUserPayload,
     admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
@@ -2236,11 +2587,26 @@ async def create_admin_ldap_user(
             sandbox_profile_id=sandbox_profile_id,
             updated_by=admin_user_id,
         )
-    return auth_user_to_payload(user)
+    result = auth_user_to_payload(user)
+    created_user_id = result.get("user_id")
+    enrich_admin_audit(
+        request,
+        target_id=created_user_id,
+        target_user_id=created_user_id,
+        changed_fields=payload.model_dump(),
+    )
+    return result
 
 
 @router.patch("/users/{user_id}/enabled")
+@admin_audit_action(
+    "user.enabled.update",
+    target_type="user",
+    target_param="user_id",
+    target_user_param="user_id",
+)
 async def update_admin_user_enabled(
+    request: Request,
     user_id: str,
     payload: AdminEnabledUpdatePayload,
     admin_user_id: str = Depends(get_current_admin_user),
@@ -2249,12 +2615,24 @@ async def update_admin_user_enabled(
     """启用或禁用用户。"""
     if user_id == admin_user_id and not payload.enabled:
         raise HTTPException(status_code=400, detail="不能禁用当前管理员账号")
+    previous = db.query(AuthUser.enabled).filter(AuthUser.user_id == user_id).scalar()
     user = update_user_enabled(db, user_id=user_id, enabled=payload.enabled)
+    enrich_admin_audit(
+        request,
+        changed_fields={"enabled": {"before": bool(previous), "after": bool(payload.enabled)}},
+    )
     return auth_user_to_payload(user)
 
 
 @router.patch("/users/{user_id}/admin")
+@admin_audit_action(
+    "user.admin.update",
+    target_type="user",
+    target_param="user_id",
+    target_user_param="user_id",
+)
 async def update_admin_user_admin_flag(
+    request: Request,
     user_id: str,
     payload: AdminFlagUpdatePayload,
     admin_user_id: str = Depends(get_current_admin_user),
@@ -2263,45 +2641,92 @@ async def update_admin_user_admin_flag(
     """设置或取消管理员权限。"""
     if user_id == admin_user_id and not payload.is_admin:
         raise HTTPException(status_code=400, detail="不能取消自己的管理员权限")
+    previous = db.query(AuthUser.is_admin).filter(AuthUser.user_id == user_id).scalar()
     user = update_user_admin(db, user_id=user_id, is_admin=payload.is_admin)
+    enrich_admin_audit(
+        request,
+        changed_fields={"is_admin": {"before": bool(previous), "after": bool(payload.is_admin)}},
+    )
     return auth_user_to_payload(user)
 
 
 @router.patch("/users/{user_id}/token-limits")
+@admin_audit_action(
+    "user.token_limits.update",
+    target_type="user",
+    target_param="user_id",
+    target_user_param="user_id",
+)
 async def update_admin_user_token_limits(
+    request: Request,
     user_id: str,
     payload: AdminTokenLimitsUpdatePayload,
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """更新用户 token 周/月限额。"""
+    previous = (
+        db.query(AuthUser.token_limit_per_week, AuthUser.token_limit_per_month)
+        .filter(AuthUser.user_id == user_id)
+        .first()
+    )
     user = update_user_token_limits(
         db,
         user_id=user_id,
         token_limit_per_week=payload.token_limit_per_week,
         token_limit_per_month=payload.token_limit_per_month,
     )
+    if previous:
+        enrich_admin_audit(
+            request,
+            changed_fields={
+                "token_limit_per_week": {
+                    "before": previous.token_limit_per_week,
+                    "after": payload.token_limit_per_week,
+                },
+                "token_limit_per_month": {
+                    "before": previous.token_limit_per_month,
+                    "after": payload.token_limit_per_month,
+                },
+            },
+        )
     return auth_user_to_payload(user)
 
 
 @router.put("/users/{user_id}/model-permission-groups")
+@admin_audit_action(
+    "user.model_groups.update",
+    target_type="user",
+    target_param="user_id",
+    target_user_param="user_id",
+)
 async def update_admin_user_model_permission_groups(
+    request: Request,
     user_id: str,
     payload: AdminGroupIdsPayload,
     admin_user_id: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
     """设置用户额外绑定的模型权限包。默认包自动应用，不在这里保存。"""
-    return set_user_groups(
+    result = set_user_groups(
         db,
         user_id=user_id,
         group_ids=payload.group_ids,
         admin_user_id=admin_user_id,
     )
+    enrich_admin_audit(request, changed_fields={"group_count": len(payload.group_ids)})
+    return result
 
 
 @router.post("/users/{user_id}/reset-password")
+@admin_audit_action(
+    "user.password.reset",
+    target_type="user",
+    target_param="user_id",
+    target_user_param="user_id",
+)
 async def reset_admin_simple_user_password(
+    request: Request,
     user_id: str,
     payload: AdminResetPasswordPayload,
     _: str = Depends(get_current_admin_user),
@@ -2309,10 +2734,21 @@ async def reset_admin_simple_user_password(
 ):
     """重置 simple 用户密码。"""
     user = reset_simple_user_password(db, user_id=user_id, password=payload.password)
+    enrich_admin_audit(
+        request,
+        changed_fields={"password_changed": True},
+        details={"password_changed": True},
+    )
     return auth_user_to_payload(user)
 
 
 @router.delete("/users/{user_id}")
+@admin_audit_action(
+    "user.delete",
+    target_type="user",
+    target_param="user_id",
+    target_user_param="user_id",
+)
 async def delete_admin_auth_user(
     user_id: str,
     admin_user_id: str = Depends(get_current_admin_user),
@@ -2358,6 +2794,7 @@ async def delete_admin_auth_user(
 
 
 @router.get("/system")
+@admin_audit_action("system.read", target_type="system")
 async def get_admin_system(
     hours: int = Query(24, ge=1, le=168),
     _: str = Depends(get_current_admin_user),

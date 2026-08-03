@@ -3,14 +3,16 @@
 ## 1. 模块职责边界
 
 - 为管理员提供跨用户的全局运维视图。
-- 提供概览、Session 监控、用户管理、沙箱管理、模型目录/权限、系统监控等聚合与管理接口。
+- 提供概览、Session 监控、用户管理、沙箱管理、模型目录/权限、操作日志、系统监控等聚合与管理接口。
 - 不负责业务执行（不创建会话、不驱动对话执行）；配置与账号类写操作仅改变管理事实源。
+- 对管理员接口向管理员披露或处理数据的事实进行后端权威审计，不依赖浏览器点击事件。
 
 ## 2. 鉴权与权限
 
 - 所有端点都要求 Bearer Token。
 - 所有端点都依赖 `get_current_admin_user`。
 - 用户是否为管理员由 `auth_users.is_admin` 决定。`AUTH_ADMIN_USERS` 仅用于首次 bootstrap。
+- 管理动作必须显式声明稳定动作编码和审计等级。L1～L3 在管理员鉴权成功后、业务处理前持久化 `started`；写入失败返回 503 且不执行管理动作。L0 常规读取不写入 `admin_operation_logs`，仅进入短期 HTTP/应用日志。
 
 ## 3. API 契约
 
@@ -75,6 +77,12 @@
   - `sandbox_status`: DB 记录状态，非实时 OpenSandbox 探活。
   - `sandbox_needs_recreate`: active Profile 指纹与当前期望 Profile 不一致时为 `true`。
 
+### POST /api/admin/users/export
+
+- Body：`{user_ids: string[]}`，ID 不得为空或重复，最多 10000 个。
+- 响应：后端按请求顺序重新查询用户并生成 UTF-8 CSV；任一用户不存在时返回 404。
+- 语义：前端只提交当前可见用户 ID，不在浏览器本地拼接敏感用户数据；审计元数据仅保存导出人数。
+
 ### POST /api/admin/users/simple
 
 - Body: `{username, password, enabled?, is_admin?, token_limit_per_week?, token_limit_per_month?, sandbox_profile_id?}`
@@ -102,14 +110,14 @@
 
 - Body: `{name, description?, department?, domain, api_key, protocol?, use_server_proxy?, enabled?}`
 - 响应：创建后的 Profile。
-- 约束：`name` 唯一；`api_key` 必填且不能为空；`protocol` 仅支持 `http` / `https`。镜像、资源限制、宿主存储根与容器挂载路径均使用全局配置，不按 Profile 自定义。MVP 仅保存 Profile 当前值和 `created_at` / `updated_at`，不保存配置变更审计历史。
+- 约束：`name` 唯一；`api_key` 必填且不能为空；`protocol` 仅支持 `http` / `https`。镜像、资源限制、宿主存储根与容器挂载路径均使用全局配置，不按 Profile 自定义。Profile 表仅保存当前值；中央管理员操作日志记录变更字段名和密钥是否变化，但不保存连接值或密钥内容。
 
 ### PATCH /api/admin/sandbox-profiles/{profile_id}
 
 - Body: `{name?, description?, department?, domain?, protocol?, api_key?, use_server_proxy?}`。
 - 响应：更新后的 Profile。
 - 语义：修改连接字段会使 `version + 1`，后续用户 sandbox/Agent 会按新版本重建。MVP 不主动迁移文件或跨 OpenSandbox 后端清理旧 sandbox，旧 sandbox 依赖 OpenSandbox TTL 回收；后续和数据迁移方案一起设计主动清理、连接快照或 Profile revision history。空 `api_key` 表示不改现有密钥；不支持清空密钥；管理端不回显明文密钥，只返回 `api_key_set`。
-- 记录：当前仅更新 Profile 行的 `updated_at` 与 `version`，不记录修改人、字段 diff 或历史连接配置。若要切换到新的 OpenSandbox 后端，建议新建 Profile 并重新分配用户，而不是原地修改既有 Profile 的 runtime 连接字段。
+- 记录：Profile 行更新 `updated_at` 与 `version`；中央管理员操作日志记录操作者、目标与脱敏后的变更字段，不保存历史连接配置。若要切换到新的 OpenSandbox 后端，建议新建 Profile 并重新分配用户，而不是原地修改既有 Profile 的 runtime 连接字段。
 
 ### PATCH /api/admin/sandbox-profiles/{profile_id}/default
 
@@ -227,6 +235,39 @@
 - 同名 `user_id` 删除后可以重新创建；新账号不得看到旧用户数据。
 - 约束：管理员不能删除当前登录账号；存在新鲜 `user_run_locks.updated_at` 心跳代表的运行中用户任务或运行中的 cron run 时返回 409；sandbox 清理失败时返回 409 且不得删除用户。若待清理 sandbox 已在进程内缓存，可直接使用 live sandbox 对象清理；若需要按 `sandbox_id` 重新连接/恢复，而 active Profile 指纹无法解析或版本不匹配，则视为 sandbox 清理失败。删除用户比切换 Profile 更严格，因为同名 `user_id` 未来可重建，必须避免新账号继承旧持久化文件。
 
+### GET /api/admin/operation-logs
+
+- Query：`from?`、`to?`、`action?`、`risk_level?`、`target_user_id?`、`session_id?`、`outcome?`、`cursor?`、`limit?`；`risk_level` 仅接受 `high` / `normal`，并与其他条件取交集。
+- 默认范围：最近 24 小时；`limit` 默认 50、最大 200。
+- 分页：按 `(started_at, id)` 倒序游标分页，响应为 `{items, next_cursor, has_more}`。
+- 结果：每项包含管理员、稳定动作编码、派生风险级别、目标标识、Session/Step 标识、结果、HTTP 状态、来源 IP、User-Agent、Request ID、脱敏变更字段及脱敏补充信息。
+- `audit_log.list` 属于 L1，每次查看或刷新操作日志都记录一次敏感查阅；本次请求对应的 `started` 行不进入本次查询结果，完成后可在后续查询中看到。
+
+### GET /api/admin/operation-logs/export
+
+- Query：与日志列表相同的筛选条件，不接受分页参数。
+- 响应：UTF-8 CSV；超过 50000 条时返回 400，要求缩小筛选范围。
+- 导出本身记录为 `audit_log.export`，审计元数据仅保存导出条数及是否使用风险级别筛选，不保存 CSV 内容。
+
+稳定动作编码按模块分组：
+
+- 概览与系统：`overview.read`、`system.read`。
+- Session/Step：`session.list`、`session.search`、`session.view`、`step.view`、`step.review.update`。
+- 用户：`user.list`、`user.login_history.view`、`user.create`、`user.enabled.update`、`user.admin.update`、`user.token_limits.update`、`user.model_groups.update`、`user.password.reset`、`user.delete`、`user.export`。
+- 沙箱：`sandbox.list`、`sandbox.create`、`sandbox.update`、`sandbox.default.set`、`sandbox.enabled.update`、`user.sandbox.update`。
+- 模型与权限包：`model.list`、`model.create`、`model.update`、`model.delete`、`model.settings.update`、`model_group.list`、`model_group.create`、`model_group.update`、`model_group.models.update`、`model_group.users.update`。
+- MCP 与工具权限：`mcp.list`、`mcp.create`、`mcp.update`、`mcp.delete`、`mcp.test`、`tool_permission.list`、`tool_permission.create`、`tool_permission.update`、`tool_permission.delete`。
+- 操作日志：`audit_log.list`、`audit_log.export`。
+
+审计等级固定按动作编码派生，不写入业务正文或新增可变等级字段：
+
+- L0 常规读取：`overview.read`、`system.read`、`sandbox.list`、`model.list`、`model_group.list`、`mcp.list`、`tool_permission.list`。成功或失败均不写入操作审计表。
+- L1 敏感查阅：`session.list`、`session.search`、`session.view`、`user.list`、`user.login_history.view`、`audit_log.list`。
+- L2 管理操作：除 L0、L1、L3 外的创建、更新、删除、重置、导出和外联测试动作，包括 `step.review.update` 与 `mcp.test`。
+- L3 高危：仅 `step.view`，表示后端向管理员披露了用户会话步骤原文。
+
+查询接口的兼容风险字段由上述等级派生：`high` 仅匹配 L3 的 `step.view`，`normal` 匹配其他已存操作日志。`/rounds-tree` 的普通列表与带非空 `search` 的查询分别在业务执行前确定为 L1 `session.list` 与 `session.search`。
+
 ### GET /api/admin/system
 
 - Query: `hours`（1~168，默认 24）
@@ -250,6 +291,10 @@
 - 删除用户是硬删除语义；禁用用户才表示保留账号与数据但禁止登录。
 - `llm_models` 与 `llm_model_settings` 是运行时模型目录与默认模型的事实源；管理端模型写操作成功后必须 reload registry。
 - 模型权限包变更是用户可见模型列表的事实源；普通用户只能看到默认权限包 + 额外绑定权限包中的启用模型。
+- 每个 L1～L3 管理请求对应 `admin_operation_logs` 一行，终态为 `succeeded` 或 `failed`；终态更新失败时保留 `started`，页面显示“中断 / 结果未知”。L0 请求不创建审计行。
+- 会话审计只到 Session 与 Step：展开 Session 记录 `session_id` 和返回 round 数量，查看 Step 原文记录 `session_id` 与 `step_record_id`，不生成 Round 级日志。
+- 日志不设置指向用户、Session 或 Step 的级联外键；业务数据硬删除后审计证据继续保留。管理端不提供日志编辑或删除接口。
+- 搜索词、会话标题、Prompt、回答、Thinking、工具参数、密码、API Key、Token、Cookie 与 Authorization 不得写入操作日志。
 
 ## 5. 失败模式
 
@@ -258,7 +303,9 @@
 - 删除用户时存在运行中任务、运行中 cron run 或 sandbox 清理失败：返回 409。
 - 删除模型时缺少必要替换模型：默认模型占用返回 400，历史 Session 占用返回 409。
 - 模型权限包写入不存在或停用模型：返回 400。
+- L1～L3 操作日志开始或终态持久化失败：返回 503；开始写入失败时业务处理不得执行。L0 不依赖操作审计表可用性。
 
 ## 6. 可观测性
 
 - 管理端关键指标优先复用现有事实源：`rounds`、`sessions`、`cron_jobs`、`cron_job_runs`、`llm_call_records`。
+- L1～L3 管理员操作日志不设置自动过期清理；如需删除，必须通过经过单独审批和留痕的数据治理流程执行。
