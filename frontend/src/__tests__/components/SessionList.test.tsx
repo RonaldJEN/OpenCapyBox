@@ -11,6 +11,7 @@ vi.mock('../../services/api', () => ({
     deleteSession: vi.fn(),
     logout: vi.fn(),
     getUserId: vi.fn(() => 'mock-session'),
+    isAdminUser: vi.fn(() => false),
     getRunningSessions: vi.fn().mockResolvedValue({ running_sessions: [] }),
   },
 }));
@@ -144,6 +145,20 @@ describe('SessionList 組件', () => {
 
     expect(apiService.logout).toHaveBeenCalled();
     expect(mockNavigate).toHaveBeenCalledWith('/login');
+  });
+
+  it('管理员账户菜单应提供管理后台入口', async () => {
+    vi.mocked(apiService.isAdminUser).mockReturnValue(true);
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('账户菜单')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByLabelText('账户菜单'));
+    fireEvent.click(screen.getByText('管理后台'));
+
+    expect(mockNavigate).toHaveBeenCalledWith('/admin');
   });
 
   it('應該顯示品牌名稱 OpenCapyBox', async () => {

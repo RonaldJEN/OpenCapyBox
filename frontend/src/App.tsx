@@ -450,7 +450,15 @@ function PublicRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = apiService.isAuthenticated();
 
   if (isAuthenticated) {
-    return <Navigate to={apiService.isAdminUser() ? '/admin' : '/'} replace />;
+    return <Navigate to="/" replace />;
+  }
+
+  return <>{children}</>;
+}
+
+function AdminLoginRoute({ children }: { children: React.ReactNode }) {
+  if (apiService.isAuthenticated() && apiService.isAdminUser()) {
+    return <Navigate to="/admin" replace />;
   }
 
   return <>{children}</>;
@@ -463,10 +471,6 @@ function UserRoute({ children }: { children: React.ReactNode }) {
     return <Navigate to="/login" replace />;
   }
 
-  if (apiService.isAdminUser()) {
-    return <Navigate to="/admin" replace />;
-  }
-
   return <>{children}</>;
 }
 
@@ -475,11 +479,11 @@ function AdminRoute({ children }: { children: React.ReactNode }) {
   const isAdmin = apiService.isAdminUser();
 
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to="/admin/login" replace />;
   }
 
   if (!isAdmin) {
-    return <Navigate to="/" replace />;
+    return <Navigate to="/admin/login" replace />;
   }
 
   return <>{children}</>;
@@ -495,6 +499,14 @@ function App() {
             <PublicRoute>
               <Login />
             </PublicRoute>
+          }
+        />
+        <Route
+          path="/admin/login"
+          element={
+            <AdminLoginRoute>
+              <Login mode="admin" />
+            </AdminLoginRoute>
           }
         />
         <Route

@@ -75,7 +75,7 @@ describe('Login 組件', () => {
     });
   });
 
-  it('管理員登錄成功應該導航到管理後台', async () => {
+  it('管理员从用户入口登录后仍应进入用户工作台', async () => {
     vi.mocked(apiService.login).mockResolvedValue({
       user_id: 'admin',
       access_token: 'mock-token',
@@ -98,8 +98,81 @@ describe('Login 組件', () => {
 
     await waitFor(() => {
       expect(apiService.login).toHaveBeenCalledWith('admin', 'admin-test-pass');
+      expect(mockNavigate).toHaveBeenCalledWith('/');
+    });
+  });
+
+  it('管理员从管理入口登录后应进入管理后台', async () => {
+    vi.mocked(apiService.login).mockResolvedValue({
+      user_id: 'admin',
+      access_token: 'mock-token',
+      token_type: 'bearer',
+      expires_in: 3600,
+      role: 'admin',
+      is_admin: true,
+      message: 'success',
+    });
+
+    render(<Login mode="admin" />);
+
+    expect(screen.getByRole('heading', { name: '管理员登录' })).toBeInTheDocument();
+    expect(screen.getByText('仅限管理员账号访问')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('用户名'), {
+      target: { value: 'ldap-admin' },
+    });
+    fireEvent.change(screen.getByLabelText('密码'), {
+      target: { value: 'admin-pass' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /登\s*录/ }));
+
+    await waitFor(() => {
+      expect(apiService.login).toHaveBeenCalledWith('ldap-admin', 'admin-pass', {
+        requireAdmin: true,
+      });
       expect(mockNavigate).toHaveBeenCalledWith('/admin');
     });
+  });
+
+  it('管理入口拒绝非管理员时只显示通用密码错误', async () => {
+    vi.mocked(apiService.login).mockRejectedValue(new Error('ADMIN_LOGIN_REJECTED'));
+
+    render(<Login mode="admin" />);
+
+    fireEvent.change(screen.getByLabelText('用户名'), {
+      target: { value: 'ordinary-user' },
+    });
+    fireEvent.change(screen.getByLabelText('密码'), {
+      target: { value: 'correct-pass' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /登\s*录/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('用户名或密码错误')).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/没有管理员权限/)).not.toBeInTheDocument();
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it('管理入口应隐藏账号禁用等内部状态', async () => {
+    vi.mocked(apiService.login).mockRejectedValue({
+      response: { data: { detail: '账户已被禁用' } },
+    });
+
+    render(<Login mode="admin" />);
+
+    fireEvent.change(screen.getByLabelText('用户名'), {
+      target: { value: 'disabled-admin' },
+    });
+    fireEvent.change(screen.getByLabelText('密码'), {
+      target: { value: 'any-pass' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /登\s*录/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('用户名或密码错误')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('账户已被禁用')).not.toBeInTheDocument();
   });
 
   it('登錄失敗應該顯示錯誤訊息', async () => {

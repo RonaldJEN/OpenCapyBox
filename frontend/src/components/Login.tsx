@@ -1,9 +1,10 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, ShieldCheck } from 'lucide-react';
 
 const loginSpecificErrorMessages = new Set(['账户已被禁用']);
+const adminLoginErrorMessage = '用户名或密码错误';
 
 function getLoginErrorMessage(err: unknown): string {
   const detail = (err as { response?: { data?: { detail?: unknown } } }).response?.data?.detail;
@@ -11,12 +12,17 @@ function getLoginErrorMessage(err: unknown): string {
   return '登录失败，请检查用户名和密码';
 }
 
-export function Login() {
+interface LoginProps {
+  mode?: 'user' | 'admin';
+}
+
+export function Login({ mode = 'user' }: LoginProps) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
+  const isAdminLogin = mode === 'admin';
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -24,11 +30,15 @@ export function Login() {
     setLoading(true);
 
     try {
-      const response = await apiService.login(username, password);
-      navigate(response.role === 'admin' || response.is_admin ? '/admin' : '/');
+      if (isAdminLogin) {
+        await apiService.login(username, password, { requireAdmin: true });
+      } else {
+        await apiService.login(username, password);
+      }
+      navigate(isAdminLogin ? '/admin' : '/');
     } catch (err) {
       console.error('Login error:', err);
-      setError(getLoginErrorMessage(err));
+      setError(isAdminLogin ? adminLoginErrorMessage : getLoginErrorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -44,10 +54,15 @@ export function Login() {
 
         {/* Title */}
         <h1 className="text-3xl font-medium text-center text-claude-text mb-2 tracking-tight">
-          OpenCapyBox
+          {isAdminLogin ? '管理员登录' : 'OpenCapyBox'}
         </h1>
         <p className="text-center text-claude-secondary mb-8">
-          你的 AI 助手，住在安全的盒子里 🛁
+          {isAdminLogin ? (
+            <span className="inline-flex items-center gap-1.5">
+              <ShieldCheck className="h-4 w-4" />
+              仅限管理员账号访问
+            </span>
+          ) : '你的 AI 助手，住在安全的盒子里 🛁'}
         </p>
 
         {/* Error Message */}
@@ -100,6 +115,15 @@ export function Login() {
             {loading ? '正在登录...' : '登 录'}
           </button>
         </form>
+
+        <div className="mt-5 text-center text-sm">
+          <Link
+            to={isAdminLogin ? '/login' : '/admin/login'}
+            className="text-claude-secondary transition-colors hover:text-claude-text"
+          >
+            {isAdminLogin ? '返回用户登录' : '管理员登录'}
+          </Link>
+        </div>
 
         {/* Footer */}
         <p className="mt-8 text-center text-xs text-claude-muted uppercase tracking-widest">

@@ -426,7 +426,20 @@ describe('AdminConsole 组件', () => {
     fireEvent.click(screen.getByText('退出登录'));
 
     expect(apiService.logout).toHaveBeenCalledTimes(1);
-    expect(mockNavigate).toHaveBeenCalledWith('/login', { replace: true });
+    expect(mockNavigate).toHaveBeenCalledWith('/admin/login', { replace: true });
+  });
+
+  it('点击用户工作台应复用当前管理员会话', async () => {
+    render(<AdminConsole />);
+
+    await waitFor(() => {
+      expect(screen.getByText('用户工作台')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('用户工作台'));
+
+    expect(apiService.logout).not.toHaveBeenCalled();
+    expect(mockNavigate).toHaveBeenCalledWith('/');
   });
 
   it('Session监控分页应按 offset/limit 请求下一页', async () => {

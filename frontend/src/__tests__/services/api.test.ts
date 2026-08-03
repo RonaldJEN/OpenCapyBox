@@ -86,6 +86,27 @@ describe('APIService', () => {
       expect(logoutSpy).not.toHaveBeenCalled();
     });
 
+    it('管理员入口不应保存非管理员登录结果', async () => {
+      const axiosModule = await import('axios');
+      const client = vi.mocked(axiosModule.default.create).mock.results[0].value as any;
+      client.post.mockResolvedValue({
+        data: {
+          user_id: 'ldap-user',
+          access_token: 'user-token',
+          role: 'user',
+          is_admin: false,
+        },
+      });
+
+      await expect(
+        apiService.login('ldap-user', 'correct-password', { requireAdmin: true }),
+      ).rejects.toThrow('ADMIN_LOGIN_REJECTED');
+
+      expect(apiService.isAuthenticated()).toBe(false);
+      expect(localStorage.setItem).not.toHaveBeenCalledWith('userId', 'ldap-user');
+      expect(localStorage.setItem).not.toHaveBeenCalledWith('accessToken', 'user-token');
+    });
+
     it('getSessions 应支持搜索参数并裁剪空白', async () => {
       const axiosModule = await import('axios');
       const client = vi.mocked(axiosModule.default.create).mock.results[0].value as any;

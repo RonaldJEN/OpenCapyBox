@@ -15,11 +15,22 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from tests.helpers import make_test_client
 
 
-def _make_client():
+def _make_client(*, authenticated=True):
     """创建挂载 cron 路由的测试客户端"""
     from src.api.routes.cron import router
     mock_db = MagicMock()
-    client = make_test_client(router, "/cron", db=mock_db)
+    if authenticated:
+        client = make_test_client(router, "/cron", db=mock_db)
+    else:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from src.api.models.database import get_db
+
+        app = FastAPI()
+        app.include_router(router, prefix="/cron")
+        app.dependency_overrides[get_db] = lambda: mock_db
+        client = TestClient(app)
     return client, mock_db
 
 
@@ -218,22 +229,16 @@ class TestDownloadRunFile:
         mock_db.query.return_value.filter.return_value.first.return_value = run
 
         # 使用 %2e%2e 避免 HTTP 客户端预处理路径
-        with patch("src.api.routes.cron.verify_access_token", return_value="testuser"):
-            resp = client.get(
-                "/cron/runs/run-1/files/sub/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
-                params={"token": "fake"},
-            )
+        resp = client.get(
+            "/cron/runs/run-1/files/sub/%2e%2e/%2e%2e/%2e%2e/etc/passwd"
+        )
         assert resp.status_code == 403
 
     def test_404_when_no_run(self):
         client, mock_db = _make_client()
         mock_db.query.return_value.filter.return_value.first.return_value = None
 
-        with patch("src.api.routes.cron.verify_access_token", return_value="testuser"):
-            resp = client.get(
-                "/cron/runs/nonexistent/files/test.txt",
-                params={"token": "fake"},
-            )
+        resp = client.get("/cron/runs/nonexistent/files/test.txt")
         assert resp.status_code == 404
 
     def test_404_when_no_workspace(self):
@@ -241,16 +246,12 @@ class TestDownloadRunFile:
         run = _make_run_record(run_workspace=None)
         mock_db.query.return_value.filter.return_value.first.return_value = run
 
-        with patch("src.api.routes.cron.verify_access_token", return_value="testuser"):
-            resp = client.get(
-                "/cron/runs/run-1/files/test.txt",
-                params={"token": "fake"},
-            )
+        resp = client.get("/cron/runs/run-1/files/test.txt")
         assert resp.status_code == 404
 
     def test_401_when_no_token(self):
         """未提供 token 必须 401。"""
-        client, _mock_db = _make_client()
+        client, _mock_db = _make_client(authenticated=False)
         resp = client.get("/cron/runs/run-1/files/test.txt")
         assert resp.status_code == 401
 
@@ -268,11 +269,11 @@ class TestDownloadRunFile:
         sandbox_service.get_or_resume = AsyncMock(return_value=sandbox)
         sandbox_service.get_sandbox_id.return_value = "sandbox-1"
 
-        with patch("src.api.routes.cron.verify_access_token", return_value="testuser"), patch(
+        with patch(
             "src.api.services.sandbox_service.get_sandbox_service",
             return_value=sandbox_service,
         ):
-            resp = client.get("/cron/runs/run-1/files/test.txt", params={"token": "fake"})
+            resp = client.get("/cron/runs/run-1/files/test.txt")
 
         assert resp.status_code == 200
         assert resp.content == b"hello"

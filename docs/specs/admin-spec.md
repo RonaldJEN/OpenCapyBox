@@ -12,6 +12,7 @@
 - 所有端点都要求 Bearer Token。
 - 所有端点都依赖 `get_current_admin_user`。
 - 用户是否为管理员由 `auth_users.is_admin` 决定。`AUTH_ADMIN_USERS` 仅用于首次 bootstrap。
+- `/admin/login` 只是独立的前端登录入口，复用统一 `/api/auth/login` 与 Bearer Token，不创建管理员专用身份、密码或 LDAP 流程；后端管理员接口仍以 `get_current_admin_user` 作为最终权限边界。
 - 管理动作必须显式声明稳定动作编码和审计等级。L1～L3 在管理员鉴权成功后、业务处理前持久化 `started`；写入失败返回 503 且不执行管理动作。L0 常规读取不写入 `admin_operation_logs`，仅进入短期 HTTP/应用日志。
 
 ## 3. API 契约

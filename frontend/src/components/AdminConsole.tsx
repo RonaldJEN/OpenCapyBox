@@ -9,6 +9,7 @@ import {
   Download,
   Gauge,
   History,
+  Home,
   KeyRound,
   LayoutDashboard,
   LogOut,
@@ -505,7 +506,11 @@ export default function AdminConsole() {
 
   const handleLogout = () => {
     apiService.logout();
-    navigate('/login', { replace: true });
+    navigate('/admin/login', { replace: true });
+  };
+
+  const handleOpenWorkspace = () => {
+    navigate('/');
   };
 
   const handleStepReviewChange = useCallback(async (llmRecordId: number, manualReviewStatus: string) => {
@@ -958,7 +963,7 @@ export default function AdminConsole() {
 
   useEffect(() => {
     if (!apiService.isAdminUser()) {
-      navigate('/', { replace: true });
+      navigate('/admin/login', { replace: true });
       return;
     }
     refreshActiveTab();
@@ -999,6 +1004,10 @@ export default function AdminConsole() {
         <div className="admin-nav-user">
           <div>当前账号：{currentUser}</div>
           <div>角色：管理员</div>
+          <button className="admin-button admin-logout-btn" onClick={handleOpenWorkspace}>
+            <Home size={14} />
+            用户工作台
+          </button>
           <button className="admin-button admin-logout-btn" onClick={handleLogout}>
             <LogOut size={14} />
             退出登录

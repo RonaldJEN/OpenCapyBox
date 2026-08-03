@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
 import type { Session } from '../types';
-import { ChevronDown, MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Clock, Search, X } from 'lucide-react';
+import { ChevronDown, MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Clock, Search, ShieldCheck, X } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -223,6 +223,11 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     onOpenConfig?.();
   };
 
+  const handleOpenAdmin = () => {
+    setAccountMenuOpen(false);
+    navigate('/admin');
+  };
+
   const isSearchActive = debouncedSearchQuery.trim().length > 0;
   const matchSourceLabel: Partial<Record<NonNullable<Session['match_type']>, string>> = {
     user: '我的问题',
@@ -440,6 +445,16 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
                 <Settings size={16} className="text-claude-muted" />
                 <span>设置</span>
               </button>
+              {apiService.isAdminUser() && (
+                <button
+                  type="button"
+                  onClick={handleOpenAdmin}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] text-claude-text transition hover:bg-claude-surface"
+                >
+                  <ShieldCheck size={16} className="text-claude-muted" />
+                  <span>管理后台</span>
+                </button>
+              )}
               <div className="mx-0.5 my-1 h-px bg-claude-border" />
               <button
                 type="button"

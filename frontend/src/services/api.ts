@@ -218,7 +218,11 @@ class APIService {
   /**
    * 用户登录
    */
-  async login(username: string, password: string): Promise<AuthResponse> {
+  async login(
+    username: string,
+    password: string,
+    options: { requireAdmin?: boolean } = {},
+  ): Promise<AuthResponse> {
     const formData = new FormData();
     formData.append('username', username);
     formData.append('password', password);
@@ -228,6 +232,10 @@ class APIService {
         'Content-Type': 'multipart/form-data',
       },
     });
+
+    if (options.requireAdmin && !response.data.is_admin) {
+      throw new Error('ADMIN_LOGIN_REJECTED');
+    }
 
     this.setUserId(response.data.user_id, response.data.access_token, response.data.role);
     return response.data;
