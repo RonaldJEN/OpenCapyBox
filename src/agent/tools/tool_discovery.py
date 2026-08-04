@@ -110,10 +110,8 @@ class ToolDiscoveryTool(Tool):
                     "default": 8,
                 },
             },
-            "anyOf": [
-                {"required": ["query"]},
-                {"required": ["names"]},
-            ],
+            # Moonshot's tool-schema subset rejects a root-level ``anyOf``.
+            # ``execute`` enforces that at least one of query/names is present.
             "additionalProperties": False,
         }
 
