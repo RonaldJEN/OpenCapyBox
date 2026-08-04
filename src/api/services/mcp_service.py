@@ -29,6 +29,7 @@ from src.api.models.mcp import (
 from src.api.schemas.mcp import (
     AdminMcpServerCreate,
     AdminMcpServerPatch,
+    McpActivationRequest,
     McpConnectionUpdate,
     McpImportRequest,
     McpImportServer,
@@ -237,16 +238,24 @@ def _visible_server(
     return server
 
 
-def _personal_server(db: DBSession, user_id: str, server_id: str) -> McpServer:
-    server = (
+def _personal_server(
+    db: DBSession,
+    user_id: str,
+    server_id: str,
+    *,
+    lock: bool = False,
+) -> McpServer:
+    query = (
         db.query(McpServer)
         .filter(
             McpServer.id == server_id,
             McpServer.source == "personal",
             McpServer.owner_user_id == user_id,
         )
-        .first()
     )
+    if lock:
+        query = query.with_for_update()
+    server = query.first()
     if server is None:
         raise HTTPException(status_code=404, detail="个人 MCP 服务不存在")
     return server
@@ -326,8 +335,13 @@ def _personal_server_count(db: DBSession, user_id: str) -> int:
     )
 
 
-def _optional_enabled_connection_count(db: DBSession, user_id: str) -> int:
-    return int(
+def _optional_enabled_connection_count(
+    db: DBSession,
+    user_id: str,
+    *,
+    exclude_installation_id: str | None = None,
+) -> int:
+    query = (
         db.query(func.count(McpInstallation.id))
         .join(McpServer, McpServer.id == McpInstallation.server_id)
         .filter(
@@ -338,9 +352,10 @@ def _optional_enabled_connection_count(db: DBSession, user_id: str) -> int:
                 McpServer.required.is_(False),
             ),
         )
-        .scalar()
-        or 0
     )
+    if exclude_installation_id is not None:
+        query = query.filter(McpInstallation.id != exclude_installation_id)
+    return int(query.scalar() or 0)
 
 
 def _enforce_personal_server_quota(db: DBSession, user_id: str) -> None:
@@ -364,7 +379,13 @@ def _enforce_optional_connection_quota(
     if installation is not None and bool(installation.enabled):
         return
     limit = int(get_settings().mcp_user_enabled_connection_limit)
-    if _optional_enabled_connection_count(db, user_id) >= limit:
+    if _optional_enabled_connection_count(
+        db,
+        user_id,
+        exclude_installation_id=(
+            str(installation.id) if installation is not None else None
+        ),
+    ) >= limit:
         raise HTTPException(
             status_code=409,
             detail=f"可选 MCP 启用数量已达到上限（{limit}）",
@@ -581,8 +602,114 @@ def _tool_is_enabled(
     )
 
 
+def _current_execution_fingerprint(
+    db: DBSession,
+    *,
+    server: McpServer,
+    installation: McpInstallation,
+) -> str:
+    """Return the exact endpoint/credential identity used by this installation."""
+
+    credential = _effective_credential(db, server, installation)
+    return _probe_target_fingerprint(
+        server,
+        credential,
+        installation_id=str(installation.id),
+        user_id=str(installation.user_id),
+    )
+
+
+def _validated_current_execution_fingerprint(
+    db: DBSession,
+    *,
+    server: McpServer,
+    installation: McpInstallation,
+    raise_on_error: bool = False,
+) -> str | None:
+    """Return the current fingerprint only when its credentials are usable.
+
+    Fingerprints intentionally hash encrypted bytes and therefore remain stable
+    across a key rotation that makes those bytes undecryptable. Card counts and
+    tool management must still fail closed in that case, matching runtime and
+    permission inventory behavior.
+    """
+
+    credential = _effective_credential(db, server, installation)
+    try:
+        credential_headers(
+            str(server.auth_type),
+            credential.encrypted_secret if credential is not None else None,
+        )
+    except McpSecurityError as exc:
+        if raise_on_error:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return None
+    return _probe_target_fingerprint(
+        server,
+        credential,
+        installation_id=str(installation.id),
+        user_id=str(installation.user_id),
+    )
+
+
+def _current_tool_snapshot_query(
+    db: DBSession,
+    *,
+    server: McpServer,
+    installation: McpInstallation,
+):
+    """Select only schemas discovered from the connection target in force now."""
+
+    fingerprint = _validated_current_execution_fingerprint(
+        db,
+        server=server,
+        installation=installation,
+    )
+    query = db.query(McpToolSnapshot).filter(
+        McpToolSnapshot.installation_id == installation.id,
+    )
+    if fingerprint is None:
+        # id is non-nullable, yielding a typed empty query without leaking a
+        # snapshot whose credential target can no longer be resolved.
+        return query.filter(McpToolSnapshot.id.is_(None))
+    return query.filter(McpToolSnapshot.connection_fingerprint == fingerprint)
+
+
+def _assert_current_discovery(
+    db: DBSession,
+    *,
+    server: McpServer,
+    installation: McpInstallation,
+) -> str:
+    """Reject activation unless at least one schema matches the locked target."""
+
+    fingerprint = _validated_current_execution_fingerprint(
+        db,
+        server=server,
+        installation=installation,
+        raise_on_error=True,
+    )
+    assert fingerprint is not None  # raise_on_error guarantees a value
+    discovered = int(
+        db.query(func.count(McpToolSnapshot.id))
+        .filter(
+            McpToolSnapshot.installation_id == installation.id,
+            McpToolSnapshot.connection_fingerprint == fingerprint,
+        )
+        .scalar()
+        or 0
+    )
+    if discovered <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="当前 MCP 配置尚无有效工具快照，请使用激活接口完成连接发现",
+        )
+    return fingerprint
+
+
 def _tool_counts(
     db: DBSession,
+    server: McpServer,
     installation: McpInstallation | None,
     enabled_tools: frozenset[str] | None = None,
     disabled_tools: frozenset[str] | None = None,
@@ -591,8 +718,11 @@ def _tool_counts(
         return 0, 0
     names = [
         str(row[0])
-        for row in db.query(McpToolSnapshot.tool_name)
-        .filter(McpToolSnapshot.installation_id == installation.id)
+        for row in _current_tool_snapshot_query(
+            db,
+            server=server,
+            installation=installation,
+        ).with_entities(McpToolSnapshot.tool_name)
         .all()
     ]
     if disabled_tools is None:
@@ -620,6 +750,7 @@ def server_to_payload(
     )
     tools_count, enabled_tools_count = _tool_counts(
         db,
+        server,
         installation,
         enabled_tools,
         disabled_tools,
@@ -906,6 +1037,22 @@ def update_admin_server(
         server.last_tested_at = None
         server.last_tools_count = None
         server.last_error = None
+        if not bool(server.required):
+            # A shared target/credential change invalidates every per-user
+            # snapshot. Optional connections must be explicitly reactivated;
+            # leaving their durable enabled bit set would serialize as 0/0.
+            db.query(McpInstallation).filter(
+                McpInstallation.server_id == server.id,
+                McpInstallation.enabled.is_(True),
+            ).update({McpInstallation.enabled: False}, synchronize_session=False)
+    elif was_required and not bool(server.required):
+        # Required installations may legitimately exist before a per-user
+        # discovery. Once the platform policy becomes optional they must use
+        # the normal validated activation contract.
+        db.query(McpInstallation).filter(
+            McpInstallation.server_id == server.id,
+            McpInstallation.enabled.is_(True),
+        ).update({McpInstallation.enabled: False}, synchronize_session=False)
     try:
         _enforce_required_official_quota(
             db,
@@ -947,6 +1094,11 @@ def create_personal_server(
     *,
     commit: bool = True,
 ) -> dict[str, Any]:
+    if payload.enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="新 MCP 连接必须先以停用状态保存，再使用激活接口完成连接发现",
+        )
     try:
         url = validate_mcp_url(payload.url)
     except McpSecurityError as exc:
@@ -971,20 +1123,13 @@ def create_personal_server(
         created_by=user_id,
     )
     try:
-        if payload.enabled:
-            _enforce_optional_connection_quota(
-                db,
-                user_id,
-                server=server,
-                installation=None,
-            )
         db.add(server)
         db.flush()
         installation = _get_or_create_installation(
             db,
             server_id=server.id,
             user_id=user_id,
-            enabled=payload.enabled,
+            enabled=False,
         )
         credential = _set_credential(
             db,
@@ -1017,7 +1162,7 @@ def update_personal_server(
     payload: UserMcpServerPatch,
 ) -> dict[str, Any]:
     _lock_user_mcp_quota(db, user_id)
-    server = _personal_server(db, user_id, server_id)
+    server = _personal_server(db, user_id, server_id, lock=True)
     data = payload.model_dump(exclude_unset=True)
     old_url = str(server.url)
     old_auth_type = server.auth_type
@@ -1037,15 +1182,6 @@ def update_personal_server(
     if old_auth_type != server.auth_type or origin_changed:
         _clear_server_credentials(db, server.id)
     installation = _get_or_create_installation(db, server_id=server.id, user_id=user_id)
-    if data.get("enabled") is not None:
-        if bool(data["enabled"]):
-            _enforce_optional_connection_quota(
-                db,
-                user_id,
-                server=server,
-                installation=installation,
-            )
-        installation.enabled = bool(data["enabled"])
     try:
         credential = _set_credential(
             db,
@@ -1059,15 +1195,38 @@ def update_personal_server(
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     installation.credential_id = credential.id if credential is not None else None
-    if (
+    connection_changed = (
         str(server.url) != old_url
         or str(server.auth_type) != str(old_auth_type)
         or data.get("bearer_token") is not None
         or data.get("headers") is not None
         or bool(data.get("clear_credential"))
-    ):
+    )
+    if connection_changed:
+        # Configuration writes are staged. The old connection must stop before
+        # a new target can be discovered and atomically activated.
+        installation.enabled = False
         server.last_tested_at = None
         server.last_error = None
+    if data.get("enabled") is False:
+        installation.enabled = False
+    elif data.get("enabled") is True:
+        try:
+            _assert_current_discovery(
+                db,
+                server=server,
+                installation=installation,
+            )
+            _enforce_optional_connection_quota(
+                db,
+                user_id,
+                server=server,
+                installation=installation,
+            )
+        except HTTPException:
+            db.rollback()
+            raise
+        installation.enabled = True
     server.version = int(server.version or 0) + 1
     bump_config_version(db, user_id)
     _commit(db, conflict_detail="个人 MCP 名称已存在")
@@ -1108,14 +1267,11 @@ def update_connection(
     if payload.auth_type is not None and payload.auth_type != server.auth_type:
         raise HTTPException(status_code=400, detail="连接 auth_type 必须与 MCP 服务定义一致")
     installation = _get_or_create_installation(db, server_id=server.id, user_id=user_id)
-    if payload.enabled:
-        _enforce_optional_connection_quota(
-            db,
-            user_id,
-            server=server,
-            installation=installation,
-        )
-    installation.enabled = bool(payload.enabled or server.required)
+    credential_changed = bool(
+        payload.bearer_token is not None
+        or payload.headers is not None
+        or payload.clear_credential
+    )
     try:
         credential = _set_credential(
             db,
@@ -1132,6 +1288,34 @@ def update_connection(
         installation.credential_id = credential.id
     elif payload.clear_credential:
         installation.credential_id = None
+    if credential_changed and not bool(server.required):
+        installation.enabled = False
+    if payload.enabled:
+        if bool(server.required) and credential_changed:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="平台必需 MCP 的凭证变更必须通过激活接口原子提交",
+            )
+        try:
+            if not bool(server.required):
+                _assert_current_discovery(
+                    db,
+                    server=server,
+                    installation=installation,
+                )
+            _enforce_optional_connection_quota(
+                db,
+                user_id,
+                server=server,
+                installation=installation,
+            )
+        except HTTPException:
+            db.rollback()
+            raise
+        installation.enabled = True
+    else:
+        installation.enabled = bool(server.required)
     if server.source == "personal" and (
         payload.bearer_token is not None
         or payload.headers is not None
@@ -1158,8 +1342,11 @@ def list_server_tools(
         installation,
     )
     rows = [] if installation is None else (
-        db.query(McpToolSnapshot)
-        .filter(McpToolSnapshot.installation_id == installation.id)
+        _current_tool_snapshot_query(
+            db,
+            server=server,
+            installation=installation,
+        )
         .order_by(McpToolSnapshot.tool_name.asc())
         .all()
     )
@@ -1692,7 +1879,241 @@ async def test_user_server(
     }
 
 
-def import_personal_servers(
+def _activation_credential_mutation(
+    payload: McpActivationRequest | None,
+) -> bool:
+    return bool(
+        payload is not None
+        and (
+            payload.bearer_token is not None
+            or payload.headers is not None
+            or payload.clear_credential
+        )
+    )
+
+
+def _proposed_activation_credential(
+    db: DBSession,
+    *,
+    server: McpServer,
+    installation: McpInstallation,
+    payload: McpActivationRequest | None,
+) -> _ProbeCredentialSnapshot | None:
+    current = _effective_credential(db, server, installation)
+    if payload is None:
+        return _probe_credential_snapshot(current)
+    if payload.auth_type is not None and payload.auth_type != server.auth_type:
+        raise HTTPException(
+            status_code=400,
+            detail="连接 auth_type 必须与 MCP 服务定义一致",
+        )
+    mutation = _activation_credential_mutation(payload)
+    if not mutation:
+        return _probe_credential_snapshot(current)
+    if payload.clear_credential and (
+        payload.bearer_token is not None or payload.headers is not None
+    ):
+        raise HTTPException(status_code=400, detail="清除凭证时不能同时提交新凭证")
+    if payload.clear_credential:
+        fallback = (
+            _credential_for_scope(db, server_id=server.id, user_id=None)
+            if server.source == "official"
+            else None
+        )
+        return _probe_credential_snapshot(fallback)
+    try:
+        proposed = credential_payload(
+            str(server.auth_type),
+            bearer_token=payload.bearer_token,
+            headers=payload.headers,
+        )
+    except McpSecurityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return (
+        _ProbeCredentialSnapshot(encrypted_secret=encrypt_credential(proposed))
+        if proposed is not None
+        else None
+    )
+
+
+async def activate_user_server(
+    db: DBSession,
+    user_id: str,
+    server_id: str,
+    payload: McpActivationRequest | None = None,
+) -> dict[str, Any]:
+    """Discover and enable one exact target without a test/enable race.
+
+    The remote probe runs without database locks.  The target's original
+    fingerprint is then revalidated under the quota, server and installation
+    locks.  Optional credential replacement, snapshot replacement and the
+    enabled bit commit together, so no observer can see enabled=true with an
+    unvalidated target.
+    """
+
+    server = _visible_server(db, user_id, server_id)
+    installation = _get_or_create_installation(
+        db,
+        server_id=server.id,
+        user_id=user_id,
+    )
+    # The stable installation id is part of the execution fingerprint. Commit
+    # a first disabled row before network I/O, just like the test endpoint.
+    db.commit()
+    server = _visible_server(db, user_id, server_id)
+    installation = _installation(db, server.id, user_id)
+    if installation is None:  # pragma: no cover - concurrent delete
+        db.rollback()
+        raise HTTPException(status_code=409, detail="MCP 连接在激活前已被删除")
+    current_credential = _effective_credential(db, server, installation)
+    probe_server = _probe_server_snapshot(server)
+    probe_credential = _proposed_activation_credential(
+        db,
+        server=server,
+        installation=installation,
+        payload=payload,
+    )
+    base_fingerprint = _probe_target_fingerprint(
+        probe_server,
+        _probe_credential_snapshot(current_credential),
+        installation_id=str(installation.id),
+        user_id=user_id,
+    )
+    db.rollback()
+
+    try:
+        tools, _latency_ms = await probe_mcp_server(probe_server, probe_credential)
+    except Exception as exc:
+        safe_error = _safe_probe_error(exc, probe_server, probe_credential)
+        raise HTTPException(
+            status_code=409,
+            detail=f"MCP 激活失败：{safe_error}",
+        ) from exc
+    if not tools:
+        raise HTTPException(
+            status_code=409,
+            detail="MCP 激活失败：当前配置未发现可用工具",
+        )
+
+    # Lock ordering matches the normal mutation and snapshot-CAS paths. No lock
+    # is acquired until after remote I/O.
+    _lock_user_mcp_quota(db, user_id)
+    try:
+        current_server = _visible_server(db, user_id, server_id, lock=True)
+    except HTTPException:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="MCP 配置在激活期间已变化，请重新激活",
+        )
+    current_installation = _installation(
+        db,
+        current_server.id,
+        user_id,
+        lock=True,
+    )
+    if current_installation is None:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="MCP 连接在激活期间已被删除")
+    locked_credential = _effective_credential(db, current_server, current_installation)
+    locked_base_fingerprint = _probe_target_fingerprint(
+        current_server,
+        locked_credential,
+        installation_id=str(current_installation.id),
+        user_id=user_id,
+    )
+    if locked_base_fingerprint != base_fingerprint:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="MCP 配置在激活期间已变化，请重新激活",
+        )
+
+    mutation = _activation_credential_mutation(payload)
+    try:
+        if mutation and payload is not None:
+            credential = _set_credential(
+                db,
+                server=current_server,
+                user_id=user_id,
+                bearer_token=payload.bearer_token,
+                headers=payload.headers,
+                clear=payload.clear_credential,
+            )
+            current_installation.credential_id = (
+                credential.id if credential is not None else None
+            )
+        effective_credential = _effective_credential(
+            db,
+            current_server,
+            current_installation,
+        )
+        probed_headers = credential_headers(
+            str(probe_server.auth_type),
+            probe_credential.encrypted_secret if probe_credential is not None else None,
+        )
+        effective_headers = credential_headers(
+            str(current_server.auth_type),
+            effective_credential.encrypted_secret
+            if effective_credential is not None
+            else None,
+        )
+        if effective_headers != probed_headers:
+            raise HTTPException(
+                status_code=409,
+                detail="MCP 凭证在激活期间已变化，请重新激活",
+            )
+        _enforce_optional_connection_quota(
+            db,
+            user_id,
+            server=current_server,
+            installation=current_installation,
+        )
+        execution_fingerprint = _current_execution_fingerprint(
+            db,
+            server=current_server,
+            installation=current_installation,
+        )
+        with db.begin_nested():
+            warmup_candidates = _save_tool_snapshots(
+                db,
+                current_installation,
+                tools,
+                connection_fingerprint=execution_fingerprint,
+                server_name=str(current_server.name),
+                server_description=(
+                    str(current_server.description)
+                    if current_server.description is not None
+                    else None
+                ),
+            )
+            current_installation.enabled = True
+            if current_server.source == "personal":
+                current_server.last_tested_at = now_naive()
+                current_server.last_error = None
+            bump_config_version(db, user_id)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        safe_error = _safe_probe_error(exc, probe_server, probe_credential)
+        raise HTTPException(
+            status_code=409,
+            detail=f"MCP 激活失败：{safe_error}",
+        ) from exc
+    db.commit()
+    if warmup_candidates:
+        from src.api.services.mcp_tool_search_service import (
+            get_mcp_tool_search_service,
+        )
+
+        get_mcp_tool_search_service().schedule_warmup(warmup_candidates)
+    current_server = _visible_server(db, user_id, server_id)
+    return server_to_payload(db, current_server, user_id=user_id)
+
+
+async def import_personal_servers(
     db: DBSession,
     user_id: str,
     payload: McpImportRequest,
@@ -1719,7 +2140,7 @@ def import_personal_servers(
                     url=config.url,
                     auth_type="headers" if config.headers else "none",
                     headers=config.headers,
-                    enabled=not config.disabled,
+                    enabled=False,
                 ),
                 commit=False,
             )
@@ -1739,11 +2160,34 @@ def import_personal_servers(
                     commit=False,
                 )
             db.commit()
-            created = server_to_payload(
-                db,
-                _visible_server(db, user_id, str(created["id"])),
-                user_id=user_id,
-            )
+            created_id = str(created["id"])
+            if not config.disabled:
+                try:
+                    created = await activate_user_server(
+                        db,
+                        user_id,
+                        created_id,
+                    )
+                except HTTPException as exc:
+                    # Creation is durable but remains disabled. Reporting the
+                    # activation failure lets a user fix credentials/endpoint
+                    # and retry without duplicating the imported definition.
+                    db.rollback()
+                    errors.append({
+                        "name": name,
+                        "error": str(exc.detail),
+                    })
+                    created = server_to_payload(
+                        db,
+                        _visible_server(db, user_id, created_id),
+                        user_id=user_id,
+                    )
+            else:
+                created = server_to_payload(
+                    db,
+                    _visible_server(db, user_id, created_id),
+                    user_id=user_id,
+                )
             imported_servers.append(created)
         except HTTPException as exc:
             db.rollback()

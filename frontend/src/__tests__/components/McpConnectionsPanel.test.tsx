@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '../utils/test-utils';
 import McpConnectionsPanel from '../../components/McpConnectionsPanel';
 import {
+  activateMcpServer,
   createMcpServer,
   deleteMcpServer,
   exportMcpConfig,
@@ -16,6 +17,7 @@ import {
 } from '../../services/mcpApi';
 
 vi.mock('../../services/mcpApi', () => ({
+  activateMcpServer: vi.fn(),
   createMcpServer: vi.fn(),
   deleteMcpServer: vi.fn(),
   exportMcpConfig: vi.fn(),
@@ -72,6 +74,10 @@ describe('McpConnectionsPanel', () => {
     vi.mocked(updateMcpConnection).mockImplementation(async (_id, payload) => ({
       ...official,
       enabled: payload.enabled ?? official.enabled,
+    }));
+    vi.mocked(activateMcpServer).mockImplementation(async (serverId) => ({
+      ...(serverId === personal.id ? personal : official),
+      enabled: true,
     }));
     vi.mocked(createMcpServer).mockResolvedValue(personal);
     vi.mocked(updateMcpServer).mockResolvedValue(personal);
@@ -143,6 +149,114 @@ describe('McpConnectionsPanel', () => {
       expect(updateMcpConnection).toHaveBeenCalledWith('official-1', { enabled: false });
       expect(screen.getByRole('switch', { name: '启用 官方知识库' })).not.toBeDisabled();
     });
+    expect(testMcpServer).not.toHaveBeenCalled();
+  });
+
+  it('启用连接前自动发现工具，成功后再打开连接并刷新权限', async () => {
+    const disabled = makeServer({
+      enabled: false,
+      installation_id: null,
+      tools_count: 0,
+      enabled_tools_count: 0,
+    });
+    let resolveActivation!: (server: McpServer) => void;
+    vi.mocked(getMcpServers).mockResolvedValue([disabled]);
+    vi.mocked(activateMcpServer).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveActivation = resolve;
+    }));
+    const onPermissionsInvalidated = vi.fn();
+    render(<McpConnectionsPanel onPermissionsInvalidated={onPermissionsInvalidated} />);
+
+    expect(await screen.findByText('未启用')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('switch', { name: '启用 官方知识库' }));
+
+    expect(screen.getByText('正在连接并发现工具...')).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: '启用 官方知识库' })).toBeDisabled();
+    expect(updateMcpConnection).not.toHaveBeenCalled();
+
+    await act(async () => resolveActivation(makeServer({
+      enabled: true,
+      tools_count: 2,
+      enabled_tools_count: 2,
+    })));
+    await waitFor(() => {
+      expect(activateMcpServer).toHaveBeenCalledWith('official-1');
+      expect(screen.getByText('2/2 个工具已发布')).toBeInTheDocument();
+      expect(onPermissionsInvalidated).toHaveBeenCalledTimes(1);
+    });
+    expect(testMcpServer).not.toHaveBeenCalled();
+    expect(updateMcpConnection).not.toHaveBeenCalled();
+  });
+
+  it('原子激活失败时保持连接关闭且不提交普通启用', async () => {
+    const disabled = makeServer({
+      enabled: false,
+      installation_id: null,
+      tools_count: 0,
+      enabled_tools_count: 0,
+    });
+    vi.mocked(getMcpServers).mockResolvedValue([disabled]);
+    vi.mocked(activateMcpServer).mockRejectedValueOnce({
+      response: { status: 409, data: { detail: '鉴权失败' } },
+    });
+    render(<McpConnectionsPanel />);
+
+    fireEvent.click(await screen.findByRole('switch', { name: '启用 官方知识库' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('鉴权失败');
+    expect(updateMcpConnection).not.toHaveBeenCalled();
+    expect(testMcpServer).not.toHaveBeenCalled();
+    expect(screen.getByRole('switch', { name: '启用 官方知识库' })).not.toBeDisabled();
+    expect(screen.getByText('未启用')).toBeInTheDocument();
+  });
+
+  it('连接设置中的启用先保存为关闭，再交给原子激活端点', async () => {
+    const disabled = makeServer({
+      enabled: false,
+      installation_id: 'installation-1',
+      tools_count: 0,
+      enabled_tools_count: 0,
+    });
+    vi.mocked(getMcpServers).mockResolvedValue([disabled]);
+    vi.mocked(updateMcpConnection).mockResolvedValueOnce(disabled);
+    vi.mocked(activateMcpServer).mockResolvedValueOnce(makeServer({ enabled: true }));
+    render(<McpConnectionsPanel />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置 官方知识库' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: '保存后启用此连接' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存连接' }));
+
+    await waitFor(() => {
+      expect(updateMcpConnection).toHaveBeenNthCalledWith(1, 'official-1', expect.objectContaining({
+        enabled: false,
+        auth_type: 'none',
+      }));
+      expect(activateMcpServer).toHaveBeenCalledWith('official-1');
+      expect(screen.queryByRole('dialog', { name: '配置 官方知识库' })).not.toBeInTheDocument();
+    });
+    expect(vi.mocked(updateMcpConnection).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(activateMcpServer).mock.invocationCallOrder[0]);
+    expect(testMcpServer).not.toHaveBeenCalled();
+  });
+
+  it('连接设置自动发现失败时保留已保存配置但保持关闭', async () => {
+    const disabled = makeServer({ enabled: false, tools_count: 0, enabled_tools_count: 0 });
+    vi.mocked(getMcpServers).mockResolvedValue([disabled]);
+    vi.mocked(updateMcpConnection).mockResolvedValueOnce(disabled);
+    vi.mocked(activateMcpServer).mockRejectedValueOnce({
+      response: { status: 409, data: { detail: '鉴权失败' } },
+    });
+    render(<McpConnectionsPanel />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置 官方知识库' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: '保存后启用此连接' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存连接' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('配置已保存但未启用：鉴权失败');
+    expect(updateMcpConnection).toHaveBeenCalledTimes(1);
+    expect(updateMcpConnection).not.toHaveBeenCalledWith('official-1', { enabled: true });
+    expect(activateMcpServer).toHaveBeenCalledWith('official-1');
+    expect(screen.getByRole('dialog', { name: '配置 官方知识库' })).toBeInTheDocument();
   });
 
   it('连接测试失败也刷新列表，避免 UI 显示旧状态', async () => {
@@ -168,48 +282,71 @@ describe('McpConnectionsPanel', () => {
     });
   });
 
-  it('并发操作刷新时只接收最后一次列表响应', async () => {
+  it('手动测试期间禁用同一卡片的启停开关', async () => {
+    let resolveTest!: (result: {
+      ok: boolean; tools_count: number; latency_ms: number; error: null;
+    }) => void;
+    vi.mocked(testMcpServer).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveTest = resolve;
+    }));
+    render(<McpConnectionsPanel />);
+    const toggle = await screen.findByRole('switch', { name: '停用 官方知识库' });
+
+    fireEvent.click(screen.getByRole('button', { name: '测试 官方知识库' }));
+
+    expect(toggle).toBeDisabled();
+    await act(async () => resolveTest({ ok: true, tools_count: 2, latency_ms: 10, error: null }));
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+  });
+
+  it('不同连接并发 mutation 丢弃旧刷新，并在全部结束后统一对账', async () => {
     const secondOfficial = makeServer({
       id: 'official-2',
       name: '第二知识库',
       installation_id: 'installation-3',
     });
-    let resolveFirstTest!: (result: {
-      ok: boolean; tools_count: number; latency_ms: number; error: null;
-    }) => void;
-    let resolveSecondTest!: (result: {
+    const reconciledSecond = {
+      ...secondOfficial,
+      name: '第二知识库已对账',
+      enabled: false,
+      last_tested_at: '2026-08-04T10:00:00',
+    };
+    let resolveTest!: (result: {
       ok: boolean; tools_count: number; latency_ms: number; error: null;
     }) => void;
     let resolveStaleLoad!: (servers: McpServer[]) => void;
-    let resolveLatestLoad!: (servers: McpServer[]) => void;
 
     vi.mocked(getMcpServers)
       .mockReset()
       .mockResolvedValueOnce([official, secondOfficial])
       .mockImplementationOnce(() => new Promise((resolve) => { resolveStaleLoad = resolve; }))
-      .mockImplementationOnce(() => new Promise((resolve) => { resolveLatestLoad = resolve; }));
-    vi.mocked(testMcpServer).mockImplementation((serverId) => new Promise((resolve) => {
-      if (serverId === official.id) resolveFirstTest = resolve;
-      else resolveSecondTest = resolve;
+      .mockResolvedValueOnce([official, reconciledSecond]);
+    vi.mocked(testMcpServer).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveTest = resolve;
     }));
+    vi.mocked(updateMcpConnection).mockResolvedValueOnce({
+      ...secondOfficial,
+      enabled: false,
+    });
 
     render(<McpConnectionsPanel />);
     await screen.findByText('第二知识库');
     fireEvent.click(screen.getByRole('button', { name: '测试 官方知识库' }));
-    fireEvent.click(screen.getByRole('button', { name: '测试 第二知识库' }));
-
-    await act(async () => resolveFirstTest({ ok: true, tools_count: 2, latency_ms: 10, error: null }));
+    await act(async () => resolveTest({ ok: true, tools_count: 2, latency_ms: 10, error: null }));
     await waitFor(() => expect(getMcpServers).toHaveBeenCalledTimes(2));
-    await act(async () => resolveSecondTest({ ok: true, tools_count: 2, latency_ms: 11, error: null }));
-    await waitFor(() => expect(getMcpServers).toHaveBeenCalledTimes(3));
 
-    const latestServer = makeServer({ name: '最新目录' });
-    await act(async () => resolveLatestLoad([latestServer]));
-    expect(await screen.findByText('最新目录')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('switch', { name: '停用 第二知识库' }));
+    await waitFor(() => {
+      expect(updateMcpConnection).toHaveBeenCalledWith('official-2', { enabled: false });
+      expect(screen.getByRole('switch', { name: '启用 第二知识库' })).not.toBeDisabled();
+    });
 
-    await act(async () => resolveStaleLoad([makeServer({ name: '过期目录' })]));
-    expect(screen.getByText('最新目录')).toBeInTheDocument();
-    expect(screen.queryByText('过期目录')).not.toBeInTheDocument();
+    await act(async () => resolveStaleLoad([official, secondOfficial]));
+    await waitFor(() => {
+      expect(getMcpServers).toHaveBeenCalledTimes(3);
+      expect(screen.getByText('第二知识库已对账')).toBeInTheDocument();
+      expect(screen.getByRole('switch', { name: '启用 第二知识库已对账' })).toBeInTheDocument();
+    });
   });
 
   it('平台必需连接在卡片和连接设置中都不能停用', async () => {
@@ -225,6 +362,31 @@ describe('McpConnectionsPanel', () => {
     const requiredCheckbox = screen.getByRole('checkbox', { name: '平台必需连接始终启用' });
     expect(requiredCheckbox).toBeChecked();
     expect(requiredCheckbox).toBeDisabled();
+  });
+
+  it('平台必需连接用原子激活验证并提交候选凭证', async () => {
+    const requiredBearer = makeServer({
+      required: true,
+      enabled: true,
+      auth_type: 'bearer',
+      credential_set: true,
+      header_names: ['Authorization'],
+    });
+    vi.mocked(getMcpServers).mockResolvedValueOnce([requiredBearer]);
+    vi.mocked(activateMcpServer).mockResolvedValueOnce(requiredBearer);
+    render(<McpConnectionsPanel />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置 官方知识库' }));
+    fireEvent.change(screen.getByLabelText('Bearer Token'), { target: { value: 'candidate-token' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存连接' }));
+
+    await waitFor(() => {
+      expect(activateMcpServer).toHaveBeenCalledWith('official-1', {
+        auth_type: 'bearer',
+        bearer_token: 'candidate-token',
+      });
+    });
+    expect(updateMcpConnection).not.toHaveBeenCalled();
   });
 
   it('官方连接认证方式只读，并始终提交服务定义的 auth_type', async () => {
@@ -252,10 +414,18 @@ describe('McpConnectionsPanel', () => {
   });
 
   it('个人 MCP 表单只接受 HTTPS 并提交写入型凭证', async () => {
+    const stagedPersonal = makeServer({
+      ...personal,
+      enabled: false,
+      tools_count: 0,
+      enabled_tools_count: 0,
+    });
+    vi.mocked(createMcpServer).mockResolvedValueOnce(stagedPersonal);
+    vi.mocked(activateMcpServer).mockResolvedValueOnce(personal);
     render(<McpConnectionsPanel />);
     await screen.findByText('官方知识库');
     fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
-    fireEvent.click(screen.getByRole('button', { name: '添加连接' }));
+    fireEvent.click(screen.getAllByRole('button', { name: '添加连接' })[0]);
 
     fireEvent.change(screen.getByLabelText('连接名称'), { target: { value: '财务数据' } });
     fireEvent.change(screen.getByLabelText('Streamable HTTP URL'), { target: { value: 'http://unsafe.example.com/mcp' } });
@@ -275,8 +445,48 @@ describe('McpConnectionsPanel', () => {
         url: 'https://safe.example.com/mcp',
         auth_type: 'bearer',
         bearer_token: 'secret-value',
+        enabled: false,
       }));
+      expect(activateMcpServer).toHaveBeenCalledWith('personal-1');
     });
+    expect(testMcpServer).not.toHaveBeenCalled();
+    expect(updateMcpServer).not.toHaveBeenCalled();
+  });
+
+  it('新个人 MCP 激活失败时明确保留为已保存但未启用的记录', async () => {
+    const stagedPersonal = makeServer({
+      ...personal,
+      name: '暂存服务',
+      enabled: false,
+      tools_count: 0,
+      enabled_tools_count: 0,
+    });
+    vi.mocked(createMcpServer).mockResolvedValueOnce(stagedPersonal);
+    vi.mocked(activateMcpServer).mockRejectedValueOnce({
+      response: { status: 409, data: { detail: '无法获取工具列表' } },
+    });
+    vi.mocked(getMcpServers).mockResolvedValueOnce([official]).mockResolvedValueOnce([
+      official,
+      stagedPersonal,
+    ]);
+    render(<McpConnectionsPanel />);
+    await screen.findByText('官方知识库');
+    fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+    fireEvent.click(screen.getAllByRole('button', { name: '添加连接' })[0]);
+    fireEvent.change(screen.getByLabelText('连接名称'), { target: { value: '暂存服务' } });
+    fireEvent.change(screen.getByLabelText('Streamable HTTP URL'), {
+      target: { value: 'https://staged.example.com/mcp' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存连接' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      '配置已保存但未启用：无法获取工具列表',
+    );
+    expect(screen.getByRole('dialog', { name: '编辑个人 MCP' })).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: '保存后启用此连接' })).not.toBeChecked();
+    expect(activateMcpServer).toHaveBeenCalledWith('personal-1');
+    expect(testMcpServer).not.toHaveBeenCalled();
+    expect(updateMcpServer).not.toHaveBeenCalledWith('personal-1', { enabled: true });
   });
 
   it('切换认证方式后个人 MCP 不携带残留 bearer_token', async () => {
@@ -448,13 +658,46 @@ describe('McpConnectionsPanel', () => {
     fireEvent.change(fileInput, { target: { files: [configFile] } });
     const warning = await screen.findByRole('status');
     expect(warning).toHaveClass('warning');
-    expect(warning).toHaveTextContent('已导入 1 个个人 MCP');
-    expect(warning).toHaveTextContent('坏连接: URL 无效');
+    expect(warning).toHaveTextContent('已保存 1 个个人 MCP');
+    expect(warning).toHaveTextContent('以下项目导入失败：坏连接: URL 无效');
 
     fireEvent.change(fileInput, { target: { files: [configFile] } });
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('个人 MCP 导入失败');
     expect(screen.queryByText('已导入 0 个个人 MCP')).not.toBeInTheDocument();
+  });
+
+  it('导入激活失败时说明连接已保存但未启用', async () => {
+    const stagedImport = makeServer({
+      ...personal,
+      name: '待修复连接',
+      enabled: false,
+      tools_count: 0,
+      enabled_tools_count: 0,
+    });
+    vi.mocked(importMcpConfig).mockResolvedValueOnce({
+      imported: 1,
+      servers: [stagedImport],
+      errors: [{ name: '待修复连接', error: '鉴权失败' }],
+    });
+    vi.mocked(getMcpServers).mockResolvedValueOnce([official]).mockResolvedValueOnce([
+      official,
+      stagedImport,
+    ]);
+    const { rerender } = render(<McpConnectionsPanel />);
+    await screen.findByText('官方知识库');
+    fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+    const configFile = { text: vi.fn().mockResolvedValue('{"mcpServers":{}}') };
+
+    fireEvent.change(screen.getByLabelText('选择 mcp.json'), { target: { files: [configFile] } });
+
+    const warning = await screen.findByRole('status');
+    expect(warning).toHaveClass('warning');
+    expect(warning).toHaveTextContent('以下项目已保存但未启用：待修复连接: 鉴权失败');
+    expect(await screen.findByText('待修复连接')).toBeInTheDocument();
+
+    rerender(<McpConnectionsPanel active={false} />);
+    await waitFor(() => expect(screen.queryByText(/以下项目已保存但未启用/)).not.toBeInTheDocument());
   });
 
   it('工具发布启停与 ALLOW/ASK/DENY 分开展示并完整替换配置', async () => {

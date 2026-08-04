@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 
 import {
+  activateMcpServer,
   createMcpServer,
   deleteMcpServer,
   exportMcpConfig,
@@ -45,14 +46,21 @@ import {
   type McpToolList,
 } from '../services/mcpApi';
 import { extractValidationErrorMessage } from '../utils/errorMessages';
+import FeedbackMessage from './FeedbackMessage';
 import './McpConnectionsPanel.css';
 
 type McpTab = 'official' | 'personal';
 type EditorMode = 'personal' | 'connection';
 
 interface McpConnectionsPanelProps {
+  active?: boolean;
   onDirtyChange?: (dirty: boolean) => void;
   onPermissionsInvalidated?: () => void;
+}
+
+interface LoadServersOptions {
+  allowDuringMutation?: boolean;
+  expectedMutationEpoch?: number;
 }
 
 type MessageTone = 'success' | 'warning';
@@ -170,6 +178,12 @@ function normalizedToolNames(names: string[]): string[] {
   return [...new Set(names)].sort((left, right) => left.localeCompare(right));
 }
 
+function upsertServer(items: McpServer[], server: McpServer): McpServer[] {
+  return items.some((item) => item.id === server.id)
+    ? items.map((item) => item.id === server.id ? server : item)
+    : [...items, server];
+}
+
 function isToolManagerDirty(manager: ToolManagerState | null): boolean {
   if (!manager || manager.loading) return false;
   const enabledTools = manager.enabledTools === null
@@ -251,6 +265,7 @@ function downloadJson(value: unknown) {
 }
 
 export default function McpConnectionsPanel({
+  active = true,
   onDirtyChange,
   onPermissionsInvalidated,
 }: McpConnectionsPanelProps) {
@@ -277,6 +292,9 @@ export default function McpConnectionsPanel({
   const toolReturnFocusRef = useRef<HTMLElement | null>(null);
   const deleteReturnFocusRef = useRef<HTMLElement | null>(null);
   const loadRequestRef = useRef(0);
+  const mutationEpochRef = useRef(0);
+  const mutationsInFlightRef = useRef(0);
+  const reconciliationNeededRef = useRef(false);
 
   const editorDirty = isEditorDirty(editor);
   const toolManagerDirty = isToolManagerDirty(toolManager);
@@ -308,15 +326,39 @@ export default function McpConnectionsPanel({
     if (deleteTarget) deleteDialogRef.current?.focus();
   }, [deleteTarget]);
 
-  const loadServers = useCallback(async () => {
+  useEffect(() => {
+    if (active) return;
+    setError('');
+    setMessage('');
+  }, [active]);
+
+  const loadServers = useCallback(async (options: LoadServersOptions = {}) => {
+    if (!options.allowDuringMutation && mutationsInFlightRef.current > 0) return;
+    if (
+      options.allowDuringMutation
+      && reconciliationNeededRef.current
+      && mutationsInFlightRef.current > 0
+    ) {
+      return;
+    }
+    const expectedMutationEpoch = options.expectedMutationEpoch ?? mutationEpochRef.current;
+    if (expectedMutationEpoch !== mutationEpochRef.current) return;
     const requestId = ++loadRequestRef.current;
     setLoading(true);
     setError('');
     try {
       const nextServers = await getMcpServers();
-      if (requestId === loadRequestRef.current) setServers(nextServers);
+      if (
+        requestId === loadRequestRef.current
+        && expectedMutationEpoch === mutationEpochRef.current
+      ) {
+        setServers(nextServers);
+      }
     } catch (loadError) {
-      if (requestId === loadRequestRef.current) {
+      if (
+        requestId === loadRequestRef.current
+        && expectedMutationEpoch === mutationEpochRef.current
+      ) {
         setError(errorText(loadError, 'MCP 连接加载失败'));
       }
     } finally {
@@ -326,6 +368,24 @@ export default function McpConnectionsPanel({
 
   useEffect(() => {
     void loadServers();
+  }, [loadServers]);
+
+  const beginMutation = useCallback((): number => {
+    if (mutationsInFlightRef.current > 0) reconciliationNeededRef.current = true;
+    mutationsInFlightRef.current += 1;
+    mutationEpochRef.current += 1;
+    return mutationEpochRef.current;
+  }, []);
+
+  const finishMutation = useCallback(() => {
+    mutationsInFlightRef.current = Math.max(0, mutationsInFlightRef.current - 1);
+    if (mutationsInFlightRef.current === 0 && reconciliationNeededRef.current) {
+      reconciliationNeededRef.current = false;
+      void loadServers({
+        allowDuringMutation: true,
+        expectedMutationEpoch: mutationEpochRef.current,
+      });
+    }
   }, [loadServers]);
 
   const officialServers = useMemo(
@@ -503,6 +563,7 @@ export default function McpConnectionsPanel({
 
   const saveToolVisibility = async () => {
     if (!toolManager) return;
+    beginMutation();
     const server = toolManager.server;
     const enabledTools = toolManager.enabledTools === null
       ? null
@@ -569,6 +630,8 @@ export default function McpConnectionsPanel({
         saving: false,
         error: saveErrorText,
       } : current);
+    } finally {
+      finishMutation();
     }
   };
 
@@ -648,47 +711,123 @@ export default function McpConnectionsPanel({
 
     setEditorError('');
     const key = `save-${editor.server?.id || 'new'}`;
+    const mutationEpoch = beginMutation();
     setBusyKeys((previous) => new Set(previous).add(key));
+    let persistedBeforeFailure = false;
+    let stagedServer: McpServer | null = null;
+    let discoveredToolsCount: number | null = null;
     try {
+      const credentialChanged = Boolean(
+        values.bearerToken.trim()
+        || headers !== undefined
+        || values.clearCredential,
+      );
+      const personalTargetChanged = Boolean(
+        editor.mode === 'personal'
+        && editor.server
+        && (
+          url !== editor.server.url
+          || authType !== editor.server.auth_type
+        ),
+      );
+      const activationNeeded = Boolean(
+        values.enabled
+        && (
+          !editor.server
+          || !editor.server.enabled
+          || personalTargetChanged
+          || credentialChanged
+        ),
+      );
+      const credentialPayload = {
+        auth_type: authType,
+        ...(authType === 'bearer' && values.bearerToken ? { bearer_token: values.bearerToken } : {}),
+        ...(headers ? { headers } : {}),
+        ...(values.clearCredential ? { clear_credential: true } : {}),
+      };
+
       if (editor.mode === 'connection' && editor.server) {
-        await updateMcpConnection(editor.server.id, {
-          enabled: values.enabled,
-          auth_type: editor.server.auth_type,
-          ...(authType === 'bearer' && values.bearerToken ? { bearer_token: values.bearerToken } : {}),
-          ...(headers ? { headers } : {}),
-          ...(values.clearCredential ? { clear_credential: true } : {}),
-        });
+        if (activationNeeded && editor.server.required) {
+          // Required connections cannot be staged as disabled. The activation
+          // endpoint probes the proposed credential and commits it atomically.
+          stagedServer = credentialChanged
+            ? await activateMcpServer(editor.server.id, credentialPayload)
+            : await activateMcpServer(editor.server.id);
+          discoveredToolsCount = stagedServer.tools_count ?? 0;
+        } else {
+          stagedServer = await updateMcpConnection(editor.server.id, {
+            enabled: activationNeeded ? false : values.enabled,
+            ...credentialPayload,
+          });
+          persistedBeforeFailure = activationNeeded;
+          if (activationNeeded) {
+            stagedServer = await activateMcpServer(editor.server.id);
+            discoveredToolsCount = stagedServer.tools_count ?? 0;
+          }
+        }
       } else if (editor.server) {
-        await updateMcpServer(editor.server.id, {
+        stagedServer = await updateMcpServer(editor.server.id, {
           name,
           description: description || null,
           url,
           auth_type: authType,
-          enabled: values.enabled,
+          enabled: activationNeeded ? false : values.enabled,
           ...(authType === 'bearer' && values.bearerToken ? { bearer_token: values.bearerToken } : {}),
           ...(headers ? { headers } : {}),
           ...(values.clearCredential ? { clear_credential: true } : {}),
         });
+        persistedBeforeFailure = activationNeeded;
+        if (activationNeeded) {
+          stagedServer = await activateMcpServer(editor.server.id);
+          discoveredToolsCount = stagedServer.tools_count ?? 0;
+        }
       } else {
-        await createMcpServer({
+        stagedServer = await createMcpServer({
           name,
           description: description || null,
           url,
           auth_type: authType,
-          enabled: values.enabled,
+          enabled: activationNeeded ? false : values.enabled,
           ...(authType === 'bearer' && values.bearerToken ? { bearer_token: values.bearerToken } : {}),
           ...(headers ? { headers } : {}),
         });
+        persistedBeforeFailure = activationNeeded;
+        if (activationNeeded) {
+          stagedServer = await activateMcpServer(stagedServer.id);
+          discoveredToolsCount = stagedServer.tools_count ?? 0;
+        }
+      }
+      if (stagedServer) {
+        setServers((items) => upsertServer(items, stagedServer as McpServer));
       }
       onPermissionsInvalidated?.();
       setEditor(null);
       editorReturnFocusRef.current?.focus();
       setMessageTone('success');
-      setMessage(editor.mode === 'connection' ? '连接设置已保存' : '个人 MCP 已保存');
-      await loadServers();
+      setMessage(discoveredToolsCount === null
+        ? (editor.mode === 'connection' ? '连接设置已保存' : '个人 MCP 已保存')
+        : `连接已启用，发现 ${discoveredToolsCount} 个工具`);
+      await loadServers({ allowDuringMutation: true, expectedMutationEpoch: mutationEpoch });
     } catch (saveError) {
-      setEditorError(errorText(saveError, 'MCP 保存失败'));
+      const failure = errorText(saveError, 'MCP 保存失败');
+      if (persistedBeforeFailure && stagedServer) {
+        const savedServer = stagedServer as McpServer;
+        const savedValues = valuesFromServer(savedServer);
+        setServers((items) => upsertServer(items, savedServer));
+        setEditor((current) => current ? {
+          ...current,
+          server: savedServer,
+          values: savedValues,
+          initial: savedValues,
+        } : current);
+        setEditorError(`配置已保存但未启用：${failure}`);
+        onPermissionsInvalidated?.();
+        await loadServers({ allowDuringMutation: true, expectedMutationEpoch: mutationEpoch });
+      } else {
+        setEditorError(failure);
+      }
     } finally {
+      finishMutation();
       setBusyKeys((previous) => {
         const next = new Set(previous);
         next.delete(key);
@@ -699,47 +838,76 @@ export default function McpConnectionsPanel({
 
   const toggleServer = (server: McpServer) => {
     const nextEnabled = !server.enabled;
-    const key = `toggle-${server.id}`;
+    const key = `${nextEnabled ? 'enable' : 'disable'}-${server.id}`;
     const previous = server.enabled;
-    setServers((items) => items.map((item) => (
-      item.id === server.id ? { ...item, enabled: nextEnabled } : item
-    )));
+    const mutationEpoch = beginMutation();
+    // Disabling is safe to render optimistically. Enabling stays visibly in a
+    // connecting state until the backend atomically probes, snapshots, and
+    // commits the enabled installation.
+    if (!nextEnabled) {
+      setServers((items) => items.map((item) => (
+        item.id === server.id ? { ...item, enabled: false } : item
+      )));
+    }
     void runAction(key, async () => {
       try {
-        const updated = await updateMcpConnection(server.id, { enabled: nextEnabled });
-        setServers((items) => items.map((item) => item.id === server.id ? updated : item));
+        const updated = nextEnabled
+          ? await activateMcpServer(server.id)
+          : await updateMcpConnection(server.id, { enabled: false });
+        setServers((items) => upsertServer(items, updated));
         onPermissionsInvalidated?.();
+        if (nextEnabled) {
+          setMessageTone('success');
+          setMessage(`连接已启用，发现 ${updated.tools_count ?? 0} 个工具`);
+        }
       } catch (toggleError) {
         setServers((items) => items.map((item) => (
           item.id === server.id ? { ...item, enabled: previous } : item
         )));
+        if (nextEnabled) {
+          await loadServers({ allowDuringMutation: true, expectedMutationEpoch: mutationEpoch });
+          onPermissionsInvalidated?.();
+        }
         throw toggleError;
+      } finally {
+        finishMutation();
       }
     });
   };
 
   const handleTest = (server: McpServer) => {
+    const mutationEpoch = beginMutation();
     void runAction(`test-${server.id}`, async () => {
-      const result = await testMcpServer(server.id);
-      // The probe persists last_tested_at/last_error server-side, so refresh
-      // regardless of ok before surfacing the error to avoid stale UI state.
-      await loadServers();
-      onPermissionsInvalidated?.();
-      if (!result.ok) throw new Error(result.error || '连接测试失败');
-      setMessageTone('success');
-      setMessage(formatTestResult(result));
+      try {
+        const result = await testMcpServer(server.id);
+        // The probe persists last_tested_at/last_error server-side, so refresh
+        // regardless of ok before surfacing the error to avoid stale UI state.
+        await loadServers({ allowDuringMutation: true, expectedMutationEpoch: mutationEpoch });
+        onPermissionsInvalidated?.();
+        if (!result.ok) throw new Error(result.error || '连接测试失败');
+        setMessageTone('success');
+        setMessage(formatTestResult(result));
+      } finally {
+        finishMutation();
+      }
     });
   };
 
   const handleDelete = () => {
     if (!deleteTarget) return;
     const target = deleteTarget;
+    const mutationEpoch = beginMutation();
     void runAction(`delete-${target.id}`, async () => {
-      await deleteMcpServer(target.id);
-      setDeleteTarget(null);
-      deleteReturnFocusRef.current?.focus();
-      onPermissionsInvalidated?.();
-      await loadServers();
+      try {
+        await deleteMcpServer(target.id);
+        setServers((items) => items.filter((item) => item.id !== target.id));
+        setDeleteTarget(null);
+        deleteReturnFocusRef.current?.focus();
+        onPermissionsInvalidated?.();
+        await loadServers({ allowDuringMutation: true, expectedMutationEpoch: mutationEpoch });
+      } finally {
+        finishMutation();
+      }
     }, '个人 MCP 已删除');
   };
 
@@ -747,23 +915,42 @@ export default function McpConnectionsPanel({
     const file = event.target.files?.[0];
     event.target.value = '';
     if (!file) return;
+    const mutationEpoch = beginMutation();
     await runAction('import', async () => {
-      const parsed: unknown = JSON.parse(await file.text());
-      if (!parsed || typeof parsed !== 'object' || !('mcpServers' in parsed)) {
-        throw new Error('请选择包含 mcpServers 的 mcp.json');
+      try {
+        const parsed: unknown = JSON.parse(await file.text());
+        if (!parsed || typeof parsed !== 'object' || !('mcpServers' in parsed)) {
+          throw new Error('请选择包含 mcpServers 的 mcp.json');
+        }
+        const result = await importMcpConfig(parsed);
+        const savedNames = new Set(result.servers.map((server) => server.name));
+        const activationErrors = result.errors.filter((item) => savedNames.has(item.name));
+        const rejectedErrors = result.errors.filter((item) => !savedNames.has(item.name));
+        const details = result.errors.map((item) => `${item.name}: ${item.error}`).join('；');
+        if (result.imported === 0 && result.errors.length) {
+          throw new Error(`个人 MCP 导入失败：${details}`);
+        }
+        if (result.servers.length) {
+          setServers((items) => result.servers.reduce(upsertServer, items));
+        }
+        setMessageTone(result.errors.length ? 'warning' : 'success');
+        const warningParts = [
+          activationErrors.length
+            ? `以下项目已保存但未启用：${activationErrors.map((item) => `${item.name}: ${item.error}`).join('；')}`
+            : '',
+          rejectedErrors.length
+            ? `以下项目导入失败：${rejectedErrors.map((item) => `${item.name}: ${item.error}`).join('；')}`
+            : '',
+        ].filter(Boolean);
+        setMessage(warningParts.length
+          ? `已保存 ${result.imported} 个个人 MCP；${warningParts.join('；')}`
+          : `已导入 ${result.imported} 个个人 MCP`);
+        setActiveTab('personal');
+        onPermissionsInvalidated?.();
+        await loadServers({ allowDuringMutation: true, expectedMutationEpoch: mutationEpoch });
+      } finally {
+        finishMutation();
       }
-      const result = await importMcpConfig(parsed);
-      const details = result.errors.map((item) => `${item.name}: ${item.error}`).join('；');
-      if (result.imported === 0 && result.errors.length) {
-        throw new Error(`个人 MCP 导入失败：${details}`);
-      }
-      setMessageTone(result.errors.length ? 'warning' : 'success');
-      setMessage(result.errors.length
-        ? `已导入 ${result.imported} 个个人 MCP；以下项目失败：${details}`
-        : `已导入 ${result.imported} 个个人 MCP`);
-      setActiveTab('personal');
-      onPermissionsInvalidated?.();
-      await loadServers();
     });
   };
 
@@ -872,21 +1059,40 @@ export default function McpConnectionsPanel({
               </button>
             </>
           ) : (
-            <button type="button" onClick={() => void loadServers()} disabled={loading}>
+            <button
+              type="button"
+              onClick={() => void loadServers()}
+              disabled={loading || busyKeys.size > 0 || toolManager?.saving === true}
+            >
               <RefreshCw size={14} className={loading ? 'spin' : ''} />刷新
             </button>
           )}
         </div>
       </div>
 
-      {error ? <div className="mcp-user-alert error" role="alert"><AlertCircle size={15} />{error}</div> : null}
+      {error ? (
+        <FeedbackMessage
+          className="mcp-user-alert error"
+          tone="error"
+          icon={<AlertCircle size={15} />}
+          onDismiss={() => setError('')}
+        >
+          {error}
+        </FeedbackMessage>
+      ) : null}
       {message ? (
-        <div className={`mcp-user-alert ${messageTone}`} role="status">
-          {messageTone === 'success' ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}{message}
-        </div>
+        <FeedbackMessage
+          className={`mcp-user-alert ${messageTone}`}
+          tone={messageTone}
+          autoDismissMs={messageTone === 'success' ? 4000 : undefined}
+          icon={messageTone === 'success' ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+          onDismiss={() => setMessage('')}
+        >
+          {message}
+        </FeedbackMessage>
       ) : null}
 
-      {loading ? (
+      {loading && servers.length === 0 ? (
         <div className="mcp-user-empty"><Loader2 className="spin" size={20} />正在读取连接...</div>
       ) : visibleServers.length === 0 ? (
         <div className="mcp-user-empty">
@@ -900,10 +1106,16 @@ export default function McpConnectionsPanel({
       ) : (
         <div className="mcp-user-list">
           {visibleServers.map((server) => {
-            const toggleBusy = busyKeys.has(`toggle-${server.id}`);
+            const enableBusy = busyKeys.has(`enable-${server.id}`);
+            const disableBusy = busyKeys.has(`disable-${server.id}`);
+            const toggleBusy = enableBusy || disableBusy;
             const testBusy = busyKeys.has(`test-${server.id}`);
             return (
-              <article className="mcp-user-card" key={server.id}>
+              <article
+                className="mcp-user-card"
+                key={server.id}
+                aria-busy={toggleBusy || testBusy}
+              >
                 <div className="mcp-user-card-icon" aria-hidden="true">
                   {server.source === 'official' ? <Cloud size={18} /> : <Server size={18} />}
                 </div>
@@ -917,9 +1129,15 @@ export default function McpConnectionsPanel({
                   <p>{server.description || '暂无说明'}</p>
                   <code title={server.url}>{server.url}</code>
                   <div className="mcp-user-card-meta">
-                    <span>{server.tools_count === null
-                      ? '工具数未知'
-                      : `${server.enabled_tools_count}/${server.tools_count} 个工具已发布`}</span>
+                    <span>{enableBusy
+                      ? '正在连接并发现工具...'
+                      : disableBusy
+                        ? '正在停用...'
+                        : !server.enabled
+                          ? '未启用'
+                          : server.tools_count === null
+                            ? '工具数未知'
+                            : `${server.enabled_tools_count}/${server.tools_count} 个工具已发布`}</span>
                     <span>{formatLastTest(server)}</span>
                     {server.last_error ? <span className="failed">上次测试失败</span> : null}
                   </div>
@@ -930,6 +1148,7 @@ export default function McpConnectionsPanel({
                     className="icon"
                     title="管理工具发布"
                     aria-label={`管理 ${server.name} 的工具`}
+                    disabled={toggleBusy || testBusy}
                     onClick={() => openToolManager(server)}
                   >
                     <Wrench size={15} />
@@ -939,7 +1158,7 @@ export default function McpConnectionsPanel({
                     className="icon"
                     title="测试连接"
                     aria-label={`测试 ${server.name}`}
-                    disabled={testBusy}
+                    disabled={testBusy || toggleBusy}
                     onClick={() => handleTest(server)}
                   >
                     {testBusy ? <Loader2 size={15} className="spin" /> : <Zap size={15} />}
@@ -949,6 +1168,7 @@ export default function McpConnectionsPanel({
                     className="icon"
                     title={server.source === 'official' ? '连接设置' : '编辑连接'}
                     aria-label={`${server.source === 'official' ? '配置' : '编辑'} ${server.name}`}
+                    disabled={toggleBusy || testBusy}
                     onClick={() => server.source === 'official' ? openConnection(server) : openEditPersonal(server)}
                   >
                     {server.source === 'official' ? <Settings2 size={15} /> : <Edit3 size={15} />}
@@ -959,6 +1179,7 @@ export default function McpConnectionsPanel({
                       className="icon danger"
                       title="删除连接"
                       aria-label={`删除 ${server.name}`}
+                      disabled={toggleBusy || testBusy}
                       onClick={() => openDeleteConfirmation(server)}
                     >
                       <Trash2 size={15} />
@@ -970,7 +1191,7 @@ export default function McpConnectionsPanel({
                     aria-checked={server.enabled}
                     aria-label={`${server.enabled ? '停用' : '启用'} ${server.name}`}
                     className={`mcp-user-switch ${server.enabled ? 'on' : ''}`}
-                    disabled={toggleBusy || server.required}
+                    disabled={toggleBusy || testBusy || server.required}
                     onClick={() => toggleServer(server)}
                   >
                     <span />

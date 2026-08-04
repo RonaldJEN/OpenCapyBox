@@ -29,6 +29,7 @@ import {
   type AdminModelsResponse,
   type AdminUsersResponse,
 } from '../services/adminApi';
+import FeedbackMessage from './FeedbackMessage';
 
 interface AdminModelAccessPanelProps {
   apiErrorDetail: (err: unknown) => string;
@@ -427,8 +428,27 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
 
   return (
     <div className="admin-model-access">
-      {error ? <div className="admin-error admin-inline-message">{error}</div> : null}
-      {message ? <div className="admin-toast" role="status">{message}</div> : null}
+      {error ? (
+        <FeedbackMessage
+          className="admin-error admin-inline-message"
+          tone="error"
+          icon={<AlertTriangle size={14} />}
+          onDismiss={() => setError('')}
+        >
+          {error}
+        </FeedbackMessage>
+      ) : null}
+      {message ? (
+        <FeedbackMessage
+          className="admin-toast"
+          tone="success"
+          autoDismissMs={4000}
+          icon={<CheckCircle2 size={14} />}
+          onDismiss={() => setMessage('')}
+        >
+          {message}
+        </FeedbackMessage>
+      ) : null}
 
       <div className="admin-model-topline">
         <div className="admin-model-tabs" role="tablist" aria-label="模型权限配置">

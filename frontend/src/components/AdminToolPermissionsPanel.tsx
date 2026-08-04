@@ -19,6 +19,7 @@ import {
   type ToolPermissionRule,
   type ToolProvider,
 } from '../services/permissionApi';
+import FeedbackMessage from './FeedbackMessage';
 import './AdminToolPermissionsPanel.css';
 
 interface AdminToolPermissionsPanelProps {
@@ -217,8 +218,27 @@ export default function AdminToolPermissionsPanel({ refreshToken = 0 }: AdminToo
         </div>
       </section>
 
-      {error ? <div className="admin-error admin-inline-message"><AlertCircle size={14} />{error}</div> : null}
-      {message ? <div className="admin-toast" role="status"><CheckCircle2 size={14} />{message}</div> : null}
+      {error ? (
+        <FeedbackMessage
+          className="admin-error admin-inline-message"
+          tone="error"
+          icon={<AlertCircle size={14} />}
+          onDismiss={() => setError('')}
+        >
+          {error}
+        </FeedbackMessage>
+      ) : null}
+      {message ? (
+        <FeedbackMessage
+          className="admin-toast"
+          tone="success"
+          autoDismissMs={4000}
+          icon={<CheckCircle2 size={14} />}
+          onDismiss={() => setMessage('')}
+        >
+          {message}
+        </FeedbackMessage>
+      ) : null}
 
       <section className="admin-card admin-tool-policy-create">
         <div className="admin-card-header">

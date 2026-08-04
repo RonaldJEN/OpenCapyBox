@@ -1136,7 +1136,7 @@ describe('AdminConsole 组件', () => {
     expect(screen.getByRole('status')).toHaveTextContent('用户已删除');
 
     act(() => {
-      vi.advanceTimersByTime(2400);
+      vi.advanceTimersByTime(4000);
     });
 
     expect(screen.queryByRole('status')).not.toBeInTheDocument();

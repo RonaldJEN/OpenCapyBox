@@ -1,0 +1,44 @@
+.feedback-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.feedback-message__icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.feedback-message__content {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+
+.feedback-message__close {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: -4px -5px -4px 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: currentColor;
+  cursor: pointer;
+  opacity: 0.72;
+}
+
+.feedback-message__close:hover {
+  background: rgba(0, 0, 0, 0.08);
+  opacity: 1;
+}
+
+.feedback-message__close:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 1px;
+}

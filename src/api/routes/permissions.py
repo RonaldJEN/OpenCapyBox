@@ -291,7 +291,10 @@ async def get_permission_tools(
     try:
         from src.api.models.mcp import McpInstallation, McpServer, McpToolSnapshot
 
-        from src.api.services.mcp_runtime import resolve_effective_mcp_installation
+        from src.api.services.mcp_runtime import (
+            EffectiveMcpInstallation,
+            resolve_effective_mcp_installation,
+        )
 
         rows = (
             db.query(McpToolSnapshot, McpServer, McpInstallation)
@@ -311,23 +314,35 @@ async def get_permission_tools(
             .order_by(McpServer.name.asc(), McpToolSnapshot.tool_name.asc())
             .all()
         )
-        installation_fingerprints: dict[str, str | None] = {}
+        effective_installations: dict[str, EffectiveMcpInstallation | None] = {}
         for snapshot, server, installation in rows:
+            if installation.id not in effective_installations:
+                effective_installations[installation.id] = (
+                    resolve_effective_mcp_installation(
+                        db,
+                        user_id=user_id,
+                        installation_id=installation.id,
+                    )
+                )
+            effective = effective_installations[installation.id]
+            # Durable snapshots and permission rules deliberately survive a
+            # connection/tool being disabled so a later re-enable restores the
+            # user's choices.  The interactive permission inventory, however,
+            # must contain only tools that are executable right now.
+            if (
+                effective is None
+                or effective.configuration_error is not None
+                or not effective.publishes_tool(snapshot.tool_name)
+                or str(snapshot.connection_fingerprint or "")
+                != effective.execution_fingerprint
+            ):
+                continue
             ref = ToolRef(
                 provider="mcp",
                 server_id=server.id,
                 tool_name=snapshot.tool_name,
             )
             default_effect = "allow"
-            if installation.id not in installation_fingerprints:
-                effective = resolve_effective_mcp_installation(
-                    db,
-                    user_id=user_id,
-                    installation_id=installation.id,
-                )
-                installation_fingerprints[installation.id] = (
-                    effective.execution_fingerprint if effective is not None else None
-                )
             candidates.append(
                 (
                     {
@@ -346,9 +361,7 @@ async def get_permission_tools(
                         ref=ref,
                         default_effect=default_effect,
                         schema_hash=snapshot.schema_hash,
-                        connection_fingerprint=installation_fingerprints[
-                            installation.id
-                        ],
+                        connection_fingerprint=effective.execution_fingerprint,
                     ),
                 )
             )

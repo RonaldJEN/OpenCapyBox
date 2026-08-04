@@ -53,7 +53,8 @@
 | DELETE | `/rules/{id}` | 删除用户级规则 |
 | GET | `/tools` | 工具清单 + 每个工具的当前裁决 `effect` 与 `matched_rule_id` |
 
-- `GET /tools` 汇总内置工具与该用户 installation 作用域内的 MCP 快照工具（均默认 `allow`），并按 §4.1 裁决
+- `GET /tools` 汇总内置工具与该用户**当前可执行**的 MCP 快照工具（均默认 `allow`），并按 §4.1 裁决。MCP 项必须同时满足：连接有效且无 `configuration_error`、工具符合发布策略、快照 `connection_fingerprint` 与当前 `execution_fingerprint` 一致；连接关闭、官方服务未发布、工具停用或快照过期时不得继续显示在权限工具清单。
+- MCP 快照和权限规则是耐久状态：上述不可用状态只影响 `/tools` 的交互清单，不删除 `/rules` 中已有选择。重新启用或恢复发布并成功发现同一工具后，原 `ALLOW / ASK / DENY` 选择按稳定的 server/tool 身份恢复生效。
 - `GET /rules` 中 `managed=true` 的平台规则仅用于展示权限天花板，用户端不得 PATCH/DELETE；用户端只可管理 `scope_type=user`、`scope_id` 为自己的非 managed 规则
 - 变更规则后调用 `invalidate_user_async` 让 Agent 池尽快生效（DB `policy_version` 为权威源）
 
@@ -126,6 +127,7 @@
 - 路由先对所有 MCP 项做访问校验，全部通过后才开始变更；任一项不可访问则 404 且不改动任何规则。
 - `items` 不得重复（同 provider/server_id/tool_name），上限 500 项；重复或超限返回 422。
 - **平台策略天花板由前端处理**：前端在发送前跳过被 managed ASK/DENY 天花板挡住、无法放宽到目标 effect 的工具（与单个操作时按钮禁用一致），并提示「N 个被平台策略跳过」；后端只对收到的项应用。
+- 前端批量跳过等普通信息反馈显示 5 秒后自动消失并可手动关闭；错误保持到用户关闭或重试。设置中心保活权限面板时，离开权限分区必须清理一次性反馈，返回时不得重现旧提示。
 
 ## 5. 配置项
 

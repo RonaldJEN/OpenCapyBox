@@ -23,6 +23,7 @@ import {
   type AdminOperationLogsResponse,
 } from '../services/adminApi';
 import { extractBlobAwareErrorMessage, extractErrorMessage } from '../utils/errorMessages';
+import FeedbackMessage from './FeedbackMessage';
 import './AdminAuditLogPanel.css';
 
 interface AdminAuditLogPanelProps {
@@ -508,8 +509,26 @@ export default function AdminAuditLogPanel({ refreshToken = 0 }: AdminAuditLogPa
         </form>
       </div>
 
-      {error ? <div className="admin-error"><AlertCircle size={15} />{error}</div> : null}
-      {exportError ? <div className="admin-error"><AlertCircle size={15} />{exportError}</div> : null}
+      {error ? (
+        <FeedbackMessage
+          className="admin-error"
+          tone="error"
+          icon={<AlertCircle size={15} />}
+          onDismiss={() => setError('')}
+        >
+          {error}
+        </FeedbackMessage>
+      ) : null}
+      {exportError ? (
+        <FeedbackMessage
+          className="admin-error"
+          tone="error"
+          icon={<AlertCircle size={15} />}
+          onDismiss={() => setExportError('')}
+        >
+          {exportError}
+        </FeedbackMessage>
+      ) : null}
 
       <div className="admin-card admin-audit-list-card">
         <div className="admin-card-header">

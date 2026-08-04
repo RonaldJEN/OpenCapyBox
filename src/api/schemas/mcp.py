@@ -120,7 +120,9 @@ class UserMcpServerCreate(_CredentialInput):
     name: str = Field(..., min_length=1, max_length=100)
     description: str | None = Field(default=None, max_length=4000)
     url: str = Field(..., min_length=1, max_length=4096)
-    enabled: bool = True
+    # New connections are staged disabled. Activation performs discovery and
+    # publishes the connection in one validated transaction.
+    enabled: bool = False
 
     @field_validator("name", "description", "url", mode="before")
     @classmethod
@@ -153,6 +155,18 @@ class UserMcpServerPatch(AdminMcpServerPatch):
 class McpConnectionUpdate(_CredentialInput):
     auth_type: McpAuthType | None = None
     enabled: bool
+
+
+class McpActivationRequest(_CredentialInput):
+    """Optional credential replacement applied by atomic activation.
+
+    Omitting the request body (or all credential mutation fields) activates the
+    already-persisted connection target.  Supplying a credential lets required
+    official connections rotate a user override without ever publishing an
+    untested intermediate target.
+    """
+
+    auth_type: McpAuthType | None = None
 
 
 class McpServerResponse(BaseModel):

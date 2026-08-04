@@ -10,7 +10,6 @@ import {
   ShieldAlert,
   Square,
   Trash2,
-  X,
 } from 'lucide-react';
 
 import {
@@ -23,6 +22,7 @@ import {
   type PermissionTool,
   type ToolPermissionRule,
 } from '../services/permissionApi';
+import FeedbackMessage from './FeedbackMessage';
 
 
 type EffectFilter = 'all' | PermissionEffect;
@@ -91,10 +91,11 @@ function blockedByManagedCeiling(
 }
 
 interface ToolPermissionsPanelProps {
+  active?: boolean;
   refreshToken?: number;
 }
 
-export default function ToolPermissionsPanel({ refreshToken = 0 }: ToolPermissionsPanelProps) {
+export default function ToolPermissionsPanel({ active = true, refreshToken = 0 }: ToolPermissionsPanelProps) {
   const [tools, setTools] = useState<PermissionTool[]>([]);
   const [rules, setRules] = useState<ToolPermissionRule[]>([]);
   const [category, setCategory] = useState<Category>('builtin');
@@ -119,6 +120,10 @@ export default function ToolPermissionsPanel({ refreshToken = 0 }: ToolPermissio
       if (sequence !== loadSequenceRef.current) return;
       setTools(nextTools);
       setRules(nextRules);
+      const nextToolRefs = new Set(nextTools.map((tool) => tool.tool_ref));
+      setSelected((current) => new Set(
+        [...current].filter((toolRef) => nextToolRefs.has(toolRef)),
+      ));
     } catch (loadError) {
       if (sequence !== loadSequenceRef.current) return;
       setError(errorMessage(loadError));
@@ -130,6 +135,12 @@ export default function ToolPermissionsPanel({ refreshToken = 0 }: ToolPermissio
   useEffect(() => {
     void load();
   }, [load, refreshToken]);
+
+  useEffect(() => {
+    if (active) return;
+    setError('');
+    setNotice('');
+  }, [active]);
 
   const ownRulesByToolRef = useMemo(() => {
     const map = new Map<string, ToolPermissionRule[]>();
@@ -323,20 +334,26 @@ export default function ToolPermissionsPanel({ refreshToken = 0 }: ToolPermissio
       </div>
 
       {error && (
-        <div className="mb-4 flex items-start gap-2 rounded-xl border border-[#efc5c0] bg-[#fff5f3] px-4 py-3 text-sm text-[#9f3b32]">
-          <AlertCircle size={16} className="mt-0.5 shrink-0" />
+        <FeedbackMessage
+          className="mb-4 rounded-xl border border-[#efc5c0] bg-[#fff5f3] px-4 py-3 text-sm text-[#9f3b32]"
+          tone="error"
+          icon={<AlertCircle size={16} />}
+          onDismiss={() => setError('')}
+        >
           {error}
-        </div>
+        </FeedbackMessage>
       )}
 
       {notice && (
-        <div className="mb-4 flex items-start gap-2 rounded-xl border border-[#cfe0ef] bg-[#f2f7fb] px-4 py-3 text-sm text-[#3f6488]">
-          <Info size={16} className="mt-0.5 shrink-0" />
-          <span className="flex-1">{notice}</span>
-          <button type="button" aria-label="关闭提示" onClick={() => setNotice('')} className="text-[#7c93a9] hover:text-[#3f6488]">
-            <X size={14} />
-          </button>
-        </div>
+        <FeedbackMessage
+          className="mb-4 rounded-xl border border-[#cfe0ef] bg-[#f2f7fb] px-4 py-3 text-sm text-[#3f6488]"
+          tone="info"
+          autoDismissMs={5000}
+          icon={<Info size={16} />}
+          onDismiss={() => setNotice('')}
+        >
+          {notice}
+        </FeedbackMessage>
       )}
 
       <div className="mb-4 flex gap-1 rounded-xl border border-[#e8e3d9] bg-[#f7f4ee] p-1">

@@ -71,6 +71,23 @@ describe('AdminMcpCatalogPanel', () => {
       expect(testAdminMcpServer).toHaveBeenCalledWith('official-1');
       expect(screen.getByRole('status')).toHaveTextContent('连接成功 · 6 个工具 · 25 ms');
     });
+    fireEvent.click(screen.getByRole('button', { name: '关闭提示' }));
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('连接测试失败使用错误提示而不是绿色成功 toast', async () => {
+    vi.mocked(testAdminMcpServer).mockResolvedValueOnce({
+      ok: false,
+      tools_count: 0,
+      latency_ms: 25,
+      error: '鉴权失败',
+    });
+    render(<AdminMcpCatalogPanel />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '测试 内部知识库' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('鉴权失败');
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
   it('并发操作刷新时只接收最后一次列表响应', async () => {

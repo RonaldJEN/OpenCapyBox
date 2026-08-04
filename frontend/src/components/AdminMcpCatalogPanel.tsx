@@ -38,6 +38,7 @@ import {
   type McpTestResult,
 } from '../services/mcpApi';
 import { extractValidationErrorMessage } from '../utils/errorMessages';
+import FeedbackMessage from './FeedbackMessage';
 import './AdminMcpCatalogPanel.css';
 
 interface AdminMcpCatalogPanelProps {
@@ -479,8 +480,27 @@ export default function AdminMcpCatalogPanel({
 
   return (
     <div className="admin-mcp-page">
-      {error ? <div className="admin-error admin-inline-message" role="alert">{error}</div> : null}
-      {message ? <div className="admin-toast" role="status">{message}</div> : null}
+      {error ? (
+        <FeedbackMessage
+          className="admin-error admin-inline-message"
+          tone="error"
+          icon={<AlertCircle size={14} />}
+          onDismiss={() => setError('')}
+        >
+          {error}
+        </FeedbackMessage>
+      ) : null}
+      {message ? (
+        <FeedbackMessage
+          className="admin-toast"
+          tone="success"
+          autoDismissMs={4000}
+          icon={<CheckCircle2 size={14} />}
+          onDismiss={() => setMessage('')}
+        >
+          {message}
+        </FeedbackMessage>
+      ) : null}
 
       <section className="admin-mcp-hero">
         <div className="admin-mcp-hero-copy">

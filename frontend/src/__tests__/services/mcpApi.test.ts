@@ -17,6 +17,7 @@ vi.mock('../../services/api', () => ({
 }));
 
 import {
+  activateMcpServer,
   createAdminMcpServer,
   exportMcpConfig,
   getMcpServerTools,
@@ -140,6 +141,24 @@ describe('mcpApi', () => {
     });
   });
 
+  it('原子激活使用独立端点，并可携带待验证凭证', async () => {
+    client.post
+      .mockResolvedValueOnce({ data: { id: 'srv-1', source: 'official', enabled: true } })
+      .mockResolvedValueOnce({ data: { id: 'srv-1', source: 'official', enabled: true } });
+
+    await activateMcpServer('srv/1');
+    await activateMcpServer('srv/1', {
+      auth_type: 'bearer',
+      bearer_token: 'candidate-secret',
+    });
+
+    expect(client.post).toHaveBeenNthCalledWith(1, '/mcp/servers/srv%2F1/activate');
+    expect(client.post).toHaveBeenNthCalledWith(2, '/mcp/servers/srv%2F1/activate', {
+      auth_type: 'bearer',
+      bearer_token: 'candidate-secret',
+    });
+  });
+
   it('测试、导入和导出使用约定端点', async () => {
     client.post
       .mockResolvedValueOnce({ data: { ok: true, tools_count: 3, latency_ms: 21, error: null } })
@@ -158,6 +177,31 @@ describe('mcpApi', () => {
     expect(client.post).toHaveBeenNthCalledWith(1, '/mcp/servers/srv-1/test');
     expect(client.post).toHaveBeenNthCalledWith(2, '/mcp/import', { mcpServers: {} });
     expect(client.get).toHaveBeenCalledWith('/mcp/export');
+  });
+
+  it('导入响应规范化保留后端返回的安全停用状态和逐项错误', async () => {
+    client.post.mockResolvedValueOnce({ data: {
+      imported: 1,
+      servers: [{
+        id: 'personal-1',
+        name: '待修复连接',
+        source: 'personal',
+        status: 'published',
+        enabled: false,
+        tools_count: 0,
+      }],
+      errors: [{ name: '待修复连接', error: '连接失败' }],
+    } });
+
+    await expect(importMcpConfig({ mcpServers: {} })).resolves.toEqual({
+      imported: 1,
+      servers: [expect.objectContaining({
+        id: 'personal-1',
+        enabled: false,
+        tools_count: 0,
+      })],
+      errors: [{ name: '待修复连接', error: '连接失败' }],
+    });
   });
 
   it('管理员创建请求包含发布状态和网络边界', async () => {

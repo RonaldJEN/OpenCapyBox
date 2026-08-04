@@ -158,7 +158,7 @@ describe('ToolPermissionsPanel', () => {
   });
 
   it('批量遇到平台策略天花板时跳过并提示', async () => {
-    render(<ToolPermissionsPanel />);
+    const { rerender } = render(<ToolPermissionsPanel />);
 
     fireEvent.click(await screen.findByRole('button', { name: '来源 官方 MCP' }));
     const mcpRow = (await screen.findByText('mcp:server-1:search')).closest('section');
@@ -169,6 +169,9 @@ describe('ToolPermissionsPanel', () => {
 
     await waitFor(() => expect(screen.getByText(/均被平台策略限制/)).toBeInTheDocument());
     expect(setPermissionSelectionBatch).not.toHaveBeenCalled();
+
+    rerender(<ToolPermissionsPanel active={false} />);
+    await waitFor(() => expect(screen.queryByText(/均被平台策略限制/)).not.toBeInTheDocument());
   });
 
   it('版本绑定标签仅在命中的用户条件规则时显示', async () => {
@@ -269,5 +272,30 @@ describe('ToolPermissionsPanel', () => {
 
     expect(await screen.findByText('builtin:new_tool')).toBeInTheDocument();
     expect(getPermissionTools).toHaveBeenCalledTimes(2);
+  });
+
+  it('连接关闭刷新目录时清理已消失 MCP 工具的多选状态', async () => {
+    const { rerender } = render(<ToolPermissionsPanel refreshToken={0} />);
+    fireEvent.click(await screen.findByRole('button', { name: '来源 官方 MCP' }));
+    const mcpRow = (await screen.findByText('mcp:server-1:search')).closest('section');
+    fireEvent.click(within(mcpRow as HTMLElement).getByRole('button', {
+      name: '选择 mcp:server-1:search',
+    }));
+    expect(screen.getByText(/已选 1 项/)).toBeInTheDocument();
+
+    vi.mocked(getPermissionTools).mockResolvedValue([
+      makeTool(),
+      makeTool({
+        tool_ref: 'builtin:write_file',
+        tool_name: 'write_file',
+        title: 'write_file',
+      }),
+    ]);
+    rerender(<ToolPermissionsPanel refreshToken={1} />);
+
+    await waitFor(() => {
+      expect(screen.queryByText('mcp:server-1:search')).not.toBeInTheDocument();
+      expect(screen.queryByText(/已选 1 项/)).not.toBeInTheDocument();
+    });
   });
 });

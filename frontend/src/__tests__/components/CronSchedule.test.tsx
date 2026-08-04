@@ -585,7 +585,7 @@ describe('CronSchedule', () => {
     });
   });
 
-  it('保存失败时弹窗提示并渲染中文错误（body.content 长度超限）', async () => {
+  it('保存失败时仅在抽屉内渲染中文错误，不重复调用 window.alert', async () => {
     const { updateCronJob } = await import('../../services/configApi');
     const alertSpy = vi.spyOn(window, 'alert').mockImplementation(() => {});
     vi.mocked(updateCronJob).mockRejectedValueOnce({
@@ -626,10 +626,9 @@ describe('CronSchedule', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
     await waitFor(() => {
-      expect(alertSpy).toHaveBeenCalledTimes(1);
-      expect(alertSpy.mock.calls[0][0]).toContain('任务内容最多 8000 个字符');
       expect(screen.getByText(/任务内容最多 8000 个字符/)).toBeInTheDocument();
     });
+    expect(alertSpy).not.toHaveBeenCalled();
 
     fireEvent.change(screen.getByRole('textbox', { name: '任务内容' }), {
       target: { value: '修正后的任务内容' },

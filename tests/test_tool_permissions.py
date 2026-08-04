@@ -25,7 +25,12 @@ from src.agent.tools.mcp_tool import McpRemoteTool
 from src.api.models.database import Base
 from src.api.models.auth_user import AuthUser
 from src.api.models.database import get_db
-from src.api.models.mcp import McpInstallation, McpServer, McpToolSnapshot
+from src.api.models.mcp import (
+    McpInstallation,
+    McpServer,
+    McpToolSnapshot,
+    McpToolVisibility,
+)
 from src.api.models.tool_permission import (
     ToolApprovalRequest,
     ToolPermissionAudit,
@@ -37,6 +42,7 @@ from src.api.services.agent_service import AgentService
 from src.api.services.mcp_runtime import (
     EffectiveMcpInstallation,
     McpToolSnapshot as RuntimeMcpToolSnapshot,
+    resolve_effective_mcp_installation,
 )
 from src.api.services.secret_crypto import decrypt_secret
 from src.api.services.tool_permission_service import (
@@ -185,14 +191,23 @@ def permission_client():
             user_id="alice",
             enabled=True,
         )
-        db.add_all([server, installation, McpToolSnapshot(
+        snapshot = McpToolSnapshot(
             installation_id=installation.id,
             tool_name="CaseSensitiveTool",
             title="Case Sensitive Tool",
             description="Preserve the remote name exactly",
             input_schema_json="{}",
             schema_hash="schema-case",
-        )])
+        )
+        db.add_all([server, installation, snapshot])
+        db.flush()
+        effective = resolve_effective_mcp_installation(
+            db,
+            user_id="alice",
+            installation_id=installation.id,
+        )
+        assert effective is not None
+        snapshot.connection_fingerprint = effective.execution_fingerprint
         db.commit()
 
     app = FastAPI()
@@ -1141,6 +1156,17 @@ def test_permission_api_preserves_mcp_name_and_enforces_managed_ask_ceiling(
 def test_permission_inventory_hides_disabled_official_tools(
     permission_client: TestClient,
 ):
+    selected = permission_client.put(
+        "/permissions/rules/selection",
+        json={
+            "provider": "mcp",
+            "server_id": "server-case",
+            "tool_name": "CaseSensitiveTool",
+            "effect": "deny",
+        },
+    )
+    assert selected.status_code == 200, selected.text
+
     with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
         server = db.query(McpServer).filter(McpServer.id == "server-case").one()
         server.status = "disabled"
@@ -1162,6 +1188,177 @@ def test_permission_inventory_hides_disabled_official_tools(
         },
     )
     assert create.status_code == 404
+    rules_while_disabled = permission_client.get("/permissions/rules").json()["rules"]
+    assert any(rule["id"] == selected.json()["id"] for rule in rules_while_disabled)
+
+    with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        server = db.query(McpServer).filter(McpServer.id == "server-case").one()
+        server.status = "published"
+        db.commit()
+
+    restored = next(
+        item
+        for item in permission_client.get("/permissions/tools").json()["tools"]
+        if item["tool_ref"] == "mcp:server-case:CaseSensitiveTool"
+    )
+    assert restored["effect"] == "deny"
+    assert restored["matched_rule_id"] == selected.json()["id"]
+
+
+def test_permission_inventory_hides_disabled_connection_but_preserves_selection(
+    permission_client: TestClient,
+):
+    selected = permission_client.put(
+        "/permissions/rules/selection",
+        json={
+            "provider": "mcp",
+            "server_id": "server-case",
+            "tool_name": "CaseSensitiveTool",
+            "effect": "deny",
+        },
+    )
+    assert selected.status_code == 200, selected.text
+
+    with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        installation = db.query(McpInstallation).filter(
+            McpInstallation.id == "installation-case"
+        ).one()
+        installation.enabled = False
+        db.commit()
+
+    disabled_inventory = permission_client.get("/permissions/tools")
+    assert disabled_inventory.status_code == 200, disabled_inventory.text
+    assert all(
+        item["server_id"] != "server-case"
+        for item in disabled_inventory.json()["tools"]
+    )
+    rules_while_disabled = permission_client.get("/permissions/rules").json()["rules"]
+    assert any(rule["id"] == selected.json()["id"] for rule in rules_while_disabled)
+
+    with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        installation = db.query(McpInstallation).filter(
+            McpInstallation.id == "installation-case"
+        ).one()
+        installation.enabled = True
+        db.commit()
+
+    restored_inventory = permission_client.get("/permissions/tools")
+    restored = next(
+        item
+        for item in restored_inventory.json()["tools"]
+        if item["tool_ref"] == "mcp:server-case:CaseSensitiveTool"
+    )
+    assert restored["effect"] == "deny"
+    assert restored["matched_rule_id"] == selected.json()["id"]
+
+
+def test_permission_inventory_honors_mcp_tool_publication_policy(
+    permission_client: TestClient,
+):
+    selected = permission_client.put(
+        "/permissions/rules/selection",
+        json={
+            "provider": "mcp",
+            "server_id": "server-case",
+            "tool_name": "CaseSensitiveTool",
+            "effect": "deny",
+        },
+    )
+    assert selected.status_code == 200, selected.text
+
+    with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        db.add(McpToolVisibility(
+            installation_id="installation-case",
+            enabled_tools_json=None,
+            disabled_tools_json='["CaseSensitiveTool"]',
+            revision=1,
+        ))
+        db.commit()
+
+    hidden_inventory = permission_client.get("/permissions/tools")
+    assert hidden_inventory.status_code == 200, hidden_inventory.text
+    assert all(
+        item["tool_ref"] != "mcp:server-case:CaseSensitiveTool"
+        for item in hidden_inventory.json()["tools"]
+    )
+    rules_while_hidden = permission_client.get("/permissions/rules").json()["rules"]
+    assert any(rule["id"] == selected.json()["id"] for rule in rules_while_hidden)
+
+    with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        visibility = db.query(McpToolVisibility).filter(
+            McpToolVisibility.installation_id == "installation-case"
+        ).one()
+        visibility.disabled_tools_json = "[]"
+        visibility.enabled_tools_json = "[]"
+        db.commit()
+
+    allowlist_hidden_inventory = permission_client.get("/permissions/tools")
+    assert all(
+        item["tool_ref"] != "mcp:server-case:CaseSensitiveTool"
+        for item in allowlist_hidden_inventory.json()["tools"]
+    )
+
+    with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        visibility = db.query(McpToolVisibility).filter(
+            McpToolVisibility.installation_id == "installation-case"
+        ).one()
+        visibility.enabled_tools_json = None
+        db.commit()
+
+    restored_inventory = permission_client.get("/permissions/tools")
+    restored = next(
+        item
+        for item in restored_inventory.json()["tools"]
+        if item["tool_ref"] == "mcp:server-case:CaseSensitiveTool"
+    )
+    assert restored["effect"] == "deny"
+    assert restored["matched_rule_id"] == selected.json()["id"]
+
+
+def test_permission_inventory_hides_stale_mcp_snapshot(
+    permission_client: TestClient,
+):
+    with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        snapshot = db.query(McpToolSnapshot).filter(
+            McpToolSnapshot.installation_id == "installation-case"
+        ).one()
+        snapshot.connection_fingerprint = "stale-target"
+        db.commit()
+
+    inventory = permission_client.get("/permissions/tools")
+    assert inventory.status_code == 200, inventory.text
+    assert all(
+        item["tool_ref"] != "mcp:server-case:CaseSensitiveTool"
+        for item in inventory.json()["tools"]
+    )
+
+
+def test_permission_inventory_hides_required_mcp_with_configuration_error(
+    permission_client: TestClient,
+):
+    with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        server = db.query(McpServer).filter(McpServer.id == "server-case").one()
+        server.required = True
+        server.auth_type = "bearer"
+        effective = resolve_effective_mcp_installation(
+            db,
+            user_id="alice",
+            installation_id="installation-case",
+        )
+        assert effective is not None
+        assert effective.configuration_error is not None
+        snapshot = db.query(McpToolSnapshot).filter(
+            McpToolSnapshot.installation_id == "installation-case"
+        ).one()
+        snapshot.connection_fingerprint = effective.execution_fingerprint
+        db.commit()
+
+    inventory = permission_client.get("/permissions/tools")
+    assert inventory.status_code == 200, inventory.text
+    assert all(
+        item["tool_ref"] != "mcp:server-case:CaseSensitiveTool"
+        for item in inventory.json()["tools"]
+    )
 
 
 def test_permission_inventory_exposes_mcp_tool_search(
@@ -1194,6 +1391,12 @@ def test_permission_inventory_batches_policy_queries_and_truncates_descriptions(
     permission_client: TestClient,
 ):
     with permission_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        effective = resolve_effective_mcp_installation(
+            db,
+            user_id="alice",
+            installation_id="installation-case",
+        )
+        assert effective is not None
         for index in range(20):
             db.add(McpToolSnapshot(
                 installation_id="installation-case",
@@ -1202,6 +1405,7 @@ def test_permission_inventory_batches_policy_queries_and_truncates_descriptions(
                 description="界" * 2000,
                 input_schema_json="{}",
                 schema_hash=f"schema-{index}",
+                connection_fingerprint=effective.execution_fingerprint,
             ))
         db.commit()
 

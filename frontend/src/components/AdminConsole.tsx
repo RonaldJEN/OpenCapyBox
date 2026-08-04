@@ -68,6 +68,7 @@ import {
   type AdminUsersResponse,
 } from '../services/adminApi';
 import { extractBlobAwareErrorMessage, extractErrorMessage } from '../utils/errorMessages';
+import FeedbackMessage from './FeedbackMessage';
 import './AdminConsole.css';
 
 const LazyAdminMcpCatalogPanel = lazy(() => import('./AdminMcpCatalogPanel'));
@@ -499,6 +500,22 @@ export default function AdminConsole() {
     if (pendingAdminTab) adminMcpDiscardDialogRef.current?.focus();
   }, [pendingAdminTab]);
 
+  useEffect(() => {
+    if (activeTab !== 'rounds') {
+      setReviewError('');
+      setStepDetailError('');
+      setSessionRoundLoadError('');
+    }
+    if (activeTab !== 'users') {
+      setUserActionError('');
+      setUserActionMessage('');
+    }
+    if (activeTab !== 'sandboxes') {
+      setSandboxActionError('');
+      setSandboxActionMessage('');
+    }
+  }, [activeTab]);
+
   const cancelAdminTabChange = () => {
     setPendingAdminTab(null);
     adminMcpNavigationReturnFocusRef.current?.focus();
@@ -722,22 +739,6 @@ export default function AdminConsole() {
       });
     }
   }, []);
-
-  useEffect(() => {
-    if (!userActionMessage) return;
-    const timer = window.setTimeout(() => {
-      setUserActionMessage('');
-    }, 2400);
-    return () => window.clearTimeout(timer);
-  }, [userActionMessage]);
-
-  useEffect(() => {
-    if (!sandboxActionMessage) return;
-    const timer = window.setTimeout(() => {
-      setSandboxActionMessage('');
-    }, 2400);
-    return () => window.clearTimeout(timer);
-  }, [sandboxActionMessage]);
 
   const handleCreateUser = useCallback(async (values: UserCreateFormValues) => {
     return runUserAction('create-user', async () => {
@@ -1029,7 +1030,16 @@ export default function AdminConsole() {
         </div>
 
         <div className="admin-content">
-          {error ? <div className="admin-error">{error}</div> : null}
+          {error ? (
+            <FeedbackMessage
+              className="admin-error"
+              tone="error"
+              icon={<AlertTriangle size={14} />}
+              onDismiss={() => setError('')}
+            >
+              {error}
+            </FeedbackMessage>
+          ) : null}
           {loading ? <div className="admin-loading">加载中...</div> : null}
 
           {!loading && !error && activeTab === 'overview' && overview ? (
@@ -1053,6 +1063,9 @@ export default function AdminConsole() {
               reviewError={reviewError}
               stepDetailError={stepDetailError}
               sessionRoundLoadError={sessionRoundLoadError}
+              onDismissReviewError={() => setReviewError('')}
+              onDismissStepDetailError={() => setStepDetailError('')}
+              onDismissSessionRoundLoadError={() => setSessionRoundLoadError('')}
               onStatusChange={setRoundStatus}
               onSearchChange={setRoundSearch}
               onPageChange={setRoundPage}
@@ -1072,6 +1085,8 @@ export default function AdminConsole() {
               sandboxProfiles={sandboxProfiles?.profiles || []}
               actionError={userActionError}
               actionMessage={userActionMessage}
+              onDismissActionError={() => setUserActionError('')}
+              onDismissActionMessage={() => setUserActionMessage('')}
               updatingKeys={userUpdatingKeys}
               onCreateUser={handleCreateUser}
               onToggleEnabled={handleToggleUserEnabled}
@@ -1089,6 +1104,8 @@ export default function AdminConsole() {
               data={sandboxProfiles}
               actionError={sandboxActionError}
               actionMessage={sandboxActionMessage}
+              onDismissActionError={() => setSandboxActionError('')}
+              onDismissActionMessage={() => setSandboxActionMessage('')}
               updatingKeys={sandboxUpdatingKeys}
               onSaveProfile={handleSaveSandboxProfile}
               onSetDefault={handleSetSandboxProfileDefault}
@@ -1378,6 +1395,9 @@ function RoundsPanel({
   reviewError,
   stepDetailError,
   sessionRoundLoadError,
+  onDismissReviewError,
+  onDismissStepDetailError,
+  onDismissSessionRoundLoadError,
   onStatusChange,
   onSearchChange,
   onPageChange,
@@ -1397,6 +1417,9 @@ function RoundsPanel({
   reviewError: string;
   stepDetailError: string;
   sessionRoundLoadError: string;
+  onDismissReviewError: () => void;
+  onDismissStepDetailError: () => void;
+  onDismissSessionRoundLoadError: () => void;
   onStatusChange: (value: string) => void;
   onSearchChange: (value: string) => void;
   onPageChange: (value: number) => void;
@@ -1478,9 +1501,21 @@ function RoundsPanel({
         </div>
       </div>
       <div className="admin-table-wrap">
-        {reviewError ? <div className="admin-step-review-error">{reviewError}</div> : null}
-        {stepDetailError ? <div className="admin-step-review-error">{stepDetailError}</div> : null}
-        {sessionRoundLoadError ? <div className="admin-step-review-error">{sessionRoundLoadError}</div> : null}
+        {reviewError ? (
+          <FeedbackMessage className="admin-step-review-error" tone="error" onDismiss={onDismissReviewError}>
+            {reviewError}
+          </FeedbackMessage>
+        ) : null}
+        {stepDetailError ? (
+          <FeedbackMessage className="admin-step-review-error" tone="error" onDismiss={onDismissStepDetailError}>
+            {stepDetailError}
+          </FeedbackMessage>
+        ) : null}
+        {sessionRoundLoadError ? (
+          <FeedbackMessage className="admin-step-review-error" tone="error" onDismiss={onDismissSessionRoundLoadError}>
+            {sessionRoundLoadError}
+          </FeedbackMessage>
+        ) : null}
         <table className="admin-table">
           <thead>
             <tr>
@@ -1789,6 +1824,8 @@ function UsersPanel({
   sandboxProfiles,
   actionError,
   actionMessage,
+  onDismissActionError,
+  onDismissActionMessage,
   updatingKeys,
   onCreateUser,
   onToggleEnabled,
@@ -1803,6 +1840,8 @@ function UsersPanel({
   sandboxProfiles: AdminSandboxProfile[];
   actionError: string;
   actionMessage: string;
+  onDismissActionError: () => void;
+  onDismissActionMessage: () => void;
   updatingKeys: Record<string, boolean>;
   onCreateUser: (values: UserCreateFormValues) => Promise<boolean>;
   onToggleEnabled: (user: AdminUserItem) => Promise<void>;
@@ -1954,9 +1993,30 @@ function UsersPanel({
         <MetricCard label="运行中用户" value={formatNumber(data?.summary.running_total || 0)} hint="正在执行任务" />
       </div>
 
-      {actionError ? <div className="admin-error admin-inline-message">{actionError}</div> : null}
-      {actionMessage ? <div className="admin-toast" role="status">{actionMessage}</div> : null}
-      {exportUsersError ? <div className="admin-error admin-inline-message">{exportUsersError}</div> : null}
+      {actionError ? (
+        <FeedbackMessage className="admin-error admin-inline-message" tone="error" onDismiss={onDismissActionError}>
+          {actionError}
+        </FeedbackMessage>
+      ) : null}
+      {actionMessage ? (
+        <FeedbackMessage
+          className="admin-toast"
+          tone="success"
+          autoDismissMs={4000}
+          onDismiss={onDismissActionMessage}
+        >
+          {actionMessage}
+        </FeedbackMessage>
+      ) : null}
+      {exportUsersError ? (
+        <FeedbackMessage
+          className="admin-error admin-inline-message"
+          tone="error"
+          onDismiss={() => setExportUsersError('')}
+        >
+          {exportUsersError}
+        </FeedbackMessage>
+      ) : null}
 
       <div className="admin-card admin-users-card">
         <div className="admin-card-header">
@@ -2655,6 +2715,8 @@ function SandboxesPanel({
   data,
   actionError,
   actionMessage,
+  onDismissActionError,
+  onDismissActionMessage,
   updatingKeys,
   onSaveProfile,
   onSetDefault,
@@ -2663,6 +2725,8 @@ function SandboxesPanel({
   data: AdminSandboxProfilesResponse | null;
   actionError: string;
   actionMessage: string;
+  onDismissActionError: () => void;
+  onDismissActionMessage: () => void;
   updatingKeys: Record<string, boolean>;
   onSaveProfile: (profileId: string | null, payload: AdminSandboxProfilePayload) => Promise<boolean>;
   onSetDefault: (profile: AdminSandboxProfile) => Promise<void>;
@@ -2705,8 +2769,21 @@ function SandboxesPanel({
         <MetricCard label="需关注" value={formatNumber(profiles.filter((profile) => !profile.enabled).length)} hint="已禁用后端" />
       </div>
 
-      {actionError ? <div className="admin-error admin-inline-message">{actionError}</div> : null}
-      {actionMessage ? <div className="admin-toast" role="status">{actionMessage}</div> : null}
+      {actionError ? (
+        <FeedbackMessage className="admin-error admin-inline-message" tone="error" onDismiss={onDismissActionError}>
+          {actionError}
+        </FeedbackMessage>
+      ) : null}
+      {actionMessage ? (
+        <FeedbackMessage
+          className="admin-toast"
+          tone="success"
+          autoDismissMs={4000}
+          onDismiss={onDismissActionMessage}
+        >
+          {actionMessage}
+        </FeedbackMessage>
+      ) : null}
 
       <div className="admin-card">
         <div className="admin-card-header">

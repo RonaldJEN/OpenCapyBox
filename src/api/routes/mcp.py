@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session as DBSession
 from src.api.deps import get_current_user
 from src.api.models.database import get_db
 from src.api.schemas.mcp import (
+    McpActivationRequest,
     McpConnectionUpdate,
     McpImportRequest,
     McpImportResponse,
@@ -20,6 +21,7 @@ from src.api.schemas.mcp import (
     UserMcpServerPatch,
 )
 from src.api.services.mcp_service import (
+    activate_user_server,
     create_personal_server,
     delete_personal_server,
     export_personal_servers,
@@ -122,6 +124,18 @@ async def test_server(
     return result
 
 
+@router.post("/servers/{server_id}/activate", response_model=McpServerResponse)
+async def activate_server(
+    server_id: str,
+    payload: McpActivationRequest | None = None,
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    result = await activate_user_server(db, user_id, server_id, payload)
+    await _invalidate_user_agents(user_id)
+    return result
+
+
 @router.get("/servers/{server_id}/tools", response_model=McpToolListResponse)
 async def get_server_tools(
     server_id: str,
@@ -152,7 +166,7 @@ async def import_servers(
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    result = import_personal_servers(db, user_id, payload)
+    result = await import_personal_servers(db, user_id, payload)
     if result.get("imported", 0):
         await _invalidate_user_agents(user_id)
     return result

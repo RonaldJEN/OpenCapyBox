@@ -179,7 +179,6 @@ const TaskFormDrawer: React.FC<Props> = ({ task, onClose, onSaved }) => {
     } catch (e: unknown) {
       const message = normalizeSaveError(e);
       setError(message);
-      window.alert(message);
     } finally {
       setSubmitting(false);
     }

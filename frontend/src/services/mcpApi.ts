@@ -78,6 +78,8 @@ export interface McpConnectionPayload {
   clear_credential?: boolean;
 }
 
+export type McpActivationPayload = Omit<McpConnectionPayload, 'enabled'>;
+
 export interface McpTestResult {
   ok: boolean;
   tools_count: number;
@@ -224,6 +226,24 @@ function normalizeTestResult(value: unknown): McpTestResult {
   };
 }
 
+function normalizeImportResult(value: unknown): McpImportResult {
+  const raw = isRecord(value) ? value : {};
+  const errors = Array.isArray(raw.errors)
+    ? raw.errors.map((value) => {
+      const error = isRecord(value) ? value : {};
+      return {
+        name: stringValue(error.name),
+        error: stringValue(error.error, '导入失败'),
+      };
+    })
+    : [];
+  return {
+    imported: typeof raw.imported === 'number' ? raw.imported : 0,
+    errors,
+    servers: Array.isArray(raw.servers) ? raw.servers.map(normalizeServer) : [],
+  };
+}
+
 export async function getMcpServers(): Promise<McpServer[]> {
   const response = await client.get('/mcp/servers');
   return normalizeServerList(response.data);
@@ -257,6 +277,17 @@ export async function updateMcpConnection(
   return normalizeServer(response.data);
 }
 
+export async function activateMcpServer(
+  serverId: string,
+  payload?: McpActivationPayload,
+): Promise<McpServer> {
+  const path = `/mcp/servers/${encodeURIComponent(serverId)}/activate`;
+  const response = payload === undefined
+    ? await client.post(path)
+    : await client.post(path, payload);
+  return normalizeServer(response.data);
+}
+
 export async function testMcpServer(serverId: string): Promise<McpTestResult> {
   const response = await client.post(`/mcp/servers/${encodeURIComponent(serverId)}/test`);
   return normalizeTestResult(response.data);
@@ -283,8 +314,8 @@ export async function updateMcpToolVisibility(
 }
 
 export async function importMcpConfig(config: unknown): Promise<McpImportResult> {
-  const response = await client.post<McpImportResult>('/mcp/import', config);
-  return response.data;
+  const response = await client.post('/mcp/import', config);
+  return normalizeImportResult(response.data);
 }
 
 export async function exportMcpConfig(): Promise<unknown> {

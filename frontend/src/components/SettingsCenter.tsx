@@ -965,6 +965,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
                 )}
               >
                 <LazyMcpConnectionsPanel
+                  active={activeSection === 'connections'}
                   onDirtyChange={setMcpDirty}
                   onPermissionsInvalidated={() => setPermissionsRefreshToken((token) => token + 1)}
                 />
@@ -980,7 +981,10 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
                   </div>
                 )}
               >
-                <LazyToolPermissionsPanel refreshToken={permissionsRefreshToken} />
+                <LazyToolPermissionsPanel
+                  active={activeSection === 'permissions'}
+                  refreshToken={permissionsRefreshToken}
+                />
               </React.Suspense>
             </div>
           ) : null}

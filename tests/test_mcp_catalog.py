@@ -118,6 +118,29 @@ def _create_official(client: TestClient, **overrides):
     return response.json()
 
 
+def _activate(
+    client: TestClient,
+    server_id: str,
+    *,
+    credentials: dict | None = None,
+    tools: list[dict] | None = None,
+):
+    discovered = tools or [{
+        "name": "health",
+        "description": "Health check",
+        "inputSchema": {"type": "object"},
+    }]
+    request_kwargs = {"json": credentials} if credentials is not None else {}
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(return_value=(discovered, 3)),
+    ):
+        return client.post(
+            f"/mcp/servers/{server_id}/activate",
+            **request_kwargs,
+        )
+
+
 def _create_healthy_required_official(client: TestClient, **overrides):
     overrides.setdefault("auth_type", "none")
     overrides.setdefault("bearer_token", None)
@@ -654,6 +677,7 @@ def test_user_catalog_mutations_invalidate_existing_conversation_agents(
                     "imported-cache-invalidation": {
                         "type": "streamable-http",
                         "url": "https://93.184.216.35/mcp",
+                        "disabled": True,
                     }
                 }
             },
@@ -661,10 +685,7 @@ def test_user_catalog_mutations_invalidate_existing_conversation_agents(
         assert imported.status_code == 200, imported.text
         assert imported.json()["imported"] == 1
 
-        connected = mcp_client.put(
-            f"/mcp/servers/{official['id']}/connection",
-            json={"enabled": True},
-        )
+        connected = _activate(mcp_client, official["id"], tools=remote_tools)
         assert connected.status_code == 200, connected.text
 
         deleted = mcp_client.delete(f"/mcp/servers/{server_id}")
@@ -675,6 +696,62 @@ def test_user_catalog_mutations_invalidate_existing_conversation_agents(
         call.args == ("alice",) and call.kwargs == {}
         for call in pool.invalidate_user_async.await_args_list
     )
+
+
+def test_user_probe_discovers_tools_before_optional_connection_activation(
+    mcp_client: TestClient,
+):
+    official = _create_official(
+        mcp_client,
+        name="official-probe-before-enable",
+        auth_type="none",
+        bearer_token=None,
+    )
+    remote_tools = [{
+        "name": "search",
+        "title": "Search",
+        "description": "Search reports",
+        "inputSchema": {"type": "object"},
+    }]
+
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(return_value=(remote_tools, 5)),
+    ):
+        tested = mcp_client.post(f"/mcp/servers/{official['id']}/test")
+
+    assert tested.status_code == 200, tested.text
+    assert tested.json()["ok"] is True
+    assert tested.json()["tools_count"] == 1
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        installation = db.query(McpInstallation).filter(
+            McpInstallation.server_id == official["id"],
+            McpInstallation.user_id == "alice",
+        ).one()
+        assert installation.enabled is False
+        snapshot = db.query(McpToolSnapshot).filter(
+            McpToolSnapshot.installation_id == installation.id,
+        ).one()
+        assert snapshot.tool_name == "search"
+        assert snapshot.connection_fingerprint
+
+    connected = mcp_client.put(
+        f"/mcp/servers/{official['id']}/connection",
+        json={"enabled": True},
+    )
+    assert connected.status_code == 200, connected.text
+    assert connected.json()["enabled"] is True
+    assert connected.json()["tools_count"] == 1
+    assert connected.json()["enabled_tools_count"] == 1
+
+    repository = _SqlAlchemyMcpRepository(mcp_client.SessionLocal)  # type: ignore[attr-defined]
+    installation = next(
+        item
+        for item in repository.list_effective_installations("alice")
+        if item.server_id == official["id"]
+    )
+    snapshots = repository.load_tool_snapshots(installation)
+    assert [snapshot.raw_name for snapshot in snapshots] == ["search"]
 
 
 def test_user_catalog_redacts_platform_only_official_connection_details(
@@ -754,10 +831,10 @@ def test_official_user_override_exposes_only_users_own_header_names(
     )
     assert before["header_names"] == []
 
-    connected = mcp_client.put(
-        f"/mcp/servers/{official['id']}/connection",
-        json={
-            "enabled": True,
+    connected = _activate(
+        mcp_client,
+        official["id"],
+        credentials={
             "auth_type": "headers",
             "headers": {"X-User-Key": "alice-secret"},
         },
@@ -863,7 +940,7 @@ def test_personal_server_is_owner_scoped_and_public_https_only(mcp_client: TestC
     assert created.status_code == 201, created.text
     body = created.json()
     assert body["source"] == "personal"
-    assert body["enabled"] is True
+    assert body["enabled"] is False
     assert body["credential_set"] is True
     assert body["header_names"] == ["X-API-Key"]
     assert "alice-secret" not in created.text
@@ -912,6 +989,8 @@ def test_catalog_fingerprint_refresh_bucket_only_applies_with_effective_installa
         },
     )
     assert created.status_code == 201, created.text
+    activated = _activate(mcp_client, created.json()["id"])
+    assert activated.status_code == 200, activated.text
 
     now[0] = 10.0
     bucket_zero = repository.catalog_fingerprint("alice")
@@ -942,6 +1021,8 @@ def test_effective_installation_carries_configured_routing_description(
         },
     )
     assert created.status_code == 201, created.text
+    activated = _activate(mcp_client, created.json()["id"])
+    assert activated.status_code == 200, activated.text
 
     repository = _SqlAlchemyMcpRepository(
         mcp_client.SessionLocal,  # type: ignore[attr-defined]
@@ -960,10 +1041,10 @@ def test_official_connection_uses_user_secret_without_overwriting_platform_secre
     mcp_client: TestClient,
 ):
     official = _create_official(mcp_client)
-    connected = mcp_client.put(
-        f"/mcp/servers/{official['id']}/connection",
-        json={
-            "enabled": True,
+    connected = _activate(
+        mcp_client,
+        official["id"],
+        credentials={
             "auth_type": "bearer",
             "bearer_token": "alice-override-token",
         },
@@ -991,10 +1072,10 @@ def test_official_origin_change_drops_platform_and_all_user_credentials(
     mcp_client: TestClient,
 ):
     official = _create_official(mcp_client, name="origin-bound-secret")
-    connected = mcp_client.put(
-        f"/mcp/servers/{official['id']}/connection",
-        json={
-            "enabled": True,
+    connected = _activate(
+        mcp_client,
+        official["id"],
+        credentials={
             "auth_type": "bearer",
             "bearer_token": "alice-old-origin-token",
         },
@@ -1076,10 +1157,10 @@ def test_official_origin_change_clears_old_secrets_before_installing_new_platfor
     mcp_client: TestClient,
 ):
     official = _create_official(mcp_client, name="origin-rotated-secret")
-    connected = mcp_client.put(
-        f"/mcp/servers/{official['id']}/connection",
-        json={
-            "enabled": True,
+    connected = _activate(
+        mcp_client,
+        official["id"],
+        credentials={
             "auth_type": "bearer",
             "bearer_token": "alice-old-origin-token",
         },
@@ -1113,10 +1194,10 @@ def test_official_path_change_on_same_effective_origin_preserves_credentials(
     mcp_client: TestClient,
 ):
     official = _create_official(mcp_client, name="same-origin-path")
-    connected = mcp_client.put(
-        f"/mcp/servers/{official['id']}/connection",
-        json={
-            "enabled": True,
+    connected = _activate(
+        mcp_client,
+        official["id"],
+        credentials={
             "auth_type": "bearer",
             "bearer_token": "alice-same-origin-token",
         },
@@ -1251,12 +1332,9 @@ def test_user_probe_snapshot_writer_serializes_with_official_config_update(
         auth_type="none",
         bearer_token=None,
     )
-    connected = mcp_client.put(
-        f"/mcp/servers/{official['id']}/connection",
-        json={"enabled": True, "auth_type": "none"},
-    )
-    assert connected.status_code == 200, connected.text
     remote_tools = [{"name": "search", "inputSchema": {"type": "object"}}]
+    connected = _activate(mcp_client, official["id"], tools=remote_tools)
+    assert connected.status_code == 200, connected.text
     snapshot_writer_entered = Event()
     admin_server_lock_attempted = Event()
     release_snapshot_writer = Event()
@@ -1326,19 +1404,31 @@ def test_user_probe_snapshot_writer_serializes_with_official_config_update(
     }
     assert updated_official["url"] == "https://93.184.216.35/changed"
 
-    repository = _SqlAlchemyMcpRepository(mcp_client.SessionLocal)  # type: ignore[attr-defined]
-    current = next(
+    listed = next(
         item
-        for item in repository.list_effective_installations("alice")
-        if item.server_id == official["id"]
+        for item in mcp_client.get("/mcp/servers").json()["servers"]
+        if item["id"] == official["id"]
     )
+    assert listed["enabled"] is False
+    assert listed["tools_count"] == 0
     with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
         snapshot = db.query(McpToolSnapshot).one()
+        installation = db.query(McpInstallation).filter_by(
+            server_id=official["id"],
+            user_id="alice",
+        ).one()
+        server = db.query(McpServer).filter_by(id=official["id"]).one()
         # The admin edit is ordered after the probe commit.  Its new target
         # makes the earlier snapshot stale, so runtime will not execute it; the
         # important invariant is that the old writer cannot commit *after* the
         # new target and masquerade as a current discovery result.
-        assert snapshot.connection_fingerprint != current.execution_fingerprint
+        assert snapshot.connection_fingerprint != (
+            mcp_service_module._current_execution_fingerprint(
+                db,
+                server=server,
+                installation=installation,
+            )
+        )
 
 
 def test_user_probe_snapshot_failure_stamps_error_and_keeps_lock(mcp_client: TestClient):
@@ -1382,6 +1472,7 @@ def test_import_is_partial_and_export_omits_credentials(mcp_client: TestClient):
                     "type": "streamable-http",
                     "url": "https://93.184.216.34/mcp",
                     "headers": {"Authorization": "Bearer imported-secret"},
+                    "disabled": True,
                 },
                 "invalid": {
                     "type": "stdio",
@@ -1412,10 +1503,12 @@ def test_import_duplicate_does_not_poison_following_valid_entry(mcp_client: Test
                 "duplicate": {
                     "type": "streamable-http",
                     "url": "https://93.184.216.34/duplicate",
+                    "disabled": True,
                 },
                 "valid-after-duplicate": {
                     "type": "streamable-http",
                     "url": "https://93.184.216.34/valid",
+                    "disabled": True,
                 },
             }
         },
@@ -1442,6 +1535,7 @@ def test_import_item_is_atomic_when_visibility_write_fails(mcp_client: TestClien
                         "type": "streamable-http",
                         "url": "https://93.184.216.34/atomic",
                         "disabled_tools": ["blocked"],
+                        "disabled": True,
                     }
                 }
             },
@@ -1466,6 +1560,7 @@ def test_import_item_is_atomic_when_visibility_write_fails(mcp_client: TestClien
                 "atomic-item": {
                     "type": "streamable-http",
                     "url": "https://93.184.216.34/atomic",
+                    "disabled": True,
                 }
             }
         },
@@ -1489,8 +1584,8 @@ def test_personal_create_and_import_respect_total_server_quota(
         "/mcp/import",
         json={
             "mcpServers": {
-                "quota-two": {"type": "streamable-http", "url": "https://93.184.216.34/two"},
-                "quota-three": {"type": "streamable-http", "url": "https://93.184.216.34/three"},
+                "quota-two": {"type": "streamable-http", "url": "https://93.184.216.34/two", "disabled": True},
+                "quota-three": {"type": "streamable-http", "url": "https://93.184.216.34/three", "disabled": True},
             }
         },
     )
@@ -1524,12 +1619,14 @@ def test_import_export_round_trip_preserves_tool_publication_policy(
                 "policy-round-trip": {
                     "type": "streamable-http",
                     "url": "https://93.184.216.34/mcp",
+                    "disabled": True,
                     "enabled_tools": ["search", "futureWrite"],
                     "disabled_tools": ["delete", "futureDangerousTool"],
                 },
                 "publish-none": {
                     "type": "streamable-http",
                     "url": "https://93.184.216.34/none/mcp",
+                    "disabled": True,
                     "enabled_tools": [],
                 },
             }
@@ -1737,6 +1834,7 @@ def test_runtime_snapshot_replace_bumps_generation_only_on_identity_change(
         "/mcp/servers",
         json={"name": "runtime-refresh", "url": "https://93.184.216.34/mcp"},
     ).json()
+    assert _activate(mcp_client, created["id"]).status_code == 200
     repository = _SqlAlchemyMcpRepository(mcp_client.SessionLocal)  # type: ignore[attr-defined]
     installation = next(
         item
@@ -1821,6 +1919,7 @@ def test_runtime_snapshot_replace_rejects_stale_execution_target(
         "/mcp/servers",
         json={"name": "runtime-cas", "url": "https://93.184.216.34/v1"},
     ).json()
+    assert _activate(mcp_client, created["id"]).status_code == 200
     repository = _SqlAlchemyMcpRepository(mcp_client.SessionLocal)  # type: ignore[attr-defined]
     original = next(
         item
@@ -1833,6 +1932,7 @@ def test_runtime_snapshot_replace_rejects_stale_execution_target(
         json={"url": "https://93.184.216.34/v2"},
     )
     assert changed_response.status_code == 200, changed_response.text
+    assert _activate(mcp_client, created["id"]).status_code == 200
     current = next(
         item
         for item in repository.list_effective_installations("alice")
@@ -1996,18 +2096,12 @@ def test_per_installation_tool_visibility_for_personal_and_official_connections(
         auth_type="none",
         bearer_token=None,
     )
-    connected = mcp_client.put(
-        f"/mcp/servers/{official['id']}/connection",
-        json={"enabled": True, "auth_type": "none"},
-    )
-    assert connected.status_code == 200, connected.text
-
     with patch(
         "src.api.services.mcp_service.probe_mcp_server",
         new=AsyncMock(return_value=(remote_tools, 5)),
     ):
-        assert mcp_client.post(f"/mcp/servers/{personal['id']}/test").status_code == 200
-        assert mcp_client.post(f"/mcp/servers/{official['id']}/test").status_code == 200
+        assert mcp_client.post(f"/mcp/servers/{personal['id']}/activate").status_code == 200
+        assert mcp_client.post(f"/mcp/servers/{official['id']}/activate").status_code == 200
 
     repository = _SqlAlchemyMcpRepository(mcp_client.SessionLocal)  # type: ignore[attr-defined]
     before_fingerprint = repository.catalog_fingerprint("alice")
@@ -2315,10 +2409,10 @@ def test_existing_installation_locks_server_before_user_credential_write(
     event.listen(session_class, "do_orm_execute", capture_query)
     event.listen(session_class, "before_flush", capture_flush)
     try:
-        connected = mcp_client.put(
-            f"/mcp/servers/{official['id']}/connection",
-            json={
-                "enabled": True,
+        connected = _activate(
+            mcp_client,
+            official["id"],
+            credentials={
                 "auth_type": "bearer",
                 "bearer_token": "alice-origin-bound-token",
             },
@@ -2379,12 +2473,11 @@ def test_optional_connection_quota_excludes_required_official_servers(
         },
     )
     assert first.status_code == 201
+    first_activated = _activate(mcp_client, first.json()["id"])
+    assert first_activated.status_code == 200, first_activated.text
     assert second.status_code == 201
 
-    rejected = mcp_client.put(
-        f"/mcp/servers/{second.json()['id']}/connection",
-        json={"enabled": True},
-    )
+    rejected = _activate(mcp_client, second.json()["id"])
     assert rejected.status_code == 409
     assert "启用数量" in rejected.json()["detail"]
 
@@ -2410,10 +2503,7 @@ def test_disabled_optional_connection_keeps_its_quota_slot(
         auth_type="none",
         bearer_token=None,
     )
-    enabled = mcp_client.put(
-        f"/mcp/servers/{official['id']}/connection",
-        json={"enabled": True},
-    )
+    enabled = _activate(mcp_client, official["id"])
     assert enabled.status_code == 200, enabled.text
     assert mcp_client.patch(
         f"/admin/mcp/servers/{official['id']}",
@@ -2429,10 +2519,7 @@ def test_disabled_optional_connection_keeps_its_quota_slot(
         },
     )
     assert personal.status_code == 201, personal.text
-    rejected = mcp_client.put(
-        f"/mcp/servers/{personal.json()['id']}/connection",
-        json={"enabled": True},
-    )
+    rejected = _activate(mcp_client, personal.json()["id"])
     assert rejected.status_code == 409
     assert "启用数量" in rejected.json()["detail"]
 
@@ -2573,3 +2660,325 @@ def test_required_provisioning_rechecks_locked_server_state(
             McpInstallation.user_id == "alice",
         ).count() == 0
         db.rollback()
+
+
+def test_direct_enable_bypasses_require_current_discovery(
+    mcp_client: TestClient,
+):
+    rejected_create = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "unsafe-direct-create",
+            "url": "https://93.184.216.34/create",
+            "enabled": True,
+        },
+    )
+    assert rejected_create.status_code == 409
+    assert "激活接口" in rejected_create.json()["detail"]
+
+    staged = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "staged-direct-enable",
+            "url": "https://93.184.216.34/staged",
+        },
+    )
+    assert staged.status_code == 201, staged.text
+    assert staged.json()["enabled"] is False
+
+    for response in (
+        mcp_client.patch(
+            f"/mcp/servers/{staged.json()['id']}",
+            json={"enabled": True},
+        ),
+        mcp_client.put(
+            f"/mcp/servers/{staged.json()['id']}/connection",
+            json={"enabled": True},
+        ),
+    ):
+        assert response.status_code == 409, response.text
+        assert "激活接口" in response.json()["detail"]
+
+    current = next(
+        item
+        for item in mcp_client.get("/mcp/servers").json()["servers"]
+        if item["id"] == staged.json()["id"]
+    )
+    assert current["enabled"] is False
+    assert current["tools_count"] == 0
+
+
+def test_atomic_activation_rejects_config_drift_and_keeps_connection_disabled(
+    mcp_client: TestClient,
+):
+    staged = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "activation-drift",
+            "url": "https://93.184.216.34/original",
+        },
+    ).json()
+
+    async def probe_then_change(_server, _credential):
+        with mcp_client.SessionLocal() as other_db:  # type: ignore[attr-defined]
+            row = other_db.query(McpServer).filter(McpServer.id == staged["id"]).one()
+            row.url = "https://93.184.216.35/changed"
+            row.version = int(row.version or 0) + 1
+            other_db.commit()
+        return [{"name": "search", "inputSchema": {"type": "object"}}], 4
+
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(side_effect=probe_then_change),
+    ):
+        response = mcp_client.post(f"/mcp/servers/{staged['id']}/activate")
+
+    assert response.status_code == 409, response.text
+    assert "激活期间已变化" in response.json()["detail"]
+    current = next(
+        item
+        for item in mcp_client.get("/mcp/servers").json()["servers"]
+        if item["id"] == staged["id"]
+    )
+    assert current["enabled"] is False
+    assert current["tools_count"] == 0
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        assert db.query(McpToolSnapshot).count() == 0
+
+
+def test_atomic_activation_probe_failure_keeps_connection_disabled(
+    mcp_client: TestClient,
+):
+    staged = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "activation-offline",
+            "url": "https://93.184.216.34/offline",
+        },
+    ).json()
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(side_effect=ConnectionError("offline")),
+    ):
+        response = mcp_client.post(f"/mcp/servers/{staged['id']}/activate")
+
+    assert response.status_code == 409, response.text
+    assert "激活失败" in response.json()["detail"]
+    current = next(
+        item
+        for item in mcp_client.get("/mcp/servers").json()["servers"]
+        if item["id"] == staged["id"]
+    )
+    assert current["enabled"] is False
+    assert current["tools_count"] == 0
+
+
+def test_import_default_enabled_activates_atomically_and_reports_failure(
+    mcp_client: TestClient,
+):
+    remote_tools = [{
+        "name": "search",
+        "description": "Search",
+        "inputSchema": {"type": "object"},
+    }]
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(return_value=(remote_tools, 5)),
+    ):
+        successful = mcp_client.post(
+            "/mcp/import",
+            json={
+                "mcpServers": {
+                    "enabled-import": {
+                        "type": "streamable-http",
+                        "url": "https://93.184.216.34/import-ok",
+                    },
+                },
+            },
+        )
+    assert successful.status_code == 200, successful.text
+    assert successful.json()["imported"] == 1
+    assert successful.json()["errors"] == []
+    assert successful.json()["servers"][0]["enabled"] is True
+    assert successful.json()["servers"][0]["tools_count"] == 1
+
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(side_effect=ConnectionError("offline")),
+    ):
+        failed = mcp_client.post(
+            "/mcp/import",
+            json={
+                "mcpServers": {
+                    "failed-enabled-import": {
+                        "type": "streamable-http",
+                        "url": "https://93.184.216.35/import-fail",
+                    },
+                },
+            },
+        )
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["imported"] == 1
+    assert len(failed.json()["errors"]) == 1
+    assert failed.json()["errors"][0]["name"] == "failed-enabled-import"
+    assert "激活失败" in failed.json()["errors"][0]["error"]
+    assert failed.json()["servers"][0]["enabled"] is False
+    assert failed.json()["servers"][0]["tools_count"] == 0
+
+
+def test_stale_snapshot_is_hidden_from_server_counts_and_tool_list(
+    mcp_client: TestClient,
+):
+    staged = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "stale-listing",
+            "url": "https://93.184.216.34/current",
+        },
+    ).json()
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        installation = db.query(McpInstallation).filter_by(
+            server_id=staged["id"],
+            user_id="alice",
+        ).one()
+        db.add(McpToolSnapshot(
+            installation_id=installation.id,
+            tool_name="staleSearch",
+            title="Stale search",
+            description="Stale",
+            input_schema_json='{"type":"object"}',
+            schema_hash="a" * 64,
+            connection_fingerprint="stale-fingerprint",
+        ))
+        db.commit()
+
+    server = next(
+        item
+        for item in mcp_client.get("/mcp/servers").json()["servers"]
+        if item["id"] == staged["id"]
+    )
+    assert server["tools_count"] == 0
+    assert server["enabled_tools_count"] == 0
+    tools = mcp_client.get(f"/mcp/servers/{staged['id']}/tools")
+    assert tools.status_code == 200, tools.text
+    assert tools.json()["tools_count"] == 0
+    assert tools.json()["tools"] == []
+
+
+def test_undecryptable_credential_hides_current_snapshot_from_counts_and_tools(
+    mcp_client: TestClient,
+    monkeypatch,
+):
+    staged = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "rotated-key-snapshot",
+            "url": "https://93.184.216.34/rotated-key",
+            "auth_type": "bearer",
+            "bearer_token": "valid-before-rotation",
+        },
+    ).json()
+    remote_tools = [{
+        "name": "search",
+        "description": "Search",
+        "inputSchema": {"type": "object"},
+    }]
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(return_value=(remote_tools, 3)),
+    ):
+        tested = mcp_client.post(f"/mcp/servers/{staged['id']}/test")
+    assert tested.status_code == 200, tested.text
+    assert tested.json()["ok"] is True
+
+    # A disabled connection may still manage a valid current discovery.
+    before = next(
+        item
+        for item in mcp_client.get("/mcp/servers").json()["servers"]
+        if item["id"] == staged["id"]
+    )
+    assert before["enabled"] is False
+    assert before["tools_count"] == 1
+    assert mcp_client.get(
+        f"/mcp/servers/{staged['id']}/tools",
+    ).json()["tools_count"] == 1
+
+    # The encrypted bytes (and therefore execution fingerprint) are unchanged,
+    # but the rotated key can no longer decrypt them. Catalog management must
+    # fail closed exactly like runtime and permission inventory.
+    monkeypatch.setattr(
+        get_settings(),
+        "mcp_secret_key",
+        "rotated-test-key-that-is-deliberately-different-2026",
+    )
+    after = next(
+        item
+        for item in mcp_client.get("/mcp/servers").json()["servers"]
+        if item["id"] == staged["id"]
+    )
+    assert after["enabled"] is False
+    assert after["tools_count"] == 0
+    assert after["enabled_tools_count"] == 0
+    tools = mcp_client.get(f"/mcp/servers/{staged['id']}/tools")
+    assert tools.status_code == 200, tools.text
+    assert tools.json()["tools_count"] == 0
+    assert tools.json()["tools"] == []
+
+
+def test_required_connection_rotates_credentials_only_with_successful_activation(
+    mcp_client: TestClient,
+):
+    required = _create_healthy_required_official(
+        mcp_client,
+        name="required-atomic-credential",
+        auth_type="bearer",
+        bearer_token="platform-token",
+    )
+    # Materialize the required installation before rotating a user override.
+    assert next(
+        item
+        for item in mcp_client.get("/mcp/servers").json()["servers"]
+        if item["id"] == required["id"]
+    )["enabled"] is True
+
+    activated = _activate(
+        mcp_client,
+        required["id"],
+        credentials={
+            "auth_type": "bearer",
+            "bearer_token": "alice-tested-token",
+        },
+    )
+    assert activated.status_code == 200, activated.text
+    assert activated.json()["enabled"] is True
+    assert activated.json()["tools_count"] == 1
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        installation = db.query(McpInstallation).filter_by(
+            server_id=required["id"],
+            user_id="alice",
+        ).one()
+        credential_before = db.query(McpCredential).filter_by(
+            id=installation.credential_id,
+        ).one().encrypted_secret
+
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(side_effect=ConnectionError("offline")),
+    ):
+        failed = mcp_client.post(
+            f"/mcp/servers/{required['id']}/activate",
+            json={
+                "auth_type": "bearer",
+                "bearer_token": "must-not-persist",
+            },
+        )
+    assert failed.status_code == 409, failed.text
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        installation = db.query(McpInstallation).filter_by(
+            server_id=required["id"],
+            user_id="alice",
+        ).one()
+        assert installation.enabled is True
+        assert db.query(McpCredential).filter_by(
+            id=installation.credential_id,
+        ).one().encrypted_secret == credential_before
