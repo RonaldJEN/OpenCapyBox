@@ -2255,8 +2255,25 @@ class Agent:
             result_content = f"Error: {result.error}\n\nOutput:\n{result.content}"
         else:
             result_content = f"Error: {result.error}"
-        return truncate_tool_output(
+        return self._bound_tool_result_content(
+            function_name,
             result_content,
+            success=result.success,
+        )
+
+    def _bound_tool_result_content(
+        self,
+        function_name: str,
+        content: str,
+        *,
+        success: bool,
+    ) -> str:
+        """Apply the generic model-facing cap unless the tool owns strict bounds."""
+        tool = self.tools.get(function_name)
+        if success and getattr(tool, "manages_model_result_size", False):
+            return content
+        return truncate_tool_output(
+            content,
             self.tool_output_truncation_bytes,
         )
 
@@ -2304,9 +2321,10 @@ class Agent:
                 role="tool",
                 id=f"{record.tool_call_id}:result",
                 run_id=source_run_id,
-                content=truncate_tool_output(
+                content=self._bound_tool_result_content(
+                    record.function_name,
                     record.result_content,
-                    self.tool_output_truncation_bytes,
+                    success=record.result.success,
                 ),
                 tool_call_id=record.tool_call_id,
                 name=record.function_name,

@@ -57,9 +57,14 @@ class ToolExposure(str, Enum):
 class Tool:
     """Base class for all tools."""
 
-    # 工具結果的最大 token 數，超出部分會被 head+tail 截斷。
-    # 子類可覆蓋，例如 SandboxReadTool 設為 32000。
+    # Legacy per-tool token hint retained for compatibility with tool plugins.
+    # The Agent's current generic context cap is configured in UTF-8 bytes.
     max_result_tokens: int = 8000
+
+    # Set only when a built-in tool enforces a strict model-facing result bound
+    # itself.  Such tools must also make any omission/continuation semantics
+    # explicit, because the Agent's generic head+tail truncation is bypassed.
+    manages_model_result_size: bool = False
 
     # 单次 execute() 超时（秒）。None = 使用 Agent 全局默认值，0 = 不限时，>0 = 工具级覆盖。
     execute_timeout: int | None = None

@@ -9,12 +9,12 @@
 - SandboxEditTool: 在沙箱中編輯文件（字串替換）
 
 保留了原有的實用函式：
-- truncate_text_by_tokens: Token 截斷
 - BINARY_FORMAT_SKILLS: 二進位格式提示
 """
 
 import base64
 import difflib
+import hashlib
 import json
 import logging
 import posixpath
@@ -70,12 +70,13 @@ def _extract_stdout(result: Any) -> str:
 async def _sandbox_read_text(sandbox: Sandbox, path: str) -> str:
     """讀取沙箱中的文本文件（byte-exact 保真）。
 
-    設計原則：以 base64 命令為主路徑，確保空行、特殊字元完全保留。
-    SDK GET 端點作為快速路徑，內含長度校驗；校驗不通過則回退到主路徑。
+    設計原則：以帶長度及 SHA-256 校驗的 base64 命令為主路徑，確保
+    空行、特殊字元完全保留。SDK files API 作為回退；遠端 stat 可用時
+    必須通過 UTF-8 byte 長度校驗。
 
     層次:
-      1. base64 命令（主路徑，保真）
-      2. SDK files API（快速路徑，帶長度校驗）
+      1. base64 命令（主路徑，保真且可檢出 stdout 截斷）
+      2. SDK files API（回退路徑，盡可能做長度校驗）
     """
     last_error: Exception | None = None
 
@@ -83,16 +84,36 @@ async def _sandbox_read_text(sandbox: Sandbox, path: str) -> str:
     py_cmd = (
         "python3 -c "
         + shlex.quote(
-            "import base64,sys; "
+            "import base64,hashlib,json,sys; "
             f"data=open({path!r},'rb').read(); "
-            "sys.stdout.write(base64.b64encode(data).decode('ascii'))"
+            "sys.stdout.write(json.dumps({"
+            "'size':len(data),"
+            "'sha256':hashlib.sha256(data).hexdigest(),"
+            "'data':base64.b64encode(data).decode('ascii')"
+            "},separators=(',',':')))"
         )
     )
     try:
         result = await sandbox.commands.run(py_cmd)
         if _extract_exit_code(result) == 0:
-            b64_text = _extract_stdout(result).strip()
-            raw = base64.b64decode(b64_text, validate=False) if b64_text else b""
+            payload = json.loads(_extract_stdout(result).strip())
+            encoded = payload.get("data")
+            expected_size = payload.get("size")
+            expected_digest = payload.get("sha256")
+            if not isinstance(encoded, str):
+                raise ValueError("base64 read returned no data")
+            if not isinstance(expected_size, int) or expected_size < 0:
+                raise ValueError("base64 read returned an invalid size")
+            if not isinstance(expected_digest, str):
+                raise ValueError("base64 read returned no digest")
+            raw = base64.b64decode(encoded, validate=True)
+            if len(raw) != expected_size:
+                raise ValueError(
+                    f"base64 read size mismatch: got {len(raw)} bytes, expected {expected_size}"
+                )
+            actual_digest = hashlib.sha256(raw).hexdigest()
+            if actual_digest != expected_digest:
+                raise ValueError("base64 read digest mismatch")
             return raw.decode("utf-8")
     except Exception as exc:
         last_error = exc
@@ -104,32 +125,38 @@ async def _sandbox_read_text(sandbox: Sandbox, path: str) -> str:
         if callable(read_file):
             content = await read_file(path)
             text = content if isinstance(content, str) else str(content)
-            # 校驗：取遠端 stat 長度，不一致就丟棄
+            # 校驗：取遠端 stat 長度，不一致就丟棄。stat 本身不可用時
+            # 保留 SDK 回退能力，但不能吞掉已證實的長度不一致。
             try:
                 stat_result = await sandbox.commands.run(f"stat -c '%s' {shlex.quote(path)}")
-                if _extract_exit_code(stat_result) == 0:
-                    expected_size = int(_extract_stdout(stat_result).strip().strip("'"))
-                    if len(text.encode("utf-8")) == expected_size:
-                        return text
-                    logger.warning(
-                        "SDK read size mismatch for %s: got %d bytes, expected %d",
-                        path, len(text.encode("utf-8")), expected_size,
-                    )
-                    raise ValueError(
-                        f"SDK read size mismatch for {path}: "
-                        f"got {len(text.encode('utf-8'))} bytes, expected {expected_size}"
-                    )
-                else:
-                    # stat 失敗就信任 SDK 結果
-                    return text
-            except Exception:
+            except Exception as exc:
+                logger.debug("SDK stat failed for %s: %s", path, exc)
                 return text
+            if _extract_exit_code(stat_result) != 0:
+                return text
+            try:
+                expected_size = int(_extract_stdout(stat_result).strip().strip("'"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"SDK stat returned invalid size for {path}") from exc
+            actual_size = len(text.encode("utf-8"))
+            if actual_size != expected_size:
+                logger.warning(
+                    "SDK read size mismatch for %s: got %d bytes, expected %d",
+                    path,
+                    actual_size,
+                    expected_size,
+                )
+                raise ValueError(
+                    f"SDK read size mismatch for {path}: "
+                    f"got {actual_size} bytes, expected {expected_size}"
+                )
+            return text
     except Exception as exc:
         last_error = exc
         logger.debug("SDK read failed for %s: %s", path, exc)
 
     if last_error:
-        raise FileNotFoundError(f"File not found or unreadable: {path} — {last_error}") from last_error
+        raise RuntimeError(f"File unreadable: {path} — {last_error}") from last_error
 
     raise FileNotFoundError(f"File not found or unreadable: {path}")
 
@@ -159,9 +186,6 @@ async def _sync_agent_config_after_write(
         logger.warning("同步 Agent 配置文件到 DB 失败 (%s): %s", path, exc)
 
 
-from ..utils.token_utils import truncate_text_by_tokens
-
-
 # 二進位文件格式到對應 skill 的映射
 BINARY_FORMAT_SKILLS = {
     '.docx': ('docx', 'python skills/document-skills/docx/scripts/read_docx.py'),
@@ -179,6 +203,40 @@ IMAGE_MIME_TYPES = {
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
 }
+
+# Model-facing read windows are bounded before they leave the tool.  Keep these
+# limits independent from the Agent's generic tool-output truncation so a file
+# result is never silently changed from a complete range into a head/tail sample.
+READ_DEFAULT_LIMIT = 2000
+READ_MAX_LINE_LENGTH = 2000
+READ_MAX_BYTES = 50 * 1024
+
+
+def _truncate_read_line(line: str) -> tuple[str, bool]:
+    if len(line) <= READ_MAX_LINE_LENGTH:
+        return line, False
+    return (
+        f"{line[:READ_MAX_LINE_LENGTH]}... (line truncated to {READ_MAX_LINE_LENGTH} chars)",
+        True,
+    )
+
+
+def _normalize_read_integer(value: Any, name: str) -> tuple[int | None, str | None]:
+    """Normalize legacy numeric strings while rejecting non-integral windows."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, f"{name} must be a positive integer"
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError:
+            return None, f"{name} must be a positive integer"
+    if not isinstance(value, int) or value < 1:
+        return None, f"{name} must be a positive integer"
+    return value, None
+
+
 MAX_SINGLE_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 50 * 1024 * 1024
 
@@ -398,13 +456,12 @@ class SandboxReadTool(Tool):
 
     設計要點：
     1. 傳輸層：_sandbox_read_text 以 base64 命令為主路徑，byte-exact 保真。
-    2. 邊界標記：輸出同時包含 HEADER（開頭）和 FOOTER（結尾），
-       讓 LLM 明確辨認「內容已完整結束」。
+    2. 呈現層：按完整行建立有界窗口，並提供明確的續讀 offset。
+    3. 邊界標記：只有從首行讀到 EOF 且沒有行內截斷才標記 COMPLETE。
     """
 
     repeat_policy = "read_only"
-
-    max_result_tokens = 32000  # 保持現有 32K token 截斷行為
+    manages_model_result_size = True
 
     def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
         self._sandbox = sandbox
@@ -419,12 +476,19 @@ class SandboxReadTool(Tool):
         return (
             "Read text file contents from the sandbox filesystem (UTF-8). "
             "Cannot read binary files (.docx, .pdf, .xlsx) — use the corresponding skill. "
+            f"Each call returns at most {READ_DEFAULT_LIMIT} complete lines and about "
+            f"{READ_MAX_BYTES // 1024} KiB; individual lines are capped at "
+            f"{READ_MAX_LINE_LENGTH} characters. "
             "Output format:\n"
             "  === FILE: <path> | All N lines | COMPLETE ===\n"
             "  <numbered lines>\n"
             "  === END OF FILE ===\n"
+            "PARTIAL results always end with an exact `use offset=N to continue` marker. "
             "When you see BOTH the COMPLETE header AND the END OF FILE footer, "
-            "the content is fully included — do NOT re-read the same file."
+            "the entire file is included — do NOT re-read it. EOF + OMITTED means "
+            "the physical end was reached, but the call started after line 1 and/or a long "
+            "line was shortened. A LINE LIMIT marker is a per-line preview limit; re-reading "
+            "the same offset will not reveal the omitted tail."
         )
 
     @property
@@ -438,11 +502,16 @@ class SandboxReadTool(Tool):
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Starting line number (1-indexed). Use for large files to read from specific line",
+                    "minimum": 1,
+                    "description": "Starting line number (1-indexed). Defaults to 1",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Number of lines to read. Use with offset for large files to read in chunks",
+                    "minimum": 1,
+                    "maximum": READ_DEFAULT_LIMIT,
+                    "description": (
+                        f"Maximum number of lines to read. Defaults to and cannot exceed {READ_DEFAULT_LIMIT}"
+                    ),
                 },
             },
             "required": ["path"],
@@ -451,6 +520,22 @@ class SandboxReadTool(Tool):
     async def execute(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
         """讀取沙箱中的文件"""
         try:
+            # Validate before any sandbox I/O. Numeric strings remain accepted for
+            # compatibility with previously persisted/provider-generated calls.
+            normalized_offset, offset_error = _normalize_read_integer(offset, "offset")
+            if offset_error:
+                return ToolResult(success=False, error=offset_error)
+            normalized_limit, limit_error = _normalize_read_integer(limit, "limit")
+            if limit_error:
+                return ToolResult(success=False, error=limit_error)
+            if normalized_limit is not None and normalized_limit > READ_DEFAULT_LIMIT:
+                return ToolResult(
+                    success=False,
+                    error=f"limit must be less than or equal to {READ_DEFAULT_LIMIT}",
+                )
+
+            requested_offset = normalized_offset or 1
+            requested_limit = normalized_limit or READ_DEFAULT_LIMIT
             full_path = _resolve_workspace_path(path, self._workspace_dir)
 
             # 檢測二進位文件格式
@@ -471,51 +556,81 @@ class SandboxReadTool(Tool):
             # ---------- 從沙箱讀取 ----------
             content_str = await _sandbox_read_text(self._sandbox, full_path)
 
-            # 按行處理
+            # 按行處理。splitlines() 保持既有語義：檔尾換行不額外算一行。
             lines = content_str.splitlines()
 
-            # 應用 offset 和 limit
-            if offset is not None:
-                offset = int(offset) if isinstance(offset, str) else offset
-            if limit is not None:
-                limit = int(limit) if isinstance(limit, str) else limit
+            total_lines = len(lines)
+            if requested_offset > total_lines and not (total_lines == 0 and requested_offset == 1):
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"offset {requested_offset} is out of range for '{path}' "
+                        f"({total_lines} lines)"
+                    ),
+                )
 
-            start = (offset - 1) if offset else 0
-            end = (start + limit) if limit else len(lines)
-            if start < 0:
-                start = 0
-            if end > len(lines):
-                end = len(lines)
+            start = requested_offset - 1
+            requested_end = min(start + requested_limit, total_lines)
 
-            selected_lines = lines[start:end]
-
-            # 格式化行號
-            numbered_lines = []
-            for i, line in enumerate(selected_lines, start=start + 1):
-                line_content = line.rstrip("\n")
-                numbered_lines.append(f"{i:6d}|{line_content}")
+            # 只加入可完整容納的渲染行；不做會丟失中間內容的 head+tail 截斷。
+            numbered_lines: list[str] = []
+            body_bytes = 0
+            truncated_by_bytes = False
+            truncated_line = False
+            for line_index in range(start, requested_end):
+                line_content, line_was_truncated = _truncate_read_line(lines[line_index])
+                rendered_line = f"{line_index + 1:6d}|{line_content}"
+                rendered_bytes = len(rendered_line.encode("utf-8"))
+                separator_bytes = 1 if numbered_lines else 0
+                if body_bytes + separator_bytes + rendered_bytes > READ_MAX_BYTES:
+                    truncated_by_bytes = True
+                    break
+                numbered_lines.append(rendered_line)
+                body_bytes += separator_bytes + rendered_bytes
+                truncated_line = truncated_line or line_was_truncated
 
             body = "\n".join(numbered_lines)
 
             # ---------- HEADER + BODY + FOOTER ----------
-            total_lines = len(lines)
-            shown_start = start + 1
-            shown_end = min(start + len(selected_lines), total_lines)
-            is_complete = (shown_start == 1 and shown_end >= total_lines)
+            shown_start = requested_offset
+            shown_end = start + len(numbered_lines)
+            reached_eof = shown_end >= total_lines
+            has_more = not reached_eof
+            is_complete = requested_offset == 1 and reached_eof and not truncated_line
 
             if total_lines == 0:
                 header = f"=== FILE: {path} | All 0 lines | COMPLETE ==="
             elif is_complete:
                 header = f"=== FILE: {path} | All {total_lines} lines | COMPLETE ==="
+            elif has_more:
+                reasons = []
+                if truncated_by_bytes:
+                    reasons.append("BYTE LIMIT")
+                if truncated_line:
+                    reasons.append("LINE LIMIT")
+                reason = f" | {', '.join(reasons)}" if reasons else ""
+                header = (
+                    f"=== FILE: {path} | Lines {shown_start}-{shown_end} "
+                    f"of {total_lines} total | PARTIAL{reason} ==="
+                )
             else:
-                header = f"=== FILE: {path} | Lines {shown_start}-{shown_end} of {total_lines} total ==="
+                reasons = []
+                if requested_offset > 1:
+                    reasons.append("STARTED AT OFFSET")
+                if truncated_line:
+                    reasons.append("LINE LIMIT")
+                reason = f" | {' | '.join(reasons)}" if reasons else ""
+                header = (
+                    f"=== FILE: {path} | Lines {shown_start}-{shown_end} "
+                    f"of {total_lines} total | EOF | OMITTED{reason} ==="
+                )
 
-            footer = "=== END OF FILE ==="
+            if has_more:
+                footer = f"=== MORE: use offset={shown_end + 1} to continue ==="
+            else:
+                footer = "=== END OF FILE ==="
 
             content = f"{header}\n{body}\n{footer}"
-
-            # Token 截斷（仍保留 footer）
-            content = truncate_text_by_tokens(content, 32000)
 
             return ToolResult(success=True, content=content)
 

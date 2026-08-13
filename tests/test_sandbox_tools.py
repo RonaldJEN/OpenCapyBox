@@ -5,6 +5,7 @@
 """
 import asyncio
 import base64
+import hashlib
 import json
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -20,6 +21,9 @@ from src.agent.tools.sandbox_bash_tool import (
     _BackgroundCommandTracker,
 )
 from src.agent.tools.sandbox_file_tools import (
+    READ_DEFAULT_LIMIT,
+    READ_MAX_BYTES,
+    READ_MAX_LINE_LENGTH,
     SandboxReadTool,
     SandboxReadImageTool,
     SandboxWriteTool,
@@ -630,6 +634,10 @@ class TestSandboxReadTool:
         tool = SandboxReadTool(mock_sandbox)
         assert tool.name == "read_file"
         assert "path" in tool.parameters.get("properties", {})
+        assert tool.parameters["properties"]["offset"]["minimum"] == 1
+        assert tool.parameters["properties"]["limit"]["minimum"] == 1
+        assert tool.parameters["properties"]["limit"]["maximum"] == READ_DEFAULT_LIMIT
+        assert tool.manages_model_result_size is True
 
     @pytest.mark.asyncio
     async def test_read_binary_docx_quick_fix_preserves_exact_chinese_etf_path(self, mock_sandbox):
@@ -669,10 +677,14 @@ class TestSandboxReadTool:
         result = await tool.execute(path="test.txt", offset=5, limit=3)
 
         assert result.success is True
-        # 應該包含第 5-7 行的內容
-        assert "line5" in result.content or "line6" in result.content
-        # 驗證摘要顯示正確的行範圍（部分讀取）
-        assert "Lines 5-7 of 20 total ===" in result.content
+        assert "Lines 5-7 of 20 total | PARTIAL ===" in result.content
+        assert "     5|line5" in result.content
+        assert "     7|line7" in result.content
+        assert "     4|line4" not in result.content
+        assert "     8|line8" not in result.content
+        assert result.content.endswith("=== MORE: use offset=8 to continue ===")
+        assert "COMPLETE" not in result.content
+        assert "END OF FILE" not in result.content
 
     @pytest.mark.asyncio
     async def test_read_file_completeness_summary_full_file(self, mock_sandbox):
@@ -709,7 +721,127 @@ class TestSandboxReadTool:
         result = await tool.execute(path="big.txt", offset=10, limit=20)
 
         assert result.success is True
-        assert "Lines 10-29 of 100 total ===" in result.content
+        assert "Lines 10-29 of 100 total | PARTIAL ===" in result.content
+        assert result.content.endswith("=== MORE: use offset=30 to continue ===")
+
+    @pytest.mark.asyncio
+    async def test_read_file_default_line_limit_returns_exact_continuation(self, mock_sandbox):
+        lines = "\n".join(f"line{i}" for i in range(1, READ_DEFAULT_LIMIT + 2))
+        mock_sandbox.files.read_file = AsyncMock(return_value=lines)
+
+        result = await SandboxReadTool(mock_sandbox).execute(path="large.md")
+
+        assert result.success is True
+        assert (
+            f"Lines 1-{READ_DEFAULT_LIMIT} of {READ_DEFAULT_LIMIT + 1} total | PARTIAL ==="
+            in result.content
+        )
+        assert f"{READ_DEFAULT_LIMIT:6d}|line{READ_DEFAULT_LIMIT}" in result.content
+        assert f"{READ_DEFAULT_LIMIT + 1:6d}|line{READ_DEFAULT_LIMIT + 1}" not in result.content
+        assert result.content.endswith(
+            f"=== MORE: use offset={READ_DEFAULT_LIMIT + 1} to continue ==="
+        )
+        assert "COMPLETE" not in result.content
+
+    @pytest.mark.asyncio
+    async def test_read_file_cjk_byte_cap_stops_before_next_complete_line(self, mock_sandbox):
+        # Nine rendered CJK lines exceed 50 KiB, while eight fit. The ninth line
+        # must be wholly absent rather than appearing as a head/tail fragment.
+        cjk_line = "中" * 1900
+        content = "\n".join(f"row-{i}:{cjk_line}" for i in range(1, 11))
+        mock_sandbox.files.read_file = AsyncMock(return_value=content)
+
+        result = await SandboxReadTool(mock_sandbox).execute(path="rules.md")
+
+        assert result.success is True
+        assert "| PARTIAL | BYTE LIMIT ===" in result.content
+        assert "     8|row-8:" in result.content
+        assert "     9|row-9:" not in result.content
+        assert result.content.endswith("=== MORE: use offset=9 to continue ===")
+        assert "chars truncated" not in result.content
+        body = result.content.split("\n", 1)[1].rsplit("\n", 1)[0]
+        assert len(body.encode("utf-8")) <= READ_MAX_BYTES
+
+        continuation = await SandboxReadTool(mock_sandbox).execute(
+            path="rules.md",
+            offset=9,
+        )
+        assert continuation.success is True
+        assert "     8|row-8:" not in continuation.content
+        assert "     9|row-9:" in continuation.content
+        assert "    10|row-10:" in continuation.content
+        assert "EOF | OMITTED | STARTED AT OFFSET" in continuation.content
+        assert continuation.content.endswith("=== END OF FILE ===")
+
+    @pytest.mark.asyncio
+    async def test_read_file_truncates_one_long_line_without_claiming_complete(self, mock_sandbox):
+        content = "🙂" * (READ_MAX_LINE_LENGTH + 1) + "TAIL"
+        mock_sandbox.files.read_file = AsyncMock(return_value=content)
+
+        result = await SandboxReadTool(mock_sandbox).execute(path="one-line.md")
+
+        assert result.success is True
+        assert "| EOF | OMITTED | LINE LIMIT ===" in result.content
+        assert f"line truncated to {READ_MAX_LINE_LENGTH} chars" in result.content
+        assert "TAIL" not in result.content
+        assert "\ufffd" not in result.content
+        assert "COMPLETE" not in result.content
+        assert result.content.endswith("=== END OF FILE ===")
+
+    @pytest.mark.asyncio
+    async def test_read_file_tail_window_reaches_eof_without_claiming_whole_file(self, mock_sandbox):
+        mock_sandbox.files.read_file = AsyncMock(return_value="one\ntwo\nthree")
+
+        result = await SandboxReadTool(mock_sandbox).execute(
+            path="tail.md",
+            offset=2,
+            limit=2,
+        )
+
+        assert result.success is True
+        assert "Lines 2-3 of 3 total | EOF | OMITTED | STARTED AT OFFSET ===" in result.content
+        assert "COMPLETE" not in result.content
+        assert result.content.endswith("=== END OF FILE ===")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("offset", "limit", "error"),
+        [
+            (0, None, "offset must be a positive integer"),
+            (1.5, None, "offset must be a positive integer"),
+            (None, 0, "limit must be a positive integer"),
+            (None, READ_DEFAULT_LIMIT + 1, f"limit must be less than or equal to {READ_DEFAULT_LIMIT}"),
+            (4, None, "offset 4 is out of range"),
+        ],
+    )
+    async def test_read_file_rejects_invalid_windows(self, mock_sandbox, offset, limit, error):
+        mock_sandbox.files.read_file = AsyncMock(return_value="one\ntwo\nthree")
+
+        result = await SandboxReadTool(mock_sandbox).execute(
+            path="small.md",
+            offset=offset,
+            limit=limit,
+        )
+
+        assert result.success is False
+        assert error in (result.error or "")
+        if offset != 4:
+            mock_sandbox.commands.run.assert_not_awaited()
+            mock_sandbox.files.read_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_read_file_accepts_legacy_numeric_string_window(self, mock_sandbox):
+        mock_sandbox.files.read_file = AsyncMock(return_value="one\ntwo\nthree")
+
+        result = await SandboxReadTool(mock_sandbox).execute(
+            path="small.md",
+            offset="2",
+            limit="1",
+        )
+
+        assert result.success is True
+        assert "Lines 2-2 of 3 total | PARTIAL ===" in result.content
+        assert result.content.endswith("=== MORE: use offset=3 to continue ===")
 
     @pytest.mark.asyncio
     async def test_read_file_header_before_content(self, mock_sandbox):
@@ -779,8 +911,15 @@ class TestSandboxReadTool:
         execution = MagicMock(spec=[])
         execution.error = None
         execution.logs = MagicMock()
+        raw = "line-1\n\nline-3\n".encode("utf-8")
         line = MagicMock()
-        line.text = base64.b64encode("line-1\n\nline-3\n".encode("utf-8")).decode("ascii")
+        line.text = json.dumps(
+            {
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "data": base64.b64encode(raw).decode("ascii"),
+            }
+        )
         execution.logs.stdout = [line]
         mock_sandbox.commands.run = AsyncMock(return_value=execution)
 
@@ -806,8 +945,15 @@ class TestSandboxReadTool:
         execution = MagicMock(spec=[])
         execution.error = None
         execution.logs = MagicMock()
-        execution.logs.stdout = []
-        execution.stdout = ""
+        line = MagicMock()
+        line.text = json.dumps(
+            {
+                "size": 0,
+                "sha256": hashlib.sha256(b"").hexdigest(),
+                "data": "",
+            }
+        )
+        execution.logs.stdout = [line]
         mock_sandbox.commands.run = AsyncMock(return_value=execution)
 
         tool = SandboxReadTool(mock_sandbox)
@@ -816,6 +962,47 @@ class TestSandboxReadTool:
         assert result.success is True
         assert "=== FILE: /home/user/empty.txt | All 0 lines | COMPLETE ===" in result.content
         assert "=== END OF FILE ===" in result.content
+
+    @pytest.mark.asyncio
+    async def test_read_file_rejects_truncated_base64_and_sdk_size_mismatch(self, mock_sandbox):
+        full = b"abcdef"
+        truncated_payload = json.dumps(
+            {
+                "size": len(full),
+                "sha256": hashlib.sha256(full).hexdigest(),
+                "data": base64.b64encode(full[:3]).decode("ascii"),
+            }
+        )
+        mock_sandbox.commands.run = AsyncMock(
+            side_effect=[
+                make_fake_execution(stdout_text=truncated_payload),
+                make_fake_execution(stdout_text=str(len(full))),
+            ]
+        )
+        mock_sandbox.files.read_file = AsyncMock(return_value="abc")
+
+        result = await SandboxReadTool(mock_sandbox).execute(path="truncated.md")
+
+        assert result.success is False
+        assert "size mismatch" in (result.error or "")
+        assert "COMPLETE" not in result.content
+
+    @pytest.mark.asyncio
+    async def test_read_file_rejects_successful_stat_with_invalid_size(self, mock_sandbox):
+        invalid_payload = "{truncated-json"
+        mock_sandbox.commands.run = AsyncMock(
+            side_effect=[
+                make_fake_execution(stdout_text=invalid_payload),
+                make_fake_execution(stdout_text="not-a-size"),
+            ]
+        )
+        mock_sandbox.files.read_file = AsyncMock(return_value="possibly truncated")
+
+        result = await SandboxReadTool(mock_sandbox).execute(path="invalid-stat.md")
+
+        assert result.success is False
+        assert "stat returned invalid size" in (result.error or "")
+        assert "COMPLETE" not in result.content
 
 
 class TestSandboxReadImageTool:

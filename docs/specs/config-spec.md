@@ -19,7 +19,7 @@
 | `agent_history_strategy` | `checkpoint_v1` | 默认使用累计替代 checkpoint；`legacy_120` 仅作回滚 |
 | `agent_max_history_messages` | `120` | 只在 legacy 策略生效；默认策略不得按消息条数裁剪 |
 
-模型级 `auto_compact_token_limit` 可覆盖自动压缩阈值，但不得超过 `(context_window - max_tokens) * 80%`；未配置时直接使用该值。模型级 `tool_output_truncation_bytes` 必须大于 0，默认 10,000 bytes；工具结果写入历史时使用 1.2 倍序列化余量并保留 UTF-8 首尾。压缩请求使用完整规范化历史和固定 Codex prompt；replacement 固定为不超过 20,000 近似 token 的最新真实 user 原文，加一条 role=user 的 synthetic summary。不存在首轮锚点、摘要格式校验、文件证据回灌、工具批次保护、单项 10k-token ceiling、确定性摘要或熔断。
+模型级 `auto_compact_token_limit` 可覆盖自动压缩阈值，但不得超过 `(context_window - max_tokens) * 80%`；未配置时直接使用该值。模型级 `tool_output_truncation_bytes` 必须大于 0，默认 10,000 bytes；通用工具结果写入历史时使用 1.2 倍序列化余量并保留 UTF-8 首尾。内建工具只有在自行严格限制模型可见结果、明确标记遗漏并提供续读语义时，成功结果才可跳过该通用 head+tail 截断；失败结果始终受通用上限保护。压缩请求使用完整规范化历史和固定 Codex prompt；replacement 固定为不超过 20,000 近似 token 的最新真实 user 原文，加一条 role=user 的 synthetic summary。不存在首轮锚点、摘要格式校验、文件证据回灌、工具批次保护、单项 10k-token ceiling、确定性摘要或熔断。
 
 `user_skill_inventory_snapshots` 每用户至多一行，保存 sandbox/Profile 代际、仅含可用 Skill 元数据的 `inventory_json`、逐项隔离诊断 `issues_json`、revision 与扫描开始时间。两份 JSON 必须属于同一次扫描并在同一事务中原子发布。无行表示从未成功完整扫描；`inventory_json=[]` 可表示目录确实为空，也可表示全部候选均损坏，此时由 `issues_json` 区分。Skill 正文和启停状态不得写入该快照。沙箱文件仍是用户 Skill 的事实源，DB 只服务于快速清单读取。
 
@@ -35,7 +35,7 @@
 
 | 工具类 | 名称 | 用途 |
 |---|---|---|
-| SandboxReadTool | read_file | 读沙箱文件（带 token 截断）|
+| SandboxReadTool | read_file | 按完整行分页读取沙箱文件（默认/最多 2000 行、约 50 KiB、单行 2000 字符）|
 | SandboxWriteTool | write_file | 写/创建沙箱文件 |
 | SandboxEditTool | edit_file | 字符串替换编辑 |
 | SandboxBashTool | bash | 执行命令（前台/后台）|

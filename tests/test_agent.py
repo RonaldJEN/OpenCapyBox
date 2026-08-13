@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from src.agent.agent import Agent, Colors
 from src.agent.logger import AgentLogger
 from src.agent.tools.base import Tool, ToolResult
-from src.agent.schema import Message, LLMResponse
+from src.agent.schema import FunctionCall, Message, LLMResponse, ToolCall
 from tests.helpers import MockLLMClient, MockTool
 
 
@@ -217,6 +217,108 @@ class TestAgent:
         assert "Error: CommandExecError: 1" in content
         assert "Output:" in content
         assert "Invalid column name ChiName" in content
+
+    @pytest.mark.asyncio
+    async def test_size_managed_tool_result_bypasses_generic_truncation_end_to_end(self, tmp_path):
+        bounded_content = "BEGIN\n" + ("中" * 1000) + "\nEND"
+
+        class BoundedReadTool(MockTool):
+            manages_model_result_size = True
+
+            def __init__(self):
+                super().__init__(name="read_file")
+
+            async def execute(self, **kwargs) -> ToolResult:
+                self.execute_count += 1
+                self.last_args = kwargs
+                return ToolResult(success=True, content=bounded_content)
+
+        class CapturingTwoStepLLM(MockLLMClient):
+            def __init__(self):
+                super().__init__()
+                self.requests = []
+
+            async def generate_stream(
+                self,
+                messages,
+                tools=None,
+                on_content=None,
+                on_thinking=None,
+                on_tool_call=None,
+            ):
+                self.requests.append([message.model_copy(deep=True) for message in messages])
+                if len(self.requests) == 1:
+                    return LLMResponse(
+                        content="",
+                        finish_reason="tool_calls",
+                        tool_calls=[
+                            ToolCall(
+                                id="read-long-md",
+                                type="function",
+                                function=FunctionCall(
+                                    name="read_file",
+                                    arguments={"param1": "rules.md"},
+                                ),
+                            )
+                        ],
+                    )
+                if on_content:
+                    await on_content("done")
+                return LLMResponse(content="done", finish_reason="stop")
+
+        llm = CapturingTwoStepLLM()
+        agent = Agent(
+            llm_client=llm,
+            system_prompt="Test",
+            tools=[BoundedReadTool()],
+            workspace_dir=str(tmp_path / "workspace"),
+            tool_output_truncation_bytes=100,
+        )
+        agent.add_user_message("read it")
+
+        [event async for event in agent.run_agui("thread-1", "run-1")]
+
+        assert len(llm.requests) == 2
+        tool_messages = [message for message in llm.requests[1] if message.role == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0].content == bounded_content
+        assert "chars truncated" not in tool_messages[0].content
+        stored_tool_messages = [message for message in agent.messages if message.role == "tool"]
+        assert stored_tool_messages[-1].content == bounded_content
+
+    def test_generic_tool_result_still_uses_model_byte_cap(self, agent):
+        agent.tool_output_truncation_bytes = 100
+        content = "x" * 1000
+
+        bounded = agent._tool_result_content(
+            "mock_tool",
+            ToolResult(success=True, content=content),
+        )
+
+        assert bounded != content
+        assert "chars truncated" in bounded
+
+    def test_size_managed_tool_failure_still_uses_model_byte_cap(self, tmp_path):
+        class BoundedReadTool(MockTool):
+            manages_model_result_size = True
+
+            def __init__(self):
+                super().__init__(name="read_file")
+
+        agent = Agent(
+            llm_client=MockLLMClient(),
+            system_prompt="Test",
+            tools=[BoundedReadTool()],
+            workspace_dir=str(tmp_path / "workspace"),
+            tool_output_truncation_bytes=100,
+        )
+
+        bounded = agent._tool_result_content(
+            "read_file",
+            ToolResult(success=False, content="x" * 1000, error="failed"),
+        )
+
+        assert "chars truncated" in bounded
 
     def test_record_failed_tool_result_logs_detail_content(self, agent):
         """失败工具日志调用不应丢弃 result.content。"""
