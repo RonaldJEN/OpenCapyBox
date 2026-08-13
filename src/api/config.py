@@ -208,7 +208,10 @@ class Settings(BaseSettings):
 
     # Agent 配置
     agent_max_steps: int = 100
-    agent_max_history_messages: int = 120  # 歷史消息注入上限（條數，含 user/assistant/tool），超出時只保留最近 N 條
+    # legacy_120 only: the checkpoint strategy is token-budgeted and never
+    # slices provider history by message count.
+    agent_max_history_messages: int = 120
+    agent_history_strategy: str = "checkpoint_v1"
     agent_tool_timeout: int = 300  # 单次工具执行超时（秒），0 表示不限
     agent_subagent_max_parallel: int = 3  # 同一父 Agent step 内最多并行执行的 sub_agent 数；1 表示串行
     agent_user_concurrency_limit: int = 1  # 同一用户允许同时运行的不同会话数，至少为 1
@@ -304,6 +307,14 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("cron_dispatch_catch_up_max_minutes must be > 0")
         return value
+
+    @field_validator("agent_history_strategy")
+    @classmethod
+    def validate_agent_history_strategy(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"legacy_120", "checkpoint_v1"}:
+            raise ValueError("agent_history_strategy must be legacy_120 or checkpoint_v1")
+        return normalized
 
     @field_validator("mcp_test_timeout_seconds")
     @classmethod

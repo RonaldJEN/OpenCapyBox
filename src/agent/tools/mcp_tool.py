@@ -70,6 +70,21 @@ class McpRemoteTool(Tool):
     def annotations(self) -> dict[str, Any]:
         return dict(self._snapshot.annotations)
 
+    def repeat_policy_for(self, arguments: dict[str, Any]) -> str:
+        """Translate MCP side-effect hints into runtime retry semantics.
+
+        MCP annotations are untrusted hints, so they may tighten but never
+        relax the default.  In particular, ``readOnlyHint=True`` is not enough
+        to grant read-only retry semantics.  An explicit non-read-only or
+        destructive declaration does justify exactly-once protection.
+        """
+        annotations = self.annotations
+        if annotations.get("destructiveHint") is True:
+            return "mutating"
+        if "readOnlyHint" in annotations and annotations.get("readOnlyHint") is False:
+            return "mutating"
+        return "standard"
+
     @property
     def source(self) -> str:
         return self._snapshot.source

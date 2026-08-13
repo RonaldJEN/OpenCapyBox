@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, AsyncIterator, Any
 
 from opensandbox import Sandbox
+from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.utils.timezone import now_naive
@@ -31,6 +32,7 @@ from src.agent.schema.run_context import (
 from src.api.services.history_service import HistoryService
 from src.api.services.agui_event_bus import SequencedAGUIEvent, StoredEvent, get_agui_event_bus
 from src.api.services.run_completion_service import RunCompletionService
+from src.api.services.context_checkpoint_service import ContextCheckpointService
 from src.api.services.sandbox_service import get_sandbox_service
 from src.api.services.subagent_graph_service import get_subagent_graph_service
 from src.api.services.tool_factory import create_agent_tools
@@ -51,6 +53,10 @@ class DuplicateRoundError(Exception):
     def __init__(self, existing_round_id: str):
         self.existing_round_id = existing_round_id
         super().__init__(f"Duplicate round: {existing_round_id}")
+
+
+class _InvalidCheckpointSourceError(RuntimeError):
+    """The checkpoint cursor cannot be located in authoritative main history."""
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,8 @@ class AgentService:
         system_prompt_override: str | None = None,
         workspace_dir: str | None = None,
         allow_human_interrupts: bool = True,
+        restore_history: bool = True,
+        persist_context_checkpoint: bool = True,
     ):
         self.sandbox = sandbox
         self.history_service = history_service
@@ -143,6 +151,8 @@ class AgentService:
         self.tool_exclude = set(tool_exclude or set())
         self.system_prompt_override = system_prompt_override
         self.allow_human_interrupts = allow_human_interrupts
+        self.restore_history = restore_history
+        self.persist_context_checkpoint = persist_context_checkpoint
         self.agent: Agent | None = None
         self._last_saved_index = 0
         self._pending_interrupt_round_ids: dict[str, str] = {}
@@ -151,6 +161,8 @@ class AgentService:
         self.mcp_catalog_configuration_fingerprint: str | None = None
         self.mcp_catalog_retry_required = False
         self.cancel_token: asyncio.Event | None = None  # per-run 取消令牌
+        self._active_checkpoint_id: str | None = None
+        self._active_checkpoint_sha256: str | None = None
         self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
         self._active_run_count = 0
         # 每個 session 使用沙箱內的隔離子目錄
@@ -362,10 +374,14 @@ class AgentService:
             deferred_tool_catalog_is_current=deferred_tool_catalog_is_current,
             user_id=self.user_id,
             allow_human_interrupts=self.allow_human_interrupts,
+            auto_compact_token_limit=getattr(model_config, "auto_compact_token_limit", None),
+            tool_output_truncation_bytes=getattr(model_config, "tool_output_truncation_bytes", 10000),
+            supports_image=bool(getattr(model_config, "supports_image", False)),
+            supports_video=bool(getattr(model_config, "supports_video", False)),
         )
 
-        # 从数据库恢复历史
-        self._restore_history()
+        if self.restore_history:
+            self._restore_history()
 
     @staticmethod
     def _is_fallback_model_compatible(primary_config, fallback_config) -> bool:
@@ -561,6 +577,8 @@ class AgentService:
                 tool_exclude=set(profile.tool_exclude),
                 system_prompt_override=profile.system_prompt,
                 allow_human_interrupts=False,
+                restore_history=False,
+                persist_context_checkpoint=False,
             )
             await child_service.initialize_agent()
             child_service.cancel_token = context.cancel_token
@@ -571,7 +589,6 @@ class AgentService:
             # Subagents are sidechains: they get their own task prompt, not the
             # full parent conversation replay. Their transcript is persisted via
             # the child Round and graph edge.
-            child_service.agent.messages = [child_service.agent.messages[0]]
             child_user_message = self._format_subagent_user_message(
                 prompt=prompt,
                 subagent_type=subagent_type,
@@ -687,9 +704,9 @@ class AgentService:
         self.history_service.close()
 
     def _load_system_prompt(self) -> str:
-        """从 DB 记忆文件组装 
-        SOUL.md / 平台 AGENTS.md 模板已包含全部指令（身份、工具规则、记忆管理等），
-        仅当 DB 中无任何记忆文件时，使用极简 fallback。
+        """从 DB 用户配置和平台 AGENTS.md 模板组装 system prompt。
+
+        MEMORY.md 在两阶段记忆管道完成前不注入。
         """
         memory_context = self._build_memory_context()
         if memory_context:
@@ -701,7 +718,8 @@ class AgentService:
         """为新用户写入默认注入文件模板（幂等）
 
         检查 DB 中是否存在用户记忆文件，如果不存在则从 docs/ 模板写入默认值。
-        包括：SOUL.md, MEMORY.md, USER.md(PROFILE)。AGENTS.md 由平台模板直接注入。
+        初始化：SOUL.md, MEMORY.md, USER.md(PROFILE)。AGENTS.md 由平台模板直接注入。
+        其中 MEMORY.md 仅持久化，不在止血阶段注入 system prompt。
         """
         try:
             from src.api.services.memory_service import MemoryService
@@ -719,11 +737,11 @@ class AgentService:
     def _build_memory_context(self) -> str:
         """组装 system prompt 前缀。
 
-        SOUL/USER/MEMORY 来自用户 DB；AGENTS.md 始终来自平台模板。
+        SOUL/USER 来自用户 DB；AGENTS.md 始终来自平台模板。
+        MEMORY.md 暂时仅保留在 DB/沙箱，不拼接到 system prompt。
         """
         try:
             from src.api.services.memory_service import MemoryService
-            import tiktoken
 
             db = self.history_service.db
             mem_svc = MemoryService(db)
@@ -733,42 +751,22 @@ class AgentService:
             if not all_files and not agents.strip():
                 return ""
 
-            try:
-                encoding = tiktoken.get_encoding("cl100k_base")
-                count_tokens = lambda t: len(encoding.encode(t))
-            except Exception:
-                count_tokens = lambda t: int(len(t) / 2.5)
-
-            max_memory_tokens = int(self._token_limit * 0.15)
-
             parts: list[str] = []
-            used_tokens = 0
 
-            # 高优先级（必须注入）
             soul = all_files.get("soul_md", "")
             if soul:
                 parts.append(f"## Agent 人格\n{soul}\n")
-                used_tokens += count_tokens(soul)
 
             user = all_files.get("user_md", "")
             if user:
                 parts.append(f"## 用户画像\n{user}\n")
-                used_tokens += count_tokens(user)
 
             if agents:
                 parts.append(f"## 行为规则\n{agents}\n")
-                used_tokens += count_tokens(agents)
 
-            # 低优先级（按剩余 budget 截断）
-            memory_budget = max(0, max_memory_tokens - used_tokens)
-
-            memory = all_files.get("memory_md", "")
-            if memory and memory_budget > 0:
-                half_budget = memory_budget // 2
-                truncated = self._truncate_to_tokens(memory, half_budget, count_tokens)
-                if truncated:
-                    parts.append(f"## 长期记忆\n{truncated}\n")
-                    memory_budget -= count_tokens(truncated)
+            # TEMPORARY SAFETY STOP: canonical MEMORY.md is deliberately not
+            # prompt-loaded. The future read path will inject only a bounded
+            # consolidated summary and retrieve scoped memory blocks on demand.
 
             if not parts:
                 return ""
@@ -799,22 +797,56 @@ class AgentService:
     def _build_restored_history_messages(self) -> list[AgentMessage]:
         """从 DB 权威历史构建本轮 Agent runtime messages。
 
-        从 rounds / conversation_messages / agui_events / interrupt_resolutions 重建
-        LLM 消息数组，并在存在摘要锚点时按裁剪规则注入。
-
-        注意：為防止歷史消息過多導致模型 context 膨脹（特別是 tool calling 能力較弱的模型），
-        會限制最多注入 agent_max_history_messages 條消息，超出時只保留最近的消息。
+        默认优先恢复最新 v4 replacement，并从精确游标回放未覆盖 suffix；
+        没有可用 v4 checkpoint 时从 rounds / conversation_messages /
+        agui_events / interrupt_resolutions 重建完整权威历史。消息条数裁剪仅属于
+        legacy_120 回滚策略。
         """
         from src.api.config import get_settings as _get_settings
 
-        # 從 agui_events 重建完整消息列表（含 tool_calls 和 tool results）
-        messages = self._rebuild_messages_from_events()
-        summary_anchor = self._load_latest_summary_anchor()
+        strategy = _get_settings().agent_history_strategy
+        if strategy == "checkpoint_v1":
+            checkpoint = ContextCheckpointService(self.history_service.db).load_latest(
+                self.session_id,
+            )
+            if checkpoint is not None:
+                try:
+                    tail = self._rebuild_messages_after_checkpoint(checkpoint)
+                except _InvalidCheckpointSourceError as exc:
+                    logger.warning(
+                        "累计上下文 checkpoint 游标无效，忽略整个 replacement 并从权威历史重建: "
+                        "checkpoint=%s session=%s error=%s",
+                        checkpoint.checkpoint_id,
+                        self.session_id,
+                        exc,
+                    )
+                else:
+                    self._active_checkpoint_id = checkpoint.checkpoint_id
+                    self._active_checkpoint_sha256 = None
+                    logger.info(
+                        "命中累计上下文 checkpoint: generation=%d replacement=%d tail=%d session=%s",
+                        checkpoint.generation,
+                        len(checkpoint.messages),
+                        len(tail),
+                        self.session_id,
+                    )
+                    return [
+                        *[message.model_copy(deep=True) for message in checkpoint.messages],
+                        *tail,
+                    ]
 
-        if not messages and not summary_anchor:
+        self._active_checkpoint_id = None
+        self._active_checkpoint_sha256 = None
+        messages = self._rebuild_messages_from_events()
+        if strategy == "checkpoint_v1":
+            # Migration path: rebuild the complete authoritative history once;
+            # Agent token projection will compact it before the provider call
+            # and persist the first cumulative replacement checkpoint.
+            return messages
+        if not messages:
             return []
 
-        # 限制歷史消息數量
+        # legacy fallback only: the checkpoint strategy never slices by count.
         max_msgs = _get_settings().agent_max_history_messages
         if messages and len(messages) > max_msgs:
             start_idx = len(messages) - max_msgs
@@ -856,11 +888,67 @@ class AgentService:
             )
             messages = trimmed
 
-        if summary_anchor and not self._has_summary_anchor(messages, summary_anchor.content):
-            messages = [summary_anchor] + messages
-            logger.info("歷史恢復注入摘要錨點 (session=%s)", self.session_id)
-
         return messages
+
+    def _rebuild_messages_after_checkpoint(self, checkpoint) -> list[AgentMessage]:
+        """Replay the uncovered suffix of a valid checkpoint source.
+
+        An empty list is a valid result meaning that the checkpoint covers all
+        authoritative history.  An invalid or unresolvable source raises
+        ``_InvalidCheckpointSourceError`` so the caller can discard the whole
+        replacement instead of accidentally appending a full-history fallback.
+        """
+        from src.api.models.agui_event import AGUIEventLog
+        from src.api.models.conversation_message import ConversationMessage
+
+        source_round_id = checkpoint.source_round_id
+        if not source_round_id:
+            raise _InvalidCheckpointSourceError("checkpoint has no source_round_id")
+
+        user_rows = (
+            self.history_service.db.query(ConversationMessage)
+            .filter(
+                ConversationMessage.session_id == self.session_id,
+                ConversationMessage.round_id == source_round_id,
+                ConversationMessage.sequence > checkpoint.source_message_sequence,
+                ConversationMessage.role == "user",
+            )
+            .order_by(ConversationMessage.sequence)
+            .all()
+        )
+        synthetic_contents: list[Any] = []
+        source_suffix: list[AgentMessage] = []
+        for row in user_rows:
+            try:
+                content = json.loads(row.content)
+            except (TypeError, json.JSONDecodeError):
+                content = row.content
+            if bool(row.is_synthetic):
+                synthetic_contents.append(content)
+            else:
+                source_suffix.append(AgentMessage(
+                    role="user",
+                    id=f"{source_round_id}:user:{row.sequence}",
+                    run_id=source_round_id,
+                    content=content,
+                ))
+
+        events = (
+            self.history_service.db.query(AGUIEventLog)
+            .filter(
+                AGUIEventLog.run_id == source_round_id,
+                AGUIEventLog.sequence > checkpoint.source_event_sequence,
+            )
+            .order_by(AGUIEventLog.sequence)
+            .all()
+        )
+        source_suffix.extend(self._events_to_messages(
+            events,
+            round_id=source_round_id,
+            synthetic_user_contents=synthetic_contents,
+        ))
+        later = self._rebuild_messages_from_events(after_round_id=source_round_id)
+        return [*source_suffix, *later]
 
     def _refresh_runtime_messages_from_history(self) -> None:
         """用 DB 历史替换本进程 Agent runtime messages，保留 system prompt。"""
@@ -875,6 +963,10 @@ class AgentService:
         self.agent.messages = system_messages + restored_messages
         self.agent._cached_token_count = 0
         self.agent._cached_message_count = 0
+        if hasattr(self.agent, "_active_context_tokens"):
+            self.agent._active_context_tokens = self.agent._estimate_messages_tokens(
+                self.agent.messages
+            )
 
         logger.info(
             "已刷新 Agent runtime messages: history=%d total=%d (session=%s)",
@@ -886,11 +978,16 @@ class AgentService:
         """从 conversation_messages 表恢复对话历史。"""
         self._refresh_runtime_messages_from_history()
 
-    def _rebuild_messages_from_events(self) -> list[AgentMessage]:
+    def _rebuild_messages_from_events(self, *, after_round_id: str | None = None) -> list[AgentMessage]:
         """從 agui_events + conversation_messages 重建完整的 LLM messages 數組。
 
         conversation_messages 提供 user 消息（含多模態內容），
         agui_events 提供 assistant + tool 交互（單一事實源，無數據重複）。
+
+        When ``after_round_id`` is provided it must resolve to an authoritative
+        main-chat Round.  A missing cursor raises ``_InvalidCheckpointSourceError``;
+        silently returning the full history would make the caller concatenate a
+        checkpoint replacement with duplicate authoritative history.
 
         Returns:
             按時序排列的 AgentMessage 列表
@@ -907,10 +1004,14 @@ class AgentService:
         rounds = (
             db.query(Round)
             .filter(Round.session_id == self.session_id)
-            .order_by(Round.created_at)
+            .order_by(Round.created_at, Round.id)
             .all()
         )
         if not rounds:
+            if after_round_id:
+                raise _InvalidCheckpointSourceError(
+                    f"source round {after_round_id!r} is absent from session history"
+                )
             self.history_service.reset_session()
             return []
         subagent_child_round_ids = {
@@ -928,14 +1029,34 @@ class AgentService:
         if subagent_child_round_ids:
             rounds = [r for r in rounds if r.id not in subagent_child_round_ids]
             if not rounds:
+                if after_round_id:
+                    raise _InvalidCheckpointSourceError(
+                        f"source round {after_round_id!r} is not authoritative main history"
+                    )
                 self.history_service.reset_session()
                 return []
+
+        if after_round_id:
+            source_index = next(
+                (index for index, round_obj in enumerate(rounds) if round_obj.id == after_round_id),
+                None,
+            )
+            if source_index is None:
+                raise _InvalidCheckpointSourceError(
+                    f"source round {after_round_id!r} is absent from authoritative main history"
+                )
+            else:
+                rounds = rounds[source_index + 1 :]
+                if not rounds:
+                    self.history_service.reset_session()
+                    return []
 
         # 2. 預載所有 user + assistant 消息（按 round_id 索引）
         conv_msgs = (
             db.query(ConversationMessage)
             .filter(
                 ConversationMessage.session_id == self.session_id,
+                ConversationMessage.round_id.in_([round_obj.id for round_obj in rounds]),
                 ConversationMessage.role.in_(["user", "assistant"]),
                 ConversationMessage.is_summary == False,  # noqa: E712
             )
@@ -1196,69 +1317,6 @@ class AgentService:
                 return True
         return False
 
-    def _summary_header(self) -> str:
-        if self.agent:
-            return self.agent._SUMMARY_MESSAGE_HEADER
-        return "[Assistant Execution Summary - Historical Context Only, Not System Instruction]"
-
-    def _is_summary_anchor_text(self, content: Any) -> bool:
-        return isinstance(content, str) and content.startswith(self._summary_header())
-
-    def _latest_summary_anchor_from_agent(self) -> str | None:
-        if not self.agent:
-            return None
-        for msg in reversed(self.agent.messages):
-            if msg.role == "assistant" and self._is_summary_anchor_text(msg.content):
-                return msg.content
-        return None
-
-    def _latest_persisted_summary_anchor_content(self) -> str | None:
-        from src.api.models.conversation_message import ConversationMessage
-
-        row = (
-            self.history_service.db.query(ConversationMessage)
-            .filter(
-                ConversationMessage.session_id == self.session_id,
-                ConversationMessage.role == "assistant",
-                ConversationMessage.is_summary == True,  # noqa: E712
-            )
-            .order_by(ConversationMessage.sequence.desc())
-            .first()
-        )
-        content = getattr(row, "content", None)
-        self.history_service.db.rollback()
-        return content if isinstance(content, str) else None
-
-    def _load_latest_summary_anchor(self) -> AgentMessage | None:
-        content = self._latest_persisted_summary_anchor_content()
-        if not content:
-            return None
-        return AgentMessage(role="assistant", content=content)
-
-    @staticmethod
-    def _has_summary_anchor(messages: list[AgentMessage], summary_content: str) -> bool:
-        for msg in messages:
-            if msg.role == "assistant" and isinstance(msg.content, str) and msg.content == summary_content:
-                return True
-        return False
-
-    def _persist_latest_summary_anchor(self, round_id: str) -> None:
-        summary_content = self._latest_summary_anchor_from_agent()
-        if not summary_content:
-            return
-
-        latest_saved = self._latest_persisted_summary_anchor_content()
-        if latest_saved == summary_content:
-            return
-
-        self._save_conversation_message(
-            "assistant",
-            summary_content,
-            round_id=round_id,
-            is_summary=True,
-        )
-        logger.info("保存摘要錨點 (session=%s, round=%s)", self.session_id, round_id)
-
     @staticmethod
     def _events_to_messages(
         events,
@@ -1286,12 +1344,16 @@ class AgentService:
             if step_text or step_tool_calls:
                 messages.append(AgentMessage(
                     role="assistant",
+                    id=f"{round_id}:assistant:{len(messages) + 1}" if round_id else None,
+                    run_id=round_id,
                     content=step_text,
                     tool_calls=step_tool_calls if step_tool_calls else None,
                 ))
             for tr in step_tool_results:
                 messages.append(AgentMessage(
                     role="tool",
+                    id=f"{tr['tool_call_id']}:result",
+                    run_id=round_id,
                     content=tr["content"],
                     tool_call_id=tr["tool_call_id"],
                     name=tr["name"],
@@ -2367,7 +2429,23 @@ class AgentService:
                             tool_call_id,
                             fallback_reason,
                         )
-                        self.agent.add_user_message(resume_user_message)
+                        add_user_parameters = inspect.signature(
+                            self.agent.add_user_message
+                        ).parameters
+                        if "message_id" in add_user_parameters:
+                            self.agent.add_user_message(
+                                resume_user_message,
+                                message_id=f"{run_id}:user",
+                                run_id=run_id,
+                            )
+                        else:
+                            self.agent.add_user_message(resume_user_message)
+                            last_message = (
+                                getattr(self.agent, "messages", None) or [None]
+                            )[-1]
+                            if isinstance(last_message, AgentMessage):
+                                last_message.id = f"{run_id}:user"
+                                last_message.run_id = run_id
 
                 # 原子创建 resume round，并只将命中的旧 round 标记为 resumed。
                 self.history_service.create_resume_round(
@@ -2431,7 +2509,7 @@ class AgentService:
         accumulated_content = ""
         _interrupt_json: str | None = None
         _dirty_memory = False
-        _memory_write_tools = {"record_memory", "update_long_term_memory", "update_user"}
+        _memory_write_tools = {"update_long_term_memory", "update_user"}
         _memory_filenames = {"USER.md", "MEMORY.md", "SOUL.md"}
         _file_op_tracking: set[str] = set()
         _round_finished = False  # 追蹤 round 是否已正常完成
@@ -2470,6 +2548,9 @@ class AgentService:
                     compaction_summary_reused_count=payload.get("compaction_summary_reused_count"),
                     compaction_summary_quality_repair_count=payload.get("compaction_summary_quality_repair_count"),
                     compaction_emergency_truncate_dropped_rounds=payload.get("compaction_emergency_truncate_dropped_rounds"),
+                    history_strategy=get_settings().agent_history_strategy,
+                    checkpoint_id=payload.get("checkpoint_id") or self._active_checkpoint_id,
+                    call_kind=str(payload.get("call_kind") or "agent_step"),
                 )
             except SQLAlchemyError:
                 self.history_service.reset_session()
@@ -2480,7 +2561,66 @@ class AgentService:
                     exc_info=True,
                 )
 
+        async def _persist_compaction(payload: dict[str, Any]) -> str | None:
+            if not self.persist_context_checkpoint:
+                return None
+            from src.api.models.agui_event import AGUIEventLog
+            from src.api.models.conversation_message import ConversationMessage
+
+            source_run_ids = [
+                str(value)
+                for value in payload.get("source_run_ids", [])
+                if value
+            ]
+            source_round_id = source_run_ids[-1] if source_run_ids else None
+            message_sequence = 0
+            if source_run_ids:
+                message_sequence = int(
+                    self.history_service.db.query(
+                        func.coalesce(func.max(ConversationMessage.sequence), 0)
+                    )
+                    .filter(
+                        ConversationMessage.session_id == self.session_id,
+                        ConversationMessage.round_id.in_(source_run_ids),
+                    )
+                    .scalar()
+                    or 0
+                )
+            event_sequence = 0
+            if source_round_id:
+                event_sequence = int(
+                    self.history_service.db.query(
+                        func.coalesce(func.max(AGUIEventLog.sequence), 0)
+                    )
+                    .filter(AGUIEventLog.run_id == source_round_id)
+                    .scalar()
+                    or 0
+                )
+            loaded = ContextCheckpointService(self.history_service.db).save(
+                session_id=self.session_id,
+                source_round_id=source_round_id,
+                source_message_sequence=message_sequence,
+                source_event_sequence=event_sequence,
+                trigger_phase=str(payload.get("phase") or "pre_turn"),
+                summary=str(payload.get("summary") or ""),
+                messages=list(payload["replacement_messages"]),
+                source_token_count=payload.get("source_token_count"),
+                replacement_token_count=payload.get("replacement_token_count"),
+            )
+            self._active_checkpoint_id = loaded.checkpoint_id
+            self._active_checkpoint_sha256 = None
+            logger.info(
+                "Persisted Codex compacted history immediately: generation=%d phase=%s session=%s",
+                loaded.generation,
+                loaded.trigger_phase,
+                self.session_id,
+            )
+            return loaded.checkpoint_id
+
         self.agent.set_llm_call_hook(_record_llm_call)
+        compaction_hook_setter = getattr(self.agent, "set_compaction_persist_hook", None)
+        if callable(compaction_hook_setter):
+            compaction_hook_setter(_persist_compaction)
 
         try:
             run_agui_kwargs = {
@@ -2674,8 +2814,6 @@ class AgentService:
                 )
                 _round_finished = True
             if status == "completed" and not bool(run_cancel_token and run_cancel_token.is_set()):
-                self._persist_latest_summary_anchor(run_id)
-
                 task = asyncio.create_task(
                     self._post_round_tasks(
                         sync_memory=_dirty_memory,
@@ -2719,6 +2857,8 @@ class AgentService:
                 except Exception:
                     logger.error("Round %s 異常退出後無法更新 DB", run_id, exc_info=True)
             self.agent.set_llm_call_hook(None)
+            if callable(compaction_hook_setter):
+                compaction_hook_setter(None)
             self._active_run_count = max(0, self._active_run_count - 1)
             current_run_context.reset(run_context_token)
 
@@ -2729,19 +2869,13 @@ class AgentService:
         user_message: str = "",
         assistant_response: str | None = None,
     ):
-        """Round 结束后的异步后台任务"""
-        flushed_by_silent_mode = False
+        """Round 结束后的异步后台任务。
 
-        # 静默记忆刷新
-        try:
-            flushed_by_silent_mode = await self.agent.maybe_flush_memory_silent(
-                session_id=self.session_id,
-            )
-        except Exception as e:
-            logger.warning("后台记忆刷新异常: %s", e)
-
-        # 将沙箱记忆文件同步回 DB 并重建 embedding
-        if sync_memory or flushed_by_silent_mode is True:
+        仅同步本轮已明确发生的记忆文件写入。旧的 token
+        阈值静默刷新已移除。后续候选提炼必须在 durable run lock
+        释放后由持久化 idle job 执行，且不得直接写 canonical Memory。
+        """
+        if sync_memory:
             await self._sync_memory_to_db()
 
         # 自动索引对话内容到 memory_embeddings（确保 search_memory 可检索）

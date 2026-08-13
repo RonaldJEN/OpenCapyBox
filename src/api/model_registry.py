@@ -134,6 +134,8 @@ class ModelConfig:
     model_name: str
     max_tokens: int = 16384          # 單次輸出上限（output tokens）
     context_window: int = 128000     # 模型總上下文窗口大小（input + output tokens）
+    auto_compact_token_limit: int | None = None
+    tool_output_truncation_bytes: int = 10000
     reasoning_format: str = "none"
     reasoning_split: bool = False
     enable_thinking: bool = False
@@ -164,11 +166,15 @@ class ModelConfig:
             raise ValueError(
                 f"模型 '{self.id}' 的 context_window 必須 > 0，got {self.context_window}"
             )
-        if self.context_window <= self.max_tokens:
+        if self.max_tokens >= self.context_window:
             raise ValueError(
                 f"模型 '{self.id}' 的 context_window ({self.context_window}) "
-                f"必須 > max_tokens ({self.max_tokens})"
+                f"必須大於 max_tokens ({self.max_tokens})"
             )
+        if self.auto_compact_token_limit is not None and self.auto_compact_token_limit <= 0:
+            raise ValueError("auto_compact_token_limit must be > 0 when configured")
+        if self.tool_output_truncation_bytes <= 0:
+            raise ValueError("tool_output_truncation_bytes must be > 0")
         if self.max_images < 0:
             raise ValueError(
                 f"模型 '{self.id}' 的 max_images 不能為負數，got {self.max_images}"
@@ -204,12 +210,11 @@ class ModelConfig:
         return resolved
 
     def compute_token_limit(self) -> int:
-        """推導 Agent token_limit（Level 3 摘要觸發閾值）。
-
-        預留 output tokens + 3000 buffer 給 system prompt，下界 8192。
-        """
-        usable_input = self.context_window - self.max_tokens
-        return max(usable_input - 3000, 8192)
+        """Auto-compaction limit: 80% of the model's usable input budget."""
+        default_limit = max(int((self.context_window - self.max_tokens) * 0.8), 1)
+        if self.auto_compact_token_limit is None:
+            return default_limit
+        return min(int(self.auto_compact_token_limit), default_limit)
 
     @property
     def supports_thinking(self) -> bool:
@@ -233,6 +238,8 @@ class ModelConfig:
             "max_videos": self.max_videos,
             "max_tokens": self.max_tokens,
             "context_window": self.context_window,
+            "auto_compact_token_limit": self.auto_compact_token_limit,
+            "tool_output_truncation_bytes": self.tool_output_truncation_bytes,
             "enabled": self.enabled,
             "tags": self.tags,
         }
@@ -339,6 +346,8 @@ class ModelRegistry:
                     model_name=cfg.get("model_name", model_id),
                     max_tokens=cfg.get("max_tokens", 16384),
                     context_window=cfg.get("context_window", 128000),
+                    auto_compact_token_limit=cfg.get("auto_compact_token_limit"),
+                    tool_output_truncation_bytes=cfg.get("tool_output_truncation_bytes", 10000),
                     reasoning_format=cfg.get("reasoning_format", "none"),
                     reasoning_split=cfg.get("reasoning_split", False),
                     enable_thinking=cfg.get("enable_thinking", False),

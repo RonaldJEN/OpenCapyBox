@@ -69,6 +69,20 @@ class Tool:
     # initial model request.
     exposure: ToolExposure = ToolExposure.DIRECT
 
+    # Runtime no-progress classification. ``standard`` allows a repeated read
+    # or retry but still stops identical-result loops. Built-ins with clearer
+    # semantics override this as read_only, mutating, or polling.
+    repeat_policy: str = "standard"
+
+    def repeat_policy_for(self, arguments: dict[str, Any]) -> str:
+        """Resolve the no-progress policy for one concrete invocation.
+
+        Most tools have one stable policy.  Mixed read/write tools and remote
+        adapters can override this hook so the runtime does not treat a read
+        operation as a side effect merely because the same tool can also write.
+        """
+        return self.repeat_policy
+
     @property
     def name(self) -> str:
         """Tool name."""

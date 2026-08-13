@@ -7,32 +7,40 @@ _encoding = tiktoken.get_encoding("cl100k_base")
 
 
 def truncate_text_by_tokens(text: str, max_tokens: int) -> str:
-    """Truncate text by token count if it exceeds the limit.
+    """Truncate text to at most max_tokens, keeping the head and tail around a note.
 
-    When text exceeds the specified token limit, performs intelligent truncation
-    by keeping the front and back parts while truncating the middle.
+    Slices the encoded token list directly, so the result is exact regardless of token
+    density; character-ratio estimates overshoot badly when density is uneven. Returns
+    "" when the truncation note alone cannot fit.
     """
-    token_count = len(_encoding.encode(text))
-
-    if token_count <= max_tokens:
+    tokens = _encoding.encode(text)
+    if len(tokens) <= max_tokens:
         return text
+    if max_tokens <= 0:
+        return ""
 
-    char_count = len(text)
-    if char_count == 0:
-        return text
+    note = f"\n\n... [Content truncated: {len(tokens)} tokens -> ~{max_tokens} tokens limit] ...\n\n"
+    body_budget = max_tokens - len(_encoding.encode(note))
+    while body_budget > 0:
+        head = body_budget // 2
+        tail = body_budget - head
+        result = _decode_whole_chars(tokens[:head]) + note + _decode_whole_chars(tokens[len(tokens) - tail:])
+        # Re-encoding can merge or split tokens at the join points.
+        overflow = len(_encoding.encode(result)) - max_tokens
+        if overflow <= 0:
+            return result
+        body_budget -= overflow
+    return ""
 
-    ratio = token_count / char_count
-    chars_per_half = int((max_tokens / 2) / ratio * 0.95)
 
-    head_part = text[:chars_per_half]
-    last_newline_head = head_part.rfind("\n")
-    if last_newline_head > 0:
-        head_part = head_part[:last_newline_head]
+def _decode_whole_chars(tokens: list[int]) -> str:
+    """Decode a token slice, dropping the partial UTF-8 sequence at either cut edge.
 
-    tail_part = text[-chars_per_half:]
-    first_newline_tail = tail_part.find("\n")
-    if first_newline_tail > 0:
-        tail_part = tail_part[first_newline_tail + 1:]
+    Slicing mid-character (emoji, CJK) would otherwise decode to U+FFFD.
+    """
+    return _encoding.decode_bytes(tokens).decode("utf-8", errors="ignore")
 
-    truncation_note = f"\n\n... [Content truncated: {token_count} tokens -> ~{max_tokens} tokens limit] ...\n\n"
-    return head_part + truncation_note + tail_part
+
+def count_text_tokens(text: str) -> int:
+    """Count tokens of a plain text fragment."""
+    return len(_encoding.encode(text))

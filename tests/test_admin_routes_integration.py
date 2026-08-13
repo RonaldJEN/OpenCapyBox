@@ -271,7 +271,9 @@ def _add_test_llm_model(db, *, model_id: str, enabled: bool = True) -> None:
         api_key="test-key",
         model_name=model_id,
         max_tokens=1024,
-        context_window=4096,
+        # Must leave the same real provider-input budget enforced by admin
+        # create/update validation: context - output - 3000 >= 8192.
+        context_window=16384,
         enabled=enabled,
     ))
 
@@ -866,6 +868,78 @@ def test_rounds_tree_step_list_is_lightweight_and_detail_is_full(admin_integrati
     detail_data = detail.json()
     assert detail_data["request_messages"] == heavy_request
     assert detail_data["response_content"] == heavy_response
+
+
+def test_session_round_steps_are_ordered_by_creation_time(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    now = now_naive()
+    db = SessionLocal()
+    try:
+        _insert_round_with_step(
+            db,
+            session_id="s-step-order",
+            user_id="admin",
+            title="StepOrder",
+            round_id="r-step-order",
+            status="completed",
+            created_at=now,
+            user_message="inspect step order",
+            final_response="ok",
+            request_messages="[]",
+            response_content="normal step one",
+        )
+        db.flush()
+        first = db.query(LLMCallRecord).filter(
+            LLMCallRecord.round_id == "r-step-order"
+        ).one()
+        first.created_at = now + timedelta(seconds=2)
+        db.add_all([
+            LLMCallRecord(
+                session_id="s-step-order",
+                round_id="r-step-order",
+                step_index=-1,
+                call_kind="compaction",
+                request_messages="[]",
+                request_tools="[]",
+                response_content="first compaction",
+                created_at=now + timedelta(seconds=1),
+            ),
+            LLMCallRecord(
+                session_id="s-step-order",
+                round_id="r-step-order",
+                step_index=-2,
+                call_kind="compaction",
+                request_messages="[]",
+                request_tools="[]",
+                response_content="second compaction",
+                created_at=now + timedelta(seconds=3),
+            ),
+            LLMCallRecord(
+                session_id="s-step-order",
+                round_id="r-step-order",
+                step_index=2,
+                call_kind="agent_step",
+                request_messages="[]",
+                request_tools="[]",
+                response_content="normal step two",
+                created_at=now + timedelta(seconds=4),
+            ),
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/admin/sessions/s-step-order/rounds", params={"status": "all"})
+
+    assert response.status_code == 200
+    steps = response.json()["rounds"][0]["steps"]
+    assert [(step["step_index"], step["call_kind"]) for step in steps] == [
+        (-1, "compaction"),
+        (1, "agent_step"),
+        (-2, "compaction"),
+        (2, "agent_step"),
+    ]
 
 
 def test_rounds_tree_marks_subagent_child_rounds(admin_integration_client):

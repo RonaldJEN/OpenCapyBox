@@ -37,6 +37,21 @@ from tests.helpers import make_fake_execution
 # mock_sandbox 已在 conftest.py 中统一定义
 
 
+@pytest.mark.parametrize(
+    "tool_class",
+    [
+        SandboxBashOutputTool,
+        SandboxBashKillTool,
+        SandboxReadImageTool,
+        SandboxReadTool,
+        SandboxWriteTool,
+        SandboxEditTool,
+    ],
+)
+def test_sandbox_tool_class_docstrings_are_preserved(tool_class):
+    assert tool_class.__doc__
+
+
 @pytest.fixture
 def bg_tracker():
     """每個測試都使用獨立的 tracker 實例"""

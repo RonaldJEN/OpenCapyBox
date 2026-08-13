@@ -137,8 +137,8 @@ class LLMClient:
         self._fallback_configs: list[ModelConfig] = []
         # 緩存已構建的 fallback 客戶端，避免每次 failover 都重建
         self._fallback_clients: dict[str, LLMClientBase] = {}
-        # Failover 通知回調（async callable）：切換 fallback 前調用，
-        # 讓調用方（如 Agent）有機會重置流式狀態，避免重複內容。
+        # Failover preparation callback. It may reset streaming state and
+        # return rewritten kwargs after compacting for the target model.
         self._failover_notify = None
 
     @classmethod
@@ -216,8 +216,10 @@ class LLMClient:
     def failover_notify(self, value):
         """Set failover notify callback.
 
-        Signature: async def callback(model_id: str) -> None
-        Called before each fallback attempt so the caller can reset streaming state.
+        Preferred signature::
+
+            async def callback(config, client, call_method, kwargs) -> dict | None
+
         """
         self._failover_notify = value
 
@@ -272,22 +274,23 @@ class LLMClient:
                 i + 1, len(self._fallback_configs),
                 fb_config.id, fb_config.model_name,
             )
-            # 通知調用方重置流式狀態（避免切換後內容重複）
-            if self._failover_notify:
-                # fb_config.max_tokens = 單次輸出上限（非 context window）
-                # fb_config.context_window = 模型總上下文窗口（Phase 1.1 新增字段）
-                await self._failover_notify(
-                    fb_config.id,
-                    fb_config.context_window,
-                    fb_config.max_tokens,  # output token limit, not context
-                )
             try:
                 # 使用緩存的 fallback 客戶端，避免重複構建 HTTP 連接
                 if fb_config.id not in self._fallback_clients:
                     self._fallback_clients[fb_config.id] = self._build_client(fb_config, self.retry_config)
                 fb_client = self._fallback_clients[fb_config.id]
                 fb_client.retry_callback = self._client.retry_callback
-                result = await getattr(fb_client, call_method)(**kwargs)
+                fallback_kwargs = dict(kwargs)
+                if self._failover_notify:
+                    prepared = await self._failover_notify(
+                        fb_config,
+                        fb_client,
+                        call_method,
+                        fallback_kwargs,
+                    )
+                    if isinstance(prepared, dict):
+                        fallback_kwargs = prepared
+                result = await getattr(fb_client, call_method)(**fallback_kwargs)
                 self._sync_last_request_snapshot(fb_client)
                 # 僅本次調用使用 fallback，不修改 self._client，
                 # 下次調用仍優先嘗試主模型（主模型可能已恢復）。

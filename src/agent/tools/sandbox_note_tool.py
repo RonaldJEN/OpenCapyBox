@@ -33,6 +33,8 @@ def _extract_exit_code(execution: Any) -> int:
 class SandboxSessionNoteTool(Tool):
     """在沙箱中記錄會話筆記"""
 
+    repeat_policy = "mutating"
+
     def __init__(self, sandbox: Sandbox):
         self._sandbox = sandbox
 
@@ -131,6 +133,8 @@ class SandboxSessionNoteTool(Tool):
 
 class SandboxRecallNoteTool(Tool):
     """從沙箱中回憶筆記"""
+
+    repeat_policy = "read_only"
 
     def __init__(self, sandbox: Sandbox):
         self._sandbox = sandbox

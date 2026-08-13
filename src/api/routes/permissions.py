@@ -44,7 +44,6 @@ _BUILTIN_TOOLS: tuple[tuple[str, str], ...] = (
     ("bash_kill", "停止后台命令"),
     ("record_note", "记录会话笔记"),
     ("recall_notes", "检索会话笔记"),
-    ("record_memory", "记录每日记忆"),
     ("update_long_term_memory", "更新长期记忆"),
     ("search_memory", "检索记忆"),
     ("read_user", "读取用户画像"),

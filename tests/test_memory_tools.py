@@ -1,7 +1,6 @@
 """记忆工具 (memory_tools) 单元测试
 
 覆盖：
-- RecordDailyLogTool: 追加每日日志
 - UpdateLongTermMemoryTool: 读/写/追加 MEMORY.md
 - SearchMemoryTool: 语义/关键词检索
 - ReadUserProfileTool: 只读 USER.md
@@ -12,64 +11,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from tests.helpers import make_mock_sandbox
-
-
-class TestRecordDailyLogTool:
-    """RecordDailyLogTool 测试"""
-
-    def test_tool_metadata(self):
-        from src.agent.tools.memory_tools import RecordDailyLogTool
-
-        tool = RecordDailyLogTool(sandbox=MagicMock())
-        assert tool.name == "record_memory"
-        assert "record" in tool.description.lower()
-        assert "content" in tool.parameters["properties"]
-        assert "content" in tool.parameters["required"]
-
-    @pytest.mark.asyncio
-    async def test_record_success(self):
-        from src.agent.tools.memory_tools import RecordDailyLogTool
-
-        sandbox = make_mock_sandbox(read_return="# Existing\n")
-        tool = RecordDailyLogTool(sandbox=sandbox, workspace_dir="/home/user")
-
-        result = await tool.execute(content="用户偏好：深色模式", category="preference")
-        assert result.success is True
-        assert "preference" in result.content
-        sandbox.files.write_file.assert_called_once()
-        assert "/home/user/MEMORY.md" in sandbox.files.write_file.call_args.args[0]
-
-    @pytest.mark.asyncio
-    async def test_record_syncs_merged_content(self):
-        from src.agent.tools.memory_tools import RecordDailyLogTool
-
-        sandbox = make_mock_sandbox(read_return="# Existing\n")
-        sync = AsyncMock()
-        tool = RecordDailyLogTool(
-            sandbox=sandbox,
-            workspace_dir="/home/user",
-            agent_config_sync=sync,
-        )
-
-        result = await tool.execute(content="用户偏好：深色模式", category="preference")
-
-        assert result.success is True
-        sync.assert_awaited_once()
-        path, synced_content = sync.call_args.args
-        assert path == "/home/user/MEMORY.md"
-        assert "# Existing" in synced_content
-        assert "用户偏好：深色模式" in synced_content
-
-    @pytest.mark.asyncio
-    async def test_record_failure(self):
-        from src.agent.tools.memory_tools import RecordDailyLogTool
-
-        sandbox = make_mock_sandbox(write_side_effect=Exception("sandbox down"))
-        tool = RecordDailyLogTool(sandbox=sandbox)
-
-        result = await tool.execute(content="test")
-        assert result.success is False
-        assert "Failed" in result.error
 
 
 # ── 参数化：UpdateLongTermMemoryTool 与 UpdateUserProfileTool ──
@@ -106,6 +47,8 @@ class TestUpdateMemoryTools:
         assert tool.name == expected_name
         assert "mode" in tool.parameters["properties"]
         assert "mode" in tool.parameters["required"]
+        assert "explicitly asks" in tool.description
+        assert "proactively" not in tool.description.lower()
 
     @pytest.mark.parametrize("cls_name,_name,_target_file", _TOOL_PARAMS)
     @pytest.mark.asyncio

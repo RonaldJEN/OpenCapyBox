@@ -30,6 +30,7 @@ data/
 *.log
 logs/
 .codex
+.codex-test
 docs/claude-code-src/
 # ========================================
 # Python

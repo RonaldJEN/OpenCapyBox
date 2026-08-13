@@ -49,6 +49,18 @@ def test_agents_template_routes_connected_data_before_web_search():
     assert "`search` / `batch_search`" in content[web_fallback:]
 
 
+def test_agents_template_does_not_request_proactive_memory_writes():
+    from src.api.services.memory_service import MemoryService
+
+    content = MemoryService(MagicMock()).get_agents_template_content()
+
+    assert "主动记录原则" not in content
+    assert "先记录再回答" not in content
+    assert '不要等用户说"记住这个"' not in content
+    assert "一行记到 `MEMORY.md`" not in content
+    assert "把值得长期保留的提炼到 `MEMORY.md`" not in content
+
+
 @pytest.mark.asyncio
 async def test_sandbox_first_when_not_forced():
     """非 force 模式：沙箱有内容 → 保留沙箱版本并回写 DB"""

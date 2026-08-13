@@ -12,6 +12,7 @@ from ..schema import FunctionCall, LLMResponse, Message, ToolCall
 from ..schema.schema import TokenUsage
 from .base import LLMClientBase
 from .json_parser import robust_json_parse
+from .tool_schema import tools_to_anthropic_schema
 
 logger = logging.getLogger(__name__)
 
@@ -129,16 +130,7 @@ class AnthropicClient(LLMClientBase):
         Returns:
             List of tools in Anthropic dict format
         """
-        result = []
-        for tool in tools:
-            if isinstance(tool, dict):
-                result.append(tool)
-            elif hasattr(tool, "to_schema"):
-                # Tool object with to_schema method
-                result.append(tool.to_schema())
-            else:
-                raise TypeError(f"Unsupported tool type: {type(tool)}")
-        return result
+        return tools_to_anthropic_schema(tools)
 
     def _convert_messages(self, messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert internal messages to Anthropic format.

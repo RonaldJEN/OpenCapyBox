@@ -120,7 +120,7 @@ Define Cron jobs via the `manage_cron` tool, and your AI assistant runs them aut
 | 📁 File Ops | Read / Write / Edit | Read, write, and string-replace edit files in sandbox |
 | 💻 Shell | Bash / BashOutput / BashKill | Execute commands in container, background process support |
 | 🔍 Web Search | GLMSearch / BatchSearch | Bocha search engine, parallel batch search |
-| 🧠 Memory | RecordDailyLog / SearchMemory | Layered persistent memory + hybrid retrieval |
+| 🧠 Memory | UpdateLongTermMemory / SearchMemory | Layered persistent memory + hybrid retrieval |
 | 📝 Session Notes | SessionNote / RecallNote | Cross-turn context preservation |
 | ⏰ Cron | ManageCron | DB-backed cron worker |
 | 🎒 Skills | GetSkill | 40+ dynamically loadable professional skills |

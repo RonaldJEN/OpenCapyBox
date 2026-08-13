@@ -80,7 +80,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `AGENT_MAX_STEPS` | 否 | `100` | Agent 单次 run 最大步数 |
-| `AGENT_MAX_HISTORY_MESSAGES` | 否 | `120` | 历史消息注入上限（条数） |
+| `AGENT_HISTORY_STRATEGY` | 否 | `checkpoint_v1` | 长程上下文策略；`checkpoint_v1` 使用累计替代 checkpoint，`legacy_120` 仅用于回滚 |
+| `AGENT_MAX_HISTORY_MESSAGES` | 否 | `120` | `legacy_120` 的历史消息注入上限（条数）；默认 `checkpoint_v1` 不使用该值裁剪 |
 | `AGENT_TOOL_TIMEOUT` | 否 | `300` | 单次工具执行超时（秒），0 表示不限。详见下方超时体系说明 |
 | `AGENT_SUBAGENT_MAX_PARALLEL` | 否 | `3` | 同一父 Agent step 内最多并行执行的 `sub_agent` 数；`1` 表示串行 |
 | `AGENT_USER_CONCURRENCY_LIMIT` | 否 | `1` | 同一用户允许同时运行的不同会话数 |

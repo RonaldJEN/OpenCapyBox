@@ -144,10 +144,23 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 
 **唯一约束**: `UniqueConstraint(session_id, sequence)`
 
-`is_summary=True` 的消息用于“历史恢复锚点”：
+`is_summary=True` 仅保留给 `legacy_120` 兼容读取。默认 `checkpoint_v1` 不累计逐轮摘要，也不把多代摘要拼进 provider 请求；累计替代上下文以 `context_checkpoints` 为事实源。
 
-- round 结束后，服务层会按去重策略持久化最新压缩摘要（若内容与上一条摘要锚点相同则不重复写入）。
-- `_restore_history` 在尾窗裁剪完成后会优先注入最新摘要锚点，再拼接尾窗消息，降低长会话冷恢复语义漂移。
+### 2.3.1 `context_checkpoints` 表
+
+保存不可变的累计替代上下文。每个新 generation 都完整替换此前 checkpoint，而不是在其后叠加摘要。
+
+| 字段 | 说明 |
+|---|---|
+| `checkpoint_id` / `generation` | checkpoint 身份与 session 内单调代际 |
+| `source_round_id` | replacement 覆盖到的最后 Round；允许是 running/failed/cancelled |
+| `source_message_sequence` / `source_event_sequence` | 在 source Round 内精确覆盖到的 conversation/event 游标 |
+| `trigger_phase` | `pre_turn`、`mid_turn` 或 `model_downshift` |
+| `summary_text` | 模型生成的原始 handoff summary |
+| `replacement_messages_json` | 最新真实 user 原文（总计最多 20,000 近似 token）+ 一条 role=user synthetic summary |
+| `source_token_count` / `replacement_token_count` | 压缩前后 token 估算 |
+
+`schema_version=4`，checkpoint append-only，并在每次压缩完成时立即写入，不等待 Round 成功。旧 v1-v3 不做语义迁移，直接从权威 rounds/messages/events 重建。恢复顺序为 `最新 replacement + source Round 游标后的 suffix + 后续 Round`；最新 v4 无法解析、缺少 `source_round_id` 或 source Round 不属于当前权威主会话历史时，必须丢弃整个 replacement 并回到权威历史，不得拼接 `replacement + 完整历史`，也不回退旧 generation。`replacement_sha256` 仅保留为 nullable 兼容列，不再参与语义。
 
 ### 2.4 `llm_call_records` 表
 
@@ -158,7 +171,8 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 | `id` | Integer | PK, autoincrement | 自增主键 |
 | `session_id` | String(36) | FK → `sessions.id`, NOT NULL, indexed | 所属会话 |
 | `round_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL, indexed | 所属 Round |
-| `step_index` | Integer | NOT NULL | 第几次 LLM 调用（从 1 开始） |
+| `step_index` | Integer | NOT NULL | 普通 step 从 1 开始；compaction 使用 session run 内递减的负索引避免唯一键冲突 |
+| `call_kind` | String(30) | NOT NULL | `agent_step` 或 `compaction` |
 | `request_message_count` | Integer | nullable | 本次实际发送给 provider 的消息条数（若为 provider 快照则取 `messages` 长度） |
 | `manual_review_status` | String(20) | NOT NULL, default=`没问题` | 人工后台标注结果，默认表示未发现问题 |
 | `request_messages` | Text | NOT NULL | 实际发送给 provider 的请求快照（JSON，包含 provider/model/messages、request-only runtime context，必要时包含 system/tools/stream 等参数） |
@@ -173,15 +187,15 @@ Agent 执行所需的对话历史。与 `agui_events` 不同，此表面向 LLM 
 | `usage_total_tokens` | Integer | nullable | 总 token 数 |
 | `first_token_latency_s` | Float | nullable | 从发起请求到收到首个流式 token 的耗时（秒） |
 | `completion_latency_s` | Float | nullable | 从发起请求到本次 LLM 调用完成返回的总耗时（秒） |
-| `compaction_triggered` | Boolean | NOT NULL, default=`false` | 本 step 调用前是否触发了上下文压缩流水线（Level 2-4） |
+| `compaction_triggered` | Boolean | NOT NULL, default=`false` | 本次普通调用前是否触发 Codex compaction |
 | `compaction_pre_tokens` | Integer | nullable | 压缩前估算 token 数 |
 | `compaction_post_tokens` | Integer | nullable | 压缩后估算 token 数 |
 | `compaction_tokens_saved` | Integer | nullable | 本次压缩节省 token 数（`pre - post`） |
-| `compaction_microcompact_compacted_messages` | Integer | nullable | Level 2 中被 microcompact 的消息数 |
-| `compaction_summary_generated_count` | Integer | nullable | Level 3 新生成摘要条数 |
-| `compaction_summary_reused_count` | Integer | nullable | Level 3 复用旧摘要条数 |
-| `compaction_summary_quality_repair_count` | Integer | nullable | Level 3 摘要结构规范化修复次数 |
-| `compaction_emergency_truncate_dropped_rounds` | Integer | nullable | Level 4 紧急截断丢弃的最老 round 数 |
+| `compaction_microcompact_compacted_messages` 等旧字段 | Integer | nullable | 仅保留数据库/API 兼容，Codex 路径固定为 0，不再代表运行阶段 |
+| `history_strategy` | String(30) | nullable | `checkpoint_v1` 或 legacy 策略 |
+| `checkpoint_id` | String(36) | nullable | 本次请求使用的 checkpoint |
+| `history_payload_sha256` | String(64) | nullable | 实际请求消息规范 JSON 哈希 |
+| `history_breakdown_json` | Text | nullable | real user、assistant、tool、synthetic、图片上下文、累计摘要的数量分解 |
 | `created_at` | DateTime | default=now, indexed | 写入时间 |
 
 **唯一约束**: `UniqueConstraint(round_id, step_index)`
@@ -327,7 +341,7 @@ Content-Type: application/json
 - 普通 `message/stream` direct Round 把本次解析后仍有效的 Skill 按顺序固化为 `preferred_skills: [{"key":"...","display_name":"..."}]`。这是发送当时的不可变展示快照：`key` 为稳定内部标识，`display_name` 为当时的展示名；不得在读取历史时用最新 registry 改写。空选择或全部 key 无效时保存/返回空数组。
 - direct 流的 `RUN_STARTED` 必须同步携带同一份权威快照 `preferredSkills: [{key, display_name}]`（包括显式空数组），让前端立即用解析结果替换 optimistic key；resume child 的 `RUN_STARTED.preferredSkills` 固定为空数组。重连订阅重放该事件时语义不变。
 - `preferred_skills` 只表示该 direct Round 的请求级“优先考虑”偏好，不证明 Agent 已加载 Skill、调用 `get_skill` 或实际使用了该 Skill。每个后续独立 direct Round 只记录自己当次提交并解析出的快照，不从前一 Round 继承或累积。
-- 解析后的上下文只投影到精确匹配的**原始 user message 锚点**的 provider 请求副本，作用于 `agent_step` / `tool_followup`；不得写回 `agent.messages`、`conversation_messages`、长期 system prompt，也不得注入标题生成、对话摘要或记忆提取请求。child resume 的回答消息不是该投影锚点。
+- 解析后的上下文只投影到精确匹配的**原始 user message 锚点**的 provider 请求副本，作用于 `agent_step` / `tool_followup`；不得写回 `agent.messages`、`conversation_messages`、长期 system prompt，也不得注入标题生成或对话摘要请求。child resume 的回答消息不是该投影锚点。
 - 该上下文是用户通过 UI 控件提交的请求元数据，不是用户正文。provider 请求必须同时携带系统级解释策略；模型不得仅因该上下文出现就声称“用户提到/点名/要求加载了这些 Skill”，也不得在与正文无关时主动复述选择。仅在用户询问选择状态或需要解释实际 Skill 动作时才可提及。
 - 若本轮因 `ask_user` 或工具权限审批中断，原始请求 key 与服务端生成的 `preferred_skills_origin_user_message_id` 会同时写入热路径 pending interrupt 和持久化 `interrupt_payload`。`resume` 时按最新 registry 和启停状态重新解析，并把同一锚点原样继承到 child resume round；因此 R1 → R2 → R3 连续中断/恢复始终投影到 R1 的原始 user message，而不是逐级改为父 Round 的回答。该继承仅延续同一次被中断的执行意图，不得扩散到之后独立发送的新消息。
 - resume child Round 运行时继续继承并重新解析原请求偏好，但自身 `preferred_skills` 必须为空，不重复展示父 direct Round 已记录的标签，也不得覆盖父 Round 的发送时快照。
@@ -581,6 +595,7 @@ SSE 事件流。
 - 该数组是不可变的历史展示数据，不是 Skill 使用审计；不能据此声称 Skill 已加载、已调用或对结果有贡献。
 - 各个独立 direct Round 的数组彼此隔离，不继承、不合并，也不根据当前启停状态、改名或删除情况重算。
 
+
 ---
 
 ## 4. 行为语义与不变量
@@ -623,7 +638,7 @@ Web send/resume/abort 入口先由 `WebChatAdapter` / `WebResumeAdapter` /
 │  ① 取消检查 ──── 检测当前 run cancel token        │
 │      │                                              │
 │      ▼                                              │
-│  ② LLM 调用（流式）                                │
+│  ② 按最终 dispatch 形态压缩/预检后调用 LLM（流式） │
 │      │  └── Producer-Consumer: LLM stream → Queue   │
 │      ▼                                              │
 │  ③ 取消检查                                         │
@@ -658,6 +673,17 @@ Web send/resume/abort 入口先由 `WebChatAdapter` / `WebResumeAdapter` /
 | 工具超时 | 300s | 是 (`tool_timeout`) | 单个工具执行超时 |
 | 流式块超时 | 100s | — | LLM 流式响应相邻 chunk 的最大间隔 |
 
+#### Runtime 工具循环防护
+
+每个 Round 在消息历史之外维护 run-local execution ledger；该 ledger 不参与摘要、provider 投影或 checkpoint，因此压缩不能让防护状态“失忆”。调用身份由稳定 tool ref 与规范化参数摘要组成，不使用每次都会变化的 `tool_call_id`；文件路径按 POSIX 分隔符归一化但保留大小写，审计只保存摘要，不保存敏感原始参数。
+
+- 相同参数、相同错误连续返回 2 次后，第 3 次执行前阻止；中间成功执行不同调用会解除旧恢复态，不同错误视为策略发生变化。
+- 只读工具允许“初读 + 复核”，第 3 次仍得到相同结果时阻止；相同成功的 mutating 工具下一次不得重复执行，`outcome_uncertain` 的副作用调用也不得自动重试。
+- 完整观察到 `A → B → A → B`，且 A/B 均为相同只读调用、两次结果各自未变化后，下一次再次调用 A 或 B 时识别为无进展循环；不得在尚未观察第二次 B 的结果前预测性阻止。成功 mutation 会清空旧的读/搜索观察。声明为 polling 的工具使用独立有界阈值，但相同 uncertain 结果最多实际尝试 2 次。
+- `bash` 命令文本不凭首个单词猜测读写属性；MCP annotation 只能把默认策略收紧，远端自称 `readOnlyHint=true` 不得放宽重试权限。带 `mode` 的记忆工具按具体调用区分 read 与 write/append。
+- 首次命中时不执行候选工具，但仍写入配对的 synthetic tool result，明确要求换策略，并给模型一次恢复机会；若下一步仍调用同一被拒绝 pattern，则为同一 assistant 批次的其余调用补齐 skipped result，发出 `RUN_ERROR(tool_loop_detected)` 并将 Round 置为失败；真正不同且成功的策略会解除该 pattern 的恢复态。
+- Round 收尾不得额外调用模型提取或写入长期记忆；只允许同步本轮已由显式工具/文件操作产生的 dirty 配置文件，并按 [memory-spec.md](./memory-spec.md) 维护对话轮检索索引。
+
 #### Producer-Consumer 模式
 
 LLM 流式响应采用 `asyncio.Queue` 解耦：
@@ -669,13 +695,15 @@ LLM 流式响应采用 `asyncio.Queue` 解耦：
 
 #### 取消检查点
 
-Agent 执行循环中有 **3 个取消检查点**:
+Agent 在每个可能长时间等待的边界都读取或等待当前 run 的 `cancel_token`：
 
-1. **Step 开始前**: 每步循环入口
-2. **LLM 完成后、工具执行前**: LLM 响应解析完成时
-3. **每个工具执行前**: 多工具调用时，每个工具执行前单独检查
+1. **Step 开始前**：每步循环入口。
+2. **上下文压缩期间**：非流式 compaction provider 请求与 cancel token 竞争；取消时终止请求，且不得发布 replacement、checkpoint 或压缩审计记录。
+3. **普通 LLM 流式请求期间**：Producer-Consumer 等待同时监听 cancel token，取消时终止 provider task。
+4. **LLM 完成后、工具执行前**：LLM 响应解析完成时。
+5. **每个工具执行前**：多工具调用时，每个工具执行前单独检查。
 
-检查逻辑：Agent 运行时读取当前 run 的 `cancel_token`；`abort` 命中本进程 registry 时立即置位 token，并写入 `run_cancel_requests` 审计行。DB 行不参与第一版取消投递。
+`abort` 命中本进程 registry 时立即置位 token，并写入 `run_cancel_requests` 审计行。DB 行不参与第一版取消投递。由 fallback 降窗触发的 compaction 使用同一个 token，不能绕过取消。
 
 #### Max Steps 处理
 
@@ -689,7 +717,7 @@ Agent 执行循环中有 **3 个取消检查点**:
 每次 `send` / `resume` 真正启动 Agent run 前，`AgentService` 必须从 DB 权威历史重建本轮 runtime messages：
 
 1. 保留当前 Agent 的 system prompt。
-2. 从 `rounds` + `conversation_messages` + `agui_events` + `interrupt_resolutions` 重建历史消息，并应用 `_restore_history` 的摘要锚点和尾窗裁剪规则。
+2. `checkpoint_v1` 优先读取最新 v4 replacement，并从精确 message/event 游标回放同轮 suffix 与后续 Round；无有效 v4 时从 `rounds` + `conversation_messages` + `agui_events` + `interrupt_resolutions` 重建完整权威历史。只有 `legacy_120` 回滚策略按消息条数裁剪。
 3. 用重建结果替换本进程内旧 `agent.messages`，不得追加到旧热缓存后面。
 4. 再注入本轮用户输入或 resume 答案后进入 LLM 调用。
 5. LLM 调用前由请求组装层临时构造 provider-bound messages，并在副本的 system 消息前加入 request-only runtime context（当前时间、时区、workspace、平台执行语义等）；不得回写 `agent.messages` 或 `conversation_messages`。
@@ -817,65 +845,44 @@ INSERT INTO rounds (..., idempotency_key)
 
 ### 4.5 上下文压缩
 
-当对话历史的 Token 数超出模型上下文窗口时，触发多级压缩。压缩从低级开始逐级升级。
+压缩行为对齐本地 Codex `compact.rs`。
 
 #### Token 限制参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `token_limit` | 80,000 | 压缩触发阈值 |
+| `token_limit` | `(context_window - max_tokens) * 80%` | 先为最大输出预留窗口，再对可用输入预算取 80%；可由模型配置调低，不能调高 |
 | `context_window` | 128,000 | 模型上下文窗口大小 |
 | `max_output_tokens` | 16,384 | 模型最大输出长度 |
-| `hard_ceiling` | `context_window - max_output_tokens - 3000`（最小 8,192） | 绝对不可超越的上限 |
-
-#### 压缩级别
-
-| 级别 | 名称 | 策略 | 是否需要 LLM | 说明 |
-|------|------|------|-------------|------|
-| Level 2 | Microcompact | 替换 + 清理 | 否 | 替换超过 4000 字符的 `tool_result` 为摘要占位符；清理旧的 `thinking` 内容；保留最近 2 轮完整内容 |
-| Level 3 | LLM Summary | LLM 摘要 | **是** | 使用 LLM 对历史轮次逐轮生成结构化摘要（9 sections），必须包含 `All user messages`（非 tool result）与 `Current Work`，替换原始内容；服务端会对缺失 section 进行规范化补齐并强制回写用户消息锚点 |
-| Level 4 | Emergency Truncate | 强制丢弃 | 否 | 从最老的 user round 开始丢弃，最多丢弃 3 轮，**至少保留 1 轮** |
 
 #### 压缩流程
 
 ```
-计算当前上下文 Token 数
+读取上一次真实 provider usage（冷启动时估算历史）
     │
     ├── ≤ token_limit → 不压缩
     │
     └── > token_limit
          │
          ▼
-    Level 2: Microcompact
+    同模型本地压缩：规范化完整历史 + 固定 checkpoint prompt
          │
-         ├── 压缩后 ≤ token_limit → 完成
+         ├── 成功 → replacement：最新真实 users（20k）+ user-role summary
          │
-         └── 仍超出
-              │
-              ▼
-         Level 3: LLM Summary
-              │
-              ├── 压缩后 ≤ token_limit → 完成
-              │
-              └── 仍超出
-                   │
-                   ▼
-              Level 4: Emergency Truncate
-                   │
-                   └── 强制满足 hard_ceiling
+         └── context overflow → 每次只删除一个最旧历史项、重新规范化并重试
 ```
 
-#### 历史恢复裁剪边界（_restore_history）
+pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后再把该消息原样接回。replacement 中保留的历史真实 user 严格按 Codex 只抽取 text block，忽略 image/audio/video 等媒体块，禁止把 data URL 或 base64 序列化为 checkpoint 文本；媒体语义由看过完整历史的 handoff summary 承接。mid-turn 只在仍要继续调用模型时触发，压缩请求能看到完整当前工具批次，但 replacement 不保护该批次，只依赖 handoff summary。工具输出在首次写入历史时按默认 10,000 bytes（1.2 倍序列化余量）做 UTF-8 中间截断。
 
-`agent_max_history_messages` 仅用于历史恢复阶段的注入上限控制，且遵循“摘要锚点优先 + user 边界对齐”：
+压缩 provider 请求必须响应当前 run 的取消信号。取消胜出时中止正在进行的请求并直接结束 run；只有 provider 响应完成且取消仍未发生时，才允许持久化 checkpoint 并发布 replacement。
 
-1. 先从 `conversation_messages` 读取最新 `is_summary=True` 的摘要锚点（若存在）。
-2. 再取最近 `N` 条事件重建消息作为尾窗。
-3. 对 `status=completed` 且 `agui_events` 未能重建出任何 assistant 文本的 Round，按顺序补回该轮最终 assistant 消息：优先使用 `rounds.final_response`；若为空，再使用同 `round_id` 下 `conversation_messages` 中 `role=assistant 且 is_summary=False` 的记录。若两者均不存在，不注入 assistant 内容并记录告警，避免事件流缺口导致下一轮“继续”丢失上一轮答复。
-4. 若尾窗首条不是“真实 user”（`role=user 且 is_synthetic=False`），向后跳过直到命中真实 user。
-5. 若尾窗内不存在真实 user，回退到全量历史中“离尾窗最近的真实 user 边界”，从该处注入到末尾（可超过 `N`）。
-6. 若全量历史都不存在真实 user（数据异常），保留尾窗作为兜底，避免注入全空导致整段失忆。
-7. 最终注入顺序为：`[summary_anchor?] + tail_window`；若无尾窗但有摘要锚点，仍注入摘要锚点。
+切换到更小 fallback 前，如原请求达到目标模型的 `(context_window - max_tokens) * 80%` 阈值，先用 primary 压缩；符合 Codex fallback 条件的失败再用目标模型压缩，context overflow 同样逐个删除最旧项。成功后立即写 checkpoint 并重建普通 fallback 请求；不再发生“少几个 token 就本地拒绝且未调用 fallback”。
+
+#### 历史恢复投影边界（_restore_history）
+
+默认 `checkpoint_v1` 的恢复顺序固定为：`checkpoint replacement + source Round 游标后的同轮 suffix + 后续 Round`。消息数不是预算单位，`agent_max_history_messages=120` 只服务 `legacy_120` 回滚开关。
+
+对 `status=completed` 且事件无法重建 assistant 文本的 Round，仍按 `rounds.final_response`、普通 assistant conversation message 的顺序兜底。resume stitching 保持不变；压缩 replacement 不强保首轮 user。
 
 **Resume resolution stitching**:
 

@@ -119,6 +119,11 @@ Runtime behavior:
   message history in the original tool-call order.
 - Child AG-UI events and LLM call snapshots are persisted under the child
   `round_id`; they are not forwarded into the parent SSE stream.
+- Child Agent starts from its profile system prompt plus the child task prompt;
+  it does not restore the session's main-chat history or cumulative checkpoint.
+  Long child runs retain the normal in-memory token compaction pipeline, but
+  child completion must not publish a session-level context checkpoint because
+  child runs are single-turn sidechains with no subsequent conversation restore.
 - The parent receives one `TOOL_CALL_RESULT` for display and LLM context. The
   durable source of parent/child metadata is the `subagent_runs` edge, not the
   human-readable result text.

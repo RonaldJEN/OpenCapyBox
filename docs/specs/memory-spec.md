@@ -8,7 +8,7 @@
 - 嵌入向量生成与混合检索（BM25 + 向量 + RRF）
 - 对话轮索引
 - 新用户模板初始化
-- **不负责**：记忆文件内容解析、Agent 行为控制
+- **当前不负责**：记忆文件内容解析、后台候选提炼、自动合并 canonical Memory、Agent 行为控制
 
 ---
 
@@ -90,7 +90,8 @@
 ```
 
 - 错误 400（无效文件名）、409（版本冲突，来源 RuntimeError）
-- 副作用：更新 DB -> 强制推送到沙箱 -> 失效 AgentPool 缓存
+- 副作用：更新 DB -> 强制推送到沙箱 -> 失效 AgentPool 缓存；`MEMORY.md` 不会因此进入 system prompt
+- 当前限制：该前端/API 写路径不重建 embedding；运行时受控工具与 dirty-file 回写路径才在 USER / MEMORY 内容变化时重建。因而 API 保存后的旧索引可能持续到下一次重建，该问题留待记忆方案重构时统一处理
 
 ### GET /api/config/skills
 
@@ -161,9 +162,16 @@
 | 新 Session Agent 创建 | sandbox-first | 沙箱有内容 -> 写回 DB；空则 DB -> sandbox |
 | AGENTS.md | template -> sandbox / system prompt | 平台模板覆盖沙箱，不从沙箱或用户 DB 反向同步 |
 
+### 运行时记忆工具
+
+- `update_long_term_memory` 是保留的显式 `MEMORY.md` 管理工具，支持 `read` / `write` / `append`；它不是后台任务，也不由 token 阈值、上下文压缩或 Round 收尾自动调用
+- `update_user` 以相同模式管理 `USER.md`；长期文件写入只允许发生在用户明确要求跨会话保存或修改 Agent 配置时
+- `search_memory` 是只读 DB 检索，可返回长期文件 embedding 与既有 `conversation/*` 对话轮索引；检索结果不会自动回写 `MEMORY.md`
+- `read_user` 只读 `USER.md`
+
 ### Dirty Flag 检测与兜底
 
-- **工具名匹配**：`record_memory`、`update_long_term_memory`、`update_user`
+- **工具名匹配**：`update_long_term_memory`、`update_user`
 - **文件操作嗅探**：`write_file` / `edit_file` 目标为记忆文件
 - **即时同步**：受控工具成功写入根目录 USER / MEMORY / SOUL 后，立即调用 DB 同步；USER / MEMORY 内容变化时同步重建 embedding
 - **AGENTS 保护**：根目录 AGENTS.md 由平台模板管理，受控文件工具拒绝写入，后台同步也不回写 DB
@@ -197,10 +205,16 @@
 
 ### System Prompt 构建
 
-- 从 SOUL / USER / MEMORY 用户 DB 文件与平台 AGENTS.md 模板拼接
-- Token 预算：`token_limit` 的 15%
-- 低优先级记忆使用二分查找截断
-- System Prompt 只包含稳定规则与记忆；当前时间、时区、workspace 等 runtime context 由 LLM 请求组装层临时注入，不写入 SOUL / USER / MEMORY / AGENTS，也不回写用户 DB。
+- 主会话默认 system prompt 的固定输入仅由用户 DB 中的 SOUL / USER 与平台 AGENTS.md 模板拼接；Cron 与子 Agent 的独立 override 规则见各自 spec
+- 当前实现不将 `MEMORY.md` 内容拼入 system prompt；它继续以 DB 为权威源持久化，并可通过显式文件/记忆工具或 `search_memory` 按需读取
+- 当前时间、时区、workspace 等 runtime context 由 LLM 请求组装层临时注入，不写入 SOUL / USER / MEMORY / AGENTS，也不回写用户 DB
+
+### 写入与自动化边界
+
+- 当前没有任何轮后、token 阈值或 compaction 联动的模型记忆写入流程；Round 收尾只同步本轮已经显式发生的 dirty 文件写入，并为本轮对话维护 `conversation/*` episodic embedding
+- `conversation/*` 是可检索的对话索引，不是 canonical Memory，也不得被当作自动提炼结果写回 `MEMORY.md`
+- 后续若引入候选提炼，必须在会话真正空闲后由持久化后台 job 执行，允许明确 no-op，并在进入模型前过滤 compaction summary、AGENTS/developer 指令、测试夹具及临时任务状态
+- 后续候选只能写 append-only staging；在 consolidator 去重、解决冲突并按 scope 晋升前，不得更新 canonical Memory。该 candidate/consolidator 管道当前尚未实现
 
 ---
 

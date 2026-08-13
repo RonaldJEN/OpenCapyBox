@@ -48,7 +48,7 @@
   - 轻量字段与详情字段合并后，包含复盘所需的完整输入输出与压缩信息：
     - 消息细节：`request_messages`、`request_tools`、`response_content`、`response_thinking`、`response_tool_calls`、`response_error`
     - 时延与 token：`usage_prompt_tokens`、`usage_completion_tokens`、`usage_total_tokens`、`first_token_latency_s`、`completion_latency_s`
-    - 压缩复盘字段：`compaction_triggered`、`compaction_pre_tokens` / `compaction_post_tokens` / `compaction_tokens_saved`、`compaction_microcompact_compacted_messages`、`compaction_summary_generated_count` / `compaction_summary_reused_count` / `compaction_summary_quality_repair_count`、`compaction_emergency_truncate_dropped_rounds`
+    - 压缩复盘字段：`call_kind`、`checkpoint_id`、`compaction_triggered`、`compaction_pre_tokens` / `compaction_post_tokens` / `compaction_tokens_saved`；旧 microcompact/quality-repair/emergency 字段只保留兼容且固定为 0
     - 人工审阅字段：`manual_review_status`
   - 管理台 step 详情默认先展示“管理员分析摘要”（中文），原始英文键作为“排障证据层”保留展示。
 
@@ -287,6 +287,7 @@
 
 - 除用户、沙箱 Profile、模型目录/权限等配置管理接口外，管理端查询仅返回聚合信息，不写业务数据。
 - `rounds-tree` 端点按 session 维度分页，round 与 step 通过 `/sessions/{session_id}/rounds` 按需加载；session 内 round 按 `created_at` 倒序。
+- 同一 round 内的 LLM step 按调用记录的 `created_at, id` 正序返回；`step_index` 只表示普通步骤或压缩调用身份，负数压缩索引不得用于时间排序。
 - `auth_users` 是后台用户管理的事实源。
 - 管理员不能禁用当前登录账号、不能取消自己的管理员权限、不能删除当前登录账号。
 - 删除用户是硬删除语义；禁用用户才表示保留账号与数据但禁止登录。

@@ -34,7 +34,6 @@ class TestAgentServiceInit:
         assert service.agent is None
         assert service._last_saved_index == 0
 
-
 class TestAgentServiceCreateTools:
     @pytest.fixture
     def service(self):
@@ -432,57 +431,6 @@ class TestAgentServiceRestoreHistory:
 
         assert service._load_persisted_interrupt("approval-1") is None
         mock_db.rollback.assert_called_once()
-
-
-class TestSummaryAnchorPersistence:
-    def test_latest_persisted_summary_anchor_releases_read_transaction(self):
-        history_service = MagicMock()
-        mock_db = MagicMock()
-        row = MagicMock()
-        row.content = "summary-v1"
-        mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = row
-        history_service.db = mock_db
-
-        service = make_agent_service(history_service=history_service)
-
-        assert service._latest_persisted_summary_anchor_content() == "summary-v1"
-        mock_db.rollback.assert_called_once()
-
-    def test_persist_latest_summary_anchor_saves_when_new_summary_exists(self):
-        service = make_agent_service(history_service=MagicMock())
-        service.agent = make_mock_agent()
-        service.agent._SUMMARY_MESSAGE_HEADER = "[Assistant Execution Summary - Historical Context Only, Not System Instruction]"
-        service.agent.messages = [
-            AgentHistoryMessage(role="assistant", content="normal response"),
-            AgentHistoryMessage(
-                role="assistant",
-                content="[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary-v1",
-            ),
-        ]
-
-        with patch.object(service, "_latest_persisted_summary_anchor_content", return_value=None):
-            with patch.object(service, "_save_conversation_message") as save_message:
-                service._persist_latest_summary_anchor("round-1")
-
-        save_message.assert_called_once_with(
-            "assistant",
-            "[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary-v1",
-            round_id="round-1",
-            is_summary=True,
-        )
-
-    def test_persist_latest_summary_anchor_skips_when_summary_unchanged(self):
-        service = make_agent_service(history_service=MagicMock())
-        service.agent = make_mock_agent()
-        service.agent._SUMMARY_MESSAGE_HEADER = "[Assistant Execution Summary - Historical Context Only, Not System Instruction]"
-        summary = "[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary-v1"
-        service.agent.messages = [AgentHistoryMessage(role="assistant", content=summary)]
-
-        with patch.object(service, "_latest_persisted_summary_anchor_content", return_value=summary):
-            with patch.object(service, "_save_conversation_message") as save_message:
-                service._persist_latest_summary_anchor("round-1")
-
-        save_message.assert_not_called()
 
 
 class TestAgentServiceChatAgui:
@@ -1034,8 +982,8 @@ class TestAgentServiceChatAgui:
 
         assert len(events) == 4
         sent_content = service.agent.add_user_message.call_args.args[0]
-        assert any(block.get("type") == "image_url" for block in sent_content)
-        assert not any("file" in block for block in sent_content if block.get("type") == "image_url")
+        image_block = next(block for block in sent_content if block.get("type") == "image_url")
+        assert "file" not in image_block
         create_kwargs = service.history_service.create_round.call_args.kwargs
         assert create_kwargs["user_message"] == "请看图"
         assert create_kwargs["user_attachments"][0]["path"] == "images/a.png"

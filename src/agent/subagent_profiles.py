@@ -22,7 +22,6 @@ _ALWAYS_EXCLUDED: frozenset[str] = frozenset(
 # 记忆写工具：研究/产物子任务不应改写用户分层记忆。
 _MEMORY_WRITE_TOOLS: frozenset[str] = frozenset(
     {
-        "RecordDailyLogTool",
         "UpdateLongTermMemoryTool",
         "UpdateUserProfileTool",
     }

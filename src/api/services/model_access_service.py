@@ -123,6 +123,8 @@ def seed_model_catalog_from_yaml_if_empty(db: DBSession, yaml_path: str | Path |
             model_name=cfg.get("model_name", str(model_id)),
             max_tokens=int(cfg.get("max_tokens", 16384)),
             context_window=int(cfg.get("context_window", 128000)),
+            auto_compact_token_limit=cfg.get("auto_compact_token_limit"),
+            tool_output_truncation_bytes=int(cfg.get("tool_output_truncation_bytes", 10000)),
             reasoning_format=cfg.get("reasoning_format", "none"),
             reasoning_split=bool(cfg.get("reasoning_split", False)),
             enable_thinking=bool(cfg.get("enable_thinking", False)),
@@ -163,6 +165,16 @@ def db_model_to_config(model: LLMModel) -> ModelConfig:
         model_name=model.model_name,
         max_tokens=int(model.max_tokens or 16384),
         context_window=int(model.context_window or 128000),
+        auto_compact_token_limit=(
+            int(model.auto_compact_token_limit)
+            if model.auto_compact_token_limit is not None
+            else None
+        ),
+        tool_output_truncation_bytes=int(
+            10000
+            if model.tool_output_truncation_bytes is None
+            else model.tool_output_truncation_bytes
+        ),
         reasoning_format=model.reasoning_format or "none",
         reasoning_split=bool(model.reasoning_split),
         enable_thinking=bool(model.enable_thinking),
@@ -429,6 +441,8 @@ def admin_model_payload(db: DBSession, model: LLMModel) -> dict[str, Any]:
         "model_name": model.model_name,
         "max_tokens": model.max_tokens,
         "context_window": model.context_window,
+        "auto_compact_token_limit": model.auto_compact_token_limit,
+        "tool_output_truncation_bytes": model.tool_output_truncation_bytes,
         "reasoning_format": model.reasoning_format,
         "reasoning_split": bool(model.reasoning_split),
         "enable_thinking": bool(model.enable_thinking),

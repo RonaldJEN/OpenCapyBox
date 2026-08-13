@@ -36,6 +36,7 @@ def _import_models():
     from src.api.models.conversation_message import ConversationMessage as _  # noqa: F401
     from src.api.models.interrupt_resolution import InterruptResolution as _  # noqa: F401
     from src.api.models.llm_call_record import LLMCallRecord as _  # noqa: F401
+    from src.api.models.context_checkpoint import ContextCheckpoint as _  # noqa: F401
     from src.api.models.user_memory import (  # noqa: F401
         UserMemory, MemoryEmbedding, CronJobRun, UserSkillConfig
     )
@@ -314,6 +315,7 @@ _PENDING_COLUMNS = [
     ("rounds", "idempotency_key", "VARCHAR(64)"),
     ("conversation_messages", "is_synthetic", f"BOOLEAN DEFAULT {_BOOL_FALSE}"),
     ("llm_call_records", "request_message_count", "INTEGER"),
+    ("llm_call_records", "call_kind", "VARCHAR(30) NOT NULL DEFAULT 'agent_step'"),
     ("llm_call_records", "manual_review_status", "VARCHAR(20) NOT NULL DEFAULT '没问题'"),
     ("llm_call_records", "first_token_latency_s", "FLOAT"),
     ("llm_call_records", "completion_latency_s", "FLOAT"),
@@ -326,6 +328,16 @@ _PENDING_COLUMNS = [
     ("llm_call_records", "compaction_summary_reused_count", "INTEGER"),
     ("llm_call_records", "compaction_summary_quality_repair_count", "INTEGER"),
     ("llm_call_records", "compaction_emergency_truncate_dropped_rounds", "INTEGER"),
+    ("llm_call_records", "history_strategy", "VARCHAR(30)"),
+    ("llm_call_records", "checkpoint_id", "VARCHAR(36)"),
+    ("llm_call_records", "history_payload_sha256", "VARCHAR(64)"),
+    ("llm_call_records", "history_breakdown_json", "TEXT"),
+    ("llm_models", "auto_compact_token_limit", "INTEGER"),
+    ("llm_models", "tool_output_truncation_bytes", "INTEGER NOT NULL DEFAULT 10000"),
+    ("context_checkpoints", "source_message_sequence", "INTEGER NOT NULL DEFAULT 0"),
+    ("context_checkpoints", "source_event_sequence", "INTEGER NOT NULL DEFAULT 0"),
+    ("context_checkpoints", "trigger_phase", "VARCHAR(30) NOT NULL DEFAULT 'pre_turn'"),
+    ("context_checkpoints", "summary_text", "TEXT NOT NULL DEFAULT ''"),
     ("user_run_locks", "lock_id", "VARCHAR(36) DEFAULT ''"),
     ("user_run_locks", "slot", "INTEGER NOT NULL DEFAULT 0"),
     # Cron 消息中心：未读标记（存量默认已读）、产物元数据、运行工作目录
@@ -544,6 +556,17 @@ def _migrate_add_columns(target_engine=None):
                 if col["name"] == "model_id" and hasattr(col["type"], "length") and (col["type"].length or 0) < 100:
                     conn.execute(text("ALTER TABLE sessions ALTER COLUMN model_id TYPE VARCHAR(100)"))
                     logger.info("DB 迁移: sessions.model_id 从 VARCHAR(%s) 升级为 VARCHAR(100)", col["type"].length)
+
+        if (
+            bind_engine.dialect.name == "postgresql"
+            and inspector.has_table("context_checkpoints")
+        ):
+            conn.execute(text(
+                "ALTER TABLE context_checkpoints ALTER COLUMN source_round_id DROP NOT NULL"
+            ))
+            conn.execute(text(
+                "ALTER TABLE context_checkpoints ALTER COLUMN replacement_sha256 DROP NOT NULL"
+            ))
 
         if inspector.has_table("user_skill_configs"):
             for col in inspector.get_columns("user_skill_configs"):

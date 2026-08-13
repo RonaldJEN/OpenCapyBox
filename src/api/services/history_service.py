@@ -5,6 +5,7 @@
 - AGUIEventLog: AG-UI 事件流（包含完整的步驟細節，用於 SSE 重連和歷史重建）
 """
 from collections.abc import Callable
+import hashlib
 from sqlalchemy.orm import Session as DBSession
 from sqlalchemy.exc import IntegrityError
 from src.api.models.session import Session
@@ -15,6 +16,7 @@ from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.subagent_run import SubagentRun
 from src.api.models.tool_permission import ToolApprovalRequest
 from src.agent.schema.agui_events import AGUIEvent, EventType
+from src.agent.context_compaction import SUMMARY_PREFIX
 from src.api.services.agui_event_bus import AguiEventBus, StoredEvent
 from src.api.services.run_completion_service import RunCompletionService
 from typing import List, Dict, Optional, AsyncIterator, Any
@@ -847,6 +849,9 @@ class HistoryService:
         compaction_summary_reused_count: int | None = None,
         compaction_summary_quality_repair_count: int | None = None,
         compaction_emergency_truncate_dropped_rounds: int | None = None,
+        history_strategy: str | None = None,
+        checkpoint_id: str | None = None,
+        call_kind: str = "agent_step",
     ) -> LLMCallRecord:
         """持久化单次 LLM 调用快照。"""
         request_message_count = len(request_messages)
@@ -857,13 +862,59 @@ class HistoryService:
         ):
             request_message_count = len(request_messages[0]["messages"])
 
+        provider_messages = request_messages
+        if (
+            len(request_messages) == 1
+            and isinstance(request_messages[0], dict)
+            and isinstance(request_messages[0].get("messages"), list)
+        ):
+            provider_messages = request_messages[0]["messages"]
+
+        breakdown = {
+            "real_user": 0,
+            "assistant": 0,
+            "assistant_with_tool_calls": 0,
+            "tool_results": 0,
+            "synthetic_user": 0,
+            "automatic_image_context": 0,
+            "compaction_summary": 0,
+        }
+        for message in provider_messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            is_synthetic = bool(message.get("is_synthetic", False))
+            if role == "user":
+                breakdown["synthetic_user" if is_synthetic else "real_user"] += 1
+                if isinstance(content, str) and content.startswith(SUMMARY_PREFIX):
+                    breakdown["compaction_summary"] += 1
+                if isinstance(content, list):
+                    breakdown["automatic_image_context"] += sum(
+                        1
+                        for block in content
+                        if isinstance(block, dict) and block.get("type") == "image_url"
+                    )
+            elif role == "assistant":
+                breakdown["assistant"] += 1
+                if message.get("tool_calls"):
+                    breakdown["assistant_with_tool_calls"] += 1
+                if isinstance(content, str) and content.startswith("[Cumulative Conversation Summary"):
+                    breakdown["compaction_summary"] += 1
+            elif role == "tool":
+                breakdown["tool_results"] += 1
+
+        request_json = json.dumps(request_messages, ensure_ascii=False)
+        payload_sha256 = hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+
         row = LLMCallRecord(
             session_id=session_id,
             round_id=round_id,
             step_index=step_index,
+            call_kind=call_kind,
             request_message_count=request_message_count,
             manual_review_status="没问题",
-            request_messages=json.dumps(request_messages, ensure_ascii=False),
+            request_messages=request_json,
             request_tools=json.dumps(request_tools, ensure_ascii=False),
             response_content=response_content,
             response_thinking=response_thinking,
@@ -888,6 +939,10 @@ class HistoryService:
             compaction_summary_reused_count=compaction_summary_reused_count,
             compaction_summary_quality_repair_count=compaction_summary_quality_repair_count,
             compaction_emergency_truncate_dropped_rounds=compaction_emergency_truncate_dropped_rounds,
+            history_strategy=history_strategy,
+            checkpoint_id=checkpoint_id,
+            history_payload_sha256=payload_sha256,
+            history_breakdown_json=json.dumps(breakdown, ensure_ascii=False, separators=(",", ":")),
         )
         self.db.add(row)
         self.db.commit()

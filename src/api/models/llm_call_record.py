@@ -23,6 +23,7 @@ class LLMCallRecord(Base):
     session_id = Column(String(36), ForeignKey("sessions.id"), nullable=False, index=True)
     round_id = Column(String(36), ForeignKey("rounds.id", ondelete="CASCADE"), nullable=False, index=True)
     step_index = Column(Integer, nullable=False)
+    call_kind = Column(String(30), nullable=False, default="agent_step", server_default=text("'agent_step'"))
     request_message_count = Column(Integer, nullable=True)
     manual_review_status = Column(
         String(20),
@@ -55,5 +56,10 @@ class LLMCallRecord(Base):
     compaction_summary_reused_count = Column(Integer, nullable=True)
     compaction_summary_quality_repair_count = Column(Integer, nullable=True)
     compaction_emergency_truncate_dropped_rounds = Column(Integer, nullable=True)
+
+    history_strategy = Column(String(30), nullable=True)
+    checkpoint_id = Column(String(36), nullable=True)
+    history_payload_sha256 = Column(String(64), nullable=True)
+    history_breakdown_json = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=now_naive, nullable=False, index=True)

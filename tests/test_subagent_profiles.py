@@ -50,7 +50,6 @@ def test_research_forbids_workspace_writes_and_memory_writes():
     exclude = resolve_profile("research").tool_exclude
     assert {"SandboxWriteTool", "SandboxEditTool"}.issubset(exclude)
     assert {
-        "RecordDailyLogTool",
         "UpdateLongTermMemoryTool",
         "UpdateUserProfileTool",
     }.issubset(exclude)
@@ -67,7 +66,6 @@ def test_write_allows_workspace_writes_but_forbids_memory_writes():
     assert "SandboxWriteTool" not in exclude
     assert "SandboxEditTool" not in exclude
     assert {
-        "RecordDailyLogTool",
         "UpdateLongTermMemoryTool",
         "UpdateUserProfileTool",
     }.issubset(exclude)
@@ -76,7 +74,7 @@ def test_write_allows_workspace_writes_but_forbids_memory_writes():
 def test_general_allows_writes_and_memory_but_forbids_cron():
     exclude = resolve_profile("general").tool_exclude
     assert "SandboxWriteTool" not in exclude
-    assert "RecordDailyLogTool" not in exclude
+    assert "UpdateLongTermMemoryTool" not in exclude
     assert "ManageCronTool" in exclude
 
 

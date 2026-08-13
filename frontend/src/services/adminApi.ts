@@ -24,6 +24,8 @@ export interface AdminOverview {
 export interface AdminRoundStepItem {
   llm_record_id: number;
   step_index: number;
+  call_kind?: 'agent_step' | 'compaction';
+  checkpoint_id?: string | null;
   request_message_count: number;
   request_messages: string;
   request_tools: string;

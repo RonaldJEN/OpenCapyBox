@@ -12,6 +12,15 @@
 
 复用 memory-spec 中的 `user_memory`、`user_skill_configs` 表，并使用 `user_skill_inventory_snapshots` 保存用户 Skill 最近一次完整扫描快照。
 
+### Chat 长程上下文配置
+
+| Settings 字段 | 默认值 | 语义 |
+|---|---:|---|
+| `agent_history_strategy` | `checkpoint_v1` | 默认使用累计替代 checkpoint；`legacy_120` 仅作回滚 |
+| `agent_max_history_messages` | `120` | 只在 legacy 策略生效；默认策略不得按消息条数裁剪 |
+
+模型级 `auto_compact_token_limit` 可覆盖自动压缩阈值，但不得超过 `(context_window - max_tokens) * 80%`；未配置时直接使用该值。模型级 `tool_output_truncation_bytes` 必须大于 0，默认 10,000 bytes；工具结果写入历史时使用 1.2 倍序列化余量并保留 UTF-8 首尾。压缩请求使用完整规范化历史和固定 Codex prompt；replacement 固定为不超过 20,000 近似 token 的最新真实 user 原文，加一条 role=user 的 synthetic summary。不存在首轮锚点、摘要格式校验、文件证据回灌、工具批次保护、单项 10k-token ceiling、确定性摘要或熔断。
+
 `user_skill_inventory_snapshots` 每用户至多一行，保存 sandbox/Profile 代际、仅含可用 Skill 元数据的 `inventory_json`、逐项隔离诊断 `issues_json`、revision 与扫描开始时间。两份 JSON 必须属于同一次扫描并在同一事务中原子发布。无行表示从未成功完整扫描；`inventory_json=[]` 可表示目录确实为空，也可表示全部候选均损坏，此时由 `issues_json` 区分。Skill 正文和启停状态不得写入该快照。沙箱文件仍是用户 Skill 的事实源，DB 只服务于快速清单读取。
 
 ### Skill 元数据（文件系统）
@@ -33,12 +42,11 @@
 | SandboxBashOutputTool | bash_output | 获取后台进程输出 |
 | SandboxBashKillTool | bash_kill | 终止后台进程 |
 | SandboxSessionNoteTool | record_note | 会话内笔记 |
-| RecallNoteTool | recall_note | 回忆笔记 |
-| RecordDailyLog | record_memory | 记录日常记忆 |
-| UpdateLongTermMemory | update_long_term_memory | 更新长期记忆 |
-| SearchMemory | search_memory | 搜索记忆 |
-| ReadUserProfile | read_user_profile | 读用户画像 |
-| UpdateUserProfile | update_user | 更新用户画像 |
+| SandboxRecallNoteTool | recall_notes | 回忆笔记 |
+| UpdateLongTermMemoryTool | update_long_term_memory | 显式读写/追加 MEMORY.md，不自动触发 |
+| SearchMemoryTool | search_memory | 只读检索长期记忆与对话轮索引 |
+| ReadUserProfileTool | read_user | 读用户画像 |
+| UpdateUserProfileTool | update_user | 显式更新用户画像 |
 | ManageCron | manage_cron | 管理定时任务 |
 | AskUserQuestion | ask_user | 人机交互中断 |
 | SubAgentTool | sub_agent | 子 Agent 委托（创建 child Round + graph edge，父 Agent 等待结果） |
@@ -126,12 +134,13 @@
 
 1. DB upsert（乐观锁）
 2. Force push to sandbox
-3. Invalidate AgentPool cache（下次请求重建 Agent with 新 system prompt）
+3. Invalidate AgentPool cache（下次请求按当前 SOUL / USER / AGENTS 重建 system prompt；`MEMORY.md` 仍不注入）
 
 失效语义：
 
 - idle Agent 立即从 AgentPool 移除；若其 tracker 中仍有后台 bash 命令，按 AgentPool eviction 规则做清理。
 - running Agent 不得被 close / interrupt。配置更新只标记该 session 懒失效；当前 run 自然结束后，下一次 `get_or_create` 必须重建 Agent，避免继续使用旧 system prompt。
+- 编辑 `MEMORY.md` 仍执行统一的缓存失效流程，但当前前端/API 写路径不重建 embedding，且后续 system prompt 不包含其正文；显式文件/记忆工具可读取最新正文，`search_memory` 在索引重建前可能仍命中旧分块。
 - 当前时间、时区、workspace 等 runtime context 不属于用户可配置 Agent 文件；它们在每次 LLM provider request 组装时临时注入，因此不依赖 AgentPool 失效来刷新。
 
 ### 子 Agent Profile（sub_agent）
@@ -140,7 +149,7 @@
 
 **核心不变量**：
 
-- 子 Agent **不继承**父 Agent 的分层记忆（SOUL/AGENTS）作为系统提示，而是加载 profile 自带的精简系统提示（runner 通过 `AgentService(system_prompt_override=...)` 注入）。
+- 子 Agent **不继承**父 Agent 的 SOUL / USER / AGENTS 系统提示；MEMORY 正文原本就不注入。子 Agent 只加载 profile 自带的精简系统提示（runner 通过 `AgentService(system_prompt_override=...)` 注入）。
 - 子 Agent 一律禁用 `AskUserQuestionTool`（无人值守）与 `SubAgentTool`（防止无限嵌套）。
 - 子 Agent 一律禁用 `ManageCronTool`。
 - profile 通过 `tool_exclude` set 喂入 `create_agent_tools`，复用既有 exclude 机制。
@@ -149,7 +158,7 @@
 
 | profile | 定位 | 额外禁用工具（在公共禁用之外） |
 | --- | --- | --- |
-| `research` | 读 + 联网 + 抓取（bash），靠提示约束不主动改 workspace | `SandboxWriteTool`、`SandboxEditTool`、记忆写工具（`RecordDailyLog`/`UpdateLongTermMemory`/`UpdateUserProfile`） |
+| `research` | 读 + 联网 + 抓取（bash），靠提示约束不主动改 workspace | `SandboxWriteTool`、`SandboxEditTool`、记忆写工具（`UpdateLongTermMemoryTool`/`UpdateUserProfileTool`） |
 | `write` | 办公长任务产物工：创建/更新/修改/批注 workspace 文件 | 记忆写工具 |
 | `general` | 兜底（默认） | 无 |
 

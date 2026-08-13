@@ -34,6 +34,33 @@ class TestAdminRouter:
         assert resp.status_code == 403
         assert "管理员权限" in resp.json()["detail"]
 
+    def test_create_model_rejects_zero_tool_output_truncation_bytes(self):
+        client = _make_client(admin_enabled=True)
+
+        resp = client.post("/admin/models", json={
+            "model_id": "zero-truncation",
+            "display_name": "Zero Truncation",
+            "provider": "openai",
+            "api_base": "https://api.example.com/v1",
+            "api_key": "test-key",
+            "model_name": "zero-truncation",
+            "max_tokens": 8192,
+            "context_window": 128000,
+            "tool_output_truncation_bytes": 0,
+        })
+
+        assert resp.status_code == 422
+
+    def test_patch_model_rejects_zero_tool_output_truncation_bytes(self):
+        client = _make_client(admin_enabled=True)
+
+        resp = client.patch(
+            "/admin/models/existing-model",
+            json={"tool_output_truncation_bytes": 0},
+        )
+
+        assert resp.status_code == 422
+
     def test_overview_delegates_to_builder(self):
         client = _make_client(admin_enabled=True)
         payload = {"summary": {"users_total": 2}, "trends": []}

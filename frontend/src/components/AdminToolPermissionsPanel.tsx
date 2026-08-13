@@ -45,7 +45,6 @@ const BUILTIN_TOOLS = [
   'bash_kill',
   'record_note',
   'recall_notes',
-  'record_memory',
   'update_long_term_memory',
   'search_memory',
   'read_user',

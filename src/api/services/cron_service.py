@@ -642,7 +642,6 @@ async def run_cron_job(
                 "AskUserQuestionTool",
                 "SandboxSessionNoteTool",
                 "SandboxRecallNoteTool",
-                "RecordDailyLogTool",
                 "UpdateLongTermMemoryTool",
                 "SearchMemoryTool",
                 "ReadUserProfileTool",

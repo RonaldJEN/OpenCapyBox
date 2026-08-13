@@ -2,7 +2,9 @@
 
 import json
 import asyncio
+import hashlib
 import logging
+import posixpath
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -14,10 +16,9 @@ from typing import AsyncIterator, Optional, Any, Callable, Awaitable
 import tiktoken
 
 from src.api.utils.timezone import get_timezone, get_timezone_offset
-
 from .llm import LLMClient
 from .logger import AgentLogger
-from .schema import Message
+from .schema import FunctionCall, Message, ToolCall
 from .schema.run_context import (
     LLMRequestContext,
     render_preferred_skills_context_block,
@@ -35,8 +36,16 @@ from .tools.tool_discovery import (
     bound_tool_search_text,
 )
 from .utils import calculate_display_width
-from .utils.token_utils import truncate_text_by_tokens
 from .event_emitter import AGUIEventEmitter
+from .context_compaction import (
+    DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES,
+    SUMMARIZATION_PROMPT,
+    build_compacted_history,
+    is_compaction_model_fallback_error,
+    is_context_window_error,
+    normalize_history,
+    truncate_tool_output,
+)
 from .schema.agui_events import (
     AGUIEvent, AgentState, CustomEvent, EventType, InterruptDetails,
 )
@@ -94,6 +103,301 @@ class _PendingApprovedToolCall:
     claim_token: str | None = None
 
 
+@dataclass(frozen=True)
+class _ToolLoopObservation:
+    fingerprint: str
+    policy: str
+    outcome: str
+    result_signature: str
+    tool_name: str
+
+
+class _ToolLoopGuard:
+    """Run-local no-progress guard independent from compacted chat history."""
+
+    _READ_ONLY_TOOLS = frozenset({
+        "read_file",
+        "read_image_file",
+        "read_user",
+        "search_memory",
+        "recall_notes",
+    })
+    _MUTATING_TOOLS = frozenset({
+        "write_file",
+        "create_file",
+        "edit_file",
+        "bash_kill",
+        "record_note",
+        "update_long_term_memory",
+        "update_user",
+    })
+    _POLLING_TOOLS = frozenset({"bash_output"})
+    def __init__(self, *, workspace_dir: str | None = None) -> None:
+        self._observations: list[_ToolLoopObservation] = []
+        self._active_recoveries: dict[str, frozenset[str]] = {}
+        self._workspace_dir = (
+            posixpath.normpath(workspace_dir.replace("\\", "/"))
+            if workspace_dir
+            else None
+        )
+
+    def _canonicalize(self, value: Any, *, key: str | None = None) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(item_key): self._canonicalize(item_value, key=str(item_key))
+                for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
+            }
+        if isinstance(value, list):
+            return [self._canonicalize(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._canonicalize(item) for item in value]
+        if (
+            isinstance(value, str)
+            and key in {"path", "file_path", "cwd", "workdir", "directory"}
+        ):
+            # The sandbox is Linux even when the API process runs on Windows.
+            # Normalize separators but deliberately retain POSIX case.
+            normalized = posixpath.normpath(value.replace("\\", "/"))
+            if self._workspace_dir and not posixpath.isabs(normalized):
+                normalized = posixpath.normpath(
+                    posixpath.join(self._workspace_dir, normalized)
+                )
+            return normalized
+        return value
+
+    @classmethod
+    def _policy(cls, tool: Tool | None, tool_name: str, arguments: Any) -> str:
+        declared = None
+        explicit_declaration = False
+        if tool is not None:
+            explicit_declaration = (
+                "repeat_policy" in tool.__dict__
+                or "repeat_policy" in tool.__class__.__dict__
+                or "repeat_policy_for" in tool.__class__.__dict__
+            )
+            resolver = getattr(tool, "repeat_policy_for", None)
+            if callable(resolver):
+                declared = resolver(arguments if isinstance(arguments, dict) else {})
+            else:
+                declared = tool.__dict__.get(
+                    "repeat_policy",
+                    tool.__class__.__dict__.get("repeat_policy"),
+                )
+        if (
+            declared in {"read_only", "mutating", "polling"}
+            or declared == "standard" and explicit_declaration
+        ):
+            return declared
+        if tool_name in {"update_long_term_memory", "update_user"}:
+            return (
+                "read_only"
+                if isinstance(arguments, dict) and arguments.get("mode") == "read"
+                else "mutating"
+            )
+        if tool_name in cls._READ_ONLY_TOOLS:
+            return "read_only"
+        if tool_name in cls._MUTATING_TOOLS:
+            return "mutating"
+        if tool_name in cls._POLLING_TOOLS:
+            return "polling"
+        if tool_name == "bash":
+            # Shell strings cannot be classified safely by their first token:
+            # e.g. ``find . -delete`` and ``ls; rm`` start like reads. Keep the
+            # conservative bounded-repeat policy unless the tool itself grows
+            # a structured, invocation-aware declaration.
+            return "standard"
+        return "standard"
+
+    def _fingerprint(
+        self,
+        tool: Tool | None,
+        tool_name: str,
+        arguments: Any,
+    ) -> tuple[str, str]:
+        ref = getattr(tool, "tool_ref", None)
+        identity = {
+            "provider": getattr(ref, "provider", "unknown"),
+            "name": getattr(ref, "name", tool_name),
+            "server_id": getattr(ref, "server_id", None),
+            "installation_id": getattr(ref, "installation_id", None),
+        }
+        canonical = {
+            "tool": identity,
+            "arguments": self._canonicalize(arguments),
+        }
+        serialized = json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest(), self._policy(
+            tool,
+            tool_name,
+            arguments,
+        )
+
+    def check(
+        self,
+        *,
+        tool: Tool | None,
+        tool_name: str,
+        arguments: Any,
+    ) -> tuple[str, str, str | None, bool]:
+        fingerprint, policy = self._fingerprint(tool, tool_name, arguments)
+        matching = [item for item in self._observations if item.fingerprint == fingerprint]
+
+        for recovery_key, members in self._active_recoveries.items():
+            if fingerprint in members:
+                return fingerprint, policy, (
+                    "Runtime blocked a tool call from the no-progress pattern that "
+                    "was just rejected. Use a genuinely different strategy or answer "
+                    "with the evidence already available."
+                ), True
+
+        def blocked(
+            *,
+            recovery_key: str,
+            members: frozenset[str],
+            message: str,
+        ) -> tuple[str, str, str, bool]:
+            terminal = recovery_key in self._active_recoveries
+            self._active_recoveries[recovery_key] = members
+            return fingerprint, policy, message, terminal
+
+        if policy in {"mutating", "standard"} and any(
+            item.outcome == "uncertain" for item in matching
+        ):
+            return blocked(
+                recovery_key=f"uncertain:{fingerprint}",
+                members=frozenset({fingerprint}),
+                message=(
+                    "Runtime blocked this repeated side-effecting tool call because "
+                    "the previous attempt had an uncertain outcome. Verify state with "
+                    "a read-only operation or choose a different strategy."
+                ),
+            )
+
+        if policy == "mutating" and any(item.outcome == "success" for item in matching):
+            return blocked(
+                recovery_key=f"mutation:{fingerprint}",
+                members=frozenset({fingerprint}),
+                message=(
+                    "Runtime blocked an identical mutating tool call that already "
+                    "succeeded in this run. Inspect the existing result instead of "
+                    "repeating the side effect."
+                ),
+            )
+
+        limit = 20 if policy == "polling" else 2
+        consecutive: list[_ToolLoopObservation] = []
+        for item in reversed(self._observations):
+            if item.fingerprint != fingerprint:
+                break
+            consecutive.append(item)
+        if len(consecutive) >= limit:
+            tail = consecutive[:limit]
+            signatures = {item.result_signature for item in tail}
+            outcomes = {item.outcome for item in tail}
+            if len(signatures) == 1 and len(outcomes) == 1:
+                return blocked(
+                    recovery_key=f"repeat:{fingerprint}",
+                    members=frozenset({fingerprint}),
+                    message=(
+                        "Runtime detected repeated tool calls with identical arguments "
+                        "and no changed result. Use the result already returned, change "
+                        "strategy, or answer with the available evidence."
+                    ),
+                )
+
+        if policy in {"read_only", "polling"} and len(consecutive) >= 2:
+            uncertain_tail = consecutive[:2]
+            if (
+                all(item.outcome == "uncertain" for item in uncertain_tail)
+                and len({item.result_signature for item in uncertain_tail}) == 1
+            ):
+                return blocked(
+                    recovery_key=f"uncertain-retry:{fingerprint}",
+                    members=frozenset({fingerprint}),
+                    message=(
+                        "Runtime detected two identical uncertain outcomes for this "
+                        "read/poll operation. Stop retrying and change strategy."
+                    ),
+                )
+
+        # Observe both complete A/B cycles before rejecting another member. A
+        # result may legitimately change on the fourth call, so predicting the
+        # cycle before B2 executes would turn the guard into a false positive.
+        if policy == "read_only" and len(self._observations) >= 4:
+            first, second, third, fourth = self._observations[-4:]
+            if (
+                first.policy == second.policy == third.policy == fourth.policy == "read_only"
+                and first.fingerprint == third.fingerprint
+                and second.fingerprint == fourth.fingerprint
+                and first.fingerprint != second.fingerprint
+                and first.outcome == third.outcome
+                and first.result_signature == third.result_signature
+                and second.outcome == fourth.outcome
+                and second.result_signature == fourth.result_signature
+                and fingerprint in {first.fingerprint, second.fingerprint}
+            ):
+                members = frozenset({first.fingerprint, second.fingerprint})
+                recovery_key = "cycle:" + ":".join(sorted(members))
+                return blocked(
+                    recovery_key=recovery_key,
+                    members=members,
+                    message=(
+                        "Runtime detected a no-progress A/B/A/B tool cycle. Stop "
+                        "re-reading and searching the same state; choose a different "
+                        "strategy or answer with the evidence already available."
+                    ),
+                )
+
+        return fingerprint, policy, None, False
+
+    def observe(
+        self,
+        *,
+        fingerprint: str,
+        policy: str,
+        tool_name: str,
+        result: ToolResult,
+        result_content: str,
+    ) -> None:
+        outcome = (
+            "uncertain"
+            if result.outcome_uncertain
+            else "success" if result.success else "failed"
+        )
+        result_signature = hashlib.sha256(
+            f"{outcome}\0{result_content}".encode("utf-8")
+        ).hexdigest()
+        if result.success:
+            # A successful call outside a rejected pattern is concrete recovery
+            # progress.  A later, unrelated loop receives its own opportunity
+            # instead of inheriting a run-global strike.
+            self._active_recoveries = {
+                key: members
+                for key, members in self._active_recoveries.items()
+                if fingerprint in members
+            }
+        if policy == "mutating" and result.success:
+            # A confirmed mutation invalidates prior read/search observations.
+            # Retain earlier mutation records so an identical side effect remains
+            # exactly-once within this run.
+            self._observations = [
+                item for item in self._observations if item.policy == "mutating"
+            ]
+        self._observations.append(_ToolLoopObservation(
+            fingerprint=fingerprint,
+            policy=policy,
+            outcome=outcome,
+            result_signature=result_signature,
+            tool_name=tool_name,
+        ))
+
+
 # ANSI color codes
 class Colors:
     """Terminal color definitions"""
@@ -131,7 +435,7 @@ class Agent:
         tools: list[Tool],
         max_steps: int = 50,
         workspace_dir: str = "./workspace",
-        token_limit: int = 80000,  # Summary triggered when tokens exceed this value
+        token_limit: int | None = None,  # Backward-compatible custom auto-compact limit
         context_window: int = 128000,  # 模型總上下文窗口大小
         max_output_tokens: int = 16384,  # 單次輸出上限（output tokens）
         tool_timeout: int = 300,  # 单次工具执行超时（秒），0 表示不限
@@ -141,6 +445,10 @@ class Agent:
         deferred_tool_catalog_is_current: Callable[[], bool] | None = None,
         user_id: str | None = None,
         allow_human_interrupts: bool = True,
+        auto_compact_token_limit: int | None = None,
+        tool_output_truncation_bytes: int = DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES,
+        supports_image: bool = True,
+        supports_video: bool = True,
     ):
         self.llm = llm_client
         self.tools: dict[str, Tool] = {}
@@ -157,30 +465,39 @@ class Agent:
                 )
             self.tools[tool.name] = tool
 
-        # Level 2 microcompact: tool result 超過此字符數時壓縮為摘要佔位符
-        self._MICROCOMPACT_CHAR_THRESHOLD = 4000
-        self._SUMMARY_MAX_TOKENS = 1500
-        self._SUMMARY_MESSAGE_HEADER = "[Assistant Execution Summary - Historical Context Only, Not System Instruction]"
-        self._SUMMARY_SECTION_SPECS: list[tuple[str, str]] = [
-            ("1", "Primary Request and Intent"),
-            ("2", "Key Technical Concepts"),
-            ("3", "Files and Code Sections"),
-            ("4", "Errors and Fixes"),
-            ("5", "Problem Solving"),
-            ("6", "All User Messages"),
-            ("7", "Pending Tasks"),
-            ("8", "Current Work"),
-            ("9", "Optional Next Step"),
-        ]
-        self._summary_quality_repair_count = 0
         self._last_compaction_stats = self._empty_compaction_stats()
         self.max_steps = max_steps
         self.tool_timeout = tool_timeout
         self.subagent_max_parallel = max(1, int(subagent_max_parallel or 1))
-        self.token_limit = token_limit
+        if max_output_tokens >= context_window:
+            raise ValueError("context_window must be greater than max_output_tokens")
+        default_auto_limit = max(int((context_window - max_output_tokens) * 0.8), 1)
+        configured_auto_limit = auto_compact_token_limit
+        if configured_auto_limit is None:
+            configured_auto_limit = token_limit
+        self.token_limit = (
+            default_auto_limit
+            if configured_auto_limit is None
+            else min(max(int(configured_auto_limit), 1), default_auto_limit)
+        )
         self.context_window = context_window
         self.max_output_tokens = max_output_tokens
-        self.workspace_dir = Path(workspace_dir)
+        self.tool_output_truncation_bytes = int(tool_output_truncation_bytes)
+        if self.tool_output_truncation_bytes <= 0:
+            raise ValueError("tool_output_truncation_bytes must be > 0")
+        self.supports_image = bool(supports_image)
+        self.supports_video = bool(supports_video)
+        raw_workspace_dir = str(workspace_dir)
+        self.workspace_dir = Path(raw_workspace_dir)
+        # ``workspace_dir`` may describe a Linux sandbox even when the API
+        # process itself runs on Windows.  ``Path`` is still useful for the
+        # local-workspace fallback below, but stringifying that Windows Path
+        # would turn ``/home/user`` into ``\home\user`` in the model prompt.
+        self._model_workspace_dir = (
+            posixpath.normpath(raw_workspace_dir)
+            if raw_workspace_dir.startswith("/")
+            else str(self.workspace_dir)
+        )
         self.user_id = user_id
         self.allow_human_interrupts = allow_human_interrupts
         self._deferred_tool_retriever = deferred_tool_retriever
@@ -225,20 +542,8 @@ class Agent:
 
         # LLM 返回的真实 token 用量（每次 LLM 调用后更新）
         self.last_llm_usage = None
-
-        # 记忆刷新标记（每次 compaction 周期内最多触发一次）
-        self._memory_flushed_this_compaction = False
-
-        # 最近操作过的文件追踪（用于压缩后重注入上下文，对齐 Claude Code readFileState）
-        # key: file_path, value: (tool_name, content_or_none, timestamp)
-        self._recent_file_operations: dict[str, tuple[str, str | None, float]] = {}
-        self._POST_COMPACT_MAX_FILES = 5
-        self._POST_COMPACT_TOKEN_BUDGET = 20_000
-        self._POST_COMPACT_MAX_TOKENS_PER_FILE = 4_000
-
-        # LLM 摘要连续失败计数器（熔断器）
-        self._consecutive_summary_failures = 0
-        self._MAX_CONSECUTIVE_SUMMARY_FAILURES = 3
+        self._active_context_tokens: int | None = None
+        self._compaction_call_index = 0
 
         # Human-in-the-Loop: ask_user 中断状态
         self._pending_interrupt: dict[str, Any] | None = None
@@ -249,6 +554,7 @@ class Agent:
 
         # 单次 LLM 调用快照回调（由 AgentService 在 run 级别绑定）
         self._llm_call_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+        self._compaction_persist_hook: Callable[[dict[str, Any]], Awaitable[str | None]] | None = None
 
         # Tool results may carry multimodal blocks that must be injected only
         # after all tool_result messages for the current assistant turn.
@@ -274,7 +580,9 @@ class Agent:
 
         # 注入工作空间信息
         if self._include_workspace_context:
-            context_info_parts.append(f"- **Workspace（当前会话工作目录）**: `{self.workspace_dir}`")
+            context_info_parts.append(
+                f"- **Workspace（当前会话工作目录）**: `{self._model_workspace_dir}`"
+            )
             context_info_parts.append("- **用户根目录**: `/home/user`（记忆文件、Skills 等用户级资源在此）")
             context_info_parts.append("- **⚠️ 为用户创建的文件（文档、代码等）必须保存在 Workspace 目录下**，用户才能看到和下载")
 
@@ -1216,22 +1524,38 @@ class Agent:
         """设置/清空 step 级 LLM 调用快照回调。"""
         self._llm_call_hook = hook
 
+    def set_compaction_persist_hook(
+        self,
+        hook: Callable[[dict[str, Any]], Awaitable[str | None]] | None,
+    ) -> None:
+        """Set the durable Compacted-item publisher for this run."""
+        self._compaction_persist_hook = hook
+
     @staticmethod
-    def _redact_multimodal_data_urls(value: Any) -> Any:
-        """Redact inline image data URLs before audit/log persistence."""
+    def _redact_multimodal_data_urls(value: Any, *, url_field: bool = False) -> Any:
+        """Redact structured inline media URLs before text projection/persistence."""
+        if isinstance(value, str):
+            if url_field and value.lstrip().lower().startswith("data:"):
+                media_type = value.lstrip()[5:].split(";", 1)[0].split("/", 1)[0].lower()
+                label = media_type if media_type in {"image", "video", "audio"} else "inline"
+                return f"[redacted {label} data URL: {len(value)} chars]"
+            return value
         if isinstance(value, list):
-            return [Agent._redact_multimodal_data_urls(item) for item in value]
+            return [
+                Agent._redact_multimodal_data_urls(item, url_field=url_field)
+                for item in value
+            ]
         if isinstance(value, dict):
-            redacted = {
-                key: Agent._redact_multimodal_data_urls(item)
-                for key, item in value.items()
-            }
-            if redacted.get("type") == "image_url" and isinstance(redacted.get("image_url"), dict):
-                image_url = dict(redacted["image_url"])
-                url = image_url.get("url")
-                if isinstance(url, str) and url.startswith("data:image/"):
-                    image_url["url"] = f"[redacted image data URL: {len(url)} chars]"
-                    redacted["image_url"] = image_url
+            redacted: dict[str, Any] = {}
+            for key, item in value.items():
+                normalized = str(key).lower()
+                child_url_field = url_field or normalized in {
+                    "url", "uri", "href", "src", "data_url", "file_data",
+                } or normalized.endswith("_url")
+                redacted[key] = Agent._redact_multimodal_data_urls(
+                    item,
+                    url_field=child_url_field,
+                )
             return redacted
         return value
 
@@ -1295,16 +1619,24 @@ class Agent:
         if not force_recalculate and current_msg_count == self._cached_message_count and self._cached_token_count > 0:
             return self._cached_token_count
 
+        total_tokens = self._estimate_messages_tokens(self.messages)
+
+        # 🔥 更新缓存
+        self._cached_token_count = total_tokens
+        self._cached_message_count = current_msg_count
+
+        return total_tokens
+
+    @staticmethod
+    def _estimate_messages_tokens(messages: list[Message]) -> int:
         try:
-            # Use cl100k_base encoder (used by GPT-4 and most modern models)
             encoding = tiktoken.get_encoding("cl100k_base")
         except Exception:
-            # Fallback: if tiktoken initialization fails, use simple estimation
-            return self._estimate_tokens_fallback()
+            total_chars = sum(len(str(message.content or "")) for message in messages)
+            return int(total_chars / 2.5)
 
         total_tokens = 0
-
-        for msg in self.messages:
+        for msg in messages:
             # Count text content
             if isinstance(msg.content, str):
                 total_tokens += len(encoding.encode(msg.content))
@@ -1334,11 +1666,6 @@ class Agent:
 
             # Metadata overhead per message (approximately 4 tokens)
             total_tokens += 4
-
-        # 🔥 更新缓存
-        self._cached_token_count = total_tokens
-        self._cached_message_count = current_msg_count
-
         return total_tokens
 
     def _estimate_tokens_fallback(self) -> int:
@@ -1368,149 +1695,6 @@ class Agent:
         # Rough estimation: average 2.5 characters = 1 token
         return int(total_chars / 2.5)
 
-    def _microcompact_messages(self) -> int:
-        """Level 2 壓縮：輕量清理舊輪次的 tool result 和 thinking，不調用 LLM。
-
-        安全邊界：保留最近 2 個 user round 的全部內容不壓縮，
-        只清理更早的舊消息，避免模型引用近期 tool result 時「失憶」。
-
-        Returns:
-            壓縮的消息數量
-        """
-        user_indices = [i for i, m in enumerate(self.messages) if m.role == "user" and i > 0 and not m.is_synthetic]
-        if len(user_indices) < 3:
-            return 0  # 不足 3 個 user round，跳過
-
-        # 安全邊界：倒數第 2 個 user 消息的 index
-        safe_boundary = user_indices[-2]
-        compacted = 0
-
-        for i in range(1, safe_boundary):  # 跳過 system prompt (index 0)
-            msg = self.messages[i]
-            if msg.role == "tool" and isinstance(msg.content, str) and len(msg.content) > self._MICROCOMPACT_CHAR_THRESHOLD:
-                original_len = len(msg.content)
-                msg.content = f"[Tool result compacted — {original_len} chars]"
-                compacted += 1
-            if msg.role == "assistant" and msg.thinking:
-                msg.thinking = None
-                compacted += 1
-
-        if compacted:
-            self._cached_token_count = 0  # 重置緩存（用 0 而非 None，與 _estimate_tokens 比較類型一致）
-            print(f"{Colors.DIM}  Level 2 microcompact: cleared {compacted} old messages{Colors.RESET}")
-        return compacted
-
-    @property
-    def _hard_ceiling(self) -> int:
-        """Level 4/5 的硬頂：context_window 減去 output 預留和 buffer，下界 8192。"""
-        return max(self.context_window - self.max_output_tokens - 3000, 8192)
-
-    def track_file_operation(self, file_path: str, tool_name: str, content: str | None = None) -> None:
-        """Track a file operation for post-compaction context re-injection.
-
-        Args:
-            file_path: The file path operated on
-            tool_name: The tool name (read_file, write_file, etc.)
-            content: Optional file content (from tool result or write arguments)
-        """
-        import time
-        self._recent_file_operations[file_path] = (tool_name, content, time.monotonic())
-
-    def _collect_recent_files_from_messages(self) -> None:
-        """Scan message history for file operations to populate _recent_file_operations.
-
-        Extracts file paths AND file contents from tool calls and their results:
-        - read_file: content from the subsequent tool result message
-        - write_file/create_file: content from arguments.content
-        - edit_file: no full file content available, tracked as path-only
-
-        This is called before compaction to ensure the tracker is up-to-date.
-        """
-        import time
-
-        FILE_TOOLS = {"read_file", "write_file", "edit_file", "create_file"}
-
-        # Build tool_call_id -> tool result content map
-        tool_result_map: dict[str, str] = {}
-        for msg in self.messages:
-            if msg.role == "tool" and msg.tool_call_id and isinstance(msg.content, str):
-                tool_result_map[msg.tool_call_id] = msg.content
-
-        base_ts = time.monotonic()
-        for msg_idx, msg in enumerate(self.messages):
-            if msg.role != "assistant" or not msg.tool_calls:
-                continue
-            for tc in msg.tool_calls:
-                if tc.function.name not in FILE_TOOLS:
-                    continue
-                path = tc.function.arguments.get("path") or tc.function.arguments.get("file_path")
-                if not path:
-                    continue
-
-                content: str | None = None
-                if tc.function.name == "read_file":
-                    content = tool_result_map.get(tc.id)
-                elif tc.function.name in ("write_file", "create_file"):
-                    content = tc.function.arguments.get("content")
-
-                # Use message index as relative timestamp for ordering
-                self._recent_file_operations[path] = (tc.function.name, content, base_ts + msg_idx)
-
-    def _reinject_recent_files(self) -> int:
-        """Re-inject recently operated file contents after compaction.
-
-        Sorts by recency, truncates each file to _POST_COMPACT_MAX_TOKENS_PER_FILE,
-        and enforces a total _POST_COMPACT_TOKEN_BUDGET. Files without content
-        (e.g. edit_file) are included as path-only references.
-
-        Returns:
-            Number of files listed in the re-injection message
-        """
-        if not self._recent_file_operations:
-            return 0
-
-        # Sort by timestamp descending (most recent first), take top N
-        sorted_files = sorted(
-            self._recent_file_operations.items(),
-            key=lambda item: item[1][2],  # timestamp
-            reverse=True,
-        )[:self._POST_COMPACT_MAX_FILES]
-
-        file_blocks: list[str] = []
-        used_tokens = 0
-
-        for path, (tool_name, content, _ts) in sorted_files:
-            if content:
-                truncated = truncate_text_by_tokens(content, self._POST_COMPACT_MAX_TOKENS_PER_FILE)
-                block = f"=== FILE: {path} (recently {tool_name}) ===\n{truncated}\n=== END FILE ==="
-            else:
-                block = f"=== FILE: {path} (recently {tool_name}, content not available) ==="
-
-            # Rough token estimate: 1 token ≈ 4 chars
-            block_tokens = len(block) // 4
-            if used_tokens + block_tokens > self._POST_COMPACT_TOKEN_BUDGET:
-                break
-            used_tokens += block_tokens
-            file_blocks.append(block)
-
-        if not file_blocks:
-            self._recent_file_operations.clear()
-            return 0
-
-        reinjection_msg = Message(
-            role="assistant",
-            content=(
-                "[Post-Compact File Context — Recently operated files]\n\n"
-                + "\n\n".join(file_blocks)
-            ),
-        )
-        self.messages.append(reinjection_msg)
-
-        # Clear tracked operations after re-injection
-        self._recent_file_operations.clear()
-
-        return len(file_blocks)
-
     @staticmethod
     def _empty_compaction_stats() -> dict[str, int | bool | None]:
         return {
@@ -1518,6 +1702,7 @@ class Agent:
             "compaction_pre_tokens": None,
             "compaction_post_tokens": None,
             "compaction_tokens_saved": None,
+            # Legacy observability columns remain zero for schema compatibility.
             "compaction_microcompact_compacted_messages": 0,
             "compaction_summary_generated_count": 0,
             "compaction_summary_reused_count": 0,
@@ -1525,477 +1710,42 @@ class Agent:
             "compaction_emergency_truncate_dropped_rounds": 0,
         }
 
-    def _emergency_truncate(self) -> int:
-        """Level 4 壓縮：緊急丟棄最老的 user round，最後手段。
+    @staticmethod
+    def _exposed_tool_names(tools: list[Any]) -> set[str]:
+        names: set[str] = set()
+        for tool in tools:
+            name = getattr(tool, "name", None)
+            if not isinstance(name, str) and isinstance(tool, dict):
+                name = tool.get("name")
+                if not isinstance(name, str) and isinstance(tool.get("function"), dict):
+                    name = tool["function"].get("name")
+            if isinstance(name, str) and name:
+                names.add(name)
+        return names
 
-        當 Level 3 摘要後仍超過硬頂（context_window - max_output_tokens - buffer）時觸發。
-        每次丟棄最老的一個 user round（user 消息 + 後續的 assistant/tool 直到下一個 user）。
-        """
-        hard_ceiling = self._hard_ceiling
-        dropped_rounds = 0
-        max_drops = 3  # 安全閥：防止極端情況下無限循環
-
-        while dropped_rounds < max_drops and self._estimate_tokens(force_recalculate=True) > hard_ceiling:
-            user_indices = [i for i, m in enumerate(self.messages) if m.role == "user" and i > 0 and not m.is_synthetic]
-            if len(user_indices) <= 1:
-                break  # 至少保留最後一個 user round
-
-            # 確定最老 user round 的範圍：從 user_indices[0] 到 user_indices[1]
-            start = user_indices[0]
-            end = user_indices[1]
-            del self.messages[start:end]
-            self._cached_token_count = 0
-            dropped_rounds += 1
-
-        if dropped_rounds:
-            print(f"{Colors.BRIGHT_YELLOW}⚠️  Level 4 emergency truncate: dropped {dropped_rounds} oldest round(s){Colors.RESET}")
-
-        return dropped_rounds
-
-    async def _summarize_messages(self):
-        """漸進式上下文管理流水線（Level 2 → Level 3 → Level 4）
-
-        Level 2: Microcompact — 清除舊 tool result 和 thinking（不調 LLM）
-        Level 3: LLM 摘要 — 將 user 之間的執行過程總結為一條消息
-        Level 4: 緊急截斷 — 丟棄最老的 user round（最後手段）
-        """
-        estimated_tokens = self._estimate_tokens()
-        compaction_stats = self._empty_compaction_stats()
-        compaction_stats["compaction_pre_tokens"] = estimated_tokens
-
-        if estimated_tokens <= self.token_limit:
-            compaction_stats["compaction_post_tokens"] = estimated_tokens
-            compaction_stats["compaction_tokens_saved"] = 0
-            self._last_compaction_stats = compaction_stats
-            return
-
-        compaction_stats["compaction_triggered"] = True
-
-        print(f"\n{Colors.BRIGHT_YELLOW}📊 Token estimate: {estimated_tokens}/{self.token_limit}{Colors.RESET}")
-
-        # Level 2: Microcompact（輕量，不調 LLM）
-        compacted_count = self._microcompact_messages()
-        compaction_stats["compaction_microcompact_compacted_messages"] = compacted_count
-        estimated_tokens = self._estimate_tokens(force_recalculate=True)
-        if estimated_tokens <= self.token_limit:
-            print(f"{Colors.BRIGHT_GREEN}✓ Level 2 microcompact sufficient, tokens now: {estimated_tokens}{Colors.RESET}")
-            compaction_stats["compaction_post_tokens"] = estimated_tokens
-            pre_tokens = compaction_stats["compaction_pre_tokens"] or 0
-            compaction_stats["compaction_tokens_saved"] = max(pre_tokens - estimated_tokens, 0)
-            self._last_compaction_stats = compaction_stats
-            return
-
-        # Level 3: LLM 摘要（原有邏輯）
-        print(f"{Colors.BRIGHT_YELLOW}🔄 Level 3: Triggering LLM summarization...{Colors.RESET}")
-        summary_stats = await self._summarize_with_llm(estimated_tokens)
-        compaction_stats["compaction_summary_generated_count"] = summary_stats["generated_count"]
-        compaction_stats["compaction_summary_reused_count"] = summary_stats["reused_count"]
-        compaction_stats["compaction_summary_quality_repair_count"] = summary_stats["quality_repair_count"]
-
-        # Level 4: 緊急截斷（摘要後仍超硬頂時觸發）
-        hard_ceiling = self._hard_ceiling
-        if self._estimate_tokens(force_recalculate=True) > hard_ceiling:
-            print(f"{Colors.BRIGHT_YELLOW}🚨 Level 4: Post-summary tokens still exceed hard ceiling ({hard_ceiling}){Colors.RESET}")
-            dropped_rounds = self._emergency_truncate()
-            compaction_stats["compaction_emergency_truncate_dropped_rounds"] = dropped_rounds
-
-        post_tokens = self._estimate_tokens(force_recalculate=True)
-        compaction_stats["compaction_post_tokens"] = post_tokens
-        pre_tokens = compaction_stats["compaction_pre_tokens"] or 0
-        compaction_stats["compaction_tokens_saved"] = max(pre_tokens - post_tokens, 0)
-        self._last_compaction_stats = compaction_stats
-
-    async def _summarize_with_llm(self, estimated_tokens: int) -> dict[str, int]:
-        """Level 3: LLM 驅動的消息摘要（原 _summarize_messages 核心邏輯）
-
-        Includes:
-        - Circuit breaker: stops after MAX_CONSECUTIVE_SUMMARY_FAILURES
-        - Post-compact file re-injection: re-reads recently operated files
-        """
-        summary_stats = {
-            "generated_count": 0,
-            "reused_count": 0,
-            "quality_repair_count": 0,
-        }
-
-        # Circuit breaker: skip LLM summarization if too many consecutive failures
-        if self._consecutive_summary_failures >= self._MAX_CONSECUTIVE_SUMMARY_FAILURES:
-            print(f"{Colors.BRIGHT_YELLOW}⚠️  LLM summarization skipped (circuit breaker: "
-                  f"{self._consecutive_summary_failures} consecutive failures){Colors.RESET}")
-            return summary_stats
-
-        # Collect file operations from messages before they get compacted
-        self._collect_recent_files_from_messages()
-
-        # Find all real user message indices (skip system prompt and synthetic nudges)
-        user_indices = [
-            i for i, msg in enumerate(self.messages)
-            if msg.role == "user" and i > 0 and not msg.is_synthetic
-        ]
-
-        # Need at least 1 user message to perform summary
-        if len(user_indices) < 1:
-            print(f"{Colors.BRIGHT_YELLOW}⚠️  Insufficient messages, cannot summarize{Colors.RESET}")
-            return summary_stats
-
-        # Build new message list
-        new_messages = [self.messages[0]]  # Keep system prompt
-        summary_count = 0
-        reused_summary_count = 0
-        llm_attempted_count = 0
-        llm_failure_count = 0
-        quality_repair_count_before = self._summary_quality_repair_count
-
-        # Iterate through each user message and summarize the execution process after it
-        for i, user_idx in enumerate(user_indices):
-            # Add current user message
-            new_messages.append(self.messages[user_idx])
-
-            # Determine message range to summarize
-            # If last user, go to end of message list; otherwise to before next user
-            if i < len(user_indices) - 1:
-                next_user_idx = user_indices[i + 1]
-            else:
-                next_user_idx = len(self.messages)
-
-            # Extract execution messages for this round
-            execution_messages = self.messages[user_idx + 1 : next_user_idx]
-
-            # If there are execution messages in this round, summarize them
-            if execution_messages:
-                if len(execution_messages) == 1 and self._is_execution_summary_message(execution_messages[0]):
-                    reused_summary = self._extract_execution_summary_text(execution_messages[0].content)
-                    reused_summary = truncate_text_by_tokens(reused_summary, self._SUMMARY_MAX_TOKENS)
-                    if reused_summary:
-                        new_messages.append(Message(
-                            role="assistant",
-                            content=self._build_execution_summary_content(reused_summary),
-                        ))
-                        summary_count += 1
-                        reused_summary_count += 1
-                    continue
-
-                llm_attempted_count += 1
-                summary_text, used_fallback = await self._create_summary_with_meta(
-                    execution_messages,
-                    i + 1,
-                    round_user_message=self.messages[user_idx].content,
+    @staticmethod
+    def _validate_complete_tool_pairs(messages: list[Message]) -> None:
+        """Assert that every assistant tool call has one adjacent result."""
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            if message.role == "tool":
+                raise RuntimeError(f"Orphan tool result: {message.tool_call_id}")
+            if message.role != "assistant" or not message.tool_calls:
+                index += 1
+                continue
+            expected = [call.id for call in message.tool_calls]
+            actual: list[str] = []
+            cursor = index + 1
+            while cursor < len(messages) and messages[cursor].role == "tool":
+                if messages[cursor].tool_call_id:
+                    actual.append(messages[cursor].tool_call_id)
+                cursor += 1
+            if actual != expected:
+                raise RuntimeError(
+                    f"Incomplete tool batch: expected {expected!r}, got {actual!r}"
                 )
-                if used_fallback:
-                    llm_failure_count += 1
-                if summary_text:
-                    summary_text = truncate_text_by_tokens(summary_text, self._SUMMARY_MAX_TOKENS)
-                    summary_message = Message(
-                        role="assistant",
-                        content=self._build_execution_summary_content(summary_text),
-                    )
-                    new_messages.append(summary_message)
-                    summary_count += 1
-
-        if summary_count == 0:
-            # All summaries failed — increment circuit breaker
-            self._consecutive_summary_failures += 1
-            print(f"{Colors.BRIGHT_YELLOW}⚠️  All summaries failed (consecutive failures: "
-                  f"{self._consecutive_summary_failures}/{self._MAX_CONSECUTIVE_SUMMARY_FAILURES}){Colors.RESET}")
-            return summary_stats
-
-        # Distinguish LLM failure from fallback success:
-        # - if all LLM attempts failed in this cycle, increment consecutive failure count
-        # - otherwise reset counter
-        if llm_attempted_count > 0 and llm_failure_count == llm_attempted_count:
-            self._consecutive_summary_failures += 1
-            print(f"{Colors.BRIGHT_YELLOW}⚠️  Summary fallback used for all LLM attempts "
-                  f"({llm_failure_count}/{llm_attempted_count}); consecutive failures: "
-                  f"{self._consecutive_summary_failures}/{self._MAX_CONSECUTIVE_SUMMARY_FAILURES}{Colors.RESET}")
-        else:
-            self._consecutive_summary_failures = 0
-
-        # Replace message list
-        self.messages = new_messages
-
-        # Post-compact file re-injection: append recently operated file contents
-        # so the model retains awareness of key files after compaction
-        reinjected = self._reinject_recent_files()
-
-        new_tokens = self._estimate_tokens()
-        print(f"{Colors.BRIGHT_GREEN}✓ Summary completed, tokens reduced from {estimated_tokens} to {new_tokens}{Colors.RESET}")
-        quality_repairs = self._summary_quality_repair_count - quality_repair_count_before
-        quality_note = f", {quality_repairs} normalized" if quality_repairs else ""
-        reuse_note = f", {reused_summary_count} reused" if reused_summary_count else ""
-        fallback_note = f", {llm_failure_count} fallback" if llm_failure_count else ""
-        files_note = f", re-injected {reinjected} file(s)" if reinjected else ""
-        print(f"{Colors.DIM}  Structure: system + {len(user_indices)} user messages + {summary_count} summaries{quality_note}{reuse_note}{fallback_note}{files_note}{Colors.RESET}")
-
-        # 重置静默记忆刷新标记，允许下次压缩前再次刷新
-        self._memory_flushed_this_compaction = False
-
-        summary_stats["generated_count"] = summary_count - reused_summary_count
-        summary_stats["reused_count"] = reused_summary_count
-        summary_stats["quality_repair_count"] = max(quality_repairs, 0)
-        return summary_stats
-
-    def _build_execution_summary_content(self, summary_text: str) -> str:
-        return f"{self._SUMMARY_MESSAGE_HEADER}\n\n{summary_text}"
-
-    def _is_execution_summary_message(self, msg: Message) -> bool:
-        return (
-            msg.role == "assistant"
-            and isinstance(msg.content, str)
-            and msg.content.startswith(self._SUMMARY_MESSAGE_HEADER)
-        )
-
-    def _extract_execution_summary_text(self, summary_content: str) -> str:
-        summary_prefix = f"{self._SUMMARY_MESSAGE_HEADER}\n\n"
-        if summary_content.startswith(summary_prefix):
-            return summary_content[len(summary_prefix):]
-        if summary_content.startswith(self._SUMMARY_MESSAGE_HEADER):
-            return summary_content[len(self._SUMMARY_MESSAGE_HEADER):].lstrip()
-        return summary_content
-
-    def _build_summary_fallback_sections(self, user_messages: list[str], transcript: str) -> dict[str, str]:
-        all_user_messages = "\n".join(
-            f"{idx}. {text}" for idx, text in enumerate(user_messages, 1)
-        ) or "None"
-        primary_request = "\n".join(user_messages) if user_messages else "None"
-        current_work = transcript[-600:].strip() if transcript else "None"
-        if not current_work:
-            current_work = "None"
-
-        return {
-            "1": primary_request,
-            "2": "None",
-            "3": "None",
-            "4": "None",
-            "5": "None",
-            "6": all_user_messages,
-            "7": "None",
-            "8": current_work,
-            "9": "None",
-        }
-
-    @staticmethod
-    def _parse_numbered_summary_sections(summary_text: str) -> dict[str, str]:
-        import re
-
-        if not summary_text.strip():
-            return {}
-
-        section_pattern = re.compile(
-            r"(?ms)^(\d+)\.\s+[^\n:]+:?\s*(.*?)\s*(?=^\d+\.\s+|\Z)"
-        )
-        parsed: dict[str, str] = {}
-        for match in section_pattern.finditer(summary_text.strip()):
-            section_number = match.group(1).strip()
-            section_content = match.group(2).strip() or "None"
-            parsed[section_number] = section_content
-        return parsed
-
-    def _format_summary_sections(self, section_contents: dict[str, str]) -> str:
-        lines: list[str] = []
-        for section_number, section_title in self._SUMMARY_SECTION_SPECS:
-            section_text = (section_contents.get(section_number) or "None").strip() or "None"
-            lines.append(f"{section_number}. {section_title}:")
-            lines.append(section_text)
-            lines.append("")
-        return "\n".join(lines).strip()
-
-    def _has_required_summary_sections(self, summary_text: str) -> bool:
-        return all(
-            f"{section_number}. {section_title}:" in summary_text
-            for section_number, section_title in self._SUMMARY_SECTION_SPECS
-        )
-
-    def _build_compact_summary_sections(self, user_messages: list[str], transcript: str) -> dict[str, str]:
-        compact = self._build_summary_fallback_sections(user_messages, transcript)
-        compact["1"] = truncate_text_by_tokens(compact["1"], 120)
-        compact["6"] = truncate_text_by_tokens(compact["6"], 320)
-        compact["8"] = truncate_text_by_tokens(compact["8"], 200)
-        return compact
-
-    def _normalize_summary_text(self, summary_text: str, user_messages: list[str], transcript: str) -> str:
-        parsed_sections = self._parse_numbered_summary_sections(summary_text)
-        fallback_sections = self._build_summary_fallback_sections(user_messages, transcript)
-
-        normalized_sections: dict[str, str] = {}
-        for section_number, _ in self._SUMMARY_SECTION_SPECS:
-            parsed_content = (parsed_sections.get(section_number) or "").strip()
-
-            if section_number == "6":
-                # 强制使用源消息重建，避免模型遗漏或改写用户意图。
-                normalized_sections[section_number] = fallback_sections[section_number]
-                continue
-
-            if section_number == "8" and (not parsed_content or parsed_content.lower() == "none"):
-                normalized_sections[section_number] = fallback_sections[section_number]
-                continue
-
-            normalized_sections[section_number] = parsed_content or fallback_sections[section_number]
-
-        normalized_text = self._format_summary_sections(normalized_sections)
-        if normalized_text.strip() != summary_text.strip():
-            self._summary_quality_repair_count += 1
-        return normalized_text
-
-    def _finalize_summary_text(self, summary_text: str, user_messages: list[str], transcript: str) -> str:
-        normalized_summary = self._normalize_summary_text(summary_text, user_messages, transcript)
-        capped_summary = truncate_text_by_tokens(normalized_summary, self._SUMMARY_MAX_TOKENS)
-        if self._has_required_summary_sections(capped_summary):
-            return capped_summary
-
-        compact_summary = self._format_summary_sections(
-            self._build_compact_summary_sections(user_messages, transcript)
-        )
-        return truncate_text_by_tokens(compact_summary, self._SUMMARY_MAX_TOKENS)
-
-    @staticmethod
-    def _extract_summary_from_response(raw: str) -> str:
-        """Extract <summary> block from compact response, stripping <analysis>.
-
-        If no <summary> tags found, return raw text as-is.
-        """
-        import re
-        match = re.search(r"<summary>(.*?)</summary>", raw, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        # Fallback: strip <analysis> block if present
-        cleaned = re.sub(r"<analysis>.*?</analysis>", "", raw, flags=re.DOTALL)
-        return cleaned.strip()
-
-    async def _create_summary(
-        self,
-        messages: list[Message],
-        round_num: int,
-        round_user_message: str | list[dict[str, Any]] | None = None,
-    ) -> str:
-        """Backward-compatible wrapper that returns summary text only."""
-        summary_text, _ = await self._create_summary_with_meta(
-            messages,
-            round_num,
-            round_user_message,
-        )
-        return summary_text
-
-    async def _create_summary_with_meta(
-        self,
-        messages: list[Message],
-        round_num: int,
-        round_user_message: str | list[dict[str, Any]] | None = None,
-    ) -> tuple[str, bool]:
-        """Create summary for one execution round using structured 9-section prompt.
-
-        Inspired by Claude Code's compact prompt: produces a structured summary
-        with an <analysis> scratchpad (stripped before entering context) and a
-        <summary> block with 9 required sections.
-
-        Args:
-            messages: List of messages to summarize
-            round_num: Round number
-            round_user_message: 原始轮次用户消息（用于保持意图锚点）
-
-        Returns:
-            (summary_text, used_fallback)
-        """
-        if not messages:
-            return "", False
-
-        def _content_to_text(content: Any) -> str:
-            if isinstance(content, str):
-                return content
-            return str(content)
-
-        user_messages: list[str] = []
-        if round_user_message is not None:
-            user_messages.append(_content_to_text(round_user_message))
-
-        for msg in messages:
-            if msg.role == "user" and not msg.is_synthetic:
-                user_messages.append(_content_to_text(msg.content))
-
-        # Build execution transcript
-        transcript_parts: list[str] = []
-        for msg in messages:
-            if msg.role == "assistant":
-                content_text = _content_to_text(msg.content)
-                transcript_parts.append(f"Assistant: {content_text}")
-                if msg.tool_calls:
-                    tool_names = [tc.function.name for tc in msg.tool_calls]
-                    transcript_parts.append(f"  → Called tools: {', '.join(tool_names)}")
-            elif msg.role == "user" and not msg.is_synthetic:
-                content_text = _content_to_text(msg.content)
-                transcript_parts.append(f"User: {content_text}")
-            elif msg.role == "tool":
-                result_preview = _content_to_text(msg.content)
-                # Preserve file content and code snippets in tool results (up to 2000 chars)
-                if len(result_preview) > 2000:
-                    result_preview = result_preview[:1000] + "\n...[truncated]...\n" + result_preview[-1000:]
-                transcript_parts.append(f"  ← Tool[{msg.name or '?'}]: {result_preview}")
-
-        transcript = "\n".join(transcript_parts)
-
-        user_messages_block = "\n".join(f"  {idx}. {text}" for idx, text in enumerate(user_messages, 1)) or "  None"
-
-        summary_prompt = f"""You are summarizing one historical agent execution slice for context compaction.
-
-Round {round_num} — All user messages in this scope (non-tool-result):
-{user_messages_block}
-
-Execution transcript:
-{transcript}
-
-Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts. In your analysis:
-1. Chronologically trace each step in the transcript
-2. Identify the user's explicit requests and intents
-3. Note specific file names, key function signatures, and concrete file edits
-4. Note errors encountered and how they were fixed
-5. Pay special attention to user feedback
-
-Then provide your summary in <summary> tags with these 9 sections:
-
-1. Primary Request and Intent: All explicit user requests/intents in detail
-2. Key Technical Concepts: Technologies, frameworks, patterns discussed
-3. Files and Code Sections: Files examined/modified/created, key snippets/signatures when critical, and why each file matters
-4. Errors and Fixes: All errors encountered and how they were resolved, including user feedback
-5. Problem Solving: Problems solved and ongoing troubleshooting
-6. All User Messages: List EVERY user message (non-tool-result) verbatim — critical for intent tracking
-7. Pending Tasks: Explicitly requested but unfinished work
-8. Current Work: Precisely what was happening at the end of this slice, with file names and code context
-9. Optional Next Step: Only if directly in line with the user's most recent request
-
-Rules:
-- Keep facts grounded in the provided content only
-- Keep the summary concise and information-dense; avoid long verbatim code dumps
-- Keep total summary length within approximately {self._SUMMARY_MAX_TOKENS} tokens
-- If a section has no information, write "None"
-- Be concise but thorough on technical details"""
-
-        try:
-            response = await self.llm.generate(
-                messages=[
-                    Message(
-                        role="system",
-                        content="You are a summarization assistant for Agent context compaction. Respond with TEXT ONLY. Do NOT call any tools.",
-                    ),
-                    Message(role="user", content=summary_prompt),
-                ]
-            )
-
-            summary_text = self._extract_summary_from_response(response.content)
-            summary_text = self._finalize_summary_text(summary_text, user_messages, transcript)
-            print(f"{Colors.BRIGHT_GREEN}✓ Summary for round {round_num} generated successfully{Colors.RESET}")
-            return summary_text, False
-
-        except Exception as e:
-            print(f"{Colors.BRIGHT_RED}✗ Summary generation failed for round {round_num}: {e}{Colors.RESET}")
-            fallback_summary = self._format_summary_sections(
-                self._build_summary_fallback_sections(user_messages, transcript)
-            )
-            return truncate_text_by_tokens(fallback_summary, self._SUMMARY_MAX_TOKENS), True
-
-    # =========================================================================
-    # 已移除廢棄方法: run() 和 run_with_steps()
-    # 請使用 run_agui() 方法獲取 AG-UI 協議兼容的事件流
-    # =========================================================================
-
+            index = cursor
     @staticmethod
     def _tool_call_identity(tool_call: Any) -> tuple[str, str, Any]:
         tool_call_id = str(getattr(tool_call, "id", "") or "")
@@ -2505,9 +2255,10 @@ Rules:
             result_content = f"Error: {result.error}\n\nOutput:\n{result.content}"
         else:
             result_content = f"Error: {result.error}"
-        tool_obj = self.tools.get(function_name)
-        budget = getattr(tool_obj, 'max_result_tokens', 8000) if tool_obj else 8000
-        return truncate_text_by_tokens(result_content, budget)
+        return truncate_tool_output(
+            result_content,
+            self.tool_output_truncation_bytes,
+        )
 
     def _record_tool_result(
         self,
@@ -2537,9 +2288,26 @@ Rules:
             else False
         )
         if not replaced:
+            source_run_id = next(
+                (
+                    message.run_id
+                    for message in reversed(self.messages)
+                    if message.role == "assistant"
+                    and any(
+                        call.id == record.tool_call_id
+                        for call in (message.tool_calls or [])
+                    )
+                ),
+                None,
+            )
             tool_msg = Message(
                 role="tool",
-                content=record.result_content,
+                id=f"{record.tool_call_id}:result",
+                run_id=source_run_id,
+                content=truncate_tool_output(
+                    record.result_content,
+                    self.tool_output_truncation_bytes,
+                ),
                 tool_call_id=record.tool_call_id,
                 name=record.function_name,
             )
@@ -2610,7 +2378,12 @@ Rules:
 
         return None
 
-    def _flush_pending_tool_content_blocks(self) -> Message | None:
+    def _flush_pending_tool_content_blocks(
+        self,
+        *,
+        run_id: str | None = None,
+        message_id: str | None = None,
+    ) -> Message | None:
         if not self._pending_tool_content_blocks:
             return None
 
@@ -2636,6 +2409,8 @@ Rules:
             )
         synthetic_msg = Message(
             role="user",
+            id=message_id or f"tool-content:{uuid.uuid4()}",
+            run_id=run_id,
             content=[{"type": "text", "text": guard_text}, *llm_blocks],
             is_synthetic=True,
         )
@@ -2717,6 +2492,237 @@ Rules:
                 records.append(raw)
         return sorted(records, key=lambda item: item.index)
 
+    def _codex_active_tokens(self, messages: list[Message], *, prefer_usage: bool) -> int:
+        estimated = self._estimate_messages_tokens(messages)
+        if self._active_context_tokens is None:
+            return estimated
+        if prefer_usage:
+            return self._active_context_tokens
+        # Mid-turn items created after the last provider response are not in
+        # that usage value, so never let a lower local estimate hide it.
+        return max(self._active_context_tokens, estimated)
+
+    @staticmethod
+    async def _await_compaction_generate(
+        client: Any,
+        *,
+        messages: list[Message],
+        cancel_token: asyncio.Event | None,
+    ) -> Any:
+        """Await one compaction request while allowing a user stop to cancel it."""
+        if cancel_token is None:
+            return await client.generate(messages=messages)
+        if cancel_token.is_set():
+            raise asyncio.CancelledError
+
+        generation_task = asyncio.ensure_future(client.generate(messages=messages))
+        cancellation_task = asyncio.create_task(cancel_token.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {generation_task, cancellation_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancellation_task in done:
+                raise asyncio.CancelledError
+            return generation_task.result()
+        finally:
+            for task in (generation_task, cancellation_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                generation_task,
+                cancellation_task,
+                return_exceptions=True,
+            )
+
+    async def _codex_compact_history(
+        self,
+        *,
+        source_messages: list[Message],
+        phase: str,
+        request_context: LLMRequestContext | None,
+        exposed_tool_names: set[str] | None,
+        model_client: Any | None = None,
+        cancel_token: asyncio.Event | None = None,
+    ) -> list[Message]:
+        """Run one local Codex compaction and durably publish its replacement."""
+        system = next(
+            (message.model_copy(deep=True) for message in source_messages if message.role == "system"),
+            Message(role="system", content=self.system_prompt),
+        )
+        source_without_system = [
+            message.model_copy(deep=True)
+            for message in source_messages
+            if message.role != "system"
+        ]
+        working = normalize_history(
+            source_without_system,
+            supports_image=self.supports_image,
+            supports_video=self.supports_video,
+        )
+        source_tokens = self._estimate_messages_tokens([system, *source_without_system])
+        dropped = 0
+        client = model_client or getattr(self.llm, "_client", self.llm)
+        response = None
+        request_messages: list[Message] = []
+        started_at = perf_counter()
+
+        while True:
+            request_messages = self._build_llm_request_messages(
+                [
+                    system.model_copy(deep=True),
+                    *[message.model_copy(deep=True) for message in working],
+                    Message(role="user", content=SUMMARIZATION_PROMPT, is_synthetic=True),
+                ],
+                request_context=request_context,
+                exposed_tool_names=exposed_tool_names,
+            )
+            try:
+                response = await self._await_compaction_generate(
+                    client,
+                    messages=request_messages,
+                    cancel_token=cancel_token,
+                )
+                break
+            except Exception as exc:
+                if is_context_window_error(exc) and working:
+                    logger.warning(
+                        "Context window exceeded while compacting; removing oldest history item: %s",
+                        exc,
+                    )
+                    working.pop(0)
+                    working = normalize_history(
+                        working,
+                        supports_image=self.supports_image,
+                        supports_video=self.supports_video,
+                    )
+                    dropped += 1
+                    continue
+                raise
+
+        assert response is not None
+        if cancel_token is not None and cancel_token.is_set():
+            raise asyncio.CancelledError
+        summary = str(response.content or "")
+        replacement = build_compacted_history(source_without_system, summary)
+        source_run_ids = list(dict.fromkeys(
+            message.run_id
+            for message in source_without_system
+            if message.run_id
+        ))
+        replacement[-1].id = f"compaction:{uuid.uuid4()}"
+        replacement[-1].run_id = source_run_ids[-1] if source_run_ids else None
+        replacement_tokens = self._estimate_messages_tokens([system, *replacement])
+
+        checkpoint_id = None
+        if self._compaction_persist_hook is not None:
+            checkpoint_id = await self._compaction_persist_hook({
+                "phase": phase,
+                "summary": summary or "(no summary available)",
+                "replacement_messages": [message.model_copy(deep=True) for message in replacement],
+                "source_token_count": source_tokens,
+                "replacement_token_count": replacement_tokens,
+                "source_run_ids": source_run_ids,
+                "dropped_oldest_items": dropped,
+            })
+
+        # Persistence completes before the live replacement becomes visible.
+        self.messages = [system, *[message.model_copy(deep=True) for message in replacement]]
+        self._cached_token_count = replacement_tokens
+        self._cached_message_count = len(self.messages)
+        self._active_context_tokens = replacement_tokens
+        self._last_compaction_stats = {
+            **self._empty_compaction_stats(),
+            "compaction_triggered": True,
+            "compaction_pre_tokens": source_tokens,
+            "compaction_post_tokens": replacement_tokens,
+            "compaction_tokens_saved": max(source_tokens - replacement_tokens, 0),
+            "compaction_summary_generated_count": 1,
+        }
+
+        self._compaction_call_index += 1
+        usage = response.usage
+        await self._emit_llm_call_record({
+            "step_index": -self._compaction_call_index,
+            "request_messages": self._redact_multimodal_data_urls(
+                [message.model_dump(exclude_none=True) for message in request_messages]
+            ),
+            "request_tools": [],
+            "response_content": response.content,
+            "response_thinking": response.thinking,
+            "response_tool_calls": None,
+            "response_error": None,
+            "finish_reason": response.finish_reason,
+            "usage_prompt_tokens": usage.prompt_tokens if usage else None,
+            "usage_completion_tokens": usage.completion_tokens if usage else None,
+            "usage_total_tokens": usage.total_tokens if usage else None,
+            "first_token_latency_s": None,
+            "completion_latency_s": round(perf_counter() - started_at, 3),
+            **self._last_compaction_stats,
+            "checkpoint_id": checkpoint_id,
+            "call_kind": "compaction",
+        })
+        return replacement
+
+    async def _codex_prepare_provider_request_messages(
+        self,
+        *,
+        request_context: LLMRequestContext | None,
+        exposed_tool_names: set[str] | None,
+        tools: list[Any],
+        incoming_run_id: str | None,
+        phase: str,
+        cancel_token: asyncio.Event | None = None,
+    ) -> list[Message]:
+        """Apply Codex pre-turn/mid-turn triggering before an ordinary request."""
+        self._last_compaction_stats = self._empty_compaction_stats()
+        incoming: list[Message] = []
+        source = self.messages
+        if incoming_run_id:
+            incoming = [
+                message.model_copy(deep=True)
+                for message in self.messages
+                if message.run_id == incoming_run_id
+                and message.role == "user"
+                and not message.is_synthetic
+            ]
+            source = [
+                message
+                for message in self.messages
+                if not (
+                    message.run_id == incoming_run_id
+                    and message.role == "user"
+                    and not message.is_synthetic
+                )
+            ]
+
+        active_tokens = self._codex_active_tokens(
+            source,
+            prefer_usage=bool(incoming_run_id),
+        )
+        self._last_compaction_stats.update({
+            "compaction_pre_tokens": active_tokens,
+            "compaction_post_tokens": active_tokens,
+            "compaction_tokens_saved": 0,
+        })
+        if active_tokens >= self.token_limit and len(source) > 1:
+            await self._codex_compact_history(
+                source_messages=source,
+                phase=phase,
+                request_context=request_context,
+                exposed_tool_names=exposed_tool_names,
+                cancel_token=cancel_token,
+            )
+            self.messages.extend(incoming)
+            self._cached_token_count = 0
+            self._cached_message_count = 0
+
+        return self._build_llm_request_messages(
+            self.messages,
+            request_context=request_context,
+            exposed_tool_names=exposed_tool_names,
+        )
+
     async def run_agui(
         self, 
         thread_id: str,
@@ -2742,9 +2748,28 @@ Rules:
         """
         # 初始化事件發射器
         emitter = AGUIEventEmitter(thread_id, run_id)
+        tool_loop_guard = _ToolLoopGuard(workspace_dir=self._model_workspace_dir)
+
+        def _observe_tool_record(record: _ExecutedToolCall) -> None:
+            tool = self.tools.get(record.function_name)
+            fingerprint, policy = tool_loop_guard._fingerprint(
+                tool,
+                record.function_name,
+                record.arguments,
+            )
+            tool_loop_guard.observe(
+                fingerprint=fingerprint,
+                policy=policy,
+                tool_name=record.function_name,
+                result=record.result,
+                result_content=record.result_content,
+            )
 
         def _flush_pending_tool_content_event():
-            synthetic_msg = self._flush_pending_tool_content_blocks()
+            synthetic_msg = self._flush_pending_tool_content_blocks(
+                run_id=run_id,
+                message_id=f"{run_id}:synthetic:{step + 1}:tool-content",
+            )
             if synthetic_msg:
                 return emitter.custom_event("synthetic_user_message", {"content": synthetic_msg.content})
             return None
@@ -2797,6 +2822,7 @@ Rules:
                 flush_event = _flush_pending_tool_content_event()
                 if flush_event:
                     yield flush_event
+                _observe_tool_record(approved_record)
             
             while step < self.max_steps:
                 # 🛑 取消檢查點 1: 每個 step 開始前
@@ -2805,21 +2831,19 @@ Rules:
                     yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
                     return
 
-                # 檢查並摘要消息歷史以防止上下文溢出（Level 2-4 流水線）
-                await self._summarize_messages()
-                compaction_stats_snapshot = dict(self._last_compaction_stats)
-
                 # 漸進式提醒（倒數第2步時提醒 LLM）
                 if step == self.max_steps - 2:
                     print(f"\n{Colors.BRIGHT_YELLOW}💡 剩餘步驟不多，建議 LLM 考慮總結...{Colors.RESET}")
                     reminder_msg = Message(
                         role="user",
+                        id=f"{run_id}:synthetic:{step + 1}:step-limit",
+                        run_id=run_id,
                         content="💡 系統提示：還剩 2 步就達到步驟上限。如果你已經收集了足夠信息，請在接下來的回復中給出答案；如果信息不足，請優先調用最關鍵的工具。",
                         is_synthetic=True,
                     )
                     self.messages.append(reminder_msg)
                     yield emitter.custom_event("synthetic_user_message", {"content": reminder_msg.content})
-                
+
                 step_name = f"step_{step + 1}"
                 
                 # STEP_STARTED
@@ -2847,10 +2871,29 @@ Rules:
                     if llm_request_context is not None
                     else None
                 )
-                llm_request_messages = self._build_llm_request_messages(
-                    request_context=step_request_context,
-                    exposed_tool_names={tool.name for tool in tool_list},
-                )
+                # Codex-style next-dispatch compaction. A completed current
+                # tool batch participates in a mid-turn summary; the following
+                # ordinary request sees only the published replacement.
+                try:
+                    llm_request_messages = await self._codex_prepare_provider_request_messages(
+                        request_context=step_request_context,
+                        exposed_tool_names=self._exposed_tool_names(tool_list),
+                        tools=tool_list,
+                        incoming_run_id=run_id if step == 0 else None,
+                        phase="pre_turn" if step == 0 else "mid_turn",
+                        cancel_token=cancel_token,
+                    )
+                except asyncio.CancelledError:
+                    if cancel_token is None or not cancel_token.is_set():
+                        raise
+                    logger.info("⏹️  用戶取消了執行 (上下文壓縮期間)")
+                    yield emitter.step_finished(step_name)
+                    yield emitter.run_finished(
+                        outcome="interrupt",
+                        result={"reason": "user_cancelled"},
+                    )
+                    return
+                compaction_stats_snapshot = dict(self._last_compaction_stats)
                 self.logger.log_request(messages=llm_request_messages, tools=tool_list)
                 request_messages_snapshot = [msg.model_dump(exclude_none=True) for msg in llm_request_messages]
                 request_tools_snapshot = [tool.name for tool in tool_list]
@@ -2904,8 +2947,13 @@ Rules:
                 _primary_context_window = self.context_window
                 _primary_max_output_tokens = self.max_output_tokens
 
-                async def on_failover_reset(model_id: str, context_window: int = 0, max_output_tokens: int = 0):
-                    """Failover 前重置流式狀態，並臨時同步 fallback 模型參數"""
+                async def on_failover_reset(
+                    fallback_config: Any,
+                    fallback_client: Any,
+                    call_method: str,
+                    fallback_kwargs: dict[str, Any],
+                ) -> dict[str, Any]:
+                    """Reset streaming state and compact for a smaller fallback."""
                     nonlocal thinking_started, message_started
                     if thinking_started:
                         await event_queue.put(emitter.thinking_end())
@@ -2913,11 +2961,63 @@ Rules:
                     if message_started:
                         await event_queue.put(emitter.text_message_end())
                         message_started = False
-                    # 臨時使用 fallback 模型參數（本次 LLM 調用結束後恢復）
+                    model_id = str(fallback_config.id)
+                    context_window = int(fallback_config.context_window or 0)
+                    max_output_tokens = int(fallback_config.max_tokens or 0)
                     if context_window > 0:
                         self.context_window = context_window
                     if max_output_tokens > 0:
                         self.max_output_tokens = max_output_tokens
+
+                    fallback_default_limit = max(
+                        int((context_window - max_output_tokens) * 0.8),
+                        1,
+                    )
+                    fallback_limit = min(
+                        fallback_default_limit,
+                        int(
+                            getattr(fallback_config, "auto_compact_token_limit", 0)
+                            or fallback_default_limit
+                        ),
+                    )
+                    request_tokens = self._estimate_messages_tokens(
+                        list(fallback_kwargs.get("messages") or [])
+                    )
+                    if request_tokens >= fallback_limit and len(self.messages) > 1:
+                        primary_error: Exception | None = None
+                        try:
+                            await self._codex_compact_history(
+                                source_messages=self.messages,
+                                phase="model_downshift",
+                                request_context=step_request_context,
+                                exposed_tool_names=self._exposed_tool_names(tool_list),
+                                model_client=getattr(self.llm, "_client", self.llm),
+                                cancel_token=cancel_token,
+                            )
+                        except Exception as exc:
+                            if not is_compaction_model_fallback_error(exc):
+                                raise
+                            primary_error = exc
+                            logger.warning(
+                                "Primary model could not compact for fallback %s: %s",
+                                model_id,
+                                exc,
+                            )
+                        if primary_error is not None:
+                            await self._codex_compact_history(
+                                source_messages=self.messages,
+                                phase="model_downshift",
+                                request_context=step_request_context,
+                                exposed_tool_names=self._exposed_tool_names(tool_list),
+                                model_client=fallback_client,
+                                cancel_token=cancel_token,
+                            )
+                        fallback_kwargs = dict(fallback_kwargs)
+                        fallback_kwargs["messages"] = self._build_llm_request_messages(
+                            self.messages,
+                            request_context=step_request_context,
+                            exposed_tool_names=self._exposed_tool_names(tool_list),
+                        )
                     await event_queue.put(CustomEvent(
                         name="failover_reset",
                         value={"model": model_id},
@@ -2926,6 +3026,7 @@ Rules:
                         "Failover reset: next model=%s, context_window=%d, max_output_tokens=%d",
                         model_id, self.context_window, self.max_output_tokens,
                     )
+                    return fallback_kwargs
 
                 self.llm.failover_notify = on_failover_reset
 
@@ -3003,6 +3104,8 @@ Rules:
                     # Failover 是一次性的，無論成功/失敗/取消都恢復主模型參數
                     self.context_window = _primary_context_window
                     self.max_output_tokens = _primary_max_output_tokens
+                    if getattr(self.llm, "failover_notify", None) is on_failover_reset:
+                        self.llm.failover_notify = None
 
                 llm_request_snapshot = getattr(self.llm, "last_request_snapshot", None)
                 if isinstance(llm_request_snapshot, dict):
@@ -3072,6 +3175,8 @@ Rules:
 
                 # 记录 LLM 返回的 token 用量
                 self.last_llm_usage = response.usage
+                if response.usage is not None and response.usage.total_tokens:
+                    self._active_context_tokens = int(response.usage.total_tokens)
 
                 # 記錄 LLM 響應
                 self.logger.log_response(
@@ -3084,6 +3189,8 @@ Rules:
                 # 添加助手消息
                 assistant_msg = Message(
                     role="assistant",
+                    id=f"{run_id}:assistant:{step + 1}",
+                    run_id=run_id,
                     content=response.content,
                     thinking=response.thinking,
                     tool_calls=response.tool_calls,
@@ -3131,7 +3238,13 @@ Rules:
                             "Resume EXACTLY where you stopped — no repeat, no recap, no apology. "
                             "If you have remaining work, break it into smaller tool calls."
                         )
-                        self.messages.append(Message(role="user", content=truncation_content, is_synthetic=True))
+                        self.messages.append(Message(
+                            role="user",
+                            id=f"{run_id}:synthetic:{step + 1}:output-truncated",
+                            run_id=run_id,
+                            content=truncation_content,
+                            is_synthetic=True,
+                        ))
                         yield emitter.custom_event("synthetic_user_message", {"content": truncation_content})
                         yield emitter.step_finished(step_name)
                         step += 1
@@ -3146,7 +3259,13 @@ Rules:
                             "You returned an empty response with no tool calls. "
                             "Please provide your answer or call a tool to continue working."
                         )
-                        self.messages.append(Message(role="user", content=nudge_content, is_synthetic=True))
+                        self.messages.append(Message(
+                            role="user",
+                            id=f"{run_id}:synthetic:{step + 1}:empty-response",
+                            run_id=run_id,
+                            content=nudge_content,
+                            is_synthetic=True,
+                        ))
                         yield emitter.custom_event("synthetic_user_message", {"content": nudge_content})
                         yield emitter.step_finished(step_name)
                         step += 1
@@ -3196,6 +3315,8 @@ Rules:
                             )
                             cancel_msg = Message(
                                 role="tool",
+                                id=f"{remaining_id}:result",
+                                run_id=run_id,
                                 content="Cancelled by user",
                                 tool_call_id=remaining_id,
                                 name=remaining_name,
@@ -3209,6 +3330,79 @@ Rules:
                         return
 
                     tool = self.tools.get(function_name)
+                    _fingerprint, _repeat_policy, loop_error, loop_terminal = tool_loop_guard.check(
+                        tool=tool,
+                        tool_name=function_name,
+                        arguments=arguments,
+                    )
+                    if loop_error is not None:
+                        for event in self._tool_call_events(
+                            emitter,
+                            tool_call_id=tool_call_id,
+                            function_name=function_name,
+                            arguments=arguments,
+                        ):
+                            yield event
+                        self._print_tool_call(function_name, arguments)
+                        blocked_content = f"tool_loop_detected: {loop_error}"
+                        blocked = _ExecutedToolCall(
+                            index=tool_call_index,
+                            tool_call_id=tool_call_id,
+                            function_name=function_name,
+                            arguments=arguments,
+                            result=ToolResult(success=False, error=blocked_content),
+                            result_content=blocked_content,
+                            execution_time_ms=0,
+                        )
+                        yield emitter.tool_call_result(
+                            tool_call_id=tool_call_id,
+                            content=blocked_content,
+                            execution_time_ms=0,
+                        )
+                        self._record_tool_result(blocked)
+                        tool_call_index += 1
+                        if not loop_terminal:
+                            continue
+
+                        # Close every still-pending call in this assistant batch
+                        # before terminating so persisted/provider history remains
+                        # structurally valid.
+                        for remaining_tc in tool_calls[tool_call_index:]:
+                            remaining_id, remaining_name, _remaining_args = self._tool_call_identity(
+                                remaining_tc
+                            )
+                            yield emitter.tool_call_start(
+                                tool_call_id=remaining_id,
+                                tool_name=remaining_name,
+                            )
+                            yield emitter.tool_call_end(remaining_id)
+                            skipped_content = "[Skipped: runtime tool loop detected]"
+                            yield emitter.tool_call_result(
+                                tool_call_id=remaining_id,
+                                content=skipped_content,
+                                execution_time_ms=0,
+                            )
+                            self.messages.append(Message(
+                                role="tool",
+                                id=f"{remaining_id}:result",
+                                run_id=run_id,
+                                content=skipped_content,
+                                tool_call_id=remaining_id,
+                                name=remaining_name,
+                                is_synthetic=True,
+                            ))
+                        flush_event = _flush_pending_tool_content_event()
+                        if flush_event:
+                            yield flush_event
+                        yield emitter.step_finished(step_name)
+                        yield emitter.run_error(
+                            message=(
+                                "tool_loop_detected: repeated tool calls made no "
+                                "progress after one recovery opportunity"
+                            )
+                        )
+                        return
+
                     # Only tools projected in the exact request that produced
                     # this response may run. This prevents same-response
                     # mcp_tool_search activation and hallucinated special tools.
@@ -3261,6 +3455,7 @@ Rules:
                             execution_time_ms=0,
                         )
                         self._record_tool_result(blocked)
+                        _observe_tool_record(blocked)
                         tool_call_index += 1
                         continue
 
@@ -3304,6 +3499,7 @@ Rules:
                             execution_time_ms=0,
                         )
                         self._record_tool_result(blocked)
+                        _observe_tool_record(blocked)
                         self._record_permission_audit(
                             tool=tool,
                             effect="deny",
@@ -3352,6 +3548,7 @@ Rules:
                                 execution_time_ms=0,
                             )
                             self._record_tool_result(blocked)
+                            _observe_tool_record(blocked)
                             self._record_permission_audit(
                                 tool=tool,
                                 effect="deny",
@@ -3405,6 +3602,7 @@ Rules:
                                     execution_time_ms=0,
                                 )
                                 self._record_tool_result(blocked)
+                                _observe_tool_record(blocked)
                                 tool_call_index += 1
                                 continue
 
@@ -3415,6 +3613,8 @@ Rules:
                             )
                             self.messages.append(Message(
                                 role="tool",
+                                id=f"{tool_call_id}:result",
+                                run_id=run_id,
                                 content="[Awaiting tool approval]",
                                 tool_call_id=tool_call_id,
                                 name=function_name,
@@ -3437,6 +3637,8 @@ Rules:
                                 )
                                 self.messages.append(Message(
                                     role="tool",
+                                    id=f"{remaining_id}:result",
+                                    run_id=run_id,
                                     content="[Skipped: tool approval pending]",
                                     tool_call_id=remaining_id,
                                     name=remaining_name,
@@ -3496,6 +3698,8 @@ Rules:
                                     )
                                     cancel_msg = Message(
                                         role="tool",
+                                        id=f"{batch_id}:result",
+                                        run_id=run_id,
                                         content="Cancelled by user",
                                         tool_call_id=batch_id,
                                         name=batch_name,
@@ -3515,6 +3719,8 @@ Rules:
                                     )
                                     cancel_msg = Message(
                                         role="tool",
+                                        id=f"{remaining_id}:result",
+                                        run_id=run_id,
                                         content="Cancelled by user",
                                         tool_call_id=remaining_id,
                                         name=remaining_name,
@@ -3540,6 +3746,7 @@ Rules:
                                     execution_time_ms=record.execution_time_ms,
                                 )
                                 self._record_tool_result(record)
+                                _observe_tool_record(record)
 
                             tool_call_index = next_index
                             continue
@@ -3562,6 +3769,8 @@ Rules:
                         )
                         tool_msg = Message(
                             role="tool",
+                            id=f"{tool_call_id}:result",
+                            run_id=run_id,
                             content="Cancelled by user",
                             tool_call_id=tool_call_id,
                             name=function_name,
@@ -3581,6 +3790,8 @@ Rules:
                             )
                             cancel_msg = Message(
                                 role="tool",
+                                id=f"{remaining_id}:result",
+                                run_id=run_id,
                                 content="Cancelled by user",
                                 tool_call_id=remaining_id,
                                 name=remaining_name,
@@ -3607,6 +3818,8 @@ Rules:
                             )
                             error_result_msg = Message(
                                 role="tool",
+                                id=f"{tool_call_id}:result",
+                                run_id=run_id,
                                 content=error_msg,
                                 tool_call_id=tool_call_id,
                                 name=function_name,
@@ -3627,6 +3840,8 @@ Rules:
                         )
                         placeholder_msg = Message(
                             role="tool",
+                            id=f"{tool_call_id}:result",
+                            run_id=run_id,
                             content="[Awaiting user response]",
                             tool_call_id=tool_call_id,
                             name=function_name,
@@ -3648,6 +3863,8 @@ Rules:
                             )
                             skip_msg = Message(
                                 role="tool",
+                                id=f"{remaining_id}:result",
+                                run_id=run_id,
                                 content="[Skipped: user question pending]",
                                 tool_call_id=remaining_id,
                                 name=remaining_name,
@@ -3695,6 +3912,7 @@ Rules:
                         execution_time_ms=record.execution_time_ms,
                     )
                     self._record_tool_result(record)
+                    _observe_tool_record(record)
                     tool_call_index += 1
 
                 flush_event = _flush_pending_tool_content_event()
@@ -3735,143 +3953,6 @@ Rules:
             error_detail = f"{type(e).__name__}: {str(e)}"
             print(f"\n{Colors.BRIGHT_RED}❌ Unexpected error:{Colors.RESET} {error_detail}")
             yield emitter.run_error(message=error_detail)
-
-    async def maybe_flush_memory_silent(self, session_id: str | None = None) -> bool:
-        """软阈值触发静默记忆刷新（在 run_agui() 外单独调用，不 yield SSE 事件）
-
-        当 token 用量达到 75% 时，通过调用 LLM 将重要内容写入记忆工具。
-        整个过程不影响 SSE 流。
-
-        Returns:
-            True: 本次确实触发并完成了静默记忆写入
-            False: 未触发或触发失败
-        """
-        if self._memory_flushed_this_compaction:
-            return False
-        estimated = self._estimate_tokens()
-        if estimated < self.token_limit * 0.75:
-            return False
-        if self.user_id and not session_id:
-            logger.warning("静默记忆刷新缺少 session_id，已安全跳过")
-            return False
-
-        # 检查是否有记忆工具可用
-        memory_tools = {"record_memory", "update_long_term_memory", "update_user"}
-        available_tools = memory_tools.intersection(self.tools.keys())
-        if not available_tools:
-            return False
-
-        print(f"{Colors.DIM}📝 静默记忆刷新 (tokens: {estimated}/{self.token_limit})...{Colors.RESET}")
-
-        try:
-            flushed = await self._run_tool_call_only(
-                "请把本次对话中需要长期记住的重要信息（用户偏好、关键决策、重要事实）写入记忆工具，然后回复 OK。",
-                allowed_tools=list(available_tools),
-                session_id=session_id or "silent-memory",
-            )
-            if not flushed:
-                return False
-            self._memory_flushed_this_compaction = True
-            print(f"{Colors.DIM}✓ 静默记忆刷新完成{Colors.RESET}")
-            return True
-        except Exception as e:
-            print(f"{Colors.DIM}⚠️ 静默记忆刷新失败: {e}{Colors.RESET}")
-            return False
-
-    async def _run_tool_call_only(
-        self,
-        prompt: str,
-        allowed_tools: list[str],
-        session_id: str,
-        max_steps: int = 3,
-    ) -> bool:
-        """执行一次仅工具调用的 LLM 交互（静默，不 yield 事件）
-
-        Args:
-            prompt: 提示词
-            allowed_tools: 允许使用的工具名列表
-            max_steps: 最大步数
-        """
-        temp_messages = list(self.messages)
-        temp_messages.append(Message(role="user", content=prompt))
-
-        filtered_tools: list[Tool] = []
-        for tool in self.tools.values():
-            if tool.name not in allowed_tools:
-                continue
-            if self._exposure_execution_error(tool, session_id=session_id) is not None:
-                continue
-            # Silent background work cannot ask a human. Only an explicit
-            # effective ALLOW is eligible for model exposure.
-            if self._resolve_tool_permission(tool, session_id=session_id).effect == "allow":
-                filtered_tools.append(tool)
-        if not filtered_tools:
-            return False
-
-        eligible_names = {tool.name for tool in filtered_tools}
-        silent_run_id = str(uuid.uuid4())
-        executed_any = False
-
-        for _ in range(max_steps):
-            response = await self.llm.generate(
-                messages=self._build_llm_request_messages(temp_messages),
-                tools=filtered_tools,
-            )
-
-            if not response.tool_calls:
-                break
-
-            temp_messages.append(Message(
-                role="assistant",
-                content=response.content,
-                tool_calls=response.tool_calls,
-            ))
-
-            for tc in response.tool_calls:
-                if tc.function.name in eligible_names and tc.function.name in self.tools:
-                    tool = self.tools[tc.function.name]
-                    exposure_error = self._exposure_execution_error(
-                        tool,
-                        session_id=session_id,
-                    )
-                    decision = self._resolve_tool_permission(tool, session_id=session_id)
-                    if exposure_error is not None or decision.effect != "allow":
-                        result_text = _TOOL_UNAVAILABLE_MESSAGE
-                        self._record_permission_audit(
-                            tool=tool,
-                            effect=decision.effect,
-                            outcome="blocked_silent",
-                            session_id=session_id,
-                            run_id=silent_run_id,
-                            tool_call_id=tc.id,
-                            arguments=tc.function.arguments,
-                            reason=exposure_error or decision.reason,
-                            matched_rule_id=decision.matched_rule_id,
-                        )
-                    else:
-                        record = await self._execute_tool_call_for_record(
-                            index=0,
-                            thread_id=session_id,
-                            run_id=silent_run_id,
-                            tool_call_id=tc.id,
-                            function_name=tc.function.name,
-                            arguments=tc.function.arguments,
-                            cancel_token=None,
-                            allowed_policy_effects=frozenset({"allow"}),
-                        )
-                        result_text = record.result_content
-                        executed_any = executed_any or record.result.success
-                else:
-                    result_text = _TOOL_UNAVAILABLE_MESSAGE
-
-                temp_messages.append(Message(
-                    role="tool",
-                    content=result_text,
-                    tool_call_id=tc.id,
-                    name=tc.function.name,
-                ))
-
-        return executed_any
 
     def get_history(self) -> list[Message]:
         """Get message history."""

@@ -146,7 +146,7 @@ useEffect(() => {
 ### 4.2 功能范围
 
 合并原 AgentConfig 与 SkillManager，分两个 section：
-- **我的记忆**：`USER.md`（用户画像）、`MEMORY.md`（长期记忆）两个 tab。
+- **我的记忆**：`USER.md`（用户画像）、`MEMORY.md`（长期记忆）两个 tab。`MEMORY.md` 是可编辑、可检索的持久化数据，不会整份自动拼入 system prompt，也不会因保存而触发模型自动提炼。
 - **能力设定**：`SOUL.md`（角色设定）与 Skills 启停两个 tab。
 
 三个记忆文件（memory/user/soul）编辑共用一套加载/保存/编辑态逻辑。

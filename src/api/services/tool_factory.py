@@ -26,7 +26,6 @@ from src.agent.tools.sandbox_bash_tool import (
 )
 from src.agent.tools.sandbox_note_tool import SandboxSessionNoteTool, SandboxRecallNoteTool
 from src.agent.tools.memory_tools import (
-    RecordDailyLogTool,
     UpdateLongTermMemoryTool,
     SearchMemoryTool,
     ReadUserProfileTool,
@@ -208,11 +207,6 @@ async def create_agent_tools(
         ("SandboxSessionNoteTool", lambda: SandboxSessionNoteTool(sandbox=sandbox)),
         ("SandboxRecallNoteTool", lambda: SandboxRecallNoteTool(sandbox=sandbox)),
         # 分层记忆工具
-        ("RecordDailyLogTool", lambda: RecordDailyLogTool(
-            sandbox=sandbox,
-            workspace_dir=mount,
-            agent_config_sync=agent_config_sync,
-        )),
         ("UpdateLongTermMemoryTool", lambda: UpdateLongTermMemoryTool(
             sandbox=sandbox,
             workspace_dir=mount,

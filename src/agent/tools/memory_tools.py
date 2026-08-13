@@ -1,7 +1,6 @@
 """分层记忆工具 — 供 Agent 在对话中读写记忆
 
-提供五个工具：
-- RecordDailyLogTool: 追加结构化记忆到 MEMORY.md（长期持久化）
+提供四个工具：
 - UpdateLongTermMemoryTool: 更新 MEMORY.md（长期知识/共识）
 - SearchMemoryTool: 语义/关键词检索记忆
 - ReadUserProfileTool: 只读 USER.md（用户画像）
@@ -9,7 +8,6 @@
 """
 
 import logging
-from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 from opensandbox import Sandbox
@@ -71,78 +69,11 @@ async def _sync_agent_config_after_write(
         logger.warning("同步 Agent 配置文件到 DB 失败 (%s): %s", file_path, exc)
 
 
-class RecordDailyLogTool(Tool):
-    """追加结构化记忆到 MEMORY.md（长期持久化）"""
-
-    def __init__(
-        self,
-        sandbox: Sandbox,
-        workspace_dir: str = "/home/user",
-        agent_config_sync: AgentConfigSync | None = None,
-    ):
-        self._sandbox = sandbox
-        self._workspace_dir = workspace_dir
-        self._agent_config_sync = agent_config_sync
-
-    @property
-    def name(self) -> str:
-        return "record_memory"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Record important information to long-term memory (MEMORY.md). "
-            "Use this to remember key facts, user preferences, decisions, or insights "
-            "that should persist across conversations. Each entry is timestamped and appended."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "string",
-                    "description": "The information to record. Be concise but specific.",
-                },
-                "category": {
-                    "type": "string",
-                    "description": "Category tag (e.g., 'preference', 'fact', 'decision', 'insight')",
-                    "default": "general",
-                },
-            },
-            "required": ["content"],
-        }
-
-    async def execute(self, content: str, category: str = "general") -> ToolResult:
-        try:
-            if not content or not content.strip():
-                return ToolResult(success=False, content="", error="content is required")
-
-            today = datetime.now().strftime("%Y-%m-%d")
-            time_str = datetime.now().strftime("%H:%M:%S")
-            file_path = f"{self._workspace_dir}/MEMORY.md"
-
-            # 构建条目
-            entry = (
-                f"\n## [{today} {time_str}] ({category})\n\n"
-                f"{content.strip()}\n"
-            )
-
-            # 追加到长期记忆文件
-            merged = await _sandbox_append_text(self._sandbox, file_path, entry)
-            await _sync_agent_config_after_write(self._agent_config_sync, file_path, merged)
-
-            return ToolResult(
-                success=True,
-                content=f"Recorded to {file_path}: [{category}] {content[:100]}...",
-            )
-        except Exception as e:
-            return ToolResult(success=False, content="", error=f"Failed to record memory: {e}")
-
-
 class UpdateLongTermMemoryTool(Tool):
     """更新 MEMORY.md（长期知识/共识）"""
+
+    def repeat_policy_for(self, arguments: dict[str, Any]) -> str:
+        return "read_only" if arguments.get("mode") == "read" else "mutating"
 
     def __init__(
         self,
@@ -162,9 +93,11 @@ class UpdateLongTermMemoryTool(Tool):
     def description(self) -> str:
         return (
             "Update the long-term memory file (MEMORY.md) in the user's workspace. "
-            "This file stores persistent knowledge, facts, and consensus that should "
-            "be available across all future conversations. Use 'read' mode to check "
-            "current content before updating. Use 'write' mode to replace the entire content."
+            "This file stores persistent knowledge, facts, and consensus for explicit "
+            "read or search in future conversations; it is not automatically injected. "
+            "Only write when the user explicitly asks to persist information across conversations. "
+            "Use 'read' mode to check current content before updating. Use 'write' mode "
+            "to replace the entire content."
         )
 
     @property
@@ -226,6 +159,8 @@ class UpdateLongTermMemoryTool(Tool):
 
 class SearchMemoryTool(Tool):
     """语义/关键词检索记忆"""
+
+    repeat_policy = "read_only"
 
     def __init__(self, db_session_factory, user_id: str):
         self._db_factory = db_session_factory
@@ -308,6 +243,8 @@ class SearchMemoryTool(Tool):
 class ReadUserProfileTool(Tool):
     """只读 USER.md（用户画像）"""
 
+    repeat_policy = "read_only"
+
     def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
         self._sandbox = sandbox
         self._workspace_dir = workspace_dir
@@ -351,6 +288,9 @@ class ReadUserProfileTool(Tool):
 class UpdateUserProfileTool(Tool):
     """读写 USER.md（用户画像）"""
 
+    def repeat_policy_for(self, arguments: dict[str, Any]) -> str:
+        return "read_only" if arguments.get("mode") == "read" else "mutating"
+
     def __init__(
         self,
         sandbox: Sandbox,
@@ -371,7 +311,8 @@ class UpdateUserProfileTool(Tool):
             "Update the user's profile (USER.md) with personal info, background, "
             "or preferences learned during conversation. Use 'read' to check current "
             "content before updating, 'write' to replace, or 'append' to add a section. "
-            "Call this proactively when you discover important user information."
+            "Only write when the user explicitly asks to persist profile information "
+            "or change the agent configuration."
         )
 
     @property

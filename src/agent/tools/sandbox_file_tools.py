@@ -243,6 +243,8 @@ except Exception as e:
 class SandboxReadImageTool(Tool):
     """Read sandbox image files and return image_url content blocks for visual models."""
 
+    repeat_policy = "read_only"
+
     def __init__(
         self,
         sandbox: Sandbox,
@@ -400,6 +402,8 @@ class SandboxReadTool(Tool):
        讓 LLM 明確辨認「內容已完整結束」。
     """
 
+    repeat_policy = "read_only"
+
     max_result_tokens = 32000  # 保持現有 32K token 截斷行為
 
     def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
@@ -525,6 +529,8 @@ class SandboxReadTool(Tool):
 class SandboxWriteTool(Tool):
     """在沙箱中寫入文件"""
 
+    repeat_policy = "mutating"
+
     def __init__(
         self,
         sandbox: Sandbox,
@@ -598,6 +604,8 @@ class SandboxWriteTool(Tool):
 
 class SandboxEditTool(Tool):
     """在沙箱中編輯文件（字串替換）"""
+
+    repeat_policy = "mutating"
 
     def __init__(
         self,

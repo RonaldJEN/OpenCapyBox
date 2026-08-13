@@ -153,7 +153,7 @@ python3 -m pip install pkg # 报 ImportError 时再装
 
 - 已有对应技能 → 直接 `edit_file` 追加到该 `SKILL.md` 的「已知坑点」或「执行步骤」
 - 需新脚本 → 直接 `write_file` 到 `skills/{skill-name}/scripts/xxx.py`
-- 还不够格成技能的零散经验 → 一行记到 `MEMORY.md`（环境事实/参数/配置）
+- 还不够格成技能的零散经验 → 留在当前任务上下文，不主动写入长期记忆
 
 ### 技能创建标准
 
@@ -185,23 +185,15 @@ python3 -m pip install pkg # 报 ImportError 时再装
 
 | 工具                        | 用途                     |
 | --------------------------- | ------------------------ |
-| `record_memory`           | 记录日志、关键事实、决策 |
 | `update_long_term_memory` | 读写 MEMORY.md           |
 | `update_user`             | 读写 USER.md             |
 | `search_memory`           | 搜索历史记忆             |
 | `read_user`               | 快速读 USER.md           |
 | `edit_file(SOUL.md)`      | 修改 Agent 身份设定      |
 
-### 主动记录原则
-
-对话中发现有价值信息时，**先记录再回答**：
-
-- 用户个人信息、背景、习惯 → `USER.md`
-- 环境事实、工具配置、技术细节 → `MEMORY.md`
-- 用户对你行为方式的偏好 → `SOUL.md`
-- 重要决策或结论 → `memory/YYYY-MM-DD.md`
-
-不要等用户说"记住这个"，信息有价值就主动记。
+只有用户明确要求跨会话长期保存或修改 Agent 配置时，才写入
+`MEMORY.md`、`USER.md` 或 `SOUL.md`。当前会话内的任务状态、测试数据、
+临时结论和压缩摘要不得主动写入长期记忆。
 
 **❌ 禁止在记忆文件中存储密钥**，密钥统一存 `/home/user/.env`。
 
@@ -257,8 +249,3 @@ description: "执行内容描述"
 ```
 
 其他操作：`list`（列出）、`remove`（删除）、`toggle`（启停）、`history`（执行历史）。
-
-### 记忆与技能维护（定期执行）
-
-1. 浏览最近 `memory/YYYY-MM-DD.md`，把值得长期保留的提炼到 `MEMORY.md`（保持 2000 字符内，删过时条目）
-2. 检查 `USER.md`，去除重复的偏好描述

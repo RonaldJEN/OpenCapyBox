@@ -598,6 +598,8 @@ export default function AdminConsole() {
                 step.llm_record_id === llmRecordId
                   ? {
                     ...step,
+                    call_kind: detail.call_kind,
+                    checkpoint_id: detail.checkpoint_id,
                     request_message_count: detail.request_message_count,
                     request_messages: detail.request_messages,
                     request_tools: detail.request_tools,
@@ -1623,6 +1625,7 @@ function RoundsPanel({
                                           <thead>
                                             <tr>
                                               <th>Step</th>
+                                              <th>类型</th>
                                               <th>详情</th>
                                               <th>消息数</th>
                                               <th>Prompt</th>
@@ -1652,6 +1655,7 @@ function RoundsPanel({
                                                 <Fragment key={step.llm_record_id}>
                                                   <tr>
                                                     <td>{step.step_index}</td>
+                                                    <td>{step.call_kind === 'compaction' ? '压缩' : '普通'}</td>
                                                     <td>
                                                       <button
                                                         className="admin-link-button"
@@ -1689,7 +1693,7 @@ function RoundsPanel({
 
                                                   {detailExpanded ? (
                                                     <tr>
-                                                      <td className="admin-step-detail-cell" colSpan={12}>
+                                                      <td className="admin-step-detail-cell" colSpan={13}>
                                                         <div className="admin-step-analysis-block">
                                                           <div className="admin-step-analysis-title">管理员分析摘要</div>
                                                           <div className="admin-step-analysis-grid">
@@ -1697,6 +1701,8 @@ function RoundsPanel({
                                                               <div className="admin-step-analysis-card-title">请求概览</div>
                                                               <div className="admin-step-analysis-row"><span>Provider</span><strong>{analysis.provider}</strong></div>
                                                               <div className="admin-step-analysis-row"><span>模型</span><strong>{analysis.model}</strong></div>
+                                                              <div className="admin-step-analysis-row"><span>调用类型</span><strong>{step.call_kind}</strong></div>
+                                                              <div className="admin-step-analysis-row"><span>Checkpoint</span><strong>{step.checkpoint_id || '-'}</strong></div>
                                                               <div className="admin-step-analysis-row"><span>消息条数</span><strong>{formatNumber(step.request_message_count)}</strong></div>
                                                               <div className="admin-step-analysis-row"><span>声明工具数</span><strong>{analysis.requestToolCount}</strong></div>
                                                               <div className="admin-step-analysis-row"><span>用户诉求摘要</span><strong>{analysis.latestUserMessage}</strong></div>
@@ -1744,6 +1750,8 @@ function RoundsPanel({
 
                                                         <div className="admin-step-compaction-grid">
                                                           <div>是否触发压缩（compaction_triggered）: {step.compaction_triggered ? '是' : '否'}</div>
+                                                          <div>调用类型（call_kind）: {step.call_kind}</div>
+                                                          <div>Checkpoint（checkpoint_id）: {step.checkpoint_id || '-'}</div>
                                                           <div>压缩前 Token（compaction_pre_tokens）: {formatNumber(step.compaction_pre_tokens)}</div>
                                                           <div>压缩后 Token（compaction_post_tokens）: {formatNumber(step.compaction_post_tokens)}</div>
                                                           <div>节省 Token（compaction_tokens_saved）: {formatNumber(step.compaction_tokens_saved)}</div>

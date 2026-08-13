@@ -15,6 +15,8 @@ from src.api.model_registry import (
     VALID_PROVIDERS,
     VALID_REASONING_FORMATS,
 )
+from src.api.models.llm_model import LLMModel
+from src.api.services.model_access_service import db_model_to_config
 
 
 # ============================================================
@@ -99,6 +101,41 @@ class TestModelConfig:
         """負 max_tokens 拋出 ValueError"""
         with pytest.raises(ValueError, match="max_tokens"):
             self._make_config(max_tokens=-100)
+
+    def test_zero_tool_output_truncation_bytes_raises(self):
+        with pytest.raises(ValueError, match="tool_output_truncation_bytes must be > 0"):
+            self._make_config(tool_output_truncation_bytes=0)
+
+    def test_db_model_zero_tool_output_truncation_bytes_is_not_defaulted(self):
+        model = LLMModel(
+            model_id="zero-truncation",
+            display_name="Zero Truncation",
+            provider="openai",
+            api_base="https://api.example.com/v1",
+            api_key="test-key",
+            model_name="zero-truncation",
+            max_tokens=8192,
+            context_window=128000,
+            tool_output_truncation_bytes=0,
+        )
+
+        with pytest.raises(ValueError, match="tool_output_truncation_bytes must be > 0"):
+            db_model_to_config(model)
+
+    def test_db_model_missing_tool_output_truncation_bytes_uses_default(self):
+        model = LLMModel(
+            model_id="missing-truncation",
+            display_name="Missing Truncation",
+            provider="openai",
+            api_base="https://api.example.com/v1",
+            api_key="test-key",
+            model_name="missing-truncation",
+            max_tokens=8192,
+            context_window=128000,
+        )
+        model.tool_output_truncation_bytes = None
+
+        assert db_model_to_config(model).tool_output_truncation_bytes == 10000
 
     def test_supports_thinking_true(self):
         """OpenAI 变体显式启用 reasoning split 时公开支持思考。"""
@@ -190,22 +227,31 @@ class TestModelConfig:
         assert cfg.tags == ["thinking", "coding"]
 
     def test_compute_token_limit_normal(self):
-        """正常情況：context_window - max_tokens - 3000"""
+        """默认阈值是可用输入预算的 80%。"""
         cfg = self._make_config(context_window=128000, max_tokens=8192)
-        # 128000 - 8192 - 3000 = 116808
-        assert cfg.compute_token_limit() == 116808
+        assert cfg.compute_token_limit() == int((128000 - 8192) * 0.8)
 
-    def test_compute_token_limit_small_window_clamps_to_floor(self):
-        """窗口極小時下界鉗位到 8192"""
+    def test_small_window_uses_same_eighty_percent_input_budget_rule(self):
         cfg = self._make_config(context_window=16000, max_tokens=8000)
-        # 16000 - 8000 - 3000 = 5000 -> clamp to 8192
-        assert cfg.compute_token_limit() == 8192
+        assert cfg.compute_token_limit() == 6400
 
     def test_compute_token_limit_large_output(self):
-        """大 output token 配額時仍正確計算"""
+        """输出配额从窗口中扣除后再计算自动压缩阈值。"""
         cfg = self._make_config(context_window=200000, max_tokens=65536)
-        # 200000 - 65536 - 3000 = 131464
-        assert cfg.compute_token_limit() == 131464
+        assert cfg.compute_token_limit() == int((200000 - 65536) * 0.8)
+
+    def test_custom_auto_compact_limit_is_capped_at_default_input_budget_limit(self):
+        assert self._make_config(
+            context_window=100000,
+            auto_compact_token_limit=60000,
+        ).compute_token_limit() == 60000
+        capped = self._make_config(
+            context_window=100000,
+            auto_compact_token_limit=99000,
+        )
+        assert capped.compute_token_limit() == int(
+            (capped.context_window - capped.max_tokens) * 0.8
+        )
 
 
 # ============================================================

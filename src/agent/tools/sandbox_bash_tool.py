@@ -650,6 +650,8 @@ Examples:
 class SandboxBashOutputTool(Tool):
     """讀取沙箱後台命令的輸出"""
 
+    repeat_policy = "polling"
+
     def __init__(self, tracker: '_BackgroundCommandTracker | None' = None):
         self._tracker = tracker or _BackgroundCommandTracker()
 
@@ -727,6 +729,8 @@ Example: bash_output(bash_id="abc12345")"""
 
 class SandboxBashKillTool(Tool):
     """終止沙箱中的後台命令"""
+
+    repeat_policy = "mutating"
 
     def __init__(self, tracker: '_BackgroundCommandTracker | None' = None):
         self._tracker = tracker or _BackgroundCommandTracker()

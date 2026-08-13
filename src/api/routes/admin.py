@@ -195,6 +195,8 @@ class AdminModelPayload(BaseModel):
     model_name: str = Field(..., min_length=1, max_length=255)
     max_tokens: int = Field(default=16384, gt=0)
     context_window: int = Field(default=128000, gt=0)
+    auto_compact_token_limit: int | None = Field(default=None, gt=0)
+    tool_output_truncation_bytes: int = Field(default=10000, gt=0)
     reasoning_format: str = "none"
     reasoning_split: bool = False
     enable_thinking: bool = False
@@ -233,6 +235,8 @@ class AdminModelPatchPayload(BaseModel):
     model_name: str | None = Field(default=None, min_length=1, max_length=255)
     max_tokens: int | None = Field(default=None, gt=0)
     context_window: int | None = Field(default=None, gt=0)
+    auto_compact_token_limit: int | None = Field(default=None, gt=0)
+    tool_output_truncation_bytes: int | None = Field(default=None, gt=0)
     reasoning_format: str | None = None
     reasoning_split: bool | None = None
     enable_thinking: bool | None = None
@@ -401,6 +405,8 @@ def _validate_model_config_values(data: dict[str, Any]) -> None:
             model_name=data["model_name"],
             max_tokens=data["max_tokens"],
             context_window=data["context_window"],
+            auto_compact_token_limit=data.get("auto_compact_token_limit"),
+            tool_output_truncation_bytes=data.get("tool_output_truncation_bytes", 10000),
             reasoning_format=data["reasoning_format"],
             reasoning_split=data["reasoning_split"],
             enable_thinking=data["enable_thinking"],
@@ -448,6 +454,8 @@ def _create_admin_model(db: DBSession, payload: AdminModelPayload) -> dict[str, 
         model_name=payload.model_name,
         max_tokens=payload.max_tokens,
         context_window=payload.context_window,
+        auto_compact_token_limit=payload.auto_compact_token_limit,
+        tool_output_truncation_bytes=payload.tool_output_truncation_bytes,
         reasoning_format=payload.reasoning_format,
         reasoning_split=payload.reasoning_split,
         enable_thinking=payload.enable_thinking,
@@ -489,6 +497,8 @@ def _update_admin_model(db: DBSession, model_id: str, payload: AdminModelPatchPa
         "model_name": model.model_name,
         "max_tokens": model.max_tokens,
         "context_window": model.context_window,
+        "auto_compact_token_limit": model.auto_compact_token_limit,
+        "tool_output_truncation_bytes": model.tool_output_truncation_bytes,
         "reasoning_format": model.reasoning_format,
         "reasoning_split": model.reasoning_split,
         "enable_thinking": model.enable_thinking,
@@ -1021,7 +1031,7 @@ def _build_rounds_tree_payload(
                 0,
             ).label("error_calls"),
             func.coalesce(
-                func.sum(case((LLMCallRecord.compaction_triggered.is_(True), 1), else_=0)),
+                func.sum(case((LLMCallRecord.call_kind == "compaction", 1), else_=0)),
                 0,
             ).label("compaction_steps"),
         )
@@ -1135,6 +1145,8 @@ def _build_lightweight_step_payload(row: Any) -> dict[str, Any]:
     return {
         "llm_record_id": int(row.id),
         "step_index": int(row.step_index),
+        "call_kind": row.call_kind or "agent_step",
+        "checkpoint_id": row.checkpoint_id,
         "request_message_count": int(row.request_message_count or 0),
         "request_messages": "",
         "request_tools": "",
@@ -1209,7 +1221,7 @@ def _build_round_items_from_rows(db: DBSession, round_rows: list[Any]) -> list[d
                 0,
             ).label("error_calls"),
             func.coalesce(
-                func.sum(case((LLMCallRecord.compaction_triggered.is_(True), 1), else_=0)),
+                func.sum(case((LLMCallRecord.call_kind == "compaction", 1), else_=0)),
                 0,
             ).label("compaction_steps"),
         )
@@ -1233,6 +1245,8 @@ def _build_round_items_from_rows(db: DBSession, round_rows: list[Any]) -> list[d
             LLMCallRecord.id,
             LLMCallRecord.round_id,
             LLMCallRecord.step_index,
+            LLMCallRecord.call_kind,
+            LLMCallRecord.checkpoint_id,
             LLMCallRecord.request_message_count,
             LLMCallRecord.finish_reason,
             LLMCallRecord.response_error,
@@ -1254,7 +1268,7 @@ def _build_round_items_from_rows(db: DBSession, round_rows: list[Any]) -> list[d
             LLMCallRecord.created_at,
         )
         .filter(LLMCallRecord.round_id.in_(round_ids))
-        .order_by(LLMCallRecord.round_id, LLMCallRecord.step_index)
+        .order_by(LLMCallRecord.created_at, LLMCallRecord.id)
         .all()
     ) if round_ids else []
 
@@ -1356,6 +1370,8 @@ def _build_llm_record_detail_payload(db: DBSession, llm_record_id: int) -> dict[
             LLMCallRecord.id,
             LLMCallRecord.round_id,
             LLMCallRecord.step_index,
+            LLMCallRecord.call_kind,
+            LLMCallRecord.checkpoint_id,
             LLMCallRecord.request_message_count,
             LLMCallRecord.request_messages,
             LLMCallRecord.request_tools,
@@ -1391,6 +1407,8 @@ def _build_llm_record_detail_payload(db: DBSession, llm_record_id: int) -> dict[
         "llm_record_id": int(row.id),
         "round_id": row.round_id,
         "step_index": int(row.step_index),
+        "call_kind": row.call_kind or "agent_step",
+        "checkpoint_id": row.checkpoint_id,
         "request_message_count": int(row.request_message_count or 0),
         "request_messages": row.request_messages or "",
         "request_tools": row.request_tools or "",
@@ -1882,7 +1900,7 @@ def _build_system_payload(db: DBSession, hours: int) -> dict[str, Any]:
         db.query(
             func.count(LLMCallRecord.id).label("llm_calls"),
             func.coalesce(
-                func.sum(case((LLMCallRecord.compaction_triggered.is_(True), 1), else_=0)),
+                func.sum(case((LLMCallRecord.call_kind == "compaction", 1), else_=0)),
                 0,
             ).label("compaction_calls"),
             func.coalesce(func.sum(LLMCallRecord.compaction_tokens_saved), 0).label("tokens_saved"),

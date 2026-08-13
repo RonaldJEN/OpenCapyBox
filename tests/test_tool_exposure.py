@@ -681,46 +681,6 @@ async def test_deferred_activation_is_bounded_to_32_tools_per_session(tmp_path):
     assert list(active) == [tool.name for tool in deferred[8:]]
 
 
-@pytest.mark.asyncio
-async def test_silent_memory_flush_excludes_deny_ask_and_hidden_tools(tmp_path):
-    denied = ExposureTool("record_memory", ToolExposure.DIRECT)
-    ask = ExposureTool("update_long_term_memory", ToolExposure.DIRECT)
-    hidden = ExposureTool("update_user", ToolExposure.HIDDEN)
-    llm = MockLLMClient()
-    agent = _agent(
-        tmp_path,
-        [denied, ask, hidden],
-        llm=llm,
-        user_id="alice",
-        token_limit=100,
-    )
-
-    def resolve(tool, *, session_id):
-        effects = {
-            denied.name: "deny",
-            ask.name: "ask",
-            hidden.name: "allow",
-        }
-        return SimpleNamespace(
-            effect=effects[tool.name],
-            reason="test policy",
-            matched_rule_id=None,
-        )
-
-    with (
-        patch.object(agent, "_estimate_tokens", return_value=100),
-        patch.object(agent, "_resolve_tool_permission", side_effect=resolve),
-    ):
-        flushed = await agent.maybe_flush_memory_silent(session_id="session-a")
-
-    assert flushed is False
-    assert llm.call_count == 0
-    assert denied.execute_count == 0
-    assert ask.execute_count == 0
-    assert hidden.execute_count == 0
-    assert agent._memory_flushed_this_compaction is False
-
-
 def test_schema_hash_is_forwarded_to_visibility_and_runtime_permission_checks(tmp_path):
     tool = ExposureTool("schema_bound", ToolExposure.DIRECT)
     tool.schema_hash = "schema-v7"

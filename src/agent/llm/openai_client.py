@@ -13,6 +13,7 @@ from ..schema import FunctionCall, LLMResponse, Message, ToolCall
 from ..schema.schema import TokenUsage
 from .base import LLMClientBase
 from .json_parser import robust_json_parse
+from .tool_schema import tools_to_openai_schema
 
 logger = logging.getLogger(__name__)
 
@@ -138,30 +139,7 @@ class OpenAIClient(LLMClientBase):
         Returns:
             List of tools in OpenAI dict format
         """
-        result = []
-        for tool in tools:
-            if isinstance(tool, dict):
-                # If already a dict, check if it's in OpenAI format
-                if "type" in tool and tool["type"] == "function":
-                    result.append(tool)
-                else:
-                    # Assume it's in Anthropic format, convert to OpenAI
-                    result.append(
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": tool["name"],
-                                "description": tool["description"],
-                                "parameters": tool["input_schema"],
-                            },
-                        }
-                    )
-            elif hasattr(tool, "to_openai_schema"):
-                # Tool object with to_openai_schema method
-                result.append(tool.to_openai_schema())
-            else:
-                raise TypeError(f"Unsupported tool type: {type(tool)}")
-        return result
+        return tools_to_openai_schema(tools)
 
     def _convert_messages(self, messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert internal messages to OpenAI format.

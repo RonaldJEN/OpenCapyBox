@@ -218,6 +218,41 @@ class TestLLMClientFailover:
             assert client.last_request_snapshot == fallback_snapshot
 
     @pytest.mark.asyncio
+    async def test_failover_preparation_can_rebuild_request_kwargs(self):
+        primary_err = RetryExhaustedError(TimeoutError("stream stalled"), 2)
+        expected = LLMResponse(content="fallback", finish_reason="stop")
+        rewritten = [Message(role="user", content="compacted replacement")]
+
+        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+            primary_client = AsyncMock()
+            primary_client.generate_stream = AsyncMock(side_effect=primary_err)
+            primary_client.retry_callback = None
+
+            fallback_client = AsyncMock()
+            fallback_client.generate_stream = AsyncMock(return_value=expected)
+            fallback_client.retry_callback = None
+            MockOAI.side_effect = [primary_client, fallback_client]
+
+            client = LLMClient.from_model_config(
+                _make_model_config("model-a"),
+                fallback_configs=[_make_model_config("model-b")],
+            )
+
+            async def prepare(config, target_client, call_method, kwargs):
+                assert config.id == "model-b"
+                assert target_client is fallback_client
+                assert call_method == "generate_stream"
+                return {**kwargs, "messages": rewritten}
+
+            client.failover_notify = prepare
+            result = await client.generate_stream(
+                messages=[Message(role="user", content="oversized")]
+            )
+
+            assert result is expected
+            assert fallback_client.generate_stream.await_args.kwargs["messages"] == rewritten
+
+    @pytest.mark.asyncio
     async def test_all_models_fail(self):
         """所有模型都失敗時拋出 RetryExhaustedError"""
         err = RetryExhaustedError(TimeoutError("stalled"), 2)

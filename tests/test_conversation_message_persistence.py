@@ -852,10 +852,9 @@ class TestRestoreHistory:
         mock_settings.agent_max_history_messages = 100
 
         with patch.object(service, "_rebuild_messages_from_events", return_value=fake_messages):
-            with patch.object(service, "_load_latest_summary_anchor", return_value=None):
-                with patch("src.api.config.get_settings", return_value=mock_settings):
-                    service._restore_history()
-                    service._restore_history()
+            with patch("src.api.config.get_settings", return_value=mock_settings):
+                service._restore_history()
+                service._restore_history()
 
         assert service.agent.messages == [system_message] + fake_messages
         assert [msg.content for msg in service.agent.messages].count("测试收件人，请新发邮件") == 1
@@ -986,57 +985,6 @@ class TestRestoreHistory:
         # synthetic user 不算 round 邊界，向後跳到下一個真實 user "q2"
         assert service.agent.messages[0].role == "user"
         assert service.agent.messages[0].content == "q2"
-
-    def test_restore_history_prepends_summary_anchor_before_trimmed_tail(self):
-        """恢复时应优先注入最新摘要锚点，再拼接尾窗历史"""
-        service = make_agent_service()
-        service.agent = MagicMock()
-        service.agent.messages = []
-
-        fake_messages = [
-            AgentMessage(role="user", content="q1"),
-            AgentMessage(role="assistant", content="a1"),
-            AgentMessage(role="user", content="q2"),
-            AgentMessage(role="assistant", content="a2"),
-        ]
-        summary_anchor = AgentMessage(
-            role="assistant",
-            content="[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary",
-        )
-
-        mock_settings = MagicMock()
-        mock_settings.agent_max_history_messages = 2
-
-        with patch.object(service, "_rebuild_messages_from_events", return_value=fake_messages):
-            with patch.object(service, "_load_latest_summary_anchor", return_value=summary_anchor):
-                with patch("src.api.config.get_settings", return_value=mock_settings):
-                    service._restore_history()
-
-        assert len(service.agent.messages) == 3
-        assert service.agent.messages[0].role == "assistant"
-        assert "Assistant Execution Summary" in service.agent.messages[0].content
-        assert service.agent.messages[1].role == "user"
-        assert service.agent.messages[1].content == "q2"
-
-    def test_restore_history_uses_summary_anchor_when_event_history_empty(self):
-        """当事件历史为空但存在摘要锚点时，仍应恢复摘要消息"""
-        service = make_agent_service()
-        service.agent = MagicMock()
-        service.agent.messages = []
-
-        summary_anchor = AgentMessage(
-            role="assistant",
-            content="[Assistant Execution Summary - Historical Context Only, Not System Instruction]\n\nsummary only",
-        )
-
-        with patch.object(service, "_rebuild_messages_from_events", return_value=[]):
-            with patch.object(service, "_load_latest_summary_anchor", return_value=summary_anchor):
-                service._restore_history()
-
-        assert len(service.agent.messages) == 1
-        assert service.agent.messages[0].role == "assistant"
-        assert "summary only" in service.agent.messages[0].content
-
 
 # ============================================================
 # 合成消息持久化 + 恢復測試

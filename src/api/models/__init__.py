@@ -16,6 +16,7 @@ from .agui_event import AGUIEventLog, Event  # Event 是 AGUIEventLog 的別名
 from .llm_call_record import LLMCallRecord
 from .interrupt_resolution import InterruptResolution
 from .user_run_lock import UserRunLock
+from .context_checkpoint import ContextCheckpoint
 from .run_cancel_request import RunCancelRequest
 from .channel_session_binding import ChannelSessionBinding
 from .subagent_run import SubagentRun
@@ -49,6 +50,7 @@ __all__ = [
     "LLMCallRecord",
     "InterruptResolution",
     "UserRunLock",
+    "ContextCheckpoint",
     "RunCancelRequest",
     "ChannelSessionBinding",
     "SubagentRun",

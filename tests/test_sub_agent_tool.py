@@ -19,6 +19,7 @@ from src.agent.tools.base import ToolResult, ToolRuntimeContext
 from src.agent.tools.sub_agent_tool import SubAgentTool
 from src.agent.subagent_profiles import resolve_profile
 from src.api.models.auth_user import AuthUser
+from src.api.models.context_checkpoint import ContextCheckpoint
 from src.api.models.database import Base
 from src.api.models.round import Round
 from src.api.models.session import Session
@@ -254,6 +255,28 @@ class _ChildAgent:
     def add_user_message(self, content):
         self.messages.append(Message(role="user", content=content))
 
+    def export_checkpoint_candidate(self):
+        return (
+            [
+                self.messages[-1].model_copy(deep=True),
+                Message(
+                    role="assistant",
+                    content=(
+                        "[Cumulative Conversation Summary - Replaces All Earlier Summaries]\n"
+                        "child-only compacted state"
+                    ),
+                ),
+            ],
+            90000,
+            100,
+        )
+
+    def _estimate_tokens(self, force_recalculate=False):
+        return 100
+
+    def mark_checkpoint_persisted(self):
+        raise AssertionError("subagent must not publish a session checkpoint")
+
     async def run_agui(self, *, thread_id, run_id, cancel_token=None):
         yield TextMessageStartEvent(messageId="child-msg", role="assistant")
         yield TextMessageContentEvent(messageId="child-msg", delta="child answer")
@@ -281,6 +304,7 @@ async def test_agent_service_sub_agent_creates_child_round_and_graph_edge():
     try:
         child_tool_excludes = []
         child_prompt_overrides = []
+        child_history_policies = []
         db.add(
             AuthUser(
                 user_id="u1",
@@ -309,6 +333,9 @@ async def test_agent_service_sub_agent_creates_child_round_and_graph_edge():
         async def fake_initialize_agent(self):
             child_tool_excludes.append(set(self.tool_exclude))
             child_prompt_overrides.append(self.system_prompt_override)
+            child_history_policies.append(
+                (self.restore_history, self.persist_context_checkpoint)
+            )
             self.agent = _ChildAgent()
 
         with (
@@ -353,6 +380,8 @@ async def test_agent_service_sub_agent_creates_child_round_and_graph_edge():
         assert {"SandboxWriteTool", "SandboxEditTool", "ManageCronTool"}.issubset(research_exclude)
         # 子 agent 使用 profile 精简 system prompt，而非父记忆
         assert child_prompt_overrides == [resolve_profile("review").system_prompt]
+        assert child_history_policies == [(False, False)]
+        assert db.query(ContextCheckpoint).count() == 0
     finally:
         service.close()
         db.close()

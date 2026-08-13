@@ -28,6 +28,8 @@
 | `model_name` | str | 发送给供应商 API 的实际模型名 |
 | `max_tokens` | int | 最大输出 token 数 |
 | `context_window` | int | 上下文窗口大小 |
+| `auto_compact_token_limit` | int/null | 可选自动压缩阈值，最终不得超过 `(context_window - max_tokens) * 80%` |
+| `tool_output_truncation_bytes` | int | 工具结果记录截断策略，必须大于 0，默认 10000 bytes |
 | `reasoning_format` | str | 推理格式配置 |
 | `reasoning_split` | bool | 是否发送 `reasoning_split` |
 | `enable_thinking` | bool | 是否启用思维链模式 |
@@ -35,6 +37,8 @@
 | `supports_video` / `max_videos` | bool / int | 视频输入能力与上限 |
 | `enabled` | bool | 是否可被用户选择 |
 | `tags_json` | json | 前端标签 |
+
+模型配置必须满足 `context_window > max_tokens`。自动压缩默认在 `(context_window - max_tokens) * 80%` 触发；自定义阈值只允许把它调低。普通请求不再使用旧的 3000-token reserve、8192 floor 或单项 10k-token 本地硬拒绝。
 
 ### `llm_model_settings`
 
@@ -125,6 +129,7 @@
 - Fallback 候选会排除当前主模型，并且必须保持多模态能力不降级（例如主模型支持图片/视频时，fallback 也必须满足同等能力与数量上限）。
 - One-shot failover：不持久切换，下次调用仍尝试主模型。
 - Fallback client 缓存避免重复 HTTP 连接。
+- 每次切换到更小窗口 fallback 前，若当前输入达到目标模型 `(context_window - max_tokens) * 80%` 阈值，先由 primary 执行本地压缩；遇到 context/invalid request/usage limit/overload/internal/retry-exhausted，再由目标 fallback 压缩。fallback 压缩的 context overflow 每次只删除一个最旧项重试，成功后用 replacement 重建并真实发送该次请求。
 
 ### 权限语义
 

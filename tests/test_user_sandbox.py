@@ -1254,22 +1254,10 @@ class TestAgentServicePostRoundTasks:
     """_post_round_tasks 和 _sync_memory_to_db 测试"""
 
     @pytest.mark.asyncio
-    async def test_post_round_calls_flush(self):
-        """_post_round_tasks 应调用 maybe_flush_memory_silent"""
-        svc = make_agent_service()
-        svc.agent = MagicMock()
-        svc.agent.maybe_flush_memory_silent = AsyncMock()
-
-        await svc._post_round_tasks(sync_memory=False)
-
-        svc.agent.maybe_flush_memory_silent.assert_called_once()
-
-    @pytest.mark.asyncio
     async def test_post_round_with_sync(self):
         """sync_memory=True 时应调用 _sync_memory_to_db"""
         svc = make_agent_service()
         svc.agent = MagicMock()
-        svc.agent.maybe_flush_memory_silent = AsyncMock()
         svc._sync_memory_to_db = AsyncMock()
 
         await svc._post_round_tasks(sync_memory=True)
@@ -1281,36 +1269,11 @@ class TestAgentServicePostRoundTasks:
         """sync_memory=False 时不应调用 _sync_memory_to_db"""
         svc = make_agent_service()
         svc.agent = MagicMock()
-        svc.agent.maybe_flush_memory_silent = AsyncMock(return_value=False)
         svc._sync_memory_to_db = AsyncMock()
 
         await svc._post_round_tasks(sync_memory=False)
 
         svc._sync_memory_to_db.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_post_round_sync_when_silent_flush_true(self):
-        """静默刷新写入成功时，即使 sync_memory=False 也应回写 DB"""
-        svc = make_agent_service()
-        svc.agent = MagicMock()
-        svc.agent.maybe_flush_memory_silent = AsyncMock(return_value=True)
-        svc._sync_memory_to_db = AsyncMock()
-
-        await svc._post_round_tasks(sync_memory=False)
-
-        svc._sync_memory_to_db.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_post_round_flush_exception_does_not_crash(self):
-        """maybe_flush_memory_silent 异常不应阻塞后续执行"""
-        svc = make_agent_service()
-        svc.agent = MagicMock()
-        svc.agent.maybe_flush_memory_silent = AsyncMock(side_effect=Exception("flush error"))
-        svc._sync_memory_to_db = AsyncMock()
-
-        # 不应抛出异常
-        await svc._post_round_tasks(sync_memory=True)
-        svc._sync_memory_to_db.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_sync_memory_to_db_calls_service(self):
