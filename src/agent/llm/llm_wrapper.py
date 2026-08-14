@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..retry import RetryConfig, RetryExhaustedError
 from ..schema import LLMProvider, LLMResponse, Message
+from ..schema.run_context import current_run_context
 from .anthropic_client import AnthropicClient
 from .base import LLMClientBase
 from .openai_client import OpenAIClient
@@ -51,6 +52,9 @@ class LLMClient:
         reasoning_format: str = "none",
         enable_reasoning_split: bool | None = None,
         enable_thinking: bool = False,
+        thinking_mode: str = "provider_default",
+        thinking_wire_format: str = "enable_thinking",
+        reasoning_effort: str | None = None,
         _api_base_is_full: bool = False,
     ):
         """Initialize LLM client with specified provider.
@@ -67,6 +71,9 @@ class LLMClient:
             reasoning_format: "none"|"reasoning_content"|"reasoning_details"|"anthropic_thinking"
             enable_reasoning_split: Send extra_body.reasoning_split (None=auto-detect for legacy)
             enable_thinking: Send extra_body.enable_thinking
+            thinking_mode: provider_default/enabled/disabled
+            thinking_wire_format: Request encoding for the thinking switch
+            reasoning_effort: Send the OpenAI-compatible reasoning_effort value
             _api_base_is_full: Internal flag — True when called from from_model_config()
         """
         self.provider = provider
@@ -119,11 +126,15 @@ class LLMClient:
                 max_tokens=max_tokens,
                 reasoning_format=reasoning_format,
                 enable_thinking=enable_thinking,
+                thinking_mode=thinking_mode,
+                thinking_wire_format=thinking_wire_format,
+                reasoning_effort=reasoning_effort,
             )
             logger.info(
                 "OpenAI client: reasoning_split=%s, reasoning_format=%s, "
-                "enable_thinking=%s, max_tokens=%d (model: %s)",
-                enable_reasoning_split, reasoning_format, enable_thinking, max_tokens, model,
+                "thinking_mode=%s, thinking_wire_format=%s, max_tokens=%d (model: %s)",
+                enable_reasoning_split, reasoning_format, thinking_mode,
+                thinking_wire_format, max_tokens, model,
             )
         else:
             raise ValueError(f"Unsupported provider: {provider}")
@@ -176,6 +187,9 @@ class LLMClient:
             reasoning_format=config.reasoning_format,
             enable_reasoning_split=config.reasoning_split,
             enable_thinking=config.enable_thinking,
+            thinking_mode=config.thinking_mode,
+            thinking_wire_format=config.thinking_wire_format,
+            reasoning_effort=config.reasoning_effort,
             _api_base_is_full=True,
         )
         instance._fallback_configs = list(fallback_configs or [])
@@ -229,6 +243,20 @@ class LLMClient:
         snapshot = getattr(client, "last_request_snapshot", None)
         self._last_request_snapshot = snapshot if isinstance(snapshot, dict) else None
 
+    @staticmethod
+    def _fallback_can_encode_run_reasoning(config: "ModelConfig") -> bool:
+        run_context = current_run_context.get()
+        reasoning = run_context.reasoning if run_context is not None else None
+        if reasoning is None or (
+            reasoning.mode == "provider_default" and reasoning.effort is None
+        ):
+            return True
+        if config.provider != "openai":
+            return False
+        if reasoning.effort is not None:
+            return True
+        return config.thinking_wire_format != "none"
+
     @classmethod
     def _build_client(cls, config: "ModelConfig", retry_config: RetryConfig) -> LLMClientBase:
         """從 ModelConfig 構建底層 LLMClientBase（複用 from_model_config 保證路徑一致）
@@ -268,7 +296,20 @@ class LLMClient:
             )
 
         # 2) 依序嘗試 fallback 模型
+        attempted_fallbacks = 0
         for i, fb_config in enumerate(self._fallback_configs):
+            if not self._fallback_can_encode_run_reasoning(fb_config):
+                logger.warning(
+                    "Failover [%d/%d]: skipping model '%s'; provider=%s "
+                    "thinking_wire_format=%s cannot encode the frozen reasoning selection",
+                    i + 1,
+                    len(self._fallback_configs),
+                    fb_config.id,
+                    fb_config.provider,
+                    fb_config.thinking_wire_format,
+                )
+                continue
+            attempted_fallbacks += 1
             logger.warning(
                 "Failover [%d/%d]: switching to model '%s' (%s)",
                 i + 1, len(self._fallback_configs),
@@ -304,8 +345,11 @@ class LLMClient:
                 )
                 last_error = fb_err
 
-        # 3) 所有模型均失敗
-        total_models = 1 + len(self._fallback_configs)
+        # 3) 所有兼容模型均失敗。若沒有任何 fallback 能編碼本輪快照，
+        # 保留主模型的原始錯誤，不把「協議不兼容而跳過」包裝成一次模型失敗。
+        if attempted_fallbacks == 0 and isinstance(last_error, RetryExhaustedError):
+            raise last_error
+        total_models = 1 + attempted_fallbacks
         raise RetryExhaustedError(
             last_error if isinstance(last_error, Exception) else Exception(str(last_error)),
             total_models,

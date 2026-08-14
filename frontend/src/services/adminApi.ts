@@ -401,6 +401,11 @@ export interface AdminModelItem {
   reasoning_format: string;
   reasoning_split: boolean;
   enable_thinking: boolean;
+  thinking_mode: 'provider_default' | 'enabled' | 'disabled';
+  thinking_wire_format: 'none' | 'enable_thinking' | 'thinking_object';
+  reasoning_effort: string | null;
+  default_reasoning_level?: string | null;
+  supported_reasoning_efforts: string[];
   supports_thinking: boolean;
   supports_image: boolean;
   max_images: number;
@@ -446,6 +451,10 @@ export interface AdminModelPayload {
   reasoning_format?: string;
   reasoning_split?: boolean;
   enable_thinking?: boolean;
+  thinking_mode?: 'provider_default' | 'enabled' | 'disabled';
+  thinking_wire_format?: 'none' | 'enable_thinking' | 'thinking_object';
+  reasoning_effort?: string | null;
+  supported_reasoning_efforts?: string[];
   supports_image?: boolean;
   max_images?: number;
   supports_video?: boolean;

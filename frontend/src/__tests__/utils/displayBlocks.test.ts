@@ -27,7 +27,6 @@ describe('getToolDescription', () => {
 
   it('应为 write/create 工具生成描述', () => {
     expect(getToolDescription('write_file', { path: 'test.txt' })).toBe('Create test.txt');
-    expect(getToolDescription('create_file', { file_path: 'a/b.ts' })).toBe('Create a/b.ts');
     expect(getToolDescription('WriteTool', {})).toBe('Create file');
   });
 
@@ -128,7 +127,6 @@ describe('getToolCategory', () => {
     expect(getToolCategory('EditTool')).toBe('edit');
     expect(getToolCategory('write_file')).toBe('create');
     expect(getToolCategory('WriteTool')).toBe('create');
-    expect(getToolCategory('create_file')).toBe('create');
     expect(getToolCategory('read_file')).toBe('read');
     expect(getToolCategory('ReadTool')).toBe('read');
     expect(getToolCategory('bash')).toBe('bash');
@@ -194,7 +192,6 @@ describe('getGroupSummary', () => {
   });
 
   it('应为 create 操作生成正确描述', () => {
-    expect(getGroupSummary([makeItem('create_file', 'new.ts')])).toBe('Created new.ts');
   });
 
   it('多个 bash 命令', () => {

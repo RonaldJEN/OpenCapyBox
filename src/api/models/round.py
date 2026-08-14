@@ -78,6 +78,10 @@ class Round(Base):
     # 本轮已解析且实际可用的 Preferred Skills 展示快照。
     # JSON 数组项固定为 {"key": str, "display_name": str}；旧数据为 NULL。
     preferred_skills = Column(Text, nullable=True)
+
+    # 本轮实际请求的思考模式与推理强度快照；旧数据为 NULL（模型默认）。
+    thinking_mode = Column(String(24), nullable=True)
+    reasoning_effort = Column(String(40), nullable=True)
     
     # 最終響應（Agent 的最後輸出）
     final_response = Column(Text, nullable=True)

@@ -14,6 +14,7 @@ from .skill_key import MAX_SKILL_KEY_LENGTH, normalize_skill_key
 logger = logging.getLogger(__name__)
 
 PREFERRED_SKILLS_CONTEXT_DESCRIPTION = "bsbox.preferred_skills.v1"
+REASONING_CONTEXT_DESCRIPTION = "bsbox.reasoning.v1"
 MAX_PREFERRED_SKILLS = 50
 
 
@@ -37,8 +38,21 @@ class ResolvedPreferredSkillsContext:
 
 
 @dataclass(frozen=True)
+class RequestedReasoningContext:
+    mode: Literal["provider_default", "enabled", "disabled"] = "provider_default"
+    effort: str | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedReasoningContext:
+    mode: Literal["provider_default", "enabled", "disabled"] = "provider_default"
+    effort: str | None = None
+
+
+@dataclass(frozen=True)
 class AgentRunContext:
     preferred_skills: ResolvedPreferredSkillsContext | None = None
+    reasoning: ResolvedReasoningContext | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +75,41 @@ current_run_context: ContextVar[AgentRunContext | None] = ContextVar(
     "current_run_context",
     default=None,
 )
+
+
+def resolve_reasoning_selection(
+    requested: RequestedReasoningContext,
+    *,
+    provider: str,
+    supports_reasoning_control: bool,
+    supported_reasoning_efforts: Sequence[str],
+) -> ResolvedReasoningContext:
+    """Validate and normalize one UI-selected reasoning override."""
+    if provider != "openai":
+        raise ValueError("当前模型不支持按轮设置推理等级")
+    if not supports_reasoning_control:
+        raise ValueError("当前模型不支持按轮设置思考模式")
+
+    effort = requested.effort
+    if effort in {"off", "on"}:
+        raise ValueError(
+            "reasoning_effort 不能使用 off/on；请通过 thinking_mode 设置思考开关"
+        )
+    requested_level = effort
+    if requested.mode == "disabled":
+        requested_level = "off"
+    elif requested.mode == "enabled" and requested_level is None:
+        requested_level = "on"
+
+    supported = list(supported_reasoning_efforts)
+    if requested_level is not None and requested_level not in supported:
+        raise ValueError(
+            f"当前模型不支持推理等级 '{requested_level}'，可选: {supported}"
+        )
+    return ResolvedReasoningContext(
+        mode=requested.mode,
+        effort=None if requested.mode == "disabled" else effort,
+    )
 
 
 def normalize_preferred_skill_keys(values: Sequence[str]) -> tuple[str, ...]:
@@ -87,6 +136,41 @@ def requested_preferred_skills_to_context(
         separators=(",", ":"),
     )
     return Context(description=PREFERRED_SKILLS_CONTEXT_DESCRIPTION, value=value)
+
+
+def requested_reasoning_to_context(requested: RequestedReasoningContext) -> Context:
+    value = json.dumps(
+        {"mode": requested.mode, "effort": requested.effort},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return Context(description=REASONING_CONTEXT_DESCRIPTION, value=value)
+
+
+def parse_requested_reasoning_contexts(
+    contexts: Sequence[Context],
+) -> RequestedReasoningContext | None:
+    matching = [c for c in contexts if c.description == REASONING_CONTEXT_DESCRIPTION]
+    if not matching:
+        return None
+    try:
+        payload = json.loads(matching[0].value)
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        mode = payload.get("mode")
+        if mode not in {"provider_default", "enabled", "disabled"}:
+            raise ValueError("invalid mode")
+        effort = payload.get("effort")
+        if effort is not None:
+            if not isinstance(effort, str):
+                raise ValueError("effort must be a string or null")
+            effort = effort.strip() or None
+        if mode == "disabled" and effort is not None:
+            raise ValueError("disabled mode cannot include effort")
+        return RequestedReasoningContext(mode=mode, effort=effort)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning("Ignoring malformed reasoning context: %s", exc)
+        return None
 
 
 def parse_requested_preferred_skills_contexts(

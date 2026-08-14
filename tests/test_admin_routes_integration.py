@@ -278,6 +278,127 @@ def _add_test_llm_model(db, *, model_id: str, enabled: bool = True) -> None:
     ))
 
 
+def test_create_non_openai_model_normalizes_thinking_wire_format(
+    admin_integration_client,
+):
+    client, SessionLocal = admin_integration_client
+
+    response = client.post("/admin/models", json={
+        "model_id": "anthropic-wire-normalized",
+        "display_name": "Anthropic Wire Normalized",
+        "provider": "anthropic",
+        "api_base": "https://api.example.com",
+        "api_key": "test-key",
+        "model_name": "anthropic-wire-normalized",
+        "max_tokens": 1024,
+        "context_window": 16384,
+        "thinking_wire_format": "enable_thinking",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["thinking_wire_format"] == "none"
+
+    db = SessionLocal()
+    try:
+        model = db.query(LLMModel).filter(
+            LLMModel.model_id == "anthropic-wire-normalized"
+        ).one()
+        assert model.thinking_wire_format == "none"
+    finally:
+        db.close()
+
+
+def test_admin_model_writes_persist_normalized_reasoning_levels(
+    admin_integration_client,
+):
+    client, SessionLocal = admin_integration_client
+
+    create_response = client.post("/admin/models", json={
+        "model_id": "normalized-reasoning-levels",
+        "display_name": "Normalized Reasoning Levels",
+        "provider": "openai",
+        "api_base": "https://api.example.com/v1",
+        "api_key": "test-key",
+        "model_name": "normalized-reasoning-levels",
+        "max_tokens": 1024,
+        "context_window": 16384,
+        "supported_reasoning_efforts": [" high ", "max", "high"],
+    })
+
+    assert create_response.status_code == 200
+    assert create_response.json()["supported_reasoning_efforts"] == ["high", "max"]
+
+    db = SessionLocal()
+    try:
+        created = db.query(LLMModel).filter(
+            LLMModel.model_id == "normalized-reasoning-levels"
+        ).one()
+        assert json.loads(created.supported_reasoning_efforts_json) == ["high", "max"]
+    finally:
+        db.close()
+
+    patch_response = client.patch(
+        "/admin/models/normalized-reasoning-levels",
+        json={"supported_reasoning_efforts": ["off", "on", "off"]},
+    )
+
+    assert patch_response.status_code == 200
+    assert patch_response.json()["supported_reasoning_efforts"] == ["off", "on"]
+
+    db = SessionLocal()
+    try:
+        model = db.query(LLMModel).filter(
+            LLMModel.model_id == "normalized-reasoning-levels"
+        ).one()
+        assert json.loads(model.supported_reasoning_efforts_json) == ["off", "on"]
+    finally:
+        db.close()
+
+
+def test_unrelated_admin_patch_reconciles_legacy_duplicate_reasoning_levels(
+    admin_integration_client,
+):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        _add_test_llm_model(db, model_id="legacy-duplicate-reasoning-levels")
+        db.flush()
+        model = db.query(LLMModel).filter(
+            LLMModel.model_id == "legacy-duplicate-reasoning-levels"
+        ).one()
+        model.supported_reasoning_efforts_json = json.dumps(["high", "max", "high"])
+        db.commit()
+    finally:
+        db.close()
+
+    catalog_response = client.get("/admin/models")
+    assert catalog_response.status_code == 200
+    legacy_payload = next(
+        item
+        for item in catalog_response.json()["models"]
+        if item["id"] == "legacy-duplicate-reasoning-levels"
+    )
+    assert legacy_payload["supported_reasoning_efforts"] == ["high", "max"]
+
+    response = client.patch(
+        "/admin/models/legacy-duplicate-reasoning-levels",
+        json={"display_name": "Legacy Levels Reconciled"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["supported_reasoning_efforts"] == ["high", "max"]
+
+    db = SessionLocal()
+    try:
+        stored = db.query(LLMModel).filter(
+            LLMModel.model_id == "legacy-duplicate-reasoning-levels"
+        ).one()
+        assert json.loads(stored.supported_reasoning_efforts_json) == ["high", "max"]
+    finally:
+        db.close()
+
+
 def test_model_permission_group_rejects_disabled_models(admin_integration_client):
     client, SessionLocal = admin_integration_client
 

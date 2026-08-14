@@ -1,4 +1,4 @@
-import { Dispatch, SetStateAction, useState, useEffect, useCallback, useRef, type KeyboardEvent } from 'react';
+import { useState, useEffect, useCallback, useRef, type KeyboardEvent } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Login } from './components/Login';
 import { SessionList } from './components/SessionList';
@@ -9,7 +9,7 @@ import SettingsCenter from './components/SettingsCenter';
 import { apiService } from './services/api';
 import { getUnreadCount } from './services/configApi';
 import { ChatRuntimeProvider, useChatRuntime } from './runtime/ChatRuntimeProvider';
-import type { ModelInfo } from './types';
+import { SessionStatus, type ModelInfo, type Session } from './types';
 
 type ConfigPanel = 'config' | 'cron' | null;
 type SessionScrollTarget = {
@@ -30,17 +30,16 @@ function HomePage() {
 
   return (
     <ChatRuntimeProvider onTitleUpdated={handleTitleUpdated}>
-      <HomePageContent refreshTrigger={refreshTrigger} setRefreshTrigger={setRefreshTrigger} />
+      <HomePageContent refreshTrigger={refreshTrigger} />
     </ChatRuntimeProvider>
   );
 }
 
 interface HomePageContentProps {
   refreshTrigger: number;
-  setRefreshTrigger: Dispatch<SetStateAction<number>>;
 }
 
-function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentProps) {
+function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   const {
     getActiveSlotSessionIds,
     getExecutingSessionIds,
@@ -50,6 +49,7 @@ function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentP
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [selectedModelId, setSelectedModelId] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [optimisticSession, setOptimisticSession] = useState<Session | null>(null);
   const [activePanel, setActivePanel] = useState<ConfigPanel>(null);
   const [lastActivePanel, setLastActivePanel] = useState<Exclude<ConfigPanel, null> | null>(null);
   const [panelMounted, setPanelMounted] = useState(false);
@@ -302,9 +302,18 @@ function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentP
   // 🆕 从 ChatV2 欢迎页触发创建会话（输入即创建）
   const handleCreateSessionForChat = useCallback(async (modelId?: string): Promise<string> => {
     const response = await apiService.createSession(modelId);
-    setRefreshTrigger((prev) => prev + 1); // 刷新侧边栏列表
+    const now = new Date().toISOString();
+    setOptimisticSession({
+      id: response.session_id,
+      user_id: apiService.getUserId() || 'user',
+      status: SessionStatus.ACTIVE,
+      created_at: now,
+      updated_at: now,
+      title: '新会话',
+      model_id: response.model_id || modelId,
+    });
     return response.session_id;
-  }, [setRefreshTrigger]);
+  }, []);
 
   const handleSessionCreatedForChat = useCallback((sessionId: string) => {
     // The user may have selected another session while creation was in flight.
@@ -322,6 +331,7 @@ function HomePageContent({ refreshTrigger, setRefreshTrigger }: HomePageContentP
           currentSessionId={currentSessionId}
           onSessionSelect={handleSessionSelect}
           refreshTrigger={refreshTrigger}
+          optimisticSession={optimisticSession}
           executingSessionIds={executingSessionIds}
           isCollapsed={isSidebarCollapsed}
           onModelChange={setSelectedModelId}

@@ -50,7 +50,12 @@ type ModelForm = {
   context_window: string;
   reasoning_format: string;
   reasoning_split: boolean;
-  enable_thinking: boolean;
+  thinking_wire_format: 'none' | 'enable_thinking' | 'thinking_object';
+  default_reasoning_level: string;
+  initial_default_reasoning_level: string;
+  initial_thinking_mode: 'provider_default' | 'enabled' | 'disabled';
+  initial_reasoning_effort: string | null;
+  supported_reasoning_efforts: string;
   supports_image: boolean;
   max_images: string;
   supports_video: boolean;
@@ -70,7 +75,12 @@ const emptyModelForm: ModelForm = {
   context_window: '128000',
   reasoning_format: 'none',
   reasoning_split: false,
-  enable_thinking: false,
+  thinking_wire_format: 'enable_thinking',
+  default_reasoning_level: 'on',
+  initial_default_reasoning_level: 'on',
+  initial_thinking_mode: 'provider_default',
+  initial_reasoning_effort: null,
+  supported_reasoning_efforts: 'off, on',
   supports_image: false,
   max_images: '0',
   supports_video: false,
@@ -80,6 +90,9 @@ const emptyModelForm: ModelForm = {
 };
 
 function modelToForm(model: AdminModelItem): ModelForm {
+  const defaultReasoningLevel = model.default_reasoning_level
+    || model.reasoning_effort
+    || (model.thinking_mode === 'disabled' ? 'off' : model.thinking_mode === 'enabled' ? 'on' : '');
   return {
     model_id: model.id,
     display_name: model.name,
@@ -91,7 +104,14 @@ function modelToForm(model: AdminModelItem): ModelForm {
     context_window: String(model.context_window),
     reasoning_format: model.reasoning_format,
     reasoning_split: model.reasoning_split,
-    enable_thinking: model.enable_thinking,
+    thinking_wire_format: model.provider === 'openai'
+      ? (model.thinking_wire_format || 'enable_thinking')
+      : 'none',
+    default_reasoning_level: defaultReasoningLevel,
+    initial_default_reasoning_level: defaultReasoningLevel,
+    initial_thinking_mode: model.thinking_mode,
+    initial_reasoning_effort: model.reasoning_effort,
+    supported_reasoning_efforts: model.supported_reasoning_efforts.join(', '),
     supports_image: model.supports_image,
     max_images: String(model.max_images),
     supports_video: model.supports_video,
@@ -373,6 +393,32 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
 
   const handleSaveModel = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const defaultReasoningLevel = modelForm.default_reasoning_level.trim();
+    const supportedReasoningLevels = tagsFromInput(modelForm.supported_reasoning_efforts);
+    // Legacy catalogs carry a default level with no whitelist; only an explicit
+    // whitelist makes the default level a membership constraint.
+    if (
+      defaultReasoningLevel
+      && supportedReasoningLevels.length > 0
+      && !supportedReasoningLevels.includes(defaultReasoningLevel)
+    ) {
+      setError('默认推理等级必须包含在支持的推理等级中');
+      return;
+    }
+    const preserveStoredDefault = editingModelId !== null
+      && defaultReasoningLevel === modelForm.initial_default_reasoning_level;
+    const thinkingMode: 'provider_default' | 'enabled' | 'disabled' = preserveStoredDefault
+      ? modelForm.initial_thinking_mode
+      : defaultReasoningLevel === 'off'
+        ? 'disabled'
+        : defaultReasoningLevel
+          ? 'enabled'
+          : 'provider_default';
+    const reasoningEffort = preserveStoredDefault
+      ? modelForm.initial_reasoning_effort
+      : !defaultReasoningLevel || defaultReasoningLevel === 'off' || defaultReasoningLevel === 'on'
+        ? null
+        : defaultReasoningLevel;
     const payload = {
       model_id: modelForm.model_id.trim(),
       display_name: modelForm.display_name.trim(),
@@ -384,7 +430,11 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
       context_window: numberOrDefault(modelForm.context_window, 128000),
       reasoning_format: modelForm.reasoning_format,
       reasoning_split: modelForm.reasoning_split,
-      enable_thinking: modelForm.enable_thinking,
+      thinking_wire_format: modelForm.thinking_wire_format,
+      enable_thinking: thinkingMode === 'enabled',
+      thinking_mode: thinkingMode,
+      reasoning_effort: reasoningEffort,
+      supported_reasoning_efforts: supportedReasoningLevels,
       supports_image: modelForm.supports_image,
       max_images: numberOrDefault(modelForm.max_images, 0),
       supports_video: modelForm.supports_video,
@@ -820,11 +870,14 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
             </div>
             <label className="admin-model-field">Model ID<input value={modelForm.model_id} disabled={!!editingModelId} onChange={(event) => setModelForm((prev) => ({ ...prev, model_id: event.target.value }))} /></label>
             <label className="admin-model-field">显示名称<input value={modelForm.display_name} onChange={(event) => setModelForm((prev) => ({ ...prev, display_name: event.target.value }))} /></label>
-            <label className="admin-model-field">Provider<select value={modelForm.provider} onChange={(event) => setModelForm((prev) => ({ ...prev, provider: event.target.value }))}><option value="openai">openai</option><option value="anthropic">anthropic</option></select></label>
+            <label className="admin-model-field">Provider<select value={modelForm.provider} onChange={(event) => setModelForm((prev) => ({ ...prev, provider: event.target.value, thinking_wire_format: event.target.value === 'openai' ? (prev.thinking_wire_format === 'none' ? 'enable_thinking' : prev.thinking_wire_format) : 'none', default_reasoning_level: event.target.value === 'openai' ? (prev.default_reasoning_level || 'on') : '', supported_reasoning_efforts: event.target.value === 'openai' ? (prev.supported_reasoning_efforts || 'off, on') : '' }))}><option value="openai">openai</option><option value="anthropic">anthropic</option></select></label>
             <label className="admin-model-field">API Base<input value={modelForm.api_base} onChange={(event) => setModelForm((prev) => ({ ...prev, api_base: event.target.value }))} /></label>
             <label className="admin-model-field">API Key<input value={modelForm.api_key} placeholder={editingModelId ? '留空则保持不变' : ''} onChange={(event) => setModelForm((prev) => ({ ...prev, api_key: event.target.value }))} /></label>
             <label className="admin-model-field">Model Name<input value={modelForm.model_name} onChange={(event) => setModelForm((prev) => ({ ...prev, model_name: event.target.value }))} /></label>
             <label className="admin-model-field">Reasoning<select value={modelForm.reasoning_format} onChange={(event) => setModelForm((prev) => ({ ...prev, reasoning_format: event.target.value }))}><option value="none">none</option><option value="reasoning_content">reasoning_content</option><option value="reasoning_details">reasoning_details</option><option value="anthropic_thinking">anthropic_thinking</option></select></label>
+            <label className="admin-model-field">思考请求协议<select value={modelForm.thinking_wire_format} disabled={modelForm.provider !== 'openai'} onChange={(event) => setModelForm((prev) => ({ ...prev, thinking_wire_format: event.target.value as ModelForm['thinking_wire_format'] }))}><option value="none">不发送思考开关</option><option value="enable_thinking">enable_thinking 布尔值</option><option value="thinking_object">thinking.type 对象</option></select></label>
+            <label className="admin-model-field">默认推理等级<input value={modelForm.default_reasoning_level} disabled={modelForm.provider !== 'openai'} placeholder="off / on / high / max" onChange={(event) => setModelForm((prev) => ({ ...prev, default_reasoning_level: event.target.value }))} /></label>
+            <label className="admin-model-field">支持的推理等级（按显示顺序）<input value={modelForm.supported_reasoning_efforts} disabled={modelForm.provider !== 'openai'} placeholder="off, high, max" onChange={(event) => setModelForm((prev) => ({ ...prev, supported_reasoning_efforts: event.target.value }))} /></label>
             <div className="admin-model-form-pair">
               <label className="admin-model-field">Max tokens<input value={modelForm.max_tokens} onChange={(event) => setModelForm((prev) => ({ ...prev, max_tokens: event.target.value }))} /></label>
               <label className="admin-model-field">Context<input value={modelForm.context_window} onChange={(event) => setModelForm((prev) => ({ ...prev, context_window: event.target.value }))} /></label>
@@ -837,7 +890,6 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
             <div className="admin-model-flags">
               <label><input type="checkbox" checked={modelForm.enabled} onChange={(event) => setModelForm((prev) => ({ ...prev, enabled: event.target.checked }))} /> <CheckCircle2 size={13} />启用</label>
               <label><input type="checkbox" checked={modelForm.reasoning_split} onChange={(event) => setModelForm((prev) => ({ ...prev, reasoning_split: event.target.checked }))} /> reasoning_split</label>
-              <label><input type="checkbox" checked={modelForm.enable_thinking} onChange={(event) => setModelForm((prev) => ({ ...prev, enable_thinking: event.target.checked }))} /> enable_thinking</label>
               <label><input type="checkbox" checked={modelForm.supports_image} onChange={(event) => setModelForm((prev) => ({ ...prev, supports_image: event.target.checked }))} /> 图片</label>
               <label><input type="checkbox" checked={modelForm.supports_video} onChange={(event) => setModelForm((prev) => ({ ...prev, supports_video: event.target.checked }))} /> 视频</label>
             </div>

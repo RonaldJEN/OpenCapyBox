@@ -13,7 +13,13 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 
-from src.api.model_registry import ModelConfig, ModelRegistry, get_model_registry, reload_model_registry
+from src.api.model_registry import (
+    ModelConfig,
+    ModelRegistry,
+    get_model_registry,
+    model_config_from_yaml_entry,
+    reload_model_registry,
+)
 from src.api.models.auth_user import AuthUser
 from src.api.models.llm_model import LLMModel, LLMModelSettings
 from src.api.models.model_permission import (
@@ -43,6 +49,22 @@ def _json_loads_list(raw: str | None) -> list[str]:
     except json.JSONDecodeError:
         pass
     return []
+
+
+def _json_loads_reasoning_levels(raw: str | None) -> list[str]:
+    """Reasoning levels are protocol values, so a wrong type must surface."""
+    if not raw:
+        return []
+    value = json.loads(raw)
+    if not isinstance(value, list):
+        raise ValueError(f"supported_reasoning_efforts 必须是数组，got {value!r}")
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"supported_reasoning_efforts 含非字符串等级 {item!r}；"
+                "YAML 中的 on/off 需加引号"
+            )
+    return value
 
 
 def _find_yaml() -> Path:
@@ -114,26 +136,34 @@ def seed_model_catalog_from_yaml_if_empty(db: DBSession, yaml_path: str | Path |
 
     seeded = 0
     for model_id, cfg in models_raw.items():
+        try:
+            config = model_config_from_yaml_entry(model_id, cfg)
+        except (KeyError, ValueError) as e:
+            raise ValueError(f"模型 '{model_id}' 配置错误: {e}") from e
         model = LLMModel(
-            model_id=str(model_id),
-            display_name=cfg.get("display_name", str(model_id)),
-            provider=cfg["provider"],
-            api_base=cfg["api_base"],
-            api_key=cfg.get("api_key", "${LLM_API_KEY}"),
-            model_name=cfg.get("model_name", str(model_id)),
-            max_tokens=int(cfg.get("max_tokens", 16384)),
-            context_window=int(cfg.get("context_window", 128000)),
-            auto_compact_token_limit=cfg.get("auto_compact_token_limit"),
-            tool_output_truncation_bytes=int(cfg.get("tool_output_truncation_bytes", 10000)),
-            reasoning_format=cfg.get("reasoning_format", "none"),
-            reasoning_split=bool(cfg.get("reasoning_split", False)),
-            enable_thinking=bool(cfg.get("enable_thinking", False)),
-            supports_image=bool(cfg.get("supports_image", False)),
-            max_images=int(cfg.get("max_images", 0)),
-            supports_video=bool(cfg.get("supports_video", False)),
-            max_videos=int(cfg.get("max_videos", 0)),
-            enabled=bool(cfg.get("enabled", True)),
-            tags_json=_json_dumps(cfg.get("tags", [])),
+            model_id=config.id,
+            display_name=config.display_name,
+            provider=config.provider,
+            api_base=config.api_base,
+            api_key=config.api_key,
+            model_name=config.model_name,
+            max_tokens=int(config.max_tokens),
+            context_window=int(config.context_window),
+            auto_compact_token_limit=config.auto_compact_token_limit,
+            tool_output_truncation_bytes=int(config.tool_output_truncation_bytes),
+            reasoning_format=config.reasoning_format,
+            reasoning_split=bool(config.reasoning_split),
+            enable_thinking=bool(config.enable_thinking),
+            thinking_mode=config.thinking_mode,
+            thinking_wire_format=config.thinking_wire_format,
+            reasoning_effort=config.reasoning_effort,
+            supported_reasoning_efforts_json=_json_dumps(config.supported_reasoning_efforts),
+            supports_image=bool(config.supports_image),
+            max_images=int(config.max_images),
+            supports_video=bool(config.supports_video),
+            max_videos=int(config.max_videos),
+            enabled=bool(config.enabled),
+            tags_json=_json_dumps(config.tags),
         )
         db.add(model)
         seeded += 1
@@ -178,6 +208,10 @@ def db_model_to_config(model: LLMModel) -> ModelConfig:
         reasoning_format=model.reasoning_format or "none",
         reasoning_split=bool(model.reasoning_split),
         enable_thinking=bool(model.enable_thinking),
+        thinking_mode=model.thinking_mode or "provider_default",
+        thinking_wire_format=model.thinking_wire_format or "enable_thinking",
+        reasoning_effort=model.reasoning_effort,
+        supported_reasoning_efforts=_json_loads_reasoning_levels(model.supported_reasoning_efforts_json),
         supports_image=bool(model.supports_image),
         max_images=int(model.max_images or 0),
         supports_video=bool(model.supports_video),
@@ -433,6 +467,7 @@ def model_group_names_by_model(db: DBSession) -> dict[str, list[str]]:
 
 def admin_model_payload(db: DBSession, model: LLMModel) -> dict[str, Any]:
     group_names = model_group_names_by_model(db).get(model.model_id, [])
+    config = db_model_to_config(model)
     return {
         "id": model.model_id,
         "name": model.display_name,
@@ -446,7 +481,12 @@ def admin_model_payload(db: DBSession, model: LLMModel) -> dict[str, Any]:
         "reasoning_format": model.reasoning_format,
         "reasoning_split": bool(model.reasoning_split),
         "enable_thinking": bool(model.enable_thinking),
-        "supports_thinking": db_model_to_config(model).supports_thinking,
+        "thinking_mode": config.effective_thinking_mode,
+        "thinking_wire_format": config.thinking_wire_format,
+        "reasoning_effort": config.reasoning_effort,
+        "default_reasoning_level": config.default_reasoning_level,
+        "supported_reasoning_efforts": list(config.supported_reasoning_efforts),
+        "supports_thinking": config.supports_thinking,
         "supports_image": bool(model.supports_image),
         "max_images": model.max_images,
         "supports_video": bool(model.supports_video),

@@ -492,7 +492,7 @@ async def create_session(
 
     Args:
         user_id: 用戶 ID
-        model_id: 模型 ID（可選，不傳則使用 models.yaml 中的 default_model）
+        model_id: 模型 ID（可选，不传则使用数据库模型目录中的默认模型）
     """
     if model_id:
         config = assert_user_can_access_model(db, user_id, model_id)

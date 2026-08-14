@@ -171,6 +171,22 @@ class TimeoutTool(SlowTool):
         return ToolResult(success=True, content="done")
 
 
+class TimeoutWriteTool(TimeoutTool):
+    """模拟已发出但未确认结果的文件写入。"""
+
+    repeat_policy = "mutating"
+
+    @property
+    def name(self) -> str:
+        return "write_file"
+
+
+class TimeoutEditTool(TimeoutWriteTool):
+    @property
+    def name(self) -> str:
+        return "edit_file"
+
+
 class NoTimeoutTool(SlowTool):
     """模拟显式关闭 Agent 单工具超时的工具"""
 
@@ -228,8 +244,41 @@ async def test_tool_execution_timeout():
     tool_results = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
     assert len(tool_results) >= 1
     assert "timed out" in tool_results[0].content.lower()
+    assert "read_file" not in tool_results[0].content
     audit.assert_called_once()
     assert audit.call_args.kwargs["outcome"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_class", "tool_name"),
+    [
+        (TimeoutWriteTool, "write_file"),
+        (TimeoutEditTool, "edit_file"),
+    ],
+)
+async def test_file_write_timeout_requires_read_verification(tool_class, tool_name):
+    """文件写入超时时应明确要求读取验证后再重试。"""
+    timeout_tool = tool_class()
+    agent, _ = _make_agent(tools=[timeout_tool])
+    agent.tool_timeout = 0.01
+
+    record = await agent._execute_tool_call_for_record(
+        index=0,
+        thread_id="thread-1",
+        run_id="run-timeout-write",
+        tool_call_id="tc-timeout-write",
+        function_name=tool_name,
+        arguments={"path": "/home/user/out.txt", "content": "new"},
+        cancel_token=None,
+    )
+
+    assert record.result.success is False
+    assert record.result.outcome_uncertain is True
+    assert "timed out" in record.result_content.lower()
+    assert "read_file" in record.result_content
+    assert "/home/user/out.txt" in record.result_content
+    assert "before retrying" in record.result_content
 
 
 @pytest.mark.asyncio

@@ -149,6 +149,156 @@ class TestOpenAIClientInitialization:
         
         assert client.retry_config.max_retries == 5
 
+    def test_reasoning_params_keep_thinking_independent_from_split(self):
+        client = _make_openai_client(
+            enable_reasoning_split=False,
+            enable_thinking=True,
+            reasoning_effort="high",
+        )
+
+        assert client._reasoning_request_params() == {
+            "extra_body": {"enable_thinking": True},
+            "reasoning_effort": "high",
+        }
+
+    def test_reasoning_params_can_explicitly_disable_thinking(self):
+        client = _make_openai_client(
+            enable_reasoning_split=False,
+            thinking_mode="disabled",
+        )
+
+        assert client._reasoning_request_params() == {
+            "extra_body": {"enable_thinking": False},
+        }
+
+    def test_provider_default_omits_thinking_switch(self):
+        client = _make_openai_client(
+            enable_reasoning_split=False,
+            enable_thinking=False,
+            thinking_mode="provider_default",
+        )
+
+        assert client._reasoning_request_params() == {}
+
+    def test_deepseek_thinking_object_matches_harness_wire_contract(self):
+        client = _make_openai_client(
+            enable_reasoning_split=False,
+            thinking_mode="enabled",
+            thinking_wire_format="thinking_object",
+            reasoning_effort="max",
+        )
+
+        assert client._reasoning_request_params() == {
+            "extra_body": {"thinking": {"type": "enabled"}},
+            "reasoning_effort": "max",
+        }
+
+    def test_deepseek_off_uses_disabled_thinking_object_without_effort(self):
+        client = _make_openai_client(
+            enable_reasoning_split=False,
+            thinking_mode="enabled",
+            thinking_wire_format="thinking_object",
+            reasoning_effort="max",
+        )
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        token = current_run_context.set(AgentRunContext(
+            reasoning=ResolvedReasoningContext(mode="disabled", effort=None)
+        ))
+        try:
+            assert client._reasoning_request_params() == {
+                "extra_body": {"thinking": {"type": "disabled"}},
+            }
+        finally:
+            current_run_context.reset(token)
+
+    def test_none_wire_format_only_sends_effort(self):
+        client = _make_openai_client(
+            enable_reasoning_split=False,
+            thinking_mode="enabled",
+            thinking_wire_format="none",
+            reasoning_effort="high",
+        )
+
+        assert client._reasoning_request_params() == {"reasoning_effort": "high"}
+
+    @pytest.mark.parametrize("reserved", ["off", "on"])
+    def test_request_boundary_rejects_switch_alias_as_reasoning_effort(self, reserved):
+        client = _make_openai_client(reasoning_effort=reserved)
+
+        with pytest.raises(ValueError, match="reasoning_effort cannot be off/on"):
+            client._reasoning_request_params()
+
+    def test_turn_reasoning_context_overrides_catalog_for_entire_run(self):
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        client = _make_openai_client(
+            enable_reasoning_split=True,
+            thinking_mode="enabled",
+            reasoning_effort="high",
+        )
+        token = current_run_context.set(AgentRunContext(
+            reasoning=ResolvedReasoningContext(mode="enabled", effort="max")
+        ))
+        try:
+            assert client._reasoning_request_params() == {
+                "extra_body": {"reasoning_split": True, "enable_thinking": True},
+                "reasoning_effort": "max",
+            }
+        finally:
+            current_run_context.reset(token)
+
+    def test_turn_off_removes_catalog_effort_and_sends_false(self):
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        client = _make_openai_client(thinking_mode="enabled", reasoning_effort="high")
+        token = current_run_context.set(AgentRunContext(
+            reasoning=ResolvedReasoningContext(mode="disabled", effort=None)
+        ))
+        try:
+            assert client._reasoning_request_params() == {
+                "extra_body": {"reasoning_split": True, "enable_thinking": False},
+            }
+        finally:
+            current_run_context.reset(token)
+
+    def test_fallback_client_passes_run_snapshot_through_unchanged(self):
+        """推理等级是网关级透传参数：备用模型不过滤、不降级主模型的冻结快照。"""
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        fallback_client = _make_openai_client(
+            enable_reasoning_split=False,
+            thinking_mode="provider_default",
+            thinking_wire_format="thinking_object",
+            reasoning_effort="low",
+        )
+        token = current_run_context.set(AgentRunContext(
+            reasoning=ResolvedReasoningContext(mode="enabled", effort="max")
+        ))
+        try:
+            assert fallback_client._reasoning_request_params() == {
+                "extra_body": {"thinking": {"type": "enabled"}},
+                "reasoning_effort": "max",
+            }
+        finally:
+            current_run_context.reset(token)
+
 
 class TestConvertTools:
     """測試工具轉換"""

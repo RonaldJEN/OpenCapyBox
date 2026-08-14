@@ -69,11 +69,16 @@ Declarative registration via `models.yaml`, supporting both Anthropic and OpenAI
     max_tokens: 32768
     reasoning_format: reasoning_content  # none / reasoning_content / anthropic_thinking
     reasoning_split: true
-    enable_thinking: true
+    thinking_mode: enabled       # Initial seed only; admin default level maps this internally
+    thinking_wire_format: enable_thinking # none / enable_thinking / thinking_object
+    reasoning_effort: high       # Initial catalog default
+    supported_reasoning_efforts: ["off", "high", "max"] # Ordered choices
     supports_image: false
     enabled: true
     tags: [thinking]
 ```
+
+> YAML 1.1 parses bare `on` / `off` as booleans, so switch entries in `supported_reasoning_efforts` must be quoted. `reasoning_effort` accepts graded values such as `high`/`max`; `on`/`off` are reserved for `thinking_mode`.
 
 See the header comments in [`models.yaml`](models.yaml) for full configuration reference.
 

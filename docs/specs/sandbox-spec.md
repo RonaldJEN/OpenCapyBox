@@ -196,6 +196,21 @@ Profile 配置更新仅保留当前行的 `updated_at` 和 `version`，MVP 不�
 - `to_sandbox_relative_path(path, mount_path)` — 绝对->相对转换
 - mount 路径默认 `/home/user`
 
+### 受控文本写入分类
+
+- `write_file` 在写入前执行一次沙箱内 SHA-256 探针，把结果分类为 `CREATED`、`UPDATED` 或 `NO CHANGE`；`NO CHANGE` 跳过实际写入。
+- 因此一次发生变化的写入通常包含一次额外沙箱命令往返。探针不可执行、返回非零或元数据无效时，为兼容不同沙箱后端退化为一次全文读取后比较；除明确的文件不存在外，检查失败必须阻止写入。
+- 文件变更密集场景需将该一致性检查计入远程调用成本；当前不按文件大小跳过，以避免相同内容仍产生不必要副作用。
+
+### 受控字符串编辑
+
+- `edit_file` 入参为 `path`、`old_str`、`new_str` 与可选布尔 `replace_all`（默认 `false`）。
+- `old_str` 为空、`old_str` 与 `new_str` 相同、`replace_all` 非布尔值一律直接拒绝，不做任何写入尝试。
+- 匹配为字面量、非重叠匹配。默认要求全文恰好一个匹配：0 个匹配返回未找到；多于 1 个匹配且未显式 `replace_all=true` 时返回匹配数量并要求收窄 `old_str`，不得静默只替换第一个。
+- 匹配在 CRLF 归一化为 LF 后进行，因此模型无需感知目标文件换行风格；替换写回时按原文件探测到的主导换行符还原 `new_str` 中的换行，且未命中区间的原始字节保持不变。
+- 成功返回 `EDITED {path} | replacements={n}`，不再返回 diff 行数统计。
+- 写回失败的处理与 `write_file` 一致：沙箱未提供写接口时返回确定失败；写请求已派发但结果未知时返回 `outcome_uncertain`，并要求先 `read_file` 校验。
+
 ### Skill 推送
 
 - 批量推送遍历目录，排除 node_modules/__pycache__/.git/.venv

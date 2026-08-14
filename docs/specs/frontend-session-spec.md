@@ -21,6 +21,7 @@
 ```ts
 const [currentSessionId, setCurrentSessionId] = useState<string>('');
 const [refreshTrigger, setRefreshTrigger] = useState(0);         // 触发 SessionList 重拉
+const [optimisticSession, setOptimisticSession] = useState<Session | null>(null);
 const [executingSessionIds, setExecutingSessionIds] = useState<Set<string>>(() => new Set());
 const [activeSlotSessionIds, setActiveSlotSessionIds] = useState<Set<string>>(() => new Set());
 const [selectedModelId, setSelectedModelId] = useState<string>('');
@@ -53,6 +54,7 @@ SessionList 挂载
   → onNewChat → App.setCurrentSessionId('')
   → ChatV2 显示欢迎页
   → 用户输入第一条消息 → onCreateSession(modelId) → POST /api/sessions
+  → App 立即写入 optimisticSession，由 SessionList 投影到本地列表
   → setCurrentSessionId(newSid) → sendMessage
 ```
 
@@ -97,9 +99,15 @@ if (session.model_id && onModelChange) {
 }
 ```
 
-原因：不同会话可能用不同模型，顶部 ModelSelector 必须反映当前会话的模型。
+原因：不同会话可能用不同模型，输入框工具栏的模型/推理选择器必须反映当前会话的模型。
 
-### 4.5 执行标记集合的清除时机
+切换选中项只从已加载的本地列表同步模型，不得把 `currentSessionId` 加入列表请求 effect 的依赖。这样切换会话不会触发整表 loading、列表闪烁或“同步会话”动画。
+
+### 4.5 新会话乐观投影
+
+`POST /api/sessions` 成功后，App 立即构造 `optimisticSession` 并传给 `SessionList`。非搜索状态下列表把该会话置顶并按 id 去重，不等待下一次全量刷新；搜索状态不得把不匹配的乐观项强行插入结果。
+
+### 4.6 执行标记集合的清除时机
 
 `executingSessionIds` 清除路径：
 - `RUN_STARTED` / 本地发送开始 → ChatV2 调用 `onExecutionStart(sessionId)`，将 sid 加入集合。
@@ -128,7 +136,7 @@ const handleExecutionEnd = (sessionId?: string) => {
 
 `App` 必须立即并周期性 reconcile `/running-sessions`，更新 `executingSessionIds` 与 `activeSlotSessionIds`。除首次恢复运行态外，不得自动切换当前会话。该收敛用于清理非当前会话后台完成后的侧栏执行标记。
 
-### 4.6 会话删除交互（应用内确认弹窗）
+### 4.7 会话删除交互（应用内确认弹窗）
 
 删除会话必须走应用内 `alertdialog`（`ConfirmDialog`），**禁止**使用原生 `window.confirm`。
 
@@ -165,9 +173,11 @@ const handleExecutionEnd = (sessionId?: string) => {
 | Cron 未读计数 | 60s | `App.tsx` 内部 `setInterval`，调用 `getUnreadCount` |
 
 触发列表重拉的其他入口：
-- `refreshTrigger` 变化（新建/删除/标题更新时 +1）
-- `currentSessionId` 变化（从 useEffect 依赖触发）
+- `refreshTrigger` 变化（标题更新时 +1）
 - `debouncedSearchQuery` 变化（搜索词 300ms 防抖后触发）
+- 删除成功后的二级异步校准刷新
+
+新建会话使用 `optimisticSession` 本地投影；`currentSessionId` 变化只切换选中态和同步本地模型，均不得触发列表重拉。
 
 ## 6. 搜索交互
 
@@ -197,7 +207,7 @@ const handleExecutionEnd = (sessionId?: string) => {
 | 错误 | 表现 |
 |---|---|
 | `getSessions` 失败 | `console.error`，显示"加载失败"空态 |
-| `deleteSession` 失败 | `console.error`，保留确认弹窗，展示"删除失败，请重试。"，确认按钮变"重试删除"，允许重试或取消；不从列表移除目标会话（见 §4.6） |
+| `deleteSession` 失败 | `console.error`，保留确认弹窗，展示"删除失败，请重试。"，确认按钮变"重试删除"，允许重试或取消；不从列表移除目标会话（见 §4.7） |
 | `getRunningSessions` 失败 | `console.error`，不影响正常流程 |
 
 ## 9. 测试清单
@@ -210,6 +220,8 @@ const handleExecutionEnd = (sessionId?: string) => {
 - [ ] 删除失败保留弹窗并展示错误，确认按钮变"重试删除"且获得焦点
 - [ ] 删除成功后按"原按钮→同行→相邻行→首行→新建对话"顺序恢复焦点
 - [ ] 欢迎页输入第一条消息才创建会话
+- [ ] 新会话创建成功后立即投影到列表，不等待全量刷新且不重复
+- [ ] 切换会话不重新请求列表、不显示列表 loading
 - [ ] A/B 多会话并行时，侧栏同时显示多个执行标记
 - [ ] 非当前会话后台完成后，周期收敛会清理对应执行标记
 - [ ] 本地 run 在 `RUN_STARTED` 前的 init-window 会保留执行标记；429 不污染执行标记
@@ -225,6 +237,6 @@ const handleExecutionEnd = (sessionId?: string) => {
 
 ## 10. 已知易错点
 
-1. `useEffect(() => loadSessions(), [refreshTrigger, currentSessionId])` —— 切换会话也会触发 reload，属于期望行为，不要误删 `currentSessionId` 依赖。
+1. `useEffect(() => loadSessions(), [refreshTrigger, currentSessionId])` —— 禁止加入 `currentSessionId`；切换会话应完全使用本地列表，否则会造成无意义刷新与闪烁。
 2. 在 `onSessionSelect` 里做异步操作会阻塞 UI → 保持同步。
 3. 运行中检测写成每次挂载都执行 → 切会话时 UI 闪跳。

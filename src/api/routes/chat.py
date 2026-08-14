@@ -33,6 +33,10 @@ from datetime import datetime
 from src.api.utils.timezone import now_naive
 # AG-UI 事件類型統一從 Agent 層導入
 from src.agent.schema.agui_events import CustomEvent, EventType, RunErrorEvent, RunFinishedEvent
+from src.agent.schema.run_context import (
+    RequestedReasoningContext,
+    resolve_reasoning_selection,
+)
 from src.api.utils.agui_encoder import EventEncoder
 from src.api.services.agent_service import DuplicateRoundError
 from src.api.services.agui_event_bus import AguiEventBus, get_agui_event_bus
@@ -109,6 +113,31 @@ def _resolve_session_model_for_user(db: DBSession, session: Session, user_id: st
     db.commit()
     db.refresh(session)
     return config.id
+
+
+def _validate_turn_reasoning_request(
+    db: DBSession,
+    *,
+    user_id: str,
+    model_id: str,
+    request: SendMessageRequest,
+) -> None:
+    """Validate a per-turn reasoning selection against the exact session model."""
+    if request.thinking_mode is None and request.reasoning_effort is None:
+        return
+    config = assert_user_can_access_model(db, user_id, model_id)
+    try:
+        resolve_reasoning_selection(
+            RequestedReasoningContext(
+                mode=request.thinking_mode or "provider_default",
+                effort=request.reasoning_effort,
+            ),
+            provider=config.provider,
+            supports_reasoning_control=config.supports_reasoning_control,
+            supported_reasoning_efforts=config.supported_reasoning_efforts,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 _web_chat_adapter = WebChatAdapter()
 _web_resume_adapter = WebResumeAdapter()
 _web_cancel_adapter = WebCancelAdapter()
@@ -590,6 +619,12 @@ async def send_message_stream(
         user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
         round_count = db.query(Round).filter(Round.session_id == chat_session_id).count()
         model_id = _resolve_session_model_for_user(db, session, user_id)
+        _validate_turn_reasoning_request(
+            db,
+            user_id=user_id,
+            model_id=model_id,
+            request=request,
+        )
     except Exception:
         await _release_user_run_lock_in_new_session(
             user_id=user_id,

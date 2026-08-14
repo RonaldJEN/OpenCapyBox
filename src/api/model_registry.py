@@ -64,6 +64,8 @@ def _resolve_env(value: str) -> str:
 # ============================================================
 
 VALID_PROVIDERS = {"anthropic", "openai"}
+VALID_THINKING_MODES = {"provider_default", "enabled", "disabled"}
+VALID_THINKING_WIRE_FORMATS = {"none", "enable_thinking", "thinking_object"}
 VALID_REASONING_FORMATS = {
     "none",                # 不支援思考
     "reasoning_content",   # OpenAI response.reasoning_content（GLM/Qwen/DeepSeek）
@@ -121,7 +123,10 @@ class ModelConfig:
         max_tokens: 最大輸出 token 數
         reasoning_format: 思考過程解析格式
         reasoning_split: 是否發送 extra_body.reasoning_split = true（僅 OpenAI）
-        enable_thinking: 是否發送 extra_body.enable_thinking = true（僅 OpenAI）
+        thinking_mode: 思考開關三態（provider_default/enabled/disabled，僅 OpenAI）
+        thinking_wire_format: 思考开关的请求协议（不发送/enable_thinking/thinking.type）
+        enable_thinking: 舊版相容開關；thinking_mode=provider_default 時 true 代表 enabled
+        reasoning_effort: 發送給 OpenAI 協議的推理強度（如 low/medium/high）
         enabled: 是否對前端可見
         tags: 分類標籤
     """
@@ -139,6 +144,10 @@ class ModelConfig:
     reasoning_format: str = "none"
     reasoning_split: bool = False
     enable_thinking: bool = False
+    thinking_mode: str = "provider_default"
+    thinking_wire_format: str = "none"
+    reasoning_effort: str | None = None
+    supported_reasoning_efforts: list[str] = field(default_factory=list)
     supports_image: bool = False
     max_images: int = 0
     supports_video: bool = False
@@ -158,6 +167,102 @@ class ModelConfig:
                 f"模型 '{self.id}' 的 reasoning_format '{self.reasoning_format}' 無效，"
                 f"可選: {VALID_REASONING_FORMATS}"
             )
+        if self.thinking_mode not in VALID_THINKING_MODES:
+            raise ValueError(
+                f"模型 '{self.id}' 的 thinking_mode '{self.thinking_mode}' 無效，"
+                f"可選: {VALID_THINKING_MODES}"
+            )
+        if self.thinking_wire_format not in VALID_THINKING_WIRE_FORMATS:
+            raise ValueError(
+                f"模型 '{self.id}' 的 thinking_wire_format '{self.thinking_wire_format}' 無效，"
+                f"可選: {VALID_THINKING_WIRE_FORMATS}"
+            )
+        if self.thinking_mode != "provider_default" and self.provider != "openai":
+            raise ValueError(
+                f"模型 '{self.id}' 的 thinking_mode 僅支援 provider=openai"
+            )
+        if self.reasoning_effort is not None:
+            # YAML 1.1 turns bare on/off/yes/no into booleans; reject instead of
+            # silently shipping "True" to the provider.
+            if not isinstance(self.reasoning_effort, str):
+                raise ValueError(
+                    f"模型 '{self.id}' 的 reasoning_effort 必須是字串，"
+                    f"got {self.reasoning_effort!r}；YAML 中的 on/off 需加引號"
+                )
+            self.reasoning_effort = self.reasoning_effort.strip()
+            if not self.reasoning_effort:
+                self.reasoning_effort = None
+            elif self.reasoning_effort in {"off", "on"}:
+                raise ValueError(
+                    f"模型 '{self.id}' 的 reasoning_effort 不能使用保留等级 "
+                    f"'{self.reasoning_effort}'；請改用 thinking_mode 表达开关"
+                )
+        normalized_efforts: list[str] = []
+        for effort in self.supported_reasoning_efforts:
+            if not isinstance(effort, str):
+                raise ValueError(
+                    f"模型 '{self.id}' 的 supported_reasoning_efforts 必須全部是字串，"
+                    f"got {effort!r}；YAML 中的 on/off 需加引號"
+                )
+            value = effort.strip()
+            if not value:
+                raise ValueError(
+                    f"模型 '{self.id}' 的 supported_reasoning_efforts 不能包含空等级"
+                )
+            if value not in normalized_efforts:
+                normalized_efforts.append(value)
+        self.supported_reasoning_efforts = normalized_efforts
+        if self.reasoning_effort is not None and self.provider != "openai":
+            raise ValueError(
+                f"模型 '{self.id}' 的 reasoning_effort 僅支援 provider=openai"
+            )
+        if self.supported_reasoning_efforts and self.provider != "openai":
+            raise ValueError(
+                f"模型 '{self.id}' 的 supported_reasoning_efforts 僅支援 provider=openai"
+            )
+        if (
+            self.reasoning_effort is not None
+            and self.supported_reasoning_efforts
+            and self.reasoning_effort not in self.supported_reasoning_efforts
+        ):
+            raise ValueError(
+                f"模型 '{self.id}' 的 reasoning_effort 必須包含在 supported_reasoning_efforts 中"
+            )
+        default_level = self.default_reasoning_level
+        if (
+            default_level in {"off", "on"}
+            and self.supported_reasoning_efforts
+            and default_level not in self.supported_reasoning_efforts
+        ):
+            raise ValueError(
+                f"模型 '{self.id}' 的默认推理等级 '{default_level}' "
+                "必须包含在 supported_reasoning_efforts 中"
+            )
+        if self.thinking_mode == "disabled" and self.reasoning_effort is not None:
+            raise ValueError(
+                f"模型 '{self.id}' 關閉思考時不能設定 reasoning_effort"
+            )
+        if self.thinking_wire_format == "none":
+            # A bare reasoning_effort still ships as a top-level field, but the
+            # on/off switch has no encoding at all under this wire format.
+            unencodable = [
+                level for level in self.supported_reasoning_efforts
+                if level in {"off", "on"}
+            ]
+            if unencodable:
+                raise ValueError(
+                    f"模型 '{self.id}' 的 thinking_wire_format=none 無法編碼 "
+                    f"{unencodable} 等級，請改用 enable_thinking 或 thinking_object"
+                )
+            # Legacy enable_thinking resolves to the same on/off switch, so it
+            # must not slip through as a catalog default the wire cannot send.
+            effective_mode = self.effective_thinking_mode
+            if effective_mode in {"enabled", "disabled"} and self.reasoning_effort is None:
+                raise ValueError(
+                    f"模型 '{self.id}' 的 thinking_wire_format=none 無法編碼 "
+                    f"thinking_mode='{effective_mode}'，請改用 enable_thinking "
+                    "或 thinking_object"
+                )
         if self.max_tokens <= 0:
             raise ValueError(
                 f"模型 '{self.id}' 的 max_tokens 必須 > 0，got {self.max_tokens}"
@@ -217,13 +322,44 @@ class ModelConfig:
         return min(int(self.auto_compact_token_limit), default_limit)
 
     @property
+    def effective_thinking_mode(self) -> str:
+        """Resolve the tri-state mode while preserving legacy enable_thinking configs."""
+        if self.thinking_mode != "provider_default":
+            return self.thinking_mode
+        if self.enable_thinking:
+            return "enabled"
+        return "provider_default"
+
+    @property
+    def default_reasoning_level(self) -> str | None:
+        """Catalog-level default; transport switches remain an internal detail."""
+        if self.reasoning_effort is not None:
+            return self.reasoning_effort
+        if self.effective_thinking_mode == "enabled":
+            return "on"
+        if self.effective_thinking_mode == "disabled":
+            return "off"
+        return None
+
+    @property
     def supports_thinking(self) -> bool:
         """当前模型变体是否实际启用了可展示的思考过程。"""
+        if self.effective_thinking_mode == "disabled":
+            return False
         if self.reasoning_format == "none":
             return False
         if self.provider != "openai":
             return True
-        return bool(self.reasoning_split)
+        return (
+            bool(self.reasoning_split)
+            or self.effective_thinking_mode == "enabled"
+            or any(level != "off" for level in self.supported_reasoning_efforts)
+        )
+
+    @property
+    def supports_reasoning_control(self) -> bool:
+        """Whether the OpenAI-compatible variant can accept per-turn controls."""
+        return self.provider == "openai" and bool(self.supported_reasoning_efforts)
 
     def to_public_dict(self) -> dict:
         """轉換為前端安全的字典（不含 api_key、api_base）"""
@@ -232,6 +368,12 @@ class ModelConfig:
             "name": self.display_name,
             "provider": self.provider,
             "supports_thinking": self.supports_thinking,
+            "supports_reasoning_control": self.supports_reasoning_control,
+            "thinking_mode": self.effective_thinking_mode,
+            "thinking_wire_format": self.thinking_wire_format,
+            "reasoning_effort": self.reasoning_effort,
+            "default_reasoning_level": self.default_reasoning_level,
+            "supported_reasoning_efforts": list(self.supported_reasoning_efforts),
             "supports_image": self.supports_image,
             "max_images": self.max_images,
             "supports_video": self.supports_video,
@@ -243,6 +385,42 @@ class ModelConfig:
             "enabled": self.enabled,
             "tags": self.tags,
         }
+
+
+def model_config_from_yaml_entry(model_id: str, cfg: dict) -> ModelConfig:
+    """Build a validated ModelConfig from one raw models.yaml entry.
+
+    Shared by registry loading and DB seeding so the seed path cannot persist
+    values the runtime registry would have rejected.
+    """
+    return ModelConfig(
+        id=str(model_id),
+        display_name=cfg.get("display_name", str(model_id)),
+        provider=cfg["provider"],
+        api_base=cfg["api_base"],
+        api_key=cfg.get("api_key", "${LLM_API_KEY}"),
+        model_name=cfg.get("model_name", str(model_id)),
+        max_tokens=cfg.get("max_tokens", 16384),
+        context_window=cfg.get("context_window", 128000),
+        auto_compact_token_limit=cfg.get("auto_compact_token_limit"),
+        tool_output_truncation_bytes=cfg.get("tool_output_truncation_bytes", 10000),
+        reasoning_format=cfg.get("reasoning_format", "none"),
+        reasoning_split=cfg.get("reasoning_split", False),
+        enable_thinking=cfg.get("enable_thinking", False),
+        thinking_mode=cfg.get("thinking_mode", "provider_default"),
+        thinking_wire_format=cfg.get(
+            "thinking_wire_format",
+            "enable_thinking" if cfg.get("provider") == "openai" else "none",
+        ),
+        reasoning_effort=cfg.get("reasoning_effort"),
+        supported_reasoning_efforts=cfg.get("supported_reasoning_efforts", []),
+        supports_image=cfg.get("supports_image", False),
+        max_images=cfg.get("max_images", 0),
+        supports_video=cfg.get("supports_video", False),
+        max_videos=cfg.get("max_videos", 0),
+        enabled=cfg.get("enabled", True),
+        tags=cfg.get("tags", []),
+    )
 
 
 # ============================================================
@@ -286,22 +464,22 @@ class ModelRegistry:
         """Load model registry.
 
         Explicit ``yaml_path`` keeps the historical YAML behavior for tests and
-        tooling. Runtime calls without a path prefer the DB catalog seeded from
-        models.yaml during startup.
+        tooling. Runtime calls without a path use the DB catalog seeded from
+        models.yaml during startup. A DB failure is surfaced instead of silently
+        switching the runtime source of truth.
         """
-        if yaml_path is None:
-            try:
-                from src.api.models.database import SessionLocal
-                from src.api.services.model_access_service import load_registry_from_db
+        if yaml_path is not None:
+            return cls.load_yaml(yaml_path)
 
-                with SessionLocal() as db:
-                    registry = load_registry_from_db(db)
-                    if registry.list_models(enabled_only=False):
-                        return registry
-                    logger.warning("DB 模型目录为空，回退到 models.yaml")
-            except Exception as e:
-                logger.warning("DB 模型目录不可用，回退到 models.yaml: %s", e)
-        return cls.load_yaml(yaml_path)
+        from src.api.models.database import SessionLocal
+        from src.api.services.model_access_service import load_registry_from_db
+
+        with SessionLocal() as db:
+            registry = load_registry_from_db(db)
+            if registry.list_models(enabled_only=False):
+                return registry
+        logger.warning("DB 模型目录为空，使用 models.yaml 初始化目录")
+        return cls.load_yaml()
 
     @classmethod
     def load_yaml(cls, yaml_path: str | Path | None = None) -> "ModelRegistry":
@@ -337,27 +515,7 @@ class ModelRegistry:
 
         for model_id, cfg in raw["models"].items():
             try:
-                models[model_id] = ModelConfig(
-                    id=model_id,
-                    display_name=cfg.get("display_name", model_id),
-                    provider=cfg["provider"],
-                    api_base=cfg["api_base"],
-                    api_key=cfg.get("api_key", "${LLM_API_KEY}"),
-                    model_name=cfg.get("model_name", model_id),
-                    max_tokens=cfg.get("max_tokens", 16384),
-                    context_window=cfg.get("context_window", 128000),
-                    auto_compact_token_limit=cfg.get("auto_compact_token_limit"),
-                    tool_output_truncation_bytes=cfg.get("tool_output_truncation_bytes", 10000),
-                    reasoning_format=cfg.get("reasoning_format", "none"),
-                    reasoning_split=cfg.get("reasoning_split", False),
-                    enable_thinking=cfg.get("enable_thinking", False),
-                    supports_image=cfg.get("supports_image", False),
-                    max_images=cfg.get("max_images", 0),
-                    supports_video=cfg.get("supports_video", False),
-                    max_videos=cfg.get("max_videos", 0),
-                    enabled=cfg.get("enabled", True),
-                    tags=cfg.get("tags", []),
-                )
+                models[model_id] = model_config_from_yaml_entry(model_id, cfg)
             except (KeyError, ValueError) as e:
                 raise ValueError(f"模型 '{model_id}' 配置錯誤: {e}") from e
 

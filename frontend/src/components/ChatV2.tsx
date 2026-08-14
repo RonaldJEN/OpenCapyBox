@@ -9,6 +9,7 @@ import {
   ModelInfo,
   RoundData,
   ToolApprovalPayload,
+  TurnReasoningSelection,
 } from '../types';
 import {
   ChatRuntimeProvider,
@@ -49,6 +50,39 @@ const WELCOME_SUGGESTIONS = [
 
 const NEW_SESSION_DRAFT_KEY = '__new_session__';
 
+function defaultTurnReasoning(model?: ModelInfo): TurnReasoningSelection | null {
+  const supportsControl = model?.supports_reasoning_control
+    ?? Boolean(model?.supported_reasoning_efforts?.length);
+  if (!model || model.provider !== 'openai' || !supportsControl) return null;
+  // Current catalogs expose the authoritative transport pair directly. The
+  // human-readable default_reasoning_level is a lossy projection (for example,
+  // both provider_default+high and enabled+high display as High), so it must
+  // never override that pair.
+  if (model.thinking_mode) {
+    return {
+      mode: model.thinking_mode,
+      effort: model.thinking_mode === 'disabled' ? null : (model.reasoning_effort || null),
+    };
+  }
+
+  // Compatibility for older API responses that only exposed the projection.
+  if (model.default_reasoning_level === 'off') return { mode: 'disabled', effort: null };
+  if (model.default_reasoning_level === 'on') return { mode: 'enabled', effort: null };
+  if (model.default_reasoning_level) {
+    return {
+      mode: 'enabled',
+      effort: model.default_reasoning_level,
+    };
+  }
+  if (model.reasoning_effort) {
+    return {
+      mode: 'provider_default',
+      effort: model.reasoning_effort,
+    };
+  }
+  return { mode: 'provider_default', effort: null };
+}
+
 interface MessageDraft {
   draftId: string;
   revision: number;
@@ -56,9 +90,15 @@ interface MessageDraft {
   attachedFiles: FileInfo[];
 }
 
+interface ReasoningDraft {
+  modelId: string;
+  selection: TurnReasoningSelection | null;
+}
+
 interface ComposerDraftState {
   messageDrafts: Record<string, MessageDraft>;
   skillDrafts: Record<string, SkillDraft>;
+  reasoningDrafts: Record<string, ReasoningDraft>;
 }
 
 let fallbackDraftId = 0;
@@ -186,6 +226,7 @@ function ChatV2View(props: ChatV2Props) {
   const [composerDrafts, setComposerDrafts] = useState<ComposerDraftState>(() => ({
     messageDrafts: { [initialDraftKey]: createMessageDraft() },
     skillDrafts: {},
+    reasoningDrafts: {},
   }));
   const [localError, setLocalError] = useState('');
   const [creatingDraftId, setCreatingDraftId] = useState<string | null>(null);
@@ -209,6 +250,7 @@ function ChatV2View(props: ChatV2Props) {
   const chatScrollTopBeforeFilesRef = useRef(0);
   const filesWereOpenRef = useRef(false);
   const focusBeforeFilesRef = useRef<HTMLElement | null>(null);
+  const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const prevRoundsLengthRef = useRef<number>(0);
   const isInitialLoadRef = useRef<boolean>(true);
   const sessionIdRef = useRef(sessionId);
@@ -227,6 +269,10 @@ function ChatV2View(props: ChatV2Props) {
     attachedFiles: [],
   };
   const currentSkillDraft = composerDrafts.skillDrafts[currentDraftKey] || { keys: [], revision: 0 };
+  const currentReasoningDraft = composerDrafts.reasoningDrafts[currentDraftKey];
+  const turnReasoning = currentReasoningDraft?.modelId === selectedModelId
+    ? currentReasoningDraft.selection
+    : defaultTurnReasoning(selectedModel);
   const input = currentMessageDraft.input;
   const attachedFiles = currentMessageDraft.attachedFiles;
   const currentDraftId = currentMessageDraft.draftId;
@@ -347,9 +393,15 @@ function ChatV2View(props: ChatV2Props) {
       if (sourceSkill) nextSkillDrafts[targetSessionId] = sourceSkill;
       delete nextSkillDrafts[sourceKey];
 
+      const nextReasoningDrafts = { ...previous.reasoningDrafts };
+      const sourceReasoning = nextReasoningDrafts[sourceKey];
+      if (sourceReasoning) nextReasoningDrafts[targetSessionId] = sourceReasoning;
+      delete nextReasoningDrafts[sourceKey];
+
       return {
         messageDrafts: nextMessageDrafts,
         skillDrafts: nextSkillDrafts,
+        reasoningDrafts: nextReasoningDrafts,
       };
     });
   };
@@ -824,6 +876,9 @@ function ChatV2View(props: ChatV2Props) {
       keys: [...currentSkillDraft.keys],
       revision: currentSkillDraft.revision,
     };
+    const reasoningSnapshot = turnReasoning
+      ? { ...turnReasoning }
+      : null;
     const clearedMessageRevision = messageSnapshot.revision + 1;
     const clearedSkillRevision = skillSnapshot.revision + 1;
     let restoreDraftKey = initialSessionKey;
@@ -849,6 +904,7 @@ function ChatV2View(props: ChatV2Props) {
             skillSnapshot,
             clearedSkillRevision,
           ),
+          reasoningDrafts: previous.reasoningDrafts,
         };
       });
     };
@@ -881,6 +937,7 @@ function ChatV2View(props: ChatV2Props) {
             ...previous.skillDrafts,
             [initialSessionKey]: { keys: [], revision: clearedSkillRevision },
           },
+          reasoningDrafts: previous.reasoningDrafts,
         };
       });
       setDisableInitialMotion(false);
@@ -924,6 +981,7 @@ function ChatV2View(props: ChatV2Props) {
         content: contentBlocks,
         attachments: draftAttachments,
         preferredSkillKeys: skillSnapshot.keys,
+        reasoning: reasoningSnapshot || undefined,
         onRejectedBeforeAccept: restoreSubmissionSnapshot,
       });
       await sendPromise;
@@ -970,15 +1028,8 @@ function ChatV2View(props: ChatV2Props) {
           </div>
         )}
 
-        <header className="h-14 flex items-center justify-between px-6 bg-claude-bg/80 backdrop-blur-sm border-b border-claude-border sticky top-0 z-20">
-          <ModelSelector
-            selectedModelId={selectedModelId}
-            onModelChange={onModelChange}
-            availableModels={availableModels}
-            readOnly={!!sessionId}
-          />
-
-          {sessionId ? (
+        <header className="h-14 flex items-center px-6 bg-claude-bg/80 backdrop-blur-sm border-b border-claude-border sticky top-0 z-20">
+          {sessionId && (
             <button
               type="button"
               onClick={() => {
@@ -986,7 +1037,7 @@ function ChatV2View(props: ChatV2Props) {
                 if (isFilesOpen) closeFilesPanel();
                 else openFilesPanel();
               }}
-              className={`h-9 px-3 rounded-xl border transition-[background-color,color,border-color,transform] active:scale-95 flex items-center gap-2 ${
+              className={`ml-auto h-9 px-3 rounded-xl border transition-[background-color,color,border-color,transform] active:scale-95 flex items-center gap-2 ${
                 isFilesOpen
                   ? 'border-[#2f6f54] bg-[#eef8f2] text-[#234d3c]'
                   : 'border-transparent text-claude-secondary hover:bg-claude-hover'
@@ -996,8 +1047,6 @@ function ChatV2View(props: ChatV2Props) {
               <Folder size={16} />
               <span className="text-sm hidden sm:inline">Files</span>
             </button>
-          ) : (
-            <div className="w-[88px]" />
           )}
         </header>
 
@@ -1025,7 +1074,7 @@ function ChatV2View(props: ChatV2Props) {
               targetFileNonce={filePanelTarget?.nonce}
               variant="workspace"
             />
-          ) : loading ? (
+          ) : loading && rounds.length === 0 ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
                 <Loader2 className="w-6 h-6 text-claude-muted animate-spin mx-auto mb-3" />
@@ -1166,6 +1215,7 @@ function ChatV2View(props: ChatV2Props) {
 
         {!isFilesOpen && (
           <ChatInput
+            textareaRef={composerTextareaRef}
             value={input}
             onChange={(value) => updateMessageDraft(currentDraftKey, (draft) => (
               draft.input === value
@@ -1189,6 +1239,38 @@ function ChatV2View(props: ChatV2Props) {
             onFileSelected={handleSelectFile}
             selectedSkillKeys={currentSkillDraft.keys}
             onSelectedSkillKeysChange={handleSelectedSkillKeysChange}
+            modelControl={(
+              <ModelSelector
+                selectedModelId={selectedModelId}
+                onModelChange={(modelId) => {
+                  const model = availableModels.find((item) => item.id === modelId);
+                  setComposerDrafts((previous) => ({
+                    ...previous,
+                    reasoningDrafts: {
+                      ...previous.reasoningDrafts,
+                      [currentDraftKey]: {
+                        modelId,
+                        selection: defaultTurnReasoning(model),
+                      },
+                    },
+                  }));
+                  onModelChange(modelId);
+                }}
+                availableModels={availableModels}
+                reasoningSelection={turnReasoning}
+                onSelectionComplete={() => composerTextareaRef.current?.focus()}
+                onReasoningChange={(selection) => {
+                  setComposerDrafts((previous) => ({
+                    ...previous,
+                    reasoningDrafts: {
+                      ...previous.reasoningDrafts,
+                      [currentDraftKey]: { modelId: selectedModelId, selection },
+                    },
+                  }));
+                }}
+                readOnly={!!sessionId}
+              />
+            )}
           />
         )}
       </div>

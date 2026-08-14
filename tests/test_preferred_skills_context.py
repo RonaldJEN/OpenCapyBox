@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from src.agent.agent import Agent
@@ -13,7 +14,9 @@ from src.agent.schema.run_context import (
     AgentRunContext,
     LLMRequestContext,
     RequestedPreferredSkillsContext,
+    RequestedReasoningContext,
     ResolvedPreferredSkillsContext,
+    ResolvedReasoningContext,
     ResolvedSkillRef,
     current_run_context,
     parse_requested_preferred_skills_contexts,
@@ -23,6 +26,7 @@ from src.agent.schema.run_context import (
 )
 from src.agent.tools.skill_loader import Skill
 from src.api.schemas.chat import SendMessageRequest
+from src.api.routes.chat import _validate_turn_reasoning_request
 from src.api.services.agent_service import (
     AgentService,
     PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY,
@@ -77,6 +81,7 @@ async def test_direct_round_persists_resolved_preferred_skill_display_snapshot()
                 display_name="PDF 文档",
             ),
         )),
+        reasoning=ResolvedReasoningContext(mode="enabled", effort="max"),
     ))
     service._normalize_content_blocks = MagicMock(
         return_value=[{"type": "text", "text": "hello"}]
@@ -98,6 +103,156 @@ async def test_direct_round_persists_resolved_preferred_skill_display_snapshot()
     assert history_service.create_round.call_args.kwargs["preferred_skills"] == [
         {"key": "pdf", "display_name": "PDF 文档"},
     ]
+    assert history_service.create_round.call_args.kwargs["thinking_mode"] == "enabled"
+    assert history_service.create_round.call_args.kwargs["reasoning_effort"] == "max"
+
+
+def test_agent_service_resolves_supported_turn_reasoning():
+    service = object.__new__(AgentService)
+    service._model_config = SimpleNamespace(
+        provider="openai",
+        supports_reasoning_control=True,
+        supported_reasoning_efforts=["high", "max"],
+    )
+
+    resolved = service._resolve_reasoning_context(
+        RequestedReasoningContext(mode="enabled", effort="max")
+    )
+
+    assert resolved == ResolvedReasoningContext(mode="enabled", effort="max")
+
+
+def test_agent_service_rejects_unsupported_turn_reasoning():
+    service = object.__new__(AgentService)
+    service._model_config = SimpleNamespace(
+        provider="openai",
+        supports_reasoning_control=True,
+        supported_reasoning_efforts=["high", "max"],
+    )
+
+    with pytest.raises(ValueError, match="不支持推理等级"):
+        service._resolve_reasoning_context(
+            RequestedReasoningContext(mode="enabled", effort="medium")
+        )
+
+
+@pytest.mark.parametrize("reserved", ["off", "on"])
+def test_agent_service_rejects_switch_alias_in_reasoning_effort(reserved):
+    service = object.__new__(AgentService)
+    service._model_config = SimpleNamespace(
+        provider="openai",
+        supports_reasoning_control=True,
+        supported_reasoning_efforts=["off", "on", "high"],
+    )
+
+    with pytest.raises(ValueError, match="reasoning_effort.*off/on"):
+        service._resolve_reasoning_context(
+            RequestedReasoningContext(mode="enabled", effort=reserved)
+        )
+
+
+@pytest.mark.parametrize(
+    ("thinking_mode", "reasoning_effort"),
+    [
+        ("enabled", "high"),
+        ("disabled", None),
+        ("provider_default", None),
+    ],
+)
+def test_agent_service_materializes_catalog_reasoning_default(
+    thinking_mode,
+    reasoning_effort,
+):
+    service = object.__new__(AgentService)
+    service._model_config = SimpleNamespace(
+        effective_thinking_mode=thinking_mode,
+        reasoning_effort=reasoning_effort,
+        supported_reasoning_efforts=[],
+    )
+
+    assert service._resolve_reasoning_context(None) == ResolvedReasoningContext(
+        mode=thinking_mode,
+        effort=reasoning_effort,
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_round_materializes_omitted_catalog_reasoning_default():
+    class FakeAgent:
+        def __init__(self):
+            self.messages = []
+
+        def has_pending_interrupt(self):
+            return False
+
+        def add_user_message(self, content, message_id=None, run_id=None):
+            self.messages.append(
+                Message(
+                    role="user",
+                    content=content,
+                    id=message_id,
+                    run_id=run_id,
+                )
+            )
+
+    history_service = MagicMock()
+    history_service.create_round.side_effect = (
+        lambda **kwargs: SimpleNamespace(id=kwargs["round_id"])
+    )
+    service = object.__new__(AgentService)
+    service.agent = FakeAgent()
+    service.history_service = history_service
+    service.session_id = "session-1"
+    service.user_id = "user-1"
+    service.skill_loader = None
+    service._model_config = SimpleNamespace(
+        effective_thinking_mode="enabled",
+        reasoning_effort="high",
+    )
+    service._normalize_content_blocks = MagicMock(
+        return_value=[{"type": "text", "text": "hello"}]
+    )
+    service._validate_multimodal_blocks = MagicMock()
+    service._build_agent_user_content = MagicMock(return_value="hello")
+    service._blocks_to_plain_text = MagicMock(return_value="hello")
+    service._extract_user_attachments = MagicMock(return_value=[])
+    service._refresh_runtime_messages_from_history = MagicMock()
+    service._save_conversation_message = MagicMock()
+
+    prepared = await service.prepare_chat_round(
+        user_content=[{"type": "text", "text": "hello"}],
+        contexts=[],
+    )
+
+    create_kwargs = history_service.create_round.call_args.kwargs
+    assert create_kwargs["thinking_mode"] == "enabled"
+    assert create_kwargs["reasoning_effort"] == "high"
+    assert prepared.context.reasoning == ResolvedReasoningContext(
+        mode="enabled",
+        effort="high",
+    )
+
+
+def test_resume_inherits_frozen_parent_reasoning_selection():
+    parent = SimpleNamespace(thinking_mode="enabled", reasoning_effort="max")
+    service = object.__new__(AgentService)
+    service.session_id = "session-1"
+    service.history_service = SimpleNamespace(db=MagicMock())
+    service.history_service.db.query.return_value.filter.return_value.first.return_value = parent
+
+    assert service._reasoning_context_from_round("round-parent") == (
+        ResolvedReasoningContext(mode="enabled", effort="max")
+    )
+
+
+def test_resume_exposes_missing_parent_round():
+    service = object.__new__(AgentService)
+    service.session_id = "session-1"
+    service.history_service = SimpleNamespace(db=MagicMock())
+    service.history_service.db.query.return_value.filter.return_value.first.return_value = None
+
+    with pytest.raises(ValueError, match="父 Round.*不存在"):
+        service._reasoning_context_from_round("round-missing")
 
 
 @pytest.mark.asyncio
@@ -196,6 +351,89 @@ def test_web_adapter_builds_versioned_context_with_stable_dedupe():
         "mode": "preferred",
         "keys": ["pdf", "data"],
     }
+
+
+def test_web_adapter_builds_separate_reasoning_context():
+    request = SendMessageRequest.model_validate({
+        "content": [{"type": "text", "text": "hello"}],
+        "thinking_mode": "enabled",
+        "reasoning_effort": "max",
+    })
+
+    turn = WebChatAdapter().normalize_send(
+        session_id="session-1",
+        user_id="user-1",
+        request=request,
+    )
+
+    assert len(turn.context) == 1
+    assert turn.context[0].description == "bsbox.reasoning.v1"
+    assert json.loads(turn.context[0].value) == {
+        "mode": "enabled",
+        "effort": "max",
+    }
+
+
+def test_send_request_rejects_effort_while_thinking_is_off():
+    with pytest.raises(ValidationError):
+        SendMessageRequest.model_validate({
+            "content": [{"type": "text", "text": "hello"}],
+            "thinking_mode": "disabled",
+            "reasoning_effort": "high",
+        })
+
+
+def test_route_rejects_stale_effort_before_stream(monkeypatch):
+    monkeypatch.setattr(
+        "src.api.routes.chat.assert_user_can_access_model",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            provider="openai",
+            supports_reasoning_control=True,
+            supported_reasoning_efforts=["high", "max"],
+        ),
+    )
+    request = SendMessageRequest.model_validate({
+        "content": [{"type": "text", "text": "hello"}],
+        "thinking_mode": "enabled",
+        "reasoning_effort": "medium",
+    })
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_turn_reasoning_request(
+            MagicMock(),
+            user_id="user-1",
+            model_id="model-1",
+            request=request,
+        )
+
+    assert exc_info.value.status_code == 400
+
+
+def test_route_rejects_switch_alias_in_effort_before_stream(monkeypatch):
+    monkeypatch.setattr(
+        "src.api.routes.chat.assert_user_can_access_model",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            provider="openai",
+            supports_reasoning_control=True,
+            supported_reasoning_efforts=["off", "on", "high"],
+        ),
+    )
+    request = SendMessageRequest.model_validate({
+        "content": [{"type": "text", "text": "hello"}],
+        "thinking_mode": "enabled",
+        "reasoning_effort": "on",
+    })
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_turn_reasoning_request(
+            MagicMock(),
+            user_id="user-1",
+            model_id="model-1",
+            request=request,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "off/on" in str(exc_info.value.detail)
 
 
 def test_wire_parser_ignores_unknown_and_malformed_versions():
@@ -415,6 +653,10 @@ async def test_registry_resolution_filters_unavailable_skills_each_run():
 
     service = object.__new__(AgentService)
     service.skill_loader = Loader()
+    service._model_config = SimpleNamespace(
+        effective_thinking_mode="provider_default",
+        reasoning_effort=None,
+    )
     requested = RequestedPreferredSkillsContext(keys=("pdf", "missing"))
 
     resolved = await service._resolve_run_context(requested)
@@ -531,6 +773,7 @@ async def test_resume_re_resolves_preferred_skills_from_persisted_interrupt():
     service._load_persisted_interrupt = MagicMock(return_value=persisted_interrupt)
     service._get_agent_pending_interrupt_snapshot = MagicMock(return_value=None)
     service._resolve_run_context = AsyncMock(return_value=resolved)
+    service._reasoning_context_from_round = MagicMock(return_value=None)
     service._prepare_tool_approval_resume_locked = MagicMock(return_value=prepared)
 
     result = await service.prepare_resume_round(
@@ -548,6 +791,70 @@ async def test_resume_re_resolves_preferred_skills_from_persisted_interrupt():
         requested_context=requested,
         run_context=resolved,
     )
+
+
+@pytest.mark.asyncio
+async def test_resume_replaces_current_default_with_frozen_parent_reasoning():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from src.api.models.database import Base
+    from src.api.models.round import Round
+    from src.api.models.session import Session
+
+    persisted_interrupt = {
+        "interrupt_id": "approval-1",
+        "round_id": "round-1",
+        "kind": "tool_approval",
+    }
+    frozen_parent = ResolvedReasoningContext(mode="enabled", effort="high")
+    prepared = MagicMock()
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    db.add(Session(id="session-1", user_id="user-1", model_id="current-model"))
+    db.add(Round(
+        id="round-1",
+        thread_id="session-1",
+        session_id="session-1",
+        user_message="original",
+        status="interrupted",
+        thinking_mode=frozen_parent.mode,
+        reasoning_effort=frozen_parent.effort,
+    ))
+    db.commit()
+
+    service = object.__new__(AgentService)
+    service.agent = MagicMock()
+    service.session_id = "session-1"
+    service.user_id = "user-1"
+    service.history_service = SimpleNamespace(db=db)
+    service.skill_loader = None
+    service._model_config = SimpleNamespace(
+        effective_thinking_mode="disabled",
+        reasoning_effort=None,
+    )
+    service._resume_lock = asyncio.Lock()
+    service._pending_interrupt_round_ids = {}
+    service._load_persisted_interrupt = MagicMock(return_value=persisted_interrupt)
+    service._get_agent_pending_interrupt_snapshot = MagicMock(return_value=None)
+    service._prepare_tool_approval_resume_locked = MagicMock(return_value=prepared)
+
+    try:
+        result = await service.prepare_resume_round(
+            interrupt_id="approval-1",
+            answers={"approve": "yes"},
+        )
+
+        assert result is prepared
+        run_context = service._prepare_tool_approval_resume_locked.call_args.kwargs[
+            "run_context"
+        ]
+        assert run_context.reasoning == frozen_parent
+    finally:
+        db.close()
+        engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -589,6 +896,7 @@ async def test_consecutive_resumes_keep_original_preferred_skill_anchor():
     service._load_persisted_interrupt = MagicMock(side_effect=persisted_interrupts)
     service._get_agent_pending_interrupt_snapshot = MagicMock(return_value=None)
     service._resolve_run_context = AsyncMock(return_value=resolved)
+    service._reasoning_context_from_round = MagicMock(return_value=None)
     service._prepare_tool_approval_resume_locked = MagicMock(side_effect=build_prepared)
 
     second_round = await service.prepare_resume_round(

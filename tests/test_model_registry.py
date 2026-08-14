@@ -16,7 +16,10 @@ from src.api.model_registry import (
     VALID_REASONING_FORMATS,
 )
 from src.api.models.llm_model import LLMModel
-from src.api.services.model_access_service import db_model_to_config
+from src.api.services.model_access_service import (
+    db_model_to_config,
+    seed_model_catalog_from_yaml_if_empty,
+)
 
 
 # ============================================================
@@ -81,6 +84,103 @@ class TestModelConfig:
         cfg = self._make_config()
         assert cfg.id == "test-model"
         assert cfg.provider == "openai"
+
+    def test_reasoning_effort_is_normalized(self):
+        cfg = self._make_config(reasoning_effort="  high  ")
+        assert cfg.reasoning_effort == "high"
+
+    @pytest.mark.parametrize("reserved", ["off", "on"])
+    def test_reasoning_effort_rejects_switch_level_aliases(self, reserved):
+        with pytest.raises(ValueError, match="reasoning_effort.*保留等级"):
+            self._make_config(reasoning_effort=reserved)
+
+    def test_supported_reasoning_efforts_are_normalized(self):
+        cfg = self._make_config(
+            reasoning_effort="high",
+            supported_reasoning_efforts=[" high ", "max", "high"],
+        )
+        assert cfg.supported_reasoning_efforts == ["high", "max"]
+
+    def test_supported_reasoning_efforts_reject_blank_entries(self):
+        with pytest.raises(ValueError, match="不能包含空等级"):
+            self._make_config(supported_reasoning_efforts=["high", "   "])
+
+    def test_default_effort_must_be_supported(self):
+        with pytest.raises(ValueError, match="supported_reasoning_efforts"):
+            self._make_config(
+                reasoning_effort="medium",
+                supported_reasoning_efforts=["high", "max"],
+            )
+
+    def test_boolean_default_level_must_be_supported(self):
+        with pytest.raises(ValueError, match="默认推理等级 'off'"):
+            self._make_config(
+                thinking_mode="disabled",
+                thinking_wire_format="enable_thinking",
+                supported_reasoning_efforts=["on"],
+            )
+
+    def test_yaml_boolean_reasoning_effort_is_rejected(self):
+        # YAML 1.1 turns bare `on` into True; never ship it as "True".
+        with pytest.raises(ValueError, match="reasoning_effort 必須是字串"):
+            self._make_config(reasoning_effort=True)
+
+    def test_yaml_boolean_supported_effort_entry_is_rejected(self):
+        with pytest.raises(ValueError, match="supported_reasoning_efforts 必須全部是字串"):
+            self._make_config(supported_reasoning_efforts=[False, "high"])
+
+    def test_wire_none_allows_graded_effort_levels(self):
+        cfg = self._make_config(
+            thinking_wire_format="none",
+            reasoning_effort="high",
+            supported_reasoning_efforts=["high", "max"],
+        )
+        assert cfg.supports_reasoning_control is True
+        assert cfg.default_reasoning_level == "high"
+
+    def test_wire_none_rejects_switch_only_levels(self):
+        with pytest.raises(ValueError, match="thinking_wire_format=none 無法編碼"):
+            self._make_config(
+                thinking_wire_format="none",
+                supported_reasoning_efforts=["off", "high"],
+            )
+
+    def test_wire_none_rejects_explicit_switch_default(self):
+        with pytest.raises(ValueError, match="thinking_wire_format=none 無法編碼"):
+            self._make_config(thinking_wire_format="none", thinking_mode="enabled")
+
+    def test_wire_none_rejects_legacy_enable_thinking_default(self):
+        # 界面会把它显示成 On，但 wire=none 永远发不出这个开关。
+        with pytest.raises(ValueError, match="thinking_wire_format=none 無法編碼"):
+            self._make_config(
+                thinking_wire_format="none",
+                thinking_mode="provider_default",
+                enable_thinking=True,
+            )
+
+    def test_blank_reasoning_effort_is_provider_default(self):
+        cfg = self._make_config(reasoning_effort="   ")
+        assert cfg.reasoning_effort is None
+
+    def test_anthropic_rejects_openai_reasoning_effort(self):
+        with pytest.raises(ValueError, match="reasoning_effort.*provider=openai"):
+            self._make_config(provider="anthropic", reasoning_effort="high")
+
+    def test_invalid_thinking_mode_raises(self):
+        with pytest.raises(ValueError, match="thinking_mode.*無效"):
+            self._make_config(thinking_mode="sometimes")
+
+    def test_invalid_thinking_wire_format_raises(self):
+        with pytest.raises(ValueError, match="thinking_wire_format.*無效"):
+            self._make_config(thinking_wire_format="vendor_magic")
+
+    def test_disabled_thinking_rejects_reasoning_effort(self):
+        with pytest.raises(ValueError, match="關閉思考.*reasoning_effort"):
+            self._make_config(
+                thinking_mode="disabled",
+                thinking_wire_format="enable_thinking",
+                reasoning_effort="high",
+            )
 
     def test_invalid_provider_raises(self):
         """無效 provider 拋出 ValueError"""
@@ -156,14 +256,46 @@ class TestModelConfig:
         )
         assert cfg.supports_thinking is False
 
-    def test_openai_enable_thinking_without_reasoning_split_is_false(self):
-        """OpenAI runtime only exposes thinking content when reasoning_split is enabled."""
+    def test_openai_enable_thinking_does_not_require_reasoning_split(self):
+        """DeepSeek native returns reasoning_content without DashScope reasoning_split."""
         cfg = self._make_config(
             reasoning_format="reasoning_content",
             reasoning_split=False,
             enable_thinking=True,
+            thinking_wire_format="enable_thinking",
+        )
+        assert cfg.supports_thinking is True
+
+    def test_explicit_disabled_overrides_legacy_enable_thinking(self):
+        cfg = self._make_config(
+            reasoning_format="reasoning_content",
+            reasoning_split=True,
+            enable_thinking=True,
+            thinking_mode="disabled",
+            thinking_wire_format="enable_thinking",
+            supported_reasoning_efforts=["off", "on"],
+        )
+        assert cfg.effective_thinking_mode == "disabled"
+        assert cfg.supports_thinking is False
+        assert cfg.supports_reasoning_control is True
+
+    def test_reasoning_format_does_not_invent_selectable_levels(self):
+        cfg = self._make_config(
+            reasoning_format="reasoning_content",
+            reasoning_split=True,
+            enable_thinking=True,
+            thinking_wire_format="enable_thinking",
+        )
+        assert cfg.supports_reasoning_control is False
+
+    def test_effort_catalog_declares_control_without_visible_thinking(self):
+        cfg = self._make_config(
+            reasoning_format="none",
+            reasoning_split=False,
+            supported_reasoning_efforts=["high", "max"],
         )
         assert cfg.supports_thinking is False
+        assert cfg.supports_reasoning_control is True
 
     def test_resolve_api_key_literal(self):
         """直接 API key 解析"""
@@ -193,6 +325,40 @@ class TestModelConfig:
         assert public["name"] == "Test Model"
         assert public["supports_image"] is False
         assert public["max_images"] == 0
+        assert public["thinking_mode"] == "provider_default"
+        assert public["reasoning_effort"] is None
+        assert public["default_reasoning_level"] is None
+        assert public["supports_reasoning_control"] is False
+
+    def test_db_model_preserves_reasoning_effort(self):
+        model = LLMModel(
+            model_id="reasoning-model",
+            display_name="Reasoning Model",
+            provider="openai",
+            api_base="https://api.example.com/v1",
+            api_key="test-key",
+            model_name="reasoning-model",
+            max_tokens=8192,
+            context_window=128000,
+            reasoning_effort="high",
+        )
+
+        assert db_model_to_config(model).reasoning_effort == "high"
+
+    def test_db_model_preserves_thinking_mode(self):
+        model = LLMModel(
+            model_id="no-think-model",
+            display_name="No Thinking Model",
+            provider="openai",
+            api_base="https://api.example.com/v1",
+            api_key="test-key",
+            model_name="no-think-model",
+            max_tokens=8192,
+            context_window=128000,
+            thinking_mode="disabled",
+        )
+
+        assert db_model_to_config(model).thinking_mode == "disabled"
 
     def test_supports_image_requires_positive_max_images(self):
         """supports_image=true 時 max_images 必須 > 0"""
@@ -400,6 +566,25 @@ class TestModelRegistryLoad:
         assert config.reasoning_format == "none"
         assert config.supports_thinking is False
 
+    def test_project_yaml_keeps_deepseek_reasoning_levels_as_strings(self):
+        project_yaml = Path(__file__).resolve().parent.parent / "models.yaml"
+        registry = ModelRegistry.load_yaml(project_yaml)
+
+        config = registry.get("deepseek-flash")
+
+        assert config is not None
+        assert config.supported_reasoning_efforts == ["off", "high", "max"]
+
+    def test_runtime_db_failure_does_not_fallback_to_yaml(self):
+        with patch(
+            "src.api.models.database.SessionLocal",
+            side_effect=RuntimeError("database unavailable"),
+        ), patch.object(ModelRegistry, "load_yaml") as load_yaml:
+            with pytest.raises(RuntimeError, match="database unavailable"):
+                ModelRegistry.load()
+
+        load_yaml.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_glm_no_think_model_list_api_serializes_supports_thinking_false(self, monkeypatch):
         """GET /api/models 的实际序列化结果与 models.yaml 的 No Thinking 配置一致。"""
@@ -428,6 +613,106 @@ class TestModelRegistryLoad:
 
         assert payload["models"] == [config.to_public_dict()]
         assert payload["models"][0]["supports_thinking"] is False
+
+
+class TestSeedCatalogValidation:
+    """首次建库必须复用 ModelConfig 校验，不得写入非法目录。"""
+
+    def _sqlite_session(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from src.api.models.database import Base
+
+        engine = create_engine("sqlite://")
+        Base.metadata.create_all(engine)
+        return sessionmaker(bind=engine)(), engine
+
+    def _seed_yaml(self, tmp_path: Path, **model_overrides) -> Path:
+        model = {
+            "display_name": "Seed",
+            "provider": "openai",
+            "api_base": "https://api.test.com/v1",
+            "api_key": "test-key",
+            "model_name": "seed-v1",
+            "max_tokens": 4096,
+        }
+        model.update(model_overrides)
+        path = tmp_path / "models.yaml"
+        path.write_text(
+            yaml.dump({"default_model": "seed-model", "models": {"seed-model": model}}),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_unquoted_yaml_off_level_fails_seed_instead_of_persisting_false(self, tmp_path):
+        # YAML 1.1 turns bare `off` into False; it must not reach the DB as "False".
+        path = tmp_path / "models.yaml"
+        path.write_text(
+            "default_model: seed-model\n"
+            "models:\n"
+            "  seed-model:\n"
+            "    display_name: Seed\n"
+            "    provider: openai\n"
+            "    api_base: https://api.test.com/v1\n"
+            "    api_key: test-key\n"
+            "    model_name: seed-v1\n"
+            "    max_tokens: 4096\n"
+            "    supported_reasoning_efforts: [off, high]\n",
+            encoding="utf-8",
+        )
+        db, engine = self._sqlite_session()
+        try:
+            with pytest.raises(ValueError, match="需加引號"):
+                seed_model_catalog_from_yaml_if_empty(db, path)
+            db.rollback()
+            assert db.query(LLMModel).count() == 0
+        finally:
+            db.close()
+            engine.dispose()
+
+    def test_seed_rejects_model_config_violation(self, tmp_path):
+        path = self._seed_yaml(tmp_path, max_tokens=200000, context_window=1000)
+        db, engine = self._sqlite_session()
+        try:
+            with pytest.raises(ValueError, match="context_window"):
+                seed_model_catalog_from_yaml_if_empty(db, path)
+            db.rollback()
+            assert db.query(LLMModel).count() == 0
+        finally:
+            db.close()
+            engine.dispose()
+
+    def test_seed_persists_normalized_levels(self, tmp_path):
+        path = self._seed_yaml(
+            tmp_path,
+            reasoning_effort="  high  ",
+            supported_reasoning_efforts=[" high ", "max", "high"],
+        )
+        db, engine = self._sqlite_session()
+        try:
+            assert seed_model_catalog_from_yaml_if_empty(db, path) == 1
+            stored = db.query(LLMModel).one()
+            assert stored.reasoning_effort == "high"
+            assert db_model_to_config(stored).supported_reasoning_efforts == ["high", "max"]
+        finally:
+            db.close()
+            engine.dispose()
+
+    def test_db_read_surfaces_non_string_reasoning_levels(self, tmp_path):
+        path = self._seed_yaml(tmp_path)
+        db, engine = self._sqlite_session()
+        try:
+            seed_model_catalog_from_yaml_if_empty(db, path)
+            stored = db.query(LLMModel).one()
+            stored.supported_reasoning_efforts_json = '[false, "high"]'
+            db.commit()
+
+            with pytest.raises(ValueError, match="非字符串等级"):
+                db_model_to_config(stored)
+        finally:
+            db.close()
+            engine.dispose()
 
 
 # ============================================================

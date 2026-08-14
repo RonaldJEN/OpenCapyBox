@@ -78,6 +78,8 @@
   "last_event_sequence": 0,
   "user_message": "...",
   "user_attachments": [],
+  "thinking_mode": "enabled | disabled | provider_default | null",
+  "reasoning_effort": "max | null",
   "final_response": "...",
   "steps": [StepData],
   "step_count": 0,

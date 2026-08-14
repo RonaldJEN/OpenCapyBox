@@ -57,7 +57,14 @@ from src.api.services.sandbox_profile_service import (
     sandbox_profile_to_payload,
     set_default_sandbox_profile,
 )
-from src.api.model_registry import ModelConfig, VALID_PROVIDERS, VALID_REASONING_FORMATS, reload_model_registry
+from src.api.model_registry import (
+    ModelConfig,
+    VALID_PROVIDERS,
+    VALID_REASONING_FORMATS,
+    VALID_THINKING_MODES,
+    VALID_THINKING_WIRE_FORMATS,
+    reload_model_registry,
+)
 from src.api.services.model_access_service import (
     admin_model_payload,
     get_or_create_default_group,
@@ -200,6 +207,10 @@ class AdminModelPayload(BaseModel):
     reasoning_format: str = "none"
     reasoning_split: bool = False
     enable_thinking: bool = False
+    thinking_mode: str = "provider_default"
+    thinking_wire_format: str = "enable_thinking"
+    reasoning_effort: str | None = Field(default=None, max_length=40)
+    supported_reasoning_efforts: list[str] = Field(default_factory=list, max_length=20)
     supports_image: bool = False
     max_images: int = Field(default=0, ge=0)
     supports_video: bool = False
@@ -207,10 +218,25 @@ class AdminModelPayload(BaseModel):
     enabled: bool = True
     tags: list[str] = Field(default_factory=list)
 
-    @field_validator("model_id", "display_name", "provider", "api_base", "api_key", "model_name", "reasoning_format", mode="before")
+    @field_validator("model_id", "display_name", "provider", "api_base", "api_key", "model_name", "reasoning_format", "thinking_mode", "thinking_wire_format", "reasoning_effort", mode="before")
     @classmethod
     def _strip_model_strings(cls, value):
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("reasoning_effort", mode="after")
+    @classmethod
+    def _empty_reasoning_effort_is_none(cls, value: str | None) -> str | None:
+        return value or None
+
+    @field_validator("supported_reasoning_efforts")
+    @classmethod
+    def _valid_supported_reasoning_efforts(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("supported_reasoning_efforts 不能包含空项")
+        if any(len(value) > 40 for value in normalized):
+            raise ValueError("supported_reasoning_efforts 单项不能超过 40 个字符")
+        return normalized
 
     @field_validator("provider")
     @classmethod
@@ -224,6 +250,22 @@ class AdminModelPayload(BaseModel):
     def _valid_reasoning_format(cls, value: str) -> str:
         if value not in VALID_REASONING_FORMATS:
             raise ValueError(f"reasoning_format 必须是 {sorted(VALID_REASONING_FORMATS)}")
+        return value
+
+    @field_validator("thinking_mode")
+    @classmethod
+    def _valid_thinking_mode(cls, value: str) -> str:
+        if value not in VALID_THINKING_MODES:
+            raise ValueError(f"thinking_mode 必须是 {sorted(VALID_THINKING_MODES)}")
+        return value
+
+    @field_validator("thinking_wire_format")
+    @classmethod
+    def _valid_thinking_wire_format(cls, value: str) -> str:
+        if value not in VALID_THINKING_WIRE_FORMATS:
+            raise ValueError(
+                f"thinking_wire_format 必须是 {sorted(VALID_THINKING_WIRE_FORMATS)}"
+            )
         return value
 
 
@@ -240,6 +282,10 @@ class AdminModelPatchPayload(BaseModel):
     reasoning_format: str | None = None
     reasoning_split: bool | None = None
     enable_thinking: bool | None = None
+    thinking_mode: str | None = None
+    thinking_wire_format: str | None = None
+    reasoning_effort: str | None = Field(default=None, max_length=40)
+    supported_reasoning_efforts: list[str] | None = Field(default=None, max_length=20)
     supports_image: bool | None = None
     max_images: int | None = Field(default=None, ge=0)
     supports_video: bool | None = None
@@ -247,13 +293,28 @@ class AdminModelPatchPayload(BaseModel):
     enabled: bool | None = None
     tags: list[str] | None = None
 
-    @field_validator("display_name", "provider", "api_base", "api_key", "model_name", "reasoning_format", mode="before")
+    @field_validator("display_name", "provider", "api_base", "api_key", "model_name", "reasoning_format", "thinking_mode", "thinking_wire_format", "reasoning_effort", mode="before")
     @classmethod
     def _strip_optional_model_strings(cls, value):
         if isinstance(value, str):
             value = value.strip()
             return value or None
         return value
+
+    @field_validator("supported_reasoning_efforts")
+    @classmethod
+    def _valid_optional_supported_reasoning_efforts(
+        cls,
+        values: list[str] | None,
+    ) -> list[str] | None:
+        if values is None:
+            return None
+        normalized = [value.strip() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("supported_reasoning_efforts 不能包含空项")
+        if any(len(value) > 40 for value in normalized):
+            raise ValueError("supported_reasoning_efforts 单项不能超过 40 个字符")
+        return normalized
 
     @field_validator("provider")
     @classmethod
@@ -267,6 +328,22 @@ class AdminModelPatchPayload(BaseModel):
     def _valid_optional_reasoning_format(cls, value: str | None) -> str | None:
         if value is not None and value not in VALID_REASONING_FORMATS:
             raise ValueError(f"reasoning_format 必须是 {sorted(VALID_REASONING_FORMATS)}")
+        return value
+
+    @field_validator("thinking_mode")
+    @classmethod
+    def _valid_optional_thinking_mode(cls, value: str | None) -> str | None:
+        if value is not None and value not in VALID_THINKING_MODES:
+            raise ValueError(f"thinking_mode 必须是 {sorted(VALID_THINKING_MODES)}")
+        return value
+
+    @field_validator("thinking_wire_format")
+    @classmethod
+    def _valid_optional_thinking_wire_format(cls, value: str | None) -> str | None:
+        if value is not None and value not in VALID_THINKING_WIRE_FORMATS:
+            raise ValueError(
+                f"thinking_wire_format 必须是 {sorted(VALID_THINKING_WIRE_FORMATS)}"
+            )
         return value
 
 
@@ -394,9 +471,10 @@ def _ensure_model_ids_exist(db: DBSession, model_ids: list[str], *, enabled_only
             raise HTTPException(status_code=400, detail=f"停用模型不能作为默认模型: {disabled}")
 
 
-def _validate_model_config_values(data: dict[str, Any]) -> None:
+def _validate_model_config_values(data: dict[str, Any]) -> ModelConfig:
+    """Return the validated domain object so callers persist its normalized state."""
     try:
-        ModelConfig(
+        return ModelConfig(
             id=data["model_id"],
             display_name=data["display_name"],
             provider=data["provider"],
@@ -410,6 +488,10 @@ def _validate_model_config_values(data: dict[str, Any]) -> None:
             reasoning_format=data["reasoning_format"],
             reasoning_split=data["reasoning_split"],
             enable_thinking=data["enable_thinking"],
+            thinking_mode=data.get("thinking_mode", "provider_default"),
+            thinking_wire_format=data.get("thinking_wire_format", "enable_thinking"),
+            reasoning_effort=data.get("reasoning_effort"),
+            supported_reasoning_efforts=data.get("supported_reasoning_efforts") or [],
             supports_image=data["supports_image"],
             max_images=data["max_images"],
             supports_video=data["supports_video"],
@@ -444,27 +526,34 @@ def _build_admin_models_payload(db: DBSession) -> dict[str, Any]:
 
 
 def _create_admin_model(db: DBSession, payload: AdminModelPayload) -> dict[str, Any]:
-    _validate_model_config_values(payload.model_dump())
+    payload_data = payload.model_dump()
+    if payload.provider != "openai":
+        payload_data["thinking_wire_format"] = "none"
+    config = _validate_model_config_values(payload_data)
     model = LLMModel(
-        model_id=payload.model_id,
-        display_name=payload.display_name,
-        provider=payload.provider,
-        api_base=payload.api_base,
-        api_key=payload.api_key,
-        model_name=payload.model_name,
-        max_tokens=payload.max_tokens,
-        context_window=payload.context_window,
-        auto_compact_token_limit=payload.auto_compact_token_limit,
-        tool_output_truncation_bytes=payload.tool_output_truncation_bytes,
-        reasoning_format=payload.reasoning_format,
-        reasoning_split=payload.reasoning_split,
-        enable_thinking=payload.enable_thinking,
-        supports_image=payload.supports_image,
-        max_images=payload.max_images,
-        supports_video=payload.supports_video,
-        max_videos=payload.max_videos,
-        enabled=payload.enabled,
-        tags_json=_tags_json(payload.tags),
+        model_id=config.id,
+        display_name=config.display_name,
+        provider=config.provider,
+        api_base=config.api_base,
+        api_key=config.api_key,
+        model_name=config.model_name,
+        max_tokens=config.max_tokens,
+        context_window=config.context_window,
+        auto_compact_token_limit=config.auto_compact_token_limit,
+        tool_output_truncation_bytes=config.tool_output_truncation_bytes,
+        reasoning_format=config.reasoning_format,
+        reasoning_split=config.reasoning_split,
+        enable_thinking=config.enable_thinking,
+        thinking_mode=config.thinking_mode,
+        thinking_wire_format=config.thinking_wire_format,
+        reasoning_effort=config.reasoning_effort,
+        supported_reasoning_efforts_json=_tags_json(config.supported_reasoning_efforts),
+        supports_image=config.supports_image,
+        max_images=config.max_images,
+        supports_video=config.supports_video,
+        max_videos=config.max_videos,
+        enabled=config.enabled,
+        tags_json=_tags_json(config.tags),
     )
     db.add(model)
     try:
@@ -486,9 +575,15 @@ def _update_admin_model(db: DBSession, model_id: str, payload: AdminModelPatchPa
         data.pop("api_key", None)
     if "tags" in data:
         model.tags_json = _tags_json(data.pop("tags"))
+    if "supported_reasoning_efforts" in data:
+        model.supported_reasoning_efforts_json = _tags_json(
+            data.pop("supported_reasoning_efforts") or []
+        )
     for field_name, value in data.items():
         setattr(model, field_name, value)
-    _validate_model_config_values({
+    if model.provider != "openai":
+        model.thinking_wire_format = "none"
+    config = _validate_model_config_values({
         "model_id": model.model_id,
         "display_name": model.display_name,
         "provider": model.provider,
@@ -502,6 +597,12 @@ def _update_admin_model(db: DBSession, model_id: str, payload: AdminModelPatchPa
         "reasoning_format": model.reasoning_format,
         "reasoning_split": model.reasoning_split,
         "enable_thinking": model.enable_thinking,
+        "thinking_mode": model.thinking_mode,
+        "thinking_wire_format": model.thinking_wire_format,
+        "reasoning_effort": model.reasoning_effort,
+        "supported_reasoning_efforts": json.loads(
+            model.supported_reasoning_efforts_json or "[]"
+        ),
         "supports_image": model.supports_image,
         "max_images": model.max_images,
         "supports_video": model.supports_video,
@@ -509,7 +610,32 @@ def _update_admin_model(db: DBSession, model_id: str, payload: AdminModelPatchPa
         "enabled": model.enabled,
         "tags": json.loads(model.tags_json or "[]"),
     })
-    if data.get("enabled") is False:
+    # ModelConfig is the domain boundary: persist its complete normalized state,
+    # not the mutable request DTO. Keeping this explicit also makes any future
+    # ModelConfig normalization automatically authoritative for admin updates.
+    model.display_name = config.display_name
+    model.provider = config.provider
+    model.api_base = config.api_base
+    model.api_key = config.api_key
+    model.model_name = config.model_name
+    model.max_tokens = config.max_tokens
+    model.context_window = config.context_window
+    model.auto_compact_token_limit = config.auto_compact_token_limit
+    model.tool_output_truncation_bytes = config.tool_output_truncation_bytes
+    model.reasoning_format = config.reasoning_format
+    model.reasoning_split = config.reasoning_split
+    model.enable_thinking = config.enable_thinking
+    model.thinking_mode = config.thinking_mode
+    model.thinking_wire_format = config.thinking_wire_format
+    model.reasoning_effort = config.reasoning_effort
+    model.supported_reasoning_efforts_json = _tags_json(config.supported_reasoning_efforts)
+    model.supports_image = config.supports_image
+    model.max_images = config.max_images
+    model.supports_video = config.supports_video
+    model.max_videos = config.max_videos
+    model.enabled = config.enabled
+    model.tags_json = _tags_json(config.tags)
+    if not config.enabled:
         db.query(ModelPermissionGroupModel).filter(
             ModelPermissionGroupModel.model_id == model.model_id
         ).delete(synchronize_session=False)
@@ -2362,6 +2488,7 @@ async def create_admin_model(
 ):
     """新增一个模型到 DB 模型目录。"""
     result = _create_admin_model(db, payload)
+    await get_agent_pool().invalidate_all_async()
     changed_fields = payload.model_dump(exclude={"api_key"})
     changed_fields["api_key_changed"] = True
     enrich_admin_audit(
@@ -2398,6 +2525,7 @@ async def update_admin_model(
 ):
     """更新模型配置；api_key 留空表示不修改。"""
     result = _update_admin_model(db, model_id, payload)
+    await get_agent_pool().invalidate_all_async()
     changed_fields = payload.model_dump(exclude_unset=True, exclude={"api_key"})
     if "api_key" in payload.model_fields_set:
         changed_fields["api_key_changed"] = bool(payload.api_key)
@@ -2422,6 +2550,7 @@ async def delete_admin_model(
 ):
     """从 DB 模型目录删除未被默认配置或历史会话引用的模型。"""
     result = _delete_admin_model(db, model_id, replacement_model_id=replacement_model_id)
+    await get_agent_pool().invalidate_all_async()
     enrich_admin_audit(
         request,
         details={"has_replacement_model": bool(replacement_model_id)},

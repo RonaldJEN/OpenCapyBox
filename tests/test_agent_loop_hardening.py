@@ -962,6 +962,201 @@ class TestRuntimeToolLoopGuard:
                 arguments={"param1": "same"},
             )[2] is not None
 
+    def test_uncertain_file_write_requires_same_path_read_before_retry(self):
+        write_tool = _MarkerTool(
+            name="write_file",
+            marker="written",
+            repeat_policy="mutating",
+        )
+        read_tool = _MarkerTool(
+            name="read_file",
+            marker="read",
+            repeat_policy="read_only",
+        )
+        guard = _ToolLoopGuard(workspace_dir="/home/user/session")
+        uncertain = ToolResult(
+            success=False,
+            error="lost response",
+            outcome_uncertain=True,
+        )
+        write_args = {"path": "result.md", "content": "first"}
+        write_fp, write_policy = guard._fingerprint(
+            write_tool,
+            write_tool.name,
+            write_args,
+        )
+        guard.observe(
+            fingerprint=write_fp,
+            policy=write_policy,
+            tool_name=write_tool.name,
+            result=uncertain,
+            result_content="uncertain",
+            arguments=write_args,
+        )
+
+        changed_write_args = {"path": "result.md", "content": "second"}
+        assert guard.check(
+            tool=write_tool,
+            tool_name=write_tool.name,
+            arguments=changed_write_args,
+        )[2] is not None
+
+        other_read_args = {"path": "other.md"}
+        other_read_fp, other_read_policy = guard._fingerprint(
+            read_tool,
+            read_tool.name,
+            other_read_args,
+        )
+        guard.observe(
+            fingerprint=other_read_fp,
+            policy=other_read_policy,
+            tool_name=read_tool.name,
+            result=ToolResult(success=True, content="other"),
+            result_content="other",
+            arguments=other_read_args,
+        )
+        assert guard.check(
+            tool=write_tool,
+            tool_name=write_tool.name,
+            arguments=changed_write_args,
+        )[2] is not None
+
+        same_read_args = {"path": "/home/user/session/result.md"}
+        same_read_fp, same_read_policy = guard._fingerprint(
+            read_tool,
+            read_tool.name,
+            same_read_args,
+        )
+        guard.observe(
+            fingerprint=same_read_fp,
+            policy=same_read_policy,
+            tool_name=read_tool.name,
+            result=ToolResult(success=True, content="verified"),
+            result_content="verified",
+            arguments=same_read_args,
+        )
+        assert guard.check(
+            tool=write_tool,
+            tool_name=write_tool.name,
+            arguments=changed_write_args,
+        )[2] is None
+
+    def test_missing_file_read_verifies_uncertain_write_did_not_land(self):
+        write_tool = _MarkerTool(
+            name="write_file",
+            marker="created",
+            repeat_policy="mutating",
+        )
+        read_tool = _MarkerTool(
+            name="read_file",
+            marker="read",
+            repeat_policy="read_only",
+        )
+        guard = _ToolLoopGuard(workspace_dir="/home/user/session")
+        write_args = {"path": "result.md", "content": "first"}
+        write_fp, write_policy = guard._fingerprint(
+            write_tool,
+            write_tool.name,
+            write_args,
+        )
+        guard.observe(
+            fingerprint=write_fp,
+            policy=write_policy,
+            tool_name=write_tool.name,
+            result=ToolResult(
+                success=False,
+                error="lost response",
+                outcome_uncertain=True,
+            ),
+            result_content="uncertain",
+            arguments=write_args,
+        )
+
+        read_args = {"path": "/home/user/session/result.md"}
+        read_fp, read_policy = guard._fingerprint(
+            read_tool,
+            read_tool.name,
+            read_args,
+        )
+        guard.observe(
+            fingerprint=read_fp,
+            policy=read_policy,
+            tool_name=read_tool.name,
+            result=ToolResult(
+                success=False,
+                error="File not found: /home/user/session/result.md",
+            ),
+            result_content="File not found: /home/user/session/result.md",
+            arguments=read_args,
+        )
+
+        assert guard.check(
+            tool=write_tool,
+            tool_name=write_tool.name,
+            arguments=write_args,
+        )[2] is None
+
+    def test_missing_file_read_does_not_clear_unrelated_recoveries(self):
+        write_tool = _MarkerTool(
+            name="write_file",
+            marker="written",
+            repeat_policy="mutating",
+        )
+        read_tool = _MarkerTool(
+            name="read_file",
+            marker="read",
+            repeat_policy="read_only",
+        )
+        guard = _ToolLoopGuard(workspace_dir="/home/user/session")
+        uncertain = ToolResult(
+            success=False,
+            error="lost response",
+            outcome_uncertain=True,
+        )
+        for path in ("alpha.md", "beta.md"):
+            args = {"path": path, "content": "first"}
+            fingerprint, policy = guard._fingerprint(write_tool, write_tool.name, args)
+            guard.observe(
+                fingerprint=fingerprint,
+                policy=policy,
+                tool_name=write_tool.name,
+                result=uncertain,
+                result_content="uncertain",
+                arguments=args,
+            )
+
+        beta_retry = {"path": "beta.md", "content": "second"}
+        assert guard.check(
+            tool=write_tool,
+            tool_name=write_tool.name,
+            arguments=beta_retry,
+        )[2] is not None
+
+        alpha_read = {"path": "/home/user/session/alpha.md"}
+        read_fp, read_policy = guard._fingerprint(read_tool, read_tool.name, alpha_read)
+        guard.observe(
+            fingerprint=read_fp,
+            policy=read_policy,
+            tool_name=read_tool.name,
+            result=ToolResult(
+                success=False,
+                error="File not found: /home/user/session/alpha.md",
+            ),
+            result_content="File not found: /home/user/session/alpha.md",
+            arguments=alpha_read,
+        )
+
+        assert guard.check(
+            tool=write_tool,
+            tool_name=write_tool.name,
+            arguments={"path": "alpha.md", "content": "second"},
+        )[2] is None
+        assert guard.check(
+            tool=write_tool,
+            tool_name=write_tool.name,
+            arguments=beta_retry,
+        )[2] is not None
+
     def test_relative_and_absolute_workspace_paths_share_fingerprint(self):
         tool = _MarkerTool(
             name="write_file",

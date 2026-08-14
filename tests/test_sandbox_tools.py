@@ -1109,35 +1109,134 @@ class TestSandboxWriteTool:
     @pytest.mark.asyncio
     async def test_write_file_success(self, mock_sandbox):
         """成功寫入文件"""
-        # mkdir -p 模擬
-        mock_cmd_result = MagicMock()
-        mock_cmd_result.exit_code = 0
-        mock_sandbox.commands.run = AsyncMock(return_value=mock_cmd_result)
+        mock_sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(stdout_text='{"exists":false}')
+        )
 
         tool = SandboxWriteTool(mock_sandbox)
         result = await tool.execute(path="/home/user/out.txt", content="hello world")
 
         assert result.success is True
+        assert result.content == "CREATED /home/user/out.txt"
         mock_sandbox.files.write_file.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_write_file_failure(self, mock_sandbox):
         """寫入失敗"""
-        mock_sandbox.commands.run = AsyncMock()
-        mock_sandbox.files.write_file = AsyncMock(side_effect=Exception("disk full"))
-        mock_sandbox.files.write = AsyncMock(side_effect=Exception("disk full"))
+        mock_sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(stdout_text='{"exists":false}')
+        )
+        mock_sandbox.files.write_file = AsyncMock(side_effect=TimeoutError("lost response"))
+        mock_sandbox.files.write = AsyncMock(side_effect=TimeoutError("lost response"))
 
         tool = SandboxWriteTool(mock_sandbox)
         result = await tool.execute(path="/out.txt", content="data")
 
         assert result.success is False
+        assert result.outcome_uncertain is True
+        assert "read_file" in result.content
+        assert "/out.txt" in result.content
+
+    @pytest.mark.asyncio
+    async def test_write_file_without_write_api_is_certain_failure(self, mock_sandbox):
+        """沒有可調用寫 API 時尚未派發，不應標記結果不確定。"""
+        mock_sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(stdout_text='{"exists":false}')
+        )
+        mock_sandbox.files.write_file = None
+        mock_sandbox.files.write = None
+
+        tool = SandboxWriteTool(mock_sandbox)
+        result = await tool.execute(path="/out.txt", content="data")
+
+        assert result.success is False
+        assert result.outcome_uncertain is False
+        assert "does not provide" in (result.error or "")
+        assert "read_file" not in result.content
+
+    @pytest.mark.asyncio
+    async def test_write_file_updated(self, mock_sandbox):
+        """現有內容不同時返回 UPDATED"""
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(
+            stdout_text=json.dumps({
+                "exists": True,
+                "size": 3,
+                "sha256": hashlib.sha256(b"old").hexdigest(),
+            })
+        ))
+
+        tool = SandboxWriteTool(mock_sandbox)
+        result = await tool.execute(path="/home/user/out.txt", content="new")
+
+        assert result.success is True
+        assert result.content == "UPDATED /home/user/out.txt"
+        mock_sandbox.files.write_file.assert_awaited_once_with(
+            "/home/user/out.txt",
+            "new",
+        )
+
+    @pytest.mark.asyncio
+    async def test_write_file_no_change_skips_sandbox_write(self, mock_sandbox):
+        """內容完全相同時返回 NO CHANGE 且不重寫文件"""
+        content = "already current"
+        raw = content.encode("utf-8")
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(
+            stdout_text=json.dumps({
+                "exists": True,
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            })
+        ))
+        sync = AsyncMock()
+
+        tool = SandboxWriteTool(mock_sandbox, agent_config_sync=sync)
+        result = await tool.execute(path="/home/user/out.txt", content=content)
+
+        assert result.success is True
+        assert result.content == "NO CHANGE /home/user/out.txt"
+        mock_sandbox.files.write_file.assert_not_awaited()
+        sync.assert_awaited_once_with("/home/user/out.txt", content)
+
+    @pytest.mark.asyncio
+    async def test_write_file_inspection_failure_is_certain_and_does_not_write(self, mock_sandbox):
+        """寫前無法檢查狀態時應安全失敗，不得假定文件不存在"""
+        mock_sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(exit_code=1, error="probe failed")
+        )
+        mock_sandbox.files.read_file = AsyncMock(side_effect=PermissionError("denied"))
+
+        tool = SandboxWriteTool(mock_sandbox)
+        result = await tool.execute(path="/home/user/out.txt", content="new")
+
+        assert result.success is False
+        assert result.outcome_uncertain is False
+        assert "inspect existing file" in (result.error or "")
+        mock_sandbox.files.write_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_write_file_does_not_treat_endpoint_not_found_as_missing_file(self, mock_sandbox):
+        """模糊的 SDK endpoint 錯誤不得被誤判為 CREATED。"""
+        mock_sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(exit_code=1, error="probe failed")
+        )
+        mock_sandbox.files.read_file = AsyncMock(
+            side_effect=RuntimeError("SDK endpoint not found")
+        )
+
+        tool = SandboxWriteTool(mock_sandbox)
+        result = await tool.execute(path="/home/user/out.txt", content="new")
+
+        assert result.success is False
+        assert result.outcome_uncertain is False
+        assert "inspect existing file" in (result.error or "")
+        mock_sandbox.files.write_file.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_write_relative_path_with_custom_workspace(self, mock_sandbox):
         """write_file 相對路徑應寫到自定義 workspace 根目錄"""
-        mock_cmd_result = MagicMock()
-        mock_cmd_result.exit_code = 0
-        mock_sandbox.commands.run = AsyncMock(return_value=mock_cmd_result)
+        mock_sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(stdout_text='{"exists":false}')
+        )
 
         tool = SandboxWriteTool(mock_sandbox, workspace_dir="/workspace/session-root")
         result = await tool.execute(path="out.txt", content="hello")
@@ -1149,9 +1248,9 @@ class TestSandboxWriteTool:
     @pytest.mark.asyncio
     async def test_write_file_calls_agent_config_sync(self, mock_sandbox):
         """write_file 寫入成功後應把完整內容交給同步回調"""
-        mock_cmd_result = MagicMock()
-        mock_cmd_result.exit_code = 0
-        mock_sandbox.commands.run = AsyncMock(return_value=mock_cmd_result)
+        mock_sandbox.commands.run = AsyncMock(
+            return_value=make_fake_execution(stdout_text='{"exists":false}')
+        )
         sync = AsyncMock()
 
         tool = SandboxWriteTool(mock_sandbox, agent_config_sync=sync)
@@ -1186,6 +1285,7 @@ class TestSandboxEditTool:
         tool = SandboxEditTool(mock_sandbox)
         assert tool.name == "edit_file"
         assert "old_str" in tool.parameters.get("properties", {})
+        assert tool.parameters["properties"]["replace_all"]["default"] is False
 
     @pytest.mark.asyncio
     async def test_edit_success(self, mock_sandbox):
@@ -1218,6 +1318,146 @@ class TestSandboxEditTool:
         )
 
         assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_edit_rejects_empty_old_str_before_reading(self, mock_sandbox):
+        tool = SandboxEditTool(mock_sandbox)
+
+        result = await tool.execute(
+            path="/test.txt",
+            old_str="",
+            new_str="replacement",
+        )
+
+        assert result.success is False
+        assert "must not be empty" in (result.error or "")
+        mock_sandbox.files.read_file.assert_not_awaited()
+        mock_sandbox.files.write_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_edit_rejects_identical_old_and_new_before_reading(self, mock_sandbox):
+        tool = SandboxEditTool(mock_sandbox)
+
+        result = await tool.execute(
+            path="/test.txt",
+            old_str="same",
+            new_str="same",
+        )
+
+        assert result.success is False
+        assert "must be different" in (result.error or "")
+        mock_sandbox.files.read_file.assert_not_awaited()
+        mock_sandbox.files.write_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_edit_multiple_matches_requires_explicit_replace_all(self, mock_sandbox):
+        mock_sandbox.files.read_file = AsyncMock(return_value="one old\ntwo old\n")
+
+        tool = SandboxEditTool(mock_sandbox)
+        result = await tool.execute(
+            path="/test.txt",
+            old_str="old",
+            new_str="new",
+        )
+
+        assert result.success is False
+        assert "Found 2 matches" in (result.error or "")
+        assert "replace_all=true" in (result.error or "")
+        mock_sandbox.files.write_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_edit_replace_all_replaces_every_match_once(self, mock_sandbox):
+        mock_sandbox.files.read_file = AsyncMock(return_value="one old\ntwo old\n")
+
+        tool = SandboxEditTool(mock_sandbox)
+        result = await tool.execute(
+            path="/test.txt",
+            old_str="old",
+            new_str="new",
+            replace_all=True,
+        )
+
+        assert result.success is True
+        assert "replacements=2" in result.content
+        mock_sandbox.files.write_file.assert_awaited_once_with(
+            "/test.txt",
+            "one new\ntwo new\n",
+        )
+
+    @pytest.mark.asyncio
+    async def test_edit_multiline_lf_input_matches_and_preserves_crlf(self, mock_sandbox):
+        mock_sandbox.files.read_file = AsyncMock(return_value="one\r\ntwo\r\n")
+
+        tool = SandboxEditTool(mock_sandbox)
+        result = await tool.execute(
+            path="/test.txt",
+            old_str="one\ntwo",
+            new_str="ONE\nTWO",
+        )
+
+        assert result.success is True
+        assert "replacements=1" in result.content
+        mock_sandbox.files.write_file.assert_awaited_once_with(
+            "/test.txt",
+            "ONE\r\nTWO\r\n",
+        )
+
+    @pytest.mark.asyncio
+    async def test_edit_replace_all_preserves_crlf(self, mock_sandbox):
+        mock_sandbox.files.read_file = AsyncMock(
+            return_value="one\r\ntwo\r\none\r\ntwo\r\n"
+        )
+
+        tool = SandboxEditTool(mock_sandbox)
+        result = await tool.execute(
+            path="/test.txt",
+            old_str="one\ntwo",
+            new_str="ONE\nTWO",
+            replace_all=True,
+        )
+
+        assert result.success is True
+        assert "replacements=2" in result.content
+        mock_sandbox.files.write_file.assert_awaited_once_with(
+            "/test.txt",
+            "ONE\r\nTWO\r\nONE\r\nTWO\r\n",
+        )
+
+    @pytest.mark.asyncio
+    async def test_edit_preserves_unmatched_mixed_line_endings(self, mock_sandbox):
+        mock_sandbox.files.read_file = AsyncMock(
+            return_value="head\r\ntarget\r\ntail\n"
+        )
+
+        tool = SandboxEditTool(mock_sandbox)
+        result = await tool.execute(
+            path="/test.txt",
+            old_str="target",
+            new_str="TARGET",
+        )
+
+        assert result.success is True
+        mock_sandbox.files.write_file.assert_awaited_once_with(
+            "/test.txt",
+            "head\r\nTARGET\r\ntail\n",
+        )
+
+    @pytest.mark.asyncio
+    async def test_edit_write_failure_requires_read_verification(self, mock_sandbox):
+        mock_sandbox.files.read_file = AsyncMock(return_value="old content")
+        mock_sandbox.files.write_file = AsyncMock(side_effect=TimeoutError("lost response"))
+
+        tool = SandboxEditTool(mock_sandbox)
+        result = await tool.execute(
+            path="/test.txt",
+            old_str="old",
+            new_str="new",
+        )
+
+        assert result.success is False
+        assert result.outcome_uncertain is True
+        assert "read_file" in result.content
+        assert "/test.txt" in result.content
 
     @pytest.mark.asyncio
     async def test_edit_relative_path_with_custom_workspace(self, mock_sandbox):

@@ -5,6 +5,7 @@ import type {
   ChatContentBlock,
   RoundData,
   StreamDeltaMeta,
+  TurnReasoningSelection,
 } from '../types';
 import type { StreamEnvelope, StreamSource } from '../runtime/chatRuntimeTypes';
 
@@ -78,6 +79,7 @@ interface StartSendArgs extends StreamIdentity, StreamHandlers {
   content: ChatContentBlock[];
   idempotencyKey?: string;
   preferredSkillKeys?: string[];
+  reasoning?: TurnReasoningSelection;
   onRejectedBeforeAccept?: () => void;
 }
 
@@ -537,6 +539,12 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
           idempotency_key: args.idempotencyKey,
           ...(args.preferredSkillKeys?.length
             ? { preferred_skill_keys: args.preferredSkillKeys }
+            : {}),
+          ...(args.reasoning
+            ? {
+                thinking_mode: args.reasoning.mode,
+                reasoning_effort: args.reasoning.effort,
+              }
             : {}),
         }),
       },

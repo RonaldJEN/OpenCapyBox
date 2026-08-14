@@ -12,9 +12,11 @@ from src.api.schemas.turn import (
     WebReplyRoute,
 )
 from src.agent.schema.run_context import (
+    RequestedReasoningContext,
     RequestedPreferredSkillsContext,
     normalize_preferred_skill_keys,
     requested_preferred_skills_to_context,
+    requested_reasoning_to_context,
 )
 
 
@@ -35,6 +37,13 @@ class WebChatAdapter:
         if preferred_keys:
             contexts.append(requested_preferred_skills_to_context(
                 RequestedPreferredSkillsContext(keys=preferred_keys)
+            ))
+        if request.thinking_mode is not None or request.reasoning_effort is not None:
+            contexts.append(requested_reasoning_to_context(
+                RequestedReasoningContext(
+                    mode=request.thinking_mode or "provider_default",
+                    effort=(request.reasoning_effort or "").strip() or None,
+                )
             ))
         return NormalizedInboundTurn(
             channel=self.channel,

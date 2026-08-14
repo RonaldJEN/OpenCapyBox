@@ -79,6 +79,7 @@ describe('chatStreamClient', () => {
       content: [{ type: 'text', text: 'hello' }],
       idempotencyKey: 'idem-a',
       preferredSkillKeys: ['pdf', 'data_analysis'],
+      reasoning: { mode: 'enabled', effort: 'max' },
       onEnvelope: (envelope) => envelopes.push(envelope),
     });
 
@@ -92,6 +93,8 @@ describe('chatStreamClient', () => {
           content: [{ type: 'text', text: 'hello' }],
           idempotency_key: 'idem-a',
           preferred_skill_keys: ['pdf', 'data_analysis'],
+          thinking_mode: 'enabled',
+          reasoning_effort: 'max',
         }),
       }),
     );

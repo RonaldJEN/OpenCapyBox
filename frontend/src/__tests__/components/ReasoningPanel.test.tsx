@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { render, screen, fireEvent } from '../utils/test-utils';
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent, act } from '../utils/test-utils';
 import { ReasoningPanel } from '../../components/ReasoningPanel';
 import { StepData } from '../../types';
 
@@ -210,7 +210,7 @@ describe('ReasoningPanel 组件', () => {
     expect(screen.getByText('正在思考中')).toBeInTheDocument();
   });
 
-  it('流式 thinking 外部预览不应省略截断', () => {
+  it('流式 thinking 外部预览应限制为三行并保留完整内容', () => {
     const longThinking = '用户想了解美国伊朗最新情况。我已经搜索过了，但可以再搜一下更详细的信息，或者整理一下已有的内容。我应该提供更全面的分析，包括各方立场、关键分歧、最新动态等。';
     const streamingSteps: StepData[] = [
       {
@@ -224,13 +224,123 @@ describe('ReasoningPanel 组件', () => {
       },
     ];
 
-    const { container } = render(
+    render(
       <ReasoningPanel steps={streamingSteps} isStreaming={true} isCompleted={false} />
     );
 
     expect(screen.getByText(longThinking)).toBeInTheDocument();
     expect(screen.getByText('_')).toBeInTheDocument();
-    expect(container.querySelector('.line-clamp-3')).toBeNull();
+    const preview = screen.getByTestId('active-thinking-preview');
+    expect(preview).toHaveClass('max-h-[78px]', 'overflow-y-auto', 'leading-[26px]');
+    expect(preview).toHaveAttribute('data-follow-end', 'true');
+    expect(preview).toHaveAttribute('tabindex', '0');
+  });
+
+  it('流式 thinking 更新应合并到三帧后跟随预览底部', () => {
+    let nextFrameId = 1;
+    const frames = new Map<number, FrameRequestCallback>();
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      const id = nextFrameId;
+      nextFrameId += 1;
+      frames.set(id, callback);
+      return id;
+    });
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => {
+      frames.delete(id);
+    });
+
+    const streamingStep = (thinking: string): StepData[] => [{
+      step_number: 1,
+      thinking,
+      assistant_content: '',
+      tool_calls: [],
+      tool_results: [],
+      status: 'streaming',
+      thinking_start_ts: Date.now(),
+    }];
+    const view = render(
+      <ReasoningPanel steps={streamingStep('第一行')} isStreaming={true} isCompleted={false} />,
+    );
+    const preview = screen.getByTestId('active-thinking-preview');
+    Object.defineProperty(preview, 'scrollHeight', { configurable: true, value: 260 });
+
+    view.rerender(
+      <ReasoningPanel steps={streamingStep('第一行\n第二行\n第三行\n最新一行')} isStreaming={true} isCompleted={false} />,
+    );
+
+    const flushFrame = () => {
+      const callbacks = [...frames.values()];
+      frames.clear();
+      callbacks.forEach((callback) => callback(0));
+    };
+    act(() => {
+      flushFrame();
+      flushFrame();
+    });
+    expect(preview.scrollTop).toBe(0);
+
+    act(() => flushFrame());
+    expect(preview.scrollTop).toBe(260);
+
+    view.unmount();
+    vi.unstubAllGlobals();
+  });
+
+  it('用户滚离底部后应暂停跟随，滚回底部后恢复', () => {
+    let nextFrameId = 1;
+    const frames = new Map<number, FrameRequestCallback>();
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      const id = nextFrameId++;
+      frames.set(id, callback);
+      return id;
+    });
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id));
+
+    const streamingStep = (thinking: string): StepData[] => [{
+      step_number: 1,
+      thinking,
+      assistant_content: '',
+      tool_calls: [],
+      tool_results: [],
+      status: 'streaming',
+      thinking_start_ts: 1000,
+    }];
+    const view = render(
+      <ReasoningPanel steps={streamingStep('第一行')} isStreaming={true} isCompleted={false} />,
+    );
+    const preview = screen.getByTestId('active-thinking-preview');
+    Object.defineProperties(preview, {
+      scrollHeight: { configurable: true, value: 260 },
+      clientHeight: { configurable: true, value: 78 },
+    });
+    const flushThreeFrames = () => {
+      for (let index = 0; index < 3; index += 1) {
+        const callbacks = [...frames.values()];
+        frames.clear();
+        callbacks.forEach((callback) => callback(index));
+      }
+    };
+
+    preview.scrollTop = 20;
+    fireEvent.scroll(preview);
+    expect(preview).toHaveAttribute('data-follow-end', 'false');
+    view.rerender(
+      <ReasoningPanel steps={streamingStep('第一行\n第二行')} isStreaming={true} isCompleted={false} />,
+    );
+    act(flushThreeFrames);
+    expect(preview.scrollTop).toBe(20);
+
+    preview.scrollTop = 182;
+    fireEvent.scroll(preview);
+    expect(preview).toHaveAttribute('data-follow-end', 'true');
+    view.rerender(
+      <ReasoningPanel steps={streamingStep('第一行\n第二行\n最新一行')} isStreaming={true} isCompleted={false} />,
+    );
+    act(flushThreeFrames);
+    expect(preview.scrollTop).toBe(260);
+
+    view.unmount();
+    vi.unstubAllGlobals();
   });
 
   it('流式 thinking 分组点击查看活动后应显示历史思考内容', () => {

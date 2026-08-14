@@ -248,6 +248,19 @@ pre_accept_pending
 - 失败恢复必须带 revision 保护：若乐观清空后用户没有新编辑，精确恢复快照；若用户已新增或移除选择，则保留当前编辑，并把快照中缺失的 key 按原顺序无重复合并，不能用旧快照覆盖新编辑。
 - `ask_user` 或工具审批产生的 child resume round 由后端继承并重新解析原请求 Skill；前端 `resume` 不重复发送 `preferred_skill_keys`。用户之后独立发送的新消息只使用当时该 session 的新草稿。
 
+#### 模型与本轮推理等级
+
+- 输入框底部工具栏使用一个向上展开的组合触发器展示“模型名 + 当前推理等级”，交互层级与 DeepSeek Harness 对齐：根菜单包含“模型”和“推理等级”，推理子菜单严格按当前模型 `supported_reasoning_efforts` 的顺序展示；`off` / `on` 也是目录显式声明的等级，前端不得自行追加。模型目录的 `thinking_mode=provider_default` 时额外提供独立 `Default` 项；若目录默认还带具体强度，显示为 `Default (<level>)`，与显式选择同名等级区分。
+- 触发器本身只显示模型名与推理等级，不挂能力徽章；模型能力说明（“支持深度思考”“支持图片（最多 N 张）”）保留在模型子菜单的每一项下方，不得因为改版而整体丢失。
+- 会话标题栏不使用固定宽度占位元素来对齐右侧 `Files` 按钮；`Files` 按钮用 `ml-auto` 靠右，欢迎页无按钮时标题栏保持空行高度。
+- 管理端新建 OpenAI 兼容模型时默认填入 `off, on` 且默认等级为 `on`；DeepSeek 等具有分级强度的模型可改为 `off, high, max`。请求协议由独立的 `thinking_wire_format` 技术项配置，不与用户可见等级混用。
+- 新 session 可切换模型；已有 session 的模型保持锁定，但下一轮推理等级仍可编辑。切换模型时按新的模型目录默认值重置选择，绝不把上一模型的强度带过去。目录默认值是 `thinking_mode + reasoning_effort` 的完整二元组：初始化草稿时必须原样冻结，不能因为存在具体强度就把 `provider_default` 推断成 `enabled`。`Default` 始终映射回该完整二元组；显式具体档位映射为 `enabled + effort`，两种状态即使展示强度相同也必须可区分、可往返。
+- 本轮推理选择属于 composer draft，必须按 `sessionId || __new_session__` 隔离；切换到使用同一模型的其他会话不得沿用当前选择，新 session 建立后随原 draft 一起迁移到真实 session id。
+- 发送前冻结 `TurnReasoningSelection` 并随 `content` 一并提交为 `thinking_mode` / `reasoning_effort`。正在流式执行时继续修改输入框只影响下一条消息，不得改变已启动 run。
+- 选择 `Off` 必须发送 `{thinking_mode: "disabled", reasoning_effort: null}`；选择 `Default` 发送目录完整默认二元组；选择显式具体档位发送 `{thinking_mode: "enabled", reasoning_effort: "<level>"}`。前端不得按模型名猜测档位或提交目录没有声明的值。
+- 从推理等级或模型菜单提交选项后，焦点必须回到消息输入框，确保用户无需额外点击即可继续输入或按 Enter 发送；通过 Escape 取消菜单时仍将焦点退回菜单触发器。
+- 服务端返回 400 时按普通确定性发送失败处理并恢复草稿；历史 `RoundData.thinking_mode` / `reasoning_effort` 是已发送轮次的审计快照，不反向覆盖当前输入框草稿。
+
 ## 4. 滚动策略
 
 | 场景 | 时机 | 实现 |
@@ -308,7 +321,7 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 ### 7.4 活动入口与抽屉
 
 - ThinkingBlock / ThinkingGroupBlock：在单个 round 内聚合为一个思考入口，不按 step 或工具分隔重复渲染多个入口。
-  - 进行中：渲染醒目的 `正在思考` 卡片，显示实时耗时、当前最新 thinking 全文与 `查看活动` 入口；外部内容不得省略截断，末尾用流式闪烁点表示仍在生成。
+  - 进行中：渲染醒目的 `正在思考` 卡片，显示实时耗时、当前最新 thinking 的最多 3 行滚动预览与 `查看活动` 入口；完整内容保留在活动抽屉。预览默认每 3 个动画帧跟随末尾，用户滚离底部后必须暂停自动跟随，回到底部后恢复；末尾用流式闪烁点表示仍在生成。
   - 完成态：渲染紧凑的 `已完成思考` 胶囊，显示整轮思考总耗时。
   - 点击 `查看活动` 或完成态胶囊后打开右侧活动抽屉；不得在主聊天区展开 thinking 详情。
 - ToolGroupBlock：完成态不在主聊天区直接渲染；工具摘要、工具项、输入输出、`✓ Done` 标记均在活动抽屉内展示。若 round 没有 thinking 但存在已完成工具活动，主聊天区渲染紧凑的 `已完成活动` 入口，仅用于打开活动抽屉。只有 round 仍处于 streaming 时，最新 ToolGroupBlock 的未返回工具结果才可视为运行中；若最新 ToolGroupBlock 仍在运行且没有正在流式的 thinking，主聊天区必须显示 `正在调用工具` 活动态卡片和工具摘要。终态 round 中缺少 tool_result 的工具调用不得显示 `正在调用工具`。若工具已返回但 round 仍处于 streaming，且下一段 thinking/正文尚未到达，主聊天区必须显示 `正在处理工具结果` 活动态卡片，避免 think/tool 与下一段 think 之间的空窗期看起来已经完成。

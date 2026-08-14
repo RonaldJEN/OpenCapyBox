@@ -13,7 +13,6 @@
 """
 
 import base64
-import difflib
 import hashlib
 import json
 import logging
@@ -29,6 +28,10 @@ from .base import Tool, ToolResult
 logger = logging.getLogger(__name__)
 
 AgentConfigSync = Callable[[str, str], Awaitable[None]]
+
+
+class _SandboxWriteNotDispatchedError(RuntimeError):
+    """The sandbox exposes no write API, so no remote mutation was attempted."""
 
 
 def _normalize_workspace_dir(workspace_dir: str) -> str:
@@ -170,7 +173,147 @@ async def _sandbox_write_text(sandbox: Sandbox, path: str, content: str) -> None
     if callable(write):
         await write(path, content.encode("utf-8"))
         return
-    raise AttributeError("Sandbox files API does not provide write_file/write")
+    raise _SandboxWriteNotDispatchedError(
+        "Sandbox files API does not provide write_file/write"
+    )
+
+
+def _is_missing_file_error(exc: BaseException) -> bool:
+    """Recognize an explicit missing-file failure without trusting vague text."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, FileNotFoundError):
+            return True
+        if "no such file" in str(current).lower():
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _normalize_edit_line_endings(content: str) -> str:
+    """Use LF for matching while leaving lone carriage returns untouched."""
+    return content.replace("\r\n", "\n")
+
+
+def _detect_edit_line_ending(content: str) -> str:
+    sample = content[:4096]
+    crlf_count = sample.count("\r\n")
+    lf_count = sample.count("\n") - crlf_count
+    return "\r\n" if crlf_count > lf_count else "\n"
+
+
+def _find_edit_matches(content: str, needle: str) -> list[int]:
+    """Return non-overlapping literal match offsets."""
+    matches: list[int] = []
+    start = 0
+    while True:
+        found = content.find(needle, start)
+        if found < 0:
+            return matches
+        matches.append(found)
+        start = found + len(needle)
+
+
+def _raw_offsets_for_normalized_indices(
+    raw_content: str,
+    indices: set[int],
+) -> dict[int, int]:
+    """Map LF-normalized character boundaries back to raw CRLF-aware offsets."""
+    offsets: dict[int, int] = {}
+    normalized_index = 0
+    raw_index = 0
+    if 0 in indices:
+        offsets[0] = 0
+    while raw_index < len(raw_content) and len(offsets) < len(indices):
+        raw_index += 2 if raw_content.startswith("\r\n", raw_index) else 1
+        normalized_index += 1
+        if normalized_index in indices:
+            offsets[normalized_index] = raw_index
+    if len(offsets) != len(indices):
+        raise ValueError("Could not map normalized edit offsets to raw content")
+    return offsets
+
+
+async def _classify_text_write(
+    sandbox: Sandbox,
+    path: str,
+    content: str,
+) -> str:
+    """Return CREATED, UPDATED, or NO CHANGE without transferring file content.
+
+    The primary path hashes the existing file inside the sandbox.  The full-read
+    fallback preserves compatibility with sandbox backends that cannot execute
+    the probe command, while still failing closed on errors other than a missing
+    target.
+    """
+    raw = content.encode("utf-8")
+    expected_size = len(raw)
+    expected_digest = hashlib.sha256(raw).hexdigest()
+    probe_script = (
+        "import hashlib,json,os,sys\n"
+        f"path={path!r}\n"
+        "if not os.path.exists(path):\n"
+        "    payload={'exists':False}\n"
+        "else:\n"
+        "    digest=hashlib.sha256()\n"
+        "    size=0\n"
+        "    with open(path,'rb') as handle:\n"
+        "        while True:\n"
+        "            chunk=handle.read(1024*1024)\n"
+        "            if not chunk:\n"
+        "                break\n"
+        "            size += len(chunk)\n"
+        "            digest.update(chunk)\n"
+        "    payload={'exists':True,'size':size,'sha256':digest.hexdigest()}\n"
+        "sys.stdout.write(json.dumps(payload,separators=(',',':')))\n"
+    )
+    try:
+        result = await sandbox.commands.run(
+            "python3 -c " + shlex.quote(probe_script)
+        )
+        if _extract_exit_code(result) == 0:
+            payload = json.loads(_extract_stdout(result).strip())
+            exists = payload.get("exists")
+            if exists is False:
+                return "CREATED"
+            if exists is True:
+                size = payload.get("size")
+                digest = payload.get("sha256")
+                if isinstance(size, int) and size >= 0 and isinstance(digest, str):
+                    if size == expected_size and digest == expected_digest:
+                        return "NO CHANGE"
+                    return "UPDATED"
+            logger.debug(
+                "sandbox write probe returned invalid metadata for %s; "
+                "falling back to a full read",
+                path,
+            )
+    except Exception as exc:
+        logger.debug("sandbox write probe failed for %s: %s", path, exc)
+
+    try:
+        existing = await _sandbox_read_text(sandbox, path)
+    except Exception as exc:
+        if _is_missing_file_error(exc):
+            return "CREATED"
+        raise RuntimeError(
+            f"Unable to inspect existing file before write: {path} — {exc}"
+        ) from exc
+    return "NO CHANGE" if existing == content else "UPDATED"
+
+
+def _uncertain_write_result(path: str, exc: Exception) -> ToolResult:
+    return ToolResult(
+        success=False,
+        error=f"Write outcome uncertain for {path}: {exc}",
+        content=(
+            f"The write to {path} may have succeeded. Use read_file on this path "
+            "to verify its content before retrying any file mutation."
+        ),
+        outcome_uncertain=True,
+    )
 
 
 async def _sync_agent_config_after_write(
@@ -670,7 +813,9 @@ class SandboxWriteTool(Tool):
             "Cannot write binary files like .docx, .pdf, .xlsx - use appropriate scripts/tools for those formats. "
             "Will overwrite existing files completely. "
             "For existing files, you should read the file first using read_file. "
-            "Prefer editing existing files over creating new ones unless explicitly needed."
+            "Prefer editing existing files over creating new ones unless explicitly needed. "
+            "Returns CREATED, UPDATED, or NO CHANGE. If the write outcome is uncertain, "
+            "read the file to verify it before retrying."
         )
 
     @property
@@ -701,17 +846,35 @@ class SandboxWriteTool(Tool):
                     error=f"{full_path} is managed by the platform template and cannot be edited.",
                 )
 
+            write_status = await _classify_text_write(
+                self._sandbox,
+                full_path,
+                content,
+            )
+
+            if write_status == "NO CHANGE":
+                await _sync_agent_config_after_write(
+                    self._agent_config_sync,
+                    full_path,
+                    content,
+                )
+                return ToolResult(success=True, content=f"NO CHANGE {full_path}")
+
             # 確保父目錄存在（透過 bash 命令）
-            import posixpath
             parent_dir = posixpath.dirname(full_path)
             if parent_dir:
                 await self._sandbox.commands.run(f"mkdir -p {shlex.quote(parent_dir)}")
 
             # 寫入文件
-            await _sandbox_write_text(self._sandbox, full_path, content)
+            try:
+                await _sandbox_write_text(self._sandbox, full_path, content)
+            except _SandboxWriteNotDispatchedError as exc:
+                return ToolResult(success=False, content="", error=str(exc))
+            except Exception as exc:
+                return _uncertain_write_result(full_path, exc)
             await _sync_agent_config_after_write(self._agent_config_sync, full_path, content)
 
-            return ToolResult(success=True, content=f"Successfully wrote to {full_path}")
+            return ToolResult(success=True, content=f"{write_status} {full_path}")
 
         except Exception as e:
             return ToolResult(success=False, content="", error=str(e))
@@ -742,7 +905,9 @@ class SandboxEditTool(Tool):
     def description(self) -> str:
         return (
             "Perform exact string replacement in a file in the sandbox. The old_str must match exactly "
-            "and appear uniquely in the file, otherwise the operation will fail. "
+            "and appear uniquely in the file by default. If it appears more than once, provide a more "
+            "specific old_str or explicitly set replace_all=true. Empty old_str and identical old_str/new_str "
+            "are rejected. "
             "You must read the file first before editing. Preserve exact indentation from the source."
         )
 
@@ -763,13 +928,45 @@ class SandboxEditTool(Tool):
                     "type": "string",
                     "description": "Replacement string",
                 },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace every match; defaults to false, which requires exactly one match",
+                    "default": False,
+                },
             },
             "required": ["path", "old_str", "new_str"],
         }
 
-    async def execute(self, path: str, old_str: str, new_str: str) -> ToolResult:
+    async def execute(
+        self,
+        path: str,
+        old_str: str,
+        new_str: str,
+        replace_all: bool = False,
+    ) -> ToolResult:
         """在沙箱中編輯文件"""
         try:
+            normalized_old_str = _normalize_edit_line_endings(old_str)
+            normalized_new_str = _normalize_edit_line_endings(new_str)
+            if normalized_old_str == "":
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error="old_str must not be empty",
+                )
+            if normalized_old_str == normalized_new_str:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error="old_str and new_str must be different",
+                )
+            if not isinstance(replace_all, bool):
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error="replace_all must be a boolean",
+                )
+
             full_path = _resolve_workspace_path(path, self._workspace_dir)
             if full_path in self._read_only_paths:
                 return ToolResult(
@@ -779,39 +976,67 @@ class SandboxEditTool(Tool):
                 )
 
             # 讀取當前內容
-            content = await _sandbox_read_text(self._sandbox, full_path)
+            raw_content = await _sandbox_read_text(self._sandbox, full_path)
+            line_ending = _detect_edit_line_ending(raw_content)
+            content = _normalize_edit_line_endings(raw_content)
 
-            if old_str not in content:
+            match_positions = _find_edit_matches(content, normalized_old_str)
+            match_count = len(match_positions)
+            if match_count == 0:
                 return ToolResult(
                     success=False,
                     content="",
                     error=f"Text not found in file: {old_str}",
                 )
+            if match_count > 1 and not replace_all:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=(
+                        f"Found {match_count} matches for old_str in {full_path}. "
+                        "Provide a more specific old_str or set replace_all=true."
+                    ),
+                )
 
-            # 替換（只替換第一個匹配）
-            new_content = content.replace(old_str, new_str, 1)
+            replacements = match_count if replace_all else 1
+            selected_positions = match_positions[:replacements]
+            normalized_boundaries = {
+                boundary
+                for position in selected_positions
+                for boundary in (
+                    position,
+                    position + len(normalized_old_str),
+                )
+            }
+            raw_offsets = _raw_offsets_for_normalized_indices(
+                raw_content,
+                normalized_boundaries,
+            )
+            rendered_new_str = normalized_new_str.replace("\n", line_ending)
+            parts: list[str] = []
+            raw_cursor = 0
+            for position in selected_positions:
+                raw_start = raw_offsets[position]
+                raw_end = raw_offsets[position + len(normalized_old_str)]
+                parts.append(raw_content[raw_cursor:raw_start])
+                parts.append(rendered_new_str)
+                raw_cursor = raw_end
+            parts.append(raw_content[raw_cursor:])
+            new_content = "".join(parts)
 
             # 寫回
-            await _sandbox_write_text(self._sandbox, full_path, new_content)
+            try:
+                await _sandbox_write_text(self._sandbox, full_path, new_content)
+            except _SandboxWriteNotDispatchedError as exc:
+                return ToolResult(success=False, content="", error=str(exc))
+            except Exception as exc:
+                return _uncertain_write_result(full_path, exc)
             await _sync_agent_config_after_write(self._agent_config_sync, full_path, new_content)
 
-            # 計算 diff 統計
-            old_lines_list = old_str.splitlines(keepends=True)
-            new_lines_list = new_str.splitlines(keepends=True)
-            matcher = difflib.SequenceMatcher(None, old_lines_list, new_lines_list)
-            lines_added = 0
-            lines_removed = 0
-            for op, i1, i2, j1, j2 in matcher.get_opcodes():
-                if op == 'replace':
-                    lines_removed += (i2 - i1)
-                    lines_added += (j2 - j1)
-                elif op == 'insert':
-                    lines_added += (j2 - j1)
-                elif op == 'delete':
-                    lines_removed += (i2 - i1)
-
-            diff_info = f" +{lines_added} -{lines_removed}" if (lines_added or lines_removed) else ""
-            return ToolResult(success=True, content=f"Successfully edited {full_path}{diff_info}")
+            return ToolResult(
+                success=True,
+                content=f"EDITED {full_path} | replacements={replacements}",
+            )
 
         except Exception as e:
             error_msg = str(e)

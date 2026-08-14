@@ -937,22 +937,29 @@ function applyRunningSessionsSnapshot(
     }
     if (item.round_id) {
       const run = nextState.runs[runKey];
-      nextState = putRun(nextState, runKey, {
-        ...run,
-        serverRunId: item.round_id,
-      });
-      nextState = {
-        ...nextState,
-        serverRunIdToClientRunKey: {
-          ...nextState.serverRunIdToClientRunKey,
-          [item.round_id]: runKey,
-        },
-      };
+      if (run.serverRunId !== item.round_id) {
+        nextState = putRun(nextState, runKey, {
+          ...run,
+          serverRunId: item.round_id,
+        });
+      }
+      if (nextState.serverRunIdToClientRunKey[item.round_id] !== runKey) {
+        nextState = {
+          ...nextState,
+          serverRunIdToClientRunKey: {
+            ...nextState.serverRunIdToClientRunKey,
+            [item.round_id]: runKey,
+          },
+        };
+      }
     }
-    nextState = putSession(nextState, item.session_id, {
-      ...session,
-      activeRunKeys: unique([...session.activeRunKeys, runKey]),
-    });
+    const currentSession = ensureSession(nextState, item.session_id);
+    if (!currentSession.activeRunKeys.includes(runKey)) {
+      nextState = putSession(nextState, item.session_id, {
+        ...currentSession,
+        activeRunKeys: unique([...currentSession.activeRunKeys, runKey]),
+      });
+    }
   }
 
   for (const [sessionId, session] of Object.entries(nextState.sessions)) {

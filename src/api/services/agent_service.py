@@ -22,11 +22,15 @@ from src.agent.schema.run_context import (
     AgentRunContext,
     LLMRequestContext,
     RequestedPreferredSkillsContext,
+    RequestedReasoningContext,
     ResolvedPreferredSkillsContext,
+    ResolvedReasoningContext,
     ResolvedSkillRef,
     current_run_context,
     parse_requested_preferred_skills_contexts,
+    parse_requested_reasoning_contexts,
     requested_preferred_skills_to_context,
+    resolve_reasoning_selection,
 )
 
 from src.api.services.history_service import HistoryService
@@ -154,6 +158,7 @@ class AgentService:
         self.restore_history = restore_history
         self.persist_context_checkpoint = persist_context_checkpoint
         self.agent: Agent | None = None
+        self._model_config = None
         self._last_saved_index = 0
         self._pending_interrupt_round_ids: dict[str, str] = {}
         self.skill_loader = None  # 保存 skill_loader 引用
@@ -224,13 +229,14 @@ class AgentService:
                 )
 
             self._token_limit = model_config.compute_token_limit()
+            self._model_config = model_config
 
             logger.info(
                 "创建 LLM 客户端: model=%s, provider=%s, api_base=%s",
                 model_config.model_name, model_config.provider, model_config.api_base,
             )
 
-            # 收集 fallback 模型（排除當前主模型，按 YAML 順序），并保持多模态能力不降级。
+            # 收集 fallback 模型（排除当前主模型，按目录顺序），并保持多模态能力不降级。
             fallback_configs = [
                 m for m in registry_models
                 if m.id != model_config.id
@@ -244,7 +250,7 @@ class AgentService:
         except FileNotFoundError as e:
             raise RuntimeError(
                 f"Model Registry 不可用: {e}. "
-                "請修復 models.yaml 配置後重試。"
+                "請檢查数据库模型目录或首次 seed 的 models.yaml。"
             ) from e
 
         except ValueError as e:
@@ -252,7 +258,7 @@ class AgentService:
                 raise
             raise RuntimeError(
                 f"Model Registry 配置異常: {e}. "
-                "請修復 models.yaml 或環境變數後重試。"
+                "請修復数据库模型配置或环境变量后重试。"
             ) from e
 
         # === 新用户默认文件初始化 ===
@@ -1794,7 +1800,11 @@ class AgentService:
                         self.agent.clear_pending_interrupt()
 
         requested_context = parse_requested_preferred_skills_contexts(contexts or [])
-        run_context = await self._resolve_run_context(requested_context)
+        requested_reasoning = parse_requested_reasoning_contexts(contexts or [])
+        run_context = await self._resolve_run_context(
+            requested_context,
+            requested_reasoning,
+        )
 
         # 正規化 + 校驗 + 構建輸入內容
         normalized_blocks = self._normalize_content_blocks(user_content)
@@ -1828,6 +1838,8 @@ class AgentService:
                     else ()
                 )
             ],
+            thinking_mode=(run_context.reasoning.mode if run_context.reasoning else None),
+            reasoning_effort=(run_context.reasoning.effort if run_context.reasoning else None),
             idempotency_key=idempotency_key,
         )
 
@@ -1899,39 +1911,87 @@ class AgentService:
     async def _resolve_run_context(
         self,
         requested: RequestedPreferredSkillsContext | None,
+        requested_reasoning: RequestedReasoningContext | None = None,
     ) -> AgentRunContext:
         """Resolve user-provided keys against the effective registry for this run."""
-        if requested is None or self.skill_loader is None:
-            return AgentRunContext()
-        try:
-            refresh_inventory = getattr(self.skill_loader, "refresh_inventory", None)
-            if callable(refresh_inventory):
-                await refresh_inventory()
-        except Exception:
-            logger.warning("Preferred Skill Inventory 刷新失败，沿用当前 Registry", exc_info=True)
-        try:
-            self.skill_loader.refresh_disabled_skills(force=True)
-        except Exception:
-            logger.warning("Preferred Skill 状态刷新失败，按当前 Registry 解析", exc_info=True)
         resolved: list[ResolvedSkillRef] = []
-        for key in requested.keys:
-            skill = self.skill_loader.get_skill(key)
-            if skill is None:
-                logger.info("忽略当前 Run 不可用的 preferred Skill: %s", key)
-                continue
-            metadata = skill.metadata if isinstance(skill.metadata, dict) else {}
-            display_name = str(metadata.get("display_name") or skill.name)
-            resolved.append(ResolvedSkillRef(
-                key=skill.name,
-                load_name=skill.name,
-                display_name=display_name,
-            ))
+        if requested is not None and self.skill_loader is not None:
+            try:
+                refresh_inventory = getattr(self.skill_loader, "refresh_inventory", None)
+                if callable(refresh_inventory):
+                    await refresh_inventory()
+            except Exception:
+                logger.warning("Preferred Skill Inventory 刷新失败，沿用当前 Registry", exc_info=True)
+            try:
+                self.skill_loader.refresh_disabled_skills(force=True)
+            except Exception:
+                logger.warning("Preferred Skill 状态刷新失败，按当前 Registry 解析", exc_info=True)
+            for key in requested.keys:
+                skill = self.skill_loader.get_skill(key)
+                if skill is None:
+                    logger.info("忽略当前 Run 不可用的 preferred Skill: %s", key)
+                    continue
+                metadata = skill.metadata if isinstance(skill.metadata, dict) else {}
+                display_name = str(metadata.get("display_name") or skill.name)
+                resolved.append(ResolvedSkillRef(
+                    key=skill.name,
+                    load_name=skill.name,
+                    display_name=display_name,
+                ))
         preferred = (
             ResolvedPreferredSkillsContext(skills=tuple(resolved))
             if resolved
             else None
         )
-        return AgentRunContext(preferred_skills=preferred)
+        reasoning = self._resolve_reasoning_context(requested_reasoning)
+        return AgentRunContext(preferred_skills=preferred, reasoning=reasoning)
+
+    def _resolve_reasoning_context(
+        self,
+        requested: RequestedReasoningContext | None,
+    ) -> ResolvedReasoningContext:
+        config = self._model_config
+        if config is None:
+            raise ValueError("当前模型不支持按轮设置推理等级")
+        if requested is None:
+            return ResolvedReasoningContext(
+                mode=config.effective_thinking_mode,
+                effort=config.reasoning_effort,
+            )
+        return resolve_reasoning_selection(
+            requested,
+            provider=config.provider,
+            supports_reasoning_control=config.supports_reasoning_control,
+            supported_reasoning_efforts=config.supported_reasoning_efforts,
+        )
+
+    def _reasoning_context_from_round(
+        self,
+        round_id: str,
+    ) -> ResolvedReasoningContext | None:
+        """Carry the frozen parent selection through interrupt continuations."""
+        from src.api.models.round import Round
+
+        db = self.history_service.db
+        parent = (
+            db.query(Round)
+            .filter(Round.id == round_id, Round.session_id == self.session_id)
+            .first()
+        )
+        if parent is None:
+            raise ValueError(f"父 Round '{round_id}' 不存在或不属于当前会话")
+        mode = parent.thinking_mode
+        if mode is None:
+            return None
+        if mode not in {"provider_default", "enabled", "disabled"}:
+            raise ValueError(f"父 Round '{round_id}' 的思考模式无效: {mode!r}")
+        effort = parent.reasoning_effort
+        if effort is not None and not isinstance(effort, str):
+            raise ValueError(f"父 Round '{round_id}' 的推理等级无效")
+        return ResolvedReasoningContext(
+            mode=mode,
+            effort=effort,
+        )
 
     @staticmethod
     def _on_post_round_done(task: asyncio.Task) -> None:
@@ -2247,6 +2307,12 @@ class AgentService:
                 tool_result_content=marker,
                 restore_strategy="approval_queued",
                 fallback_reason=None,
+                thinking_mode=(
+                    run_context.reasoning.mode if run_context.reasoning else None
+                ),
+                reasoning_effort=(
+                    run_context.reasoning.effort if run_context.reasoning else None
+                ),
                 commit=False,
             )
             self.agent.queue_tool_approval_resume(
@@ -2360,6 +2426,12 @@ class AgentService:
                 )
             )
             run_context = await self._resolve_run_context(requested_context)
+            parent_reasoning = self._reasoning_context_from_round(parent_run_id)
+            if parent_reasoning is not None:
+                run_context = AgentRunContext(
+                    preferred_skills=run_context.preferred_skills,
+                    reasoning=parent_reasoning,
+                )
             if interrupt_kind == "tool_approval":
                 return self._prepare_tool_approval_resume_locked(
                     interrupt_id=interrupt_id,
@@ -2460,6 +2532,12 @@ class AgentService:
                     tool_result_content=tool_result_content,
                     restore_strategy=restore_strategy,
                     fallback_reason=fallback_reason,
+                    thinking_mode=(
+                        run_context.reasoning.mode if run_context.reasoning else None
+                    ),
+                    reasoning_effort=(
+                        run_context.reasoning.effort if run_context.reasoning else None
+                    ),
                 )
             except Exception:
                 if messages_snapshot is not None:

@@ -319,7 +319,9 @@ Content-Type: application/json
 {
   "content": ContentBlock[],
   "idempotency_key": "uuid-string",    // 可选
-  "preferred_skill_keys": ["pdf", "data_analysis"] // 可选，本轮优先 Skill
+  "preferred_skill_keys": ["pdf", "data_analysis"], // 可选，本轮优先 Skill
+  "thinking_mode": "enabled",          // 可选：provider_default / enabled / disabled
+  "reasoning_effort": "max"             // 可选：当前模型声明的精确强度
 }
 ```
 
@@ -346,6 +348,14 @@ Content-Type: application/json
 - 若本轮因 `ask_user` 或工具权限审批中断，原始请求 key 与服务端生成的 `preferred_skills_origin_user_message_id` 会同时写入热路径 pending interrupt 和持久化 `interrupt_payload`。`resume` 时按最新 registry 和启停状态重新解析，并把同一锚点原样继承到 child resume round；因此 R1 → R2 → R3 连续中断/恢复始终投影到 R1 的原始 user message，而不是逐级改为父 Round 的回答。该继承仅延续同一次被中断的执行意图，不得扩散到之后独立发送的新消息。
 - resume child Round 运行时继续继承并重新解析原请求偏好，但自身 `preferred_skills` 必须为空，不重复展示父 direct Round 已记录的标签，也不得覆盖父 Round 的发送时快照。
 - `preferred_skills_origin_user_message_id` 是服务端专用元数据，不属于 `bsbox.preferred_skills.v1` 的客户端 payload。发送和 resume 请求均不能提交或覆盖它；客户端在 runtime context 中夹带同名字段必须被忽略。旧中断记录缺少该字段时，仅可用命中中断的父 Round user message 作为兼容回退，并在下一次中断时持久化服务端确认的锚点。
+
+**本轮推理选择契约**:
+
+- `thinking_mode` 与 `reasoning_effort` 是发送瞬间的不可变快照，只覆盖当前逻辑执行链；两者均省略时必须把当前模型目录默认值物化到快照与 direct Round，不得用 `NULL / NULL` 延迟解析。`disabled` 必须清除并拒绝同时携带的强度。
+- 后端先按 session 的精确 `model_id` 校验：仅 OpenAI 兼容且显式声明非空 `supported_reasoning_efforts` 的模型可切换；`disabled` 校验目录中的 `off`，无强度的 `enabled` 校验 `on`，具体强度精确命中同一有序目录，失效或伪造值在建立 SSE 前返回 400。`reasoning_effort` 中的 `off` / `on` 必须拒绝，它们只能通过 `thinking_mode` 表达。
+- 归一化后写入独立版本化上下文 `bsbox.reasoning.v1`，不得混入 Skill 上下文；OpenAI 同步、流式、工具 follow-up、retry 和 failover 在同一 run 中都从 `ContextVar` 读取同一冻结快照。failover 不按备用模型白名单过滤或降级，但只能尝试能够编码该快照的客户端：`provider_default + null` 可跨 provider；显式开关或具体强度不能交给 Anthropic 客户端；OpenAI `thinking_wire_format=none` 只能承载具体 `reasoning_effort`，不能承载纯 On/Off。协议不兼容的备用模型必须跳过，继续尝试后续模型；若没有任何备用模型兼容，保留并抛出主模型的原始失败。
+- direct Round 将最终 `thinking_mode` / `reasoning_effort` 持久化用于审计和历史恢复。若执行因 `ask_user` 或工具审批中断，child resume Round 从父 Round 继承同一快照；`resume` API 不接受新的推理选择。
+- `enabled` / `disabled` 由模型 DB 的 `thinking_wire_format` 编码：DashScope 类网关使用 `enable_thinking=true|false`，DeepSeek 原生协议使用 `thinking: {type: enabled|disabled}`；`disabled` 同时移除强度，非空强度作为顶层 `reasoning_effort` 发送。选择 Off 不能退化成字段缺省。
 
 **file block 注入语义**:
 
@@ -378,6 +388,7 @@ SSE 事件流格式遵循 AG-UI 协议（详见 [第 4.6 节](#46-ag-ui-事件�
 | HTTP 状态码 | 含义 | 场景 |
 |-------------|------|------|
 | 404 | 会话不存在 | `session_id` 无效或不属于当前用户 |
+| 400 | 本轮推理选择无效 | 模型不支持按轮控制，或强度不在模型白名单 |
 | 410 | 会话已完成 | 会话处于终态，不再接受新消息 |
 | 422 | 请求校验失败 | `content` 或 `preferred_skill_keys` 超出数量/长度限制、字段类型非法 |
 | 429 | 当前运行任务数已达上限 | 用户 slot 已满，或同 session 已有 active run |
@@ -445,6 +456,8 @@ Agent 初始化和中断状态校验在 SSE generator 内执行；入口只做�
 恢复请求都会创建新的 Round，其 `parent_run_id` 指向被 `interrupt_id` 命中的中断 Round，并在同一事务中写入 `interrupt_resolutions`。原 Round 只在命中该 `interrupt_id` 时迁移为 `resumed`，不得批量 resolve 同 session 的其他 interrupted rounds。
 
 若父 Round 携带 `preferred_skill_keys` 生成的版本化 runtime context，热路径 pending interrupt 与持久化 `interrupt_payload` 都必须保留该请求上下文及服务端生成的原始 user message 锚点。`resume` 请求本身不接收新的 `preferred_skill_keys` 或锚点；服务端从中断快照恢复原始 key 和锚点，并按 resume 当时可见且已启用的 Skill registry 重新解析。恢复后仍不可用的 key 静默忽略，解析结果仅作用于新建的 child resume round；该 child 若再次中断，必须继续写回同一锚点，不能改成当前父 Round 的 user message。
+
+父 Round 已固化的 `thinking_mode` / `reasoning_effort` 同样由服务端继承到 child resume Round，确保审批或回答之后的 provider follow-up 不会因为用户后来调整输入框选择而改变推理强度。
 
 #### 错误码
 
@@ -681,6 +694,8 @@ Web send/resume/abort 入口先由 `WebChatAdapter` / `WebResumeAdapter` /
 - 只读工具允许“初读 + 复核”，第 3 次仍得到相同结果时阻止；相同成功的 mutating 工具下一次不得重复执行，`outcome_uncertain` 的副作用调用也不得自动重试。
 - 完整观察到 `A → B → A → B`，且 A/B 均为相同只读调用、两次结果各自未变化后，下一次再次调用 A 或 B 时识别为无进展循环；不得在尚未观察第二次 B 的结果前预测性阻止。成功 mutation 会清空旧的读/搜索观察。声明为 polling 的工具使用独立有界阈值，但相同 uncertain 结果最多实际尝试 2 次。
 - `bash` 命令文本不凭首个单词猜测读写属性；MCP annotation 只能把默认策略收紧，远端自称 `readOnlyHint=true` 不得放宽重试权限。带 `mode` 的记忆工具按具体调用区分 read 与 write/append。
+- 文件变更工具（`write_file` / `edit_file`）额外按规范化路径记账：某路径上出现过 `outcome_uncertain` 写入后，该路径上的任何后续文件变更都被阻止，即使参数不同。解除条件唯一——对同一规范化路径调用 `read_file` 并得到确定结果（成功，或明确的 `File not found:`）；用 `bash cat` 等其他方式旁路校验不解除阻断。工具超时产生的 uncertain 写入必须在 synthetic tool result 中明确告知模型该路径需要 `read_file` 校验。
+- 确定存在的缺失文件读取只解除它自己验证的那个路径的 uncertain 记账与对应恢复态，不得清空其他无关 pattern 的恢复态；只有成功调用才按既有规则收敛全局恢复态。
 - 首次命中时不执行候选工具，但仍写入配对的 synthetic tool result，明确要求换策略，并给模型一次恢复机会；若下一步仍调用同一被拒绝 pattern，则为同一 assistant 批次的其余调用补齐 skipped result，发出 `RUN_ERROR(tool_loop_detected)` 并将 Round 置为失败；真正不同且成功的策略会解除该 pattern 的恢复态。
 - Round 收尾不得额外调用模型提取或写入长期记忆；只允许同步本轮已由显式工具/文件操作产生的 dirty 配置文件，并按 [memory-spec.md](./memory-spec.md) 维护对话轮检索索引。
 

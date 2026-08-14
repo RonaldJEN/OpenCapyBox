@@ -5,6 +5,7 @@ import type {
   FileInfo,
   InterruptDetails,
   RoundData,
+  TurnReasoningSelection,
 } from '../types';
 
 export type StreamSource = 'direct' | 'subscribe' | 'resume';
@@ -121,6 +122,7 @@ export interface SendMessageInput {
   content: ChatContentBlock[];
   attachments?: FileInfo[];
   preferredSkillKeys?: string[];
+  reasoning?: TurnReasoningSelection;
   onStreamAccepted?: () => void;
   onRejectedBeforeAccept?: () => void;
 }

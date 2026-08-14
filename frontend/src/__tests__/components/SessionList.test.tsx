@@ -78,6 +78,46 @@ describe('SessionList 組件', () => {
     });
   });
 
+  it('创建成功的会话应立即插入本地列表且不触发全量刷新', async () => {
+    const { rerender } = render(<SessionList onSessionSelect={vi.fn()} />);
+
+    await screen.findByText('測試會話 1');
+    vi.mocked(apiService.getSessions).mockClear();
+
+    const now = new Date().toISOString();
+    rerender(
+      <SessionList
+        onSessionSelect={vi.fn()}
+        optimisticSession={{
+          id: 'session-new',
+          user_id: 'user-1',
+          status: SessionStatus.ACTIVE,
+          created_at: now,
+          updated_at: now,
+          title: '新会话',
+          model_id: 'qwen-plus',
+        }}
+      />,
+    );
+
+    expect(await screen.findByText('新会话')).toBeInTheDocument();
+    expect(apiService.getSessions).not.toHaveBeenCalled();
+  });
+
+  it('切换当前会话应复用本地列表而不是重新请求', async () => {
+    const { rerender } = render(
+      <SessionList currentSessionId="session-1" onSessionSelect={vi.fn()} />,
+    );
+
+    await screen.findByText('測試會話 1');
+    vi.mocked(apiService.getSessions).mockClear();
+
+    rerender(<SessionList currentSessionId="session-2" onSessionSelect={vi.fn()} />);
+
+    expect(screen.getByText('測試會話 2')).toBeInTheDocument();
+    expect(apiService.getSessions).not.toHaveBeenCalled();
+  });
+
   it('點擊會話應該觸發 onSessionSelect', async () => {
     const mockOnSelect = vi.fn();
     render(<SessionList onSessionSelect={mockOnSelect} />);

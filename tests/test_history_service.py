@@ -117,6 +117,8 @@ class TestHistoryServiceRound:
             round_id="round-resume",
             user_message="Q: Confirm?\nA: yes",
             parent_run_id="round-interrupted",
+            thinking_mode="enabled",
+            reasoning_effort="max",
         )
 
         mock_db.query.return_value.filter.return_value.update.assert_called_once()
@@ -129,6 +131,8 @@ class TestHistoryServiceRound:
         assert added_round.session_id == "session-123"
         assert added_round.parent_run_id == "round-interrupted"
         assert added_round.preferred_skills is None
+        assert added_round.thinking_mode == "enabled"
+        assert added_round.reasoning_effort == "max"
         assert added_round.status == "running"
         mock_db.commit.assert_called_once()
         mock_db.refresh.assert_called_once_with(added_round)

@@ -17,9 +17,17 @@
 #   - reasoning_details   OpenAI 協議 response.reasoning_details（MiniMax via OpenAI）
 #   - anthropic_thinking  Anthropic 協議原生 thinking content blocks
 #
-# reasoning_split / enable_thinking 僅對 provider=openai 生效：
+# reasoning_split / thinking_mode / reasoning_effort 僅對 provider=openai 生效：
 #   - reasoning_split:  發送 extra_body.reasoning_split = true
-#   - enable_thinking:  發送 extra_body.enable_thinking = true
+#   - thinking_mode:    provider_default（省略）/ enabled（true）/ disabled（false）
+#   - thinking_wire_format: none / enable_thinking 布尔值 / thinking_object（thinking.type）
+#   - enable_thinking:  舊版相容欄位；true 等同 thinking_mode=enabled
+#   - reasoning_effort: 首次建库时的默认推理等级，发送顶层 reasoning_effort
+#   - supported_reasoning_efforts: 首次建库时的有序等级目录；off/on 映射思考开关
+# 注意：YAML 1.1 会把裸 on/off/yes/no 解析成布尔值，目录中的这些等级必须加引号，
+#       例如 supported_reasoning_efforts: ["off", "on"]。reasoning_effort 只接受
+#       high/max 等分级强度，off/on 是开关保留字，必须通过 thinking_mode 表达。
+# 注意：模型表建立后运行时只读数据库，这些模型项不会覆盖管理后台配置。
 #
 # 環境變數對照（需在 .env 中配置）：
 #   LLM_API_KEY         — 阿里 DashScope 統一密鑰（Qwen / GLM / DeepSeek 三方模型）
@@ -142,6 +150,7 @@ models:
     reasoning_format: none
     reasoning_split: false
     enable_thinking: false
+    thinking_mode: disabled
     enabled: true
     tags: [cron]
   # ======================== Kimi（月之暗面，阿里 DashScope 三方）========================
@@ -202,8 +211,11 @@ models:
     max_tokens: 384000
     context_window: 1024000
     reasoning_format: reasoning_content
-    reasoning_split: true
+    reasoning_split: false
     enable_thinking: true
+    thinking_wire_format: thinking_object
+    reasoning_effort: max
+    supported_reasoning_efforts: ["off", "high", "max"]
     enabled: true
     tags: [thinking, coding, long-context]
 

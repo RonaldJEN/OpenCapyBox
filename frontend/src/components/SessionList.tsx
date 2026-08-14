@@ -11,6 +11,7 @@ interface SessionListProps {
   currentSessionId?: string;
   onSessionSelect: (sessionId: string, target?: { roundId: string }) => void;
   refreshTrigger?: number;
+  optimisticSession?: Session | null;
   executingSessionIds?: Set<string>;
   isCollapsed?: boolean;
   onModelChange?: (modelId: string) => void;
@@ -25,7 +26,7 @@ interface DeleteFocusOrigin {
   adjacentSessionIds: string[];
 }
 
-export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, executingSessionIds, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenCron }: SessionListProps) {
+export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, optimisticSession, executingSessionIds, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenCron }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -55,11 +56,21 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     return () => clearTimeout(timer);
   }, [searchQuery]);
 
-  // 合併為單一 useEffect，避免重複 API 請求
+  // 切换选中项只使用本地列表；仅显式刷新和搜索变化才重新请求列表。
   useEffect(() => {
     debouncedSearchQueryRef.current = debouncedSearchQuery;
     loadSessions(debouncedSearchQuery);
-  }, [refreshTrigger, currentSessionId, debouncedSearchQuery]);
+  }, [refreshTrigger, debouncedSearchQuery]);
+
+  // 创建接口已确认成功后立即投影到本地列表，不等待下一次全量刷新。
+  useEffect(() => {
+    if (!optimisticSession || debouncedSearchQueryRef.current.trim()) return;
+    setSessions((currentSessions) => [
+      optimisticSession,
+      ...currentSessions.filter((session) => session.id !== optimisticSession.id),
+    ]);
+    setLoading(false);
+  }, [optimisticSession]);
 
   useEffect(() => {
     if (!currentSessionId || !onModelChange) return;

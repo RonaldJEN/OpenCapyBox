@@ -15,7 +15,7 @@ export type ToolCategory = 'edit' | 'create' | 'read' | 'bash' | 'search' | 'ski
 export function getToolCategory(name: string): ToolCategory {
   const lower = name.toLowerCase();
   if (lower === 'edit_file' || lower === 'edittool') return 'edit';
-  if (lower === 'write_file' || lower === 'writetool' || lower === 'create_file') return 'create';
+  if (lower === 'write_file' || lower === 'writetool') return 'create';
   if (lower === 'read_file' || lower === 'readtool') return 'read';
   if (lower === 'bash' || lower === 'bashtool' || lower === 'shell' || lower === 'bash_output' || lower === 'bashoutputtool' || lower === 'bash_kill' || lower === 'bashkilltool') return 'bash';
   if (lower.includes('search')) return 'search';

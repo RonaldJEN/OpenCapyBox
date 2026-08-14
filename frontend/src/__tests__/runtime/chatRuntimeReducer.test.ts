@@ -617,4 +617,20 @@ describe('chatRuntimeReducer', () => {
 
     expect(state.sessions['sess-a'].activeRunKeys).toEqual([]);
   });
+
+  it('returns the same state for an unchanged running-session snapshot', () => {
+    const state = chatRuntimeReducer(initialChatRuntimeState, {
+      type: 'RUNNING_SESSIONS_SNAPSHOT',
+      runningSessions: [{ session_id: 'sess-a', round_id: 'server-r1' }],
+      receivedAt: Date.parse('2026-01-01T00:00:04.000Z'),
+    });
+
+    const unchanged = chatRuntimeReducer(state, {
+      type: 'RUNNING_SESSIONS_SNAPSHOT',
+      runningSessions: [{ session_id: 'sess-a', round_id: 'server-r1' }],
+      receivedAt: Date.parse('2026-01-01T00:00:09.000Z'),
+    });
+
+    expect(unchanged).toBe(state);
+  });
 });

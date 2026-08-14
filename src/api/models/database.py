@@ -311,6 +311,8 @@ _PENDING_COLUMNS = [
     ("sessions", "model_id", "VARCHAR(50)"),
     ("rounds", "user_attachments", "TEXT"),
     ("rounds", "preferred_skills", "TEXT"),
+    ("rounds", "thinking_mode", "VARCHAR(24)"),
+    ("rounds", "reasoning_effort", "VARCHAR(40)"),
     ("rounds", "interrupt_payload", "TEXT"),
     ("rounds", "idempotency_key", "VARCHAR(64)"),
     ("conversation_messages", "is_synthetic", f"BOOLEAN DEFAULT {_BOOL_FALSE}"),
@@ -334,6 +336,10 @@ _PENDING_COLUMNS = [
     ("llm_call_records", "history_breakdown_json", "TEXT"),
     ("llm_models", "auto_compact_token_limit", "INTEGER"),
     ("llm_models", "tool_output_truncation_bytes", "INTEGER NOT NULL DEFAULT 10000"),
+    ("llm_models", "reasoning_effort", "VARCHAR(40)"),
+    ("llm_models", "thinking_mode", "VARCHAR(24) NOT NULL DEFAULT 'provider_default'"),
+    ("llm_models", "thinking_wire_format", "VARCHAR(32) NOT NULL DEFAULT 'enable_thinking'"),
+    ("llm_models", "supported_reasoning_efforts_json", "TEXT"),
     ("context_checkpoints", "source_message_sequence", "INTEGER NOT NULL DEFAULT 0"),
     ("context_checkpoints", "source_event_sequence", "INTEGER NOT NULL DEFAULT 0"),
     ("context_checkpoints", "trigger_phase", "VARCHAR(30) NOT NULL DEFAULT 'pre_turn'"),
@@ -480,6 +486,7 @@ def _migrate_add_columns(target_engine=None):
     inspector = inspect(bind_engine)
     with bind_engine.begin() as conn:
         table_columns_cache: dict[str, set[str] | None] = {}
+        added_columns: set[tuple[str, str]] = set()
 
         for table_name, column_name, column_type in _PENDING_COLUMNS:
             if table_name not in table_columns_cache:
@@ -495,6 +502,7 @@ def _migrate_add_columns(target_engine=None):
                 stmt = f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
                 conn.execute(text(stmt))
                 existing_columns.add(column_name)
+                added_columns.add((table_name, column_name))
                 logger.info("DB 迁移: %s 表新增列 %s (%s)", table_name, column_name, column_type)
 
         # The periodic reconciler must not scan the full approval history on
@@ -664,6 +672,16 @@ def _migrate_add_columns(target_engine=None):
         for t in _SERIAL_TABLES:
             if inspector.has_table(t):
                 _sync_postgres_sequence(conn, t)
+
+        # Keep this after all inspector calls. SQLite's in-memory test engine
+        # can reuse the migration connection for inspection, whose rollback
+        # would otherwise undo this data normalization.
+        if ("llm_models", "thinking_wire_format") in added_columns:
+            conn.execute(text(
+                "UPDATE llm_models "
+                "SET thinking_wire_format = 'none', enable_thinking = false "
+                "WHERE provider <> 'openai' AND thinking_wire_format = 'enable_thinking'"
+            ))
 
 
 def _ensure_agui_events_run_sequence_unique(conn, inspector) -> None:

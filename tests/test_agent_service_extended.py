@@ -1354,6 +1354,7 @@ class TestAgentServiceResumeAgui:
         service.agent.has_pending_interrupt.return_value = True
         service.model_id = "mock-model"
         service._build_restored_history_messages = MagicMock(return_value=[])
+        service._reasoning_context_from_round = MagicMock(return_value=None)
         return service
 
     @pytest.mark.asyncio

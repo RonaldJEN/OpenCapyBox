@@ -181,6 +181,12 @@ class TestDatabaseConfig:
         assert "compaction_summary_quality_repair_count" in llm_columns
         assert "compaction_emergency_truncate_dropped_rounds" in llm_columns
 
+        model_columns = {col["name"] for col in inspector.get_columns("llm_models")}
+        assert "thinking_mode" in model_columns
+        assert "thinking_wire_format" in model_columns
+        assert "reasoning_effort" in model_columns
+        assert "supported_reasoning_efforts_json" in model_columns
+
 
 class TestDatabaseMigration:
     """测试数据库迁移逻辑"""
@@ -213,6 +219,53 @@ class TestDatabaseMigration:
                 for column in inspect(sqlite_engine).get_columns("rounds")
             }
             assert "preferred_skills" in columns
+        finally:
+            sqlite_engine.dispose()
+
+    def test_thinking_wire_format_migration_preserves_openai_and_normalizes_anthropic(self):
+        from sqlalchemy import create_engine, text
+
+        from src.api.models import database as database_module
+
+        sqlite_engine = create_engine("sqlite://")
+        try:
+            with sqlite_engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE TABLE llm_models ("
+                    "model_id VARCHAR(100) PRIMARY KEY, provider VARCHAR(20) NOT NULL, "
+                    "enable_thinking BOOLEAN NOT NULL DEFAULT false)"
+                ))
+                conn.execute(text(
+                    "INSERT INTO llm_models (model_id, provider, enable_thinking) VALUES "
+                    "('openai-model', 'openai', true), ('anthropic-model', 'anthropic', true)"
+                ))
+
+            database_module._migrate_add_columns(sqlite_engine)
+
+            with sqlite_engine.connect() as conn:
+                rows = {
+                    row[0]: (row[1], bool(row[2]))
+                    for row in conn.execute(text(
+                        "SELECT model_id, thinking_wire_format, enable_thinking FROM llm_models"
+                    )).all()
+                }
+            assert rows == {
+                "openai-model": ("enable_thinking", True),
+                "anthropic-model": ("none", False),
+            }
+
+            with sqlite_engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE llm_models SET thinking_wire_format = 'vendor_custom' "
+                    "WHERE model_id = 'anthropic-model'"
+                ))
+            database_module._migrate_add_columns(sqlite_engine)
+            with sqlite_engine.connect() as conn:
+                value = conn.execute(text(
+                    "SELECT thinking_wire_format FROM llm_models "
+                    "WHERE model_id = 'anthropic-model'"
+                )).scalar_one()
+            assert value == "vendor_custom"
         finally:
             sqlite_engine.dispose()
 

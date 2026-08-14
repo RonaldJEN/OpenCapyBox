@@ -101,6 +101,24 @@ class TestLLMClient:
             call_kwargs = MockClient.call_args[1]
             assert call_kwargs["enable_reasoning_split"] is False
 
+    def test_reasoning_effort_reaches_openai_client(self):
+        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as mock_client:
+            config = _make_model_config("reasoning-model")
+            config.reasoning_effort = "high"
+
+            LLMClient.from_model_config(config)
+
+            assert mock_client.call_args.kwargs["reasoning_effort"] == "high"
+
+    def test_thinking_mode_reaches_openai_client(self):
+        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as mock_client:
+            config = _make_model_config("no-think-model")
+            config.thinking_mode = "disabled"
+
+            LLMClient.from_model_config(config)
+
+            assert mock_client.call_args.kwargs["thinking_mode"] == "disabled"
+
     def test_url_cleanup_anthropic_suffix(self):
         """測試清理 URL 中已存在的 /anthropic 後綴"""
         with patch("src.agent.llm.llm_wrapper.AnthropicClient"):
@@ -143,6 +161,9 @@ def _make_model_config(model_id: str, provider: str = "openai"):
     cfg.reasoning_format = "none"
     cfg.reasoning_split = False
     cfg.enable_thinking = False
+    cfg.thinking_mode = "provider_default"
+    cfg.thinking_wire_format = "enable_thinking"
+    cfg.reasoning_effort = None
     cfg.resolve_api_key.return_value = "test-key"
     return cfg
 
@@ -345,3 +366,250 @@ class TestLLMClientFailover:
             result = await client.generate(messages=[])
 
             assert result.content == "fallback ok"
+
+    @pytest.mark.asyncio
+    async def test_failover_keeps_run_reasoning_snapshot_untouched(self):
+        """备用网关负责兼容未声明的等级，wrapper 不按白名单过滤或降级。"""
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
+        expected = LLMResponse(content="fallback ok", finish_reason="stop")
+        snapshot = ResolvedReasoningContext(mode="enabled", effort="max")
+
+        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+            primary_client = AsyncMock()
+            primary_client.generate = AsyncMock(side_effect=primary_err)
+            primary_client.retry_callback = None
+
+            fb_client = AsyncMock()
+            fb_client.generate = AsyncMock(return_value=expected)
+            fb_client.retry_callback = None
+
+            MockOAI.side_effect = [primary_client, fb_client]
+
+            primary = _make_model_config("model-a")
+            fb = _make_model_config("model-b")
+            fb.reasoning_effort = "low"
+            fb.supported_reasoning_efforts = ["off", "low"]
+
+            client = LLMClient.from_model_config(primary, fallback_configs=[fb])
+            token = current_run_context.set(AgentRunContext(reasoning=snapshot))
+            try:
+                result = await client.generate(messages=[])
+                assert current_run_context.get().reasoning == snapshot
+            finally:
+                current_run_context.reset(token)
+
+            assert result.content == "fallback ok"
+            # fallback client 只用自身目录配置构建，运行期覆盖仍由 ContextVar 提供
+            assert MockOAI.call_args_list[-1].kwargs["reasoning_effort"] == "low"
+            assert fb_client.generate.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_failover_skips_anthropic_for_explicit_reasoning_selection(self):
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
+        anthropic_result = LLMResponse(content="anthropic", finish_reason="stop")
+        compatible_result = LLMResponse(content="compatible", finish_reason="stop")
+
+        with (
+            patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI,
+            patch("src.agent.llm.llm_wrapper.AnthropicClient") as MockAnthropic,
+        ):
+            primary_client = AsyncMock()
+            primary_client.generate = AsyncMock(side_effect=primary_err)
+            primary_client.retry_callback = None
+            compatible_client = AsyncMock()
+            compatible_client.generate = AsyncMock(return_value=compatible_result)
+            compatible_client.retry_callback = None
+            MockOAI.side_effect = [primary_client, compatible_client]
+
+            anthropic_client = AsyncMock()
+            anthropic_client.generate = AsyncMock(return_value=anthropic_result)
+            anthropic_client.retry_callback = None
+            MockAnthropic.return_value = anthropic_client
+
+            client = LLMClient.from_model_config(
+                _make_model_config("primary"),
+                fallback_configs=[
+                    _make_model_config("anthropic", provider="anthropic"),
+                    _make_model_config("compatible"),
+                ],
+            )
+            token = current_run_context.set(AgentRunContext(
+                reasoning=ResolvedReasoningContext(mode="disabled", effort=None)
+            ))
+            try:
+                result = await client.generate(messages=[])
+            finally:
+                current_run_context.reset(token)
+
+            assert result is compatible_result
+            MockAnthropic.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failover_skips_none_wire_for_pure_thinking_switch(self):
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
+        expected = LLMResponse(content="compatible", finish_reason="stop")
+
+        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+            primary_client = AsyncMock()
+            primary_client.generate = AsyncMock(side_effect=primary_err)
+            primary_client.retry_callback = None
+            compatible_client = AsyncMock()
+            compatible_client.generate = AsyncMock(return_value=expected)
+            compatible_client.retry_callback = None
+            MockOAI.side_effect = [primary_client, compatible_client]
+
+            no_switch = _make_model_config("no-switch")
+            no_switch.thinking_wire_format = "none"
+            compatible = _make_model_config("switch-capable")
+            client = LLMClient.from_model_config(
+                _make_model_config("primary"),
+                fallback_configs=[no_switch, compatible],
+            )
+            token = current_run_context.set(AgentRunContext(
+                reasoning=ResolvedReasoningContext(mode="enabled", effort=None)
+            ))
+            try:
+                result = await client.generate(messages=[])
+            finally:
+                current_run_context.reset(token)
+
+            assert result is expected
+            assert MockOAI.call_args_list[-1].kwargs["model"] == "switch-capable"
+
+    @pytest.mark.asyncio
+    async def test_failover_allows_none_wire_for_specific_effort(self):
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
+        expected = LLMResponse(content="fallback", finish_reason="stop")
+
+        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+            primary_client = AsyncMock()
+            primary_client.generate = AsyncMock(side_effect=primary_err)
+            primary_client.retry_callback = None
+            fallback_client = AsyncMock()
+            fallback_client.generate = AsyncMock(return_value=expected)
+            fallback_client.retry_callback = None
+            MockOAI.side_effect = [primary_client, fallback_client]
+
+            fallback = _make_model_config("effort-only")
+            fallback.thinking_wire_format = "none"
+            client = LLMClient.from_model_config(
+                _make_model_config("primary"),
+                fallback_configs=[fallback],
+            )
+            token = current_run_context.set(AgentRunContext(
+                reasoning=ResolvedReasoningContext(mode="enabled", effort="high")
+            ))
+            try:
+                result = await client.generate(messages=[])
+            finally:
+                current_run_context.reset(token)
+
+            assert result is expected
+            assert MockOAI.call_args_list[-1].kwargs["model"] == "effort-only"
+
+    @pytest.mark.asyncio
+    async def test_failover_allows_anthropic_for_provider_default(self):
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
+        expected = LLMResponse(content="anthropic", finish_reason="stop")
+
+        with (
+            patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI,
+            patch("src.agent.llm.llm_wrapper.AnthropicClient") as MockAnthropic,
+        ):
+            primary_client = AsyncMock()
+            primary_client.generate = AsyncMock(side_effect=primary_err)
+            primary_client.retry_callback = None
+            MockOAI.return_value = primary_client
+            fallback_client = AsyncMock()
+            fallback_client.generate = AsyncMock(return_value=expected)
+            fallback_client.retry_callback = None
+            MockAnthropic.return_value = fallback_client
+
+            client = LLMClient.from_model_config(
+                _make_model_config("primary"),
+                fallback_configs=[_make_model_config("anthropic", provider="anthropic")],
+            )
+            token = current_run_context.set(AgentRunContext(
+                reasoning=ResolvedReasoningContext(
+                    mode="provider_default",
+                    effort=None,
+                )
+            ))
+            try:
+                result = await client.generate(messages=[])
+            finally:
+                current_run_context.reset(token)
+
+            assert result is expected
+            MockAnthropic.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_failover_raises_primary_error_when_all_fallbacks_are_incompatible(self):
+        from src.agent.schema.run_context import (
+            AgentRunContext,
+            ResolvedReasoningContext,
+            current_run_context,
+        )
+
+        primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
+
+        with (
+            patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI,
+            patch("src.agent.llm.llm_wrapper.AnthropicClient") as MockAnthropic,
+        ):
+            primary_client = AsyncMock()
+            primary_client.generate = AsyncMock(side_effect=primary_err)
+            primary_client.retry_callback = None
+            MockOAI.return_value = primary_client
+
+            no_switch = _make_model_config("no-switch")
+            no_switch.thinking_wire_format = "none"
+            client = LLMClient.from_model_config(
+                _make_model_config("primary"),
+                fallback_configs=[
+                    _make_model_config("anthropic", provider="anthropic"),
+                    no_switch,
+                ],
+            )
+            token = current_run_context.set(AgentRunContext(
+                reasoning=ResolvedReasoningContext(mode="disabled", effort=None)
+            ))
+            try:
+                with pytest.raises(RetryExhaustedError) as exc_info:
+                    await client.generate(messages=[])
+            finally:
+                current_run_context.reset(token)
+
+            assert exc_info.value is primary_err
+            MockAnthropic.assert_not_called()
+            assert MockOAI.call_count == 1

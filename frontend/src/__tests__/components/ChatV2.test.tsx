@@ -5,6 +5,7 @@ import { ChatV2 } from '../../components/ChatV2';
 import { apiService } from '../../services/api';
 import { RoundData } from '../../types';
 import { makeChatV2DefaultProps } from '../utils/chatv2-helpers';
+import { startSendStream } from '../../services/chatStreamClient';
 import {
   ChatRuntimeProvider,
   useChatRuntime,
@@ -204,8 +205,10 @@ vi.mock('../../components/QuestionCard', () => ({
 
 function RuntimeStreamOwnershipHarness() {
   const runtime = useChatRuntime();
+  const projection = runtime.getSessionProjection('test-session');
   return (
     <>
+      <span data-testid="runtime-loading">{String(projection.loading)}</span>
       <button
         type="button"
         onClick={() => {
@@ -1869,6 +1872,322 @@ describe('ChatV2 组件', () => {
         expect.any(Object),
         7,
       );
+    });
+  });
+
+  it('已有本地运行轮次时历史校准不应重新进入阻塞加载态', async () => {
+    let resolveHistory!: (value: {
+      rounds: RoundData[];
+      session_id: string;
+      total: number;
+    }) => void;
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(() => new Promise((resolve) => {
+      resolveHistory = resolve;
+    }));
+
+    render(
+      <ChatRuntimeProvider>
+        <RuntimeStreamOwnershipHarness />
+      </ChatRuntimeProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'start direct run' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('runtime-loading')).toHaveTextContent('false');
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'reload history' }));
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(1);
+    });
+    expect(screen.getByTestId('runtime-loading')).toHaveTextContent('false');
+
+    await act(async () => {
+      resolveHistory({ rounds: [], session_id: 'test-session', total: 0 });
+    });
+  });
+
+  describe('本轮推理等级', () => {
+    const gradedModel = {
+      id: 'graded-model',
+      name: 'Graded Model',
+      provider: 'openai',
+      supports_thinking: true,
+      supports_reasoning_control: true,
+      thinking_mode: 'enabled' as const,
+      reasoning_effort: 'high',
+      default_reasoning_level: 'high',
+      supported_reasoning_efforts: ['off', 'high', 'max'],
+      supports_image: false,
+      max_images: 0,
+      supports_video: false,
+      max_videos: 0,
+      max_tokens: 8192,
+      context_window: 128000,
+      enabled: true,
+      tags: [],
+    };
+    const switchModel = {
+      ...gradedModel,
+      id: 'switch-model',
+      name: 'Switch Model',
+      thinking_mode: 'disabled' as const,
+      reasoning_effort: null,
+      default_reasoning_level: 'off',
+      supported_reasoning_efforts: ['off', 'on'],
+    };
+    const providerDefaultEffortModel = {
+      ...gradedModel,
+      id: 'provider-default-effort-model',
+      name: 'Provider Default Effort Model',
+      thinking_mode: 'provider_default' as const,
+      reasoning_effort: 'high',
+      default_reasoning_level: 'high',
+      supported_reasoning_efforts: ['high', 'max'],
+    };
+
+    beforeEach(() => {
+      vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+        rounds: [],
+        session_id: 'test-session',
+        total: 0,
+      });
+      vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    });
+
+    it('切换模型后按新模型目录默认值重置推理选择', async () => {
+      const { rerender } = render(
+        <ChatV2
+          sessionId="test-session"
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel, switchModel]}
+        />,
+      );
+
+      expect(await screen.findByRole('button', { name: /推理等级 High/ })).toBeInTheDocument();
+
+      rerender(
+        <ChatV2
+          sessionId="test-session"
+          {...defaultProps}
+          selectedModelId="switch-model"
+          availableModels={[gradedModel, switchModel]}
+        />,
+      );
+
+      expect(await screen.findByRole('button', { name: /推理等级 Off/ })).toBeInTheDocument();
+    });
+
+    it('发送时冻结推理快照，之后修改只影响下一轮', async () => {
+      render(
+        <ChatV2
+          sessionId="test-session"
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel]}
+        />,
+      );
+
+      const textarea = await screen.findByPlaceholderText('输入指令...');
+      fireEvent.change(textarea, { target: { value: '第一轮' } });
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+      await waitFor(() => expect(startSendStream).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(startSendStream).mock.calls[0][0].reasoning).toEqual({
+        mode: 'enabled',
+        effort: 'high',
+      });
+
+      // 会话已锁定模型，触发器直接展开推理等级面板。
+      fireEvent.click(screen.getByRole('button', { name: /推理等级 High/ }));
+      fireEvent.click(await screen.findByRole('menuitemradio', { name: 'Max' }));
+
+      expect(startSendStream).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(startSendStream).mock.calls[0][0].reasoning).toEqual({
+        mode: 'enabled',
+        effort: 'high',
+      });
+      expect(screen.getByRole('button', { name: /推理等级 Max/ })).toBeInTheDocument();
+    });
+
+    it('目录默认强度不应把 provider_default 推断成 enabled', async () => {
+      render(
+        <ChatV2
+          sessionId="test-session"
+          {...defaultProps}
+          selectedModelId="provider-default-effort-model"
+          availableModels={[providerDefaultEffortModel]}
+        />,
+      );
+
+      const textarea = await screen.findByPlaceholderText('输入指令...');
+      fireEvent.change(textarea, { target: { value: '沿用供应商默认开关' } });
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+      await waitFor(() => expect(startSendStream).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(startSendStream).mock.calls[0][0].reasoning).toEqual({
+        mode: 'provider_default',
+        effort: 'high',
+      });
+    });
+
+    it('选择 Off 后发送 disabled 且不带强度', async () => {
+      render(
+        <ChatV2
+          sessionId="test-session"
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel]}
+        />,
+      );
+
+      const textarea = await screen.findByPlaceholderText('输入指令...');
+      fireEvent.change(textarea, { target: { value: '关闭思考' } });
+      textarea.focus();
+
+      fireEvent.click(screen.getByRole('button', { name: /推理等级 High/ }));
+      fireEvent.click(await screen.findByRole('menuitemradio', { name: 'Off' }));
+
+      expect(textarea).toHaveFocus();
+      fireEvent.keyDown(document.activeElement as HTMLElement, { key: 'Enter', shiftKey: false });
+
+      await waitFor(() => expect(startSendStream).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(startSendStream).mock.calls[0][0].reasoning).toEqual({
+        mode: 'disabled',
+        effort: null,
+      });
+    });
+
+    it('同一模型的不同会话分别保存本轮推理选择', async () => {
+      vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sessionId) => ({
+        rounds: [],
+        session_id: sessionId,
+        total: 0,
+      }));
+      const { rerender } = render(
+        <ChatV2
+          sessionId="session-a"
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel]}
+        />,
+      );
+
+      fireEvent.click(await screen.findByRole('button', { name: /推理等级 High/ }));
+      fireEvent.click(await screen.findByRole('menuitemradio', { name: 'Off' }));
+
+      rerender(
+        <ChatV2
+          sessionId="session-b"
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel]}
+        />,
+      );
+      expect(await screen.findByRole('button', { name: /推理等级 High/ })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /推理等级 High/ }));
+      fireEvent.click(await screen.findByRole('menuitemradio', { name: 'Max' }));
+
+      rerender(
+        <ChatV2
+          sessionId="session-a"
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel]}
+        />,
+      );
+      expect(await screen.findByRole('button', { name: /推理等级 Off/ })).toBeInTheDocument();
+      const sessionATextarea = screen.getByPlaceholderText('输入指令...');
+      fireEvent.change(sessionATextarea, { target: { value: '会话 A' } });
+      fireEvent.keyDown(sessionATextarea, { key: 'Enter', shiftKey: false });
+      await waitFor(() => expect(startSendStream).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(startSendStream).mock.calls[0][0].reasoning).toEqual({
+        mode: 'disabled',
+        effort: null,
+      });
+
+      rerender(
+        <ChatV2
+          sessionId="session-b"
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel]}
+        />,
+      );
+      expect(await screen.findByRole('button', { name: /推理等级 Max/ })).toBeInTheDocument();
+      const sessionBTextarea = screen.getByPlaceholderText('输入指令...');
+      fireEvent.change(sessionBTextarea, { target: { value: '会话 B' } });
+      fireEvent.keyDown(sessionBTextarea, { key: 'Enter', shiftKey: false });
+      await waitFor(() => expect(startSendStream).toHaveBeenCalledTimes(2));
+      expect(vi.mocked(startSendStream).mock.calls[1][0].reasoning).toEqual({
+        mode: 'enabled',
+        effort: 'max',
+      });
+    });
+
+    it('欢迎页的推理选择随 draft 迁移到新会话', async () => {
+      vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sessionId) => ({
+        rounds: [],
+        session_id: sessionId,
+        total: 0,
+      }));
+      vi.mocked(apiService.uploadFile).mockResolvedValue({
+        name: 'reasoning.txt',
+        path: 'reasoning.txt',
+        size: 9,
+        modified: new Date().toISOString(),
+        type: 'text/plain',
+      });
+      const onCreateSession = vi.fn().mockResolvedValue('new-session');
+      const { container, rerender } = render(
+        <ChatV2
+          sessionId=""
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel]}
+          onCreateSession={onCreateSession}
+        />,
+      );
+
+      fireEvent.click(await screen.findByRole('button', { name: /推理等级 High/ }));
+      fireEvent.click(screen.getByRole('menuitem', { name: /推理等级 High/ }));
+      fireEvent.click(await screen.findByRole('menuitemradio', { name: 'Off' }));
+
+      const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+      fireEvent.change(fileInput, {
+        target: { files: [new File(['reasoning'], 'reasoning.txt', { type: 'text/plain' })] },
+      });
+      await waitFor(() => {
+        expect(apiService.uploadFile).toHaveBeenCalledWith('new-session', expect.any(File));
+      });
+
+      rerender(
+        <ChatV2
+          sessionId="new-session"
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel]}
+          onCreateSession={onCreateSession}
+        />,
+      );
+      expect(await screen.findByRole('button', { name: /推理等级 Off/ })).toBeInTheDocument();
+    });
+
+    it('会话标题栏不使用固定宽度占位对齐 Files 按钮', async () => {
+      const { container } = render(
+        <ChatV2
+          sessionId="test-session"
+          {...defaultProps}
+          selectedModelId="graded-model"
+          availableModels={[gradedModel]}
+        />,
+      );
+
+      const header = container.querySelector('header')!;
+      expect(header.querySelectorAll('.w-\\[88px\\]')).toHaveLength(0);
+      expect(await screen.findByTitle('会话资源')).toHaveClass('ml-auto');
     });
   });
 

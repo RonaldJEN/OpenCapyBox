@@ -32,6 +32,10 @@ logs/
 .codex
 .codex-test
 docs/claude-code-src/
+# 外部参考仓库快照与本地临时产物，不纳入版本控制
+/docs/codex/
+/docs/deepseek-harness/
+/tmp/
 # ========================================
 # Python
 # ========================================

@@ -69,11 +69,16 @@
     max_tokens: 32768
     reasoning_format: reasoning_content  # none / reasoning_content / anthropic_thinking
     reasoning_split: true
-    enable_thinking: true
+    thinking_mode: enabled       # 首次建库使用；管理端由默认推理等级自动映射
+    thinking_wire_format: enable_thinking # none / enable_thinking / thinking_object
+    reasoning_effort: high       # 首次建库的默认等级
+    supported_reasoning_efforts: ["off", "high", "max"] # 有序可选等级
     supports_image: false
     enabled: true
     tags: [thinking]
 ```
+
+> YAML 1.1 会把裸 `on` / `off` 解析成布尔值，因此 `supported_reasoning_efforts` 中的开关等级必须加引号。`reasoning_effort` 只接受 `high`/`max` 等分级强度；`on`/`off` 是 `thinking_mode` 的保留开关值。
 
 完整配置说明见 [`models.yaml`](models.yaml) 文件头注释。
 

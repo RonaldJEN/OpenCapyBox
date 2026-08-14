@@ -110,6 +110,7 @@ class _ToolLoopObservation:
     outcome: str
     result_signature: str
     tool_name: str
+    path: str | None = None
 
 
 class _ToolLoopGuard:
@@ -124,7 +125,6 @@ class _ToolLoopGuard:
     })
     _MUTATING_TOOLS = frozenset({
         "write_file",
-        "create_file",
         "edit_file",
         "bash_kill",
         "record_note",
@@ -132,6 +132,7 @@ class _ToolLoopGuard:
         "update_user",
     })
     _POLLING_TOOLS = frozenset({"bash_output"})
+    _FILE_MUTATING_TOOLS = frozenset({"write_file", "edit_file"})
     def __init__(self, *, workspace_dir: str | None = None) -> None:
         self._observations: list[_ToolLoopObservation] = []
         self._active_recoveries: dict[str, frozenset[str]] = {}
@@ -238,6 +239,20 @@ class _ToolLoopGuard:
             arguments,
         )
 
+    def _canonical_path(self, arguments: Any) -> str | None:
+        if not isinstance(arguments, dict):
+            return None
+        for key in ("path", "file_path"):
+            value = arguments.get(key)
+            if isinstance(value, str):
+                normalized = self._canonicalize(value, key=key)
+                return normalized if isinstance(normalized, str) else None
+        return None
+
+    @staticmethod
+    def _uncertain_file_recovery_key(canonical_path: str) -> str:
+        return f"uncertain-file:{hashlib.sha256(canonical_path.encode('utf-8')).hexdigest()}"
+
     def check(
         self,
         *,
@@ -247,6 +262,7 @@ class _ToolLoopGuard:
     ) -> tuple[str, str, str | None, bool]:
         fingerprint, policy = self._fingerprint(tool, tool_name, arguments)
         matching = [item for item in self._observations if item.fingerprint == fingerprint]
+        canonical_path = self._canonical_path(arguments)
 
         for recovery_key, members in self._active_recoveries.items():
             if fingerprint in members:
@@ -265,6 +281,27 @@ class _ToolLoopGuard:
             terminal = recovery_key in self._active_recoveries
             self._active_recoveries[recovery_key] = members
             return fingerprint, policy, message, terminal
+
+        if (
+            tool_name in self._FILE_MUTATING_TOOLS
+            and canonical_path is not None
+            and any(
+                item.tool_name in self._FILE_MUTATING_TOOLS
+                and item.path == canonical_path
+                and item.outcome == "uncertain"
+                for item in self._observations
+            )
+        ):
+            path_key = self._uncertain_file_recovery_key(canonical_path)
+            return blocked(
+                recovery_key=path_key,
+                members=frozenset({fingerprint}),
+                message=(
+                    "Runtime blocked this file mutation because a previous write "
+                    "to the same path had an uncertain outcome. Use read_file on "
+                    "that path to verify its current content before any retry."
+                ),
+            )
 
         if policy in {"mutating", "standard"} and any(
             item.outcome == "uncertain" for item in matching
@@ -364,6 +401,7 @@ class _ToolLoopGuard:
         tool_name: str,
         result: ToolResult,
         result_content: str,
+        arguments: Any = None,
     ) -> None:
         outcome = (
             "uncertain"
@@ -373,10 +411,38 @@ class _ToolLoopGuard:
         result_signature = hashlib.sha256(
             f"{outcome}\0{result_content}".encode("utf-8")
         ).hexdigest()
+        canonical_path = self._canonical_path(arguments)
+        verified_missing_file = (
+            tool_name == "read_file"
+            and not result.success
+            and not result.outcome_uncertain
+            and isinstance(result.error, str)
+            and result.error.startswith("File not found:")
+        )
+        if (
+            (result.success or verified_missing_file)
+            and tool_name == "read_file"
+            and canonical_path is not None
+        ):
+            self._observations = [
+                item
+                for item in self._observations
+                if not (
+                    item.tool_name in self._FILE_MUTATING_TOOLS
+                    and item.path == canonical_path
+                    and item.outcome == "uncertain"
+                )
+            ]
+            self._active_recoveries.pop(
+                self._uncertain_file_recovery_key(canonical_path),
+                None,
+            )
         if result.success:
             # A successful call outside a rejected pattern is concrete recovery
             # progress.  A later, unrelated loop receives its own opportunity
-            # instead of inheriting a run-global strike.
+            # instead of inheriting a run-global strike.  A verified *missing*
+            # file only clears the path it actually verified, so probing an
+            # unrelated absent path cannot launder a different loop's strike.
             self._active_recoveries = {
                 key: members
                 for key, members in self._active_recoveries.items()
@@ -395,6 +461,7 @@ class _ToolLoopGuard:
             outcome=outcome,
             result_signature=result_signature,
             tool_name=tool_name,
+            path=canonical_path,
         ))
 
 
@@ -1879,9 +1946,22 @@ class Agent:
                             logger.debug("工具清理 runtime context 失败: %s", function_name, exc_info=True)
             except asyncio.TimeoutError:
                 timeout_used = self.tool_timeout if tool.execute_timeout is None else tool.execute_timeout
+                verification_content = ""
+                if function_name in {"write_file", "edit_file"}:
+                    target = (
+                        arguments.get("path")
+                        if isinstance(arguments, dict)
+                        else None
+                    )
+                    target_text = f" for {target!r}" if isinstance(target, str) else ""
+                    verification_content = (
+                        f"The write outcome{target_text} is uncertain and may have "
+                        "succeeded. You must use read_file to verify the current "
+                        "content before retrying any file mutation."
+                    )
                 result = ToolResult(
                     success=False,
-                    content="",
+                    content=verification_content,
                     error=f"Tool execution timed out after {timeout_used}s",
                     outcome_uncertain=True,
                 )
@@ -2781,6 +2861,7 @@ class Agent:
                 tool_name=record.function_name,
                 result=record.result,
                 result_content=record.result_content,
+                arguments=record.arguments,
             )
 
         def _flush_pending_tool_content_event():

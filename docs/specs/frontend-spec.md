@@ -130,7 +130,11 @@
 ### 4.8 管理后台模型与权限
 
 - `AdminModelAccessPanel` 负责模型目录、默认模型与模型权限包管理，通过 `services/adminApi.ts` 调用 `/admin/models*`、`/admin/model-permission-groups*` 与 `/admin/users/{user_id}/model-permission-groups`。
-- 新建/编辑模型必须覆盖 provider、api_base、api_key、model_name、token 窗口、reasoning、多模态能力、启停与 tags；编辑时不填 api_key 表示保留旧密钥。
+- 新建/编辑模型必须覆盖 provider、api_base、api_key、model_name、token 窗口、reasoning 格式/思考请求协议/默认推理等级/按轮可选等级、多模态能力、启停与 tags；编辑时不填 api_key 表示保留旧密钥。
+- 管理端不单独暴露供应商传输用的 `thinking_mode`；统一编辑“默认推理等级”：空值映射 `provider_default`，`off` 映射 `disabled`，`on` 映射 `enabled`，其他值映射为 `enabled + reasoning_effort`。请求协议由独立的 `thinking_wire_format` 字段配置。
+- “默认推理等级”只是目录二元组的展示投影。编辑既有模型且该字段未发生实际变化时，必须原样保留后端返回的 `thinking_mode + reasoning_effort`；只有新建模型或管理员改变该字段时才执行上述反向映射，避免无关编辑把 `provider_default + high` 改写为 `enabled + high`。
+- 按轮可选强度以逗号分隔编辑并保存为精确白名单；默认思考关闭时仍允许维护该白名单，以支持聊天中显式开启。
+- “默认推理等级必须包含在白名单中”只在白名单非空时校验。存量 `enable_thinking=true` 且白名单为空的模型必须能只改显示名等无关字段并保存，前端校验不得比后端 `ModelConfig` 更严。
 - 删除模型时若模型被默认配置或历史 Session 使用，必须要求选择启用的替换模型，并在确认弹窗中说明会迁移默认配置、历史 Session 与权限包绑定。
 - 停用模型后不得留在任何模型权限包中；权限包模型选择器只允许加入启用模型。
 - 模型写操作成功后必须重新拉取模型目录与权限包，确保 UI 与后端事实源一致。

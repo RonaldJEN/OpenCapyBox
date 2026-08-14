@@ -61,6 +61,31 @@ class TestAdminRouter:
 
         assert resp.status_code == 422
 
+    def test_create_model_rejects_overlong_reasoning_level(self):
+        client = _make_client(admin_enabled=True)
+
+        resp = client.post("/admin/models", json={
+            "model_id": "overlong-reasoning-level",
+            "display_name": "Overlong Reasoning Level",
+            "provider": "openai",
+            "api_base": "https://api.example.com/v1",
+            "api_key": "test-key",
+            "model_name": "overlong-reasoning-level",
+            "supported_reasoning_efforts": ["x" * 41],
+        })
+
+        assert resp.status_code == 422
+
+    def test_patch_model_rejects_blank_reasoning_level(self):
+        client = _make_client(admin_enabled=True)
+
+        resp = client.patch(
+            "/admin/models/existing-model",
+            json={"supported_reasoning_efforts": ["high", "   "]},
+        )
+
+        assert resp.status_code == 422
+
     def test_overview_delegates_to_builder(self):
         client = _make_client(admin_enabled=True)
         payload = {"summary": {"users_total": 2}, "trends": []}

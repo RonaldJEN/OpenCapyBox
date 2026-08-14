@@ -1,7 +1,7 @@
 """对话相关 Schema"""
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import AfterValidator, BaseModel, Field, StringConstraints
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints, model_validator
 
 from src.agent.schema.skill_key import (
     MAX_SKILL_KEY_LENGTH,
@@ -87,6 +87,23 @@ class SendMessageRequest(BaseModel):
         max_length=50,
         description="本轮优先考虑的 Skill 内部 key",
     )
+    thinking_mode: Optional[Literal["provider_default", "enabled", "disabled"]] = Field(
+        default=None,
+        description="本轮思考模式；为空时使用模型配置",
+    )
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        max_length=40,
+        description="本轮推理强度；必须属于模型声明的可选强度",
+    )
+
+    @model_validator(mode="after")
+    def _validate_reasoning_selection(self):
+        if self.reasoning_effort is not None:
+            self.reasoning_effort = self.reasoning_effort.strip() or None
+        if self.thinking_mode == "disabled" and self.reasoning_effort is not None:
+            raise ValueError("thinking_mode=disabled 时不能设置 reasoning_effort")
+        return self
 
 
 class ResumeRequest(BaseModel):
@@ -154,6 +171,8 @@ class RoundData(BaseModel):
     user_message: str
     user_attachments: List[Dict[str, Any]] = Field(default_factory=list)
     preferred_skills: List[RoundPreferredSkill] = Field(default_factory=list)
+    thinking_mode: Optional[Literal["provider_default", "enabled", "disabled"]] = None
+    reasoning_effort: Optional[str] = None
     final_response: Optional[str] = None
     steps: List[StepData] = Field(default_factory=list)
     step_count: int

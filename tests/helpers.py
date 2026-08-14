@@ -251,6 +251,10 @@ def make_agent_service(*, sandbox=None, history_service=None,
             session_id=session_id,
             user_id=user_id,
         )
+    # Most service tests attach a fake Agent without calling initialize().
+    # Mirror the provider-default model state that initialize() always installs
+    # so omitted per-turn reasoning can still be materialized deterministically.
+    svc._model_config = MockModelConfig()
 
     if attach_db:
         return svc, history_service.db
@@ -365,6 +369,12 @@ class MockModelConfig:
         self.max_images = max_images
         self.supports_video = supports_video
         self.max_videos = max_videos
+        self.provider = "openai"
+        self.supports_reasoning_control = False
+        self.supported_reasoning_efforts = []
+        self.effective_thinking_mode = "provider_default"
+        self.thinking_wire_format = "enable_thinking"
+        self.reasoning_effort = None
 
 
 class MockRegistry:

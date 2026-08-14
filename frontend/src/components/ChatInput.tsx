@@ -1,4 +1,12 @@
-import { useRef, useEffect, useMemo, useState } from 'react';
+import {
+  useCallback,
+  useRef,
+  useEffect,
+  useMemo,
+  useState,
+  type MutableRefObject,
+  type ReactNode,
+} from 'react';
 import { ArrowUp, BookOpenCheck, Check, Loader2, Paperclip, Search, Square, X } from 'lucide-react';
 import { FileInfo } from '../types';
 import { getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, isImageFile } from '../utils/fileUtils';
@@ -36,6 +44,8 @@ interface ChatInputProps {
   placeholder?: string;
   /** 进入欢迎页时将键盘焦点放到输入框 */
   autoFocus?: boolean;
+  /** 允许组合控件在完成选择后把焦点交还给输入框。 */
+  textareaRef?: MutableRefObject<HTMLTextAreaElement | null>;
 
   // ---- 文件上传 ----
   attachedFiles?: FileInfo[];
@@ -48,6 +58,9 @@ interface ChatInputProps {
   // ---- 本轮 Skill 偏好 ----
   selectedSkillKeys?: string[];
   onSelectedSkillKeysChange?: (keys: string[]) => void;
+
+  // ---- 模型与本轮推理等级 ----
+  modelControl?: ReactNode;
 
   // ---- 输入代理 ----
   onInputChangeRaw?: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
@@ -67,6 +80,7 @@ export function ChatInput({
   sendingLabel,
   placeholder = '输入消息...',
   autoFocus = false,
+  textareaRef: externalTextareaRef,
   attachedFiles = [],
   onRemoveAttachment,
   onFileUpload,
@@ -75,9 +89,14 @@ export function ChatInput({
   uploading = false,
   selectedSkillKeys = [],
   onSelectedSkillKeysChange,
+  modelControl,
   onInputChangeRaw,
 }: ChatInputProps) {
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const setTextareaRef = useCallback((node: HTMLTextAreaElement | null) => {
+    textareaRef.current = node;
+    if (externalTextareaRef) externalTextareaRef.current = node;
+  }, [externalTextareaRef]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [previewImage, setPreviewImage] = useState<{ src: string; name: string } | null>(null);
   const [isInputDragging, setIsInputDragging] = useState(false);
@@ -364,7 +383,7 @@ export function ChatInput({
 
             {/* textarea */}
             <textarea
-              ref={textareaRef}
+              ref={setTextareaRef}
               value={value}
               onChange={handleChange}
               onKeyDown={handleKeyDown}
@@ -519,6 +538,8 @@ export function ChatInput({
                     )}
                   </div>
                 )}
+
+                {modelControl}
               </div>
 
               {/* 发送/停止按钮 — 圆形 */}

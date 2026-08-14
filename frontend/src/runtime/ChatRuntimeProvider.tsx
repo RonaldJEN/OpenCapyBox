@@ -366,7 +366,14 @@ export function ChatRuntimeProvider({
     if (!sessionId) return;
     const requestId = (historyRequestSeqRef.current[sessionId] || 0) + 1;
     historyRequestSeqRef.current[sessionId] = requestId;
-    dispatch({ type: 'SESSION_LOADING', sessionId, loading: true });
+    const currentSession = stateRef.current.sessions[sessionId];
+    // 已有本地消息或运行槽时在后台校准历史，避免把乐观首轮替换成整页同步动画。
+    if (!currentSession || (
+      currentSession.rounds.length === 0
+      && currentSession.activeRunKeys.length === 0
+    )) {
+      dispatch({ type: 'SESSION_LOADING', sessionId, loading: true });
+    }
     try {
       const response = await apiService.getSessionHistoryV2(sessionId);
       if (historyRequestSeqRef.current[sessionId] !== requestId) {
@@ -440,6 +447,7 @@ export function ChatRuntimeProvider({
     content,
     attachments = [],
     preferredSkillKeys = [],
+    reasoning,
     onStreamAccepted,
     onRejectedBeforeAccept,
   }: SendMessageInput) => {
@@ -455,6 +463,8 @@ export function ChatRuntimeProvider({
         key,
         display_name: key,
       })),
+      thinking_mode: reasoning?.mode,
+      reasoning_effort: reasoning?.effort,
       final_response: '',
       steps: [],
       step_count: 0,
@@ -491,6 +501,7 @@ export function ChatRuntimeProvider({
         content,
         idempotencyKey,
         preferredSkillKeys,
+        reasoning,
         onRejectedBeforeAccept,
         onEnvelope: (envelope) => {
           if (

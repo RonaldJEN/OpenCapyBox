@@ -119,6 +119,8 @@ class HistoryService:
         user_message: str,
         user_attachments: Optional[List[Dict]] = None,
         preferred_skills: Optional[List[Dict[str, str]]] = None,
+        thinking_mode: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         parent_run_id: Optional[str] = None,
     ) -> Round:
@@ -147,6 +149,8 @@ class HistoryService:
                 if preferred_skills is not None
                 else None
             ),
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
             status="running",
             idempotency_key=idempotency_key,
             parent_run_id=parent_run_id,
@@ -185,6 +189,8 @@ class HistoryService:
         tool_result_content: Optional[str] = None,
         restore_strategy: Optional[str] = None,
         fallback_reason: Optional[str] = None,
+        thinking_mode: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         commit: bool = True,
     ) -> Round:
         """原子创建 resume round，并将被接管的父 round 标记为 resumed。"""
@@ -225,6 +231,8 @@ class HistoryService:
             session_id=session_id,
             user_message=user_message,
             user_attachments=json.dumps(user_attachments or [], ensure_ascii=False),
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
             status="running",
             parent_run_id=parent_run_id,
         )
@@ -581,6 +589,8 @@ class HistoryService:
                     "user_message": round_obj.user_message,
                     "user_attachments": attachments,
                     "preferred_skills": preferred_skills,
+                    "thinking_mode": round_obj.thinking_mode,
+                    "reasoning_effort": round_obj.reasoning_effort,
                     "final_response": round_obj.final_response,
                     "step_count": round_obj.step_count,
                     "status": round_obj.status,

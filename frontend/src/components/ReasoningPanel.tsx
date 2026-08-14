@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { StepData } from '../types';
 import {
   ChevronDown,
@@ -281,6 +281,41 @@ function ActiveThinkingCard({ content, durationText, onOpenActivity, disableMoti
   onOpenActivity: () => void;
   disableMotion: boolean;
 }) {
+  const previewRef = useRef<HTMLDivElement>(null);
+  const pendingScrollFrameRef = useRef<number | null>(null);
+  const followEndRef = useRef(true);
+  const [followEnd, setFollowEnd] = useState(true);
+
+  // 与 DeepSeek Harness 的流式摘要一致：视觉跟随按帧合并，避免每个 token 都触发布局滚动。
+  useLayoutEffect(() => {
+    if (pendingScrollFrameRef.current !== null) return;
+    if (typeof requestAnimationFrame !== 'function') {
+      const element = previewRef.current;
+      if (followEndRef.current && element) element.scrollTop = element.scrollHeight;
+      return;
+    }
+
+    let remainingFrames = 3;
+    const advance = () => {
+      remainingFrames -= 1;
+      if (remainingFrames > 0) {
+        pendingScrollFrameRef.current = requestAnimationFrame(advance);
+        return;
+      }
+      pendingScrollFrameRef.current = null;
+      if (!followEndRef.current) return;
+      const element = previewRef.current;
+      if (element) element.scrollTop = element.scrollHeight;
+    };
+    pendingScrollFrameRef.current = requestAnimationFrame(advance);
+  }, [content]);
+
+  useLayoutEffect(() => () => {
+    if (pendingScrollFrameRef.current === null || typeof cancelAnimationFrame !== 'function') return;
+    cancelAnimationFrame(pendingScrollFrameRef.current);
+    pendingScrollFrameRef.current = null;
+  }, []);
+
   return (
     <div className={`my-2 rounded-xl border border-claude-border bg-white/75 px-4 py-3 shadow-sm ${disableMotion ? '' : 'animate-fade-in'}`}>
       <div className="flex items-center justify-between gap-3">
@@ -300,7 +335,20 @@ function ActiveThinkingCard({ content, durationText, onOpenActivity, disableMoti
         </button>
       </div>
 
-      <div className="mt-3 border-l-2 border-claude-accent/40 pl-3 text-[15px] leading-relaxed text-claude-text whitespace-pre-wrap">
+      <div
+        ref={previewRef}
+        data-testid="active-thinking-preview"
+        data-follow-end={followEnd ? 'true' : 'false'}
+        tabIndex={0}
+        aria-label="实时思考内容"
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          const shouldFollow = element.scrollHeight - element.scrollTop - element.clientHeight <= 12;
+          followEndRef.current = shouldFollow;
+          setFollowEnd(shouldFollow);
+        }}
+        className="mt-3 max-h-[78px] overflow-y-auto overscroll-contain scrollbar-hide border-l-2 border-claude-accent/40 pl-3 pr-1 text-[15px] leading-[26px] text-claude-text whitespace-pre-wrap break-words focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/20"
+      >
         {content}
         <span className={`ml-1 inline-block text-claude-accent ${disableMotion ? '' : 'animate-pulse'}`}>_</span>
       </div>

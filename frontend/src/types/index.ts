@@ -335,6 +335,12 @@ export interface ModelInfo {
   name: string;
   provider: string;
   supports_thinking: boolean;
+  supports_reasoning_control?: boolean;
+  thinking_mode?: 'provider_default' | 'enabled' | 'disabled';
+  thinking_wire_format?: 'none' | 'enable_thinking' | 'thinking_object';
+  reasoning_effort?: string | null;
+  default_reasoning_level?: string | null;
+  supported_reasoning_efforts?: string[];
   supports_image: boolean;
   max_images: number;
   supports_video: boolean;
@@ -342,6 +348,13 @@ export interface ModelInfo {
   max_tokens: number;
   enabled: boolean;
   tags: string[];
+}
+
+export type ThinkingMode = 'provider_default' | 'enabled' | 'disabled';
+
+export interface TurnReasoningSelection {
+  mode: ThinkingMode;
+  effort: string | null;
 }
 
 export interface ModelsResponse {
@@ -449,6 +462,8 @@ export interface RoundData {
   user_message: string;
   user_attachments?: AttachmentInfo[];
   preferred_skills?: PreferredSkillSnapshot[];
+  thinking_mode?: 'provider_default' | 'enabled' | 'disabled' | null;
+  reasoning_effort?: string | null;
   final_response: string | null;
   steps: StepData[];
   step_count: number;

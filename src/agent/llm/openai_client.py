@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 from ..retry import RetryConfig, async_retry
 from ..schema import FunctionCall, LLMResponse, Message, ToolCall
 from ..schema.schema import TokenUsage
+from ..schema.run_context import current_run_context
 from .base import LLMClientBase
 from .json_parser import robust_json_parse
 from .tool_schema import tools_to_openai_schema
@@ -41,6 +42,9 @@ class OpenAIClient(LLMClientBase):
         max_tokens: int = 16384,
         reasoning_format: str = "none",
         enable_thinking: bool = False,
+        thinking_mode: str = "provider_default",
+        thinking_wire_format: str = "enable_thinking",
+        reasoning_effort: str | None = None,
     ):
         """Initialize OpenAI client.
 
@@ -52,7 +56,10 @@ class OpenAIClient(LLMClientBase):
             enable_reasoning_split: Send extra_body.reasoning_split = true
             max_tokens: Maximum output tokens (from ModelConfig)
             reasoning_format: Thinking format: "none" | "reasoning_content" | "reasoning_details"
-            enable_thinking: Send extra_body.enable_thinking = true
+            enable_thinking: Legacy switch used when thinking_mode is provider_default
+            thinking_mode: provider_default omits the flag; enabled/disabled send a boolean
+            thinking_wire_format: none / enable_thinking boolean / thinking.type object
+            reasoning_effort: Optional OpenAI-compatible reasoning effort
         """
         super().__init__(api_key, api_base, model, retry_config)
 
@@ -68,10 +75,19 @@ class OpenAIClient(LLMClientBase):
         self.reasoning_format = reasoning_format
         self.max_tokens = max_tokens
         self.enable_thinking = enable_thinking
+        if thinking_mode not in {"provider_default", "enabled", "disabled"}:
+            raise ValueError(f"Unsupported thinking_mode: {thinking_mode}")
+        self.thinking_mode = thinking_mode
+        if thinking_wire_format not in {"none", "enable_thinking", "thinking_object"}:
+            raise ValueError(f"Unsupported thinking_wire_format: {thinking_wire_format}")
+        self.thinking_wire_format = thinking_wire_format
+        self.reasoning_effort = reasoning_effort
         logger.info(
             "OpenAIClient initialized: model=%s, reasoning_format=%s, "
-            "reasoning_split=%s, enable_thinking=%s, max_tokens=%d",
-            model, reasoning_format, enable_reasoning_split, enable_thinking, max_tokens,
+            "reasoning_split=%s, thinking_mode=%s, thinking_wire_format=%s, "
+            "reasoning_effort=%s, max_tokens=%d",
+            model, reasoning_format, enable_reasoning_split,
+            self.effective_thinking_mode, thinking_wire_format, reasoning_effort, max_tokens,
         )
 
     async def _make_api_request(
@@ -97,11 +113,7 @@ class OpenAIClient(LLMClientBase):
             "max_tokens": self.max_tokens,
         }
 
-        # Add reasoning params from ModelConfig (no more model.startswith() branching)
-        if self.enable_reasoning_split:
-            params["extra_body"] = {"reasoning_split": True}
-            if self.enable_thinking:
-                params["extra_body"]["enable_thinking"] = True
+        params.update(self._reasoning_request_params())
 
         converted_tools = self._convert_tools(tools) if tools else None
         if converted_tools:
@@ -140,6 +152,45 @@ class OpenAIClient(LLMClientBase):
             List of tools in OpenAI dict format
         """
         return tools_to_openai_schema(tools)
+
+    def _reasoning_request_params(self) -> dict[str, Any]:
+        """Build provider reasoning fields without coupling independent switches."""
+        thinking_mode, reasoning_effort = self._turn_reasoning_selection()
+        if reasoning_effort in {"off", "on"}:
+            raise ValueError(
+                "reasoning_effort cannot be off/on; encode the switch with thinking_mode"
+            )
+        extra_body: dict[str, Any] = {}
+        if self.enable_reasoning_split:
+            extra_body["reasoning_split"] = True
+        if thinking_mode in {"enabled", "disabled"}:
+            if self.thinking_wire_format == "enable_thinking":
+                extra_body["enable_thinking"] = thinking_mode == "enabled"
+            elif self.thinking_wire_format == "thinking_object":
+                extra_body["thinking"] = {"type": thinking_mode}
+
+        params: dict[str, Any] = {}
+        if extra_body:
+            params["extra_body"] = extra_body
+        if reasoning_effort:
+            params["reasoning_effort"] = reasoning_effort
+        return params
+
+    def _turn_reasoning_selection(self) -> tuple[str, str | None]:
+        """Snapshot the current run override, falling back to catalog defaults."""
+        context = current_run_context.get()
+        override = context.reasoning if context is not None else None
+        if override is None:
+            return self.effective_thinking_mode, self.reasoning_effort
+        if override.mode == "disabled":
+            return "disabled", None
+        return override.mode, override.effort
+
+    @property
+    def effective_thinking_mode(self) -> str:
+        if self.thinking_mode != "provider_default":
+            return self.thinking_mode
+        return "enabled" if self.enable_thinking else "provider_default"
 
     def _convert_messages(self, messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert internal messages to OpenAI format.
@@ -572,11 +623,7 @@ class OpenAIClient(LLMClientBase):
             "stream_options": {"include_usage": True},
         }
 
-        # Add reasoning params from ModelConfig (no more model.startswith() branching)
-        if self.enable_reasoning_split:
-            params["extra_body"] = {"reasoning_split": True}
-            if self.enable_thinking:
-                params["extra_body"]["enable_thinking"] = True
+        params.update(self._reasoning_request_params())
 
         converted_tools = self._convert_tools(request_params["tools"]) if request_params["tools"] else None
         if converted_tools:
