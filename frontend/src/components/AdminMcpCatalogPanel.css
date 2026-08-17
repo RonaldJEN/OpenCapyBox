@@ -1,4 +1,11 @@
 .admin-mcp-page { display: grid; gap: 18px; color: #172019; }
+.admin-mcp-network-policy { padding-bottom: 18px; border: 1px solid #d5ded7; border-radius: 16px; background: #fbfdfb; }
+.admin-mcp-policy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 0 20px; }
+.admin-mcp-policy-grid label { display: grid; gap: 7px; color: #314338; font-size: 11px; font-weight: 700; }
+.admin-mcp-policy-grid textarea { min-height: 122px; resize: vertical; padding: 10px 12px; border: 1px solid #cfd9d1; border-radius: 9px; background: #fff; color: #172019; font: inherit; line-height: 1.5; }
+.admin-mcp-policy-grid textarea.code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.admin-mcp-policy-grid small { color: #778078; font-size: 9px; font-weight: 400; line-height: 1.5; }
+.admin-mcp-policy-meta { display: flex; align-items: center; gap: 12px; color: #758078; font-size: 9px; }
 .admin-mcp-hero { position: relative; display: flex; min-height: 154px; align-items: center; justify-content: space-between; gap: 28px; overflow: hidden; padding: 25px 28px; border: 1px solid #cfd9d1; border-radius: 18px; background: linear-gradient(128deg, #f3f7f3 0%, #fbfdfb 58%, #eef5f0 100%); }
 .admin-mcp-hero::after { position: absolute; right: -54px; bottom: -82px; width: 230px; height: 230px; border: 36px solid rgb(62 106 75 / 7%); border-radius: 50%; content: ''; }
 .admin-mcp-hero-copy { position: relative; z-index: 1; max-width: 630px; }
@@ -85,6 +92,7 @@
 @media (max-width: 1050px) {
   .admin-mcp-hero { align-items: stretch; flex-direction: column; }
   .admin-mcp-metrics { min-width: 0; width: 100%; }
+  .admin-mcp-policy-grid { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

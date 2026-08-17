@@ -207,6 +207,34 @@ class McpInstallation(Base):
         nullable=True,
         index=True,
     )
+    # Evidence from the last successful activation when a personal connection
+    # needed the administrator-managed private-network policy.  NULL means the
+    # endpoint was ordinary public HTTPS and did not consume an exception.
+    network_authorization_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=now_naive, nullable=False)
+    updated_at = Column(DateTime, default=now_naive, onupdate=now_naive, nullable=False)
+
+
+class McpPersonalNetworkPolicy(Base):
+    """Singleton administrator policy for personal MCP network exceptions."""
+
+    __tablename__ = "mcp_personal_network_policies"
+
+    scope_key = Column(String(20), primary_key=True, default="global")
+    domain_suffixes_json = Column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default=text("'[]'"),
+    )
+    cidrs_json = Column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default=text("'[]'"),
+    )
+    version = Column(Integer, nullable=False, default=1, server_default=text("1"))
+    updated_by = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=now_naive, nullable=False)
     updated_at = Column(DateTime, default=now_naive, onupdate=now_naive, nullable=False)
 

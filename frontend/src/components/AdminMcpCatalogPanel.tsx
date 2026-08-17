@@ -29,13 +29,16 @@ import {
   createAdminMcpServer,
   deleteAdminMcpServer,
   getAdminMcpServers,
+  getPersonalMcpNetworkPolicy,
   testAdminMcpServer,
   updateAdminMcpServer,
+  updatePersonalMcpNetworkPolicy,
   type AdminMcpServerPayload,
   type McpAuthMode,
   type McpServer,
   type McpServerStatus,
   type McpTestResult,
+  type PersonalMcpNetworkPolicy,
 } from '../services/mcpApi';
 import { extractValidationErrorMessage } from '../utils/errorMessages';
 import FeedbackMessage from './FeedbackMessage';
@@ -163,6 +166,12 @@ export default function AdminMcpCatalogPanel({
   onDirtyChange,
 }: AdminMcpCatalogPanelProps) {
   const [servers, setServers] = useState<McpServer[]>([]);
+  const [networkPolicy, setNetworkPolicy] = useState<PersonalMcpNetworkPolicy | null>(null);
+  const [domainSuffixesText, setDomainSuffixesText] = useState('');
+  const [cidrsText, setCidrsText] = useState('');
+  const [initialPolicyText, setInitialPolicyText] = useState({ domains: '', cidrs: '' });
+  const [policySaving, setPolicySaving] = useState(false);
+  const [policyWarning, setPolicyWarning] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
@@ -190,6 +199,8 @@ export default function AdminMcpCatalogPanel({
     [editingServer],
   );
   const formDirty = drawerOpen && JSON.stringify(form) !== JSON.stringify(initialForm);
+  const policyDirty = domainSuffixesText !== initialPolicyText.domains
+    || cidrsText !== initialPolicyText.cidrs;
   const saving = pendingKeys.has(`save-${editingServer?.id ?? 'new'}`);
   const credentialContextChanged = Boolean(
     editingServer
@@ -205,8 +216,19 @@ export default function AdminMcpCatalogPanel({
     setLoading(true);
     setError('');
     try {
-      const nextServers = await getAdminMcpServers();
-      if (requestId === loadRequestRef.current) setServers(nextServers);
+      const [nextServers, nextPolicy] = await Promise.all([
+        getAdminMcpServers(),
+        getPersonalMcpNetworkPolicy(),
+      ]);
+      if (requestId === loadRequestRef.current) {
+        setServers(nextServers);
+        setNetworkPolicy(nextPolicy);
+        const domains = nextPolicy.domain_suffixes.join('\n');
+        const cidrs = nextPolicy.cidrs.join('\n');
+        setDomainSuffixesText(domains);
+        setCidrsText(cidrs);
+        setInitialPolicyText({ domains, cidrs });
+      }
     } catch (loadError) {
       if (requestId === loadRequestRef.current) setError(errorText(loadError));
     } finally {
@@ -219,8 +241,8 @@ export default function AdminMcpCatalogPanel({
   }, [loadServers, refreshToken]);
 
   useEffect(() => {
-    onDirtyChange?.(formDirty);
-  }, [formDirty, onDirtyChange]);
+    onDirtyChange?.(formDirty || policyDirty);
+  }, [formDirty, onDirtyChange, policyDirty]);
 
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
 
@@ -412,6 +434,41 @@ export default function AdminMcpCatalogPanel({
     }
   };
 
+  const saveNetworkPolicy = async () => {
+    const parseLines = (value: string) => value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const domain_suffixes = parseLines(domainSuffixesText);
+    const cidrs = parseLines(cidrsText);
+    if (domain_suffixes.length + cidrs.length > 100) {
+      setError('个人 MCP 网络白名单最多允许 100 条');
+      return;
+    }
+    setPolicySaving(true);
+    setError('');
+    setMessage('');
+    setPolicyWarning('');
+    try {
+      const saved = await updatePersonalMcpNetworkPolicy({ domain_suffixes, cidrs });
+      setNetworkPolicy(saved);
+      const domains = saved.domain_suffixes.join('\n');
+      const normalizedCidrs = saved.cidrs.join('\n');
+      setDomainSuffixesText(domains);
+      setCidrsText(normalizedCidrs);
+      setInitialPolicyText({ domains, cidrs: normalizedCidrs });
+      if (saved.disabled_installations > 0) {
+        setPolicyWarning(`白名单已保存，并停用了 ${saved.disabled_installations} 个不再合规的个人 MCP 连接。连接配置和凭证已保留。`);
+      } else {
+        setMessage('个人 MCP 网络白名单已更新');
+      }
+    } catch (saveError) {
+      setError(errorText(saveError));
+    } finally {
+      setPolicySaving(false);
+    }
+  };
+
   const handleTest = (server: McpServer) => {
     void runServerAction(`test-${server.id}`, server.id, async () => {
       const result = await testAdminMcpServer(server.id);
@@ -501,6 +558,16 @@ export default function AdminMcpCatalogPanel({
           {message}
         </FeedbackMessage>
       ) : null}
+      {policyWarning ? (
+        <FeedbackMessage
+          className="admin-inline-message"
+          tone="warning"
+          icon={<ShieldAlert size={14} />}
+          onDismiss={() => setPolicyWarning('')}
+        >
+          {policyWarning}
+        </FeedbackMessage>
+      ) : null}
 
       <section className="admin-mcp-hero">
         <div className="admin-mcp-hero-copy">
@@ -513,6 +580,50 @@ export default function AdminMcpCatalogPanel({
           <div><strong>{publishedCount}</strong><span>已发布</span></div>
           <div><strong>{connectedCount}</strong><span>测试通过</span></div>
           <div><strong>{toolCount}</strong><span>发现工具</span></div>
+        </div>
+      </section>
+
+      <section className="admin-mcp-network-policy">
+        <div className="admin-mcp-catalog-head">
+          <div>
+            <h3><ShieldAlert size={16} />个人 MCP 网络白名单</h3>
+            <p>命中的个人 MCP 可访问内网并使用 HTTP；每个域名条目同时覆盖其全部子域。</p>
+          </div>
+          <div className="admin-mcp-policy-meta">
+            <span>版本 {networkPolicy?.version ?? 0}</span>
+            <button
+              type="button"
+              className="admin-button admin-primary-button"
+              disabled={!policyDirty || policySaving}
+              onClick={() => void saveNetworkPolicy()}
+            >
+              {policySaving ? <Loader2 className="admin-mcp-spin" size={14} /> : <CheckCircle2 size={14} />}
+              保存白名单
+            </button>
+          </div>
+        </div>
+        <div className="admin-mcp-policy-grid">
+          <label>
+            域名后缀（每行一条）
+            <textarea
+              aria-label="个人 MCP 域名白名单"
+              value={domainSuffixesText}
+              onChange={(event) => setDomainSuffixesText(event.target.value)}
+              placeholder={'company.cc.com\nmcp.corp.example'}
+            />
+            <small>company.cc.com 会匹配自身和所有子域，但不会匹配 evilcompany.cc.com。</small>
+          </label>
+          <label>
+            CIDR（每行一条）
+            <textarea
+              className="code"
+              aria-label="个人 MCP CIDR 白名单"
+              value={cidrsText}
+              onChange={(event) => setCidrsText(event.target.value)}
+              placeholder={'10.20.0.0/16\nfd00:1234::/48'}
+            />
+            <small>localhost、云元数据、loopback、link-local 和保留地址始终禁止。</small>
+          </label>
         </div>
       </section>
 

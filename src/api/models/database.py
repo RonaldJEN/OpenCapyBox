@@ -50,6 +50,7 @@ def _import_models():
         McpToolSnapshot,
         McpToolSearchIndex,
         McpConfigVersion,
+        McpPersonalNetworkPolicy,
     )
     from src.api.models.tool_permission import (  # noqa: F401
         ToolPermissionRule,
@@ -376,6 +377,7 @@ _PENDING_COLUMNS = [
     ("user_sandboxes", "active_profile_id", "VARCHAR(36)"),
     ("user_sandboxes", "active_profile_version", "INTEGER"),
     ("mcp_servers", "last_tools_count", "INTEGER"),
+    ("mcp_installations", "network_authorization_json", "TEXT"),
     ("mcp_tool_visibility", "revision", "INTEGER NOT NULL DEFAULT 1"),
     ("tool_approval_requests", "connection_fingerprint", "VARCHAR(64)"),
     ("tool_approval_requests", "execution_claim_token", "VARCHAR(64)"),

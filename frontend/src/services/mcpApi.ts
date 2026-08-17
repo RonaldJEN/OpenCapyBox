@@ -93,6 +93,14 @@ export interface McpImportResult {
   servers: McpServer[];
 }
 
+export interface PersonalMcpNetworkPolicy {
+  domain_suffixes: string[];
+  cidrs: string[];
+  version: number;
+  updated_at: string | null;
+  disabled_installations: number;
+}
+
 type UnknownRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -348,4 +356,43 @@ export async function deleteAdminMcpServer(serverId: string): Promise<void> {
 export async function testAdminMcpServer(serverId: string): Promise<McpTestResult> {
   const response = await client.post(`/admin/mcp/servers/${encodeURIComponent(serverId)}/test`);
   return normalizeTestResult(response.data);
+}
+
+export async function getPersonalMcpNetworkPolicy(): Promise<PersonalMcpNetworkPolicy> {
+  const response = await client.get('/admin/mcp/personal-network-policy');
+  const raw = isRecord(response.data) ? response.data : {};
+  return {
+    domain_suffixes: Array.isArray(raw.domain_suffixes)
+      ? raw.domain_suffixes.filter((item): item is string => typeof item === 'string')
+      : [],
+    cidrs: Array.isArray(raw.cidrs)
+      ? raw.cidrs.filter((item): item is string => typeof item === 'string')
+      : [],
+    version: typeof raw.version === 'number' ? raw.version : 0,
+    updated_at: nullableString(raw.updated_at),
+    disabled_installations: typeof raw.disabled_installations === 'number'
+      ? raw.disabled_installations
+      : 0,
+  };
+}
+
+export async function updatePersonalMcpNetworkPolicy(payload: {
+  domain_suffixes: string[];
+  cidrs: string[];
+}): Promise<PersonalMcpNetworkPolicy> {
+  const response = await client.put('/admin/mcp/personal-network-policy', payload);
+  const raw = isRecord(response.data) ? response.data : {};
+  return {
+    domain_suffixes: Array.isArray(raw.domain_suffixes)
+      ? raw.domain_suffixes.filter((item): item is string => typeof item === 'string')
+      : [],
+    cidrs: Array.isArray(raw.cidrs)
+      ? raw.cidrs.filter((item): item is string => typeof item === 'string')
+      : [],
+    version: typeof raw.version === 'number' ? raw.version : 0,
+    updated_at: nullableString(raw.updated_at),
+    disabled_installations: typeof raw.disabled_installations === 'number'
+      ? raw.disabled_installations
+      : 0,
+  };
 }

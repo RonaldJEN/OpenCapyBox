@@ -22,10 +22,12 @@ import {
   exportMcpConfig,
   getMcpServerTools,
   getMcpServers,
+  getPersonalMcpNetworkPolicy,
   importMcpConfig,
   testMcpServer,
   updateMcpConnection,
   updateMcpToolVisibility,
+  updatePersonalMcpNetworkPolicy,
 } from '../../services/mcpApi';
 
 describe('mcpApi', () => {
@@ -220,5 +222,29 @@ describe('mcpApi', () => {
     await createAdminMcpServer(payload);
 
     expect(client.post).toHaveBeenCalledWith('/admin/mcp/servers', payload);
+  });
+
+  it('读取并原子替换个人 MCP 网络白名单', async () => {
+    const policy = {
+      domain_suffixes: ['company.cc.com'],
+      cidrs: ['10.20.0.0/16'],
+      version: 2,
+      updated_at: '2026-08-17T12:00:00',
+      disabled_installations: 1,
+    };
+    client.get.mockResolvedValueOnce({ data: policy });
+    client.put.mockResolvedValueOnce({ data: policy });
+
+    await expect(getPersonalMcpNetworkPolicy()).resolves.toEqual(policy);
+    await expect(updatePersonalMcpNetworkPolicy({
+      domain_suffixes: ['company.cc.com'],
+      cidrs: ['10.20.0.0/16'],
+    })).resolves.toEqual(policy);
+
+    expect(client.get).toHaveBeenCalledWith('/admin/mcp/personal-network-policy');
+    expect(client.put).toHaveBeenCalledWith('/admin/mcp/personal-network-policy', {
+      domain_suffixes: ['company.cc.com'],
+      cidrs: ['10.20.0.0/16'],
+    });
   });
 });

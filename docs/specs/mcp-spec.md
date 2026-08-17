@@ -20,7 +20,7 @@
 - `source`: `official` | `personal`；约束：official 必须 `owner_user_id IS NULL`，personal 必须非空
 - `status`: `draft` | `published` | `disabled`（仅 official 有意义；个人服务恒为可用）
 - `auth_type`: `none` | `bearer` | `headers`
-- `allow_private_network` / `allow_insecure_http`: **仅官方服务**可由管理员放开；个人服务恒为 `false`（公网 HTTPS）
+- `allow_private_network` / `allow_insecure_http`: **仅官方服务**可逐服务放开；个人服务恒为 `false`，其例外统一由全局个人 MCP 网络白名单裁决
 - `required`: 官方服务是否强制为所有用户装配
 - `version`: 单调递增，凭证/配置变更时自增，用于指纹与缓存
 - `last_tested_at` / `last_tools_count` / `last_error`: 平台探针结果（官方服务无 per-user 快照）
@@ -34,6 +34,11 @@
 ### `mcp_installations` — 用户装配
 - `(server_id, user_id)` 唯一；`enabled` 表示是否向该用户的 Agent 暴露
 - `credential_id`: 指向所选凭证（`ondelete=SET NULL`）
+- `network_authorization_json`: 最近一次成功激活时命中个人网络白名单的非敏感证据（scheme、hostname、固定解析地址和命中规则）；普通公网 HTTPS 为 NULL
+
+### `mcp_personal_network_policies` — 个人 MCP 网络白名单
+- 单例 `scope_key=global`，保存规范化的域名后缀与 IPv4/IPv6 CIDR 列表、策略版本及更新人
+- 域名后缀按 DNS 标签边界匹配自身和全部子域；域名统一 IDNA 小写，CIDR 必须为 canonical network，合计最多 100 条
 
 ### `mcp_tool_visibility` — 发布策略（按 installation）
 - 无行 = 发布全部远程工具
@@ -83,6 +88,8 @@
 | PATCH | `/servers/{id}` | 编辑官方服务（含 status/网络策略/required） |
 | DELETE | `/servers/{id}` | 删除官方服务 |
 | POST | `/servers/{id}/test` | 平台探针测试 |
+| GET | `/personal-network-policy` | 读取个人 MCP 域名/CIDR 白名单 |
+| PUT | `/personal-network-policy` | 原子替换白名单，并返回受影响停用连接数 |
 
 ### 3.3 关键响应字段
 
@@ -101,7 +108,10 @@
 ## 4. 行为语义与不变量
 
 ### 4.1 安全（SSRF 与凭证）
-- 个人服务：**强制公网 HTTPS**，禁止私网/内网地址与明文 HTTP
+- 个人服务默认强制公网 HTTPS；命中管理员域名后缀或 CIDR 白名单时才允许私网地址与 HTTP。空白名单保持原有公网 HTTPS 行为
+- 域名规则（如 `company.cc.com`）匹配自身及 `*.company.cc.com`，不匹配 `evilcompany.cc.com`；CIDR 规则按每个实际解析地址裁决
+- HTTP 例外要求逐个解析地址满足：命中 CIDR（无论该地址公网与否，视为管理员显式放行），或命中域名后缀且该地址本身为私网地址。域名命中但解析到公网地址时，仍强制该地址走 HTTPS，不获得明文 HTTP 例外
+- localhost、云元数据、loopback、link-local、multicast、unspecified、保留地址以及 IPv6 transition/mapped 地址是个人服务不可覆盖的永久拒绝范围
 - 连接前 DNS 解析 + `_PinnedNetworkBackend` 固定已解析地址，防 DNS 重绑定
 - 官方服务可由管理员显式放开 `allow_private_network` / `allow_insecure_http`
 - **凭证绑定 origin**：编辑服务（官方与个人一致）时，凡 `scheme` / `hostname` / 有效端口（origin）发生变化，即清除该服务已存的全部凭证（平台凭证与所有 per-user 覆盖），避免旧凭证被发往新主机；仅路径变化视为同 origin，保留凭证。同请求内若同时提供新凭证，则先清旧再装新。
@@ -117,6 +127,7 @@
 
 ### 4.3 目录与缓存
 - 官方目录变更自增 `global` 代次；个人变更自增 `user:<id>` 代次
+- 个人网络白名单变化自增 `global` 代次，并纳入个人 installation 的 execution fingerprint；激活探测前后策略版本不一致时拒绝迟到结果
 - Agent 池按代次失效；DB 代次为跨 worker 权威源，本地驱逐仅加速可见性
 - 目录构建按 `(server_id, installation_id)` 稳定排序并分为 required、optional 两阶段；required 优先发现和计入预算，只有 required 集合自身违反 installation 数、总 deadline、工具数或累计字节限制时才抛 `McpRequiredServerUnavailable`
 - optional 服务按稳定顺序整服务加入目录；发现失败、超时、模型工具名碰撞或加入后超过工具数/字节预算时，仅跳过该 optional 服务并记录脱敏 error，不得拖垮已验证的 required 目录
@@ -163,13 +174,15 @@
 - 用户端和管理端的 MCP 成功反馈显示 4 秒后自动消失并可手动关闭；部分成功/未启用警告及错误保持到用户关闭或开始下一操作。连接测试失败必须使用错误视觉与 `role="alert"`，不得复用绿色成功 toast
 - 设置中心会保活已访问的数据连接组件；离开数据连接分区时必须清理一次性 MCP 反馈，返回时不得重新展示上一次操作结果
 - 管理端同一 server 的测试、保存、启停、删除互斥；pending 状态按请求集合计数，较早请求结束不得提前解锁仍在途操作。编辑表单 dirty 时，关闭 drawer 或切换管理模块前必须确认
+- 管理端白名单按行编辑域名后缀与 CIDR。收紧策略时用已保存的固定解析证据重新裁决：仅停用失去全部授权的个人连接，保留服务与凭证；替代规则仍覆盖时保持启用。实时 DNS 漂移在测试、发现或调用入口再次 fail-closed 并原子停用
 - 对话框打开时将焦点限制在框内；焦点落在容器本身或框外时，Tab / Shift+Tab 分别回到首个 / 末个可聚焦元素，关闭后把焦点还给触发元素
 
 ## 5. 失败模式
 
 | 场景 | 行为 |
 |---|---|
-| 个人服务填内网/HTTP URL | 创建/连接校验失败，返回 4xx，错误已脱敏 |
+| 个人服务填未命中白名单的内网/HTTP URL | 创建、激活或连接校验失败，返回 4xx，错误已脱敏 |
+| 管理员收紧个人网络白名单 | 仅停用失去授权的个人 installation，保留连接定义与凭证；不自动重新启用 |
 | 编辑服务改变 origin（scheme/host/port） | 自动清除该服务已存全部凭证，`credential_set=false`，重置测试状态 |
 | 连接测试超时/鉴权失败 | `McpTestResponse.ok=false` + 脱敏 `error`，同时落 `last_error` |
 | 发现部分失败 | 保留旧快照，不清空发布策略 |

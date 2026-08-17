@@ -258,13 +258,13 @@
 - 用户：`user.list`、`user.login_history.view`、`user.create`、`user.enabled.update`、`user.admin.update`、`user.token_limits.update`、`user.model_groups.update`、`user.password.reset`、`user.delete`、`user.export`。
 - 沙箱：`sandbox.list`、`sandbox.create`、`sandbox.update`、`sandbox.default.set`、`sandbox.enabled.update`、`user.sandbox.update`。
 - 模型与权限包：`model.list`、`model.create`、`model.update`、`model.delete`、`model.settings.update`、`model_group.list`、`model_group.create`、`model_group.update`、`model_group.models.update`、`model_group.users.update`。
-- MCP 与工具权限：`mcp.list`、`mcp.create`、`mcp.update`、`mcp.delete`、`mcp.test`、`tool_permission.list`、`tool_permission.create`、`tool_permission.update`、`tool_permission.delete`。
+- MCP 与工具权限：`mcp.list`、`mcp.create`、`mcp.update`、`mcp.delete`、`mcp.test`、`mcp.personal_network_policy.list`、`mcp.personal_network_policy.update`、`tool_permission.list`、`tool_permission.create`、`tool_permission.update`、`tool_permission.delete`。
 - 操作日志：`audit_log.list`、`audit_log.export`。
 
 审计等级固定按动作编码派生，不写入业务正文或新增可变等级字段：
 
 - L0 常规读取：`overview.read`、`system.read`、`sandbox.list`、`model.list`、`model_group.list`、`mcp.list`、`tool_permission.list`。成功或失败均不写入操作审计表。
-- L1 敏感查阅：`session.list`、`session.search`、`session.view`、`user.list`、`user.login_history.view`、`audit_log.list`。
+- L1 敏感查阅：`session.list`、`session.search`、`session.view`、`user.list`、`user.login_history.view`、`audit_log.list`、`mcp.personal_network_policy.list`。
 - L2 管理操作：除 L0、L1、L3 外的创建、更新、删除、重置、导出和外联测试动作，包括 `step.review.update` 与 `mcp.test`。
 - L3 高危：仅 `step.view`，表示后端向管理员披露了用户会话步骤原文。
 

@@ -886,6 +886,20 @@ def test_operation_log_export_rejects_results_above_limit_and_audits_failure(
         assert export_row.status_code == 400
 
 
+def test_mcp_personal_network_policy_read_is_audited_as_l1(audit_db):
+    response = _client_for_router(admin_mcp.router, audit_db, prefix="/admin/mcp").get(
+        "/admin/mcp/personal-network-policy"
+    )
+
+    assert response.status_code == 200, response.text
+    with audit_db() as db:
+        row = db.query(AdminOperationLog).filter_by(
+            action="mcp.personal_network_policy.list"
+        ).one()
+    assert row.outcome == "succeeded"
+    assert row.actor_user_id == "admin-id"
+
+
 def test_every_admin_route_declares_audit_action_and_admin_dependency():
     routers = (
         admin.router,
@@ -947,6 +961,8 @@ def test_every_admin_route_declares_audit_action_and_admin_dependency():
         "mcp.update",
         "mcp.delete",
         "mcp.test",
+        "mcp.personal_network_policy.list",
+        "mcp.personal_network_policy.update",
         "tool_permission.list",
         "tool_permission.create",
         "tool_permission.update",
@@ -970,6 +986,7 @@ def test_every_admin_route_declares_audit_action_and_admin_dependency():
         "session.view",
         "user.list",
         "user.login_history.view",
+        "mcp.personal_network_policy.list",
     }
     assert L0_ACTIONS == {
         "overview.read",
@@ -981,6 +998,7 @@ def test_every_admin_route_declares_audit_action_and_admin_dependency():
         "tool_permission.list",
     }
     assert "mcp.test" in L2_ACTIONS
+    assert "mcp.personal_network_policy.update" in L2_ACTIONS
 
 
 def test_every_registered_api_admin_route_uses_strict_audit_route():

@@ -5,8 +5,10 @@ import {
   createAdminMcpServer,
   deleteAdminMcpServer,
   getAdminMcpServers,
+  getPersonalMcpNetworkPolicy,
   testAdminMcpServer,
   updateAdminMcpServer,
+  updatePersonalMcpNetworkPolicy,
   type McpServer,
 } from '../../services/mcpApi';
 
@@ -14,8 +16,10 @@ vi.mock('../../services/mcpApi', () => ({
   createAdminMcpServer: vi.fn(),
   deleteAdminMcpServer: vi.fn(),
   getAdminMcpServers: vi.fn(),
+  getPersonalMcpNetworkPolicy: vi.fn(),
   testAdminMcpServer: vi.fn(),
   updateAdminMcpServer: vi.fn(),
+  updatePersonalMcpNetworkPolicy: vi.fn(),
 }));
 
 const server: McpServer = {
@@ -48,6 +52,13 @@ describe('AdminMcpCatalogPanel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getAdminMcpServers).mockResolvedValue([server]);
+    vi.mocked(getPersonalMcpNetworkPolicy).mockResolvedValue({
+      domain_suffixes: [],
+      cidrs: [],
+      version: 0,
+      updated_at: null,
+      disabled_installations: 0,
+    });
     vi.mocked(createAdminMcpServer).mockResolvedValue(server);
     vi.mocked(updateAdminMcpServer).mockResolvedValue(server);
     vi.mocked(deleteAdminMcpServer).mockResolvedValue();
@@ -56,6 +67,33 @@ describe('AdminMcpCatalogPanel', () => {
       tools_count: 6,
       latency_ms: 25,
       error: null,
+    });
+    vi.mocked(updatePersonalMcpNetworkPolicy).mockResolvedValue({
+      domain_suffixes: ['company.cc.com'],
+      cidrs: ['10.20.0.0/16'],
+      version: 1,
+      updated_at: '2026-08-17T12:00:00',
+      disabled_installations: 0,
+    });
+  });
+
+  it('可保存个人 MCP 域名和 CIDR 白名单', async () => {
+    render(<AdminMcpCatalogPanel />);
+    await screen.findByText('内部知识库');
+
+    fireEvent.change(screen.getByLabelText('个人 MCP 域名白名单'), {
+      target: { value: 'company.cc.com' },
+    });
+    fireEvent.change(screen.getByLabelText('个人 MCP CIDR 白名单'), {
+      target: { value: '10.20.0.0/16' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存白名单' }));
+
+    await waitFor(() => {
+      expect(updatePersonalMcpNetworkPolicy).toHaveBeenCalledWith({
+        domain_suffixes: ['company.cc.com'],
+        cidrs: ['10.20.0.0/16'],
+      });
     });
   });
 

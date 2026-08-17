@@ -30,7 +30,9 @@ from jsonschema.exceptions import SchemaError
 from src.api.models.database import SessionLocal
 from src.api.config import get_settings
 from src.api.services.mcp_security import (
+    McpNetworkAuthorization,
     McpSecurityError,
+    PersonalMcpNetworkPolicy,
     ResolvedMcpEndpoint,
     credential_headers,
     resolve_mcp_endpoint,
@@ -156,6 +158,7 @@ class EffectiveMcpInstallation:
     credential_fingerprint: str = ""
     allow_private_network: bool = False
     allow_insecure_http: bool = False
+    personal_network_policy: PersonalMcpNetworkPolicy | None = None
     enabled_tools: frozenset[str] | None = None
     disabled_tools: frozenset[str] = field(default_factory=frozenset)
     configuration_error: str | None = None
@@ -184,6 +187,11 @@ class EffectiveMcpInstallation:
             credential_fingerprint=self.credential_fingerprint,
             allow_private_network=self.allow_private_network,
             allow_insecure_http=self.allow_insecure_http,
+            personal_network_policy_version=(
+                self.personal_network_policy.version
+                if self.personal_network_policy is not None
+                else 0
+            ),
         )
 
     @property
@@ -205,6 +213,27 @@ def _sanitize_mcp_exception(
         headers=installation.headers,
         include_exception_type=True,
     )
+
+
+def _contains_mcp_security_error(exc: BaseException) -> bool:
+    """Find a policy denial through SDK/httpx exception wrapping."""
+
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, McpSecurityError):
+            return True
+        nested = getattr(current, "exceptions", None)
+        if isinstance(nested, tuple):
+            pending.extend(item for item in nested if isinstance(item, BaseException))
+        for candidate in (current.__cause__, current.__context__):
+            if isinstance(candidate, BaseException):
+                pending.append(candidate)
+    return False
 
 
 @dataclass(frozen=True)
@@ -282,6 +311,12 @@ class McpRepository(Protocol):
         tools: list[McpToolSnapshot],
     ) -> bool: ...
 
+    def disable_for_network_policy(
+        self,
+        user_id: str,
+        installation_id: str,
+    ) -> None: ...
+
 
 class McpSessionConnector(Protocol):
     async def list_tools(self, installation: EffectiveMcpInstallation) -> list[Any]: ...
@@ -311,6 +346,7 @@ def mcp_execution_fingerprint(
     credential_fingerprint: str,
     allow_private_network: bool,
     allow_insecure_http: bool,
+    personal_network_policy_version: int = 0,
 ) -> str:
     """Hash only state that selects or authorizes the remote call target."""
 
@@ -323,6 +359,7 @@ def mcp_execution_fingerprint(
         "credential": credential_fingerprint,
         "allow_private_network": bool(allow_private_network),
         "allow_insecure_http": bool(allow_insecure_http),
+        "personal_network_policy_version": int(personal_network_policy_version),
     })
 
 
@@ -1013,6 +1050,7 @@ class _SdkSessionConnector:
         read_timeout: float = 300.0,
         connect_retry_attempts: int | None = None,
         connect_retry_base_delay_seconds: float | None = None,
+        endpoint_observer: Callable[[ResolvedMcpEndpoint], None] | None = None,
     ):
         settings = get_settings()
         self.connect_timeout = connect_timeout
@@ -1027,6 +1065,7 @@ class _SdkSessionConnector:
             if connect_retry_base_delay_seconds is not None
             else settings.mcp_connect_retry_base_delay_seconds
         )
+        self.endpoint_observer = endpoint_observer
         if not 0 < self.connect_retry_attempts <= 10:
             raise ValueError("connect_retry_attempts must be > 0 and <= 10")
         if not 0 <= self.connect_retry_base_delay_seconds <= 30:
@@ -1067,11 +1106,14 @@ class _SdkSessionConnector:
                     installation.url,
                     allow_private_network=installation.allow_private_network,
                     allow_insecure_http=installation.allow_insecure_http,
+                    personal_network_policy=installation.personal_network_policy,
                 ),
                 timeout=self.connect_timeout,
             )
         except asyncio.TimeoutError as exc:
             raise McpConnectionUnavailable("MCP DNS resolution timed out") from exc
+        if self.endpoint_observer is not None:
+            self.endpoint_observer(endpoint)
         timeout = httpx.Timeout(
             timeout=self.read_timeout,
             connect=self.connect_timeout,
@@ -1517,6 +1559,9 @@ class _SqlAlchemyMcpRepository:
         if installation_id is not None:
             query = query.filter(McpInstallation.id == installation_id)
         rows = query.order_by(McpServer.id, McpInstallation.id).all()
+        from src.api.services.mcp_network_policy import load_personal_mcp_network_policy
+
+        personal_policy = load_personal_mcp_network_policy(db).policy
         resolved = []
         for installation, server in rows:
             if server.source == "personal" and server.owner_user_id != user_id:
@@ -1625,11 +1670,48 @@ class _SqlAlchemyMcpRepository:
                 credential_fingerprint=credential_fp,
                 allow_private_network=bool(server.allow_private_network),
                 allow_insecure_http=bool(server.allow_insecure_http),
+                personal_network_policy=(
+                    personal_policy if server.source == "personal" else None
+                ),
                 enabled_tools=enabled_tools,
                 disabled_tools=disabled_tools,
                 configuration_error=configuration_error,
             ))
         return resolved
+
+    def disable_for_network_policy(
+        self,
+        user_id: str,
+        installation_id: str,
+    ) -> None:
+        """Fail closed after live DNS no longer satisfies the admin policy."""
+
+        _, _, McpInstallation, McpServer, _, _ = self._models()
+        with self._session_factory() as db:
+            row = (
+                db.query(McpInstallation, McpServer)
+                .join(McpServer, McpServer.id == McpInstallation.server_id)
+                .filter(
+                    McpInstallation.id == installation_id,
+                    McpInstallation.user_id == user_id,
+                    McpInstallation.enabled.is_(True),
+                    McpServer.source == "personal",
+                    McpServer.owner_user_id == user_id,
+                )
+                .with_for_update()
+                .first()
+            )
+            if row is None:
+                db.rollback()
+                return
+            installation, server = row
+            installation.enabled = False
+            installation.network_authorization_json = None
+            server.last_error = "个人 MCP 当前地址不再满足管理员网络白名单，连接已停用"
+            from src.api.services.mcp_service import bump_config_version
+
+            bump_config_version(db, user_id)
+            db.commit()
 
     def list_effective_installations(self, user_id: str) -> list[EffectiveMcpInstallation]:
         with self._session_factory() as db:
@@ -2374,7 +2456,14 @@ class McpRuntime:
     ) -> list[McpToolSnapshot]:
         if installation.configuration_error:
             raise McpRuntimeError(installation.configuration_error)
-        remote_tools = await self.connector.list_tools(installation)
+        try:
+            remote_tools = await self.connector.list_tools(installation)
+        except Exception as exc:
+            if installation.source == "personal" and _contains_mcp_security_error(exc):
+                self.repository.disable_for_network_policy(
+                    installation.user_id, installation.installation_id
+                )
+            raise
         projected: list[McpToolSnapshot] = []
         for remote in remote_tools:
             raw = _as_dict(remote)
@@ -2616,6 +2705,10 @@ class McpRuntime:
                 except McpCallOutcomeUnknown:
                     raise
                 except Exception as exc:
+                    if installation.source == "personal" and _contains_mcp_security_error(exc):
+                        self.repository.disable_for_network_policy(
+                            installation.user_id, installation.installation_id
+                        )
                     if dispatched:
                         raise McpCallOutcomeUnknown(
                             "MCP 调用可能已执行，但传输在结果返回前失败；请勿自动重试。"
@@ -2688,8 +2781,9 @@ async def probe_streamable_http(
     headers: dict[str, str] | None = None,
     allow_private_network: bool = False,
     allow_insecure_http: bool = False,
+    personal_network_policy: PersonalMcpNetworkPolicy | None = None,
     timeout_seconds: float = 15.0,
-) -> list[Any]:
+) -> tuple[list[Any], McpNetworkAuthorization | None]:
     """One-shot initialize + tools/list helper for catalog connection tests."""
 
     installation = EffectiveMcpInstallation(
@@ -2701,12 +2795,24 @@ async def probe_streamable_http(
         headers=dict(headers or {}),
         allow_private_network=allow_private_network,
         allow_insecure_http=allow_insecure_http,
+        personal_network_policy=personal_network_policy,
     )
+    observed_endpoint: ResolvedMcpEndpoint | None = None
+
+    def observe_endpoint(endpoint: ResolvedMcpEndpoint) -> None:
+        nonlocal observed_endpoint
+        observed_endpoint = endpoint
+
     connector = _SdkSessionConnector(
         connect_timeout=timeout_seconds,
         read_timeout=timeout_seconds,
+        endpoint_observer=observe_endpoint,
     )
-    return await asyncio.wait_for(
+    tools = await asyncio.wait_for(
         connector.list_tools(installation),
         timeout=timeout_seconds,
+    )
+    return (
+        tools,
+        observed_endpoint.network_authorization if observed_endpoint is not None else None,
     )

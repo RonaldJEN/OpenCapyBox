@@ -299,6 +299,7 @@ export default function McpConnectionsPanel({
   const editorDirty = isEditorDirty(editor);
   const toolManagerDirty = isToolManagerDirty(toolManager);
   const dirty = editorDirty || toolManagerDirty;
+  const editorOpen = editor !== null;
   const editorSaveKey = editor ? `save-${editor.server?.id || 'new'}` : '';
   const editorSaving = Boolean(editorSaveKey && busyKeys.has(editorSaveKey));
   const editorCredentialContextChanged = credentialContextChanged(editor);
@@ -314,8 +315,8 @@ export default function McpConnectionsPanel({
 
   useEffect(() => {
     if (confirmDiscard) confirmDiscardDialogRef.current?.focus();
-    else if (editor) editorDialogRef.current?.focus();
-  }, [confirmDiscard, editor]);
+    else if (editorOpen) editorDialogRef.current?.focus();
+  }, [confirmDiscard, editorOpen]);
 
   useEffect(() => {
     if (confirmToolDiscard) confirmToolDiscardDialogRef.current?.focus();

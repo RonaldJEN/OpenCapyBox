@@ -57,6 +57,7 @@ L1_ACTIONS = frozenset(
         "session.view",
         "user.list",
         "user.login_history.view",
+        "mcp.personal_network_policy.list",
     }
 )
 L2_ACTIONS = frozenset(
@@ -87,6 +88,7 @@ L2_ACTIONS = frozenset(
         "mcp.update",
         "mcp.delete",
         "mcp.test",
+        "mcp.personal_network_policy.update",
         "tool_permission.create",
         "tool_permission.update",
         "tool_permission.delete",

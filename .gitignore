@@ -29,6 +29,7 @@ claude-code-sourcemap
 data/
 *.log
 logs/
+plugins/
 .codex
 .codex-test
 docs/claude-code-src/

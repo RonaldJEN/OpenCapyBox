@@ -200,6 +200,25 @@ class McpServerListResponse(BaseModel):
     config_version: str
 
 
+class PersonalMcpNetworkPolicyUpdate(BaseModel):
+    domain_suffixes: list[str] = Field(default_factory=list, max_length=100)
+    cidrs: list[str] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def _bound_total_entries(self):
+        if len(self.domain_suffixes) + len(self.cidrs) > 100:
+            raise ValueError("个人 MCP 网络白名单最多允许 100 条")
+        return self
+
+
+class PersonalMcpNetworkPolicyResponse(BaseModel):
+    domain_suffixes: list[str]
+    cidrs: list[str]
+    version: int
+    updated_at: datetime | None
+    disabled_installations: int = 0
+
+
 class McpTestResponse(BaseModel):
     ok: bool
     tools_count: int = 0

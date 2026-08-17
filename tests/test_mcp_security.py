@@ -14,6 +14,7 @@ from src.api.services.mcp_security import (
     decrypt_credential,
     encrypt_credential,
     mcp_url_without_query,
+    normalize_personal_mcp_network_policy,
     resolve_mcp_endpoint,
     sanitize_mcp_exception,
     validate_mcp_headers,
@@ -51,6 +52,130 @@ def test_personal_mcp_accepts_ordinary_public_ipv6_literal():
         validate_mcp_url("https://[2606:4700:4700::1111]/mcp")
         == "https://[2606:4700:4700::1111]/mcp"
     )
+
+
+def test_personal_network_policy_normalizes_suffixes_and_cidrs():
+    policy = normalize_personal_mcp_network_policy(
+        ["Company.CC.com.", "company.cc.com"],
+        ["10.20.0.0/16", "fd00:1234::/48"],
+        version=7,
+    )
+
+    assert policy.domain_suffixes == ("company.cc.com",)
+    assert policy.cidrs == ("10.20.0.0/16", "fd00:1234::/48")
+    assert policy.version == 7
+
+
+def test_personal_policy_domain_suffix_is_label_bounded(monkeypatch):
+    policy = normalize_personal_mcp_network_policy(["company.cc.com"], [])
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.20.1.5", 80)),
+        ],
+    )
+
+    allowed = resolve_mcp_endpoint(
+        "http://mcp.company.cc.com/mcp",
+        personal_network_policy=policy,
+    )
+    assert allowed.network_authorization is not None
+    assert allowed.network_authorization.matched_domain_suffix == "company.cc.com"
+
+    with pytest.raises(McpSecurityError, match="白名单"):
+        resolve_mcp_endpoint(
+            "http://evilcompany.cc.com/mcp",
+            personal_network_policy=policy,
+        )
+
+
+def test_personal_policy_domain_match_does_not_authorize_http_for_public_address(monkeypatch):
+    policy = normalize_personal_mcp_network_policy(["company.cc.com"], [])
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+        ],
+    )
+
+    with pytest.raises(McpSecurityError, match="CIDR"):
+        resolve_mcp_endpoint(
+            "http://mcp.company.cc.com/mcp",
+            personal_network_policy=policy,
+        )
+
+    endpoint = resolve_mcp_endpoint(
+        "https://mcp.company.cc.com/mcp",
+        personal_network_policy=policy,
+    )
+    assert endpoint.network_authorization is None
+
+
+def test_personal_policy_cidr_allows_private_https_and_http(monkeypatch):
+    policy = normalize_personal_mcp_network_policy([], ["10.20.0.0/16"])
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.20.9.8", 80)),
+        ],
+    )
+
+    endpoint = resolve_mcp_endpoint(
+        "http://mcp.internal.example/mcp",
+        personal_network_policy=policy,
+    )
+    assert endpoint.network_authorization is not None
+    assert endpoint.network_authorization.matched_cidrs == ("10.20.0.0/16",)
+
+
+@pytest.mark.parametrize(
+    "cidr",
+    [
+        "0.0.0.0/0",
+        "100.100.100.200/32",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "::1/128",
+    ],
+)
+def test_personal_policy_rejects_overwide_or_permanently_blocked_cidrs(cidr):
+    with pytest.raises(McpSecurityError):
+        normalize_personal_mcp_network_policy([], [cidr])
+
+
+def test_personal_domain_policy_never_allows_loopback(monkeypatch):
+    policy = normalize_personal_mcp_network_policy(["company.cc.com"], [])
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+        ],
+    )
+    with pytest.raises(McpSecurityError, match="永久禁止"):
+        resolve_mcp_endpoint(
+            "https://mcp.company.cc.com/mcp",
+            personal_network_policy=policy,
+        )
+
+
+def test_personal_domain_policy_never_allows_cloud_metadata(monkeypatch):
+    policy = normalize_personal_mcp_network_policy(["company.cc.com"], [])
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.100.100.200", 443)),
+        ],
+    )
+    with pytest.raises(McpSecurityError, match="永久禁止"):
+        resolve_mcp_endpoint(
+            "https://mcp.company.cc.com/mcp",
+            personal_network_policy=policy,
+        )
 
 
 def test_official_policy_can_explicitly_allow_private_http():

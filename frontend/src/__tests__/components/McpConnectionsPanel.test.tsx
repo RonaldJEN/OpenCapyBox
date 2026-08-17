@@ -548,6 +548,23 @@ describe('McpConnectionsPanel', () => {
     await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
   });
 
+  it('逐字符输入 URL 时保持输入框焦点', async () => {
+    render(<McpConnectionsPanel />);
+    await screen.findByText('官方知识库');
+    fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+    fireEvent.click(screen.getByRole('button', { name: '添加连接' }));
+
+    const urlInput = screen.getByLabelText('Streamable HTTP URL');
+    const url = 'https://mcp.example.com/mcp';
+    urlInput.focus();
+    for (let length = 1; length <= url.length; length += 1) {
+      fireEvent.change(urlInput, { target: { value: url.slice(0, length) } });
+      expect(urlInput).toHaveFocus();
+    }
+
+    expect(urlInput).toHaveValue(url);
+  });
+
   it('origin 或认证方式变化后不承诺保留旧凭证，并要求重新输入', async () => {
     const securedPersonal = makeServer({
       id: 'personal-secured',

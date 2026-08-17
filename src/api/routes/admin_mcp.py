@@ -13,6 +13,8 @@ from src.api.schemas.mcp import (
     McpServerListResponse,
     McpServerResponse,
     McpTestResponse,
+    PersonalMcpNetworkPolicyResponse,
+    PersonalMcpNetworkPolicyUpdate,
 )
 from src.api.services.mcp_service import (
     create_admin_server,
@@ -22,6 +24,10 @@ from src.api.services.mcp_service import (
     update_admin_server,
 )
 from src.api.services.agent_pool_service import get_agent_pool
+from src.api.services.mcp_network_policy import (
+    personal_mcp_network_policy_payload,
+    update_personal_mcp_network_policy,
+)
 from src.api.services.admin_operation_audit import (
     AdminAuditRoute,
     admin_audit_action,
@@ -88,6 +94,64 @@ async def get_servers(
         request,
         details={"returned_count": len(result.get("servers", []))},
     )
+    return result
+
+
+@router.get(
+    "/personal-network-policy",
+    response_model=PersonalMcpNetworkPolicyResponse,
+)
+@admin_audit_action("mcp.personal_network_policy.list")
+async def get_personal_network_policy(
+    request: Request,
+    _: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    result = personal_mcp_network_policy_payload(db)
+    enrich_admin_audit(
+        request,
+        details={
+            "domain_suffix_count": len(result["domain_suffixes"]),
+            "cidr_count": len(result["cidrs"]),
+        },
+    )
+    return result
+
+
+@router.put(
+    "/personal-network-policy",
+    response_model=PersonalMcpNetworkPolicyResponse,
+)
+@admin_audit_action(
+    "mcp.personal_network_policy.update",
+    target_type="mcp_personal_network_policy",
+)
+async def put_personal_network_policy(
+    request: Request,
+    payload: PersonalMcpNetworkPolicyUpdate,
+    admin_user_id: str = Depends(get_current_admin_user),
+    db: DBSession = Depends(get_db),
+):
+    enrich_admin_audit(
+        request,
+        target_id="global",
+        changed_fields=["domain_suffixes", "cidrs"],
+        details={
+            "domain_suffix_count": len(payload.domain_suffixes),
+            "cidr_count": len(payload.cidrs),
+        },
+    )
+    result = update_personal_mcp_network_policy(
+        db,
+        domain_suffixes=payload.domain_suffixes,
+        cidrs=payload.cidrs,
+        admin_user_id=admin_user_id,
+    )
+    enrich_admin_audit(
+        request,
+        details={"disabled_installation_count": result["disabled_installations"]},
+    )
+    await _invalidate_all_agents()
     return result
 
 

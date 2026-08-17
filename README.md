@@ -136,7 +136,7 @@ Define Cron jobs via the `manage_cron` tool, and your AI assistant runs them aut
 OpenCapyBox supports external tools through [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) and currently supports **Streamable HTTP only**. Connections are stored in the database; the server no longer launches MCP processes from a local `mcp.json`:
 
 - **Official MCP** servers are created, tested, published, and disabled by administrators. They may use a platform credential and may be marked platform-required; ordinary connections are user-enabled and may use a credential override, while required connections are automatically enabled and cannot be disabled by users.
-- **Personal MCP** servers are owned and visible only by the user. Public HTTPS is required by default.
+- **Personal MCP** servers are owned and visible only by the user. Public HTTPS is required by default. Administrators may configure a global domain-suffix/CIDR allowlist for trusted internal services; localhost, cloud metadata, and other high-risk destinations remain permanently blocked.
 - **`mcp.json`** is an import/export format for personal MCP entries, not the runtime source of truth. Exports always omit tokens and headers.
 
 ```json

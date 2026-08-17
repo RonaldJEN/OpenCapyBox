@@ -38,13 +38,16 @@ from src.api.schemas.mcp import (
     UserMcpServerPatch,
 )
 from src.api.services.mcp_security import (
+    McpNetworkAuthorization,
     McpSecurityError,
+    PersonalMcpNetworkPolicy,
     credential_header_names,
     credential_headers,
     credential_payload,
     encrypt_credential,
     mcp_url_without_query,
     sanitize_mcp_exception,
+    resolve_mcp_endpoint,
     validate_mcp_url,
 )
 from src.api.services.mcp_runtime import (
@@ -74,6 +77,7 @@ class _ProbeServerSnapshot:
     auth_type: str
     allow_private_network: bool
     allow_insecure_http: bool
+    personal_network_policy: PersonalMcpNetworkPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -81,7 +85,10 @@ class _ProbeCredentialSnapshot:
     encrypted_secret: str
 
 
-def _probe_server_snapshot(server: McpServer) -> _ProbeServerSnapshot:
+def _probe_server_snapshot(
+    server: McpServer,
+    personal_network_policy: PersonalMcpNetworkPolicy | None = None,
+) -> _ProbeServerSnapshot:
     return _ProbeServerSnapshot(
         id=str(server.id),
         source=str(server.source),
@@ -90,6 +97,7 @@ def _probe_server_snapshot(server: McpServer) -> _ProbeServerSnapshot:
         auth_type=str(server.auth_type),
         allow_private_network=bool(server.allow_private_network),
         allow_insecure_http=bool(server.allow_insecure_http),
+        personal_network_policy=personal_network_policy,
     )
 
 
@@ -107,7 +115,9 @@ def _probe_target_fingerprint(
     *,
     installation_id: str,
     user_id: str,
+    personal_network_policy_version: int | None = None,
 ) -> str:
+    policy = getattr(server, "personal_network_policy", None)
     return mcp_execution_fingerprint(
         installation_id=installation_id,
         server_id=str(server.id),
@@ -121,7 +131,25 @@ def _probe_target_fingerprint(
         ),
         allow_private_network=bool(server.allow_private_network),
         allow_insecure_http=bool(server.allow_insecure_http),
+        personal_network_policy_version=(
+            int(personal_network_policy_version)
+            if personal_network_policy_version is not None
+            else int(policy.version if policy is not None else 0)
+        ),
     )
+
+
+@dataclass(frozen=True)
+class McpProbeResult:
+    tools: list[Any]
+    latency_ms: int
+    network_authorization: McpNetworkAuthorization | None = None
+
+    def __iter__(self):
+        # Preserve the long-standing two-value unpacking contract used by
+        # catalog callers and injected test probes.
+        yield self.tools
+        yield self.latency_ms
 
 
 def _scope_key(user_id: str | None) -> str:
@@ -611,12 +639,30 @@ def _current_execution_fingerprint(
     """Return the exact endpoint/credential identity used by this installation."""
 
     credential = _effective_credential(db, server, installation)
+    policy_version = 0
+    if server.source == "personal":
+        from src.api.services.mcp_network_policy import load_personal_mcp_network_policy
+
+        policy_version = load_personal_mcp_network_policy(db).policy.version
     return _probe_target_fingerprint(
         server,
         credential,
         installation_id=str(installation.id),
         user_id=str(installation.user_id),
+        personal_network_policy_version=policy_version,
     )
+
+
+def _validate_personal_server_url(db: DBSession, value: str) -> str:
+    from src.api.services.mcp_network_policy import load_personal_mcp_network_policy
+
+    policy = load_personal_mcp_network_policy(db).policy
+    if urlsplit(str(value or "")).scheme.lower() == "http":
+        return resolve_mcp_endpoint(
+            value,
+            personal_network_policy=policy,
+        ).url
+    return validate_mcp_url(value, personal_network_policy=policy)
 
 
 def _validated_current_execution_fingerprint(
@@ -644,12 +690,30 @@ def _validated_current_execution_fingerprint(
         if raise_on_error:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return None
-    return _probe_target_fingerprint(
-        server,
-        credential,
-        installation_id=str(installation.id),
-        user_id=str(installation.user_id),
+    return _current_execution_fingerprint(
+        db,
+        server=server,
+        installation=installation,
     )
+
+
+def _contains_mcp_security_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, McpSecurityError):
+            return True
+        nested = getattr(current, "exceptions", None)
+        if isinstance(nested, tuple):
+            pending.extend(item for item in nested if isinstance(item, BaseException))
+        for candidate in (current.__cause__, current.__context__):
+            if isinstance(candidate, BaseException):
+                pending.append(candidate)
+    return False
 
 
 def _current_tool_snapshot_query(
@@ -1100,7 +1164,7 @@ def create_personal_server(
             detail="新 MCP 连接必须先以停用状态保存，再使用激活接口完成连接发现",
         )
     try:
-        url = validate_mcp_url(payload.url)
+        url = _validate_personal_server_url(db, payload.url)
     except McpSecurityError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
@@ -1171,7 +1235,7 @@ def update_personal_server(
             setattr(server, field, data[field])
     if "url" in data:
         try:
-            server.url = validate_mcp_url(data["url"])
+            server.url = _validate_personal_server_url(db, data["url"])
         except McpSecurityError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Credentials authorize an origin, not an arbitrary future target. A
@@ -1206,10 +1270,12 @@ def update_personal_server(
         # Configuration writes are staged. The old connection must stop before
         # a new target can be discovered and atomically activated.
         installation.enabled = False
+        installation.network_authorization_json = None
         server.last_tested_at = None
         server.last_error = None
     if data.get("enabled") is False:
         installation.enabled = False
+        installation.network_authorization_json = None
     elif data.get("enabled") is True:
         try:
             _assert_current_discovery(
@@ -1290,6 +1356,7 @@ def update_connection(
         installation.credential_id = None
     if credential_changed and not bool(server.required):
         installation.enabled = False
+        installation.network_authorization_json = None
     if payload.enabled:
         if bool(server.required) and credential_changed:
             db.rollback()
@@ -1316,6 +1383,8 @@ def update_connection(
         installation.enabled = True
     else:
         installation.enabled = bool(server.required)
+        if not installation.enabled:
+            installation.network_authorization_json = None
     if server.source == "personal" and (
         payload.bearer_token is not None
         or payload.headers is not None
@@ -1502,7 +1571,7 @@ def resolve_effective_servers(
 async def probe_mcp_server(
     server: McpServer | _ProbeServerSnapshot,
     credential: McpCredential | _ProbeCredentialSnapshot | None,
-) -> tuple[list[Any], int]:
+) -> McpProbeResult:
     """Initialize a Streamable HTTP session and list its tools."""
 
     headers = credential_headers(
@@ -1516,11 +1585,12 @@ async def probe_mcp_server(
     from src.api.services.mcp_runtime import probe_streamable_http
 
     started = perf_counter()
-    tools = await probe_streamable_http(
+    tools, network_authorization = await probe_streamable_http(
         url=server.url,
         headers=headers,
         allow_private_network=bool(server.allow_private_network),
         allow_insecure_http=bool(server.allow_insecure_http),
+        personal_network_policy=getattr(server, "personal_network_policy", None),
         timeout_seconds=timeout_seconds,
     )
     for tool in tools:
@@ -1547,7 +1617,11 @@ async def probe_mcp_server(
             annotations=annotations,
         )
     latency_ms = int((perf_counter() - started) * 1000)
-    return tools, latency_ms
+    return McpProbeResult(
+        tools=tools,
+        latency_ms=latency_ms,
+        network_authorization=network_authorization,
+    )
 
 
 def _jsonable(value: Any) -> Any:
@@ -1769,7 +1843,12 @@ async def test_user_server(
         db.rollback()
         raise HTTPException(status_code=409, detail="MCP 连接在测试前已被删除")
     credential = _effective_credential(db, server, installation)
-    probe_server = _probe_server_snapshot(server)
+    personal_policy = None
+    if server.source == "personal":
+        from src.api.services.mcp_network_policy import load_personal_mcp_network_policy
+
+        personal_policy = load_personal_mcp_network_policy(db).policy
+    probe_server = _probe_server_snapshot(server, personal_policy)
     probe_credential = _probe_credential_snapshot(credential)
     target_fingerprint = _probe_target_fingerprint(
         probe_server,
@@ -1783,11 +1862,16 @@ async def test_user_server(
     tools: list[Any] = []
     warmup_candidates: list[Any] = []
     safe_error: str | None = None
+    policy_denied = False
+    network_authorization: McpNetworkAuthorization | None = None
     try:
-        tools, latency_ms = await probe_mcp_server(probe_server, probe_credential)
+        probe_result = await probe_mcp_server(probe_server, probe_credential)
+        tools, latency_ms = probe_result
+        network_authorization = getattr(probe_result, "network_authorization", None)
     except Exception as exc:
         latency_ms = int((perf_counter() - started) * 1000)
         safe_error = _safe_probe_error(exc, probe_server, probe_credential)
+        policy_denied = _contains_mcp_security_error(exc)
 
     # Serialize with user-scoped mutations on the quota row, then acquire the
     # target rows in the same server -> installation order as runtime snapshot
@@ -1824,6 +1908,11 @@ async def test_user_server(
             current_credential,
             installation_id=str(current_installation.id),
             user_id=user_id,
+            personal_network_policy_version=(
+                load_personal_mcp_network_policy(db).policy.version
+                if current_server.source == "personal"
+                else 0
+            ),
         )
         if current_installation is not None
         else None
@@ -1862,6 +1951,20 @@ async def test_user_server(
         except Exception as exc:
             safe_error = _safe_probe_error(exc, probe_server, probe_credential)
     if is_personal:
+        if policy_denied:
+            current_installation.enabled = False
+            current_installation.network_authorization_json = None
+            bump_config_version(db, user_id)
+        elif safe_error is None and current_installation.enabled:
+            current_installation.network_authorization_json = (
+                None
+                if network_authorization is None
+                else json.dumps(
+                    network_authorization.to_jsonable(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
         current_server.last_tested_at = now_naive()
         current_server.last_error = safe_error
     db.commit()
@@ -1966,7 +2069,12 @@ async def activate_user_server(
         db.rollback()
         raise HTTPException(status_code=409, detail="MCP 连接在激活前已被删除")
     current_credential = _effective_credential(db, server, installation)
-    probe_server = _probe_server_snapshot(server)
+    personal_policy = None
+    if server.source == "personal":
+        from src.api.services.mcp_network_policy import load_personal_mcp_network_policy
+
+        personal_policy = load_personal_mcp_network_policy(db).policy
+    probe_server = _probe_server_snapshot(server, personal_policy)
     probe_credential = _proposed_activation_credential(
         db,
         server=server,
@@ -1982,7 +2090,9 @@ async def activate_user_server(
     db.rollback()
 
     try:
-        tools, _latency_ms = await probe_mcp_server(probe_server, probe_credential)
+        probe_result = await probe_mcp_server(probe_server, probe_credential)
+        tools, _latency_ms = probe_result
+        network_authorization = getattr(probe_result, "network_authorization", None)
     except Exception as exc:
         safe_error = _safe_probe_error(exc, probe_server, probe_credential)
         raise HTTPException(
@@ -2021,6 +2131,11 @@ async def activate_user_server(
         locked_credential,
         installation_id=str(current_installation.id),
         user_id=user_id,
+        personal_network_policy_version=(
+            load_personal_mcp_network_policy(db).policy.version
+            if current_server.source == "personal"
+            else 0
+        ),
     )
     if locked_base_fingerprint != base_fingerprint:
         db.rollback()
@@ -2089,6 +2204,15 @@ async def activate_user_server(
             )
             current_installation.enabled = True
             if current_server.source == "personal":
+                current_installation.network_authorization_json = (
+                    None
+                    if network_authorization is None
+                    else json.dumps(
+                        network_authorization.to_jsonable(),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
                 current_server.last_tested_at = now_naive()
                 current_server.last_error = None
             bump_config_version(db, user_id)

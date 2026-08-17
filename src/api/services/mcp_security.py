@@ -33,6 +33,40 @@ class ResolvedMcpEndpoint:
     hostname: str
     port: int
     addresses: tuple[str, ...]
+    network_authorization: "McpNetworkAuthorization | None" = None
+
+
+@dataclass(frozen=True)
+class PersonalMcpNetworkPolicy:
+    """Normalized administrator exceptions for personal MCP endpoints."""
+
+    domain_suffixes: tuple[str, ...] = ()
+    cidrs: tuple[str, ...] = ()
+    version: int = 0
+
+    @property
+    def networks(self) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+        return tuple(ipaddress.ip_network(value) for value in self.cidrs)
+
+
+@dataclass(frozen=True)
+class McpNetworkAuthorization:
+    """Non-secret evidence explaining why a personal endpoint was allowed."""
+
+    scheme: str
+    hostname: str
+    addresses: tuple[str, ...]
+    matched_domain_suffix: str | None = None
+    matched_cidrs: tuple[str, ...] = ()
+
+    def to_jsonable(self) -> dict[str, Any]:
+        return {
+            "scheme": self.scheme,
+            "hostname": self.hostname,
+            "addresses": list(self.addresses),
+            "matched_domain_suffix": self.matched_domain_suffix,
+            "matched_cidrs": list(self.matched_cidrs),
+        }
 
 
 _BLOCKED_HOSTNAMES = {
@@ -65,6 +99,23 @@ _BLOCKED_IPV6_TRANSITION_NETWORKS = (
     ipaddress.IPv6Network("64:ff9b::/96"),
     ipaddress.IPv6Network("64:ff9b:1::/48"),
 )
+_PERSONAL_NEVER_ALLOW_NETWORKS = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("100.100.100.200/32"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("::ffff:0:0/96"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("ff00::/8"),
+    ipaddress.ip_network("2001::/32"),
+    ipaddress.ip_network("2002::/16"),
+    *_BLOCKED_IPV6_TRANSITION_NETWORKS,
+)
+_MAX_PERSONAL_NETWORK_POLICY_ENTRIES = 100
 _BLOCKED_HEADER_NAMES = {
     "accept-encoding",
     "connection",
@@ -174,12 +225,177 @@ def _is_non_public_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) ->
     return False
 
 
+def _is_personal_never_allowed_ip(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    if (
+        any(
+            address.version == network.version and address in network
+            for network in _PERSONAL_NEVER_ALLOW_NETWORKS
+        )
+        or address.is_unspecified
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+    ):
+        return True
+    if isinstance(address, ipaddress.IPv6Address):
+        if any(address in network for network in _BLOCKED_IPV6_TRANSITION_NETWORKS):
+            return True
+        if address.ipv4_mapped is not None or address.sixtofour is not None or address.teredo is not None:
+            return True
+    return False
+
+
+def normalize_personal_mcp_network_policy(
+    domain_suffixes: list[str] | tuple[str, ...] | None,
+    cidrs: list[str] | tuple[str, ...] | None,
+    *,
+    version: int = 0,
+) -> PersonalMcpNetworkPolicy:
+    """Validate, normalize and bound the global personal-MCP policy."""
+
+    raw_domains = list(domain_suffixes or ())
+    raw_cidrs = list(cidrs or ())
+    if len(raw_domains) + len(raw_cidrs) > _MAX_PERSONAL_NETWORK_POLICY_ENTRIES:
+        raise McpSecurityError("个人 MCP 网络白名单最多允许 100 条")
+
+    domains: set[str] = set()
+    for raw_value in raw_domains:
+        value = str(raw_value or "").strip().rstrip(".")
+        if not value or "*" in value or "://" in value or "/" in value:
+            raise McpSecurityError("个人 MCP 域名白名单格式非法")
+        try:
+            normalized = value.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise McpSecurityError("个人 MCP 域名白名单 IDNA 编码非法") from exc
+        try:
+            ipaddress.ip_address(normalized)
+        except ValueError:
+            pass
+        else:
+            raise McpSecurityError("IP 地址必须配置为 CIDR")
+        if len(normalized) > 253 or len(normalized.split(".")) < 2:
+            raise McpSecurityError("个人 MCP 域名白名单至少需要两个标签")
+        if normalized in _BLOCKED_HOSTNAMES:
+            raise McpSecurityError("不能将本机或云元数据域名加入个人 MCP 白名单")
+        domains.add(normalized)
+
+    normalized_cidrs: set[str] = set()
+    for raw_value in raw_cidrs:
+        value = str(raw_value or "").strip()
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError as exc:
+            raise McpSecurityError(f"个人 MCP CIDR 格式非法: {value}") from exc
+        if (network.version == 4 and network.prefixlen < 8) or (
+            network.version == 6 and network.prefixlen < 16
+        ):
+            raise McpSecurityError("个人 MCP CIDR 范围过宽")
+        if any(
+            network.version == blocked.version and network.overlaps(blocked)
+            for blocked in _PERSONAL_NEVER_ALLOW_NETWORKS
+        ):
+            raise McpSecurityError("个人 MCP CIDR 包含永久禁止访问的地址")
+        normalized_cidrs.add(str(network))
+
+    return PersonalMcpNetworkPolicy(
+        domain_suffixes=tuple(sorted(domains)),
+        cidrs=tuple(
+            sorted(
+                normalized_cidrs,
+                key=lambda item: (
+                    ipaddress.ip_network(item).version,
+                    int(ipaddress.ip_network(item).network_address),
+                    ipaddress.ip_network(item).prefixlen,
+                ),
+            )
+        ),
+        version=max(0, int(version)),
+    )
+
+
+def _matching_domain_suffix(
+    hostname: str,
+    policy: PersonalMcpNetworkPolicy | None,
+) -> str | None:
+    if policy is None:
+        return None
+    matches = [
+        suffix
+        for suffix in policy.domain_suffixes
+        if hostname == suffix or hostname.endswith(f".{suffix}")
+    ]
+    return max(matches, key=len) if matches else None
+
+
+def authorize_personal_mcp_endpoint(
+    *,
+    scheme: str,
+    hostname: str,
+    addresses: tuple[str, ...],
+    policy: PersonalMcpNetworkPolicy | None,
+) -> McpNetworkAuthorization | None:
+    """Authorize resolved personal-MCP destinations or fail closed."""
+
+    if hostname in _BLOCKED_HOSTNAMES:
+        raise McpSecurityError("个人 MCP 不能访问本机或云元数据地址")
+    parsed_addresses = tuple(ipaddress.ip_address(value) for value in addresses)
+    for address in parsed_addresses:
+        if _is_personal_never_allowed_ip(address):
+            raise McpSecurityError("个人 MCP 主机解析到永久禁止访问的地址")
+
+    domain_match = _matching_domain_suffix(hostname, policy)
+    networks = () if policy is None else policy.networks
+    matched_cidrs: set[str] = set()
+    uncovered_non_public = False
+    # A domain match authorizes HTTP only for the private addresses it is
+    # meant to reach. A public address needs its own explicit CIDR entry, so
+    # whitelisting an internal-sounding domain can't silently grant a
+    # plaintext-HTTP exception for whatever public address it resolves to.
+    all_addresses_http_authorized = bool(parsed_addresses)
+    for address in parsed_addresses:
+        matching = [
+            network
+            for network in networks
+            if address.version == network.version and address in network
+        ]
+        if matching:
+            matched_cidrs.add(str(max(matching, key=lambda item: item.prefixlen)))
+        non_public = _is_non_public_ip(address)
+        if non_public and domain_match is None and not matching:
+            uncovered_non_public = True
+        if not matching and not (non_public and domain_match is not None):
+            all_addresses_http_authorized = False
+    if uncovered_non_public:
+        raise McpSecurityError("MCP 主机解析到未被管理员白名单授权的非公网地址")
+    if scheme != "https" and not all_addresses_http_authorized:
+        raise McpSecurityError("个人 MCP 的 HTTP 连接必须命中 CIDR 白名单，或命中域名白名单且解析地址为私网地址")
+
+    policy_used = bool(
+        scheme != "https"
+        or any(_is_non_public_ip(address) for address in parsed_addresses)
+    )
+    if not policy_used:
+        return None
+    return McpNetworkAuthorization(
+        scheme=scheme,
+        hostname=hostname,
+        addresses=tuple(str(address) for address in parsed_addresses),
+        matched_domain_suffix=domain_match,
+        matched_cidrs=tuple(sorted(matched_cidrs)),
+    )
+
+
 def _resolve_addresses(
     hostname: str,
     port: int,
     *,
     allow_private_network: bool,
-) -> tuple[str, tuple[str, ...]]:
+    scheme: str = "https",
+    personal_network_policy: PersonalMcpNetworkPolicy | None = None,
+) -> tuple[str, tuple[str, ...], McpNetworkAuthorization | None]:
     try:
         wire_hostname = hostname.encode("idna").decode("ascii").lower()
     except UnicodeError as exc:
@@ -202,7 +418,11 @@ def _resolve_addresses(
             address = str(ipaddress.ip_address(record[4][0]))
         except ValueError as exc:
             raise McpSecurityError("MCP 主机解析结果非法") from exc
-        if not allow_private_network and _is_non_public_ip(ipaddress.ip_address(address)):
+        if (
+            not allow_private_network
+            and personal_network_policy is None
+            and _is_non_public_ip(ipaddress.ip_address(address))
+        ):
             raise McpSecurityError("MCP 主机解析到非公网地址")
         if address not in seen and len(addresses) < _MAX_MCP_DNS_ADDRESSES:
             seen.add(address)
@@ -210,7 +430,15 @@ def _resolve_addresses(
 
     if not addresses:
         raise McpSecurityError("MCP 主机名没有可用地址")
-    return wire_hostname, tuple(addresses)
+    authorization = None
+    if not allow_private_network and personal_network_policy is not None:
+        authorization = authorize_personal_mcp_endpoint(
+            scheme=scheme,
+            hostname=wire_hostname,
+            addresses=tuple(addresses),
+            policy=personal_network_policy,
+        )
+    return wire_hostname, tuple(addresses), authorization
 
 
 def validate_mcp_headers(headers: dict[str, str] | None) -> dict[str, str]:
@@ -255,6 +483,7 @@ def validate_mcp_url(
     allow_private_network: bool = False,
     allow_insecure_http: bool = False,
     resolve_dns: bool = False,
+    personal_network_policy: PersonalMcpNetworkPolicy | None = None,
 ) -> str:
     """Validate and normalize a Streamable HTTP endpoint.
 
@@ -274,7 +503,11 @@ def validate_mcp_url(
     scheme = parsed.scheme.lower()
     if scheme not in {"https", "http"}:
         raise McpSecurityError("仅支持 Streamable HTTP 的 http/https URL")
-    if scheme != "https" and not allow_insecure_http:
+    if (
+        scheme != "https"
+        and not allow_insecure_http
+        and personal_network_policy is None
+    ):
         raise McpSecurityError("MCP URL 必须使用 HTTPS")
     if not parsed.hostname:
         raise McpSecurityError("MCP URL 缺少主机名")
@@ -291,8 +524,16 @@ def validate_mcp_url(
         literal_ip = ipaddress.ip_address(hostname)
     except ValueError:
         literal_ip = None
-    if literal_ip is not None and not allow_private_network and _is_non_public_ip(literal_ip):
-        raise McpSecurityError("个人 MCP 只能访问公网地址")
+    if literal_ip is not None and not allow_private_network:
+        if personal_network_policy is None and _is_non_public_ip(literal_ip):
+            raise McpSecurityError("个人 MCP 只能访问公网地址")
+        if personal_network_policy is not None:
+            authorize_personal_mcp_endpoint(
+                scheme=scheme,
+                hostname=hostname,
+                addresses=(str(literal_ip),),
+                policy=personal_network_policy,
+            )
 
     try:
         port = parsed.port
@@ -306,6 +547,8 @@ def validate_mcp_url(
             hostname,
             port or (443 if scheme == "https" else 80),
             allow_private_network=allow_private_network,
+            scheme=scheme,
+            personal_network_policy=personal_network_policy,
         )
 
     # urlsplit lower-cases hostname through .hostname but preserves the raw
@@ -320,6 +563,7 @@ def resolve_mcp_endpoint(
     *,
     allow_private_network: bool = False,
     allow_insecure_http: bool = False,
+    personal_network_policy: PersonalMcpNetworkPolicy | None = None,
 ) -> ResolvedMcpEndpoint:
     """Validate an MCP URL and capture the addresses used by the TCP connector.
 
@@ -332,20 +576,24 @@ def resolve_mcp_endpoint(
         allow_private_network=allow_private_network,
         allow_insecure_http=allow_insecure_http,
         resolve_dns=False,
+        personal_network_policy=personal_network_policy,
     )
     parsed = urlsplit(url)
     hostname = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    wire_hostname, addresses = _resolve_addresses(
+    wire_hostname, addresses, authorization = _resolve_addresses(
         hostname,
         port,
         allow_private_network=allow_private_network,
+        scheme=parsed.scheme,
+        personal_network_policy=personal_network_policy,
     )
     return ResolvedMcpEndpoint(
         url=url,
         hostname=wire_hostname,
         port=port,
         addresses=addresses,
+        network_authorization=authorization,
     )
 
 

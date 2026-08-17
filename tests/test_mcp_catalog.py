@@ -1,6 +1,7 @@
 """MCP catalog API and persistence tests."""
 
 import json
+import socket
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -11,7 +12,7 @@ from threading import Event
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import event
 from sqlalchemy.dialects import postgresql
@@ -171,8 +172,174 @@ def test_models_are_registered_in_metadata():
         "mcp_tool_snapshots",
         "mcp_tool_search_indexes",
         "mcp_config_versions",
+        "mcp_personal_network_policies",
     }
     assert expected.issubset(Base.metadata.tables)
+
+
+def test_admin_personal_network_policy_api_normalizes_and_requires_admin(
+    mcp_client: TestClient,
+):
+    empty = mcp_client.get("/admin/mcp/personal-network-policy")
+    assert empty.status_code == 200, empty.text
+    assert empty.json()["domain_suffixes"] == []
+    assert empty.json()["cidrs"] == []
+
+    updated = mcp_client.put(
+        "/admin/mcp/personal-network-policy",
+        json={
+            "domain_suffixes": ["Company.CC.com.", "company.cc.com"],
+            "cidrs": ["10.20.0.0/16"],
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["domain_suffixes"] == ["company.cc.com"]
+    assert updated.json()["cidrs"] == ["10.20.0.0/16"]
+    assert updated.json()["version"] == 1
+
+    def deny_admin():
+        raise HTTPException(status_code=403, detail="管理员权限不足")
+
+    mcp_client.app.dependency_overrides[get_current_admin_user] = deny_admin
+    denied = mcp_client.get("/admin/mcp/personal-network-policy")
+    assert denied.status_code == 403
+    mcp_client.app.dependency_overrides[get_current_admin_user] = lambda: "admin"
+
+
+@pytest.mark.parametrize("cidr", ["0.0.0.0/0", "127.0.0.0/8", "10.20.0.1/16"])
+def test_admin_personal_network_policy_rejects_invalid_cidr(
+    mcp_client: TestClient,
+    cidr: str,
+):
+    response = mcp_client.put(
+        "/admin/mcp/personal-network-policy",
+        json={"domain_suffixes": [], "cidrs": [cidr]},
+    )
+    assert response.status_code == 400, response.text
+
+
+def test_personal_http_server_requires_and_uses_admin_allowlist(
+    mcp_client: TestClient,
+    monkeypatch,
+):
+    records = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.20.1.5", 80)),
+    ]
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: records)
+    rejected = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "private-http-rejected",
+            "url": "http://mcp.company.cc.com/mcp",
+            "auth_type": "none",
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+
+    allowed_policy = mcp_client.put(
+        "/admin/mcp/personal-network-policy",
+        json={"domain_suffixes": ["company.cc.com"], "cidrs": []},
+    )
+    assert allowed_policy.status_code == 200, allowed_policy.text
+    created = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "private-http-allowed",
+            "url": "http://mcp.company.cc.com/mcp",
+            "auth_type": "none",
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["url"] == "http://mcp.company.cc.com/mcp"
+
+
+def test_policy_update_disables_only_connections_that_lose_authorization(
+    mcp_client: TestClient,
+):
+    initial = mcp_client.put(
+        "/admin/mcp/personal-network-policy",
+        json={
+            "domain_suffixes": ["old.company.cc.com", "kept.company.cc.com"],
+            "cidrs": [],
+        },
+    )
+    assert initial.status_code == 200, initial.text
+
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        old_server = McpServer(
+            source="personal",
+            owner_user_id="alice",
+            name="old-private",
+            url="http://mcp.old.company.cc.com/mcp",
+            status="published",
+            auth_type="none",
+        )
+        kept_server = McpServer(
+            source="personal",
+            owner_user_id="alice",
+            name="kept-private",
+            url="http://mcp.kept.company.cc.com/mcp",
+            status="published",
+            auth_type="none",
+        )
+        public_server = McpServer(
+            source="personal",
+            owner_user_id="alice",
+            name="public-https",
+            url="https://93.184.216.34/mcp",
+            status="published",
+            auth_type="none",
+        )
+        db.add_all([old_server, kept_server, public_server])
+        db.flush()
+        db.add_all([
+            McpInstallation(
+                server_id=old_server.id,
+                user_id="alice",
+                enabled=True,
+                network_authorization_json=json.dumps({
+                    "scheme": "http",
+                    "hostname": "mcp.old.company.cc.com",
+                    "addresses": ["10.20.1.5"],
+                }),
+            ),
+            McpInstallation(
+                server_id=kept_server.id,
+                user_id="alice",
+                enabled=True,
+                network_authorization_json=json.dumps({
+                    "scheme": "http",
+                    "hostname": "mcp.kept.company.cc.com",
+                    "addresses": ["10.21.1.5"],
+                }),
+            ),
+            McpInstallation(
+                server_id=public_server.id,
+                user_id="alice",
+                enabled=True,
+            ),
+        ])
+        db.commit()
+        old_id = old_server.id
+        kept_id = kept_server.id
+        public_id = public_server.id
+
+    narrowed = mcp_client.put(
+        "/admin/mcp/personal-network-policy",
+        json={"domain_suffixes": ["kept.company.cc.com"], "cidrs": []},
+    )
+    assert narrowed.status_code == 200, narrowed.text
+    assert narrowed.json()["disabled_installations"] == 1
+
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        states = {
+            row.server_id: row.enabled
+            for row in db.query(McpInstallation).all()
+        }
+        assert states[old_id] is False
+        assert states[kept_id] is True
+        assert states[public_id] is True
+        assert db.query(McpServer).filter(McpServer.id == old_id).one().last_error
 
 
 def test_tool_search_index_sync_retains_and_invalidates_vectors(mcp_client: TestClient):
