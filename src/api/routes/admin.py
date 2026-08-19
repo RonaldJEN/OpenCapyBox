@@ -203,7 +203,7 @@ class AdminModelPayload(BaseModel):
     max_tokens: int = Field(default=16384, gt=0)
     context_window: int = Field(default=128000, gt=0)
     auto_compact_token_limit: int | None = Field(default=None, gt=0)
-    tool_output_truncation_bytes: int = Field(default=10000, gt=0)
+    tool_output_truncation_bytes: int = Field(default=42667, gt=0)
     reasoning_format: str = "none"
     reasoning_split: bool = False
     enable_thinking: bool = False
@@ -484,7 +484,7 @@ def _validate_model_config_values(data: dict[str, Any]) -> ModelConfig:
             max_tokens=data["max_tokens"],
             context_window=data["context_window"],
             auto_compact_token_limit=data.get("auto_compact_token_limit"),
-            tool_output_truncation_bytes=data.get("tool_output_truncation_bytes", 10000),
+            tool_output_truncation_bytes=data.get("tool_output_truncation_bytes", 42667),
             reasoning_format=data["reasoning_format"],
             reasoning_split=data["reasoning_split"],
             enable_thinking=data["enable_thinking"],

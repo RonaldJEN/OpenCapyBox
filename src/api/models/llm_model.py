@@ -20,7 +20,7 @@ class LLMModel(Base):
     max_tokens = Column(Integer, nullable=False, default=16384, server_default=text("16384"))
     context_window = Column(Integer, nullable=False, default=128000, server_default=text("128000"))
     auto_compact_token_limit = Column(Integer, nullable=True)
-    tool_output_truncation_bytes = Column(Integer, nullable=False, default=10000, server_default=text("10000"))
+    tool_output_truncation_bytes = Column(Integer, nullable=False, default=42667, server_default=text("42667"))
     reasoning_format = Column(String(40), nullable=False, default="none", server_default=text("'none'"))
     reasoning_split = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     enable_thinking = Column(Boolean, nullable=False, default=False, server_default=text("false"))

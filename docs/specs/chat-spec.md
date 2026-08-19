@@ -887,7 +887,7 @@ INSERT INTO rounds (..., idempotency_key)
          └── context overflow → 每次只删除一个最旧历史项、重新规范化并重试
 ```
 
-pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后再把该消息原样接回。replacement 中保留的历史真实 user 严格按 Codex 只抽取 text block，忽略 image/audio/video 等媒体块，禁止把 data URL 或 base64 序列化为 checkpoint 文本；媒体语义由看过完整历史的 handoff summary 承接。mid-turn 只在仍要继续调用模型时触发，压缩请求能看到完整当前工具批次，但 replacement 不保护该批次，只依赖 handoff summary。工具输出在首次写入历史时按默认 10,000 bytes（1.2 倍序列化余量）做 UTF-8 中间截断。
+pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后再把该消息原样接回。replacement 中保留的历史真实 user 严格按 Codex 只抽取 text block，忽略 image/audio/video 等媒体块，禁止把 data URL 或 base64 序列化为 checkpoint 文本；媒体语义由看过完整历史的 handoff summary 承接。mid-turn 只在仍要继续调用模型时触发，压缩请求能看到完整当前工具批次，但 replacement 不保护该批次，只依赖 handoff summary。工具输出在首次写入历史时按默认 42,667 bytes 配置和 1.2 倍序列化余量做 UTF-8 中间截断，默认正文预算为 51,200 bytes。
 
 压缩 provider 请求必须响应当前 run 的取消信号。取消胜出时中止正在进行的请求并直接结束 run；只有 provider 响应完成且取消仍未发生时，才允许持久化 checkpoint 并发布 replacement。
 

@@ -413,7 +413,7 @@ describe('McpConnectionsPanel', () => {
     });
   });
 
-  it('个人 MCP 表单只接受 HTTPS 并提交写入型凭证', async () => {
+  it('个人 MCP 表单允许提交由管理员白名单裁决的 HTTP 地址和写入型凭证', async () => {
     const stagedPersonal = makeServer({
       ...personal,
       enabled: false,
@@ -428,13 +428,7 @@ describe('McpConnectionsPanel', () => {
     fireEvent.click(screen.getAllByRole('button', { name: '添加连接' })[0]);
 
     fireEvent.change(screen.getByLabelText('连接名称'), { target: { value: '财务数据' } });
-    fireEvent.change(screen.getByLabelText('Streamable HTTP URL'), { target: { value: 'http://unsafe.example.com/mcp' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存连接' }));
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('个人 MCP 仅允许 HTTPS 地址');
-    expect(createMcpServer).not.toHaveBeenCalled();
-
-    fireEvent.change(screen.getByLabelText('Streamable HTTP URL'), { target: { value: 'https://safe.example.com/mcp' } });
+    fireEvent.change(screen.getByLabelText('Streamable HTTP URL'), { target: { value: 'http://mcp.internal.example.com/mcp' } });
     fireEvent.change(screen.getByLabelText('认证方式'), { target: { value: 'bearer' } });
     fireEvent.change(screen.getByLabelText('Bearer Token'), { target: { value: 'secret-value' } });
     fireEvent.click(screen.getByRole('button', { name: '保存连接' }));
@@ -442,7 +436,7 @@ describe('McpConnectionsPanel', () => {
     await waitFor(() => {
       expect(createMcpServer).toHaveBeenCalledWith(expect.objectContaining({
         name: '财务数据',
-        url: 'https://safe.example.com/mcp',
+        url: 'http://mcp.internal.example.com/mcp',
         auth_type: 'bearer',
         bearer_token: 'secret-value',
         enabled: false,
@@ -451,6 +445,20 @@ describe('McpConnectionsPanel', () => {
     });
     expect(testMcpServer).not.toHaveBeenCalled();
     expect(updateMcpServer).not.toHaveBeenCalled();
+  });
+
+  it('个人 MCP 表单拒绝非 HTTP(S) 地址', async () => {
+    render(<McpConnectionsPanel />);
+    await screen.findByText('官方知识库');
+    fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+    fireEvent.click(screen.getAllByRole('button', { name: '添加连接' })[0]);
+
+    fireEvent.change(screen.getByLabelText('连接名称'), { target: { value: '本地进程' } });
+    fireEvent.change(screen.getByLabelText('Streamable HTTP URL'), { target: { value: 'file:///tmp/mcp' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存连接' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('个人 MCP 仅支持 HTTP 或 HTTPS 地址');
+    expect(createMcpServer).not.toHaveBeenCalled();
   });
 
   it('新个人 MCP 激活失败时明确保留为已保存但未启用的记录', async () => {

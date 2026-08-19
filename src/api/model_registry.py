@@ -140,7 +140,7 @@ class ModelConfig:
     max_tokens: int = 16384          # 單次輸出上限（output tokens）
     context_window: int = 128000     # 模型總上下文窗口大小（input + output tokens）
     auto_compact_token_limit: int | None = None
-    tool_output_truncation_bytes: int = 10000
+    tool_output_truncation_bytes: int = 42667
     reasoning_format: str = "none"
     reasoning_split: bool = False
     enable_thinking: bool = False
@@ -403,7 +403,7 @@ def model_config_from_yaml_entry(model_id: str, cfg: dict) -> ModelConfig:
         max_tokens=cfg.get("max_tokens", 16384),
         context_window=cfg.get("context_window", 128000),
         auto_compact_token_limit=cfg.get("auto_compact_token_limit"),
-        tool_output_truncation_bytes=cfg.get("tool_output_truncation_bytes", 10000),
+        tool_output_truncation_bytes=cfg.get("tool_output_truncation_bytes", 42667),
         reasoning_format=cfg.get("reasoning_format", "none"),
         reasoning_split=cfg.get("reasoning_split", False),
         enable_thinking=cfg.get("enable_thinking", False),

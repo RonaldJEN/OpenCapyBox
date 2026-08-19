@@ -201,7 +201,7 @@ def db_model_to_config(model: LLMModel) -> ModelConfig:
             else None
         ),
         tool_output_truncation_bytes=int(
-            10000
+            42667
             if model.tool_output_truncation_bytes is None
             else model.tool_output_truncation_bytes
         ),

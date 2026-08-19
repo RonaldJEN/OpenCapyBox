@@ -381,7 +381,7 @@ class AgentService:
             user_id=self.user_id,
             allow_human_interrupts=self.allow_human_interrupts,
             auto_compact_token_limit=getattr(model_config, "auto_compact_token_limit", None),
-            tool_output_truncation_bytes=getattr(model_config, "tool_output_truncation_bytes", 10000),
+            tool_output_truncation_bytes=getattr(model_config, "tool_output_truncation_bytes", 42667),
             supports_image=bool(getattr(model_config, "supports_image", False)),
             supports_video=bool(getattr(model_config, "supports_video", False)),
         )

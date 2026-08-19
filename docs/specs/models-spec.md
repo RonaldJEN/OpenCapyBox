@@ -30,7 +30,7 @@
 | `max_tokens` | int | 最大输出 token 数 |
 | `context_window` | int | 上下文窗口大小 |
 | `auto_compact_token_limit` | int/null | 可选自动压缩阈值，最终不得超过 `(context_window - max_tokens) * 80%` |
-| `tool_output_truncation_bytes` | int | 通用工具结果记录截断策略，必须大于 0，默认 10000 bytes；自行严格限流的内建工具成功结果可豁免 |
+| `tool_output_truncation_bytes` | int | 通用工具结果记录截断策略，必须大于 0，默认 42667 bytes；按 1.2 倍序列化余量得到 51200 UTF-8 bytes 正文预算；自行严格限流的内建工具成功结果可豁免 |
 | `reasoning_format` | str | 推理格式配置 |
 | `reasoning_split` | bool | 是否发送 `reasoning_split` |
 | `thinking_mode` | str | 内部传输字段：`provider_default` 省略开关；`enabled` / `disabled` 显式发送 true / false；管理端不单独暴露 |

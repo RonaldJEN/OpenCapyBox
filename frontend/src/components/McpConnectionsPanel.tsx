@@ -673,12 +673,12 @@ export default function McpConnectionsPanel({
     if (editor.mode === 'personal') {
       try {
         const parsedUrl = new URL(url);
-        if (parsedUrl.protocol !== 'https:') {
-          setEditorError('个人 MCP 仅允许 HTTPS 地址');
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+          setEditorError('个人 MCP 仅支持 HTTP 或 HTTPS 地址');
           return;
         }
       } catch {
-        setEditorError('请输入有效的 HTTPS 地址');
+        setEditorError('请输入有效的 HTTP 或 HTTPS 地址');
         return;
       }
     }
@@ -1012,7 +1012,7 @@ export default function McpConnectionsPanel({
         </div>
         <div>
           <strong>Streamable HTTP</strong>
-          <p>连接由 OpenCapyBox 服务端建立。个人连接仅允许公网 HTTPS，凭证不会回显。</p>
+          <p>连接由 OpenCapyBox 服务端建立。个人连接默认仅允许公网 HTTPS；管理员白名单可放行受信任的内网或 HTTP 地址。凭证不会回显。</p>
         </div>
       </div>
 
@@ -1380,7 +1380,7 @@ export default function McpConnectionsPanel({
                 <>
                   <label>连接名称<input value={editor.values.name} onChange={(event) => updateEditor('name', event.target.value)} placeholder="例如：内部知识库" /></label>
                   <label>说明<textarea value={editor.values.description} onChange={(event) => updateEditor('description', event.target.value)} placeholder="说明这个服务提供什么能力" /></label>
-                  <label>Streamable HTTP URL<input value={editor.values.url} onChange={(event) => updateEditor('url', event.target.value)} placeholder="https://mcp.example.com/mcp" /></label>
+                  <label>Streamable HTTP URL<input value={editor.values.url} onChange={(event) => updateEditor('url', event.target.value)} placeholder="https://mcp.example.com/mcp 或 http://mcp.internal/mcp" /></label>
                 </>
               ) : (
                 <div className="mcp-user-readonly-url"><span>服务地址</span><code>{editor.server?.url}</code></div>

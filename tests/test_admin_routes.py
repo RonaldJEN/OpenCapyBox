@@ -34,6 +34,23 @@ class TestAdminRouter:
         assert resp.status_code == 403
         assert "管理员权限" in resp.json()["detail"]
 
+    def test_model_payload_uses_default_tool_output_truncation_bytes(self):
+        payload = admin_routes.AdminModelPayload(
+            model_id="default-truncation",
+            display_name="Default Truncation",
+            provider="openai",
+            api_base="https://api.example.com/v1",
+            api_key="test-key",
+            model_name="default-truncation",
+        )
+
+        assert payload.tool_output_truncation_bytes == 42667
+
+    def test_model_patch_omits_tool_output_truncation_bytes_by_default(self):
+        payload = admin_routes.AdminModelPatchPayload(display_name="Updated")
+
+        assert "tool_output_truncation_bytes" not in payload.model_dump(exclude_unset=True)
+
     def test_create_model_rejects_zero_tool_output_truncation_bytes(self):
         client = _make_client(admin_enabled=True)
 

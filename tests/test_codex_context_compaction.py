@@ -7,8 +7,10 @@ import pytest
 
 from src.agent.agent import Agent
 from src.agent.context_compaction import (
+    DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES,
     SUMMARY_PREFIX,
     SUMMARIZATION_PROMPT,
+    TOOL_OUTPUT_SERIALIZATION_HEADROOM,
     approx_token_count,
     build_compacted_history,
     normalize_history,
@@ -212,6 +214,19 @@ def test_tool_output_uses_codex_record_time_byte_policy():
     assert "chars truncated" in truncated
     assert truncated.startswith("头")
     assert truncated.endswith("tail")
+
+
+def test_default_tool_output_budget_is_50_kib():
+    budget = int(
+        DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES
+        * TOOL_OUTPUT_SERIALIZATION_HEADROOM
+    )
+
+    assert DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES == 42_667
+    assert TOOL_OUTPUT_SERIALIZATION_HEADROOM == 1.2
+    assert budget == 51_200
+    assert truncate_tool_output("x" * budget) == "x" * budget
+    assert "chars truncated" in truncate_tool_output("x" * (budget + 1))
 
 
 @pytest.mark.asyncio

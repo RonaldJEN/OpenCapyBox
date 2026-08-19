@@ -235,7 +235,7 @@ class TestModelConfig:
         )
         model.tool_output_truncation_bytes = None
 
-        assert db_model_to_config(model).tool_output_truncation_bytes == 10000
+        assert db_model_to_config(model).tool_output_truncation_bytes == 42667
 
     def test_supports_thinking_true(self):
         """OpenAI 变体显式启用 reasoning split 时公开支持思考。"""
@@ -454,7 +454,9 @@ class TestModelRegistryLoad:
         """載入最小 YAML 成功"""
         path = self._write_yaml(tmp_path, self._minimal_yaml())
         registry = ModelRegistry.load(path)
-        assert registry.get("test-model") is not None
+        model = registry.get("test-model")
+        assert model is not None
+        assert model.tool_output_truncation_bytes == 42667
         assert registry.default_model_id == "test-model"
 
     def test_load_multiple_models(self, tmp_path):
