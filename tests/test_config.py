@@ -39,6 +39,11 @@ def test_mcp_catalog_refresh_defaults_to_five_minutes():
     assert Settings().mcp_catalog_refresh_seconds == 300.0
 
 
+def test_human_interactions_have_no_protocol_toggle():
+    assert "agent_same_round_interactions" not in Settings.model_fields
+    assert not hasattr(Settings(), "agent_same_round_interactions")
+
+
 def test_mcp_catalog_cache_has_bounded_defaults():
     settings = Settings()
     assert settings.mcp_catalog_cache_max_users == 64

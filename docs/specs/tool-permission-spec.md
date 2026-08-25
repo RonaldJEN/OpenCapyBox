@@ -30,7 +30,7 @@
 - `(run_id, tool_call_id)` 唯一（防重复审批）
 - `arguments_encrypted` / `result_encrypted`: 参数与结果均加密存储；`arguments_hash` 供审计
 - `schema_hash` / `connection_fingerprint`: 审批发起时的工具身份证据（durable）
-- `status`: `requested` → `executing` / `denied` → `executed` / `failed` / `unknown`
+- `status`: 允许路径 `requested` → `approved` → `executing` → `executed` / `failed` / `unknown`；拒绝路径 `requested` → `denied`；Round 在派发前结束时 `requested` / `approved` → `cancelled`
 - `resolution`: `allow_once` | `allow_session` | `allow_always` | `deny`
 - `execution_claim_token` + `execution_lease_expires_at`: 执行幂等围栏与租约
 
@@ -69,11 +69,11 @@
 
 ### 3.3 审批解决路径
 
-审批**不经独立 REST 端点**，而是通过 chat 的 resume-interrupt 机制解决：审批 `id` 即 interrupt id，前端在审批卡选择后以 resume payload 携带 `resolution`（`ToolApprovalResolutionPayload`，见 [src/api/schemas/tool_permission.py](../../src/api/schemas/tool_permission.py)）。
+审批**不经独立 REST 端点**，而是通过 chat 的 resume-interrupt 机制解决：审批 `id` 同时是 `AgentInteraction.id`，前端提交 `POST /api/chat/{session_id}/resume`，请求体固定为 `{"interrupt_id":"...","answers":{"approval":"allow_once|allow_session|allow_always|deny"}}`。服务端按 Interaction kind 对 `answers.approval` 做 trim/lower 与枚举校验，并让 `AgentInteraction.answer_payload`、`ToolApprovalRequest.resolution` 共用 canonical `{"approval": resolution}`；不允许客户端用顶层 `resolution` 绕过通用 resume wire。`CUSTOM interaction_requested(kind=tool_approval)` 暂停同一 Round，回答后使用同一 `runId` 继续。
 
-审批解决是**控制决策而非用户聊天输入**：它已由 `tool_approval_requests` / interrupt resolution / 审计记录持久化，且获批工具结果在历史重建时拼接回父 round。因此：
+审批解决是**控制决策而非用户聊天输入**：由 `tool_approval_requests` + `agent_interactions` + 审计记录持久化，且获批工具结果在同一 Round 的历史中替换预派发占位。因此：
 - **不**将 `resolution` 持久化为 `role="user"` 会话消息（区别于 `ask_user`，后者答案是真实用户输入）；不会伪装成聊天气泡，也不进入重建后的模型上下文。
-- resume round 可保留 `Tool approval: <resolution>` 作为内部可读文本，但**不得依据文本内容识别控制轮次**。历史 API 通过 `InterruptResolution.resume_round_id` 与对应 `ToolApprovalRequest` 的结构化关系返回 `RoundData.control_kind="tool_approval"`；前端仅依据该字段拼接轮次和隐藏控制气泡。用户真实发送同名文本时仍是普通聊天消息。
+- same-Round continuation 不生成 `Tool approval: <resolution>` 的用户消息。用户真实发送同名文本始终是普通聊天消息。
 
 ## 4. 行为语义与不变量
 
@@ -92,18 +92,27 @@
 - 条件规则不参与裁决后，最终结果继续由其他适用规则及 provider 默认策略决定；由于 MCP 默认 `allow`，没有其他限制规则时最终仍为 `ALLOW`
 
 ### 4.3 审批解决与「记住选择」
-- `allow_once`：仅本次执行，不建规则
-- `allow_session`：建 **session 作用域** ALLOW 规则
-- `allow_always`：建 **user 作用域** ALLOW 规则
-- `deny`：状态转 `denied`，不执行
+- `allow_once`：先持久化为 `approved`，仅本次执行，不建规则
+- `allow_session`：先持久化为 `approved`，建 **session 作用域** ALLOW 规则
+- `allow_always`：先持久化为 `approved`，建 **user 作用域** ALLOW 规则
+- `deny`：`requested → denied`，永不进入执行派发
 - MCP 的记住选择会写入绑定条件 `{schema_hash, connection_fingerprint}`；仅当当前 installation 的 `server_id` / `execution_fingerprint` 与快照 `schema_hash` / `connection_fingerprint` 全部一致时才建规则（`remember_binding_valid`），否则只执行本次不建规则（fail-closed，避免绑定漂移）
 
 ### 4.4 执行幂等与租约
-- `claim_approval_request` 用**状态守卫 UPDATE**（`status='requested'` CAS）保证恰有一个执行者从 `requested` 转 `executing`/`denied`
+- `prepare_approval_request` 只持久化用户决定：允许时以 `status='requested'` CAS 转 `approved`，拒绝时转 `denied`。此阶段不得设置 `execution_started_at`、claim token 或 lease。
+- `approved` 表示“决定已落库但外部副作用尚未开始”，可在进程崩溃后恢复，也可随 Round 安全取消。
+- `dispatch_approval_request` 只能在即将调用工具的执行边界，以 `status='approved'` CAS 转 `executing`，并在同一步生成唯一 `execution_claim_token` 与 lease。参数解密/完整性校验在 CAS 前完成；校验失败不得留下假 `executing`。
 - 执行者持 `execution_claim_token` + 租约；`finish_approval_request` 需 `with_for_update` + claim token 匹配才可完成
 - 租约过期**不授权重试**（远程副作用可能已发生）；reconciler 将过期 `executing` 置为 `unknown`
 - 终态：`executed`（成功）/ `failed`（失败）/ `unknown`（结果不确定或租约过期）
 - Agent 层单工具超时同样视为结果不确定：`ToolResult.outcome_uncertain=true`，权限审计记 `unknown`，不得误记为确定失败
+
+**continuation 与取消边界**：
+
+- same-Round 回答、Interaction、审批 prepare 共用事务并遵循 `Round → AgentInteraction → ToolApprovalRequest` 锁序；允许决定落库后才发 `interaction_resolved`。
+- `interaction_resolved` 尚未提交时，continuation 可从 `requested` / `approved` / `denied` 安全恢复决定投影；`denied` 只投影拒绝 tool result，不执行工具。Interaction 已 durable started 后，即使审批仍为这些 pre-dispatch 状态，continuation claim 过期也必须终态化原 Round，不得重新显示审批卡或重复 continuation。
+- `requested` / `approved` 属于 `APPROVAL_CANCELLABLE_STATUSES`。abort 或其他 Round 终态必须把它们收敛为 `cancelled`；`executing` 明确排除，因为远端副作用可能已经发生。
+- 对工具审批，Interaction 只有在最终 `TOOL_CALL_RESULT` 已持久化后才可从 pending 完成；`CUSTOM tool_approval_resume` 只标记随后结果应回填原工具占位，仅持久化 `interaction_resolved` / 该 marker 还不是完成边界。
 
 ### 4.5 暴露语义
 - `DENY` 的工具**不向模型暴露**（连 schema 都不给）
@@ -140,8 +149,11 @@
 
 | 场景 | 行为 |
 |---|---|
-| 并发解决同一审批 | CAS 只放一个成功，其余抛「already resolved」 |
+| 并发解决同一审批 | prepare CAS 只接受一个决定；大小写/首尾空白归一后的同 resolution 重试幂等，不同 resolution 报冲突；无关额外键不得改变幂等事实 |
+| 决定已批准、派发前 worker 崩溃 | 保留 `approved`，无 claim/lease/副作用，可由同一 Round continuation 恢复 |
+| 并发派发同一审批 | `approved → executing` CAS 只允许一个执行者，其余被拒绝，不重复工具调用 |
 | 执行中 worker 崩溃 | 租约到期后 reconciler 置 `unknown`，不自动重试 |
+| Round 在派发前被取消/失败 | `requested` / `approved` 与 pending Interaction 同事务收敛为 `cancelled`；不附加远端副作用警告 |
 | 完成时 claim token 不匹配 | 拒绝完成（陈旧 worker 被围栏挡下） |
 | 规则条件损坏或绑定不匹配 | 条件 ALLOW 不参与裁决，ASK/DENY 保守生效；最终结果按其他适用规则及 provider 默认策略计算 |
 | MCP 服务被删但审批未决 | 保留原始身份为证据，执行前重新校验归属/可用性 |

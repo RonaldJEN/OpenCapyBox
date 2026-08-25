@@ -76,23 +76,6 @@ describe('Round 组件', () => {
     expect(screen.getByTitle('pdf')).toHaveTextContent('PDF 处理');
   });
 
-  it('工具审批控制标记不渲染为用户消息气泡', () => {
-    const round = createMockRound({
-      user_message: 'Tool approval: allow_once',
-      control_kind: 'tool_approval',
-      preferred_skills: [{ key: 'pdf', display_name: 'PDF 处理' }],
-    });
-
-    render(<Round round={round} isStreaming={false} />);
-
-    // 审批解决结果是控制决策而非用户输入，不应出现在对话气泡里。
-    expect(screen.queryByText('Tool approval: allow_once')).not.toBeInTheDocument();
-    expect(screen.queryByText('你')).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('本轮优先 Skill')).not.toBeInTheDocument();
-    // 助手响应仍正常渲染。
-    expect(screen.getByText('这是我的分析结果...')).toBeInTheDocument();
-  });
-
   it('普通用户发送审批格式文本时仍渲染用户消息气泡', () => {
     const round = createMockRound({ user_message: 'Tool approval: allow_once' });
 
@@ -138,19 +121,6 @@ describe('Round 组件', () => {
 
     expect(screen.getByRole('button', { name: '复制回复' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '复制回复' }).parentElement).not.toHaveClass('opacity-0');
-  });
-
-  it('中断态即使有响应内容也不应显示复制按钮', () => {
-    const round = createMockRound({
-      status: 'interrupted',
-      final_response: '这是一段未完成的响应',
-      steps: [],
-    });
-
-    render(<Round round={round} isStreaming={false} />);
-
-    expect(screen.getByText('这是一段未完成的响应')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
   });
 
   it('应该渲染 ReasoningPanel 组件', () => {

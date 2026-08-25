@@ -488,6 +488,37 @@ describe('AdminConsole 组件', () => {
     });
   });
 
+  it('Session监控应提供完整 Round 状态筛选并支持 waiting_interaction', async () => {
+    render(<AdminConsole />);
+
+    await waitFor(() => {
+      expect(getAdminOverview).toHaveBeenCalled();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Session监控/ }));
+
+    const statusSelect = await screen.findByRole('combobox', { name: 'Round 状态' }) as HTMLSelectElement;
+    expect(Array.from(statusSelect.options, (option) => option.value)).toEqual([
+      'all',
+      'running',
+      'waiting_interaction',
+      'completed',
+      'failed',
+      'cancelled',
+      'max_steps_reached',
+    ]);
+
+    fireEvent.change(statusSelect, { target: { value: 'waiting_interaction' } });
+
+    await waitFor(() => {
+      expect(getAdminRoundsTree).toHaveBeenLastCalledWith({
+        limit: 5,
+        offset: 0,
+        status: 'waiting_interaction',
+        search: undefined,
+      });
+    });
+  });
+
   it('展开 Session 时才懒加载 Round 明细', async () => {
     vi.mocked(getAdminRoundsTree).mockResolvedValue({
       total_sessions: 1,

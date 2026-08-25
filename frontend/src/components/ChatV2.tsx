@@ -139,50 +139,6 @@ interface ChatV2Props {
   } | null;
 }
 
-interface DisplayRoundGroup {
-  round: RoundData;
-  sourceRoundIds: string[];
-}
-
-function mergeApprovalContinuation(base: RoundData, continuation: RoundData): RoundData {
-  return {
-    ...base,
-    last_event_sequence: continuation.last_event_sequence ?? base.last_event_sequence,
-    final_response: continuation.final_response || base.final_response,
-    steps: [...base.steps, ...continuation.steps],
-    step_count: base.step_count + continuation.step_count,
-    status: continuation.status,
-    completed_at: continuation.completed_at,
-    interrupt: continuation.interrupt,
-  };
-}
-
-function buildDisplayRoundGroups(rounds: RoundData[]): DisplayRoundGroup[] {
-  const groups: DisplayRoundGroup[] = [];
-
-  for (const round of rounds) {
-    const isApprovalContinuation = round.control_kind === 'tool_approval';
-    if (isApprovalContinuation) {
-      const parentGroupIndex = round.parent_run_id
-        ? groups.findIndex((group) => group.sourceRoundIds.includes(round.parent_run_id!))
-        : groups.length - 1;
-
-      if (parentGroupIndex >= 0) {
-        const parentGroup = groups[parentGroupIndex];
-        groups[parentGroupIndex] = {
-          round: mergeApprovalContinuation(parentGroup.round, round),
-          sourceRoundIds: [...parentGroup.sourceRoundIds, round.round_id],
-        };
-        continue;
-      }
-    }
-
-    groups.push({ round, sourceRoundIds: [round.round_id] });
-  }
-
-  return groups;
-}
-
 export function ChatV2(props: ChatV2Props) {
   const runtime = useChatRuntimeOptional();
   if (!runtime) {
@@ -211,14 +167,19 @@ function ChatV2View(props: ChatV2Props) {
     scrollTarget,
   } = props;
   const runtime = useChatRuntime();
+  const loadSessionHistory = runtime.loadSessionHistory;
   const projection = runtime.getSessionProjection(sessionId);
   const rounds = projection.rounds;
-  const displayRoundGroups = buildDisplayRoundGroups(rounds);
   const loading = projection.loading;
   const sending = projection.sending;
   const resuming = projection.resuming;
   const pendingInterrupt = projection.pendingInterrupt;
+  const waitingInteraction = rounds.some((round) => round.status === 'waiting_interaction');
   const runtimeError = projection.error;
+  const hasLocalActiveTransport = projection.activeRunKeys.some((runKey) => {
+    const source = runtime.state.runs[runKey]?.source;
+    return source === 'direct' || source === 'resume';
+  });
 
   const [disableInitialMotion, setDisableInitialMotion] = useState(false);
   const [highlightedRoundId, setHighlightedRoundId] = useState<string | null>(null);
@@ -240,7 +201,6 @@ function ChatV2View(props: ChatV2Props) {
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [stopping, setStopping] = useState(false);
-  const [dismissedInterruptId, setDismissedInterruptId] = useState<string | null>(null);
 
   const assistantFileMatchesRef = useRef<Record<string, FileInfo>>({});
   const assistantFileMissRoundCountsRef = useRef<Record<string, number>>({});
@@ -280,9 +240,12 @@ function ChatV2View(props: ChatV2Props) {
   const uploadingCurrentDraft = uploadingDraftIds.has(currentDraftId);
   const displayError = localError || runtimeError;
   const hasActiveSlot = activeSlotSessionIds?.has(sessionId) ?? false;
+  const activeSlotSessionIdsRef = useRef(activeSlotSessionIds);
+  const previousActiveSlotRef = useRef({ sessionId, hasActiveSlot });
 
   sessionIdRef.current = sessionId;
   composerDraftsRef.current = composerDrafts;
+  activeSlotSessionIdsRef.current = activeSlotSessionIds;
 
   const openFilesPanel = () => {
     if (!isFilesOpen) {
@@ -497,7 +460,6 @@ function ChatV2View(props: ChatV2Props) {
       setIsDragging(false);
       setDisableInitialMotion(false);
       setHighlightedRoundId(null);
-      setDismissedInterruptId(null);
       roundElementRefs.current = {};
       isInitialLoadRef.current = true;
       suppressAutoScrollRef.current = false;
@@ -509,15 +471,45 @@ function ChatV2View(props: ChatV2Props) {
     suppressAutoScrollRef.current = true;
     roundElementRefs.current = {};
     setHighlightedRoundId(null);
-    setDismissedInterruptId(null);
     setFilePanelTarget(null);
     resetAssistantFileMatches();
     setIsAtBottom(false);
     prevRoundsLengthRef.current = 0;
     setLocalError('');
     setStopping(false);
-    void runtime.loadSessionHistory(sessionId, { hasActiveSlot });
-  }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+    void loadSessionHistory(sessionId, {
+      hasActiveSlot,
+      isActiveSlotCurrent: () => (
+        activeSlotSessionIdsRef.current?.has(sessionId) ?? false
+      ),
+    });
+  }, [loadSessionHistory, sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const previous = previousActiveSlotRef.current;
+    previousActiveSlotRef.current = { sessionId, hasActiveSlot };
+    if (
+      !sessionId
+      || previous.sessionId !== sessionId
+      || previous.hasActiveSlot === hasActiveSlot
+    ) {
+      return;
+    }
+    if (!previous.hasActiveSlot && hasActiveSlot && hasLocalActiveTransport) {
+      return;
+    }
+
+    // A snapshot-owned slot starts/restarts init discovery for an already open
+    // session; a local direct/resume transport already owns that discovery.
+    // A removed slot cancels the stale timer but still performs one final read
+    // so a just-entered waiting_interaction Round can surface.
+    void loadSessionHistory(sessionId, {
+      hasActiveSlot,
+      isActiveSlotCurrent: () => (
+        activeSlotSessionIdsRef.current?.has(sessionId) ?? false
+      ),
+    });
+  }, [hasActiveSlot, hasLocalActiveTransport, loadSessionHistory, sessionId]);
 
   useEffect(() => {
     if (!sessionId || sending || resuming) return;
@@ -992,7 +984,7 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleStop = async () => {
-    if (!sessionId || !(sending || resuming) || stopping) return;
+    if (!sessionId || !(sending || resuming || waitingInteraction) || stopping) return;
     setStopping(true);
     try {
       await runtime.stopSessionRun(sessionId);
@@ -1006,8 +998,16 @@ function ChatV2View(props: ChatV2Props) {
     await runtime.resumeRun(sessionId, pendingInterrupt, answers);
   };
 
-  const inputDisabled = sending || creatingCurrentDraft || resuming;
-  const sendingLabel = creatingCurrentDraft ? '创建中' : resuming ? 'Resuming' : sending ? 'Running' : '';
+  const inputDisabled = sending || creatingCurrentDraft || resuming || waitingInteraction;
+  const sendingLabel = creatingCurrentDraft
+    ? '创建中'
+    : resuming
+      ? 'Resuming'
+      : sending
+        ? 'Running'
+        : waitingInteraction
+          ? 'Waiting'
+          : '';
   const hasLiveReplyBelow = showScrollButton && (sending || resuming);
 
   return (
@@ -1108,13 +1108,11 @@ function ChatV2View(props: ChatV2Props) {
             </div>
           ) : (
             <div className="mx-auto px-4 md:px-8 py-6 space-y-6 max-w-3xl">
-              {displayRoundGroups.map(({ round, sourceRoundIds }, index) => (
+              {rounds.map((round, index) => (
                 <div
                   key={round.round_id}
                   ref={(el) => {
-                    sourceRoundIds.forEach((roundId) => {
-                      roundElementRefs.current[roundId] = el;
-                    });
+                    roundElementRefs.current[round.round_id] = el;
                   }}
                   data-round-id={round.round_id}
                   className={`scroll-mt-20 rounded-2xl transition-colors duration-300 ${
@@ -1130,7 +1128,7 @@ function ChatV2View(props: ChatV2Props) {
                     assistantFileMatches={assistantFileMatches}
                     onPreviewAttachment={handlePreviewAttachment}
                     onOpenFileInPanel={handleOpenAssistantFile}
-                    isStreaming={(sending || resuming) && index === displayRoundGroups.length - 1}
+                    isStreaming={(sending || resuming) && index === rounds.length - 1}
                     disableMotion={disableInitialMotion}
                   />
                 </div>
@@ -1187,27 +1185,22 @@ function ChatV2View(props: ChatV2Props) {
           </div>
         )}
 
-        {pendingInterrupt && pendingInterrupt.id !== dismissedInterruptId && pendingInterrupt.reason === 'input_required' && pendingInterrupt.payload?.questions && (pendingInterrupt.payload.questions as AskUserQuestion[]).length > 0 && (
+        {pendingInterrupt && pendingInterrupt.reason === 'input_required' && pendingInterrupt.payload?.questions && (pendingInterrupt.payload.questions as AskUserQuestion[]).length > 0 && (
           <div className="relative z-20 px-4 md:px-8 mb-[-3.5rem] mx-auto w-full max-w-3xl">
             <QuestionCard
+              key={pendingInterrupt.id}
               questions={pendingInterrupt.payload.questions as AskUserQuestion[]}
               onSubmit={handleResumeSubmit}
-              onDismiss={() => {
-                setDismissedInterruptId(pendingInterrupt.id || 'dismissed');
-              }}
               disabled={resuming}
             />
           </div>
         )}
 
-        {pendingInterrupt && pendingInterrupt.id !== dismissedInterruptId && pendingInterrupt.reason === 'human_approval' && pendingInterrupt.payload?.kind === 'tool_approval' && (
+        {pendingInterrupt && pendingInterrupt.reason === 'human_approval' && pendingInterrupt.payload?.kind === 'tool_approval' && (
           <div className="relative z-20 px-4 md:px-8 mb-[-3.5rem] mx-auto w-full max-w-3xl">
             <ToolApprovalCard
               approval={pendingInterrupt.payload as ToolApprovalPayload}
               onSubmit={handleResumeSubmit}
-              onDismiss={() => {
-                setDismissedInterruptId(pendingInterrupt.id || 'dismissed');
-              }}
               disabled={resuming}
             />
           </div>
@@ -1223,7 +1216,7 @@ function ChatV2View(props: ChatV2Props) {
                 : { ...draft, input: value, revision: draft.revision + 1 }
             ))}
             onSend={handleSend}
-            onStop={(sending || resuming) ? handleStop : undefined}
+            onStop={(sending || resuming || waitingInteraction) ? handleStop : undefined}
             disabled={inputDisabled}
             sendDisabled={stopping || uploadingCurrentDraft}
             sendingLabel={sendingLabel}

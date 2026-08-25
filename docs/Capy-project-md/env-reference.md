@@ -86,12 +86,17 @@ CREATE EXTENSION IF NOT EXISTS vector;
 | `AGENT_SUBAGENT_MAX_PARALLEL` | 否 | `3` | 同一父 Agent step 内最多并行执行的 `sub_agent` 数；`1` 表示串行 |
 | `AGENT_USER_CONCURRENCY_LIMIT` | 否 | `1` | 同一用户允许同时运行的不同会话数 |
 | `SKILL_DISABLED_CACHE_TTL_SECONDS` | 否 | `30` | Skill 启停快照复用窗口（秒），避免每步 LLM 请求都查库；改启停最迟约此值内生效，`0` 表示每步实时查库 |
+| `TOOL_APPROVAL_EXECUTION_LEASE_SECONDS` | 否 | `120` | 审批已从 `approved` 派发为 `executing` 后的执行 lease；过期只收敛 unknown，不授权重试 |
+| `TOOL_APPROVAL_LEASE_HEARTBEAT_SECONDS` | 否 | `30` | executing 审批续租心跳间隔，必须小于执行 lease |
+| `TOOL_APPROVAL_RECONCILE_INTERVAL_SECONDS` | 否 | `30` | 过期 executing 审批对账周期 |
 | `SSE_HEARTBEAT_INTERVAL` | 否 | `15` | SSE 心跳间隔（秒） |
-| `SSE_SUBSCRIBE_TIMEOUT` | 否 | `300` | SSE 订阅超时（秒） |
+| `SSE_SUBSCRIBE_TIMEOUT` | 否 | `300` | runtime 心跳陈旧阈值（秒），用于 UserRunLock 回收与 worker_dead 判定；不是订阅最大时长 |
 | `AGUI_REPAIR_TERMINAL_SINCE_HOURS` | 否 | `24` | `scripts/repair_terminal_runs.py` 默认扫描窗口（小时） |
 | `TIMEZONE_OFFSET` | 否 | `8` | UTC 偏移小时数（中国大陆常用 8） |
 
 > 第一版 Agent runtime 依赖进程内 `AguiEventBus`、subscriber registry 和 per-run cancel token，正确性假设为单 worker。生产入口、容器和进程管理应按 `UVICORN_WORKERS=1` 部署；恢复多 worker 前必须引入外部 bus/lease 或 durable command queue。
+
+`ask_user` 与工具审批固定采用 same-Round 暂停/恢复协议，不提供环境变量切换为其他 Round 语义。
 
 ## 超时体系说明
 
@@ -105,13 +110,24 @@ CREATE EXTENSION IF NOT EXISTS vector;
                                            后台 bash 命令服务端运行上限，0 表示不设置
 
 网络传输层
-├── SSE_HEARTBEAT_INTERVAL (15s)       SSE 心跳，防止连接被中间件/nginx 判定空闲
-└── SSE_SUBSCRIBE_TIMEOUT (300s)       前端订阅事件流的最大等待
+└── SSE_HEARTBEAT_INTERVAL (15s)       SSE 心跳，防止连接被中间件/nginx 判定空闲
+
+Runtime 存活判定
+└── SSE_SUBSCRIBE_TIMEOUT (300s)       历史兼容命名；作为 UserRunLock 心跳陈旧阈值
+                                       与 worker_dead 判定窗口，不关闭健康订阅
 
 Agent 逻辑层
 └── AGENT_TOOL_TIMEOUT (300s)          单次 tool.execute() 的 asyncio.wait_for 兜底
                                        防止沙箱 API 无响应导致 step 永久挂起
                                        SandboxBashTool 自身覆盖为 660s (SDK 层 600s + 余量)
+
+审批执行层
+├── TOOL_APPROVAL_EXECUTION_LEASE_SECONDS (120s)
+│                                      仅 approved → executing 时创建；过期不重试
+├── TOOL_APPROVAL_LEASE_HEARTBEAT_SECONDS (30s)
+│                                      executing worker 的续租间隔
+└── TOOL_APPROVAL_RECONCILE_INTERVAL_SECONDS (30s)
+                                       将过期 executing 保守收敛为 unknown
 ```
 
 工具级覆盖：每个 Tool 子类可通过 `execute_timeout` 类属性覆盖全局默认值（0 = 用全局默认）。

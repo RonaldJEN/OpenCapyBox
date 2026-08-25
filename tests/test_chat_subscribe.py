@@ -630,61 +630,6 @@ class TestSubscribeEndToEnd:
             if round_id in _event_subscribers():
                 del _event_subscribers()[round_id]
 
-    def test_resumed_round_emits_interrupt_not_success(self):
-        """测试 resumed 轮次应发 outcome=interrupt 而非 success
-
-        当轮次被中断后由新 run 接管（status='resumed'），
-        回放时不应把 outcome 设为 success，否则前端会误判为正常完成。
-        """
-        from src.agent.schema.agui_events import RunFinishedEvent
-
-        # 模拟 resumed 轮次的终态事件构造（与 chat.py 逻辑一致）
-        round_status = "resumed"
-        final_response = "被中断的回复"
-        step_count = 2
-
-        assert round_status in ("completed", "failed", "interrupted", "resumed")
-
-        # resumed 路径应发 interrupt
-        finished = RunFinishedEvent(
-            threadId="session-resumed", runId="round-resumed",
-            result={
-                "finalResponse": final_response,
-                "stepCount": step_count,
-                "reason": "resumed_by_new_run",
-            },
-            outcome="interrupt",
-        )
-        data = finished.model_dump(by_alias=True)
-
-        assert data["outcome"] == "interrupt", "resumed 轮次应为 interrupt 而非 success"
-        assert data["result"]["reason"] == "resumed_by_new_run"
-        assert data["type"] == "RUN_FINISHED"
-
-    def test_interrupted_round_emits_interrupt(self):
-        """测试 interrupted 轮次发 outcome=interrupt，并携带正确的中断详情"""
-        from src.agent.schema.agui_events import RunFinishedEvent, InterruptDetails
-
-        finished = RunFinishedEvent(
-            threadId="session-int", runId="round-int",
-            result={"finalResponse": "", "stepCount": 1},
-            outcome="interrupt",
-            interrupt=InterruptDetails(
-                id="int-1",
-                reason="input_required",
-                payload={"questions": [{"question": "请确认"}], "tool_call_id": "tc-1"},
-            ),
-        )
-        data = finished.model_dump(by_alias=True)
-
-        assert data["outcome"] == "interrupt"
-        assert data["interrupt"] is not None
-        assert data["interrupt"]["id"] == "int-1"
-        assert data["interrupt"]["reason"] == "input_required"
-        assert data["interrupt"]["payload"]["tool_call_id"] == "tc-1"
-        assert data["interrupt"]["payload"]["questions"][0]["question"] == "请确认"
-
-
 class TestActiveRunners:
     """后台 Agent 运行任务追踪测试"""
 
@@ -743,6 +688,53 @@ class TestActiveRunners:
 
         assert not ran_to_completion
         _active_runners.pop(session_id, None)
+
+    @pytest.mark.asyncio
+    async def test_liveness_loss_preserves_lock_for_stale_recovery(self):
+        from src.api.schemas.chat import TextContentBlock
+        from src.api.schemas.turn import NormalizedInboundTurn, WebReplyRoute
+        from src.api.services.agent_service import PreparedAgentRun
+        from src.api.services.turn_orchestrator import TurnOrchestrator
+
+        class LostLivenessAgentService:
+            cancel_token: asyncio.Event | None = None
+            liveness_token: asyncio.Event | None = None
+
+            async def prepare_chat_round(self, *, user_content, idempotency_key=None):
+                return PreparedAgentRun(run_id="run-liveness", user_message="hello")
+
+            async def run_prepared_round(self, prepared, *, error_label):
+                assert self.liveness_token is not None
+                self.liveness_token.set()
+                if False:
+                    yield None
+
+        service = LostLivenessAgentService()
+        orchestrator = TurnOrchestrator()
+        orchestrator._complete_cancel_requests = AsyncMock()
+        orchestrator._release_lock = AsyncMock()
+        turn = NormalizedInboundTurn(
+            channel="web",
+            user_id="user-liveness",
+            peer_kind="web",
+            peer_id="session-liveness",
+            content=[TextContentBlock(type="text", text="hello")],
+            reply_route=WebReplyRoute(session_id="session-liveness"),
+        )
+
+        execution = await orchestrator.submit_turn(
+            turn,
+            agent_service=service,
+            lock_id="lock-liveness",
+        )
+        assert [event async for event in execution.event_source] == []
+        assert execution.task is not None
+        await execution.task
+
+        assert service.cancel_token is not None
+        assert not service.cancel_token.is_set()
+        orchestrator._complete_cancel_requests.assert_not_awaited()
+        orchestrator._release_lock.assert_not_awaited()
 
 
 class TestSseDetachedProducer:
@@ -1283,6 +1275,99 @@ class TestRunCancelRegistryFlow:
 
 class TestSubscribePersistedPolling:
     """subscribe 端点与 EventBus replay/fanout 回归测试。"""
+
+    @pytest.mark.asyncio
+    async def test_subscribe_replays_terminal_committed_before_queue_registration(self):
+        """首次 replay 后、注册 queue 前提交的 terminal 仍必须交付。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from src.agent.schema.agui_events import CustomEvent
+        from src.api.models.database import Base
+        from src.api.models.round import Round
+        from src.api.models.session import Session
+        from src.api.services.agui_event_bus import AguiEventBus
+        from src.api.services.run_completion_service import RunCompletionService
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestSL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        run_id = "round-terminal-before-queue"
+        bus = AguiEventBus(TestSL)
+        iterator = None
+        cursor_iterator = None
+        try:
+            with TestSL() as setup_db:
+                setup_db.add(Session(id="session-terminal-before-queue", user_id="testuser"))
+                setup_db.add(
+                    Round(
+                        id=run_id,
+                        session_id="session-terminal-before-queue",
+                        thread_id="session-terminal-before-queue",
+                        user_message="hello",
+                        status="running",
+                    )
+                )
+                setup_db.commit()
+
+            stored = await bus.publish(
+                run_id,
+                CustomEvent(name="before_terminal", value={}),
+            )
+            assert stored is not None
+            assert stored.sequence == 1
+
+            iterator = bus.subscribe(run_id, after_sequence=0).__aiter__()
+            first = await asyncio.wait_for(iterator.__anext__(), timeout=1.0)
+            assert first["type"] == "CUSTOM"
+            assert first["sequence"] == 1
+
+            # The initial replay yield is a deterministic barrier: subscribe()
+            # has not reached ensure_terminal() or registered its live queue.
+            with bus.subscribers_lock:
+                assert run_id not in bus.subscribers
+
+            terminal = RunCompletionService(TestSL).complete_sync(
+                run_id=run_id,
+                status="completed",
+                terminal_event={
+                    "type": "RUN_FINISHED",
+                    "threadId": "session-terminal-before-queue",
+                    "runId": run_id,
+                    "outcome": "success",
+                    "result": {"finalResponse": "done", "stepCount": 0},
+                },
+            )
+            assert terminal is not None
+            assert terminal.sequence == 2
+            with bus.subscribers_lock:
+                assert run_id not in bus.subscribers
+
+            second = await asyncio.wait_for(iterator.__anext__(), timeout=1.0)
+            assert second["type"] == "RUN_FINISHED"
+            assert second["sequence"] == 2
+            with pytest.raises(StopAsyncIteration):
+                await asyncio.wait_for(iterator.__anext__(), timeout=1.0)
+
+            # A client that already consumed the terminal cursor should receive
+            # a clean EOF rather than a duplicate terminal.
+            cursor_iterator = bus.subscribe(run_id, after_sequence=2).__aiter__()
+            with pytest.raises(StopAsyncIteration):
+                await asyncio.wait_for(cursor_iterator.__anext__(), timeout=1.0)
+        finally:
+            if iterator is not None:
+                await iterator.aclose()
+            if cursor_iterator is not None:
+                await cursor_iterator.aclose()
+            bus.cleanup_subscribers(run_id)
+            bus._terminal_runs.discard(run_id)
+            Base.metadata.drop_all(bind=engine)
+            engine.dispose()
 
     @pytest.mark.asyncio
     async def test_subscribe_receives_persisted_terminal_event_without_local_broadcast(self):
@@ -2002,55 +2087,4 @@ class TestUserCancelledRoundStatus:
         actual_status = call_kwargs.kwargs.get("status") or call_kwargs[1].get("status")
         assert actual_status == "cancelled", (
             f"user_cancelled 应该映射为 cancelled，实际: {actual_status}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_run_finished_ask_user_interrupt_sets_status_interrupted(self):
-        """Agent yield RUN_FINISHED(outcome=interrupt) 无 user_cancelled → status=interrupted"""
-        from src.api.services.agent_service import AgentService
-        from src.agent.schema.agui_events import (
-            RunStartedEvent, RunFinishedEvent,
-            StepStartedEvent, StepFinishedEvent,
-            InterruptDetails,
-        )
-
-        mock_history = MagicMock()
-        mock_history.save_agui_event = AsyncMock()
-        mock_history.complete_round = MagicMock()
-
-        service = object.__new__(AgentService)
-        service.history_service = mock_history
-        service.session_id = "test-session"
-        service.cancel_token = None
-        service._active_run_count = 0
-        service.agent = MagicMock()
-        service._last_saved_index = 0
-        service._pending_interrupt_round_ids = {}
-
-        async def fake_run_agui(**kwargs):
-            yield RunStartedEvent(threadId="test-session", runId="run-ask")
-            yield StepStartedEvent(stepName="step_1")
-            yield StepFinishedEvent(stepName="step_1")
-            yield RunFinishedEvent(
-                threadId="test-session",
-                runId="run-ask",
-                outcome="interrupt",
-                result={"finalResponse": "waiting for answer"},
-                interrupt=InterruptDetails(id="int-1", payload={}),
-            )
-
-        service.agent.run_agui = fake_run_agui
-
-        events = []
-        async for event in service._run_round_stream(
-            run_id="run-ask",
-            user_message="test",
-        ):
-            events.append(event)
-
-        mock_history.complete_round.assert_called_once()
-        call_kwargs = mock_history.complete_round.call_args
-        actual_status = call_kwargs.kwargs.get("status") or call_kwargs[1].get("status")
-        assert actual_status == "interrupted", (
-            f"ask_user 中断应该映射为 interrupted，实际: {actual_status}"
         )

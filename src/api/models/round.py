@@ -25,17 +25,13 @@ class Round(Base):
 
     # ----- 終態常量（全局唯一事實源）-----
     # complete_round 終態：一旦進入，不允許被覆寫（防止跨 worker 狀態矛盾）。
-    # 注意 interrupted 不在此集合——它是「暫停等待用戶輸入」的中間態，
-    # resume 後 Agent 會繼續執行並最終 complete_round 為 completed/failed。
+    # waiting_interaction 是同一 logical Round 的暂停态，不是完成态。
     COMPLETE_TERMINAL_STATUSES: frozenset[str] = frozenset(
         {"completed", "failed", "cancelled", "max_steps_reached"}
     )
 
-    # subscribe 終態：subscribe_to_round 視為「不再產生新事件」的狀態集合。
-    # 比 COMPLETE 多了 interrupted 和 resumed——這些 round 不會再有事件推送。
-    SUBSCRIBE_TERMINAL_STATUSES: frozenset[str] = frozenset(
-        {"completed", "failed", "interrupted", "resumed", "cancelled", "max_steps_reached"}
-    )
+    SUBSCRIBE_TERMINAL_STATUSES = COMPLETE_TERMINAL_STATUSES
+    QUIESCENT_STATUSES: frozenset[str] = frozenset({"waiting_interaction"})
 
     __tablename__ = "rounds"
     __table_args__ = (
@@ -64,7 +60,7 @@ class Round(Base):
     
     # outcome - 運行結果（AG-UI RunFinishedOutcome）
     # "success" = 正常完成
-    # "interrupt" = 需要人工介入
+    # "interrupt" = 取消或步数上限等非成功终止
     outcome = Column(String(20), nullable=True)
     
     # === 業務字段 ===
@@ -93,14 +89,10 @@ class Round(Base):
     # "running" = 執行中
     # "completed" = 已完成
     # "failed" = 執行失敗
-    # "interrupted" = 已中斷（等待人工介入）
+    # "waiting_interaction" = 同一 Round 暂停等待用户输入或审批
     # "max_steps_reached" = 步數耗盡自動停止（不可恢復終態）
     status = Column(String(20), default="running")
 
-    # AG-UI InterruptDetails（JSON 字符串，僅 status="interrupted" 時有值）
-    # 存儲 {id, reason, payload} 用於刷新後恢復 Human-in-the-Loop 問題卡片
-    interrupt_payload = Column(Text, nullable=True)
-    
     # 幂等鍵（防止多 Worker 重複處理同一請求）
     idempotency_key = Column(String(64), nullable=True)
 

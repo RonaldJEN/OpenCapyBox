@@ -6,6 +6,7 @@ import {
   ChatRuntimeState,
   ChatRunRuntimeState,
   ChatSessionRuntimeState,
+  RUNTIME_HISTORY_SNAPSHOT,
   StreamEnvelope,
   emptyAgentState,
   emptyBuffers,
@@ -16,8 +17,6 @@ import {
 const TERMINAL_ROUND_STATUSES = new Set([
   'completed',
   'failed',
-  'interrupted',
-  'resumed',
   'cancelled',
   'max_steps_reached',
 ]);
@@ -61,16 +60,22 @@ export function chatRuntimeReducer(
     case 'STREAM_EVENT':
       return applyStreamEvent(state, action.envelope);
 
+    case 'LOCAL_CONTROL_CONFLICT':
+      return applyLocalControlConflict(
+        state,
+        action.sessionId,
+        action.clientRunKey,
+        action.serverRunId,
+      );
+
     case 'LOCAL_CANCELLED':
       return applyLocalCancelled(state, action.sessionId, action.clientRunKey);
 
-    case 'SET_PENDING_INTERRUPT': {
-      const session = ensureSession(state, action.sessionId);
-      return putSession(state, action.sessionId, {
-        ...session,
-        pendingInterrupt: action.interrupt,
-      });
-    }
+    case 'LOCAL_INIT_SLOT_CLEARED':
+      return clearLocalInitSlot(state, action.sessionId);
+
+    case 'RESTORE_PENDING_INTERACTION':
+      return restorePendingInteraction(state, action);
 
     case 'RUNNING_SESSIONS_SNAPSHOT':
       return applyRunningSessionsSnapshot(state, action.runningSessions, action.receivedAt);
@@ -157,6 +162,7 @@ function applyLocalRunStarted(
         ...baseRun,
         serverRunId: existingRun.serverRunId ?? baseRun.serverRunId,
         lastSequence: Math.max(existingRun.lastSequence, baseRun.lastSequence),
+        lastInteractionSequence: existingRun.lastInteractionSequence,
         buffers: existingRun.buffers,
       }
     : baseRun;
@@ -194,6 +200,119 @@ function applyLocalRunStarted(
     : withRun;
 }
 
+function applyLocalControlConflict(
+  state: ChatRuntimeState,
+  sessionId: string,
+  clientRunKey: string,
+  serverRunId?: string,
+): ChatRuntimeState {
+  const session = ensureSession(state, sessionId);
+  const run = state.runs[clientRunKey];
+  if (!run) return state;
+
+  const rounds = session.rounds.filter((round) => (
+    round.round_id !== run.tempRoundId || round.round_id === serverRunId
+  ));
+  const nextSession: ChatSessionRuntimeState = {
+    ...session,
+    rounds,
+    activeRunKeys: session.activeRunKeys.filter((key) => key !== clientRunKey),
+    agentStateByRunKey: {
+      ...session.agentStateByRunKey,
+      [clientRunKey]: {
+        ...(session.agentStateByRunKey[clientRunKey] || emptyAgentState()),
+        status: serverRunId ? 'waiting' : 'idle',
+        lastUpdated: Date.now(),
+      },
+    },
+  };
+  const idempotencyKeyToClientRunKey = { ...state.idempotencyKeyToClientRunKey };
+  if (run.idempotencyKey) {
+    delete idempotencyKeyToClientRunKey[run.idempotencyKey];
+  }
+  const nextState = putSession({
+    ...state,
+    idempotencyKeyToClientRunKey,
+  }, sessionId, nextSession);
+
+  if (!serverRunId) {
+    const runs = { ...nextState.runs };
+    delete runs[clientRunKey];
+    return { ...nextState, runs };
+  }
+
+  return {
+    ...putRun(nextState, clientRunKey, {
+      ...run,
+      serverRunId,
+      status: 'waiting',
+      buffers: emptyBuffers(),
+      updatedAt: Date.now(),
+    }),
+    serverRunIdToClientRunKey: {
+      ...nextState.serverRunIdToClientRunKey,
+      [serverRunId]: clientRunKey,
+    },
+    tempRoundIdToServerRoundId: {
+      ...nextState.tempRoundIdToServerRoundId,
+      [run.tempRoundId]: serverRunId,
+    },
+    serverRoundIdToLocalRoundId: {
+      ...nextState.serverRoundIdToLocalRoundId,
+      [serverRunId]: serverRunId,
+    },
+  };
+}
+
+function restorePendingInteraction(
+  state: ChatRuntimeState,
+  action: Extract<ChatRuntimeAction, { type: 'RESTORE_PENDING_INTERACTION' }>,
+): ChatRuntimeState {
+  const session = ensureSession(state, action.sessionId);
+  const run = state.runs[action.clientRunKey];
+  const restoredRound: RoundData = {
+    ...action.round,
+    status: 'waiting_interaction',
+    completed_at: undefined,
+    interrupt: action.interrupt,
+  };
+  let matched = false;
+  const rounds = session.rounds.map((round) => {
+    if (
+      round.round_id !== restoredRound.round_id
+      && (!run || !roundMatchesRun(round, run, restoredRound.round_id))
+    ) {
+      return round;
+    }
+    matched = true;
+    return restoredRound;
+  });
+  const nextSession: ChatSessionRuntimeState = {
+    ...session,
+    rounds: matched ? rounds : [...rounds, restoredRound],
+    pendingInterrupt: action.interrupt,
+    activeRunKeys: session.activeRunKeys.filter((key) => key !== action.clientRunKey),
+    agentStateByRunKey: {
+      ...session.agentStateByRunKey,
+      [action.clientRunKey]: {
+        ...(session.agentStateByRunKey[action.clientRunKey] || emptyAgentState()),
+        status: 'waiting',
+        lastUpdated: Date.now(),
+      },
+    },
+  };
+  const nextState = putSession(state, action.sessionId, nextSession);
+  if (!run) return nextState;
+  return putRun(nextState, action.clientRunKey, {
+    ...run,
+    serverRunId: restoredRound.round_id,
+    status: 'waiting',
+    backendTerminal: undefined,
+    buffers: emptyBuffers(),
+    updatedAt: Date.now(),
+  });
+}
+
 function applyHistoryLoaded(
   state: ChatRuntimeState,
   sessionId: string,
@@ -209,6 +328,7 @@ function applyHistoryLoaded(
   const nextTempMap = { ...state.tempRoundIdToServerRoundId };
   const nextServerRoundMap = { ...state.serverRoundIdToLocalRoundId };
   const nextIdempotencyMap = { ...state.idempotencyKeyToClientRunKey };
+  const reconciledRunKeys = new Set<string>();
 
   for (const runKey of session.activeRunKeys) {
     const run = nextRuns[runKey];
@@ -235,18 +355,46 @@ function applyHistoryLoaded(
       }
       continue;
     }
+    reconciledRunKeys.add(runKey);
 
     const serverIsTerminal = TERMINAL_ROUND_STATUSES.has(serverRound.status);
     const useServerTerminal = serverIsTerminal && (
       !localRound || isServerRoundNewer(localRound, serverRound, run)
     );
+    const serverSequence = serverRound.last_event_sequence || 0;
+    const historyHasMaterializedLocalSegments = !hasDirtyStreamSegments(run.buffers)
+      || historyMaterializesDirtySegments(serverRound, run.buffers);
+    const serverLiveStateIsCurrent = !serverIsTerminal && (
+      !localRound || serverSequence >= run.lastSequence
+    );
+    const useServerLiveProjection = serverLiveStateIsCurrent
+      && (!localRound || historyHasMaterializedLocalSegments);
+    const liveRunStatus = serverRound.status === 'waiting_interaction'
+      ? 'waiting'
+      : 'streaming';
 
     nextRuns[runKey] = {
       ...run,
       serverRunId: serverRound.round_id,
-      lastSequence: Math.max(run.lastSequence, serverRound.last_event_sequence || 0),
-      status: useServerTerminal ? runStatusFromRoundStatus(serverRound.status) : run.status,
-      buffers: useServerTerminal ? emptyBuffers() : run.buffers,
+      lastSequence: useServerTerminal || useServerLiveProjection
+        ? Math.max(run.lastSequence, serverSequence)
+        : run.lastSequence,
+      lastInteractionSequence: serverRound.status === 'waiting_interaction'
+        && typeof serverRound.last_event_sequence === 'number'
+        ? Math.max(run.lastInteractionSequence || 0, serverRound.last_event_sequence)
+        : run.lastInteractionSequence,
+      status: useServerTerminal
+        ? runStatusFromRoundStatus(serverRound.status)
+        : serverLiveStateIsCurrent
+          ? liveRunStatus
+          : run.status,
+      // A higher global cursor can belong to another interleaved segment whose
+      // durable START reached history before this segment's aggregate END.
+      // Replace dirty buffers only when this snapshot proves their prefixes
+      // were materialized, not merely because some event advanced the cursor.
+      buffers: useServerTerminal || useServerLiveProjection
+        ? emptyBuffers()
+        : run.buffers,
       debugMetadata: serverIsTerminal && !useServerTerminal
         ? {
             ...run.debugMetadata,
@@ -257,6 +405,12 @@ function applyHistoryLoaded(
     };
     if (useServerTerminal) {
       activeRunKeys.delete(runKey);
+    } else if (serverLiveStateIsCurrent) {
+      if (serverRound.status === 'running') {
+        activeRunKeys.add(runKey);
+      } else {
+        activeRunKeys.delete(runKey);
+      }
     }
     nextServerRunMap[serverRound.round_id] = runKey;
     nextTempMap[run.tempRoundId] = serverRound.round_id;
@@ -268,39 +422,77 @@ function applyHistoryLoaded(
     if (localRound && !useServerTerminal && !TERMINAL_ROUND_STATUSES.has(localRound.status)) {
       rounds = rounds.map((round) => (
         round.round_id === serverRound.round_id
-          ? mergeActiveRound(localRound, serverRound)
+          ? mergeActiveRound(
+              localRound,
+              serverRound,
+              serverLiveStateIsCurrent ? serverRound.status : localRound.status,
+              useServerLiveProjection,
+            )
           : round
       ));
     }
   }
 
   for (const round of serverRounds) {
-    if (round.status === 'running') {
+    if (round.status === 'running' || round.status === 'waiting_interaction') {
       const runKey = nextServerRunMap[round.round_id] || `run:${round.round_id}`;
-      activeRunKeys.add(runKey);
+      if (reconciledRunKeys.has(runKey)) {
+        continue;
+      }
+      const effectiveRound = rounds.find((candidate) => candidate.round_id === round.round_id);
+      const effectiveStatus = effectiveRound?.status === 'running'
+        || effectiveRound?.status === 'waiting_interaction'
+        ? effectiveRound.status
+        : round.status;
+      if (effectiveStatus === 'running') {
+        activeRunKeys.add(runKey);
+      } else {
+        activeRunKeys.delete(runKey);
+      }
       if (!nextRuns[runKey]) {
         nextRuns[runKey] = createRun({
           ownerSessionId: sessionId,
           clientRunKey: runKey,
           tempRoundId: round.round_id,
           source: 'history',
-          status: 'streaming',
+          status: effectiveStatus === 'running' ? 'streaming' : 'waiting',
         });
       }
       nextRuns[runKey] = {
         ...nextRuns[runKey],
         serverRunId: round.round_id,
         lastSequence: Math.max(nextRuns[runKey].lastSequence, round.last_event_sequence || 0),
-        status: 'streaming',
+        lastInteractionSequence: effectiveStatus === 'waiting_interaction'
+          && typeof round.last_event_sequence === 'number'
+          ? Math.max(nextRuns[runKey].lastInteractionSequence || 0, round.last_event_sequence)
+          : nextRuns[runKey].lastInteractionSequence,
+        status: effectiveStatus === 'running' ? 'streaming' : 'waiting',
         updatedAt: loadedAt,
       };
       nextServerRunMap[round.round_id] = runKey;
       nextServerRoundMap[round.round_id] = round.round_id;
+      continue;
+    }
+
+    if (TERMINAL_ROUND_STATUSES.has(round.status)) {
+      const runKey = nextServerRunMap[round.round_id];
+      const existingRun = runKey ? nextRuns[runKey] : undefined;
+      if (runKey && existingRun && !activeRunKeys.has(runKey)) {
+        nextRuns[runKey] = {
+          ...existingRun,
+          serverRunId: round.round_id,
+          lastSequence: Math.max(existingRun.lastSequence, round.last_event_sequence || 0),
+          status: runStatusFromRoundStatus(round.status),
+          buffers: emptyBuffers(),
+          updatedAt: loadedAt,
+        };
+        activeRunKeys.delete(runKey);
+      }
     }
   }
 
-  const interruptedRound = [...rounds].reverse().find((round) => (
-    round.status === 'interrupted' && round.interrupt
+  const waitingRound = [...rounds].reverse().find((round) => (
+    round.status === 'waiting_interaction' && round.interrupt
   ));
   const hasRunningRound = rounds.some((round) => round.status === 'running');
   const nextSession: ChatSessionRuntimeState = {
@@ -312,7 +504,7 @@ function applyHistoryLoaded(
       const run = nextRuns[runKey];
       return run && !terminalRunStatuses.has(run.status);
     })),
-    pendingInterrupt: hasRunningRound ? null : (interruptedRound?.interrupt || session.pendingInterrupt),
+    pendingInterrupt: hasRunningRound ? null : (waitingRound?.interrupt || null),
   };
 
   nextState = {
@@ -326,18 +518,28 @@ function applyHistoryLoaded(
   return putSession(nextState, sessionId, nextSession);
 }
 
-function mergeActiveRound(localRound: RoundData, serverRound: RoundData): RoundData {
+function mergeActiveRound(
+  localRound: RoundData,
+  serverRound: RoundData,
+  status: RoundData['status'],
+  useServerProjection: boolean = false,
+): RoundData {
   return {
     ...serverRound,
     round_id: serverRound.round_id,
-    control_kind: localRound.control_kind ?? serverRound.control_kind,
     user_message: localRound.user_message || serverRound.user_message,
     user_attachments: localRound.user_attachments || serverRound.user_attachments,
     preferred_skills: serverRound.preferred_skills ?? localRound.preferred_skills,
-    final_response: localRound.final_response || serverRound.final_response,
-    steps: localRound.steps.length > 0 ? localRound.steps : serverRound.steps,
-    step_count: Math.max(localRound.step_count || 0, serverRound.step_count || 0),
-    status: localRound.status,
+    final_response: useServerProjection
+      ? serverRound.final_response
+      : (localRound.final_response || serverRound.final_response),
+    steps: useServerProjection
+      ? serverRound.steps
+      : (localRound.steps.length > 0 ? localRound.steps : serverRound.steps),
+    step_count: useServerProjection
+      ? serverRound.step_count
+      : Math.max(localRound.step_count || 0, serverRound.step_count || 0),
+    status,
   };
 }
 
@@ -362,7 +564,9 @@ function isServerRoundNewer(
   if (!Number.isNaN(serverUpdatedAt) && !Number.isNaN(localUpdatedAt) && serverUpdatedAt > localUpdatedAt) {
     return true;
   }
-  if ((serverRound.last_event_sequence || 0) > run.lastSequence) {
+  // Equal sequence means history has materialized the same durable terminal
+  // boundary the stream cursor already observed; it is not a stale snapshot.
+  if ((serverRound.last_event_sequence || 0) >= run.lastSequence) {
     return true;
   }
   if (serverRound.final_response && !localRound.final_response && !TERMINAL_ROUND_STATUSES.has(localRound.status)) {
@@ -380,14 +584,47 @@ function runStatusFromRoundStatus(status: string): ChatRunRuntimeState['status']
 function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): ChatRuntimeState {
   const event = envelope.event;
   const eventType = event?.type;
+  if (eventType === RUNTIME_HISTORY_SNAPSHOT && Array.isArray(event.rounds)) {
+    return applyHistoryLoaded(
+      state,
+      envelope.ownerSessionId,
+      event.rounds,
+      envelope.receivedAt,
+    );
+  }
   const run = state.runs[envelope.clientRunKey];
   if (!run) {
     return state;
   }
 
   const sequence = envelope.sequence;
-  if (typeof sequence === 'number' && sequence <= run.lastSequence) {
+  const reconcilesCurrentAggregate = typeof sequence === 'number'
+    && sequence === run.lastSequence
+    && aggregateMatchesBufferedSegment(run, envelope);
+  if (
+    typeof sequence === 'number'
+    && sequence <= run.lastSequence
+    && !envelope.authoritativeRecovery
+    && !reconcilesCurrentAggregate
+  ) {
     return state;
+  }
+
+  if (
+    eventType === 'RUN_ERROR'
+    && typeof sequence !== 'number'
+    && !envelope.authoritativeRecovery
+    && typeof run.lastInteractionSequence === 'number'
+  ) {
+    return putRun(state, run.clientRunKey, {
+      ...run,
+      debugMetadata: {
+        ...run.debugMetadata,
+        droppedUnsequencedRunErrors:
+          (run.debugMetadata?.droppedUnsequencedRunErrors || 0) + 1,
+      },
+      updatedAt: envelope.receivedAt,
+    });
   }
 
   if (
@@ -421,7 +658,9 @@ function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): Ch
   let nextState = state;
   let nextRun: ChatRunRuntimeState = {
     ...run,
-    lastSequence: typeof sequence === 'number' ? sequence : run.lastSequence,
+    lastSequence: typeof sequence === 'number'
+      ? Math.max(run.lastSequence, sequence)
+      : run.lastSequence,
     updatedAt: envelope.receivedAt,
   };
 
@@ -455,6 +694,13 @@ function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): Ch
           ...nextRun.buffers,
           currentTextMessageId: event.messageId,
           textByMessageId: { ...nextRun.buffers.textByMessageId, [event.messageId]: '' },
+          textSegmentStateByMessageId: {
+            ...nextRun.buffers.textSegmentStateByMessageId,
+            [event.messageId]: {
+              open: true,
+              dirty: nextRun.buffers.textSegmentStateByMessageId[event.messageId]?.dirty || false,
+            },
+          },
         },
       };
       break;
@@ -463,7 +709,17 @@ function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): Ch
       nextState = updateRound(nextState, nextRun, (round) => updateRoundTextContent(round, latestText(nextRun)));
       break;
     case 'TEXT_MESSAGE_END':
-      nextRun = { ...nextRun, buffers: { ...nextRun.buffers, currentTextMessageId: null } };
+      nextRun = {
+        ...nextRun,
+        buffers: {
+          ...nextRun.buffers,
+          currentTextMessageId: null,
+          textSegmentStateByMessageId: closeSegment(
+            nextRun.buffers.textSegmentStateByMessageId,
+            event.messageId || nextRun.buffers.currentTextMessageId,
+          ),
+        },
+      };
       break;
     case 'THINKING_TEXT_MESSAGE_START':
       nextRun = {
@@ -472,6 +728,13 @@ function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): Ch
           ...nextRun.buffers,
           currentThinkingMessageId: event.messageId,
           thinkingByMessageId: { ...nextRun.buffers.thinkingByMessageId, [event.messageId]: '' },
+          thinkingSegmentStateByMessageId: {
+            ...nextRun.buffers.thinkingSegmentStateByMessageId,
+            [event.messageId]: {
+              open: true,
+              dirty: nextRun.buffers.thinkingSegmentStateByMessageId[event.messageId]?.dirty || false,
+            },
+          },
         },
       };
       nextState = updateLastStep(nextState, nextRun, (step) => ({ ...step, thinking_start_ts: event.timestamp }));
@@ -481,7 +744,17 @@ function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): Ch
       nextState = updateLastStep(nextState, nextRun, (step) => ({ ...step, thinking: latestThinking(nextRun) }));
       break;
     case 'THINKING_TEXT_MESSAGE_END':
-      nextRun = { ...nextRun, buffers: { ...nextRun.buffers, currentThinkingMessageId: null } };
+      nextRun = {
+        ...nextRun,
+        buffers: {
+          ...nextRun.buffers,
+          currentThinkingMessageId: null,
+          thinkingSegmentStateByMessageId: closeSegment(
+            nextRun.buffers.thinkingSegmentStateByMessageId,
+            event.messageId || nextRun.buffers.currentThinkingMessageId,
+          ),
+        },
+      };
       nextState = updateLastStep(nextState, nextRun, (step) => ({ ...step, thinking_end_ts: event.timestamp }));
       break;
     case 'TOOL_CALL_START':
@@ -497,6 +770,13 @@ function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): Ch
             )
               ? nextRun.buffers.toolArgsByToolCallId[event.toolCallId]
               : '',
+          },
+          toolArgsSegmentStateByToolCallId: {
+            ...nextRun.buffers.toolArgsSegmentStateByToolCallId,
+            [event.toolCallId]: {
+              open: true,
+              dirty: nextRun.buffers.toolArgsSegmentStateByToolCallId[event.toolCallId]?.dirty || false,
+            },
           },
         },
       };
@@ -519,10 +799,38 @@ function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): Ch
       nextState = updateToolArgs(nextState, nextRun, event.toolCallId);
       break;
     case 'TOOL_CALL_END':
+      nextRun = {
+        ...nextRun,
+        buffers: {
+          ...nextRun.buffers,
+          toolArgsSegmentStateByToolCallId: closeSegment(
+            nextRun.buffers.toolArgsSegmentStateByToolCallId,
+            event.toolCallId,
+          ),
+        },
+      };
       nextState = updateToolEnd(nextState, nextRun, event.toolCallId, event.timestamp);
       break;
     case 'TOOL_CALL_RESULT':
+      nextRun = {
+        ...nextRun,
+        buffers: {
+          ...nextRun.buffers,
+          toolArgsSegmentStateByToolCallId: closeSegment(
+            nextRun.buffers.toolArgsSegmentStateByToolCallId,
+            event.toolCallId,
+          ),
+        },
+      };
       nextState = updateToolResult(nextState, nextRun, event.toolCallId, event.content, event.timestamp, event.executionTimeMs);
+      break;
+    case 'CUSTOM':
+      if (event.name === 'interaction_requested') {
+        return applyInteractionRequested(nextState, envelope, nextRun);
+      }
+      if (event.name === 'interaction_resolved') {
+        return applyInteractionResolved(nextState, envelope, nextRun);
+      }
       break;
     case 'RUN_FINISHED':
       nextState = applyRunFinished(nextState, envelope, nextRun);
@@ -623,6 +931,18 @@ function transferRunOwnership(
         ...previousRun.buffers.toolArgsByToolCallId,
         ...incomingRun.buffers.toolArgsByToolCallId,
       },
+      textSegmentStateByMessageId: {
+        ...previousRun.buffers.textSegmentStateByMessageId,
+        ...incomingRun.buffers.textSegmentStateByMessageId,
+      },
+      thinkingSegmentStateByMessageId: {
+        ...previousRun.buffers.thinkingSegmentStateByMessageId,
+        ...incomingRun.buffers.thinkingSegmentStateByMessageId,
+      },
+      toolArgsSegmentStateByToolCallId: {
+        ...previousRun.buffers.toolArgsSegmentStateByToolCallId,
+        ...incomingRun.buffers.toolArgsSegmentStateByToolCallId,
+      },
       currentTextMessageId:
         incomingRun.buffers.currentTextMessageId
         ?? previousRun.buffers.currentTextMessageId,
@@ -717,7 +1037,7 @@ function reconcileRunStartedRounds(
   const serverRound = rounds.find((round) => round.round_id === serverRunId)
     || rounds[matchingIndexes[0]];
   const mergedRound = localRound && localRound !== serverRound
-    ? mergeActiveRound(localRound, serverRound)
+    ? mergeActiveRound(localRound, serverRound, localRound.status)
     : { ...(localRound || serverRound) };
   const reconciledRound: RoundData = {
     ...mergedRound,
@@ -787,7 +1107,7 @@ function applyRunFinished(
     rounds,
     pendingInterrupt: event.outcome === 'interrupt' && event.interrupt && !isCancelled
       ? event.interrupt
-      : (isCancelled ? null : session.pendingInterrupt),
+      : null,
     activeRunKeys: session.activeRunKeys.filter((key) => key !== run.clientRunKey),
     agentStateByRunKey: {
       ...session.agentStateByRunKey,
@@ -800,6 +1120,124 @@ function applyRunFinished(
   };
   const nextState = putSession(state, run.ownerSessionId, nextSession);
   return putRun(nextState, run.clientRunKey, nextRun);
+}
+
+function applyInteractionRequested(
+  state: ChatRuntimeState,
+  envelope: StreamEnvelope,
+  run: ChatRunRuntimeState,
+): ChatRuntimeState {
+  const value = envelope.event?.value && typeof envelope.event.value === 'object'
+    ? envelope.event.value
+    : {};
+  const runId = value.runId || run.serverRunId || run.tempRoundId;
+  const kind = value.kind || 'user_input';
+  const payload = value.payload && typeof value.payload === 'object' ? value.payload : {};
+  const interrupt: InterruptDetails = {
+    id: value.interactionId,
+    reason: kind === 'tool_approval' ? 'human_approval' : 'input_required',
+    payload: {
+      ...payload,
+      kind,
+      tool_call_id: value.toolCallId,
+      run_id: runId,
+    },
+  };
+  const session = ensureSession(state, run.ownerSessionId);
+  const rounds = session.rounds.map((round) => (
+    roundMatchesRun(round, run, runId)
+      ? {
+          ...round,
+          round_id: runId,
+          status: 'waiting_interaction',
+          completed_at: undefined,
+          interrupt,
+        }
+      : round
+  ));
+  const nextRun: ChatRunRuntimeState = {
+    ...run,
+    serverRunId: runId,
+    status: 'waiting',
+    lastInteractionSequence: typeof envelope.sequence === 'number'
+      ? Math.max(run.lastInteractionSequence || 0, envelope.sequence)
+      : run.lastInteractionSequence,
+    updatedAt: envelope.receivedAt,
+  };
+  const nextSession: ChatSessionRuntimeState = {
+    ...session,
+    rounds,
+    pendingInterrupt: interrupt,
+    activeRunKeys: session.activeRunKeys.filter((key) => key !== run.clientRunKey),
+    agentStateByRunKey: {
+      ...session.agentStateByRunKey,
+      [run.clientRunKey]: {
+        ...(session.agentStateByRunKey[run.clientRunKey] || emptyAgentState()),
+        status: 'waiting',
+        lastUpdated: Date.now(),
+      },
+    },
+  };
+  const nextState = putSession(state, run.ownerSessionId, nextSession);
+  return putRun(nextState, run.clientRunKey, nextRun);
+}
+
+function applyInteractionResolved(
+  state: ChatRuntimeState,
+  envelope: StreamEnvelope,
+  run: ChatRunRuntimeState,
+): ChatRuntimeState {
+  const value = envelope.event?.value && typeof envelope.event.value === 'object'
+    ? envelope.event.value
+    : {};
+  const runId = value.runId || run.serverRunId || run.tempRoundId;
+  const session = ensureSession(state, run.ownerSessionId);
+  const rounds = session.rounds.map((round) => (
+    roundMatchesRun(round, run, runId)
+      ? {
+          ...round,
+          round_id: runId,
+          status: 'running',
+          interrupt: undefined,
+        }
+      : round
+  ));
+  let nextState = putSession(state, run.ownerSessionId, {
+    ...session,
+    rounds,
+    pendingInterrupt: null,
+    activeRunKeys: unique([...session.activeRunKeys, run.clientRunKey]),
+    agentStateByRunKey: {
+      ...session.agentStateByRunKey,
+      [run.clientRunKey]: {
+        ...(session.agentStateByRunKey[run.clientRunKey] || emptyAgentState()),
+        status: 'running',
+        lastUpdated: Date.now(),
+      },
+    },
+    visibleAgentStateRunKey: run.clientRunKey,
+  });
+  const nextRun: ChatRunRuntimeState = {
+    ...run,
+    serverRunId: runId,
+    status: 'streaming',
+    lastInteractionSequence: typeof envelope.sequence === 'number'
+      ? Math.max(run.lastInteractionSequence || 0, envelope.sequence)
+      : run.lastInteractionSequence,
+    updatedAt: envelope.receivedAt,
+  };
+  nextState = putRun(nextState, run.clientRunKey, nextRun);
+  if (typeof value.toolCallId === 'string' && typeof value.toolResultContent === 'string') {
+    nextState = updateToolResult(
+      nextState,
+      nextRun,
+      value.toolCallId,
+      value.toolResultContent,
+      envelope.event.timestamp,
+      0,
+    );
+  }
+  return nextState;
 }
 
 function applyRunError(
@@ -816,6 +1254,7 @@ function applyRunError(
         ...session,
         rounds,
         error: message,
+        pendingInterrupt: null,
         activeRunKeys: session.activeRunKeys.filter((key) => key !== run.clientRunKey),
       }),
       run.clientRunKey,
@@ -849,6 +1288,7 @@ function applyRunError(
     ...session,
     rounds,
     error: nextRun.status === 'cancelled' ? session.error : message,
+    pendingInterrupt: null,
     activeRunKeys: session.activeRunKeys.filter((key) => key !== run.clientRunKey),
     agentStateByRunKey: {
       ...session.agentStateByRunKey,
@@ -901,6 +1341,35 @@ function applyLocalCancelled(
     pendingInterrupt: null,
     activeRunKeys: session.activeRunKeys.filter((key) => !targetKeys.includes(key)),
   });
+}
+
+function clearLocalInitSlot(
+  state: ChatRuntimeState,
+  sessionId: string,
+): ChatRuntimeState {
+  const session = ensureSession(state, sessionId);
+  const initRunKeys = session.activeRunKeys.filter(
+    (key) => state.runs[key]?.source === 'init',
+  );
+  if (initRunKeys.length === 0) return state;
+
+  const initRunKeySet = new Set(initRunKeys);
+  const nextRuns = { ...state.runs };
+  for (const key of initRunKeys) {
+    nextRuns[key] = {
+      ...nextRuns[key],
+      status: 'stale',
+      updatedAt: Date.now(),
+    };
+  }
+  return putSession(
+    { ...state, runs: nextRuns },
+    sessionId,
+    {
+      ...session,
+      activeRunKeys: session.activeRunKeys.filter((key) => !initRunKeySet.has(key)),
+    },
+  );
 }
 
 function applyRunningSessionsSnapshot(
@@ -1263,12 +1732,22 @@ function applyTextDelta(run: ChatRunRuntimeState, envelope: StreamEnvelope): Cha
   const messageId = envelope.messageId || envelope.event.messageId || run.buffers.currentTextMessageId || 'default';
   const prev = run.buffers.textByMessageId[messageId] || '';
   const next = envelope.isAggregate ? envelope.event.delta : prev + (envelope.event.delta || '');
+  const previousSegment = run.buffers.textSegmentStateByMessageId[messageId];
   return {
     ...run,
     buffers: {
       ...run.buffers,
       currentTextMessageId: messageId,
       textByMessageId: { ...run.buffers.textByMessageId, [messageId]: next },
+      textSegmentStateByMessageId: {
+        ...run.buffers.textSegmentStateByMessageId,
+        [messageId]: {
+          open: envelope.isAggregate ? previousSegment?.open || false : true,
+          dirty: envelope.isAggregate
+            ? false
+            : previousSegment?.dirty || typeof envelope.sequence !== 'number',
+        },
+      },
     },
   };
 }
@@ -1277,12 +1756,22 @@ function applyThinkingDelta(run: ChatRunRuntimeState, envelope: StreamEnvelope):
   const messageId = envelope.messageId || envelope.event.messageId || run.buffers.currentThinkingMessageId || 'default';
   const prev = run.buffers.thinkingByMessageId[messageId] || '';
   const next = envelope.isAggregate ? envelope.event.delta : prev + (envelope.event.delta || '');
+  const previousSegment = run.buffers.thinkingSegmentStateByMessageId[messageId];
   return {
     ...run,
     buffers: {
       ...run.buffers,
       currentThinkingMessageId: messageId,
       thinkingByMessageId: { ...run.buffers.thinkingByMessageId, [messageId]: next },
+      thinkingSegmentStateByMessageId: {
+        ...run.buffers.thinkingSegmentStateByMessageId,
+        [messageId]: {
+          open: envelope.isAggregate ? previousSegment?.open || false : true,
+          dirty: envelope.isAggregate
+            ? false
+            : previousSegment?.dirty || typeof envelope.sequence !== 'number',
+        },
+      },
     },
   };
 }
@@ -1291,6 +1780,7 @@ function applyToolArgsDelta(run: ChatRunRuntimeState, envelope: StreamEnvelope):
   const toolCallId = envelope.toolCallId || envelope.event.toolCallId;
   const prev = run.buffers.toolArgsByToolCallId[toolCallId] || '';
   const next = envelope.isAggregate ? envelope.event.delta : prev + (envelope.event.delta || '');
+  const previousSegment = run.buffers.toolArgsSegmentStateByToolCallId[toolCallId];
   return {
     ...run,
     buffers: {
@@ -1299,6 +1789,133 @@ function applyToolArgsDelta(run: ChatRunRuntimeState, envelope: StreamEnvelope):
         ...run.buffers.toolArgsByToolCallId,
         [toolCallId]: next,
       },
+      toolArgsSegmentStateByToolCallId: {
+        ...run.buffers.toolArgsSegmentStateByToolCallId,
+        [toolCallId]: {
+          open: envelope.isAggregate ? previousSegment?.open || false : true,
+          dirty: envelope.isAggregate
+            ? false
+            : previousSegment?.dirty || typeof envelope.sequence !== 'number',
+        },
+      },
+    },
+  };
+}
+
+function hasDirtyStreamSegments(buffers: ChatRunRuntimeState['buffers']): boolean {
+  return [
+    ...Object.values(buffers.textSegmentStateByMessageId),
+    ...Object.values(buffers.thinkingSegmentStateByMessageId),
+    ...Object.values(buffers.toolArgsSegmentStateByToolCallId),
+  ].some((segment) => segment.dirty);
+}
+
+function historyMaterializesDirtySegments(
+  serverRound: RoundData,
+  buffers: ChatRunRuntimeState['buffers'],
+): boolean {
+  const textCandidates = serverRound.steps.map((step) => step.assistant_content || '');
+  const thinkingCandidates = serverRound.steps.map((step) => step.thinking || '');
+
+  const prefixesAreMaterialized = (
+    values: Record<string, string>,
+    segments: Record<string, { open: boolean; dirty: boolean }>,
+    candidates: string[],
+    currentSegmentId?: string | null,
+  ): boolean => {
+    const remaining = candidates.filter(Boolean);
+    for (const [segmentId, segment] of Object.entries(segments)) {
+      if (!segment.dirty) continue;
+      const prefix = values[segmentId] || '';
+      if (!prefix) continue;
+      if (segment.open && segmentId === currentSegmentId) {
+        const currentCandidate = candidates[candidates.length - 1] || '';
+        if (!currentCandidate.startsWith(prefix)) return false;
+        const currentCandidateIndex = remaining.lastIndexOf(currentCandidate);
+        if (currentCandidateIndex >= 0) {
+          remaining.splice(currentCandidateIndex, 1);
+        }
+        continue;
+      }
+      const matchIndex = remaining.findIndex((candidate) => candidate.startsWith(prefix));
+      if (matchIndex < 0) return false;
+      remaining.splice(matchIndex, 1);
+    }
+    return true;
+  };
+
+  if (!prefixesAreMaterialized(
+    buffers.textByMessageId,
+    buffers.textSegmentStateByMessageId,
+    textCandidates,
+    buffers.currentTextMessageId,
+  )) {
+    return false;
+  }
+  if (!prefixesAreMaterialized(
+    buffers.thinkingByMessageId,
+    buffers.thinkingSegmentStateByMessageId,
+    thinkingCandidates,
+    buffers.currentThinkingMessageId,
+  )) {
+    return false;
+  }
+
+  const persistedToolCallIds = new Set(
+    serverRound.steps.flatMap((step) => (
+      step.tool_calls
+        .map((toolCall) => toolCall.id)
+        .filter((toolCallId): toolCallId is string => Boolean(toolCallId))
+    )),
+  );
+  return Object.entries(buffers.toolArgsSegmentStateByToolCallId).every(
+    ([toolCallId, segment]) => !segment.dirty
+      || !(buffers.toolArgsByToolCallId[toolCallId] || '')
+      || persistedToolCallIds.has(toolCallId),
+  );
+}
+
+function aggregateMatchesBufferedSegment(
+  run: ChatRunRuntimeState,
+  envelope: StreamEnvelope,
+): boolean {
+  if (!envelope.isAggregate) return false;
+  const aggregate = String(envelope.event?.delta || '');
+  const eventType = envelope.event?.type;
+  if (eventType === 'TEXT_MESSAGE_CONTENT') {
+    const messageId = envelope.messageId
+      || envelope.event.messageId
+      || run.buffers.currentTextMessageId
+      || 'default';
+    const segment = run.buffers.textSegmentStateByMessageId[messageId];
+    return Boolean(segment && aggregate.startsWith(run.buffers.textByMessageId[messageId] || ''));
+  }
+  if (eventType === 'THINKING_TEXT_MESSAGE_CONTENT') {
+    const messageId = envelope.messageId
+      || envelope.event.messageId
+      || run.buffers.currentThinkingMessageId
+      || 'default';
+    const segment = run.buffers.thinkingSegmentStateByMessageId[messageId];
+    return Boolean(segment && aggregate.startsWith(run.buffers.thinkingByMessageId[messageId] || ''));
+  }
+  if (eventType === 'TOOL_CALL_ARGS') {
+    const toolCallId = envelope.toolCallId || envelope.event.toolCallId;
+    const segment = run.buffers.toolArgsSegmentStateByToolCallId[toolCallId];
+    return Boolean(segment && aggregate.startsWith(run.buffers.toolArgsByToolCallId[toolCallId] || ''));
+  }
+  return false;
+}
+
+function closeSegment(
+  segments: Record<string, { open: boolean; dirty: boolean }>,
+  segmentId?: string | null,
+): Record<string, { open: boolean; dirty: boolean }> {
+  if (!segmentId) return segments;
+  return {
+    ...segments,
+    [segmentId]: {
+      open: false,
+      dirty: segments[segmentId]?.dirty || false,
     },
   };
 }
@@ -1446,15 +2063,12 @@ function isUserCancelledOutcome(outcome: string, _interrupt: InterruptDetails | 
 function getRunFinishedRoundStatus(outcome: string, isUserCancelled: boolean, result?: any): string {
   if (isUserCancelled) return 'cancelled';
   if (outcome === 'interrupt' && result?.reason === 'max_steps_reached') return 'max_steps_reached';
-  if (outcome === 'interrupt') return 'interrupted';
+  if (outcome === 'interrupt') return 'failed';
   if (outcome === 'success') return 'completed';
   return outcome;
 }
 
-function getRunFinishedCompletedAt(outcome: string, isUserCancelled: boolean, result?: any): string | undefined {
-  if (outcome === 'interrupt' && !isUserCancelled && result?.reason !== 'max_steps_reached') {
-    return undefined;
-  }
+function getRunFinishedCompletedAt(_outcome: string, _isUserCancelled: boolean, _result?: any): string | undefined {
   return new Date().toISOString();
 }
 

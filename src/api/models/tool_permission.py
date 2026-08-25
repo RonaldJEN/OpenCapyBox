@@ -62,7 +62,13 @@ class ToolPermissionRule(Base):
 
 
 class ToolApprovalRequest(Base):
-    """Durable, single-execution record for an ASK decision."""
+    """Durable, single-execution record for an ASK decision.
+
+    Normal allow flow is ``requested -> approved -> executing -> terminal``.
+    ``approved`` is intentionally pre-execution: it has a durable resolution
+    but no claim token or lease, so a continuation can recover it after a crash.
+    Denial transitions directly from ``requested`` to terminal ``denied``.
+    """
 
     __tablename__ = "tool_approval_requests"
     __table_args__ = (
@@ -115,9 +121,10 @@ class ToolApprovalRequest(Base):
     requested_at = Column(DateTime, default=now_naive, nullable=False, index=True)
     resolved_at = Column(DateTime, nullable=True)
     execution_started_at = Column(DateTime, nullable=True)
-    # A claim token fences a stale worker from completing a newer execution
-    # claim. The lease is only a liveness signal: expiry never authorizes a
-    # retry because the remote side effect may already have happened.
+    # These fields remain null while status is ``approved``. A claim token
+    # fences a stale executing worker from completing a newer execution claim.
+    # The lease is only a liveness signal: expiry never authorizes a retry
+    # because the remote side effect may already have happened.
     execution_claim_token = Column(String(64), nullable=True)
     execution_lease_expires_at = Column(DateTime, nullable=True, index=True)
     completed_at = Column(DateTime, nullable=True)

@@ -26,6 +26,19 @@ VALID_EFFECTS = {"allow", "ask", "deny"}
 VALID_PROVIDERS = {"builtin", "mcp"}
 VALID_SCOPES = {"platform", "user", "session"}
 APPROVAL_RESOLUTIONS = {"allow_once", "allow_session", "allow_always", "deny"}
+APPROVAL_ALLOW_RESOLUTIONS = frozenset(
+    {"allow_once", "allow_session", "allow_always"}
+)
+# A terminal Round may safely converge either state because no tool execution
+# claim exists yet. ``executing`` is deliberately excluded: its side effect may
+# already have happened and must be reconciled through the execution lease.
+APPROVAL_CANCELLABLE_STATUSES = frozenset({"requested", "approved"})
+# A pending same-Round continuation may also replay a durable denial after a
+# worker crash. ``denied`` is terminal for tool execution but not necessarily
+# for projecting that decision back into the owning Agent turn.
+APPROVAL_CONTINUATION_RESUMABLE_STATUSES = frozenset(
+    {"requested", "approved", "denied"}
+)
 RULE_CONDITIONS_VERSION = 1
 APPROVAL_OUTCOME_UNKNOWN_ERROR = (
     "外部副作用结果未知，工具可能已执行；绝不自动重试。"
@@ -141,6 +154,16 @@ class ApprovalClaim:
     request: ToolApprovalRequest
     claim_token: str | None = None
     lease_expires_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ApprovalPreparation:
+    """Durable user decision made before any tool execution claim exists."""
+
+    request_id: str
+    resolution: str
+    should_execute: bool
+    request: ToolApprovalRequest
 
 
 def _canonical_json(value: Any) -> str:
@@ -860,6 +883,275 @@ def load_approval_arguments(request: ToolApprovalRequest) -> dict[str, Any]:
     return value
 
 
+def _persist_remembered_approval_rule(
+    db: DBSession,
+    *,
+    request: ToolApprovalRequest,
+    resolution: str,
+    user_id: str,
+) -> None:
+    if resolution not in {"allow_session", "allow_always"}:
+        return
+
+    ref = ToolRef(
+        provider=request.provider,
+        server_id=request.server_id,
+        tool_name=request.tool_name,
+    )
+    remember_binding_valid = True
+    if request.provider == "mcp":
+        from src.api.models.mcp import McpToolSnapshot
+        from src.api.services.mcp_runtime import resolve_effective_mcp_installation
+
+        current_installation = None
+        if request.installation_id:
+            current_installation = resolve_effective_mcp_installation(
+                db,
+                user_id=request.user_id,
+                installation_id=request.installation_id,
+            )
+        current_snapshot = None
+        if current_installation is not None:
+            current_snapshot = (
+                db.query(McpToolSnapshot)
+                .filter(
+                    McpToolSnapshot.installation_id == request.installation_id,
+                    McpToolSnapshot.tool_name == request.tool_name,
+                )
+                .first()
+            )
+        remember_binding_valid = bool(
+            request.server_id
+            and request.schema_hash
+            and request.connection_fingerprint
+            and current_installation is not None
+            and current_installation.server_id == request.server_id
+            and current_installation.execution_fingerprint
+            == request.connection_fingerprint
+            and current_snapshot is not None
+            and current_snapshot.schema_hash == request.schema_hash
+            and current_snapshot.connection_fingerprint
+            == request.connection_fingerprint
+        )
+    if not remember_binding_valid:
+        return
+
+    scope_type = "session" if resolution == "allow_session" else "user"
+    scope_id = request.session_id if scope_type == "session" else request.user_id
+    create_permission_rule(
+        db,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        ref=ref,
+        effect="allow",
+        created_by=user_id,
+        description=f"Created from approval {request.id}",
+        conditions=(
+            {
+                "version": RULE_CONDITIONS_VERSION,
+                "schema_hash": request.schema_hash,
+                "connection_fingerprint": request.connection_fingerprint,
+            }
+            if request.provider == "mcp"
+            else None
+        ),
+        commit=False,
+    )
+
+
+def prepare_approval_request(
+    db: DBSession,
+    *,
+    request_id: str,
+    user_id: str,
+    resolution: str,
+    commit: bool = True,
+) -> ApprovalPreparation:
+    """Persist an approval decision without claiming tool execution.
+
+    Allowed decisions enter the durable ``approved`` queue.  No execution
+    timestamp, claim token, or lease is created until
+    :func:`dispatch_approval_request` wins the later CAS.  This makes a process
+    crash between accepting the user's answer and starting continuation safely
+    recoverable.  Denial remains terminal and never enters the queue.
+    """
+
+    if resolution not in APPROVAL_RESOLUTIONS:
+        raise ValueError(f"unsupported approval resolution: {resolution}")
+    now = now_naive()
+    should_execute = resolution in APPROVAL_ALLOW_RESOLUTIONS
+    status = "approved" if should_execute else "denied"
+    updated = (
+        db.query(ToolApprovalRequest)
+        .filter(
+            ToolApprovalRequest.id == request_id,
+            ToolApprovalRequest.user_id == user_id,
+            ToolApprovalRequest.status == "requested",
+        )
+        .update(
+            {
+                "resolution": resolution,
+                "resolved_at": now,
+                "status": status,
+                "execution_started_at": None,
+                "execution_claim_token": None,
+                "execution_lease_expires_at": None,
+                "completed_at": None if should_execute else now,
+            },
+            synchronize_session=False,
+        )
+    )
+    if not updated:
+        existing = (
+            db.query(ToolApprovalRequest)
+            .populate_existing()
+            .filter(
+                ToolApprovalRequest.id == request_id,
+                ToolApprovalRequest.user_id == user_id,
+            )
+            .first()
+        )
+        if existing is None:
+            raise LookupError("tool approval request not found")
+        if existing.status == status and existing.resolution == resolution:
+            if commit:
+                db.commit()
+                db.refresh(existing)
+            else:
+                db.flush()
+            return ApprovalPreparation(
+                request_id=existing.id,
+                resolution=resolution,
+                should_execute=should_execute,
+                request=existing,
+            )
+        raise RuntimeError(
+            f"tool approval request already resolved: {existing.status}"
+        )
+
+    request = (
+        db.query(ToolApprovalRequest)
+        .populate_existing()
+        .filter(
+            ToolApprovalRequest.id == request_id,
+            ToolApprovalRequest.user_id == user_id,
+        )
+        .one()
+    )
+    _persist_remembered_approval_rule(
+        db,
+        request=request,
+        resolution=resolution,
+        user_id=user_id,
+    )
+    if commit:
+        db.commit()
+        db.refresh(request)
+    else:
+        db.flush()
+    return ApprovalPreparation(
+        request_id=request.id,
+        resolution=resolution,
+        should_execute=should_execute,
+        request=request,
+    )
+
+
+def dispatch_approval_request(
+    db: DBSession,
+    *,
+    request_id: str,
+    user_id: str,
+    commit: bool = True,
+) -> ApprovalClaim:
+    """Claim one durably approved request at the tool execution boundary."""
+
+    prepared = (
+        db.query(ToolApprovalRequest)
+        .populate_existing()
+        .filter(
+            ToolApprovalRequest.id == request_id,
+            ToolApprovalRequest.user_id == user_id,
+        )
+        .first()
+    )
+    if prepared is None:
+        raise LookupError("tool approval request not found")
+    if prepared.status != "approved":
+        raise RuntimeError(
+            f"tool approval request is not dispatchable: {prepared.status}"
+        )
+    if prepared.resolution not in APPROVAL_ALLOW_RESOLUTIONS:
+        raise RuntimeError(
+            "tool approval request has non-executable resolution: "
+            f"{prepared.resolution}"
+        )
+    # Validate immutable encrypted input before creating an execution claim. If
+    # integrity verification fails, the durable request remains recoverable and
+    # no worker can mistake it for a possibly-started side effect.
+    arguments = load_approval_arguments(prepared)
+
+    now = now_naive()
+    claim_token = uuid.uuid4().hex
+    lease_seconds = float(get_settings().tool_approval_execution_lease_seconds)
+    lease_expires_at = now + timedelta(seconds=lease_seconds)
+    updated = (
+        db.query(ToolApprovalRequest)
+        .filter(
+            ToolApprovalRequest.id == request_id,
+            ToolApprovalRequest.user_id == user_id,
+            ToolApprovalRequest.status == "approved",
+            ToolApprovalRequest.resolution == prepared.resolution,
+        )
+        .update(
+            {
+                "status": "executing",
+                "execution_started_at": now,
+                "execution_claim_token": claim_token,
+                "execution_lease_expires_at": lease_expires_at,
+            },
+            synchronize_session=False,
+        )
+    )
+    if not updated:
+        existing = (
+            db.query(ToolApprovalRequest)
+            .populate_existing()
+            .filter(
+                ToolApprovalRequest.id == request_id,
+                ToolApprovalRequest.user_id == user_id,
+            )
+            .one()
+        )
+        raise RuntimeError(
+            f"tool approval request is not dispatchable: {existing.status}"
+        )
+
+    request = (
+        db.query(ToolApprovalRequest)
+        .populate_existing()
+        .filter(
+            ToolApprovalRequest.id == request_id,
+            ToolApprovalRequest.user_id == user_id,
+        )
+        .one()
+    )
+    if commit:
+        db.commit()
+        db.refresh(request)
+    else:
+        db.flush()
+    return ApprovalClaim(
+        request_id=request.id,
+        resolution=request.resolution,
+        should_execute=True,
+        arguments=arguments,
+        request=request,
+        claim_token=request.execution_claim_token,
+        lease_expires_at=request.execution_lease_expires_at,
+    )
+
+
 def claim_approval_request(
     db: DBSession,
     *,
@@ -926,69 +1218,12 @@ def claim_approval_request(
         .one()
     )
 
-    if resolution in {"allow_session", "allow_always"}:
-        ref = ToolRef(
-            provider=request.provider,
-            server_id=request.server_id,
-            tool_name=request.tool_name,
-        )
-        remember_binding_valid = True
-        if request.provider == "mcp":
-            from src.api.models.mcp import McpToolSnapshot
-            from src.api.services.mcp_runtime import resolve_effective_mcp_installation
-
-            current_installation = None
-            if request.installation_id:
-                current_installation = resolve_effective_mcp_installation(
-                    db,
-                    user_id=request.user_id,
-                    installation_id=request.installation_id,
-                )
-            current_snapshot = None
-            if current_installation is not None:
-                current_snapshot = (
-                    db.query(McpToolSnapshot)
-                    .filter(
-                        McpToolSnapshot.installation_id == request.installation_id,
-                        McpToolSnapshot.tool_name == request.tool_name,
-                    )
-                    .first()
-                )
-            remember_binding_valid = bool(
-                request.server_id
-                and request.schema_hash
-                and request.connection_fingerprint
-                and current_installation is not None
-                and current_installation.server_id == request.server_id
-                and current_installation.execution_fingerprint
-                == request.connection_fingerprint
-                and current_snapshot is not None
-                and current_snapshot.schema_hash == request.schema_hash
-                and current_snapshot.connection_fingerprint
-                == request.connection_fingerprint
-            )
-        if remember_binding_valid:
-            scope_type = "session" if resolution == "allow_session" else "user"
-            scope_id = request.session_id if scope_type == "session" else request.user_id
-            create_permission_rule(
-                db,
-                scope_type=scope_type,
-                scope_id=scope_id,
-                ref=ref,
-                effect="allow",
-                created_by=user_id,
-                description=f"Created from approval {request.id}",
-                conditions=(
-                    {
-                        "version": RULE_CONDITIONS_VERSION,
-                        "schema_hash": request.schema_hash,
-                        "connection_fingerprint": request.connection_fingerprint,
-                    }
-                    if request.provider == "mcp"
-                    else None
-                ),
-                commit=False,
-            )
+    _persist_remembered_approval_rule(
+        db,
+        request=request,
+        resolution=resolution,
+        user_id=user_id,
+    )
 
     arguments = load_approval_arguments(request)
     if commit:

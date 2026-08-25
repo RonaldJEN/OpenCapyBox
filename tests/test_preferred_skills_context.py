@@ -665,7 +665,7 @@ async def test_registry_resolution_filters_unavailable_skills_each_run():
     assert [skill.key for skill in resolved.preferred_skills.skills] == ["pdf"]
 
 
-def test_requested_context_round_trip_for_interrupt_metadata():
+def test_requested_context_round_trip_for_interaction_metadata():
     requested = RequestedPreferredSkillsContext(keys=("pdf", "data"))
     wire = requested_preferred_skills_to_context(requested)
     parsed = AgentService._requested_context_from_interrupt({
@@ -674,27 +674,27 @@ def test_requested_context_round_trip_for_interrupt_metadata():
     assert parsed == requested
 
 
-def test_interrupt_metadata_persists_runtime_context_and_server_origin_anchor():
+def test_interaction_metadata_persists_runtime_context_and_server_origin_anchor():
     requested = RequestedPreferredSkillsContext(keys=("pdf", "data"))
-    interrupt_payload = {
+    interaction_payload = {
         PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY: "forged:user",
     }
     pending_interrupt = {
         PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY: "also-forged:user",
     }
 
-    AgentService._attach_preferred_skills_interrupt_context(
-        interrupt_payload,
+    AgentService._attach_preferred_skills_interaction_context(
+        interaction_payload,
         pending_interrupt,
         requested_context=requested,
         origin_user_message_id="round-1:user",
     )
 
     expected_wire = requested_preferred_skills_to_context(requested).model_dump()
-    assert interrupt_payload["runtime_context"] == expected_wire
+    assert interaction_payload["runtime_context"] == expected_wire
     assert pending_interrupt["runtime_context"] == expected_wire
     assert (
-        interrupt_payload[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY]
+        interaction_payload[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY]
         == "round-1:user"
     )
     assert (
@@ -716,41 +716,6 @@ def test_client_runtime_context_cannot_forge_server_origin_anchor():
         snapshot,
         parent_run_id="server-round",
     ) == "server-round:user"
-
-
-def test_persisted_interrupt_loader_restores_server_origin_anchor():
-    requested = RequestedPreferredSkillsContext(keys=("pdf",))
-    round_row = MagicMock()
-    round_row.id = "round-1"
-    round_row.interrupt_payload = json.dumps({
-        "id": "interrupt-1",
-        "payload": {"tool_call_id": "tool-call-1"},
-        "runtime_context": requested_preferred_skills_to_context(
-            requested
-        ).model_dump(),
-        PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY: "round-1:user",
-    })
-    db = MagicMock()
-    db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
-        round_row
-    ]
-
-    service = object.__new__(AgentService)
-    service.session_id = "session-1"
-    service.user_id = "user-1"
-    service.history_service = MagicMock(db=db)
-
-    snapshot = service._load_persisted_interrupt("interrupt-1")
-
-    assert snapshot is not None
-    assert snapshot["runtime_context"] == requested_preferred_skills_to_context(
-        requested
-    ).model_dump()
-    assert (
-        snapshot[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY]
-        == "round-1:user"
-    )
-    db.rollback.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -819,7 +784,7 @@ async def test_resume_replaces_current_default_with_frozen_parent_reasoning():
         thread_id="session-1",
         session_id="session-1",
         user_message="original",
-        status="interrupted",
+        status="waiting_interaction",
         thinking_mode=frozen_parent.mode,
         reasoning_effort=frozen_parent.effort,
     ))
@@ -829,7 +794,11 @@ async def test_resume_replaces_current_default_with_frozen_parent_reasoning():
     service.agent = MagicMock()
     service.session_id = "session-1"
     service.user_id = "user-1"
-    service.history_service = SimpleNamespace(db=db)
+    recover_expired_continuations = MagicMock(return_value=[])
+    service.history_service = SimpleNamespace(
+        db=db,
+        recover_expired_interaction_continuations=recover_expired_continuations,
+    )
     service.skill_loader = None
     service._model_config = SimpleNamespace(
         effective_thinking_mode="disabled",
@@ -852,84 +821,10 @@ async def test_resume_replaces_current_default_with_frozen_parent_reasoning():
             "run_context"
         ]
         assert run_context.reasoning == frozen_parent
+        recover_expired_continuations.assert_called_once_with("session-1")
     finally:
         db.close()
         engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_consecutive_resumes_keep_original_preferred_skill_anchor():
-    requested = RequestedPreferredSkillsContext(keys=("pdf",))
-    wire = requested_preferred_skills_to_context(requested).model_dump()
-    persisted_interrupts = [
-        {
-            "interrupt_id": "approval-1",
-            "round_id": "round-1",
-            "kind": "tool_approval",
-            "runtime_context": wire,
-            PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY: "round-1:user",
-        },
-        {
-            "interrupt_id": "approval-2",
-            "round_id": "round-2",
-            "kind": "tool_approval",
-            "runtime_context": wire,
-            PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY: "round-1:user",
-        },
-    ]
-    resolved = _run_context("pdf")
-
-    def build_prepared(**kwargs):
-        return PreparedAgentRun(
-            run_id=f"{kwargs['parent_run_id']}-child",
-            user_message="Tool approval: allow_once",
-            user_message_id=kwargs["preferred_skills_origin_user_message_id"],
-            context=kwargs["run_context"],
-            requested_context=kwargs["requested_context"],
-            parent_run_id=kwargs["parent_run_id"],
-        )
-
-    service = object.__new__(AgentService)
-    service.agent = MagicMock()
-    service._resume_lock = asyncio.Lock()
-    service._pending_interrupt_round_ids = {}
-    service._load_persisted_interrupt = MagicMock(side_effect=persisted_interrupts)
-    service._get_agent_pending_interrupt_snapshot = MagicMock(return_value=None)
-    service._resolve_run_context = AsyncMock(return_value=resolved)
-    service._reasoning_context_from_round = MagicMock(return_value=None)
-    service._prepare_tool_approval_resume_locked = MagicMock(side_effect=build_prepared)
-
-    second_round = await service.prepare_resume_round(
-        interrupt_id="approval-1",
-        answers={"approval": "allow_once"},
-    )
-    third_round = await service.prepare_resume_round(
-        interrupt_id="approval-2",
-        answers={"approval": "allow_once"},
-    )
-
-    assert second_round.user_message_id == "round-1:user"
-    assert third_round.user_message_id == "round-1:user"
-    assert service._resolve_run_context.await_args_list == [
-        ((requested,),),
-        ((requested,),),
-    ]
-
-    request_messages = [
-        Message(role="user", id="round-1:user", content="original request"),
-        Message(role="user", id="round-2:user", content="resume answer"),
-    ]
-    Agent._project_user_run_context(
-        request_messages,
-        request_context=LLMRequestContext(
-            purpose="agent_step",
-            run_context=third_round.context,
-            user_message_id=third_round.user_message_id,
-        ),
-        exposed_tool_names={"get_skill"},
-    )
-    assert isinstance(request_messages[0].content, list)
-    assert request_messages[1].content == "resume answer"
 
 
 @pytest.mark.asyncio

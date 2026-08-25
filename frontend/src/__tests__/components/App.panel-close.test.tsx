@@ -289,7 +289,7 @@ describe('App 配置抽屉交互', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByTestId('executing-sessions')).toHaveTextContent('session-a,session-b');
+      expect(screen.getByTestId('executing-sessions')).toHaveTextContent('session-b');
     });
 
     expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-active-slots', 'session-a,session-b');
@@ -317,7 +317,7 @@ describe('App 配置抽屉交互', () => {
     fireEvent.click(screen.getByText('select-manual'));
 
     await waitFor(() => {
-      expect(screen.getByTestId('executing-sessions')).toHaveTextContent('session-a');
+      expect(screen.getByTestId('executing-sessions')).toBeEmptyDOMElement();
     });
 
     expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-active-slots', 'session-a');
@@ -372,7 +372,7 @@ describe('App 配置抽屉交互', () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByTestId('executing-sessions')).toHaveTextContent('session-a,session-b');
+    expect(screen.getByTestId('executing-sessions')).toHaveTextContent('session-b');
     expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-active-slots', 'session-a,session-b');
 
     await act(async () => {

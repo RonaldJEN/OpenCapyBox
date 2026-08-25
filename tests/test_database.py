@@ -222,6 +222,47 @@ class TestDatabaseMigration:
         finally:
             sqlite_engine.dispose()
 
+    def test_fresh_agent_interaction_schema_has_started_boundary(self):
+        from sqlalchemy import create_engine, inspect
+
+        from src.api.models import database as database_module
+        from src.api.models.agent_interaction import AgentInteraction
+        from src.api.models.database import Base
+        from src.api.models.round import Round
+        from src.api.models.session import Session
+
+        pending_tables = {
+            table_name
+            for table_name, column_name, column_type in database_module._PENDING_COLUMNS
+        }
+        assert "agent_interactions" not in pending_tables
+
+        fresh_engine = create_engine("sqlite://")
+        try:
+            Base.metadata.create_all(
+                fresh_engine,
+                tables=[
+                    Session.__table__,
+                    Round.__table__,
+                    AgentInteraction.__table__,
+                ],
+            )
+            columns = {
+                column["name"]
+                for column in inspect(fresh_engine).get_columns("agent_interactions")
+            }
+            assert "continuation_started_at" in columns
+            fresh_indexes = [
+                index
+                for index in inspect(fresh_engine).get_indexes("agent_interactions")
+                if index["column_names"] == ["continuation_started_at"]
+            ]
+            assert [index["name"] for index in fresh_indexes] == [
+                "ix_agent_interactions_continuation_started_at"
+            ]
+        finally:
+            fresh_engine.dispose()
+
     def test_thinking_wire_format_migration_preserves_openai_and_normalizes_anthropic(self):
         from sqlalchemy import create_engine, text
 

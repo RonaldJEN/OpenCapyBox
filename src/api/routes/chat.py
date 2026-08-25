@@ -32,13 +32,17 @@ import time
 from datetime import datetime
 from src.api.utils.timezone import now_naive
 # AG-UI 事件類型統一從 Agent 層導入
-from src.agent.schema.agui_events import CustomEvent, EventType, RunErrorEvent, RunFinishedEvent
+from src.agent.schema.agui_events import CustomEvent, EventType, RunErrorEvent
 from src.agent.schema.run_context import (
     RequestedReasoningContext,
     resolve_reasoning_selection,
 )
 from src.api.utils.agui_encoder import EventEncoder
-from src.api.services.agent_service import DuplicateRoundError
+from src.api.services.agent_service import (
+    DuplicateRoundError,
+    InvalidInteractionResponseError,
+)
+from src.api.services.agent_interaction_service import InteractionConflictError
 from src.api.services.agui_event_bus import AguiEventBus, get_agui_event_bus
 from src.api.services.run_completion_service import RunCompletionService
 from src.api.services.run_cancel_service import get_run_cancel_service
@@ -296,7 +300,7 @@ def _cleanup_orphaned_rounds(
     user_id: str,
     session_id: str | None = None,
 ) -> int:
-    """將已失去心跳鎖的 running round 標記為 cancelled（用於 worker 崩潰後回收）。
+    """恢复安全 continuation，并将其余 worker 崩溃 Round 标记为 failed。
 
     只在鎖心跳已過期且鎖被回收後調用 — 此時可確定該 session 的原 worker 已死。
     """
@@ -355,6 +359,7 @@ async def _sse_from_turn_execution(
     execution: TurnExecution,
     *,
     on_run_finished: Callable[[str | None], Awaitable[AsyncIterator[str]]] | None = None,
+    on_stream_finished: Callable[[str | None], Awaitable[AsyncIterator[str]]] | None = None,
     error_message: str | None = None,
 ):
     """Render an orchestrator-managed run stream as Web SSE.
@@ -399,6 +404,9 @@ async def _sse_from_turn_execution(
             try:
                 event = next_event_task.result()
             except StopAsyncIteration:
+                if on_stream_finished:
+                    async for extra in await on_stream_finished(current_run_id):
+                        yield extra
                 break
 
             event_type = _event_type(event)
@@ -697,6 +705,8 @@ async def send_message_stream(
 
         # --- 標題生成任務（如果是第一條消息）---
         title_generation_task = None
+        title_run_id: str | None = None
+        title_run_ready = asyncio.Event()
         try:
             if round_count == 0:
                 print(f"🏷️  檢測到第一條消息，啟動標題生成任務...")
@@ -712,6 +722,27 @@ async def send_message_stream(
                                 title_session.updated_at = now_naive()
                                 title_db.commit()
                                 print(f"✅ 會話標題已保存: {title}")
+                                await title_run_ready.wait()
+                                if title_run_id:
+                                    title_event = CustomEvent(
+                                        name="title_updated",
+                                        value={
+                                            "sessionId": chat_session_id,
+                                            "title": title,
+                                        },
+                                    )
+                                    try:
+                                        await _agui_event_bus.publish_ephemeral(
+                                            title_run_id,
+                                            title_event,
+                                        )
+                                    except Exception:
+                                        logger.warning(
+                                            "标题已落库但实时通知失败: session=%s run=%s",
+                                            chat_session_id,
+                                            title_run_id,
+                                            exc_info=True,
+                                        )
                                 return title
                     except Exception as e:
                         print(f"⚠️  標題生成失敗: {e}")
@@ -730,8 +761,6 @@ async def send_message_stream(
                                     name="title_updated",
                                     value={"sessionId": chat_session_id, "title": title},
                                 )
-                                if _run_id:
-                                    await _agui_event_bus.publish_ephemeral(_run_id, title_event)
                                 yield event_encoder.encode(title_event)
                         except Exception as e:
                             print(f"⚠️  等待標題生成失敗: {e}")
@@ -747,20 +776,37 @@ async def send_message_stream(
             except DuplicateRoundError as e:
                 yield event_encoder.encode(RunErrorEvent(message=e.existing_round_id, code="ROUND_IN_PROGRESS"))
                 return
+            except InteractionConflictError as e:
+                yield event_encoder.encode(RunErrorEvent(
+                    message=str(e),
+                    code="INTERACTION_PENDING",
+                ))
+                return
             except Exception:
                 logger.error("submit turn failed before orchestrated SSE started", exc_info=True)
                 yield event_encoder.encode(RunErrorEvent(message="Agent 執行失敗", code="INTERNAL_ERROR"))
                 return
 
+            title_run_id = execution.handle.run_id
+            title_run_ready.set()
             _entered_sse = True  # producer 已由 TurnOrchestrator 接管，鎖的釋放由 orchestrator 負責
             async for chunk in _sse_from_turn_execution(
                 execution,
                 on_run_finished=on_run_finished,
+                on_stream_finished=on_run_finished,
                 error_message="Agent 執行失敗",
             ):
                 yield chunk
         finally:
-            if title_generation_task and not title_generation_task.done():
+            # Once the orchestrator owns the run, a disconnected Web consumer
+            # must not cancel first-message title persistence.  A normally
+            # suspended same-Round stream awaits the task via
+            # ``on_stream_finished`` and emits ``title_updated`` before EOF.
+            if (
+                not _entered_sse
+                and title_generation_task
+                and not title_generation_task.done()
+            ):
                 title_generation_task.cancel()
             # 若 producer 未由 TurnOrchestrator 接管，手動釋放用戶鎖
             if not _entered_sse:
@@ -881,6 +927,18 @@ async def resume_interrupt(
                     lock_id=lock_id,
                     run_started_at=run_guard_started_at,
                 )
+            except InteractionConflictError as e:
+                yield event_encoder.encode(RunErrorEvent(
+                    message=str(e),
+                    code="RESUME_CONFLICT",
+                ))
+                return
+            except InvalidInteractionResponseError as e:
+                yield event_encoder.encode(RunErrorEvent(
+                    message=str(e),
+                    code="INVALID_INTERACTION_RESPONSE",
+                ))
+                return
             except Exception:
                 logger.error("resume turn failed before orchestrated SSE started", exc_info=True)
                 yield event_encoder.encode(RunErrorEvent(message="服务暂时不可用，请稍后重试", code="INTERNAL_ERROR"))
@@ -1140,29 +1198,20 @@ async def abort_chat(
         logger.info("abort 命中本地 runner，等待其通过 cancel_token/终态检查退出: session=%s", chat_session_id)
 
     # 若有 running round，立即收斂本地状态为 cancelled，避免前端與
-    # running-sessions 視圖回跳。取消不能撤回已经跨过 dispatch 边界的
-    # 远端请求，因此终态必须持久化保守的 outcome-unknown 警告。
+    # running-sessions 視圖回跳。终态事务只把 waiting interaction 与
+    # approved-but-undispatched 视为可证明安全；已派发审批或没有 durable
+    # pre-dispatch 事实的普通 running Round 都保守报告 outcome unknown。
+    outcome_warning: str | None = None
     if running_round:
-        final_response = ABORT_OUTCOME_WARNING
-        finished_event = RunFinishedEvent(
-            threadId=chat_session_id,
-            runId=running_round_id,
-            outcome="interrupt",
-            result={
-                "reason": "user_cancelled",
-                "finalResponse": final_response,
-                "stepCount": running_round.step_count or 0,
-                "outcomeUncertain": True,
-                "warning": ABORT_OUTCOME_WARNING,
-            },
-        )
         try:
-            await RunCompletionService(db).complete(
+            cancellation = await RunCompletionService(db).cancel_user_run(
                 run_id=running_round_id,
-                status="cancelled",
-                final_response=final_response,
-                step_count=running_round.step_count or 0,
-                terminal_event=finished_event,
+                outcome_warning=ABORT_OUTCOME_WARNING,
+            )
+            outcome_warning = (
+                ABORT_OUTCOME_WARNING
+                if cancellation.outcome_uncertain
+                else None
             )
         except OperationalError:
             db.rollback()
@@ -1183,6 +1232,10 @@ async def abort_chat(
             )
             raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
 
+        if agent_service:
+            agent_service.discard_pending_runtime_state(
+                owner_round_id=running_round_id,
+            )
         _agui_event_bus.cleanup_subscribers(running_round_id)
 
     # 立即釋放該會話鎖（如果存在），允許用戶立刻重發。
@@ -1213,7 +1266,7 @@ async def abort_chat(
             "status": "cancelled",
             "request_id": request_id,
             "reason": reason,
-            "outcome_warning": ABORT_OUTCOME_WARNING,
+            "outcome_warning": outcome_warning,
         }
 
     # 僅處於 init-window（有鎖無 round）時也立即解除阻塞。
@@ -1221,7 +1274,7 @@ async def abort_chat(
         "status": "cancelled",
         "request_id": request_id,
         "reason": "force_unlocked",
-        "outcome_warning": ABORT_OUTCOME_WARNING,
+        "outcome_warning": None,
     }
 
 

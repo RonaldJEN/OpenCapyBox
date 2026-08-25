@@ -21,6 +21,17 @@ export interface AdminOverview {
   trends: Array<{ date: string; rounds: number; tokens: number }>;
 }
 
+export type AdminRoundStatus =
+  | 'running'
+  | 'waiting_interaction'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'max_steps_reached';
+
+export type AdminRoundStatusFilter = 'all' | AdminRoundStatus;
+export type AdminSessionMonitorStatus = 'running' | 'waiting_interaction' | 'error' | 'completed';
+
 export interface AdminRoundStepItem {
   llm_record_id: number;
   step_index: number;
@@ -75,7 +86,7 @@ export interface AdminRoundTreeItem {
   subagent_description: string | null;
   subagent_prompt_preview: string | null;
   subagent_child_count: number;
-  status: string;
+  status: AdminRoundStatus;
   step_count: number;
   started_at: string;
   completed_at: string | null;
@@ -101,7 +112,7 @@ export interface AdminRoundSessionItem {
   error_calls: number;
   compaction_steps: number;
   total_duration_s: number;
-  status: string;
+  status: AdminSessionMonitorStatus;
   rounds_loaded?: boolean;
   rounds: AdminRoundTreeItem[];
 }
@@ -228,7 +239,7 @@ export async function getAdminOverview(days: number = 7): Promise<AdminOverview>
 export async function getAdminRoundsTree(params?: {
   limit?: number;
   offset?: number;
-  status?: string;
+  status?: AdminRoundStatusFilter;
   user_id?: string;
   search?: string;
 }): Promise<AdminRoundTreeResponse> {
@@ -239,7 +250,7 @@ export async function getAdminRoundsTree(params?: {
 export async function getAdminSessionRounds(
   sessionId: string,
   params?: {
-    status?: string;
+    status?: AdminRoundStatusFilter;
     search?: string;
   },
 ): Promise<AdminSessionRoundsResponse> {

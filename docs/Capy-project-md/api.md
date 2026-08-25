@@ -284,9 +284,11 @@ Authorization: Bearer <access_token>
 }
 ```
 
-`preferred_skills` 始终为 `[{key, display_name}]` 数组。普通 direct Round 返回本次发送开始时根据可见且已启用 Skill 清单解析并持久化的有效“优先 Skill”展示快照；空选择、全部 key 无效或旧版 Round 没有该数据时返回 `[]`。`display_name` 是发送当时的不可变展示名，历史读取不会因 Skill 后续改名、禁用或删除而重算。
+`preferred_skills` 始终为 `[{key, display_name}]` 数组。普通 direct Round 返回本次发送开始时根据可见且已启用 Skill 清单解析并持久化的有效“优先 Skill”展示快照；空选择、全部 key 无效或没有该数据时返回 `[]`。`display_name` 是发送当时的不可变展示名，历史读取不会因 Skill 后续改名、禁用或删除而重算。
 
-该字段仅说明这次请求要求 Agent 优先考虑这些 Skill，不代表 Skill 已被加载、调用或实际参与结果。resume child Round 虽在运行时继承并重新解析原请求偏好，但自身返回 `preferred_skills: []`，避免在每条 Q/A 或工具审批 child 消息旁重复展示。之后每个独立 direct Round 只返回自己当次选择的快照，不从前序 Round 继承、合并或累积。
+该字段仅说明这次请求要求 Agent 优先考虑这些 Skill，不代表 Skill 已被加载、调用或实际参与结果。same-Round continuation 继续使用原 Round 的冻结快照，不新增额外 Q/A 或审批消息。之后每个独立 direct Round 仍只返回自己当次选择的快照。
+
+`status=waiting_interaction` 表示该 Round 暂停等待 `ask_user` 回答或工具审批，不是终态。此时 `interrupt` 由 pending `agent_interactions` 投影，形如 `{id, reason, payload}`；刷新后客户端应显示卡片，并用该 Round 的 `round_id` 与 `last_event_sequence` 继续订阅。
 
 ---
 
@@ -605,11 +607,11 @@ Content-Type: application/json
 | idempotency_key  | string   | 否   | 幂等键（UUID），防止同一请求被重复处理。前端自动生成 |
 | preferred_skill_keys | string[] | 否 | 本次逻辑执行链优先考虑的 Skill 稳定内部 `key`；最多 50 项，每项最多 128 个字符 |
 
-`preferred_skill_keys` 表达偏好而非强制调用。服务端按首次出现顺序去重，并在每次运行（包括中断后的 child resume round）按当时可见且已启用的 Skill 清单重新解析；未知、已删除或已禁用的 key 会被忽略。该偏好不会从同一会话的前序独立消息继承。
+`preferred_skill_keys` 表达偏好而非强制调用。服务端按首次出现顺序去重，并在每次运行（包括 same-Round continuation）按当时可见且已启用的 Skill 清单重新解析；未知、已删除或已禁用的 key 会被忽略。该偏好不会从同一会话的前序独立消息继承。
 
 该字段来自 UI 控件元数据，不属于用户消息正文。Agent 不得仅因收到这些 key 就声称用户在正文中提到、点名或要求加载了对应 Skill；与正文无关时也不应主动复述选择。
 
-普通 direct Round 会把首次运行时解析出的有效项以 `preferred_skills: [{key, display_name}]` 固化到 Round，并由 `history/v2` 返回，供前端在该用户消息旁展示。该快照不证明 Skill 实际被加载或调用；resume child 只继承运行时偏好，不重复保存/展示该数组，之后的独立 direct Round 也不会继承或累积它。
+普通 direct Round 会把首次运行时解析出的有效项以 `preferred_skills: [{key, display_name}]` 固化到 Round，并由 `history/v2` 返回。same-Round resume 不改写这份快照。之后的独立 direct Round 不继承或累积它。
 
 有效 key 经 trim 后必须非空且不超过 128 个 Unicode 字符；兼容人类可读 Unicode、空格和括号，禁止 `/`、`\`、`?`、`#`、`%` 及 Unicode `C*` 控制/不可见类别字符。请求数组中的空白项会被忽略，其他非法 key 返回校验错误。
 
@@ -661,6 +663,8 @@ RUN_STARTED → STATE_SNAPSHOT → THINKING_TEXT_MESSAGE_START → THINKING_TEXT
 
 前端收到后应使用 `message` 中的 `round_id` 转入 `subscribe` 恢复路径。
 
+若当前 session 已有同一 Round 的 pending Interaction，HTTP 流会返回无 sequence 的 `RUN_ERROR(code=INTERACTION_PENDING)`。它表示本条普通消息未被接受，不是原 waiting Round 的终态；客户端必须恢复未受理草稿，查询 `history/v2` 并继续订阅权威 waiting Round。
+
 **错误响应**
 
 | 状态码 | 说明 |
@@ -701,13 +705,14 @@ Connection: keep-alive
 
 **行为说明**
 
-1. **已终态轮次**（`completed` / `failed` / `interrupted` / `resumed` / `cancelled` / `max_steps_reached`）：立即返回补齐事件并关闭连接
-2. **运行中的轮次**：
+1. **已终态轮次**（`completed` / `failed` / `cancelled` / `max_steps_reached`）：立即返回补齐事件并关闭连接
+2. **运行中的轮次**（`running`）：
    - 先从 `agui_events` 表重放 `last_sequence` 之后的所有已持久化事件
    - 然后注册为订阅者接收后续实时事件
    - 轮次完成时发送 `RUN_FINISHED` 事件并关闭连接
-3. **心跳**：每 15 秒发送 `CUSTOM` (heartbeat) 事件防止连接超时
-4. **超时**：5 分钟无事件自动断开
+3. **暂停等待的轮次**（`waiting_interaction`）：重放包含 `interaction_requested` 的历史事件后保持订阅；其他标签页回答/审批时会收到同一 runId 的 `interaction_resolved`、后续输出，取消时收到终态
+4. **心跳**：每 15 秒发送 `CUSTOM` (heartbeat) 事件防止连接超时
+5. **生命周期**：服务端不设置应用级订阅最大时长；连接持续到 Round 终态、客户端断开或基础设施关闭。`SSE_SUBSCRIBE_TIMEOUT` 是 runtime/UserRunLock 陈旧判定阈值，不用于关闭健康订阅
 
 **事件类型**
 
@@ -722,7 +727,9 @@ Connection: keep-alive
 | `TOOL_CALL_START/ARGS/END/RESULT`         | 工具调用流式事件               |
 | `STEP_STARTED/FINISHED`                   | 步骤开始/完成事件              |
 | `RUN_FINISHED` / `RUN_ERROR`            | 运行完成/错误事件              |
-| `CUSTOM`                                  | 自定义事件（心跳、标题更新等） |
+| `CUSTOM`                                  | 自定义事件（心跳、标题更新、`interaction_requested/resolved` 等） |
+
+订阅基础设施异常时可能收到无 sequence 的 `RUN_ERROR(code=SUBSCRIBE_FAILED)`。该事件只结束当前订阅 transport，不能把 Round 标为 failed；客户端应从最后 sequence 重连或回拉 `history/v2`。只有带 durable sequence 的 Round terminal，或 history 权威终态，才能终态化本地 Round。
 
 **使用场景**
 
@@ -787,7 +794,7 @@ Authorization: Bearer <access_token>
 ```
 
 `idempotency_key` 用于客户端在 `/message/stream` 已被接受但尚未收到 `runId` 时，通过 history/v2 精确恢复同一次请求对应的 round。
-`last_event_sequence` 用于 running round 的 SSE 订阅续接；前端已用 history 展示过的事件不应再从 `last_sequence=0` 重放。
+`last_event_sequence` 用于 running / waiting Round 的 SSE 订阅续接；前端已用 history 展示过的事件不应再从 `last_sequence=0` 重放。
 
 ---
 
@@ -795,9 +802,9 @@ Authorization: Bearer <access_token>
 
 中止正在进行的 Agent 执行。
 
-第一版按单 worker 部署。该接口会写入 append-only 取消审计行，并通过进程内 run registry 命中当前 run 的取消令牌；接口同时将 running round 立即收敛为 `cancelled` 并释放会话锁，允许用户马上重发。
+第一版按单 worker 部署。该接口会写入 append-only 取消审计行，并通过进程内 run registry 命中当前 run 的取消令牌；接口同时将 `running` 或 `waiting_interaction` Round 立即收敛为 `cancelled` 并释放会话锁，允许用户马上重发。
 
-取消成功时，`RUN_FINISHED.result.reason` 为 `user_cancelled`，用于前端区分“用户取消”与“ask_user 中断”。
+取消成功时，`RUN_FINISHED.result.reason` 为 `user_cancelled`。取消 waiting Round 会同时收敛 pending Interaction 与尚未 dispatch 的 `requested` / `approved` 审批，并唤醒已注册 subscriber。REST 响应只返回 nullable `outcome_warning`：能证明尚未 dispatch 时为 `null`；审批为 `executing` / `unknown`，或普通 running Round 无法证明尚未派发时返回保守警告。durable `RUN_FINISHED.result` 才包含对应的 `outcomeUncertain` 布尔值。风险判定和 cancelled terminal 必须属于同一锁事务，避免判定后又发生 dispatch。
 
 **请求**
 
@@ -819,7 +826,8 @@ Authorization: Bearer <access_token>
 {
   "status": "cancelled",
   "request_id": "uuid",
-  "reason": "force_aborted"
+  "reason": "force_aborted",
+  "outcome_warning": null
 }
 ```
 
@@ -829,16 +837,19 @@ Authorization: Bearer <access_token>
 {
   "status": "cancelled",
   "request_id": "uuid",
-  "reason": "worker_dead"
+  "reason": "worker_dead",
+  "outcome_warning": null
 }
 ```
+
+若取消事务发现审批已进入 `executing` / `unknown`，或普通 running Round 无法证明尚未派发远端调用，`outcome_warning` 返回保守警告文本；同一文本也写入 durable `RUN_FINISHED.result.warning`，并令 `result.outcomeUncertain=true`。
 
 **错误**
 
 | 状态码 | 说明                           |
 | ------ | -------------------------------- |
 | 404    | 会话不存在 |
-| 409    | 该会话没有正在进行的执行（无 running round 且锁不存在或已过期） |
+| 409    | 该会话没有可取消的 running/waiting Round，且锁不存在或已过期 |
 | 503    | 取消请求写入失败（数据库繁忙等） |
 
 ### 查询取消请求状态
@@ -884,9 +895,9 @@ Authorization: Bearer <access_token>
 
 ---
 
-### 恢复中断执行 (Human-in-the-Loop)
+### 恢复暂停执行 (Human-in-the-Loop)
 
-恢复被 `ask_user` 工具中断的 Agent 执行。返回 SSE 流。
+回答 `ask_user` 或解决工具审批，并恢复 Agent 执行。默认继续同一个逻辑 Round，返回 SSE 流。
 
 **请求**
 
@@ -915,10 +926,12 @@ Content-Type: application/json
 
 | 字段         | 类型              | 必填 | 说明 |
 | ------------ | ----------------- | ---- | ---- |
-| interrupt_id | string            | 是   | 中断 ID（来自 `RUN_FINISHED.interrupt.id`） |
+| interrupt_id | string            | 是   | 来自 `CUSTOM interaction_requested.value.interactionId` |
 | answers      | dict[string, string] | 是   | 用户回答（问题文本 → 选项值） |
 
-`resume` 不接收 `preferred_skill_keys`，也不接收或允许覆盖服务端保存的原始用户消息锚点。服务端从中断快照继承原请求的 Skill key 与锚点；连续多次中断/恢复仍锚定最初发起该逻辑执行链的 user message，并按本次 resume 时的有效 Skill 清单重新解析。
+工具审批复用同一 wire，`answers` 必须为 `{"approval":"allow_once|allow_session|allow_always|deny"}`。审批值按 trim/lower 规范化；同一 canonical resolution 的重试幂等，不同 resolution 返回控制面冲突。顶层 `resolution` 不是公开请求字段。
+
+`resume` 不接收 `preferred_skill_keys`，也不允许覆盖服务端保存的原始用户消息锚点。服务端从 Interaction request 继承原请求的 Skill key 与锚点；连续多次暂停/恢复仍锚定最初 user message，并按本次 resume 时的有效 Skill 清单重新解析。
 
 **响应** `200 OK`
 
@@ -926,13 +939,13 @@ Content-Type: application/json
 Content-Type: text/event-stream
 ```
 
-事件类型与 `message/stream` 完全相同（AG-UI 协议）。恢复操作会创建一个新的 Round。
+事件类型与 `message/stream` 相同。响应继续使用原 `runId == round_id`，不会创建新 Round，也不会再发一次 `RUN_STARTED`；持久化 `CUSTOM interaction_resolved` 表示 continuation 已经接管原 Round。
 
 **恢复机制**
 
-- **热恢复**：Agent 内存中仍持有中断状态，直接替换 `ask_user` 占位 tool_result 继续执行
-- **冷恢复**：Agent 内存状态已丢失（如 AgentPool TTL 回收），退化为注入用户回答作为新消息继续对话
-- 旧的 `interrupted` 轮次会被标记为 `resumed`
+- **same-Round 热恢复**：在 `agent_interactions` 幂等冻结答案，取得 continuation claim，将 `interaction_resolved` 与原 Round 从 `waiting_interaction` 改回 `running` 原子提交，并回填 tool result。
+- **same-Round 冷恢复**：Agent 内存状态丢失时，从原 Round 的事件与 Interaction 重建占位，仍继续同一 runId；不把回答降级为新的聊天消息。
+- **工具审批**：允许决定先 `requested → approved` 持久化；只有到工具调用边界才 `approved → executing` 并生成执行 claim/lease。派发前崩溃可恢复，派发后结果未知绝不自动重试。
 
 **并发限制**
 
@@ -940,7 +953,7 @@ Content-Type: text/event-stream
 
 **错误响应**
 
-`resume` 返回 SSE 后，恢复过程中的运行期错误以 AG-UI `RUN_ERROR` 事件结束流。
+`resume` 返回 SSE 后，初始化/竞争错误也可能以 AG-UI `RUN_ERROR` 结束当前 HTTP 流。
 
 | 状态码 | 说明 |
 | ------ | ---- |
@@ -951,7 +964,13 @@ Content-Type: text/event-stream
 | RUN_ERROR code | 说明 |
 | -------------- | ---- |
 | `NO_PENDING_INTERRUPT` | 无待处理的中断，或中断 ID 已过期/已恢复 |
+| `RESUME_CONFLICT` | 回答与已持久化答案冲突，或并发恢复已获胜 |
+| `INVALID_INTERACTION_RESPONSE` | 回答格式或枚举值与 Interaction kind 不匹配；例如审批值非法 |
 | `AGENT_INIT_FAILED` | Agent 初始化失败 |
+| `USER_ABORT` | resume 初始化期间已被较新的 abort 取消 |
+| `INTERNAL_ERROR` | continuation 启动前内部错误 |
+
+若上述 `RUN_ERROR` 出现在 `interaction_resolved` 之前，它是 **控制面错误**，不是原 waiting Round 的失败终态。客户端必须查询 `history/v2`，按权威 waiting/running/terminal 恢复，并在恢复成功后仍显示本次请求错误。越过 `interaction_resolved` 后的运行异常必须先与原 Round 原子持久化为带 sequence 的 durable `RUN_ERROR`；无 sequence 的 adapter/transport 错误仍不能单独终态化 Round。
 
 ---
 
@@ -989,7 +1008,7 @@ Agent 运行开始。
 }
 ```
 
-普通 direct Round 的 `preferredSkills` 是与该 Round 持久化数据相同的权威展示快照；没有有效选择时也显式返回 `[]`，供前端清除 optimistic key。resume child 固定返回 `[]`，避免重复展示父 Round 标签。该字段表示请求级偏好，不代表 Skill 已实际加载或调用；订阅重放以及从历史直接恢复终态时保持相同语义。
+普通 direct Round 的 `preferredSkills` 是与该 Round 持久化数据相同的权威展示快照；没有有效选择时也显式返回 `[]`。same-Round resume 不发新的 `RUN_STARTED`，原快照不变。该字段表示请求级偏好，不代表 Skill 已实际加载或调用。
 
 #### RUN_FINISHED
 
@@ -1009,6 +1028,8 @@ Agent 运行结束。
   "timestamp": 1699000100000
 }
 ```
+
+`outcome="interrupt"` 仅用于用户取消或 `max_steps_reached` 等终止结果；Human-in-the-Loop 进入 `waiting_interaction` 时不发送 `RUN_FINISHED`。
 
 #### RUN_ERROR
 
@@ -1226,6 +1247,8 @@ Agent 运行错误。
 }
 ```
 
+首条消息若很快进入 `waiting_interaction`，标题生成仍继续：标题最终落库，原 SSE 尚在时追加该事件；客户端已断开时向 waiting subscriber 投递更新，不因暂停或断连取消标题任务。
+
 ```json
 {
   "type": "CUSTOM",
@@ -1234,6 +1257,57 @@ Agent 运行错误。
   "timestamp": 1699000070000
 }
 ```
+
+Human-in-the-Loop 请求事件（持久化并参与 sequence 重放）：
+
+```json
+{
+  "type": "CUSTOM",
+  "name": "interaction_requested",
+  "value": {
+    "interactionId": "interaction-uuid",
+    "runId": "original-round-uuid",
+    "kind": "user_input",
+    "toolCallId": "tool-call-id",
+    "payload": {"questions": []}
+  },
+  "sequence": 12
+}
+```
+
+`kind` 为 `user_input` 或 `tool_approval`，`payload` 是对应 kind 的结构化请求。创建该事件、pending `AgentInteraction` 和 `Round.status=waiting_interaction` 必须同事务提交。
+
+同一 Round continuation 接管事件：
+
+```json
+{
+  "type": "CUSTOM",
+  "name": "interaction_resolved",
+  "value": {
+    "interactionId": "interaction-uuid",
+    "runId": "original-round-uuid",
+    "toolCallId": "tool-call-id",
+    "toolResultContent": "frozen model-visible result",
+    "resolution": "answered"
+  },
+  "sequence": 13
+}
+```
+
+`toolResultContent` 用于可重复的历史重建，不得包含解密后的敏感工具参数。客户端收到该事件后将同一 Round 从 waiting 转回 running；仅 HTTP 200 或本地 `stream_accepted` 不具有此语义。
+
+工具审批在最终结果前还会持久化同一 Round 的回填 marker：
+
+```json
+{
+  "type": "CUSTOM",
+  "name": "tool_approval_resume",
+  "value": {"toolCallId": "tool-call-id"},
+  "sequence": 14
+}
+```
+
+历史重建用该 marker 将随后匹配的 `TOOL_CALL_RESULT` 替换到原审批占位，避免追加重复工具结果。marker 本身不完成 Interaction；只有最终匹配的 `TOOL_CALL_RESULT` 持久化后，工具审批 Interaction 才转为 `answered`。
 
 ### ID 体系说明
 
@@ -1344,9 +1418,25 @@ GET /api/models/{model_id}
 | final_response | string | 最终响应                                     |
 | steps          | Step[] | 执行步骤列表                                 |
 | step_count     | int    | 步骤数量                                     |
-| status         | string | 状态：pending / running / completed / failed / cancelled / interrupted / resumed / max_steps_reached |
+| status         | string | 状态：running / waiting_interaction / completed / failed / cancelled / max_steps_reached |
 | created_at     | string | 创建时间                                     |
 | completed_at   | string | 完成时间                                     |
+
+### AgentInteraction（同 Round 人机交互）
+
+| 字段 | 类型 | 说明 |
+| ---- | ---- | ---- |
+| id | string | Interaction ID；工具审批时也等于 approval request ID |
+| round_id | string | 暂停并继续的同一个 Round |
+| kind | string | `user_input` / `tool_approval` |
+| tool_call_id | string | 对应工具调用 |
+| status | string | `pending` / `answered` / `cancelled` / `failed` |
+| request_payload | object | `interaction_requested.value` 的持久化结构 |
+| answer_payload | object | 已接受的规范答案；有值但仍 pending 且尚未 started 时表示 continuation 可恢复 |
+| claim_token / claim_lease_expires_at | string / datetime | continuation 围栏与可回收 lease；不等于工具执行 claim |
+| continuation_started_at | datetime | 与 durable `interaction_resolved` 同事务写入；有值后 lease 过期只能将原 Round 收敛 failed |
+
+同一 Round 最多一条 pending Interaction。创建 Interaction、Round 进入 waiting、当前完成 step 计数与 `interaction_requested` 事件必须同事务提交；复合审批写入固定采用 `Round → AgentInteraction → ToolApprovalRequest` 锁序。只有 `continuation_started_at` 为空的过期 claim 可以恢复 waiting；started continuation 必须以 durable `RUN_ERROR` 终态化。
 
 ### Step（执行步骤）
 

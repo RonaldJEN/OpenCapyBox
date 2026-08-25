@@ -25,6 +25,7 @@ from src.api.models.user_run_lock import UserRunLock
 from src.api.schemas.turn import CancelResult, NormalizedInboundTurn, NormalizedResumeTurn, RunHandle, TurnCancelTarget
 from src.api.schemas.turn import WebReplyRoute
 from src.api.services.agent_service import AgentService, PreparedAgentRun
+from src.api.services.agent_engine import AgentEngine, InProcessAgentEngine
 from src.api.services.run_completion_service import RunCompletionService
 from src.api.services.run_coordinator import RunCoordinator, get_run_coordinator
 from src.api.services.run_cancel_service import RunCancelService, get_run_cancel_service
@@ -105,26 +106,24 @@ class TurnOrchestrator:
         turn: NormalizedInboundTurn,
         *,
         agent_service: AgentService | None = None,
+        agent_engine: AgentEngine | None = None,
         cancel_token: asyncio.Event | None = None,
         lock_id: str | None = None,
         run_started_at: datetime | None = None,
     ) -> TurnExecution:
         if self._submit_handler is not None:
             return await self._submit_handler(turn)
-        if agent_service is None:
-            raise RuntimeError("submit_turn requires agent_service")
+        engine = agent_engine or (
+            InProcessAgentEngine(agent_service) if agent_service is not None else None
+        )
+        if engine is None:
+            raise RuntimeError("submit_turn requires agent_engine or agent_service")
 
-        prepare_kwargs = {
-            "user_content": turn.content,
-            "idempotency_key": turn.idempotency_key,
-        }
-        if turn.context:
-            prepare_kwargs["contexts"] = turn.context
-        prepared = await agent_service.prepare_chat_round(**prepare_kwargs)
+        prepared = await engine.start_turn(turn)
         return self._execution_from_prepared(
             turn=turn,
             prepared=prepared,
-            agent_service=agent_service,
+            agent_engine=engine,
             cancel_token=cancel_token,
             lock_id=lock_id,
             run_started_at=run_started_at,
@@ -136,23 +135,24 @@ class TurnOrchestrator:
         turn: NormalizedResumeTurn,
         *,
         agent_service: AgentService | None = None,
+        agent_engine: AgentEngine | None = None,
         cancel_token: asyncio.Event | None = None,
         lock_id: str | None = None,
         run_started_at: datetime | None = None,
     ) -> TurnExecution:
         if self._resume_handler is not None:
             return await self._resume_handler(turn)
-        if agent_service is None:
-            raise RuntimeError("resume_turn requires agent_service")
-
-        prepared = await agent_service.prepare_resume_round(
-            interrupt_id=turn.interrupt_id,
-            answers=turn.answers,
+        engine = agent_engine or (
+            InProcessAgentEngine(agent_service) if agent_service is not None else None
         )
+        if engine is None:
+            raise RuntimeError("resume_turn requires agent_engine or agent_service")
+
+        prepared = await engine.answer_interaction(turn)
         return self._execution_from_prepared(
             turn=turn,
             prepared=prepared,
-            agent_service=agent_service,
+            agent_engine=engine,
             cancel_token=cancel_token,
             lock_id=lock_id,
             run_started_at=run_started_at,
@@ -180,7 +180,7 @@ class TurnOrchestrator:
         *,
         turn: NormalizedInboundTurn | NormalizedResumeTurn,
         prepared: PreparedAgentRun,
-        agent_service: AgentService,
+        agent_engine: AgentEngine,
         cancel_token: asyncio.Event | None,
         lock_id: str | None,
         run_started_at: datetime | None,
@@ -189,7 +189,9 @@ class TurnOrchestrator:
         session_id = self._session_id_from_turn(turn)
         started_at = run_started_at or now_naive()
         cancel_token = cancel_token or asyncio.Event()
-        agent_service.cancel_token = cancel_token
+        liveness_token = asyncio.Event()
+        agent_engine.set_cancel_token(cancel_token)
+        agent_engine.set_liveness_token(liveness_token)
         handle = RunHandle(
             session_id=session_id,
             round_id=prepared.run_id,
@@ -200,7 +202,7 @@ class TurnOrchestrator:
             started_at=started_at,
         )
         stream = _ManagedEventStream()
-        source = agent_service.run_prepared_round(
+        source = agent_engine.stream(
             prepared,
             error_label=error_label,
         )
@@ -212,6 +214,7 @@ class TurnOrchestrator:
                 user_id=turn.user_id,
                 lock_id=lock_id,
                 cancel_token=cancel_token,
+                liveness_token=liveness_token,
             )
         )
         self._active_runners[session_id] = task
@@ -248,6 +251,7 @@ class TurnOrchestrator:
         user_id: str,
         lock_id: str | None,
         cancel_token: asyncio.Event,
+        liveness_token: asyncio.Event,
     ) -> None:
         run_completed = False
         heartbeat_task: asyncio.Task | None = None
@@ -258,6 +262,7 @@ class TurnOrchestrator:
                     session_id=handle.session_id,
                     lock_id=lock_id,
                     cancel_token=cancel_token,
+                    liveness_token=liveness_token,
                 )
             )
         try:
@@ -305,9 +310,23 @@ class TurnOrchestrator:
             if self._active_runners.get(handle.session_id) is asyncio.current_task():
                 self._active_runners.pop(handle.session_id, None)
             self._cancel_service.unregister(session_id=handle.session_id, run_id=handle.run_id)
-            if lock_id:
+            preserve_stale_lock_for_recovery = bool(
+                lock_id
+                and liveness_token.is_set()
+                and not cancel_token.is_set()
+                and not run_completed
+            )
+            if lock_id and not preserve_stale_lock_for_recovery:
                 await self._complete_cancel_requests(user_id=user_id, session_id=handle.session_id)
                 await self._release_lock(user_id=user_id, session_id=handle.session_id, lock_id=lock_id)
+            elif preserve_stale_lock_for_recovery:
+                logger.warning(
+                    "preserving stale UserRunLock for coordinator recovery: "
+                    "user=%s session=%s lock=%s",
+                    user_id,
+                    handle.session_id,
+                    lock_id,
+                )
 
     @staticmethod
     def _event_type(event: AGUIEvent | dict[str, Any]) -> Any:
@@ -352,6 +371,7 @@ class TurnOrchestrator:
         session_id: str,
         lock_id: str,
         cancel_token: asyncio.Event,
+        liveness_token: asyncio.Event,
     ) -> None:
         settings = get_settings()
         check_interval = max(settings.cancel_watcher_interval_seconds, 0.5)
@@ -360,7 +380,7 @@ class TurnOrchestrator:
         fail_count = 0
         max_failures = 3
         try:
-            while not cancel_token.is_set():
+            while not cancel_token.is_set() and not liveness_token.is_set():
                 if time.monotonic() - last_heartbeat >= heartbeat_interval:
                     try:
                         with SessionLocal() as db:
@@ -374,12 +394,12 @@ class TurnOrchestrator:
                             last_heartbeat = time.monotonic()
                         else:
                             logger.warning(
-                                "heartbeat found missing lock, cancelling run: user=%s session=%s lock=%s",
+                                "heartbeat found missing lock, stopping stale worker: user=%s session=%s lock=%s",
                                 user_id,
                                 session_id,
                                 lock_id,
                             )
-                            cancel_token.set()
+                            liveness_token.set()
                             return
                     except OperationalError:
                         fail_count += 1
@@ -402,7 +422,7 @@ class TurnOrchestrator:
                             exc_info=True,
                         )
                     if fail_count >= max_failures:
-                        cancel_token.set()
+                        liveness_token.set()
                         return
                 await asyncio.sleep(check_interval)
         except asyncio.CancelledError:

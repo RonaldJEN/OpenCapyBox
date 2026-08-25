@@ -100,9 +100,8 @@ class RoundData(StrictModel):
         "running",
         "completed",
         "failed",
-        "interrupted",
+        "waiting_interaction",
         "cancelled",
-        "resumed",
         "max_steps_reached",
     ]
 

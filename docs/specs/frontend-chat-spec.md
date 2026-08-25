@@ -11,7 +11,7 @@
 - 渲染消息流（user → reasoning → assistant）
 - 选择并发送仅作用于当前逻辑执行链的优先 Skill
 - 将助手回复中的会话文件引用抽取为回复底部的可点击文件卡片，同时保留 markdown 正文原样显示
-- 处理中断/恢复：断连重连、ask_user 中断、用户主动取消
+- 处理暂停/恢复：断连重连、same-Round ask_user/工具审批、用户主动取消
 - 滚动控制：普通进入定位最新消息、搜索命中定位 round、流式底部跟随
 
 **不职责**：
@@ -31,10 +31,10 @@ RoundData {
   final_response: string | null
   steps: StepData[]
   step_count: number
-  status: 'running' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'resumed' | 'max_steps_reached'
+  status: 'running' | 'waiting_interaction' | 'completed' | 'failed' | 'cancelled' | 'max_steps_reached'
   created_at: string
   completed_at?: string
-  interrupt?: InterruptDetails       // ask_user 中断
+  interrupt?: InterruptDetails       // same-Round 提问或审批
 }
 
 PreferredSkillSnapshot {
@@ -99,34 +99,44 @@ SkillDraft {
 
 ### 3.1 会话隔离（最关键）
 
-**任何 SSE 回调、异步 fetch 的 setState 之前必须校验：**
+所有 chat transport 事件必须先包装成稳定归属的 envelope：
 
 ```ts
-const isStale = () => boundSessionId !== undefined && sessionIdRef.current !== boundSessionId;
-if (isStale()) return;
+interface StreamEnvelope {
+  ownerSessionId: string;
+  clientRunKey: string;
+  transportEpoch: number;
+  connectionId: string;
+  event: AGUIEvent;
+}
 ```
 
-`boundSessionId` 在 `createStreamCallbacks({ boundSessionId })` 工厂函数中闭包捕获；`sessionIdRef.current` 在 `sessionId` 变化时即时更新。
+`ChatRuntimeProvider.guardAndDispatch()` 只有在 registry 中的 current epoch 与 connection id 都匹配时才允许 reducer 更新对应 `ownerSessionId` 分区；旧 transport 的 finally、错误或迟到事件不得删除/覆盖新 transport。history 还必须通过 request id 与 stream watermark 防止旧快照覆盖新事件。
 
 **违反后果**：A 会话消息污染 B 会话 UI。
 
-### 3.2 RUN_STARTED 才通知执行中
+### 3.2 接受边界与执行标记
 
-`onRunStarted` 回调触发后才调用 `notifyExecutionStart()`，避免被拒请求（429 等）污染执行标记。
+`stream_accepted` 只可建立本地 active-slot/init-window 保护；direct run 以 `RUN_STARTED` 通知真正执行中，避免 429 或仅传输接受污染执行标记。same-Round resume 不发新 `RUN_STARTED`：`interaction_resolved` 才表示原 Round continuation 已启动；`interaction_requested` 则结束本段执行标记并进入 waiting UI。
 
 ### 3.3 SSE 断连恢复流程
 
 ```
 catch (SSE error)
-  → GET /api/sessions/{sid}/history
+  → GET /api/sessions/{sid}/history/v2
     → 找到目标 round
-      → 若 status ∈ {completed, failed, interrupted, resumed, cancelled, max_steps_reached}
-          → 调用 _tryRecoverRoundFinished → onRunFinished → 结束
-      → 若 status == running
-          → subscribeToRound(sid, roundId, { lastSequence })
+      → 先完整投影 Round.steps / final_response / interrupt，再推进 lastSequence
+      → 若 status ∈ {completed, failed, cancelled, max_steps_reached}
+          → HISTORY_LOADED / authoritative recovery envelope → reducer 收敛终态
+      → 若 status ∈ {running, waiting_interaction}
+          → startSubscribeForRound(sid, roundId, lastSequence)
 ```
 
-订阅断连且目标 round 仍为 `running` 时，前端最多静默重试 3 次；重试期间不得展示错误横幅。重试耗尽后才展示“订阅连接已断开，Agent 可能仍在运行。请刷新页面查看结果”，提醒用户刷新查看最终结果。
+订阅断连且目标 Round 仍为 `running` 或 `waiting_interaction` 时，前端最多静默重试 3 次；重试期间不得展示错误横幅。waiting 订阅用于跨标签页接收 `interaction_resolved`、后续输出、取消和终态，不计为 `sending`。重试耗尽后才展示刷新提示。用户点击 Stop 时必须先清除该 Round 已安排但尚未执行的 retry timer，并使旧 transport identity 失效，再发起 abort；旧 timer 不得在取消窗口重建订阅或用较早 history 恢复 waiting。
+
+history 的 `last_event_sequence` 只有在同一 snapshot 的 `steps/final_response/interrupt/status` 已完整投影后才能成为新 cursor；禁止保留局部本地 steps 却直接跳到服务端高水位。text / thinking / tool args delta 在 END 前是 live-only、没有 durable sequence；全局 cursor 变大只证明某个 durable 事件已提交，不证明每个交错 segment 都已写入 aggregate。只要本地仍有 dirty segment，history 必须逐 segment 证明其对应 projection 已包含本地前缀（工具参数以同 `tool_call_id` 的持久化调用为证），否则即使 cursor 更高也要保留本地 projection 与 buffer。direct / resume 内嵌 subscribe 若恢复出非终态，必须以结构化 handoff 把同一 `clientRunKey + roundId + cursor` 交给 Provider 继续 subscribe，不得合成 Round terminal `RUN_ERROR`。无 durable sequence 的 `SUBSCRIBE_FAILED` 属于 transport 控制错误；只有持久化或 history 权威恢复的 `RUN_ERROR` 才能终态化 Round。
+
+一旦收到新的持久化 `interaction_requested`，它就是权威等待边界。即使紧接着断网且 history 查询也失败，前端也必须保留新卡片和 `waiting_interaction`，不得再合成 `RUN_ERROR` 覆盖它。
 
 `_ROUND_TERMINAL_STATUSES` 必须与后端 `Round.SUBSCRIBE_TERMINAL_STATUSES` 保持一致。
 
@@ -139,16 +149,17 @@ pre_accept_pending
   ├─ 收到响应头 / stream_accepted ───────────────→ accepted
   ├─ 确定性 HTTP 4xx/5xx ───────────────────────→ definite_rejected
   ├─ 响应头前网络错误 ──────────────────────────→ ambiguous
-  │    ├─ history 命中同 idempotency_key ───────→ accepted（订阅 running 或收敛终态）
+  │    ├─ history 命中同 idempotency_key ───────→ accepted（订阅 running/waiting 或收敛终态）
   │    ├─ 3 次 history 全部成功且均无匹配 ──────→ definite_rejected
   │    └─ 3 次中任一次失败且最终未命中 ─────────→ ambiguous_unknown
   └─ 用户主动取消 ──────────────────────────────→ client_cancelled_unknown
 ```
 
 - `ambiguous` 期间绝不重发 POST；固定使用原 `idempotency_key` 查询 history，当前确认预算为 3 次。
+- 响应头已到达的确定性 4xx/5xx 直接进入 `definite_rejected`，不进入 history 确认或自动重发；5xx 只提供用户显式重试入口。
 - 只有 3 次查询全部成功且都无匹配，才能调用一次 `onRejectedBeforeAccept`、恢复乐观清空的草稿并提示请求失败。任一次查询失败都会使“无匹配”证据不完整；预算耗尽后保持 `ambiguous_unknown`，提示刷新查看，禁止恢复草稿、提示重新发送或用新幂等键自动发送。
 - 用户在响应头前取消：立即 abort POST，停止本地订阅，不启动 history 确认，不发出 `stream_accepted` / `RUN_ERROR` / 接受前拒绝回调，并保持乐观清空后的草稿，防止服务端其实已接受时重复发送。
-- 用户在等待 history 时取消：停止后续确认，忽略在途 history 的迟到结果；即使迟到结果命中 running Round，也不得建立 subscribe。该路径同样不恢复草稿、不自动重发，用户只能刷新查看服务端事实。
+- 用户在等待 history 时取消：停止后续确认，忽略在途 history 的迟到结果；即使迟到结果命中 running / waiting Round，也不得建立 subscribe。该路径同样不恢复草稿、不自动重发，用户只能刷新查看服务端事实。
 
 ### 3.4 幂等冲突走订阅
 
@@ -160,12 +171,13 @@ pre_accept_pending
 
 用户点击取消：
 1. 前端点击后必须立即取消当前订阅（`subscription.abort()`），防止后续迟到回调覆盖状态。
-2. 本地将当前 `running` round 先收敛为取消态 `cancelled`（用于即时反馈），结束 `sending/resuming`，并立即恢复输入可用；不得等待 `/abort` HTTP 响应或 SSE 终态事件。
+2. 本地将当前 `running` 或 `waiting_interaction` Round 先收敛为取消态 `cancelled`（用于即时反馈），结束 `sending/resuming` 并移除交互卡；不得等待 `/abort` HTTP 响应或 SSE 终态事件。
 3. 进入 `stopping` 状态：输入框保持可编辑，但新的发送动作必须禁用，直到 `/abort` 返回，避免用户立即发送新问题时撞到后端尚未释放的 user/session lock。
 4. 同步发起 POST `/api/chat/{sid}/abort`。
 5. 若请求返回 409（会话已无运行任务）：按“已停止”处理，保持本地已收敛 UI。
-6. 其他请求失败：重新拉取历史以恢复真实运行态，并提示停止请求失败。
-7. 后端规范终态为 `RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled)`，
+6. 成功响应中的 `outcome_warning` 仅作为后端诊断信息，聊天页不再展示独立提示；取消状态保持成功。
+7. 其他请求失败：重新拉取历史以恢复真实运行态，并提示停止请求失败。
+8. 后端规范终态为 `RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled)`，
   前端按 `isUserCancelledOutcome()` 识别为"已取消"，**不是错误**。
 
 **判定**：`outcome === 'interrupt' && result?.reason === 'user_cancelled'`。outcome=interrupt 但无 reason 的保守处理为非取消。
@@ -188,30 +200,26 @@ pre_accept_pending
 - 取消态不显示复制按钮：`canCopyAssistantContent = status === 'completed' && !!final_response`。
 - 回退取正文时，step 级 `assistant_content` 同样按 sentinel 规则过滤占位串。
 
-### 3.6 ask_user 中断恢复
+### 3.6 Human-in-the-Loop 暂停与恢复
 
-- `loadHistory()` 若发现最新 round `status === 'interrupted' && interrupt`：
-  - `setPendingInterrupt(interrupt)` + `agentState.status = 'waiting'`
-  - 渲染 `QuestionCard` 供用户回答
-- 用户回答 → 继续调用后端 `resume` 接口（携带答案）。
-- **放弃路径**：`QuestionCard` 提供关闭按钮（X），点击仅本地 `setPendingInterrupt(null)` 隐藏卡片，不调用任何后端接口。Round 保持 `interrupted` 终态，用户可直接发新消息开启新 round。
+- `loadHistory()` 若发现 Round `status === 'waiting_interaction' && interrupt`：
+  - 以原 `round_id` 恢复/绑定 runtime run，`agentState.status='waiting'`；
+  - 渲染 `QuestionCard` 或工具审批卡；
+  - 从 `last_event_sequence` 继续订阅同一 Round，等待其他标签页的动作。
+- waiting 时普通发送必须禁用。卡片不得提供“只在本地隐藏”的 X；用户只能回答/审批，或点击 Stop 取消整个 Round，避免进入既不能回答也不能发送的死角。
+- 提交回答时复用原 client run key 与 server `round_id`，不追加 optimistic child Round。收到 `interaction_resolved` 后清卡、把同一 Round 改回 `running` 并继续消费事件。
+- resume transport 已消费 durable terminal 后，即使 reader 在 clean EOF 前再次报错，也必须成功 settle，保留 terminal、禁止回拉旧 waiting 快照。若显式收到 `interaction_resolved`，或在漏收该事件后由权威 history 确认同一 Round 已是 `running`，都表示 continuation 已不可逆启动；后续 history 连续失败，或返回与本次 resume 相同 `interaction_id` 的陈旧 waiting 快照时，都必须保持 running 并从最新 cursor 续订，不得恢复 resume 前捕获的问题卡。只有不同 `interaction_id` 的后续 `interaction_requested` 可以再次进入 waiting。
+- HTTP 200 / 本地 `stream_accepted` 只是传输接受，不是 continuation 边界。若在 `interaction_resolved` 前收到 `NO_PENDING_INTERRUPT`、`RESUME_CONFLICT`、`INVALID_INTERACTION_RESPONSE`、`AGENT_INIT_FAILED` 等 `RUN_ERROR`，不得将原 Round 置 `failed`；应立即回拉 history，并按 waiting / running / 终态权威恢复。
+- 上述控制面错误即使已成功恢复权威 history，也必须通过独立的非终态错误通道展示给用户；不得因为恢复成功而静默吞掉错误，也不得把错误重新派发为 Round terminal。
+- `interaction_resolved` 后若又收到下一次 `interaction_requested`，以后任何网络错误都不能覆盖该新问题；卡片保留并继续走 waiting subscribe/history。
 
-### 3.7 多 RUN 同一 Round
+### 3.7 多传输阶段同一 Round
 
-一个 round 可能包含多个 RUN（断线重连同一 round 时新增 RUN）。前端按 `runId` 区分，但 UI 内聚合在同一个 `RoundData.steps` 下。
+一个 same-Round 执行可经历 direct stream、waiting subscribe、resume stream 和重连 subscribe。所有服务端事件仍使用同一个 `runId == round_id`；前端以稳定 client run key 聚合到同一 `RoundData.steps`，并用 transport epoch / connection id 丢弃旧连接迟到回调。
 
 ### 3.8 Resume 后的 Round 关系
 
-`ask_user` 中断恢复后，**不**复用旧 round。后端语义（见 `chat-spec.md` §Resume 流程，对应实现 `history_service.create_resume_round()` 与 `agent_service` 的 resume 入口）：
-
-- 旧 `interrupted` round 的状态会被后端迁移为 `resumed`，并清除 `interrupt_payload`，以阻止刷新后重复弹出 `QuestionCard`。
-- 同时新建一个 round（`parent_run_id` 指向旧 round）承载 resume 之后的步骤。
-
-前端实现与之一致：
-
-- `handleResumeSubmit` 在调用 `resumeStream` 前向 `rounds` 数组追加一个新的 `running` 占位 round（`user_message` 用 `Q:/A:` 拼接的回答摘要）。
-- 旧 round 仍展示在历史中作为可读记录，但其状态在拉取历史时会是 `resumed`（不再是 `interrupted`）。前端断言、测试 fixture 与 UI 渲染分支需基于 `resumed` 而非 `interrupted`。
-- 这样保证刷新页面后，从后端拉到的多 round 结构与本地实时状态一致。
+`ask_user` / 工具审批恢复始终复用原 Round：`waiting_interaction → running`，`round_id`、用户消息、Skill 展示快照和推理快照均不变，回答不生成新的聊天气泡或临时 child Round。
 
 ### 3.9 本轮 Skill 偏好
 
@@ -230,7 +238,7 @@ pre_accept_pending
 
 - `Round` 在普通 direct Round 的用户消息旁展示只读“优先 Skill”标签，数据源为该 Round 的 `preferred_skills`。标签显示持久化的 `display_name`，需要辅助提示时可同时暴露稳定 `key`；不得重新查询当前 Skill 清单来替换历史展示名。
 - 标签表达“这次发送要求 Agent 优先考虑”，不表示该 Skill 已加载、被调用或实际参与生成结果。UI 不得使用“已使用”“已调用”等成功态文案或图标。
-- `preferred_skills=[]` 时不渲染标签容器。resume child Round 即使运行时继承了父逻辑执行链的偏好也保持空数组，前端不得在 Q/A 或工具审批 child 用户消息旁重复展示；标签只出现在最初的 direct Round。
+- `preferred_skills=[]` 时不渲染标签容器。same-Round resume 不新增消息或标签，继续展示原 direct Round 的冻结快照。
 - 每个独立 direct Round 只展示自己当次发送的快照，不继承或合并前一 Round 的标签。后续 Skill 被禁用、改名或删除也不得改写已有历史标签。
 - 新消息尚未拿到服务端 Round 数据时，可用本次 composer 快照做 optimistic 展示；收到 `RUN_STARTED.preferredSkills`（显式空数组也算权威结果）后立即替换，刷新/断线恢复再以 `history/v2` 的持久化快照为准，确保无效 key 被清除且实时视图与历史一致。
 
@@ -243,10 +251,10 @@ pre_accept_pending
 - 发送时对当前草稿创建不可变快照，并将其作为 `preferred_skill_keys` 与正文、附件一并提交；空数组可省略。之后用户对选择器的编辑不得改变已经发出的请求。
 - 提交发送时乐观清空该目标 session 的 Skill 草稿。服务端确认 SSE 已接受（`stream_accepted` 或 `RUN_STARTED`）后保持清空；执行已被接受后的流式失败、中断或取消不得恢复旧选择。
 - composer 清空只影响下一条待发送草稿，不得删除或隐藏已经固化在当前 direct Round 用户消息旁的 `preferred_skills` 标签。
-- 若 POST 在收到响应头前发生网络错误，前端须按 §3.3.1 用同一 `idempotency_key` 查询历史：匹配到 running/终态 Round 即视为已接受，补发一次 `stream_accepted`，随后立即订阅或收敛终态；从历史恢复的失败终态也必须携带真实 `threadId`、`runId` 和末事件序号。只有 3 次 history 均成功且均无匹配时才恢复发送快照并报请求失败；任一次 history 失败则保持歧义、草稿保持清空并提示刷新。确定性的 HTTP 4xx/5xx 仍立即恢复；恢复回调最多执行一次。
-- 从 history 直接收敛已完成/失败终态时，必须先合成一个无 sequence 的 `RUN_STARTED`，携带该 Round 的 `preferred_skills`（旧数据按 `[]`），再派发 terminal；已知 run 的订阅终态兜底同样如此。Reducer 必须允许这个补偿事件按 server run id 命中已绑定 Round，以纠正 optimistic 展示名并清除无效 key。
+- 若 POST 在收到响应头前发生网络错误，前端须按 §3.3.1 用同一 `idempotency_key` 查询历史：匹配到 running/waiting/终态 Round 即视为已接受，补发一次 `stream_accepted`，随后立即订阅或收敛终态；从历史恢复的失败终态也必须携带真实 `threadId`、`runId` 和末事件序号。只有 3 次 history 均成功且均无匹配时才恢复发送快照并报请求失败；任一次 history 失败则保持歧义、草稿保持清空并提示刷新。确定性的 HTTP 4xx/5xx 仍立即恢复；恢复回调最多执行一次。
+- 从 history 直接收敛已完成/失败终态时，必须先合成一个无 sequence 的 `RUN_STARTED`，携带该 Round 的 `preferred_skills`（没有数据时按 `[]`），再派发 terminal；已知 run 的订阅终态兜底同样如此。Reducer 必须允许这个补偿事件按 server run id 命中已绑定 Round，以纠正 optimistic 展示名并清除无效 key。
 - 失败恢复必须带 revision 保护：若乐观清空后用户没有新编辑，精确恢复快照；若用户已新增或移除选择，则保留当前编辑，并把快照中缺失的 key 按原顺序无重复合并，不能用旧快照覆盖新编辑。
-- `ask_user` 或工具审批产生的 child resume round 由后端继承并重新解析原请求 Skill；前端 `resume` 不重复发送 `preferred_skill_keys`。用户之后独立发送的新消息只使用当时该 session 的新草稿。
+- `ask_user` 或工具审批 continuation 由后端按原请求锚点重新解析 Skill；前端 `resume` 不重复发送 `preferred_skill_keys`，也不改写原 Round 的展示快照。用户之后独立发送的新消息只使用当时的新草稿。
 
 #### 模型与本轮推理等级
 
@@ -338,19 +346,33 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 
 | 错误 | 来源 | UI 表现 |
 |---|---|---|
-| `HttpError(4xx)` | axios 拒绝 | 显示错误 banner，**不重试** |
-| `HttpError(5xx)` | axios 拒绝 | 显示错误 banner，允许用户重试 |
+| `HttpError(4xx)` | axios 拒绝 | definite rejection；显示错误 banner，**不自动重试** |
+| `HttpError(5xx)` | axios 拒绝 | definite rejection；显示错误 banner，允许用户显式重试，但不自动重发 |
 | `RoundExistsError` | `sendMessage` 冲突 | 静默切到 subscribe |
+| direct 控制面 `INTERACTION_PENDING` | 陈旧标签页在已有 waiting Interaction 时发送普通消息 | 新 optimistic Round 不得终态化原 Round；回拉 history、恢复 waiting subscribe 与未受理草稿，并显示非终态冲突提示 |
 | SSE 断开 | EventSource error | 走 §3.3 恢复 |
-| `onStreamError(msg, code)` | 后端 AG-UI `RUN_ERROR` | 显示错误 banner，`setBusyFalse` |
+| resume 控制面 `RUN_ERROR` | `interaction_resolved` 前的 `NO_PENDING_INTERRUPT` / `RESUME_CONFLICT` / `INVALID_INTERACTION_RESPONSE` / `AGENT_INIT_FAILED` 等 | 显示请求错误但不终态化原 Round；回拉 history 恢复权威状态 |
+| 运行期 `RUN_ERROR` | 新消息已建立 Round，或 resume 已越过 `interaction_resolved`，且事件带 durable sequence 或 history 已权威投影 failed | 将对应 Round 收敛为 failed，显示错误 banner |
 
 ## 10. 测试清单
 
 - [ ] 切换会话时旧 SSE 事件不污染新会话（mock 迟到事件）
 - [ ] 取消后 UI 显示"已取消"而非"错误"
 - [ ] 取消成功后无需等待 SSE，即刻恢复输入并允许重发
-- [ ] ask_user 中断恢复：刷新页面后 QuestionCard 正常显示
-- [ ] SSE 断连后自动恢复（history API 查询终态/续订）
+- [ ] 取消成功返回 `outcome_warning`：取消状态不变，聊天页不展示重复的副作用提示
+- [ ] ask_user / 工具审批暂停：刷新页面后同一 waiting Round 的卡片正常显示且继续订阅
+- [ ] 另一个标签页回答或取消 waiting Round，本页通过 subscribe 收到 resolved、后续输出或终态，无需刷新
+- [ ] resume 200 SSE 在 `interaction_resolved` 前返回控制面 RUN_ERROR：原 Round 不变为 failed，history 可恢复卡片/运行态/终态
+- [ ] resume 控制面错误恢复 history 成功后仍显示请求错误，不生成 terminal RUN_ERROR
+- [ ] resume 收到 durable terminal 后 reader reject 且 history 不可用：仍保持终态，不恢复旧问题卡或重建 waiting subscribe
+- [ ] resume 已 resolved 未 terminal 且 history 全失败：保持 running，从 resolved cursor 续订
+- [ ] resume 已 resolved 后 history 返回相同 `interaction_id` 的 waiting 快照：视为陈旧状态且不复活旧卡；不同 ID 的新 Interaction 仍可进入 waiting
+- [ ] 陈旧标签页发送消息收到 `INTERACTION_PENDING`：恢复未受理草稿、waiting 卡片与订阅
+- [ ] 收到下一次 `interaction_requested` 后立刻断网且 history 失败：新卡片仍保留，不被 RUN_ERROR 覆盖
+- [ ] waiting subscribe 已安排 retry 时点击 Stop：旧 timer 不再建连，慢 abort 期间 UI 不回跳 waiting
+- [ ] equal 或 unrelated higher cursor history 不覆盖尚未 END 的 text / thinking / tool args dirty segment；只有逐 segment 匹配的 server projection / aggregate 才可权威替换并推进 cursor
+- [ ] waiting 卡片无纯本地关闭入口；回答与 Stop 均可离开等待态
+- [ ] SSE 断连后自动恢复（history API 查询终态，running/waiting 续订）
 - [ ] 幂等冲突自动切 subscribe
 - [ ] 普通进入长会话时定位到底部；A 滚到中间 → 切 B → 切回 A，A 仍定位到底部
 - [ ] 搜索结果带 `match_round_id` 时定位到命中 round，而不是底部
@@ -362,7 +384,7 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] Skill 选择器仅在显式打开时加载并在重新打开时后台刷新；已有清单立即展示，未完成请求可复用，只展示 enabled 项
 - [ ] Skill 清单不跨组件实例/账号复用，退出后切换账号不泄露上一账号的私有 Skill；成功空列表与请求失败均不产生自动重载循环，刷新失败保留旧清单
 - [ ] Skill 使用 `display_name` 展示、`key` 提交；搜索重开清空；选择、标签移除、50 项上限、桌面点击外部/`Escape` 与移动端关闭按钮行为正确
-- [ ] 普通 direct Round 在用户消息旁按 `preferred_skills` 展示只读标签；空数组不展示，resume child 不重复展示，文案不暗示 Skill 已加载或调用
+- [ ] 普通 direct Round 在用户消息旁按 `preferred_skills` 展示只读标签；空数组不展示，same-Round resume 不新增标签，文案不暗示 Skill 已加载或调用
 - [ ] Skill 草稿按 session 隔离；A/B 会话切换互不污染，新会话创建后草稿迁移到实际 session
 - [ ] 正文与附件草稿按 session 隔离；切回会话可恢复，迟到上传只更新其捕获的 `draftId + serverSessionId`
 - [ ] 新会话的正文、附件与 Skill 协调迁移；重复或迟到的创建结果不得覆盖真实 session 下的较新草稿
@@ -375,8 +397,8 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 
 ## 11. 已知易错点
 
-1. 忘记在新的 useEffect 里加 `boundSessionId` 校验。
-2. 新增 SSE 事件类型时忘记在 `services/api.ts` 的 dispatcher 注册。
+1. 新 transport 没有递增 epoch/替换 connection id，或旧 finally 未校验 identity 就清理新连接。
+2. 新增 SSE 事件类型时只改解析层，忘记补 `chatRuntimeReducer` 与 history replay 投影。
 3. `ToolResult` 很大时直接渲染导致卡顿 → 用 `TruncatedCodeBlock`。
 4. `applyPatch` 失败时吞异常 → **必须 console.error**，否则 state 偷偷停更。
 5. 取消后未清除 `sending` → 输入框卡死。

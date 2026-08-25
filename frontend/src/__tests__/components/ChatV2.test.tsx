@@ -78,8 +78,15 @@ vi.mock('../../services/chatStreamClient', async () => {
   const callbacksFor = (args: any) => ({
     onStreamAccepted: () => emit(args, { type: 'CUSTOM', name: 'stream_accepted', value: {} }),
     onRunStarted: (threadId: string, runId: string) => emit(args, { type: 'RUN_STARTED', threadId, runId }),
-    onRunFinished: (threadId: string, runId: string, result: any, outcome: string, interrupt?: any) => (
-      emit(args, { type: 'RUN_FINISHED', threadId, runId, result, outcome, interrupt })
+    onRunFinished: (
+      threadId: string,
+      runId: string,
+      result: any,
+      outcome: string,
+      interrupt?: any,
+      meta?: any,
+    ) => (
+      emit(args, { type: 'RUN_FINISHED', threadId, runId, result, outcome, interrupt }, meta)
     ),
     onRunError: (message: string, code?: string) => {
       args.onError?.(message, code);
@@ -157,7 +164,6 @@ vi.mock('../../components/Round', () => ({
       data-assistant={round.final_response}
       data-steps={JSON.stringify(round.steps)}
       data-status={round.status}
-      data-control-kind={round.control_kind || ''}
       data-preferred-skills={JSON.stringify(round.preferred_skills || [])}
     >
       <span>Round: {round.round_id}</span>
@@ -184,24 +190,37 @@ vi.mock('../../components/FilePreview', () => ({
   ),
 }));
 
-vi.mock('../../components/QuestionCard', () => ({
-  QuestionCard: ({ questions, onSubmit, onDismiss, disabled }: any) => (
-    <div data-testid="question-card">
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => onSubmit({ [questions?.[0]?.question || 'Which database should we use?']: 'PostgreSQL' })}
-      >
-        Submit Question
-      </button>
-      {onDismiss && (
-        <button type="button" data-testid="question-card-dismiss" onClick={onDismiss}>
-          Dismiss
-        </button>
-      )}
-    </div>
-  ),
-}));
+vi.mock('../../components/QuestionCard', async () => {
+  const { useState } = await import('react');
+  return {
+    QuestionCard: ({ questions, onSubmit, onDismiss, disabled }: any) => {
+      const [draft, setDraft] = useState('');
+      const question = questions?.[0]?.question || 'Which database should we use?';
+      return (
+        <div data-testid="question-card">
+          <span>{`Question: ${question}`}</span>
+          <input
+            aria-label="mock question answer"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onSubmit({ [question]: draft || 'PostgreSQL' })}
+          >
+            Submit Question
+          </button>
+          {onDismiss && (
+            <button type="button" data-testid="question-card-dismiss" onClick={onDismiss}>
+              Dismiss
+            </button>
+          )}
+        </div>
+      );
+    },
+  };
+});
 
 function RuntimeStreamOwnershipHarness() {
   const runtime = useChatRuntime();
@@ -490,7 +509,7 @@ describe('ChatV2 组件', () => {
     });
   });
 
-  it('当前会话进入运行态时不应重新加载历史记录', async () => {
+  it('当前会话收到外部 active slot 时应后台重新校准历史', async () => {
     const { rerender } = render(
       <ChatV2
         sessionId="test-session"
@@ -512,11 +531,10 @@ describe('ChatV2 组件', () => {
       />
     );
 
-    await act(async () => {
-      await Promise.resolve();
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(1);
     });
 
-    expect(apiService.getSessionHistoryV2).not.toHaveBeenCalled();
     expect(screen.queryByText('正在同步会话...')).not.toBeInTheDocument();
     expect(screen.getByText('Round: round-1')).toBeInTheDocument();
   });
@@ -1352,14 +1370,14 @@ describe('ChatV2 组件', () => {
   });
 
   it('resume 失败后应恢复问题卡片以便重试', async () => {
-    const interruptedRounds: RoundData[] = [
+    const waitingRounds: RoundData[] = [
       {
-        round_id: 'round-interrupted-1',
+        round_id: 'round-waiting-1',
         user_message: '请帮我选数据库',
         final_response: '',
         steps: [],
         step_count: 0,
-        status: 'interrupted',
+        status: 'waiting_interaction',
         created_at: new Date().toISOString(),
         interrupt: {
           id: 'interrupt-1',
@@ -1381,9 +1399,9 @@ describe('ChatV2 组件', () => {
     ];
 
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      rounds: interruptedRounds,
+      rounds: waitingRounds,
       session_id: 'test-session',
-      total: interruptedRounds.length,
+      total: waitingRounds.length,
     });
     vi.mocked(apiService.resumeStream).mockRejectedValue(new Error('resume failed'));
 
@@ -1410,14 +1428,54 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('连续 interaction_requested 应按 interaction id 重建问题卡本地状态', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [{
+        round_id: 'round-waiting-identity',
+        user_message: '连续提问',
+        final_response: '',
+        steps: [],
+        step_count: 0,
+        status: 'waiting_interaction',
+        created_at: new Date().toISOString(),
+        last_event_sequence: 7,
+        interrupt: {
+          id: 'interaction-1',
+          reason: 'input_required',
+          payload: { questions: [{ question: 'Old question?' }] },
+        },
+      }],
+      session_id: 'test-session',
+      total: 1,
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    const answer = await screen.findByLabelText('mock question answer');
+    fireEvent.change(answer, { target: { value: 'answer from old card' } });
+    expect(answer).toHaveValue('answer from old card');
+
+    const subscribeCallbacks = vi.mocked(apiService.subscribeToRound).mock.calls[0][2] as any;
+    await act(async () => {
+      subscribeCallbacks.onCustomEvent('interaction_requested', {
+        interactionId: 'interaction-2',
+        runId: 'round-waiting-identity',
+        kind: 'user_input',
+        payload: { questions: [{ question: 'New question?' }] },
+      });
+    });
+
+    expect(screen.getByText('Question: New question?')).toBeInTheDocument();
+    expect(screen.getByLabelText('mock question answer')).toHaveValue('');
+  });
+
   it('普通 ask_user 的问题键为 approval 时仍是用户回答而非工具审批控制', async () => {
-    const interruptedRounds: RoundData[] = [{
+    const waitingRounds: RoundData[] = [{
       round_id: 'round-ask-approval-key',
       user_message: '请确认审批字段',
       final_response: '',
       steps: [],
       step_count: 0,
-      status: 'interrupted',
+      status: 'waiting_interaction',
       created_at: new Date().toISOString(),
       interrupt: {
         id: 'interrupt-approval-key',
@@ -1432,7 +1490,7 @@ describe('ChatV2 组件', () => {
       },
     }];
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      rounds: interruptedRounds,
+      rounds: waitingRounds,
       session_id: 'test-session',
       total: 1,
     });
@@ -1447,21 +1505,20 @@ describe('ChatV2 组件', () => {
         { approval: 'PostgreSQL' },
         expect.any(Object),
       );
-      const answerRound = screen.getByText(/User: Q: approval/).closest('[data-testid="round"]');
-      expect(answerRound).toHaveAttribute('data-control-kind', '');
-      expect(answerRound).toHaveTextContent('A: PostgreSQL');
+      expect(screen.getAllByTestId('round')).toHaveLength(1);
+      expect(screen.getByText('User: 请确认审批字段')).toBeInTheDocument();
     });
   });
 
   it('应渲染工具审批中断，并把精确审批结果提交到 resume 接口', async () => {
-    const interruptedRounds: RoundData[] = [
+    const waitingRounds: RoundData[] = [
       {
         round_id: 'round-approval-1',
         user_message: '查询企业知识库',
         final_response: '',
         steps: [],
         step_count: 1,
-        status: 'interrupted',
+        status: 'waiting_interaction',
         created_at: new Date().toISOString(),
         interrupt: {
           id: 'approval-1',
@@ -1483,7 +1540,7 @@ describe('ChatV2 组件', () => {
     ];
 
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      rounds: interruptedRounds,
+      rounds: waitingRounds,
       session_id: 'test-session',
       total: 1,
     });
@@ -1492,6 +1549,7 @@ describe('ChatV2 组件', () => {
 
     expect(await screen.findByText('工具执行需要确认')).toBeInTheDocument();
     expect(screen.getByText('官方 MCP · 官方知识库')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '暂时隐藏审批' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /允许本次/ }));
 
     await waitFor(() => {
@@ -1505,77 +1563,6 @@ describe('ChatV2 组件', () => {
       expect(screen.getAllByTestId('round')).toHaveLength(1);
       expect(screen.getByText('User: 查询企业知识库')).toBeInTheDocument();
     });
-  });
-
-  it('历史中的连续工具审批恢复应整合为同一轮助手响应', async () => {
-    const approvalChain: RoundData[] = [
-      {
-        round_id: 'round-root',
-        user_message: '查询贵州茅台过去一年的 Beta',
-        final_response: '',
-        steps: [{
-          step_number: 1,
-          thinking: '先查询指标。',
-          tool_calls: [],
-          tool_results: [],
-          status: 'completed',
-        }],
-        step_count: 1,
-        status: 'interrupted',
-        created_at: '2026-07-16T10:00:00Z',
-      },
-      {
-        round_id: 'round-resume-1',
-        parent_run_id: 'round-root',
-        control_kind: 'tool_approval',
-        user_message: 'Tool approval: allow_once',
-        final_response: '第一次查询没有返回 Beta，改用日期区间重试。',
-        steps: [{
-          step_number: 1,
-          thinking: '调整查询参数。',
-          tool_calls: [],
-          tool_results: [],
-          status: 'completed',
-        }],
-        step_count: 1,
-        status: 'interrupted',
-        created_at: '2026-07-16T10:00:06Z',
-      },
-      {
-        round_id: 'round-resume-2',
-        parent_run_id: 'round-resume-1',
-        control_kind: 'tool_approval',
-        user_message: 'Tool approval: allow_once',
-        final_response: '最终 Beta 为 0.2308。',
-        steps: [{
-          step_number: 1,
-          thinking: '整理最终结果。',
-          tool_calls: [],
-          tool_results: [],
-          status: 'completed',
-        }],
-        step_count: 1,
-        status: 'completed',
-        created_at: '2026-07-16T10:00:08Z',
-        completed_at: '2026-07-16T10:00:12Z',
-      },
-    ];
-
-    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      rounds: approvalChain,
-      session_id: 'test-session',
-      total: approvalChain.length,
-    });
-
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => expect(screen.getAllByTestId('round')).toHaveLength(1));
-    const displayedRound = screen.getByTestId('round');
-    expect(displayedRound).toHaveAttribute('data-assistant', '最终 Beta 为 0.2308。');
-    expect(displayedRound).toHaveAttribute('data-status', 'completed');
-    expect(JSON.parse(displayedRound.getAttribute('data-steps') || '[]')).toHaveLength(3);
-    expect(screen.getByText('User: 查询贵州茅台过去一年的 Beta')).toBeInTheDocument();
-    expect(screen.queryByText(/User: Tool approval:/)).not.toBeInTheDocument();
   });
 
   it('普通用户发送审批格式文本时不应被当作控制轮次', async () => {
@@ -1599,59 +1586,6 @@ describe('ChatV2 组件', () => {
 
     expect(await screen.findByText('User: Tool approval: deny')).toBeInTheDocument();
     expect(screen.getAllByTestId('round')).toHaveLength(1);
-  });
-
-  it('interrupted 历史状态下输入框不应被锁死', async () => {
-    const interruptedRounds: RoundData[] = [
-      {
-        round_id: 'round-interrupted-2',
-        user_message: '请继续',
-        final_response: '',
-        steps: [],
-        step_count: 0,
-        status: 'interrupted',
-        created_at: new Date().toISOString(),
-        interrupt: {
-          id: 'interrupt-2',
-          reason: 'input_required',
-          payload: {
-            questions: [
-              {
-                question: 'Pick one?',
-                header: 'Choice',
-                options: [
-                  { label: 'A', description: 'Option A' },
-                  { label: 'B', description: 'Option B' },
-                ],
-              },
-            ],
-          },
-        },
-      },
-    ];
-
-    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      rounds: interruptedRounds,
-      session_id: 'test-session',
-      total: interruptedRounds.length,
-    });
-
-    render(
-      <ChatV2
-        sessionId="test-session"
-        {...defaultProps}
-      />
-    );
-
-    await waitFor(() => {
-      expect(screen.getByTestId('question-card')).toBeInTheDocument();
-    });
-
-    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
-    expect(textarea).not.toBeDisabled();
-
-    fireEvent.change(textarea, { target: { value: '直接发新消息跳过中断' } });
-    expect(textarea.value).toBe('直接发新消息跳过中断');
   });
 
   it('切换 session 时 sending 状态应重置，输入框不应被锁死', async () => {
@@ -1767,14 +1701,26 @@ describe('ChatV2 组件', () => {
     });
   });
 
-  it('init-window active slot 无 running round 时不应清除执行标记', async () => {
+  it('已打开 session 从无 slot 变为 init slot 时应启动 history 探测并锁定输入', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       rounds: [],
       session_id: 'session-init',
       total: 0,
     });
 
-    render(
+    const { rerender } = render(
+      <ChatV2
+        sessionId="session-init"
+        activeSlotSessionIds={new Set()}
+        {...defaultProps}
+      />
+    );
+
+    await waitFor(() => {
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(1);
+    });
+
+    rerender(
       <ChatV2
         sessionId="session-init"
         activeSlotSessionIds={new Set(['session-init'])}
@@ -1783,11 +1729,9 @@ describe('ChatV2 组件', () => {
     );
 
     await waitFor(() => {
-      expect(apiService.getSessionHistoryV2).toHaveBeenCalledWith('session-init');
+      expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(2);
+      expect(defaultProps.onExecutionStart).toHaveBeenCalledWith('session-init');
     });
-
-    expect(defaultProps.onExecutionStart).toHaveBeenCalledWith('session-init');
-    expect(defaultProps.onExecutionEnd).not.toHaveBeenCalledWith('session-init');
 
     await waitFor(() => {
       const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
@@ -2519,7 +2463,8 @@ describe('ChatV2 组件', () => {
       resolveAbort();
     });
 
-    // 正常停止不展示远端副作用提醒。
+    // 停止成功后不再重复展示后端的保守副作用提示。
+    expect(screen.queryByTestId('runtime-warning')).not.toBeInTheDocument();
     expect(screen.queryByText(ABORT_WARNING)).not.toBeInTheDocument();
 
     await act(async () => {
@@ -2618,15 +2563,14 @@ describe('ChatV2 组件', () => {
   });
 
   it('abort 时应清理残留的 pendingInterrupt（QuestionCard 不应残留）', async () => {
-    // 模拟一个处于 interrupted 状态的轮次（有 ask_user 中断）
-    const interruptedRounds: RoundData[] = [
+    const waitingRounds: RoundData[] = [
       {
         round_id: 'round-int-1',
         user_message: '分析一下',
         final_response: '',
         steps: [],
         step_count: 1,
-        status: 'interrupted',
+        status: 'waiting_interaction',
         created_at: new Date().toISOString(),
         interrupt: {
           id: 'int-001',
@@ -2639,7 +2583,7 @@ describe('ChatV2 组件', () => {
     ];
 
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      rounds: interruptedRounds,
+      rounds: waitingRounds,
       session_id: 'test-session',
       total: 1,
     });
@@ -2667,40 +2611,25 @@ describe('ChatV2 组件', () => {
     // QuestionCard 应该可见
     expect(screen.getByTestId('question-card')).toBeInTheDocument();
 
-    // 模拟：用户开始了新的执行（发送新消息），此时 sending=true
-    // 然后触发了一个带 outcome=interrupt 但无 interrupt 的 RUN_FINISHED（用户取消）
-    // 这会触发 sendMessageForSession 中的 setPendingInterrupt(null)    // 直接验证：发送新消息会清除 pendingInterrupt
-    const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
-
-    // sendMessageStreamV2 模拟立即完成
-    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
-      callbacks.onRunStarted?.('test-session', 'new-round-1');
-      callbacks.onRunFinished?.('test-session', 'new-round-1', { finalResponse: '完成' }, 'success', undefined);
-    });
-
     await act(async () => {
-      fireEvent.change(textarea, { target: { value: '新消息' } });
+      fireEvent.click(screen.getByTitle('停止生成'));
     });
 
-    await act(async () => {
-      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
-    });
-
-    // 发送新消息后 QuestionCard 应该消失
     await waitFor(() => {
       expect(screen.queryByTestId('question-card')).not.toBeInTheDocument();
+      expect(screen.getByTestId('round')).toHaveAttribute('data-status', 'cancelled');
     });
   });
 
-  it('点击 QuestionCard dismiss 按钮应本地隐藏卡片，不调后端接口', async () => {
-    const interruptedRounds: RoundData[] = [
+  it('waiting interaction 不提供仅本地关闭入口，避免隐藏后无法继续', async () => {
+    const waitingRounds: RoundData[] = [
       {
         round_id: 'round-dismiss-1',
         user_message: '分析一下',
         final_response: '',
         steps: [],
         step_count: 1,
-        status: 'interrupted',
+        status: 'waiting_interaction',
         created_at: new Date().toISOString(),
         interrupt: {
           id: 'int-dismiss-001',
@@ -2713,7 +2642,7 @@ describe('ChatV2 组件', () => {
     ];
 
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      rounds: interruptedRounds,
+      rounds: waitingRounds,
       session_id: 'test-session',
       total: 1,
     });
@@ -2725,15 +2654,8 @@ describe('ChatV2 组件', () => {
       expect(screen.getByTestId('question-card')).toBeInTheDocument();
     });
 
-    // 点击 dismiss 按钮
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('question-card-dismiss'));
-    });
-
-    // QuestionCard 应该消失
-    expect(screen.queryByTestId('question-card')).not.toBeInTheDocument();
-
-    // 不应调用 resume 或 cancel 接口
+    expect(screen.queryByTestId('question-card-dismiss')).not.toBeInTheDocument();
+    expect(screen.getByTestId('question-card')).toBeInTheDocument();
     expect(apiService.resumeStream).not.toHaveBeenCalled();
     expect(apiService.abortChat).not.toHaveBeenCalled();
   });
@@ -2864,7 +2786,8 @@ describe('ChatV2 组件', () => {
         'round-abort-race',
         { finalResponse: '已完成' },
         'success',
-        undefined
+        undefined,
+        { sequence: 9 },
       );
       throw new Error('Network Error');
     });
@@ -3004,7 +2927,7 @@ describe('ChatV2 组件', () => {
     });
   });
 
-  it('后端接受 SSE 后应在 RUN_STARTED 前标记执行态', async () => {
+  it('后端仅接受 SSE 时不应在 RUN_STARTED 前标记执行态', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       rounds: [],
       session_id: 'test-session',
@@ -3032,7 +2955,7 @@ describe('ChatV2 组件', () => {
       fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
     });
 
-    expect(defaultProps.onExecutionStart).toHaveBeenCalledWith('test-session');
+    expect(defaultProps.onExecutionStart).not.toHaveBeenCalled();
   });
 
   it('ask_user 中断事件不应泄漏到用户已切换到的新会话', async () => {

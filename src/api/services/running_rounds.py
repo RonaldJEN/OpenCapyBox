@@ -23,12 +23,12 @@ def main_running_round_join_condition(session_id_column):
 
 
 def get_main_running_round(db: DBSession, *, session_id: str) -> Round | None:
-    """Fetch the user-visible running round, excluding internal subagent children."""
+    """Fetch a cancellable main Round, including one parked for interaction."""
     return (
         db.query(Round)
         .filter(
             Round.session_id == session_id,
-            Round.status == "running",
+            Round.status.in_(("running", "waiting_interaction")),
             ~Round.id.in_(subagent_child_run_ids_select()),
         )
         .first()

@@ -110,8 +110,9 @@ if (session.model_id && onModelChange) {
 ### 4.6 执行标记集合的清除时机
 
 `executingSessionIds` 清除路径：
-- `RUN_STARTED` / 本地发送开始 → ChatV2 调用 `onExecutionStart(sessionId)`，将 sid 加入集合。
-- `RUN_FINISHED` → ChatV2 调用 `onExecutionEnd(sessionId)`（传 sid，精确清除）。
+- direct run 以 `RUN_STARTED` 加入；same-Round resume 只有收到 `interaction_resolved` 才重新加入。HTTP 200 / `stream_accepted` 只是传输或 slot 接受，不是 continuation 执行边界。
+- durable `RUN_FINISHED` / durable `RUN_ERROR` / `CUSTOM interaction_requested` → ChatV2 调用 `onExecutionEnd(sessionId)`（传 sid，精确清除）。无 sequence 的 `INTERACTION_PENDING`、`SUBSCRIBE_FAILED`、resume prelude error 等控制面/transport `RUN_ERROR` 不代表 Round 终态，必须先恢复权威 history，不能按 terminal 清除原 waiting 状态。`waiting_interaction` 没有活跃 producer，不显示“执行中”。
+- waiting Round 收到 `interaction_resolved` 后重新加入执行集合；随后若再请求交互则再次清除。
 - **禁止**在切换会话时无条件清除 → 会误清其他正在运行的会话标记。
 
 ```ts
@@ -132,7 +133,9 @@ const handleExecutionEnd = (sessionId?: string) => {
 };
 ```
 
-`activeSlotSessionIds` 保存后端 `/running-sessions` 返回或本地已启动的运行 slot。本地发送 / resume 在 HTTP 响应通过后、`RUN_STARTED` 到达前也必须先加入该集合；429 等请求级拒绝不得加入。若 ChatV2 加载当前 session 历史时尚未看到 `running` round，但该 session 仍在 `activeSlotSessionIds` 中，必须保留执行标记并禁用输入；这表示 Agent 初始化窗口，不能误判为空闲。进入该分支后 ChatV2 必须短间隔检查最新 `activeSlotSessionIds` prop/ref：slot 消失则清除执行态，slot 仍存在则重拉 history，直到看到 `running` round 并进入 `subscribeToRound` 订阅路径。ChatV2 不得为该探测额外请求 `/running-sessions`。
+`activeSlotSessionIds` 保存后端 `/running-sessions` 返回或本地已接受的运行 slot。本地发送 / resume 在 HTTP 响应通过后、运行边界事件到达前可以先加入该集合；这只用于 init-window 输入保护，不得提前加入 `executingSessionIds`。429 等请求级拒绝不得加入。若 ChatV2 加载当前 session 历史时尚未看到 `running` 或 `waiting_interaction` Round，但该 session 仍在 `activeSlotSessionIds` 中，必须保留输入保护；这表示 Agent 初始化窗口。进入该分支后短间隔检查最新集合：slot 消失则清除，slot 仍存在则重拉 history，直到看到 `running` 并订阅，或看到 `waiting_interaction` 后切换为“等待但继续订阅”。ChatV2 不得为该探测额外请求 `/running-sessions`。
+
+`waiting_interaction` 不持有 UserRunLock，因此通常不出现在 `/running-sessions`，也不属于 `activeSlotSessionIds`；但 ChatRuntime 仍须按同一 roundId 保持 SSE subscribe，以接收跨标签页恢复/取消。这两个集合表示 producer/slot 活跃性，不能拿来决定问题卡是否存在。
 
 `App` 必须立即并周期性 reconcile `/running-sessions`，更新 `executingSessionIds` 与 `activeSlotSessionIds`。除首次恢复运行态外，不得自动切换当前会话。该收敛用于清理非当前会话后台完成后的侧栏执行标记。
 
@@ -167,7 +170,7 @@ const handleExecutionEnd = (sessionId?: string) => {
 
 | 轮询 | 间隔 | 实现 |
 |---|---|---|
-| init-window 补偿探测 | 1.5s | `ChatV2` 在 active slot 但无 running round 时触发，通过最新 `activeSlotSessionIds` 判断是否重拉 history 或清标记 |
+| init-window 补偿探测 | 1.5s | `ChatV2` 在 active slot 但无 running/waiting Round 时触发；history 命中 waiting 后停止 init 探测、清执行标记并建立 waiting subscribe |
 | running-sessions 后台收敛 | 5s | `App` 立即并周期调用 `/running-sessions`，同步运行态集合；仅首次 reconcile 返回运行态且当前为空时可自动跳转 |
 | 会话列表刷新 | 30s | `SessionList` 内部 `setInterval` |
 | Cron 未读计数 | 60s | `App.tsx` 内部 `setInterval`，调用 `getUnreadCount` |
@@ -226,6 +229,8 @@ const handleExecutionEnd = (sessionId?: string) => {
 - [ ] 非当前会话后台完成后，周期收敛会清理对应执行标记
 - [ ] 本地 run 在 `RUN_STARTED` 前的 init-window 会保留执行标记；429 不污染执行标记
 - [ ] ChatV2 init-window 补偿探测不额外请求 `/running-sessions`
+- [ ] Round 进入 waiting 后清除侧栏执行标记但保留交互卡和 subscribe；其他标签页恢复后重新显示执行标记
+- [ ] `/running-sessions` 不返回无锁 waiting Round时，App reconcile 不得清掉 ChatRuntime 的 pending Interaction
 - [ ] A 会话运行中切到 B 会话，A 的 `executingSessionIds` 标记不被误清
 - [ ] 30s 后列表自动刷新
 - [ ] 搜索输入 300ms 后调用 `getSessions(q)`

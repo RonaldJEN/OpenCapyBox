@@ -47,7 +47,7 @@ from .context_compaction import (
     truncate_tool_output,
 )
 from .schema.agui_events import (
-    AGUIEvent, AgentState, CustomEvent, EventType, InterruptDetails,
+    AGUIEvent, AgentState, CustomEvent, EventType,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,10 @@ class _ToolPolicyDecision:
     matched_rule_id: str | None = None
 
 
+class ContinuationOwnershipLostError(RuntimeError):
+    """A stale same-Round worker must stop without terminating the new owner."""
+
+
 @dataclass(frozen=True)
 class _PendingApprovedToolCall:
     request_id: str
@@ -101,6 +105,8 @@ class _PendingApprovedToolCall:
     should_execute: bool
     connection_fingerprint: str | None = None
     claim_token: str | None = None
+    owner_round_id: str | None = None
+    interaction_claim_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -834,6 +840,46 @@ class Agent:
         self._pending_interrupt["round_id"] = round_id
         return True
 
+    def discard_pending_runtime_state(
+        self,
+        *,
+        interrupt_id: str | None = None,
+        owner_round_id: str | None = None,
+    ) -> None:
+        """丢弃已由持久化终态否决的 Human-in-the-Loop 热缓存。
+
+        这里不认领审批、不改写消息历史。数据库才是 Interaction/Round
+        状态的事实源；本方法只防止复用 Agent 时把旧请求带入新 Round。
+        """
+        pending_interrupt = self._pending_interrupt
+        if isinstance(pending_interrupt, dict):
+            matches_interrupt = (
+                interrupt_id is None
+                or pending_interrupt.get("interrupt_id") == interrupt_id
+            )
+            pending_round_id = pending_interrupt.get("round_id")
+            matches_round = (
+                owner_round_id is None
+                or pending_round_id is None
+                or pending_round_id == owner_round_id
+            )
+            if matches_interrupt and matches_round:
+                self._pending_interrupt = None
+
+        pending_approved = self._pending_approved_tool
+        if pending_approved is not None:
+            matches_interrupt = (
+                interrupt_id is None
+                or pending_approved.request_id == interrupt_id
+            )
+            matches_round = (
+                owner_round_id is None
+                or pending_approved.owner_round_id is None
+                or pending_approved.owner_round_id == owner_round_id
+            )
+            if matches_interrupt and matches_round:
+                self._pending_approved_tool = None
+
     @staticmethod
     def _permission_ref(tool: Tool):
         """Translate an Agent tool identity into the policy-domain identity."""
@@ -1471,6 +1517,8 @@ class Agent:
         should_execute: bool,
         connection_fingerprint: str | None = None,
         claim_token: str | None = None,
+        owner_round_id: str | None = None,
+        interaction_claim_token: str | None = None,
     ) -> None:
         """Queue a durably claimed approval for the first action of a resume run."""
         self._pending_approved_tool = _PendingApprovedToolCall(
@@ -1487,12 +1535,44 @@ class Agent:
             should_execute=should_execute,
             connection_fingerprint=connection_fingerprint,
             claim_token=claim_token,
+            owner_round_id=owner_round_id,
+            interaction_claim_token=interaction_claim_token,
         )
         self._pending_interrupt = None
 
     @staticmethod
-    def format_interrupt_tool_result(answers: dict[str, str]) -> str:
+    def order_interrupt_answers(
+        answers: dict[str, str],
+        questions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, str]:
+        """Return answers in definition order, or preserve pre-normalized input."""
+        if questions is None:
+            return dict(answers)
+        ordered: dict[str, str] = {}
+        for item in questions or []:
+            if not isinstance(item, dict):
+                continue
+            question = item.get("question")
+            if (
+                isinstance(question, str)
+                and question in answers
+                and question not in ordered
+            ):
+                ordered[question] = answers[question]
+        for question in sorted(
+            (key for key in answers if key not in ordered),
+            key=str,
+        ):
+            ordered[question] = answers[question]
+        return ordered
+
+    @staticmethod
+    def format_interrupt_tool_result(
+        answers: dict[str, str],
+        questions: list[dict[str, Any]] | None = None,
+    ) -> str:
         """格式化 ask_user 回答为热 resume 写入 tool result 的内容。"""
+        answers = Agent.order_interrupt_answers(answers, questions)
         answer_lines = []
         for question_text, answer in answers.items():
             answer_lines.append(f"- {question_text}: {answer}")
@@ -1540,7 +1620,11 @@ class Agent:
             raise ValueError("tool approvals must be resumed through AgentService")
 
         tool_call_id = self._pending_interrupt["tool_call_id"]
-        formatted_answers = self.format_interrupt_tool_result(answers)
+        questions = self._pending_interrupt.get("questions")
+        formatted_answers = self.format_interrupt_tool_result(
+            answers,
+            questions if isinstance(questions, list) else None,
+        )
         self.replace_interrupt_tool_result(tool_call_id, formatted_answers)
 
         self._pending_interrupt = None
@@ -2057,6 +2141,64 @@ class Agent:
             )
             return False
 
+    def _pending_approved_tool_matches_durable_turn(
+        self,
+        pending: _PendingApprovedToolCall,
+        *,
+        thread_id: str,
+        run_id: str,
+    ) -> bool:
+        """Fail closed when a queued approval no longer owns this durable Round."""
+        owner_round_id = pending.owner_round_id
+        if owner_round_id is not None and owner_round_id != run_id:
+            return False
+        if owner_round_id is None or not self.user_id:
+            return True
+
+        try:
+            from src.api.models.agent_interaction import AgentInteraction
+            from src.api.models.database import SessionLocal
+            from src.api.models.round import Round
+            from src.api.utils.timezone import now_naive
+
+            with SessionLocal() as db:
+                round_obj = (
+                    db.query(Round)
+                    .filter(
+                        Round.id == owner_round_id,
+                        Round.session_id == thread_id,
+                    )
+                    .first()
+                )
+                interaction = (
+                    db.query(AgentInteraction)
+                    .filter(
+                        AgentInteraction.id == pending.request_id,
+                        AgentInteraction.session_id == thread_id,
+                        AgentInteraction.round_id == owner_round_id,
+                    )
+                    .first()
+                )
+                return bool(
+                    round_obj is not None
+                    and round_obj.status == "running"
+                    and interaction is not None
+                    and interaction.answer_payload is not None
+                    and interaction.status == "pending"
+                    and pending.interaction_claim_token is not None
+                    and interaction.claim_token == pending.interaction_claim_token
+                    and interaction.claim_lease_expires_at is not None
+                    and interaction.claim_lease_expires_at > now_naive()
+                )
+        except Exception:
+            logger.warning(
+                "校验待执行审批的 Round/Interaction 状态失败，拒绝派发: request=%s run=%s",
+                pending.request_id,
+                run_id,
+                exc_info=True,
+            )
+            return False
+
     async def _renew_approval_lease_until_cancelled(
         self,
         pending: _PendingApprovedToolCall,
@@ -2111,6 +2253,120 @@ class Agent:
         pending = self._pending_approved_tool
         if pending is None:
             return None
+        if not self._pending_approved_tool_matches_durable_turn(
+            pending,
+            thread_id=thread_id,
+            run_id=run_id,
+        ):
+            logger.warning(
+                "丢弃不再拥有当前 Round 的待执行审批: request=%s owner=%s run=%s",
+                pending.request_id,
+                pending.owner_round_id,
+                run_id,
+            )
+            if self._pending_approved_tool is pending:
+                self._pending_approved_tool = None
+            if pending.owner_round_id is not None and self.user_id:
+                raise ContinuationOwnershipLostError(
+                    f"Tool approval continuation ownership lost: {pending.request_id}"
+                )
+            return None
+
+        cancelled_before_dispatch = bool(cancel_token and cancel_token.is_set())
+        if (
+            not cancelled_before_dispatch
+            and pending.should_execute
+            and self.user_id
+            and not pending.claim_token
+        ):
+            try:
+                from src.api.models.database import SessionLocal
+                from src.api.models.round import Round
+                from src.api.services.agent_interaction_service import (
+                    AgentInteractionService,
+                    InteractionConflictError,
+                )
+                from src.api.services.tool_permission_service import (
+                    dispatch_approval_request,
+                )
+                from src.api.utils.timezone import now_naive
+
+                with SessionLocal() as approval_db:
+                    if pending.owner_round_id is not None:
+                        dispatch_round = (
+                            approval_db.query(Round)
+                            .filter(
+                                Round.id == pending.owner_round_id,
+                                Round.session_id == thread_id,
+                            )
+                            .with_for_update()
+                            .first()
+                        )
+                        if dispatch_round is None or dispatch_round.status != "running":
+                            raise InteractionConflictError(
+                                "Tool approval owner Round is no longer running"
+                            )
+                    round_obj, interaction = (
+                        AgentInteractionService.lock_pending_for_update(
+                            approval_db,
+                            session_id=thread_id,
+                            interaction_id=pending.request_id,
+                        )
+                    )
+                    if (
+                        round_obj.id != run_id
+                        or round_obj.status != "running"
+                        or not pending.interaction_claim_token
+                        or interaction.claim_token
+                        != pending.interaction_claim_token
+                        or interaction.claim_lease_expires_at is None
+                        or interaction.claim_lease_expires_at <= now_naive()
+                    ):
+                        raise InteractionConflictError(
+                            "Tool approval continuation claim is stale"
+                        )
+                    claim = dispatch_approval_request(
+                        approval_db,
+                        request_id=pending.request_id,
+                        user_id=self.user_id,
+                        commit=False,
+                    )
+                    request = claim.request
+                    if (
+                        pending.owner_round_id is not None
+                        and request.run_id != pending.owner_round_id
+                    ):
+                        raise InteractionConflictError(
+                            "Tool approval Round ownership changed"
+                        )
+                    claimed_arguments = dict(claim.arguments)
+                    claimed_token = claim.claim_token
+                    claimed_should_execute = claim.should_execute
+                    approval_db.commit()
+                pending = replace(
+                    pending,
+                    arguments=claimed_arguments,
+                    should_execute=claimed_should_execute,
+                    claim_token=claimed_token,
+                )
+                self._pending_approved_tool = pending
+            except InteractionConflictError as exc:
+                logger.info(
+                    "工具审批 continuation 已由其他 worker 接管: request=%s",
+                    pending.request_id,
+                )
+                if self._pending_approved_tool is pending:
+                    self._pending_approved_tool = None
+                raise ContinuationOwnershipLostError(str(exc)) from exc
+            except Exception:
+                logger.warning(
+                    "工具审批派发前 claim 失败，拒绝执行: request=%s",
+                    pending.request_id,
+                    exc_info=True,
+                )
+                if self._pending_approved_tool is pending:
+                    self._pending_approved_tool = None
+                raise
 
         tool = self.tools.get(pending.function_name)
         record: _ExecutedToolCall
@@ -2124,7 +2380,18 @@ class Agent:
                 name=f"tool-approval-lease-{pending.request_id}",
             )
         try:
-            if pending.should_execute and not lease_owned:
+            if cancelled_before_dispatch:
+                result = ToolResult(success=False, error="Cancelled before approved tool execution")
+                record = _ExecutedToolCall(
+                    index=0,
+                    tool_call_id=pending.tool_call_id,
+                    function_name=pending.function_name,
+                    arguments=pending.arguments,
+                    result=result,
+                    result_content="Cancelled before approved tool execution.",
+                    execution_time_ms=0,
+                )
+            elif pending.should_execute and not lease_owned:
                 result = ToolResult(
                     success=False,
                     error="Approved tool execution lease was lost",
@@ -2163,7 +2430,15 @@ class Agent:
                         arguments=pending.arguments,
                         reason="user denied approval request",
                     )
-            elif cancel_token and cancel_token.is_set():
+            elif (
+                (cancel_token and cancel_token.is_set())
+                or self._pending_approved_tool is not pending
+                or not self._pending_approved_tool_matches_durable_turn(
+                    pending,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                )
+            ):
                 result = ToolResult(success=False, error="Cancelled before approved tool execution")
                 record = _ExecutedToolCall(
                     index=0,
@@ -2284,7 +2559,6 @@ class Agent:
             if self.user_id:
                 try:
                     from src.api.models.database import SessionLocal
-                    from src.api.models.interrupt_resolution import InterruptResolution
                     from src.api.services.tool_permission_service import finish_approval_request
 
                     with SessionLocal() as db:
@@ -2299,17 +2573,7 @@ class Agent:
                                 outcome_uncertain=record.result.outcome_uncertain,
                                 commit=False,
                             )
-                        resolution = (
-                            db.query(InterruptResolution)
-                            .filter(InterruptResolution.interrupt_id == pending.request_id)
-                            .first()
-                        )
-                        if resolution is not None:
-                            resolution.tool_result_content = record.result_content
-                        if (
-                            (pending.should_execute and lease_owned)
-                            or resolution is not None
-                        ):
+                        if pending.should_execute and lease_owned:
                             db.commit()
                 except Exception:
                     # The request was already claimed before external execution;
@@ -2326,7 +2590,8 @@ class Agent:
                     await lease_heartbeat
                 except asyncio.CancelledError:
                     pass
-            self._pending_approved_tool = None
+            if self._pending_approved_tool is pending:
+                self._pending_approved_tool = None
 
     def _tool_result_content(self, function_name: str, result: ToolResult) -> str:
         if result.success:
@@ -2827,6 +3092,8 @@ class Agent:
         run_id: str,
         cancel_token: Optional[asyncio.Event] = None,
         llm_request_context: LLMRequestContext | None = None,
+        emit_run_started: bool = True,
+        initial_step: int = 0,
     ) -> AsyncIterator[AGUIEvent]:
         """執行 Agent 並輸出 AG-UI 事件流
         
@@ -2877,7 +3144,7 @@ class Agent:
         self.logger.start_new_run()
         print(f"{Colors.DIM}📝 Log file: {self.logger.get_log_file_path()}{Colors.RESET}")
         
-        step = 0
+        step = max(int(initial_step or 0), 0)
         final_response: Optional[str] = None
 
         # 多層退出檢查計數器
@@ -2886,15 +3153,15 @@ class Agent:
         empty_response_nudged = False
         
         try:
-            # RUN_STARTED
-            yield emitter.run_started()
-            
-            # STATE_SNAPSHOT - 初始狀態
-            yield emitter.state_snapshot(AgentState(
-                current_step=0,
-                total_steps=self.max_steps,
-                status="running",
-            ))
+            if emit_run_started:
+                yield emitter.run_started()
+
+                # STATE_SNAPSHOT - 初始狀態
+                yield emitter.state_snapshot(AgentState(
+                    current_step=step,
+                    total_steps=self.max_steps,
+                    status="running",
+                ))
 
             # A claimed human approval belongs to the prior assistant tool call,
             # but executes inside this resume run so cancellation and SSE result
@@ -3705,11 +3972,6 @@ class Agent:
                                 tool_call_index += 1
                                 continue
 
-                            yield emitter.tool_call_result(
-                                tool_call_id=tool_call_id,
-                                content="[Awaiting tool approval]",
-                                execution_time_ms=0,
-                            )
                             self.messages.append(Message(
                                 role="tool",
                                 id=f"{tool_call_id}:result",
@@ -3753,15 +4015,20 @@ class Agent:
                             flush_event = _flush_pending_tool_content_event()
                             if flush_event:
                                 yield flush_event
-                            yield emitter.step_finished(step_name)
-                            yield emitter.run_finished(
-                                outcome="interrupt",
-                                interrupt=InterruptDetails(
-                                    id=interrupt_id,
-                                    reason="human_approval",
-                                    payload=approval_payload,
-                                ),
+                            yield emitter.custom_event(
+                                "interaction_requested",
+                                {
+                                    "interactionId": interrupt_id,
+                                    "runId": run_id,
+                                    "kind": "tool_approval",
+                                    "toolCallId": tool_call_id,
+                                    "payload": {
+                                        **approval_payload,
+                                        "kind": "tool_approval",
+                                    },
+                                },
                             )
+                            yield emitter.step_finished(step_name)
                             return
 
                     if function_name == "sub_agent" and self.subagent_max_parallel > 1:
@@ -3931,12 +4198,9 @@ class Agent:
 
                         print(f"\n{Colors.BRIGHT_MAGENTA}❓ Ask User:{Colors.RESET} {len(questions_payload)} question(s) — interrupting for user input")
 
-                        # 注入占位 tool_result（等待用户回答后替换）
-                        yield emitter.tool_call_result(
-                            tool_call_id=tool_call_id,
-                            content="[Awaiting user response]",
-                            execution_time_ms=0,
-                        )
+                        # 内存中的占位仅用于进程内 Agent/冷恢复模型上下文。wire
+                        # 不把占位内容投影给前端，回答后由 interaction_resolved
+                        # 事件补齐可重建的真实 tool result。
                         placeholder_msg = Message(
                             role="tool",
                             id=f"{tool_call_id}:result",
@@ -3981,18 +4245,19 @@ class Agent:
                         flush_event = _flush_pending_tool_content_event()
                         if flush_event:
                             yield flush_event
-                        yield emitter.step_finished(step_name)
-                        yield emitter.run_finished(
-                            outcome="interrupt",
-                            interrupt=InterruptDetails(
-                                id=interrupt_id,
-                                reason="input_required",
-                                payload={
+                        yield emitter.custom_event(
+                            "interaction_requested",
+                            {
+                                "interactionId": interrupt_id,
+                                "runId": run_id,
+                                "kind": "user_input",
+                                "toolCallId": tool_call_id,
+                                "payload": {
                                     "questions": questions_payload,
-                                    "tool_call_id": tool_call_id,
                                 },
-                            ),
+                            },
                         )
+                        yield emitter.step_finished(step_name)
                         return
 
                     record = await self._execute_tool_call_for_record(
@@ -4047,6 +4312,8 @@ class Agent:
                 # 正常完成
                 yield emitter.run_finished(outcome="success", result={"final_response": final_response})
                 
+        except ContinuationOwnershipLostError:
+            raise
         except Exception as e:
             import traceback
             error_detail = f"{type(e).__name__}: {str(e)}"

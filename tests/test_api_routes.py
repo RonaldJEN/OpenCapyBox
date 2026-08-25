@@ -2482,13 +2482,33 @@ class TestAbortEndpoint:
         assert response.status_code == 409
         assert "沒有正在進行" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        ("round_status", "approval_status", "expects_warning"),
+        [
+            ("waiting_interaction", None, False),
+            ("waiting_interaction", "denied", False),
+            ("running", None, True),
+            ("running", "approved", False),
+            ("running", "denied", True),
+            ("running", "executing", True),
+            ("running", "unknown", True),
+        ],
+    )
     @patch("src.api.routes.chat.get_agent_pool")
-    def test_abort_with_cancel_token_returns_200(self, mock_pool_fn, client):
+    def test_abort_with_cancel_token_returns_200(
+        self,
+        mock_pool_fn,
+        client,
+        round_status,
+        approval_status,
+        expects_warning,
+    ):
         """有 cancel_token 時成功取消"""
         import asyncio
         from src.api.models.session import Session as SessionModel
         from src.api.models.round import Round as RoundModel
         from src.api.models.user_run_lock import UserRunLock
+        from src.api.services.run_completion_service import RunCancellationResult
         from src.api.utils.timezone import now_naive
 
         mock_session = MagicMock()
@@ -2498,6 +2518,7 @@ class TestAbortEndpoint:
 
         mock_round = MagicMock()
         mock_round.id = "round-1"
+        mock_round.status = round_status
 
         # 心跳新鲜的锁（worker 存活）
         mock_lock = MagicMock()
@@ -2530,21 +2551,34 @@ class TestAbortEndpoint:
             new_callable=AsyncMock,
             return_value=self._cancel_result("req-1"),
         ), patch(
-            "src.api.routes.chat.RunCompletionService.complete",
+            "src.api.routes.chat.RunCompletionService.cancel_user_run",
             new_callable=AsyncMock,
-            return_value=None,
-        ) as complete_round:
+            return_value=RunCancellationResult(
+                stored_event=None,
+                outcome_uncertain=expects_warning,
+                final_response=(
+                    "outcome warning" if expects_warning else "Cancelled"
+                ),
+            ),
+        ) as cancel_round:
             response = client.post("/chat/session-1/abort")
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
         assert response.json()["reason"] == "force_aborted"
         assert response.json()["request_id"] == "req-1"
-        assert "远端副作用可能已经发生" in response.json()["outcome_warning"]
-        terminal_event = complete_round.await_args.kwargs["terminal_event"]
-        assert terminal_event.result["outcomeUncertain"] is True
-        assert terminal_event.result["warning"] == response.json()["outcome_warning"]
-        assert complete_round.await_args.kwargs["final_response"] == response.json()["outcome_warning"]
+        if expects_warning:
+            assert "远端副作用可能已经发生" in response.json()["outcome_warning"]
+        else:
+            assert response.json()["outcome_warning"] is None
+        cancel_round.assert_awaited_once()
+        assert cancel_round.await_args.kwargs["run_id"] == "round-1"
+        assert "远端副作用可能已经发生" in (
+            cancel_round.await_args.kwargs["outcome_warning"]
+        )
         assert cancel_token.is_set()
+        mock_agent_service.discard_pending_runtime_state.assert_called_once_with(
+            owner_round_id="round-1"
+        )
 
     @patch("src.api.routes.chat.get_agent_pool")
     def test_abort_returns_503_when_lock_release_failed(self, mock_pool_fn, client):

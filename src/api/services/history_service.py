@@ -11,13 +11,14 @@ from sqlalchemy.exc import IntegrityError
 from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.agui_event import AGUIEventLog
-from src.api.models.interrupt_resolution import InterruptResolution
+from src.api.models.agent_interaction import AgentInteraction
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.subagent_run import SubagentRun
 from src.api.models.tool_permission import ToolApprovalRequest
 from src.agent.schema.agui_events import AGUIEvent, EventType
 from src.agent.context_compaction import SUMMARY_PREFIX
-from src.api.services.agui_event_bus import AguiEventBus, StoredEvent
+from src.api.services.agui_event_bus import AguiEventBus, StoredEvent, get_agui_event_bus
+from src.api.services.agent_interaction_service import ContinuationWriteFence
 from src.api.services.run_completion_service import RunCompletionService
 from typing import List, Dict, Optional, AsyncIterator, Any
 from datetime import datetime
@@ -26,23 +27,6 @@ import json
 import logging
 
 logger = logging.getLogger(__name__)
-
-
-def _is_interrupt_resolution_unique_violation(exc: IntegrityError) -> bool:
-    orig = getattr(exc, "orig", None)
-    pgcode = getattr(orig, "pgcode", None)
-    if pgcode and pgcode != "23505":
-        return False
-    constraint_name = getattr(getattr(orig, "diag", None), "constraint_name", None)
-    if constraint_name:
-        return constraint_name in {
-            "interrupt_resolutions_pkey",
-            "uq_interrupt_resolution_resume_round",
-        }
-    message = str(orig or exc).lower()
-    return "interrupt_resolutions" in message and (
-        "unique" in message or "duplicate" in message
-    )
 
 
 class HistoryService:
@@ -110,6 +94,22 @@ class HistoryService:
         status = self.get_round_status(round_id)
         return bool(status and status in Round.SUBSCRIBE_TERMINAL_STATUSES)
 
+    def save_waiting_round_progress(self, round_id: str, *, step_count: int) -> None:
+        """Persist non-terminal progress when a logical Round parks for input."""
+        round_obj = (
+            self.db.query(Round)
+            .filter(Round.id == round_id, Round.status == "waiting_interaction")
+            .first()
+        )
+        if round_obj is None:
+            self.db.rollback()
+            raise ValueError(f"Waiting round not found: {round_id}")
+        round_obj.step_count = max(int(round_obj.step_count or 0), int(step_count or 0))
+        round_obj.completed_at = None
+        self.db.commit()
+        self.db.expunge(round_obj)
+        self.db.rollback()
+
     # 🆕 Round 相关方法
 
     def create_round(
@@ -176,176 +176,23 @@ class HistoryService:
         self._refresh_detached(round_obj)
         return round_obj
 
-    def create_resume_round(
-        self,
-        session_id: str,
-        round_id: str,
-        user_message: str,
-        parent_run_id: str,
-        user_attachments: Optional[List[Dict]] = None,
-        interrupt_id: Optional[str] = None,
-        tool_call_id: Optional[str] = None,
-        answers: Optional[Dict[str, str]] = None,
-        tool_result_content: Optional[str] = None,
-        restore_strategy: Optional[str] = None,
-        fallback_reason: Optional[str] = None,
-        thinking_mode: Optional[str] = None,
-        reasoning_effort: Optional[str] = None,
-        commit: bool = True,
-    ) -> Round:
-        """原子创建 resume round，并将被接管的父 round 标记为 resumed。"""
-        completed_at = now_naive()
-        updated = (
-            self.db.query(Round)
-            .filter(
-                Round.id == parent_run_id,
-                Round.session_id == session_id,
-                Round.status.in_(("running", "interrupted")),
-            )
-            .update(
-                {
-                    "status": "resumed",
-                    "interrupt_payload": None,
-                    "completed_at": completed_at,
-                },
-                synchronize_session="fetch",
-            )
-        )
-        if updated != 1:
-            self.db.rollback()
-            parent_round = (
-                self.db.query(Round)
-                .filter(Round.id == parent_run_id, Round.session_id == session_id)
-                .first()
-            )
-            parent_status = parent_round.status if parent_round else None
-            self.db.rollback()
-            if not parent_round:
-                raise ValueError(f"Interrupted round not found: {parent_run_id}")
-            raise ValueError(
-                f"Round is not resumable: {parent_run_id} status={parent_status}"
-            )
-
-        round_obj = Round(
-            id=round_id,
-            session_id=session_id,
-            user_message=user_message,
-            user_attachments=json.dumps(user_attachments or [], ensure_ascii=False),
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
-            status="running",
-            parent_run_id=parent_run_id,
-        )
-        try:
-            self.db.add(round_obj)
-            self.db.flush()
-            if interrupt_id:
-                if tool_result_content is None:
-                    self.db.rollback()
-                    raise ValueError("tool_result_content is required for interrupt resolution")
-                resolution = InterruptResolution(
-                    interrupt_id=interrupt_id,
-                    session_id=session_id,
-                    parent_round_id=parent_run_id,
-                    resume_round_id=round_id,
-                    tool_call_id=tool_call_id,
-                    answers_json=json.dumps(answers or {}, ensure_ascii=False),
-                    resume_user_message=user_message,
-                    tool_result_content=tool_result_content,
-                    restore_strategy=restore_strategy,
-                    fallback_reason=fallback_reason,
-                )
-                self.db.add(resolution)
-            if commit:
-                self.db.commit()
-            else:
-                self.db.flush()
-        except IntegrityError as e:
-            self.db.rollback()
-            if interrupt_id and _is_interrupt_resolution_unique_violation(e):
-                raise ValueError(f"Interrupt already resumed: {interrupt_id}") from e
-            raise
-        except Exception:
-            self.db.rollback()
-            raise
-        if commit:
-            self._refresh_detached(round_obj)
-        return round_obj
-
-    def update_interrupt_resolution_fallback(
-        self,
-        interrupt_id: str,
-        fallback_reason: str,
-    ) -> int:
-        """记录已创建 resolution 在冷启动 stitching 阶段的降级原因。"""
-        updated = (
-            self.db.query(InterruptResolution)
-            .filter(InterruptResolution.interrupt_id == interrupt_id)
-            .update({"fallback_reason": fallback_reason}, synchronize_session="fetch")
-        )
-        if updated:
-            self.db.commit()
-        return updated
-
-    def resolve_interrupted_rounds(self, session_id: str, *, commit: bool = True) -> int:
-        """将会话中所有 interrupted 轮次标记为已解决（清除 interrupt_payload）。
-
-        在 resume 成功创建新 round 之前调用，防止旧中断被前端重复恢复。
-        Returns:
-            被更新的轮次数量
-        """
-        updated = (
-            self.db.query(Round)
-            .filter(Round.session_id == session_id, Round.status == "interrupted")
-            .update(
-                {"status": "resumed", "interrupt_payload": None, "completed_at": now_naive()},
-                synchronize_session="fetch",
-            )
-        )
-        if updated and commit:
-            self.db.commit()
-        elif updated:
-            self.db.flush()
-        return updated
-
     # 終態集合引用 Round 模型的全局常量（唯一事實源）。
-    _TERMINAL_STATUSES = Round.COMPLETE_TERMINAL_STATUSES | {"resumed"}
+    _TERMINAL_STATUSES = Round.COMPLETE_TERMINAL_STATUSES
 
     def complete_round(
         self, round_id: str, final_response: str, step_count: int,
-        status: str = "completed", interrupt_payload: str | None = None,
+        status: str = "completed",
         terminal_event: AGUIEvent | dict[str, Any] | None = None,
+        continuation_fence: ContinuationWriteFence | None = None,
     ) -> Round:
         """完成对话轮次
 
-        若 round 已處於終態（completed/failed/cancelled/resumed），跳過狀態覆寫。
-        resumed round 允許接收遲到的 interrupted 完成回填展示元數據，但狀態保持 resumed。
+        若 round 已處於終態，跳過狀態覆寫。
         """
         self._last_terminal_event = None
         round_obj = self.db.query(Round).filter(Round.id == round_id).first()
         if round_obj:
             if round_obj.status in self._TERMINAL_STATUSES:
-                if round_obj.status == "resumed" and status == "interrupted":
-                    changed = False
-                    if final_response and not round_obj.final_response:
-                        round_obj.final_response = final_response
-                        changed = True
-                    if (
-                        step_count is not None
-                        and (round_obj.step_count is None or step_count > round_obj.step_count)
-                    ):
-                        round_obj.step_count = step_count
-                        changed = True
-                    if round_obj.completed_at is None:
-                        round_obj.completed_at = now_naive()
-                        changed = True
-                    if changed:
-                        self.db.commit()
-                        self._refresh_detached(round_obj)
-                    else:
-                        self.db.expunge(round_obj)
-                        self.db.rollback()
-                    return round_obj
                 logger.info(
                     "Round %s 已處於終態 %s，跳過 complete_round(status=%s)",
                     round_id, round_obj.status, status,
@@ -359,8 +206,8 @@ class HistoryService:
                 status=status,
                 final_response=final_response,
                 step_count=step_count,
-                interrupt_payload=interrupt_payload,
                 terminal_event=terminal_event,
+                continuation_fence=continuation_fence,
             )
             round_obj = self.db.query(Round).filter(Round.id == round_id).first()
             if round_obj is None:
@@ -437,6 +284,20 @@ class HistoryService:
                     current_step["status"] = "completed"
                     current_step["finished_at_ts"] = timestamp
 
+                elif (
+                    event_type == "CUSTOM"
+                    and event_data.get("name") == "interaction_requested"
+                    and current_step
+                ):
+                    # Same-Round interaction_requested is the durable waiting
+                    # boundary for the step. Agent.run_agui emits an explicit
+                    # STEP_FINISHED immediately afterwards, but a process may
+                    # die before that second event commits. Treat the request
+                    # as an implicit finish so history never resurrects the
+                    # accepted waiting step as running.
+                    current_step["status"] = "completed"
+                    current_step["finished_at_ts"] = timestamp
+
                 elif event_type == "THINKING_TEXT_MESSAGE_START" and current_step:
                     current_step["thinking_start_ts"] = timestamp
                     
@@ -503,7 +364,42 @@ class HistoryService:
                         "received_at_ts": timestamp,
                         "execution_time_ms": event_data.get("executionTimeMs"),
                     }
-                    current_step["tool_results"].append(result)
+                    existing_result = next(
+                        (
+                            item
+                            for item in current_step["tool_results"]
+                            if item.get("tool_call_id") == result["tool_call_id"]
+                        ),
+                        None,
+                    )
+                    if existing_result is None:
+                        current_step["tool_results"].append(result)
+                    else:
+                        existing_result.update(result)
+
+                elif (
+                    event_type == "CUSTOM"
+                    and event_data.get("name") == "interaction_resolved"
+                    and current_step
+                ):
+                    value = (
+                        event_data.get("value")
+                        if isinstance(event_data.get("value"), dict)
+                        else {}
+                    )
+                    tool_call_id = value.get("toolCallId", "")
+                    if tool_call_id and not any(
+                        item.get("tool_call_id") == tool_call_id
+                        for item in current_step["tool_results"]
+                    ):
+                        current_step["tool_results"].append({
+                            "tool_call_id": tool_call_id,
+                            "success": True,
+                            "content": value.get("toolResultContent", ""),
+                            "error": None,
+                            "received_at_ts": timestamp,
+                            "execution_time_ms": 0,
+                        })
                     
             except (json.JSONDecodeError, KeyError) as e:
                 print(f"⚠️ 解析事件失败: {e} (run_id={run_id}, id={event_log.id})")
@@ -513,21 +409,104 @@ class HistoryService:
             return steps, last_event_sequence
         return steps
 
+    def recover_expired_interaction_continuations(
+        self,
+        session_id: str,
+    ) -> list[str]:
+        """Reclaim pre-start leases and fail expired started continuations."""
+        from src.api.services.agent_interaction_service import AgentInteractionService
+
+        if not isinstance(self.db, DBSession):
+            return []
+        AgentInteractionService.repark_expired_continuation_claims(
+            self.db,
+            session_id=session_id,
+        )
+        irrecoverable_run_ids = (
+            AgentInteractionService.load_irrecoverable_continuation_round_ids(
+                self.db,
+                session_id=session_id,
+            )
+        )
+        failed_run_ids: list[str] = []
+        for run_id in irrecoverable_run_ids:
+            interaction_kind = (
+                AgentInteractionService.lock_irrecoverable_continuation_round_for_failure(
+                    self.db,
+                    round_id=run_id,
+                )
+            )
+            if interaction_kind is None:
+                self.db.rollback()
+                continue
+            final_response = (
+                "[工具审批续跑进程中断；为避免重复副作用，本轮不会自动重试]"
+                if interaction_kind == "tool_approval"
+                else "[交互续跑在持久化启动后中断；本轮不会重新提交已接受的回答]"
+            )
+            stored_terminal = RunCompletionService(self.db).complete_sync(
+                run_id=run_id,
+                status="failed",
+                final_response=final_response,
+            )
+            if stored_terminal is not None:
+                get_agui_event_bus().publish_committed_nowait(
+                    run_id,
+                    stored_terminal.event,
+                )
+                failed_run_ids.append(run_id)
+        return failed_run_ids
+
     def get_session_rounds(self, session_id: str) -> List[Dict]:
         """获取会话的所有轮次
-        
+
         步骤(steps)从 AG-UI 事件日志动态重建，而非单独存储。
         """
+        if isinstance(self.db, DBSession):
+            self.recover_expired_interaction_continuations(session_id)
         subagent_child_round_ids = self._get_subagent_child_round_ids(session_id)
-        tool_approval_resume_round_ids = self._get_tool_approval_resume_round_ids(
-            session_id
-        )
         rounds = (
             self.db.query(Round)
             .filter(Round.session_id == session_id)
             .order_by(Round.created_at)
             .all()
         )
+        resumable_approval_ids: set[str] | None = None
+        if isinstance(self.db, DBSession):
+            from src.api.services.tool_permission_service import (
+                APPROVAL_CONTINUATION_RESUMABLE_STATUSES,
+            )
+
+            resumable_approval_ids = {
+                str(row[0])
+                for row in (
+                    self.db.query(ToolApprovalRequest.id)
+                    .filter(
+                        ToolApprovalRequest.session_id == session_id,
+                        ToolApprovalRequest.status.in_(
+                            APPROVAL_CONTINUATION_RESUMABLE_STATUSES
+                        ),
+                    )
+                    .all()
+                )
+                if isinstance(row[0], str) and row[0]
+            }
+        pending_interactions = {
+            interaction.round_id: interaction
+            for interaction in (
+                self.db.query(AgentInteraction)
+                .filter(
+                    AgentInteraction.session_id == session_id,
+                    AgentInteraction.status == "pending",
+                )
+                .all()
+            )
+            if (
+                interaction.kind != "tool_approval"
+                or resumable_approval_ids is None
+                or interaction.id in resumable_approval_ids
+            )
+        }
         if subagent_child_round_ids:
             rounds = [round_obj for round_obj in rounds if round_obj.id not in subagent_child_round_ids]
 
@@ -567,23 +546,38 @@ class HistoryService:
                 except (json.JSONDecodeError, TypeError):
                     preferred_skills = []
 
-            # 解析 interrupt_payload（仅 interrupted 状态）
             interrupt_details = None
-            if round_obj.status == "interrupted" and round_obj.interrupt_payload:
-                try:
-                    interrupt_details = json.loads(round_obj.interrupt_payload)
-                except json.JSONDecodeError:
-                    interrupt_details = None
+            if round_obj.status == "waiting_interaction":
+                interaction = pending_interactions.get(round_obj.id)
+                if interaction is not None:
+                    try:
+                        request_payload = json.loads(interaction.request_payload)
+                    except (TypeError, json.JSONDecodeError):
+                        request_payload = {}
+                    nested_payload = (
+                        request_payload.get("payload")
+                        if isinstance(request_payload, dict)
+                        and isinstance(request_payload.get("payload"), dict)
+                        else {}
+                    )
+                    interrupt_details = {
+                        "id": interaction.id,
+                        "reason": (
+                            "human_approval"
+                            if interaction.kind == "tool_approval"
+                            else "input_required"
+                        ),
+                        "payload": {
+                            **nested_payload,
+                            "kind": interaction.kind,
+                            "tool_call_id": interaction.tool_call_id,
+                        },
+                    }
 
             result.append(
                 {
                     "round_id": round_obj.id,
                     "parent_run_id": round_obj.parent_run_id,
-                    "control_kind": (
-                        "tool_approval"
-                        if round_obj.id in tool_approval_resume_round_ids
-                        else None
-                    ),
                     "idempotency_key": round_obj.idempotency_key,
                     "last_event_sequence": last_event_sequence,
                     "user_message": round_obj.user_message,
@@ -604,34 +598,6 @@ class HistoryService:
             )
 
         return result
-
-    def _get_tool_approval_resume_round_ids(self, session_id: str) -> set[str]:
-        """Return resume rounds backed by a durable tool approval request.
-
-        ``parent_run_id`` is shared by every interrupt resume (and may also be
-        used by future branching flows), so it cannot identify approval control
-        rounds on its own.  ``InterruptResolution`` already records the resume
-        round structurally, while a matching ``ToolApprovalRequest`` separates
-        tool approvals from ordinary ``ask_user`` answers without inspecting
-        user-visible message text.
-        """
-
-        rows = (
-            self.db.query(InterruptResolution.resume_round_id)
-            .join(
-                ToolApprovalRequest,
-                ToolApprovalRequest.id == InterruptResolution.interrupt_id,
-            )
-            .filter(
-                InterruptResolution.session_id == session_id,
-                ToolApprovalRequest.session_id == session_id,
-            )
-            .all()
-        )
-        return {
-            str(row[0] if isinstance(row, tuple) else row.resume_round_id)
-            for row in rows
-        }
 
     def _get_subagent_child_round_ids(self, session_id: str) -> set[str]:
         """Return child round ids that belong to subagent sidechains."""
@@ -658,7 +624,13 @@ class HistoryService:
     def last_terminal_event(self) -> StoredEvent | None:
         return self._last_terminal_event
 
-    async def save_agui_event(self, run_id: str, event: AGUIEvent) -> Optional[StoredEvent]:
+    async def save_agui_event(
+        self,
+        run_id: str,
+        event: AGUIEvent,
+        *,
+        continuation_fence: ContinuationWriteFence | None = None,
+    ) -> Optional[StoredEvent]:
         """Store one non-terminal AG-UI event via AguiEventBus."""
         event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
         if event_type in (EventType.RUN_FINISHED.value, EventType.RUN_ERROR.value):
@@ -666,7 +638,11 @@ class HistoryService:
                 logger.info("Run %s 已终态，丢弃迟到 terminal 事件: %s", run_id, event_type)
                 return None
             raise ValueError("terminal events must be written via complete_round/RunCompletionService")
-        return await AguiEventBus(self.db).publish(run_id, event)
+        return await AguiEventBus(self.db).publish(
+            run_id,
+            event,
+            continuation_fence=continuation_fence,
+        )
     
     def get_run_events(self, run_id: str) -> List[Dict]:
         """獲取某次運行的所有事件（按序號排序）

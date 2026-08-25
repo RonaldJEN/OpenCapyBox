@@ -14,7 +14,7 @@ from .session import Session, Thread  # Thread 是 Session 的別名
 from .round import Round, Run  # Run 是 Round 的別名
 from .agui_event import AGUIEventLog, Event  # Event 是 AGUIEventLog 的別名
 from .llm_call_record import LLMCallRecord
-from .interrupt_resolution import InterruptResolution
+from .agent_interaction import AgentInteraction
 from .user_run_lock import UserRunLock
 from .context_checkpoint import ContextCheckpoint
 from .run_cancel_request import RunCancelRequest
@@ -48,7 +48,7 @@ __all__ = [
     "Round",
     "AGUIEventLog",
     "LLMCallRecord",
-    "InterruptResolution",
+    "AgentInteraction",
     "UserRunLock",
     "ContextCheckpoint",
     "RunCancelRequest",

@@ -34,7 +34,7 @@ def _import_models():
     from src.api.models.user_sandbox import UserSandbox as _  # noqa: F401
     from src.api.models.user_skill_inventory import UserSkillInventorySnapshot as _  # noqa: F401
     from src.api.models.conversation_message import ConversationMessage as _  # noqa: F401
-    from src.api.models.interrupt_resolution import InterruptResolution as _  # noqa: F401
+    from src.api.models.agent_interaction import AgentInteraction as _  # noqa: F401
     from src.api.models.llm_call_record import LLMCallRecord as _  # noqa: F401
     from src.api.models.context_checkpoint import ContextCheckpoint as _  # noqa: F401
     from src.api.models.user_memory import (  # noqa: F401
@@ -314,7 +314,6 @@ _PENDING_COLUMNS = [
     ("rounds", "preferred_skills", "TEXT"),
     ("rounds", "thinking_mode", "VARCHAR(24)"),
     ("rounds", "reasoning_effort", "VARCHAR(40)"),
-    ("rounds", "interrupt_payload", "TEXT"),
     ("rounds", "idempotency_key", "VARCHAR(64)"),
     ("conversation_messages", "is_synthetic", f"BOOLEAN DEFAULT {_BOOL_FALSE}"),
     ("llm_call_records", "request_message_count", "INTEGER"),
@@ -515,7 +514,6 @@ def _migrate_add_columns(target_engine=None):
                 "CREATE INDEX IF NOT EXISTS idx_tool_approval_execution_lease "
                 "ON tool_approval_requests (status, execution_lease_expires_at)"
             ))
-
         for table_name, column_name in _DEPRECATED_COLUMNS:
             if not inspector.has_table(table_name):
                 continue
@@ -675,16 +673,12 @@ def _migrate_add_columns(target_engine=None):
             if inspector.has_table(t):
                 _sync_postgres_sequence(conn, t)
 
-        # Keep this after all inspector calls. SQLite's in-memory test engine
-        # can reuse the migration connection for inspection, whose rollback
-        # would otherwise undo this data normalization.
         if ("llm_models", "thinking_wire_format") in added_columns:
             conn.execute(text(
                 "UPDATE llm_models "
                 "SET thinking_wire_format = 'none', enable_thinking = false "
                 "WHERE provider <> 'openai' AND thinking_wire_format = 'enable_thinking'"
             ))
-
 
 def _ensure_agui_events_run_sequence_unique(conn, inspector) -> None:
     """Ensure agui_events(run_id, sequence) is unique without rewriting history."""

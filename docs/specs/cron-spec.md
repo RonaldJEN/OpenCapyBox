@@ -265,7 +265,7 @@ All require Bearer auth.
 
 ### 启动清理
 
-- `main.py` startup 调用 `cleanup_stale_runtime_state()`：标记所有遗留 `running` cron run 为 `failed`，输出固定中断说明，防止进程重启/部署后前端永久 running。
+- `main.py` startup 调用 `cleanup_stale_runtime_state()`：标记所有遗留 `running` cron run 为 `failed`，写入 `output="[服务重启，定时任务执行被中断]"` 与当前 `completed_at`，防止进程重启/部署后前端永久 running。
 - 进程重启后内存中的 worker task、用户锁与 in-flight 状态不可恢复，因此不再按运行时长保留任何旧 `running` 记录。
 
 ### 周期性清理

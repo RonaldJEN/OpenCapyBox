@@ -53,10 +53,13 @@ def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
     """
     from datetime import timedelta
 
-    from sqlalchemy import and_, exists, or_, select
+    from sqlalchemy import and_, insert, or_
 
     from src.api.models.round import Round
     from src.api.models.user_run_lock import UserRunLock
+    from src.api.models.user_memory import CronJobRun
+    from src.api.services.agent_interaction_service import AgentInteractionService
+    from src.api.services.run_completion_service import RunCompletionService
     from src.api.services.tool_permission_service import (
         reconcile_expired_approval_leases,
     )
@@ -77,9 +80,14 @@ def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
     )
     stale_lock_candidates = db.query(
         UserRunLock.lock_id,
+        UserRunLock.user_id,
         UserRunLock.session_id,
+        UserRunLock.slot,
+        UserRunLock.created_at,
+        UserRunLock.updated_at,
     ).filter(stale_lock_filter).all()
     stale_lock_count = 0
+    deleted_stale_locks_by_session: dict[str, list[dict[str, object]]] = {}
     for candidate in stale_lock_candidates:
         deleted = (
             db.query(UserRunLock)
@@ -91,7 +99,48 @@ def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
         )
         if deleted:
             stale_lock_count += int(deleted)
+            session_id = str(candidate.session_id)
+            deleted_stale_locks_by_session.setdefault(session_id, []).append({
+                "lock_id": candidate.lock_id,
+                "user_id": candidate.user_id,
+                "session_id": candidate.session_id,
+                "slot": candidate.slot,
+                "created_at": candidate.created_at,
+                "updated_at": candidate.updated_at,
+            })
     db.flush()
+
+    # A stale UserRunLock heartbeat does not supersede the finer-grained
+    # continuation/tool execution leases. Restore the exact slot before any
+    # orphan terminalization so a rolling startup cannot admit a duplicate run
+    # while another worker still owns accepted input or a dispatched tool.
+    for session_id, deleted_locks in deleted_stale_locks_by_session.items():
+        continuation_round_ids = [
+            str(row[0])
+            for row in (
+                db.query(Round.id)
+                .filter(
+                    Round.status.in_(("running", "waiting_interaction")),
+                    or_(Round.session_id == session_id, Round.thread_id == session_id),
+                )
+                .order_by(Round.id.asc())
+                .all()
+            )
+            if isinstance(row[0], str) and row[0]
+        ]
+        if not any(
+            AgentInteractionService.has_active_continuation_work(
+                db,
+                round_id=round_id,
+                now=cleanup_at,
+            )
+            for round_id in continuation_round_ids
+        ):
+            continue
+        for lock_values in deleted_locks:
+            db.execute(insert(UserRunLock).values(**lock_values))
+            stale_lock_count -= 1
+        db.flush()
 
     # Any lock that survived the CAS is authoritative, whether it was already
     # fresh or won a concurrent heartbeat race.  Only old running rounds with
@@ -103,6 +152,69 @@ def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
         if row[0]
     }
     stale_count = 0
+
+    def _continuation_failure_response(interaction_kind: str) -> str:
+        if interaction_kind == "tool_approval":
+            return "[工具审批续跑进程中断；为避免重复副作用，本轮不会自动重试]"
+        return "[交互续跑在持久化启动后中断；本轮不会重新提交已接受的回答]"
+
+    # Classify every continuation Round without a surviving lock, including
+    # rows whose lock was deleted by an earlier startup that crashed before
+    # cleanup. Active fine-grained leases remain virtually protected; expired
+    # pre-start claims are fenced before the lock deletion becomes visible;
+    # expired started/dispatch-crossed work converges immediately.
+    unlocked_continuation_rounds = (
+        db.query(Round.id, Round.session_id, Round.thread_id, Round.status)
+        .filter(Round.status.in_(("running", "waiting_interaction")))
+        .order_by(Round.id.asc())
+        .all()
+    )
+    for continuation_round in unlocked_continuation_rounds:
+        session_ids = {
+            str(value)
+            for value in (
+                continuation_round.session_id,
+                continuation_round.thread_id,
+            )
+            if value
+        }
+        if session_ids & protected_session_ids:
+            continue
+        round_id = str(continuation_round.id)
+        if AgentInteractionService.has_active_continuation_work(
+            db,
+            round_id=round_id,
+            now=cleanup_at,
+        ):
+            protected_session_ids.update(session_ids)
+            continue
+        if (
+            continuation_round.status == "waiting_interaction"
+            and AgentInteractionService.lock_expired_prestart_continuation_for_recovery(
+                db,
+                round_id=round_id,
+                now=cleanup_at,
+            )
+        ):
+            db.flush()
+            continue
+        interaction_kind = (
+            AgentInteractionService.lock_irrecoverable_continuation_round_for_failure(
+                db,
+                round_id=round_id,
+                now=cleanup_at,
+            )
+        )
+        if interaction_kind is None:
+            continue
+        stored = RunCompletionService(db).complete_sync(
+            run_id=round_id,
+            status="failed",
+            final_response=_continuation_failure_response(interaction_kind),
+        )
+        if stored is not None:
+            stale_count += 1
+
     old_running_rounds = (
         db.query(Round.id, Round.session_id, Round.thread_id)
         .filter(
@@ -119,49 +231,74 @@ def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
         }
         if session_ids & protected_session_ids:
             continue
-        # A reclaimed lock identifies the expected stale-worker path; an old
-        # round without any lock is the supported orphan path.
-        round_update = db.query(Round).filter(
-            Round.id == old_round.id,
-            Round.status == "running",
-            Round.created_at <= cutoff,
-        )
-        if session_ids:
-            # Re-check at the UPDATE boundary so a lock acquired after the
-            # candidate snapshot also protects its round.
-            round_update = round_update.filter(
-                ~exists(
-                    select(UserRunLock.lock_id).where(
-                        UserRunLock.session_id.in_(tuple(session_ids))
-                    )
+        canonical_session_id = old_round.session_id or old_round.thread_id
+        if canonical_session_id:
+            locked_round = AgentInteractionService.lock_running_round_for_terminal_cleanup(
+                db,
+                session_id=str(canonical_session_id),
+                round_id=str(old_round.id),
+            )
+        else:
+            locked_round = (
+                db.query(Round)
+                .filter(
+                    Round.id == old_round.id,
+                    Round.status == "running",
+                    Round.created_at <= cutoff,
                 )
+                .with_for_update()
+                .first()
             )
-        stale_count += int(
-            round_update.update(
-                {
-                    "status": "failed",
-                    "completed_at": cleanup_at,
-                    "final_response": "[运行心跳已过期，执行被中断]",
-                },
-                synchronize_session=False,
+        if locked_round is None:
+            continue
+        if session_ids and (
+            db.query(UserRunLock.lock_id)
+            .filter(UserRunLock.session_id.in_(tuple(session_ids)))
+            .first()
+            is not None
+        ):
+            db.commit()
+            continue
+        interaction_kind = (
+            AgentInteractionService.lock_irrecoverable_continuation_round_for_failure(
+                db,
+                round_id=str(old_round.id),
+                now=cleanup_at,
             )
-            or 0
         )
-    # interrupted 轮次的 payload 与工具占位都已持久化，可以冷恢复；
-    # 启动时保留 ASK/ask_user，不再因内存 Agent 丢失而误判失败。
-    zombie_count = 0
-    # Another worker may still own an active execution lease. Only expired (or
-    # legacy lease-less) claims become terminal unknown; none are retried.
+        if interaction_kind == "tool_approval":
+            final_response = _continuation_failure_response(interaction_kind)
+        elif interaction_kind == "user_input":
+            final_response = _continuation_failure_response(interaction_kind)
+        else:
+            final_response = "[运行心跳已过期，执行被中断]"
+        stored = RunCompletionService(db).complete_sync(
+            run_id=old_round.id,
+            status="failed",
+            final_response=final_response,
+        )
+        if stored is not None:
+            stale_count += 1
+    # Another worker may still own an active execution lease. Only missing or
+    # expired claims become terminal unknown; none are retried.
     reconcile_expired_approval_leases(db, now=cleanup_at, commit=False)
-    # CronJobRun has no owner token or renewable lease.  Age alone cannot
-    # distinguish an abandoned record from a healthy long-running job on
-    # another worker, so startup must not mutate running cron rows.
-    stale_cron_count = 0
+    stale_cron_count = (
+        db.query(CronJobRun)
+        .filter(CronJobRun.status == "running")
+        .update(
+            {
+                "status": "failed",
+                "output": "[服务重启，定时任务执行被中断]",
+                "completed_at": cleanup_at,
+            },
+            synchronize_session=False,
+        )
+    )
 
     db.commit()
     return (
         int(stale_count or 0),
-        int(zombie_count or 0),
+        0,
         int(stale_lock_count),
         int(stale_cron_count or 0),
     )
@@ -206,11 +343,9 @@ async def startup_event():
         from src.api.services.cron_worker import start_cron_worker
 
         with SessionLocal() as db:
-            stale_count, zombie_count, stale_lock_count, stale_cron_count = cleanup_stale_runtime_state(db)
+            stale_count, _reserved_count, stale_lock_count, stale_cron_count = cleanup_stale_runtime_state(db)
             if stale_count:
                 print(f"⚠️  已清理 {stale_count} 个残留的 running 轮次（标记为 failed）")
-            if zombie_count:
-                print(f"⚠️  已清理 {zombie_count} 个残留的 interrupted 轮次（标记为 failed）")
             if stale_lock_count:
                 print(f"⚠️  已清理 {stale_lock_count} 条残留的 user_run_locks")
             if stale_cron_count:

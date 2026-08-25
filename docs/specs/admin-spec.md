@@ -26,20 +26,22 @@
 
 ### GET /api/admin/rounds-tree
 
-- Query: `limit`、`offset`、`status`、`user_id`、`search`
+- Query: `limit`、`offset`、`status`、`user_id`、`search`。`status` 允许 `all` 及完整 Round 状态：`running`、`waiting_interaction`、`completed`、`failed`、`cancelled`、`max_steps_reached`。
 - 响应：按 `session` 聚合的分页列表，首屏不包含 round 树。
   - 顶层：`total_sessions`、`offset`、`limit`、`sessions`
   - `session` 层：`session_id`、`user_id`、`session_title`、`rounds_count`、`last_round_at`、`sum_step_count`、`total_tokens`、`llm_calls`、`error_calls`、`compaction_steps`、`total_duration_s`、`status`
+  - Session `status` 按匹配 Round 集合投影，优先级固定为 `running > waiting_interaction > error > completed`。其中 `failed/cancelled/max_steps_reached` 聚合为 `error`；`completed` 在不存在更高优先级状态时聚合为 `completed`。因此含 pending `waiting_interaction` 的 Session 不得显示为 `completed`。
   - `rounds_loaded=false` 且 `rounds=[]`，表示需要通过 `GET /api/admin/sessions/{session_id}/rounds` 懒加载。
   - `total_duration_s` 为匹配 round 的耗时总和：已完成 round 使用 `completed_at - created_at`，未完成 round 使用当前时间近似。
   - Token 口径：session 层 `total_tokens` 为对应范围内 `SUM(llm_call_records.usage_total_tokens)`，用于成本与用量统计；它不是会话累计上下文长度。
   - 管理台展示语义（前端约定）：
     - Session 监控默认分页为每页 `5` 条 session，可在页面切换为 `5/10/15`。
+    - 状态筛选必须提供上述完整 Round 状态集合，不能遗漏 `waiting_interaction` 或 `max_steps_reached`。
     - 筛选条件变化后前端必须折叠已展开 session，再按需重新加载当前列表中的 session rounds。
 
 ### GET /api/admin/sessions/{session_id}/rounds
 
-- Query: `status`、`search`
+- Query: `status`、`search`；`status` 取值与 `/rounds-tree` 相同。
 - 响应：单个 Session 下的 round 列表与轻量 step 明细。
   - `session_id`
   - `rounds`: round 状态、耗时、token 与压缩指标、主/子 Agent 元数据、轻量 step 列表。

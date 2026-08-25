@@ -12,12 +12,13 @@ from typing import List, Dict, Optional, AsyncIterator, Any
 from opensandbox import Sandbox
 from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session as DBSession
 
 from src.api.utils.timezone import now_naive
-from src.agent.agent import Agent
+from src.agent.agent import Agent, ContinuationOwnershipLostError
 from src.agent.llm import LLMClient
 from src.agent.schema import Message as AgentMessage
-from src.agent.schema.agui_events import AGUIEvent, Context, EventType
+from src.agent.schema.agui_events import AGUIEvent, Context, CustomEvent, EventType
 from src.agent.schema.run_context import (
     AgentRunContext,
     LLMRequestContext,
@@ -34,7 +35,18 @@ from src.agent.schema.run_context import (
 )
 
 from src.api.services.history_service import HistoryService
-from src.api.services.agui_event_bus import SequencedAGUIEvent, StoredEvent, get_agui_event_bus
+from src.api.services.agent_interaction_service import (
+    AgentInteractionService,
+    ContinuationWriteFence,
+    DEFAULT_CONTINUATION_LEASE_SECONDS,
+    InteractionConflictError,
+)
+from src.api.services.agui_event_bus import (
+    RoundTerminalWriteSuppressed,
+    SequencedAGUIEvent,
+    StoredEvent,
+    get_agui_event_bus,
+)
 from src.api.services.run_completion_service import RunCompletionService
 from src.api.services.context_checkpoint_service import ContextCheckpointService
 from src.api.services.sandbox_service import get_sandbox_service
@@ -59,8 +71,41 @@ class DuplicateRoundError(Exception):
         super().__init__(f"Duplicate round: {existing_round_id}")
 
 
+class InvalidInteractionResponseError(ValueError):
+    """A Human-in-the-Loop response does not match its durable interaction kind."""
+
+
 class _InvalidCheckpointSourceError(RuntimeError):
     """The checkpoint cursor cannot be located in authoritative main history."""
+
+
+class _RunLivenessLostError(RuntimeError):
+    """The worker no longer owns the UserRunLock that authorizes production."""
+
+
+class _CombinedRunStopToken:
+    """Duck-typed asyncio.Event view over independent stop reasons."""
+
+    def __init__(self, *tokens: asyncio.Event | None):
+        self._tokens = tuple(token for token in tokens if token is not None)
+
+    def is_set(self) -> bool:
+        return any(token.is_set() for token in self._tokens)
+
+    async def wait(self) -> bool:
+        if self.is_set():
+            return True
+        waiters = [asyncio.create_task(token.wait()) for token in self._tokens]
+        if not waiters:
+            await asyncio.Future()
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            return True
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+            if waiters:
+                await asyncio.gather(*waiters, return_exceptions=True)
 
 
 @dataclass(frozen=True)
@@ -73,6 +118,13 @@ class PreparedAgentRun:
     context: AgentRunContext = field(default_factory=AgentRunContext)
     requested_context: RequestedPreferredSkillsContext | None = None
     parent_run_id: str | None = None
+    is_continuation: bool = False
+    initial_step: int = 0
+    interaction_id: str | None = None
+    interaction_tool_call_id: str | None = None
+    interaction_tool_result_content: str | None = None
+    interaction_kind: str | None = None
+    tool_approval_resolution: str | None = None
 
 
 settings = get_settings()
@@ -166,6 +218,7 @@ class AgentService:
         self.mcp_catalog_configuration_fingerprint: str | None = None
         self.mcp_catalog_retry_required = False
         self.cancel_token: asyncio.Event | None = None  # per-run 取消令牌
+        self.liveness_token: asyncio.Event | None = None  # UserRunLock 所有权信号
         self._active_checkpoint_id: str | None = None
         self._active_checkpoint_sha256: str | None = None
         self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
@@ -805,7 +858,7 @@ class AgentService:
 
         默认优先恢复最新 v4 replacement，并从精确游标回放未覆盖 suffix；
         没有可用 v4 checkpoint 时从 rounds / conversation_messages /
-        agui_events / interrupt_resolutions 重建完整权威历史。消息条数裁剪仅属于
+        agui_events 重建完整权威历史。消息条数裁剪仅属于
         legacy_120 回滚策略。
         """
         from src.api.config import get_settings as _get_settings
@@ -1000,7 +1053,6 @@ class AgentService:
         """
         from src.api.models.agui_event import AGUIEventLog
         from src.api.models.conversation_message import ConversationMessage
-        from src.api.models.interrupt_resolution import InterruptResolution
         from src.api.models.round import Round
         from src.api.models.subagent_run import SubagentRun
 
@@ -1089,42 +1141,7 @@ class AgentService:
         for evt in all_events:
             events_by_round.setdefault(evt.run_id, []).append(evt)
 
-        # 4. 预载 ask_user resume resolution，用于让冷恢复重建出热 resume 等价结构。
-        resolution_rows = (
-            db.query(InterruptResolution)
-            .filter(InterruptResolution.session_id == self.session_id)
-            .order_by(InterruptResolution.created_at)
-            .all()
-        )
-        round_by_id = {rnd.id: rnd for rnd in rounds}
-        resolution_by_parent_round_id = {}
-        resolution_by_resume_round_id = {}
-        for row in resolution_rows:
-            child_round = round_by_id.get(row.resume_round_id)
-            if not child_round or getattr(child_round, "parent_run_id", None) != row.parent_round_id:
-                fallback_reason = (
-                    "history stitch child round not found"
-                    if not child_round
-                    else "history stitch parent_run_id mismatch"
-                )
-                self.history_service.update_interrupt_resolution_fallback(
-                    row.interrupt_id,
-                    fallback_reason,
-                )
-                logger.warning(
-                    "忽略无法按 parent_run_id 对齐的 interrupt resolution: "
-                    "session=%s parent_round=%s resume_round=%s reason=%s",
-                    self.session_id,
-                    row.parent_round_id,
-                    row.resume_round_id,
-                    fallback_reason,
-                )
-                continue
-            resolution_by_parent_round_id[row.parent_round_id] = row
-            resolution_by_resume_round_id[row.resume_round_id] = row
-        stitched_resume_round_ids: set[str] = set()
-
-        # 5. 逐 round 重建
+        # 4. 逐 round 重建
         messages: list[AgentMessage] = []
 
         def _round_has_synthetic_user_custom(round_events: list) -> bool:
@@ -1148,9 +1165,6 @@ class AgentService:
 
             # 4a. User 消息（從 conversation_messages 取，保留多模態塊）
             user_records = user_msgs_by_round.get(rnd.id, [])
-            resume_resolution = resolution_by_resume_round_id.get(rnd.id)
-            skip_resume_user = rnd.id in stitched_resume_round_ids
-            skipped_resume_user = False
             synthetic_user_contents: list[Any] = []
             has_real_user_record = False
             if user_records:
@@ -1165,14 +1179,6 @@ class AgentService:
                         synthetic_user_contents.append(content)
                         continue
                     has_real_user_record = True
-                    if (
-                        skip_resume_user
-                        and not skipped_resume_user
-                        and resume_resolution
-                        and content == resume_resolution.resume_user_message
-                    ):
-                        skipped_resume_user = True
-                        continue
                     messages.append(
                         AgentMessage(
                             role="user",
@@ -1183,34 +1189,22 @@ class AgentService:
                         )
                     )
             if not has_real_user_record and rnd.user_message:
-                if (
-                    skip_resume_user
-                    and resume_resolution
-                    and rnd.user_message == resume_resolution.resume_user_message
-                ):
-                    skipped_resume_user = True
-                else:
-                    # Fallback：conversation_messages 無記錄（歷史數據遷移期），用 rounds.user_message
-                    logger.warning(
-                        "Round %s 無 conversation_messages user 記錄，fallback 到 rounds.user_message (session=%s)",
-                        rnd.id, self.session_id,
-                    )
-                    messages.append(AgentMessage(
-                        role="user",
-                        id=f"{round_id}:user" if round_id else None,
-                        run_id=round_id,
-                        content=rnd.user_message,
-                    ))
+                logger.warning(
+                    "Round %s 無 conversation_messages user 記錄，fallback 到 rounds.user_message (session=%s)",
+                    rnd.id, self.session_id,
+                )
+                messages.append(AgentMessage(
+                    role="user",
+                    id=f"{round_id}:user" if round_id else None,
+                    run_id=round_id,
+                    content=rnd.user_message,
+                ))
             elif not has_real_user_record:
-                if skip_resume_user:
-                    skipped_resume_user = True
-                else:
-                    # 兩邊都無 user 消息（數據損壞），跳過該 round 的 agent 輸出以避免孤立 assistant 消息
-                    logger.warning(
-                        "Round %s 既無 conversation_messages 也無 user_message，跳過整個 round (session=%s)",
-                        rnd.id, self.session_id,
-                    )
-                    continue
+                logger.warning(
+                    "Round %s 既無 conversation_messages 也無 user_message，跳過整個 round (session=%s)",
+                    rnd.id, self.session_id,
+                )
+                continue
 
             # 4b. Agent 輸出（從預載的 agui_events 重建 assistant + tool 消息）
             round_messages = self._events_to_messages(
@@ -1252,45 +1246,6 @@ class AgentService:
                             rnd.id, len(round_events), self.session_id,
                         )
 
-            # interrupted round 被後續輪次解決後，避免冷恢復時仍看到過期占位內容
-            if getattr(rnd, "status", None) == "resumed":
-                resolution = resolution_by_parent_round_id.get(rnd.id)
-                if resolution:
-                    replaced = False
-                    if resolution.tool_call_id:
-                        replaced = self._replace_interrupt_tool_result_in_messages(
-                            round_messages,
-                            resolution.tool_call_id,
-                            resolution.tool_result_content,
-                        )
-                    if replaced:
-                        stitched_resume_round_ids.add(resolution.resume_round_id)
-                    else:
-                        fallback_reason = (
-                            "history stitch tool_call_id missing"
-                            if not resolution.tool_call_id
-                            else "history stitch tool placeholder not found or already resolved"
-                        )
-                        self.history_service.update_interrupt_resolution_fallback(
-                            resolution.interrupt_id,
-                            fallback_reason,
-                        )
-                        logger.warning(
-                            "未能按 interrupt resolution 回填 ask_user tool result: "
-                            "session=%s parent_round=%s resume_round=%s tool_call_id=%s reason=%s",
-                            self.session_id,
-                            rnd.id,
-                            resolution.resume_round_id,
-                            resolution.tool_call_id,
-                            fallback_reason,
-                        )
-                for msg in round_messages:
-                    if msg.role == "tool" and msg.content in {
-                        "[Awaiting user response]",
-                        "[Awaiting tool approval]",
-                    }:
-                        msg.content = "[Interrupt resolved in subsequent round]"
-
             messages.extend(round_messages)
 
         logger.info(
@@ -1309,11 +1264,18 @@ class AgentService:
         """在一组 AgentMessage 中替换 ask_user tool result 占位。"""
         placeholders = {
             "[Awaiting user response]",
-            "[Interrupt resolved in subsequent round]",
             "[Awaiting tool approval]",
             "[Tool approval execution pending]",
         }
         for msg in messages:
+            if (
+                getattr(msg, "role", None) == "tool"
+                and getattr(msg, "tool_call_id", None) == tool_call_id
+                and getattr(msg, "content", None) == content
+            ):
+                # A previous worker persisted interaction_resolved before it
+                # died. The durable tool result is already safe to continue.
+                return True
             if (
                 getattr(msg, "role", None) == "tool"
                 and getattr(msg, "tool_call_id", None) == tool_call_id
@@ -1341,7 +1303,7 @@ class AgentService:
         step_tool_calls: list[ToolCall] = []
         step_tool_results: list[dict] = []
         tc_id_to_name: dict[str, str] = {}
-        stitched_tool_result_ids: set[str] = set()
+        approval_result_ids: set[str] = set()
         _skipped = 0
         synthetic_content_iter = iter(synthetic_user_contents or [])
 
@@ -1412,8 +1374,23 @@ class AgentService:
 
             elif evt_type == "TOOL_CALL_RESULT":
                 tc_id = payload.get("toolCallId", "")
-                if tc_id in stitched_tool_result_ids:
-                    continue
+                if tc_id in approval_result_ids:
+                    content = payload.get("content", "")
+                    replaced = False
+                    for pending_result in reversed(step_tool_results):
+                        if pending_result.get("tool_call_id") == tc_id:
+                            pending_result["content"] = content
+                            replaced = True
+                            break
+                    if not replaced:
+                        for message in reversed(messages):
+                            if message.role == "tool" and message.tool_call_id == tc_id:
+                                message.content = content
+                                replaced = True
+                                break
+                    approval_result_ids.discard(tc_id)
+                    if replaced:
+                        continue
                 tc_name = tc_id_to_name.get(tc_id, "")
                 content = payload.get("content", "")
                 step_tool_results.append({
@@ -1430,7 +1407,49 @@ class AgentService:
                 value = payload.get("value") if isinstance(payload.get("value"), dict) else {}
                 tc_id = value.get("toolCallId")
                 if isinstance(tc_id, str) and tc_id:
-                    stitched_tool_result_ids.add(tc_id)
+                    approval_result_ids.add(tc_id)
+
+            elif evt_type == "CUSTOM" and payload.get("name") == "interaction_requested":
+                value = payload.get("value") if isinstance(payload.get("value"), dict) else {}
+                tc_id = value.get("toolCallId")
+                if isinstance(tc_id, str) and tc_id:
+                    kind = value.get("kind")
+                    step_tool_results.append({
+                        "tool_call_id": tc_id,
+                        "name": tc_id_to_name.get(
+                            tc_id,
+                            "ask_user" if kind != "tool_approval" else "",
+                        ),
+                        "content": (
+                            "[Awaiting tool approval]"
+                            if kind == "tool_approval"
+                            else "[Awaiting user response]"
+                        ),
+                    })
+
+            elif evt_type == "CUSTOM" and payload.get("name") == "interaction_resolved":
+                value = payload.get("value") if isinstance(payload.get("value"), dict) else {}
+                tc_id = value.get("toolCallId")
+                content = value.get("toolResultContent")
+                if isinstance(tc_id, str) and tc_id and isinstance(content, str):
+                    replaced = False
+                    for pending_result in reversed(step_tool_results):
+                        if pending_result.get("tool_call_id") == tc_id:
+                            pending_result["content"] = content
+                            replaced = True
+                            break
+                    if not replaced:
+                        for message in reversed(messages):
+                            if message.role == "tool" and message.tool_call_id == tc_id:
+                                message.content = content
+                                replaced = True
+                                break
+                    if not replaced:
+                        logger.warning(
+                            "interaction_resolved 未找到待替换 tool result: round=%s tool_call=%s",
+                            round_id,
+                            tc_id,
+                        )
 
             elif evt_type == "CUSTOM" and payload.get("name") == "synthetic_user_message":
                 content = next(synthetic_content_iter, None) if synthetic_user_contents is not None else None
@@ -1650,6 +1669,7 @@ class AgentService:
         is_synthetic: bool = False,
         is_summary: bool = False,
         raise_on_error: bool = False,
+        commit: bool = True,
     ) -> bool:
         """向 conversation_messages 表持久化一條消息。
 
@@ -1698,7 +1718,10 @@ class AgentService:
                     "created_at": now_naive(),
                 },
             )
-            db.commit()
+            if commit:
+                db.commit()
+            else:
+                db.flush()
             return True
         except Exception as e:
             db.rollback()
@@ -1748,56 +1771,13 @@ class AgentService:
         if not self.agent:
             raise RuntimeError("Agent not initialized")
 
-        # 用户可以不点审批/问答卡而直接发送新消息。热状态使用 Agent
-        # 快照，重启/TTL 回收后则使用 Round.interrupt_payload 冷恢复。
-        pending_interrupt = None
-        pending_getter = getattr(type(self.agent), "get_pending_interrupt", None)
-        if callable(pending_getter):
-            candidate = self.agent.get_pending_interrupt()
-            if isinstance(candidate, dict):
-                pending_interrupt = candidate
-        if pending_interrupt is None and self.agent.has_pending_interrupt():
-            candidate = getattr(self.agent, "_pending_interrupt", None)
-            pending_interrupt = (
-                candidate
-                if isinstance(candidate, dict)
-                else {"kind": "ask_user"}
+        persisted_interrupt = self._load_persisted_interrupt(None)
+        if persisted_interrupt is not None:
+            raise InteractionConflictError(
+                "当前 Round 正在等待用户回答，请先处理待办问题或取消该 Round"
             )
-        persisted_interrupt = (
-            None if pending_interrupt else self._load_persisted_interrupt(None)
-        )
-        interrupt_to_abandon = pending_interrupt or persisted_interrupt
-        if interrupt_to_abandon:
-            logger.info("用户发送新消息，清除待处理中断")
-            db = self.history_service.db
-            try:
-                if interrupt_to_abandon.get("kind") == "tool_approval":
-                    from src.api.services.tool_permission_service import claim_approval_request
-
-                    claim_approval_request(
-                        db,
-                        request_id=interrupt_to_abandon["interrupt_id"],
-                        user_id=self.user_id,
-                        resolution="deny",
-                        commit=False,
-                    )
-                    self.history_service.resolve_interrupted_rounds(
-                        self.session_id,
-                        commit=False,
-                    )
-                    db.commit()
-                else:
-                    self.history_service.resolve_interrupted_rounds(self.session_id)
-            except Exception:
-                db.rollback()
-                logger.exception("清理 interrupted 轮次失败，保留 pending interrupt 以便重试")
-            else:
-                if pending_interrupt:
-                    try:
-                        self.agent.clear_pending_interrupt(claim_approval=False)
-                    except TypeError:
-                        # Compatibility with small test/fallback Agent doubles.
-                        self.agent.clear_pending_interrupt()
+        if self.agent.has_pending_interrupt():
+            self.discard_pending_runtime_state()
 
         requested_context = parse_requested_preferred_skills_contexts(contexts or [])
         requested_reasoning = parse_requested_reasoning_contexts(contexts or [])
@@ -1904,6 +1884,13 @@ class AgentService:
             run_context=prepared.context,
             requested_context=prepared.requested_context,
             round_preferred_skills=preferred_skills,
+            is_continuation=prepared.is_continuation,
+            initial_step=prepared.initial_step,
+            interaction_id=prepared.interaction_id,
+            interaction_tool_call_id=prepared.interaction_tool_call_id,
+            interaction_tool_result_content=prepared.interaction_tool_result_content,
+            interaction_kind=prepared.interaction_kind,
+            tool_approval_resolution=prepared.tool_approval_resolution,
             error_label=error_label,
         ):
             yield event
@@ -2002,105 +1989,74 @@ class AgentService:
         if exc:
             logger.error("后台 _post_round_tasks 异常: %s", exc, exc_info=exc)
 
-    @staticmethod
-    def _format_resume_user_message(answers: dict[str, str]) -> str:
-        """将 resume 回答格式化为可读的 Q/A 多行文本。"""
-        if not answers:
-            return "Q: (No question)\nA: [No preference]"
-
-        lines: list[str] = []
-        for index, (question_text, answer) in enumerate(answers.items()):
-            question = (question_text or "").strip() or "(Untitled question)"
-            selected = (answer or "").strip() or "[No preference]"
-            if index > 0:
-                lines.append("")
-            lines.extend([
-                f"Q: {question}",
-                f"A: {selected}",
-            ])
-
-        return "\n".join(lines)
-
     def _load_persisted_interrupt(self, interrupt_id: str | None) -> dict[str, Any] | None:
-        """从数据库查找仍处于 interrupted 状态的中断详情。
+        """从数据库查找同 Round Interaction。
 
         该方法用于 Agent 内存状态丢失（例如 AgentPool TTL 回收）后的冷恢复。
         """
-        from src.api.models.round import Round
         from src.api.models.tool_permission import ToolApprovalRequest
+        from src.api.services.tool_permission_service import (
+            APPROVAL_CONTINUATION_RESUMABLE_STATUSES,
+        )
 
         db = self.history_service.db
         try:
-            candidates = (
-                db.query(Round)
-                .filter(Round.session_id == self.session_id, Round.status == "interrupted")
-                .order_by(Round.created_at.desc())
-                .all()
+            interaction = AgentInteractionService.load_pending(
+                db,
+                session_id=self.session_id,
+                interaction_id=interrupt_id,
             )
-
-            for round_obj in candidates:
-                raw_payload = getattr(round_obj, "interrupt_payload", None)
-                if not raw_payload:
-                    continue
-
-                try:
-                    payload = json.loads(raw_payload)
-                except (TypeError, json.JSONDecodeError):
-                    continue
-
-                if not isinstance(payload, dict):
-                    continue
-                persisted_id = payload.get("id")
-                if not isinstance(persisted_id, str) or not persisted_id:
-                    continue
-                if interrupt_id is not None and persisted_id != interrupt_id:
-                    continue
-
-                details = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
-                questions = details.get("questions") if isinstance(details.get("questions"), list) else []
-                reason = payload.get("reason") if isinstance(payload.get("reason"), str) else None
-                kind = details.get("kind") if isinstance(details.get("kind"), str) else None
-                if not kind:
-                    kind = "tool_approval" if reason == "human_approval" else "ask_user"
-                if kind == "tool_approval":
+            if interaction is not None:
+                request = AgentInteractionService.request_payload(interaction)
+                nested_payload = (
+                    request.get("payload")
+                    if isinstance(request.get("payload"), dict)
+                    else {}
+                )
+                interaction_kind = (
+                    "tool_approval"
+                    if interaction.kind == "tool_approval"
+                    else "ask_user"
+                )
+                if interaction_kind == "tool_approval":
                     approval = (
                         db.query(ToolApprovalRequest)
                         .filter(
-                            ToolApprovalRequest.id == persisted_id,
+                            ToolApprovalRequest.id == interaction.id,
                             ToolApprovalRequest.user_id == self.user_id,
                             ToolApprovalRequest.session_id == self.session_id,
+                            ToolApprovalRequest.status.in_(
+                                APPROVAL_CONTINUATION_RESUMABLE_STATUSES
+                            ),
                         )
                         .first()
                     )
-                    # Only a never-claimed request is approvable. Executing,
-                    # denied, completed and unknown rows are terminal from the
-                    # resume surface even if their historical Round remains
-                    # interrupted for audit/replay purposes.
-                    if approval is None or approval.status != "requested":
-                        continue
+                    if approval is None:
+                        return None
                 result = {
-                    "interrupt_id": persisted_id,
-                    "round_id": round_obj.id,
-                    "tool_call_id": details.get("tool_call_id"),
-                    "questions": questions,
+                    "interrupt_id": interaction.id,
+                    "round_id": interaction.round_id,
+                    "tool_call_id": interaction.tool_call_id,
+                    "questions": (
+                        nested_payload.get("questions")
+                        if isinstance(nested_payload.get("questions"), list)
+                        else []
+                    ),
+                    "kind": interaction_kind,
+                    "payload": nested_payload,
                 }
-                if isinstance(payload.get("runtime_context"), dict):
-                    result["runtime_context"] = payload["runtime_context"]
-                origin_user_message_id = payload.get(
+                if interaction_kind == "tool_approval":
+                    result["reason"] = "human_approval"
+                if isinstance(request.get("runtime_context"), dict):
+                    result["runtime_context"] = request["runtime_context"]
+                origin_user_message_id = request.get(
                     PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY
                 )
                 if isinstance(origin_user_message_id, str):
                     result[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = (
                         origin_user_message_id
                     )
-                if kind == "tool_approval":
-                    result.update({
-                        "reason": reason,
-                        "kind": kind,
-                        "payload": details,
-                    })
                 return result
-
             return None
         finally:
             db.rollback()
@@ -2125,7 +2081,7 @@ class AgentService:
         *,
         parent_run_id: str,
     ) -> str:
-        """Read the server-owned preferred-Skill anchor with a legacy fallback."""
+        """Read the server-owned preferred-Skill anchor with a deterministic default."""
         raw = (snapshot or {}).get(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY)
         if isinstance(raw, str):
             candidate = raw.strip()
@@ -2134,17 +2090,17 @@ class AgentService:
         return f"{parent_run_id}:user"
 
     @staticmethod
-    def _attach_preferred_skills_interrupt_context(
-        interrupt_payload: dict[str, Any],
+    def _attach_preferred_skills_interaction_context(
+        interaction_payload: dict[str, Any],
         pending_interrupt: dict[str, Any] | None,
         *,
         requested_context: RequestedPreferredSkillsContext | None,
         origin_user_message_id: str,
     ) -> None:
         """Persist requested keys and their original user-message anchor."""
-        # The anchor is server-owned. Drop any value serialized by an interrupt
+        # The anchor is server-owned. Drop any value serialized by an interaction
         # producer before assigning the trusted value derived from PreparedAgentRun.
-        interrupt_payload.pop(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY, None)
+        interaction_payload.pop(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY, None)
         if isinstance(pending_interrupt, dict):
             pending_interrupt.pop(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY, None)
         if requested_context is None:
@@ -2153,7 +2109,7 @@ class AgentService:
         runtime_wire = requested_preferred_skills_to_context(
             requested_context
         ).model_dump()
-        interrupt_payload["runtime_context"] = runtime_wire
+        interaction_payload["runtime_context"] = runtime_wire
         if isinstance(pending_interrupt, dict):
             pending_interrupt["runtime_context"] = runtime_wire
 
@@ -2165,37 +2121,80 @@ class AgentService:
         ):
             logger.warning("Preferred Skill 原始用户消息锚点无效，未写入中断元数据")
             return
-        interrupt_payload[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = trusted_anchor
+        interaction_payload[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = trusted_anchor
         if isinstance(pending_interrupt, dict):
             pending_interrupt[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = trusted_anchor
 
-    def has_pending_interrupt(self, interrupt_id: str) -> bool:
-        """检查是否存在匹配的待处理中断（内存态 + 持久化态）。"""
-        if self.agent and self.agent.has_pending_interrupt(interrupt_id):
-            snapshot = self._get_agent_pending_interrupt_snapshot(interrupt_id)
-            if (snapshot or {}).get("kind") != "tool_approval":
-                return True
-            return self._tool_approval_is_requested(interrupt_id)
-        return self._load_persisted_interrupt(interrupt_id) is not None
-
-    def _tool_approval_is_requested(self, interrupt_id: str) -> bool:
-        from src.api.models.tool_permission import ToolApprovalRequest
-
-        db = self.history_service.db
-        try:
-            return (
-                db.query(ToolApprovalRequest.id)
-                .filter(
-                    ToolApprovalRequest.id == interrupt_id,
-                    ToolApprovalRequest.user_id == self.user_id,
-                    ToolApprovalRequest.session_id == self.session_id,
-                    ToolApprovalRequest.status == "requested",
+    def discard_pending_runtime_state(
+        self,
+        *,
+        interrupt_id: str | None = None,
+        owner_round_id: str | None = None,
+    ) -> None:
+        """清除已被数据库终态否决的 Agent 热缓存和本地 parent 映射。"""
+        if self.agent:
+            discard = getattr(type(self.agent), "discard_pending_runtime_state", None)
+            if callable(discard):
+                self.agent.discard_pending_runtime_state(
+                    interrupt_id=interrupt_id,
+                    owner_round_id=owner_round_id,
                 )
-                .first()
-                is not None
+            else:
+                pending = getattr(self.agent, "_pending_interrupt", None)
+                if isinstance(pending, dict):
+                    matches_interrupt = (
+                        interrupt_id is None
+                        or pending.get("interrupt_id") == interrupt_id
+                    )
+                    pending_round_id = pending.get("round_id")
+                    matches_round = (
+                        owner_round_id is None
+                        or pending_round_id is None
+                        or pending_round_id == owner_round_id
+                    )
+                    if matches_interrupt and matches_round:
+                        self.agent._pending_interrupt = None
+
+                approved = getattr(self.agent, "_pending_approved_tool", None)
+                if approved is not None:
+                    matches_interrupt = (
+                        interrupt_id is None
+                        or getattr(approved, "request_id", None) == interrupt_id
+                    )
+                    approved_round_id = getattr(approved, "owner_round_id", None)
+                    matches_round = (
+                        owner_round_id is None
+                        or approved_round_id is None
+                        or approved_round_id == owner_round_id
+                    )
+                    if matches_interrupt and matches_round:
+                        self.agent._pending_approved_tool = None
+
+        pending_round_ids = getattr(self, "_pending_interrupt_round_ids", None)
+        if not isinstance(pending_round_ids, dict):
+            return
+        if interrupt_id is not None:
+            pending_round_ids.pop(interrupt_id, None)
+        if owner_round_id is not None:
+            stale_ids = [
+                pending_id
+                for pending_id, round_id in pending_round_ids.items()
+                if round_id == owner_round_id
+            ]
+            for pending_id in stale_ids:
+                pending_round_ids.pop(pending_id, None)
+
+    def has_pending_interrupt(self, interrupt_id: str) -> bool:
+        """检查匹配的待处理中断；同 Round 缓存必须由数据库状态背书。"""
+        if self._load_persisted_interrupt(interrupt_id) is not None:
+            return True
+        snapshot = self._get_agent_pending_interrupt_snapshot(interrupt_id)
+        if snapshot is not None:
+            self.discard_pending_runtime_state(
+                interrupt_id=interrupt_id,
+                owner_round_id=snapshot.get("round_id"),
             )
-        finally:
-            db.rollback()
+        return False
 
     def _get_agent_pending_interrupt_snapshot(self, interrupt_id: str) -> dict[str, Any] | None:
         """尽量从 Agent 内存态读取 pending interrupt 快照。"""
@@ -2246,80 +2245,183 @@ class AgentService:
         requested_context: RequestedPreferredSkillsContext | None,
         run_context: AgentRunContext,
     ) -> PreparedAgentRun:
-        """Atomically claim an approval and create its resume round.
+        """Persist an approval answer and prepare its continuation.
 
-        External execution is intentionally deferred to ``Agent.run_agui`` so
-        the approved call remains cancellable and its result is delivered over
-        the normal persisted SSE stream. A crash after the claim leaves the
-        request in ``executing`` and is never retried automatically.
+        Same-Round execution is split into a durable decision and a later
+        dispatch claim. External execution remains deferred to ``Agent.run_agui``
+        so a crash before dispatch is recoverable and a crash after dispatch is
+        never retried automatically.
         """
         if not self.agent:
             raise RuntimeError("Agent not initialized")
 
         from src.api.services.tool_permission_service import (
+            APPROVAL_CONTINUATION_RESUMABLE_STATUSES,
             APPROVAL_RESOLUTIONS,
-            claim_approval_request,
+            prepare_approval_request,
         )
 
         resolution = str(answers.get("approval") or "").strip().lower()
         if resolution not in APPROVAL_RESOLUTIONS:
-            raise ValueError(
+            raise InvalidInteractionResponseError(
                 "tool approval requires answers.approval to be one of "
                 "allow_once, allow_session, allow_always, deny"
             )
+        # Approval has exactly one durable fact.  Ignore unrelated wire keys so
+        # retries with the same normalized decision remain idempotent.
+        canonical_answers = {"approval": resolution}
 
-        resume_user_message = f"Tool approval: {resolution}"
-        run_id = str(uuid.uuid4())
         marker = (
             "Tool execution denied by user."
             if resolution == "deny"
             else "[Tool approval execution pending]"
         )
+        from src.api.models.tool_permission import ToolApprovalRequest
+
         messages_snapshot = copy.deepcopy(self.agent.messages)
         pending_interrupt_snapshot = copy.deepcopy(
             getattr(self.agent, "_pending_interrupt", None)
         )
-        pending_approved_snapshot = copy.deepcopy(
-            getattr(self.agent, "_pending_approved_tool", None)
-        )
         pending_round_ids_snapshot = dict(self._pending_interrupt_round_ids)
         db = self.history_service.db
-
         try:
             self._refresh_runtime_messages_from_history()
-            claim = claim_approval_request(
+            round_row, _interaction = AgentInteractionService.lock_pending_for_update(
+                db,
+                session_id=self.session_id,
+                interaction_id=interrupt_id,
+            )
+            if round_row.id != parent_run_id:
+                raise InteractionConflictError(
+                    f"Interaction Round ownership changed: {interrupt_id}"
+                )
+            if round_row.status != "waiting_interaction":
+                raise InteractionConflictError(
+                    f"Round is not waiting for interaction: {parent_run_id} "
+                    f"status={round_row.status}"
+                )
+            approval = (
+                db.query(ToolApprovalRequest)
+                .filter(
+                    ToolApprovalRequest.id == interrupt_id,
+                    ToolApprovalRequest.user_id == self.user_id,
+                    ToolApprovalRequest.session_id == self.session_id,
+                    ToolApprovalRequest.run_id == parent_run_id,
+                    ToolApprovalRequest.status.in_(
+                        APPROVAL_CONTINUATION_RESUMABLE_STATUSES
+                    ),
+                )
+                .with_for_update()
+                .first()
+            )
+            if approval is None:
+                raise InteractionConflictError(
+                    f"Tool approval is not requestable: {interrupt_id}"
+                )
+            if approval.status != "requested" and approval.resolution != resolution:
+                raise InteractionConflictError(
+                    f"Tool approval already has a different resolution: {interrupt_id}"
+                )
+            initial_step = int(round_row.step_count or 0)
+            original_user_message = round_row.user_message
+            approval_tool_call_id = approval.tool_call_id
+            AgentInteractionService.answer_pending(
+                db,
+                session_id=self.session_id,
+                interaction_id=interrupt_id,
+                answers=canonical_answers,
+                tool_result_content=marker,
+                commit=False,
+            )
+            prepare_approval_request(
                 db,
                 request_id=interrupt_id,
                 user_id=self.user_id,
                 resolution=resolution,
                 commit=False,
             )
-            request = claim.request
-            self.history_service.create_resume_round(
+            db.commit()
+        except Exception:
+            db.rollback()
+            self.agent.messages = messages_snapshot
+            self.agent._pending_interrupt = pending_interrupt_snapshot
+            self._pending_interrupt_round_ids = pending_round_ids_snapshot
+            raise
+
+        return PreparedAgentRun(
+            run_id=parent_run_id,
+            user_message=original_user_message,
+            user_message_id=preferred_skills_origin_user_message_id,
+            context=run_context,
+            requested_context=requested_context,
+            parent_run_id=None,
+            is_continuation=True,
+            initial_step=initial_step,
+            interaction_id=interrupt_id,
+            interaction_tool_call_id=approval_tool_call_id,
+            interaction_tool_result_content=marker,
+            interaction_kind="tool_approval",
+            tool_approval_resolution=resolution,
+        )
+
+    def _claim_and_queue_tool_approval(
+        self,
+        *,
+        interaction_id: str,
+        interaction_claim_token: str,
+        run_id: str,
+        resolution: str,
+    ) -> None:
+        """Queue an unclaimed tool after a continuation worker owns the Round."""
+        if not self.agent:
+            raise RuntimeError("Agent not initialized")
+
+        from src.api.models.tool_permission import ToolApprovalRequest
+        from src.api.services.tool_permission_service import load_approval_arguments
+
+        db = self.history_service.db
+        pending_interrupt_snapshot = copy.deepcopy(
+            getattr(self.agent, "_pending_interrupt", None)
+        )
+        pending_approved_snapshot = copy.deepcopy(
+            getattr(self.agent, "_pending_approved_tool", None)
+        )
+        try:
+            round_obj, interaction = AgentInteractionService.lock_pending_for_update(
+                db,
                 session_id=self.session_id,
-                round_id=run_id,
-                user_message=resume_user_message,
-                parent_run_id=parent_run_id,
-                user_attachments=[],
-                interrupt_id=interrupt_id,
-                tool_call_id=request.tool_call_id,
-                answers=answers,
-                tool_result_content=marker,
-                restore_strategy="approval_queued",
-                fallback_reason=None,
-                thinking_mode=(
-                    run_context.reasoning.mode if run_context.reasoning else None
-                ),
-                reasoning_effort=(
-                    run_context.reasoning.effort if run_context.reasoning else None
-                ),
-                commit=False,
+                interaction_id=interaction_id,
             )
+            if round_obj.id != run_id or interaction.claim_token != interaction_claim_token:
+                raise InteractionConflictError(
+                    f"Interaction continuation ownership changed: {interaction_id}"
+                )
+            if round_obj.status != "running":
+                raise InteractionConflictError(
+                    f"Round continuation is not running: {run_id} status={round_obj.status}"
+                )
+            request = (
+                db.query(ToolApprovalRequest)
+                .filter(
+                    ToolApprovalRequest.id == interaction_id,
+                    ToolApprovalRequest.user_id == self.user_id,
+                    ToolApprovalRequest.session_id == self.session_id,
+                    ToolApprovalRequest.run_id == run_id,
+                    ToolApprovalRequest.status.in_(("approved", "denied")),
+                    ToolApprovalRequest.resolution == resolution,
+                )
+                .with_for_update()
+                .first()
+            )
+            if request is None:
+                raise InteractionConflictError(
+                    f"Tool approval is not prepared for continuation: {interaction_id}"
+                )
             self.agent.queue_tool_approval_resume(
                 request_id=request.id,
                 tool_call_id=request.tool_call_id,
                 function_name=request.model_tool_name,
-                arguments=claim.arguments,
+                arguments=load_approval_arguments(request),
                 provider=request.provider,
                 tool_name=request.tool_name,
                 server_id=request.server_id,
@@ -2327,34 +2429,17 @@ class AgentService:
                 schema_hash=request.schema_hash,
                 connection_fingerprint=request.connection_fingerprint,
                 resolution=resolution,
-                should_execute=claim.should_execute,
-                claim_token=claim.claim_token,
+                should_execute=request.status == "approved",
+                claim_token=None,
+                owner_round_id=run_id,
+                interaction_claim_token=interaction_claim_token,
             )
-            db.commit()
+            db.rollback()
         except Exception:
             db.rollback()
-            self.agent.messages = messages_snapshot
             self.agent._pending_interrupt = pending_interrupt_snapshot
             self.agent._pending_approved_tool = pending_approved_snapshot
-            self._pending_interrupt_round_ids = pending_round_ids_snapshot
             raise
-
-        self._pending_interrupt_round_ids.pop(interrupt_id, None)
-        # A tool-approval resolution is a control decision, not user chat input.
-        # It is already durably recorded in tool_approval_requests, the interrupt
-        # resolution and the audit trail, and the approved tool result is stitched
-        # into the parent round on history rebuild. Persisting an extra role="user"
-        # conversation message would surface the resolution as a fake user turn in
-        # both the transcript and the rebuilt model context, so it is deliberately
-        # not saved here (unlike ask_user, whose answer is genuine user input).
-        return PreparedAgentRun(
-            run_id=run_id,
-            user_message=resume_user_message,
-            user_message_id=preferred_skills_origin_user_message_id,
-            context=run_context,
-            requested_context=requested_context,
-            parent_run_id=parent_run_id,
-        )
 
     async def resume_agui(
         self,
@@ -2389,7 +2474,7 @@ class AgentService:
         interrupt_id: str,
         answers: dict[str, str],
     ) -> PreparedAgentRun:
-        """Create a resume round and stitch the interrupted parent atomically."""
+        """Persist an answer and prepare the original Round continuation."""
         if self._resume_lock.locked():
             raise RuntimeError("另一个 resume 操作正在进行中，请等待完成后重试")
 
@@ -2397,27 +2482,32 @@ class AgentService:
             if not self.agent:
                 raise RuntimeError("Agent not initialized")
 
-            resume_user_message = self._format_resume_user_message(answers)
+            history_service = getattr(self, "history_service", None)
+            history_db = getattr(history_service, "db", None)
+            if isinstance(history_db, DBSession):
+                history_service.recover_expired_interaction_continuations(
+                    self.session_id,
+                )
             persisted_interrupt = self._load_persisted_interrupt(interrupt_id)
             pending_interrupt = self._get_agent_pending_interrupt_snapshot(interrupt_id)
-            if (
-                (pending_interrupt or {}).get("kind") == "tool_approval"
-                and not self._tool_approval_is_requested(interrupt_id)
-            ):
-                pending_interrupt = None
-            parent_run_id = (
-                (persisted_interrupt or {}).get("round_id")
-                or (pending_interrupt or {}).get("round_id")
-                or self._pending_interrupt_round_ids.get(interrupt_id)
-            )
-            if not parent_run_id:
-                raise ValueError("No pending interrupt to resume from")
+            if persisted_interrupt is None:
+                if pending_interrupt is not None:
+                    self.discard_pending_runtime_state(
+                        interrupt_id=interrupt_id,
+                        owner_round_id=pending_interrupt.get("round_id"),
+                    )
+                raise ValueError("No pending interaction to resume from")
 
-            interrupt_kind = (
-                (pending_interrupt or {}).get("kind")
-                or (persisted_interrupt or {}).get("kind")
-            )
-            interrupt_snapshot = persisted_interrupt or pending_interrupt
+            parent_run_id = persisted_interrupt.get("round_id")
+            if not isinstance(parent_run_id, str) or not parent_run_id:
+                self.discard_pending_runtime_state(
+                    interrupt_id=interrupt_id,
+                    owner_round_id=None,
+                )
+                raise ValueError("Pending interaction has no Round")
+
+            interrupt_kind = persisted_interrupt.get("kind")
+            interrupt_snapshot = persisted_interrupt
             requested_context = self._requested_context_from_interrupt(interrupt_snapshot)
             preferred_skills_origin_user_message_id = (
                 self._preferred_skills_origin_user_message_id_from_interrupt(
@@ -2444,17 +2534,24 @@ class AgentService:
                     run_context=run_context,
                 )
 
-            tool_call_id = (
-                (persisted_interrupt or {}).get("tool_call_id")
-                or (pending_interrupt or {}).get("tool_call_id")
+            question_definitions = interrupt_snapshot.get("questions")
+            ordered_answers = Agent.order_interrupt_answers(
+                answers,
+                (
+                    question_definitions
+                    if isinstance(question_definitions, list)
+                    else None
+                ),
             )
-            tool_result_content = Agent.format_interrupt_tool_result(answers)
-            restore_strategy: str | None = None
-            fallback_reason: str | None = None
-
-            # 创建新的 run_id（恢复是一次新运行）
-            run_id = str(uuid.uuid4())
-
+            tool_call_id = persisted_interrupt.get("tool_call_id")
+            tool_result_content = Agent.format_interrupt_tool_result(
+                ordered_answers,
+                (
+                    question_definitions
+                    if isinstance(question_definitions, list)
+                    else None
+                ),
+            )
             messages_snapshot = (
                 copy.deepcopy(self.agent.messages)
                 if isinstance(getattr(self.agent, "messages", None), list)
@@ -2464,81 +2561,67 @@ class AgentService:
                 getattr(self.agent, "_pending_interrupt", None)
             )
             pending_round_ids_snapshot = dict(self._pending_interrupt_round_ids)
-
+            db = self.history_service.db
             try:
                 self._refresh_runtime_messages_from_history()
-
                 if self.agent.has_pending_interrupt(interrupt_id):
-                    # 热恢复：直接替换 ask_user 占位 tool_result
-                    self.agent.resume_from_interrupt(interrupt_id, answers)
-                    restore_strategy = "hot_replace"
+                    self.agent.resume_from_interrupt(interrupt_id, ordered_answers)
                 else:
-                    # 冷恢复：内存中断状态已丢失，优先替换历史恢复出的 ask_user tool 占位。
-                    logger.warning(
-                        "resume 进入冷恢复路径: session=%s, interrupt_id=%s",
-                        self.session_id,
-                        interrupt_id,
-                    )
                     replaced = (
-                        self._replace_agent_interrupt_tool_result(tool_call_id, tool_result_content)
+                        self._replace_agent_interrupt_tool_result(
+                            tool_call_id,
+                            tool_result_content,
+                        )
                         if tool_call_id
                         else False
                     )
-                    if replaced:
-                        restore_strategy = "cold_replace"
-                    else:
-                        restore_strategy = "cold_fallback_user_message"
-                        fallback_reason = (
-                            "tool_call_id missing"
-                            if not tool_call_id
-                            else "tool placeholder not found or already resolved"
+                    if not replaced:
+                        raise RuntimeError(
+                            "Unable to restore pending ask_user tool result "
+                            f"for interaction {interrupt_id}"
                         )
-                        logger.warning(
-                            "冷 resume 未能替换 ask_user tool result，退化为 user message: "
-                            "session=%s interrupt_id=%s tool_call_id=%s reason=%s",
-                            self.session_id,
-                            interrupt_id,
-                            tool_call_id,
-                            fallback_reason,
-                        )
-                        add_user_parameters = inspect.signature(
-                            self.agent.add_user_message
-                        ).parameters
-                        if "message_id" in add_user_parameters:
-                            self.agent.add_user_message(
-                                resume_user_message,
-                                message_id=f"{run_id}:user",
-                                run_id=run_id,
-                            )
-                        else:
-                            self.agent.add_user_message(resume_user_message)
-                            last_message = (
-                                getattr(self.agent, "messages", None) or [None]
-                            )[-1]
-                            if isinstance(last_message, AgentMessage):
-                                last_message.id = f"{run_id}:user"
-                                last_message.run_id = run_id
 
-                # 原子创建 resume round，并只将命中的旧 round 标记为 resumed。
-                self.history_service.create_resume_round(
-                    session_id=self.session_id,
-                    round_id=run_id,
-                    user_message=resume_user_message,
-                    parent_run_id=parent_run_id,
-                    user_attachments=[],
-                    interrupt_id=interrupt_id,
-                    tool_call_id=tool_call_id,
-                    answers=answers,
-                    tool_result_content=tool_result_content,
-                    restore_strategy=restore_strategy,
-                    fallback_reason=fallback_reason,
-                    thinking_mode=(
-                        run_context.reasoning.mode if run_context.reasoning else None
-                    ),
-                    reasoning_effort=(
-                        run_context.reasoning.effort if run_context.reasoning else None
-                    ),
+                from src.api.models.round import Round
+
+                round_row = (
+                    db.query(Round)
+                    .filter(
+                        Round.id == parent_run_id,
+                        Round.session_id == self.session_id,
+                    )
+                    .first()
                 )
+                if round_row is None:
+                    db.rollback()
+                    raise ValueError(f"Round not found: {parent_run_id}")
+                initial_step = int(round_row.step_count or 0)
+                original_user_message = round_row.user_message
+                db.rollback()
+
+                answered_interaction = AgentInteractionService.answer_pending(
+                    db,
+                    session_id=self.session_id,
+                    interaction_id=interrupt_id,
+                    answers=ordered_answers,
+                    tool_result_content=tool_result_content,
+                )
+                durable_tool_result_content = (
+                    answered_interaction.tool_result_content
+                    if isinstance(answered_interaction.tool_result_content, str)
+                    else tool_result_content
+                )
+                durable_tool_message = next(
+                    (
+                        message
+                        for message in getattr(self.agent, "messages", [])
+                        if getattr(message, "role", None) == "tool"
+                        and getattr(message, "tool_call_id", None) == tool_call_id
+                    ),
+                    None,
+                )
+                if durable_tool_message is not None:
+                    durable_tool_message.content = durable_tool_result_content
+                tool_result_content = durable_tool_result_content
             except Exception:
                 if messages_snapshot is not None:
                     self.agent.messages = messages_snapshot
@@ -2548,17 +2631,19 @@ class AgentService:
                 raise
 
             self._pending_interrupt_round_ids.pop(interrupt_id, None)
-
-            # 持久化用户 resume 消息到 conversation_messages（用于上下文恢复）
-            self._save_conversation_message("user", resume_user_message, round_id=run_id)
-
             return PreparedAgentRun(
-                run_id=run_id,
-                user_message=resume_user_message,
+                run_id=parent_run_id,
+                user_message=original_user_message,
                 user_message_id=preferred_skills_origin_user_message_id,
                 context=run_context,
                 requested_context=requested_context,
-                parent_run_id=parent_run_id,
+                parent_run_id=None,
+                is_continuation=True,
+                initial_step=initial_step,
+                interaction_id=interrupt_id,
+                interaction_tool_call_id=tool_call_id,
+                interaction_tool_result_content=tool_result_content,
+                interaction_kind="user_input",
             )
 
     async def _run_round_stream(
@@ -2569,6 +2654,13 @@ class AgentService:
         run_context: AgentRunContext | None = None,
         requested_context: RequestedPreferredSkillsContext | None = None,
         round_preferred_skills: list[dict[str, str]] | None = None,
+        is_continuation: bool = False,
+        initial_step: int = 0,
+        interaction_id: str | None = None,
+        interaction_tool_call_id: str | None = None,
+        interaction_tool_result_content: str | None = None,
+        interaction_kind: str | None = None,
+        tool_approval_resolution: str | None = None,
         error_label: str = "执行失败",
     ) -> AsyncIterator[AGUIEvent]:
         """共享的 round 事件流处理：追踪状态、持久化事件、完成 round。
@@ -2582,22 +2674,154 @@ class AgentService:
         """
         run_context = run_context or AgentRunContext()
         final_response: Optional[str] = None
-        step_count = 0
+        step_count = max(int(initial_step or 0), 0)
         status = "running"
         accumulated_content = ""
-        _interrupt_json: str | None = None
         _dirty_memory = False
         _memory_write_tools = {"update_long_term_memory", "update_user"}
         _memory_filenames = {"USER.md", "MEMORY.md", "SOUL.md"}
         _file_op_tracking: set[str] = set()
         _round_finished = False  # 追蹤 round 是否已正常完成
+        _round_suspended = False
         _final_status: str | None = None  # except 路徑填充
         _final_response: str | None = None
         _externally_terminated = False
-        # 固化本輪 cancel_token，避免後續新 run 覆蓋 self.cancel_token 導致判定串擾。
+        continuation_claim_token: str | None = None
+        continuation_claim_completed = False
+        continuation_start_committed = False
+        continuation_claim_released = False
+        continuation_claim_stop = asyncio.Event()
+        continuation_claim_heartbeat: asyncio.Task | None = None
+        continuation_completion_in_flight = False
+        continuation_ownership_lost = asyncio.Event()
+        waiting_step_finish_precounted = False
+        # 固化本輪各类信号，避免後續新 run 覆蓋 service 屬性導致串擾。
         run_cancel_token = self.cancel_token
+        run_liveness_token = getattr(self, "liveness_token", None)
+        execution_stop_token = _CombinedRunStopToken(
+            run_cancel_token,
+            run_liveness_token,
+            continuation_ownership_lost,
+        )
         self._active_run_count += 1
         run_context_token = current_run_context.set(run_context)
+
+        def _terminal_continuation_fence() -> ContinuationWriteFence | None:
+            if (
+                not interaction_id
+                or not continuation_claim_token
+                or continuation_claim_completed
+                or continuation_claim_released
+            ):
+                return None
+            return ContinuationWriteFence(
+                session_id=self.session_id,
+                interaction_id=interaction_id,
+                claim_token=continuation_claim_token,
+                transition="validate",
+            )
+
+        async def _renew_continuation_claim_until_stopped(
+            interaction_id_value: str,
+            claim_token_value: str,
+        ) -> None:
+            from src.api.models.database import SessionLocal
+
+            interval = max(DEFAULT_CONTINUATION_LEASE_SECONDS / 3.0, 1.0)
+            while True:
+                try:
+                    await asyncio.wait_for(
+                        continuation_claim_stop.wait(),
+                        timeout=interval,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    with SessionLocal() as claim_db:
+                        AgentInteractionService.renew_continuation_claim(
+                            claim_db,
+                            session_id=self.session_id,
+                            interaction_id=interaction_id_value,
+                            claim_token=claim_token_value,
+                        )
+                except (InteractionConflictError, ValueError):
+                    if (
+                        continuation_claim_stop.is_set()
+                        or continuation_claim_completed
+                        or continuation_completion_in_flight
+                    ):
+                        return
+                    logger.info(
+                        "Interaction continuation ownership lost: interaction=%s",
+                        interaction_id_value,
+                        exc_info=True,
+                    )
+                    continuation_ownership_lost.set()
+                    return
+                except Exception:
+                    logger.warning(
+                        "Interaction continuation claim renewal failed; will retry: interaction=%s",
+                        interaction_id_value,
+                        exc_info=True,
+                    )
+
+        async def _release_uncommitted_continuation_start() -> None:
+            """Stop lease renewal and release only an uncommitted start."""
+            nonlocal continuation_claim_released
+            nonlocal continuation_start_committed
+            nonlocal _round_suspended
+
+            if not interaction_id or not continuation_claim_token:
+                return
+
+            continuation_claim_stop.set()
+            if continuation_claim_heartbeat is not None:
+                try:
+                    await continuation_claim_heartbeat
+                except asyncio.CancelledError:
+                    pass
+            if (
+                continuation_claim_completed
+                or continuation_start_committed
+                or continuation_claim_released
+            ):
+                return
+
+            # publish() commits before its async fanout.  Cancellation in that
+            # post-commit await means the caller never receives StoredEvent,
+            # so confirm the authoritative Round state before deciding that
+            # start was uncommitted.
+            try:
+                authoritative_status = self.history_service.get_round_status(run_id)
+            except Exception:
+                self.history_service.reset_session()
+                _round_suspended = True
+                return
+            if authoritative_status == "running":
+                continuation_start_committed = True
+                return
+            from src.api.models.round import Round
+
+            if authoritative_status in Round.SUBSCRIBE_TERMINAL_STATUSES:
+                _round_suspended = True
+                return
+
+            try:
+                AgentInteractionService.release_continuation_claim(
+                    self.history_service.db,
+                    session_id=self.session_id,
+                    interaction_id=interaction_id,
+                    claim_token=continuation_claim_token,
+                )
+                continuation_claim_released = True
+            except Exception:
+                self.history_service.reset_session()
+            finally:
+                # A missing durable interaction_resolved event is still a
+                # waiting continuation.  If release itself failed, lease
+                # recovery owns convergence; never manufacture a failed Round.
+                _round_suspended = True
 
         async def _record_llm_call(payload: dict[str, Any]) -> None:
             try:
@@ -2704,20 +2928,84 @@ class AgentService:
             run_agui_kwargs = {
                 "thread_id": self.session_id,
                 "run_id": run_id,
-                "cancel_token": run_cancel_token,
+                "cancel_token": execution_stop_token,
             }
-            run_agui_parameters = inspect.signature(self.agent.run_agui).parameters.values()
+            run_agui_parameters = inspect.signature(self.agent.run_agui).parameters
+            accepts_var_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in run_agui_parameters.values()
+            )
             if any(
                 parameter.name == "llm_request_context"
-                or parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in run_agui_parameters
+                or accepts_var_kwargs
+                for parameter in run_agui_parameters.values()
             ):
                 run_agui_kwargs["llm_request_context"] = LLMRequestContext(
                     purpose="agent_step",
                     run_context=run_context,
                     user_message_id=user_message_id,
                 )
-            async for event in self.agent.run_agui(**run_agui_kwargs):
+            if "emit_run_started" in run_agui_parameters or accepts_var_kwargs:
+                run_agui_kwargs["emit_run_started"] = not is_continuation
+            if "initial_step" in run_agui_parameters or accepts_var_kwargs:
+                run_agui_kwargs["initial_step"] = step_count
+
+            async def _events_with_interaction_prelude():
+                nonlocal continuation_claim_token
+                nonlocal continuation_claim_heartbeat
+                if interaction_id and interaction_tool_call_id and interaction_tool_result_content is not None:
+                    claimed = AgentInteractionService.claim_answered_continuation(
+                        self.history_service.db,
+                        session_id=self.session_id,
+                        interaction_id=interaction_id,
+                    )
+                    continuation_claim_token = claimed.claim_token
+                    if not continuation_claim_token:
+                        raise RuntimeError(
+                            f"Interaction continuation claim missing token: {interaction_id}"
+                        )
+                    continuation_claim_heartbeat = asyncio.create_task(
+                        _renew_continuation_claim_until_stopped(
+                            interaction_id,
+                            continuation_claim_token,
+                        )
+                    )
+                    try:
+                        yield CustomEvent(
+                            name="interaction_resolved",
+                            value={
+                                "interactionId": interaction_id,
+                                "runId": run_id,
+                                "toolCallId": interaction_tool_call_id,
+                                "toolResultContent": interaction_tool_result_content,
+                                "resolution": "answered",
+                            },
+                        )
+                        if interaction_kind == "tool_approval":
+                            if not tool_approval_resolution:
+                                raise RuntimeError(
+                                    f"Tool approval continuation missing resolution: {interaction_id}"
+                                )
+                            self._claim_and_queue_tool_approval(
+                                interaction_id=interaction_id,
+                                interaction_claim_token=continuation_claim_token,
+                                run_id=run_id,
+                                resolution=tool_approval_resolution,
+                            )
+                        async for agent_event in self.agent.run_agui(**run_agui_kwargs):
+                            yield agent_event
+                    finally:
+                        continuation_claim_stop.set()
+                        if continuation_claim_heartbeat is not None:
+                            try:
+                                await continuation_claim_heartbeat
+                            except asyncio.CancelledError:
+                                pass
+                else:
+                    async for agent_event in self.agent.run_agui(**run_agui_kwargs):
+                        yield agent_event
+
+            async for event in _events_with_interaction_prelude():
                 # 本輪已被外部收斂為終態（常見於 abort 立即 cancelled）時，
                 # 停止處理遲到事件，避免污染 conversation_messages 與 round 狀態。
                 if self.history_service.is_round_terminal(run_id) is True:
@@ -2730,8 +3018,6 @@ class AgentService:
                     status = current_status
                     _round_finished = True
                     _externally_terminated = True
-                    if run_cancel_token and not run_cancel_token.is_set():
-                        run_cancel_token.set()
                     stored_terminal = RunCompletionService(
                         self.history_service.db
                     ).ensure_terminal_sync(run_id)
@@ -2739,6 +3025,16 @@ class AgentService:
                     if isinstance(stored_terminal, StoredEvent):
                         yield stored_terminal.event
                     break
+
+                if not bool(run_cancel_token and run_cancel_token.is_set()):
+                    if continuation_ownership_lost.is_set():
+                        raise ContinuationOwnershipLostError(
+                            f"Interaction continuation ownership lost: {interaction_id}"
+                        )
+                    if run_liveness_token and run_liveness_token.is_set():
+                        raise _RunLivenessLostError(
+                            f"UserRunLock ownership lost for Round {run_id}"
+                        )
 
                 if (
                     event.type == EventType.RUN_STARTED
@@ -2757,6 +3053,50 @@ class AgentService:
                 event_to_store = event
                 event_to_yield = event
                 synthetic_user_content = None
+                pending_interaction_to_commit: str | None = None
+                pending_interaction_step_count: int | None = None
+                if (
+                    event.type == EventType.CUSTOM
+                    and getattr(event, "name", "") == "interaction_requested"
+                ):
+                    value = dict(event.value) if isinstance(event.value, dict) else {}
+                    interaction_id_value = value.get("interactionId")
+                    tool_call_id_value = value.get("toolCallId")
+                    kind = value.get("kind") or "user_input"
+                    if not isinstance(interaction_id_value, str) or not interaction_id_value:
+                        raise RuntimeError("interaction_requested is missing interactionId")
+                    pending = getattr(self.agent, "_pending_interrupt", None)
+                    self._attach_preferred_skills_interaction_context(
+                        value,
+                        pending if isinstance(pending, dict) else None,
+                        requested_context=requested_context,
+                        origin_user_message_id=user_message_id,
+                    )
+                    event = event.model_copy(update={"value": value})
+                    event_to_store = event
+                    event_to_yield = event
+                    # interaction_requested is emitted only after the Agent has
+                    # completed the current step. Persist that cumulative fact
+                    # in the same transaction as the waiting interaction/event
+                    # so a crash before the following STEP_FINISHED cannot
+                    # repeat the step number or grant extra budget on resume.
+                    pending_interaction_step_count = step_count + 1
+                    AgentInteractionService.create_pending(
+                        self.history_service.db,
+                        interaction_id=interaction_id_value,
+                        session_id=self.session_id,
+                        round_id=run_id,
+                        kind=str(kind),
+                        tool_call_id=(
+                            tool_call_id_value
+                            if isinstance(tool_call_id_value, str)
+                            else None
+                        ),
+                        request_payload=value,
+                        step_count=pending_interaction_step_count,
+                        commit=False,
+                    )
+                    pending_interaction_to_commit = interaction_id_value
                 if (
                     event.type == EventType.CUSTOM
                     and getattr(event, "name", "") == "synthetic_user_message"
@@ -2769,6 +3109,7 @@ class AgentService:
                             round_id=run_id,
                             is_synthetic=True,
                             raise_on_error=True,
+                            commit=False,
                         )
                         event_to_store = self._lightweight_synthetic_user_event(
                             event,
@@ -2776,9 +3117,116 @@ class AgentService:
                         )
                         event_to_yield = event_to_store
 
+                is_interaction_prelude = bool(
+                    interaction_id
+                    and event.type == EventType.CUSTOM
+                    and getattr(event, "name", "") == "interaction_resolved"
+                    and isinstance(getattr(event, "value", None), dict)
+                    and event.value.get("interactionId") == interaction_id
+                )
+                continuation_fence: ContinuationWriteFence | None = None
+                if (
+                    interaction_id
+                    and continuation_claim_token
+                    and not continuation_claim_completed
+                ):
+                    if event.type in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
+                        transition = "validate"
+                    elif is_interaction_prelude:
+                        transition = "start"
+                    elif (
+                        interaction_kind == "tool_approval"
+                        and not (
+                            event.type == EventType.TOOL_CALL_RESULT
+                            and getattr(event, "tool_call_id", None)
+                            == interaction_tool_call_id
+                        )
+                    ):
+                        transition = "validate"
+                    else:
+                        transition = "complete"
+                    continuation_fence = ContinuationWriteFence(
+                        session_id=self.session_id,
+                        interaction_id=interaction_id,
+                        claim_token=continuation_claim_token,
+                        transition=transition,
+                    )
+
                 stored_event = None
-                if event_to_store.type not in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
-                    stored_event = await self.history_service.save_agui_event(run_id, event_to_store)
+                try:
+                    if event_to_store.type not in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
+                        continuation_completion_in_flight = bool(
+                            continuation_fence is not None
+                            and continuation_fence.transition == "complete"
+                        )
+                        stored_event = await self.history_service.save_agui_event(
+                            run_id,
+                            event_to_store,
+                            continuation_fence=continuation_fence,
+                        )
+                except RoundTerminalWriteSuppressed as exc:
+                    if pending_interaction_to_commit is not None:
+                        self.history_service.db.rollback()
+                    if continuation_fence is not None:
+                        raise ContinuationOwnershipLostError(str(exc)) from exc
+                    status = (
+                        self.history_service.get_round_status(run_id)
+                        or "cancelled"
+                    )
+                    _round_finished = True
+                    _externally_terminated = True
+                    stored_terminal = RunCompletionService(
+                        self.history_service.db
+                    ).ensure_terminal_sync(run_id)
+                    self.history_service.reset_session()
+                    if isinstance(stored_terminal, StoredEvent):
+                        yield stored_terminal.event
+                    break
+                except InteractionConflictError as exc:
+                    if pending_interaction_to_commit is not None:
+                        self.history_service.db.rollback()
+                    if continuation_fence is not None:
+                        raise ContinuationOwnershipLostError(str(exc)) from exc
+                    raise
+                except Exception:
+                    if pending_interaction_to_commit is not None:
+                        self.history_service.db.rollback()
+                    raise
+                finally:
+                    continuation_completion_in_flight = False
+
+                if (
+                    continuation_fence is not None
+                    and continuation_fence.transition == "complete"
+                    and stored_event is not None
+                ):
+                    continuation_claim_completed = True
+                    continuation_claim_stop.set()
+                elif (
+                    is_interaction_prelude
+                    and continuation_fence is not None
+                    and continuation_fence.transition == "start"
+                    and stored_event is not None
+                ):
+                    # From this commit onward the continuation is a running
+                    # Round.  Startup failures must consume the still-owned
+                    # fence into a durable failed terminal, never re-park it.
+                    continuation_start_committed = True
+
+                if pending_interaction_to_commit is not None:
+                    interaction_id_value = pending_interaction_to_commit
+                    step_count = max(
+                        step_count,
+                        int(pending_interaction_step_count or 0),
+                    )
+                    waiting_step_finish_precounted = True
+                    self._attach_agent_pending_interrupt_round_id(
+                        interaction_id_value,
+                        run_id,
+                    )
+                    self._pending_interrupt_round_ids[interaction_id_value] = run_id
+                    status = "waiting_interaction"
+                    _round_suspended = True
 
                 if event.type == EventType.TEXT_MESSAGE_CONTENT:
                     accumulated_content += event.delta
@@ -2812,7 +3260,10 @@ class AgentService:
                     tcid = getattr(event, "tool_call_id", "")
                     _file_op_tracking.discard(tcid)
                 elif event.type == EventType.STEP_FINISHED:
-                    step_count += 1
+                    if waiting_step_finish_precounted:
+                        waiting_step_finish_precounted = False
+                    else:
+                        step_count += 1
                 elif event.type == EventType.RUN_FINISHED:
                     _result = event.result
                     if isinstance(_result, dict):
@@ -2826,37 +3277,15 @@ class AgentService:
                     if event.outcome == "success":
                         status = "completed"
                     elif event.outcome == "interrupt":
-                        # 區分用戶主動取消、步數耗盡和 ask_user 中斷：
-                        # - user_cancelled → cancelled（終態）
-                        # - max_steps_reached → max_steps_reached（終態）
-                        # - ask_user 問答中斷 → interrupted（中間態，可恢復）
                         reason = _result.get("reason") if isinstance(_result, dict) else None
                         if reason == "user_cancelled":
                             status = "cancelled"
                         elif reason == "max_steps_reached":
                             status = "max_steps_reached"
                         else:
-                            status = "interrupted"
-                            if event.interrupt:
-                                interrupt_id = event.interrupt.id
-                                if interrupt_id:
-                                    self._attach_agent_pending_interrupt_round_id(
-                                        interrupt_id,
-                                        run_id,
-                                    )
-                                    self._pending_interrupt_round_ids[interrupt_id] = run_id
-                                interrupt_payload = event.interrupt.model_dump(exclude_none=True)
-                                pending = getattr(self.agent, "_pending_interrupt", None)
-                                self._attach_preferred_skills_interrupt_context(
-                                    interrupt_payload,
-                                    pending if isinstance(pending, dict) else None,
-                                    requested_context=requested_context,
-                                    origin_user_message_id=user_message_id,
-                                )
-                                _interrupt_json = json.dumps(
-                                    interrupt_payload,
-                                    ensure_ascii=False,
-                                )
+                            raise RuntimeError(
+                                f"Unsupported RUN_FINISHED interrupt reason: {reason!r}"
+                            )
                     else:
                         status = "failed"
                 elif event.type == EventType.RUN_ERROR:
@@ -2864,32 +3293,72 @@ class AgentService:
                     final_response = getattr(event, "message", None) or final_response
 
                 if event.type in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
-                    self.history_service.complete_round(
-                        round_id=run_id,
-                        final_response=final_response,
-                        step_count=step_count,
-                        status=status,
-                        interrupt_payload=_interrupt_json,
-                        terminal_event=event,
+                    requested_terminal_payload = event_to_yield.model_dump(
+                        by_alias=True,
+                        exclude_none=True,
+                        mode="json",
                     )
+                    try:
+                        completed_round = self.history_service.complete_round(
+                            round_id=run_id,
+                            final_response=final_response,
+                            step_count=step_count,
+                            status=status,
+                            terminal_event=event,
+                            continuation_fence=_terminal_continuation_fence(),
+                        )
+                    except InteractionConflictError as exc:
+                        raise ContinuationOwnershipLostError(str(exc)) from exc
+                    continuation_claim_stop.set()
                     stored_event = self.history_service.last_terminal_event
+                    if not isinstance(stored_event, StoredEvent):
+                        from src.api.models.round import Round
+
+                        authoritative_status = getattr(completed_round, "status", None)
+                        if authoritative_status in Round.SUBSCRIBE_TERMINAL_STATUSES:
+                            stored_event = RunCompletionService(
+                                self.history_service.db
+                            ).ensure_terminal_sync(run_id)
+                            self.history_service.reset_session()
                     if isinstance(stored_event, StoredEvent):
                         await get_agui_event_bus().publish_committed(run_id, stored_event.event)
                     _round_finished = True
+
+                    if isinstance(stored_event, StoredEvent):
+                        committed_payload = dict(stored_event.event)
+                        committed_payload.pop("sequence", None)
+                        if committed_payload != requested_terminal_payload:
+                            status = (
+                                getattr(completed_round, "status", None)
+                                or status
+                            )
+                            _externally_terminated = True
+                            yield stored_event.event
+                            break
 
                 yield SequencedAGUIEvent(event_to_yield, stored_event) if stored_event else event_to_yield
 
             if _externally_terminated:
                 return
 
-            if not _round_finished:
-                self.history_service.complete_round(
-                    round_id=run_id,
-                    final_response=final_response,
+            if _round_suspended:
+                self.history_service.save_waiting_round_progress(
+                    run_id,
                     step_count=step_count,
-                    status=status,
-                    interrupt_payload=_interrupt_json,
                 )
+                return
+
+            if not _round_finished and not _round_suspended:
+                try:
+                    self.history_service.complete_round(
+                        round_id=run_id,
+                        final_response=final_response,
+                        step_count=step_count,
+                        status=status,
+                        continuation_fence=_terminal_continuation_fence(),
+                    )
+                except InteractionConflictError as exc:
+                    raise ContinuationOwnershipLostError(str(exc)) from exc
                 _round_finished = True
             if status == "completed" and not bool(run_cancel_token and run_cancel_token.is_set()):
                 task = asyncio.create_task(
@@ -2903,13 +3372,28 @@ class AgentService:
                 )
                 task.add_done_callback(self._on_post_round_done)
 
+        except ContinuationOwnershipLostError:
+            _round_suspended = True
+            logger.info(
+                "Round %s 的 continuation 已由其他 worker 接管，旧 worker 静默退出",
+                run_id,
+            )
+            return
+        except _RunLivenessLostError:
+            _round_suspended = True
+            logger.warning(
+                "Round %s 的 UserRunLock 已丢失，旧 worker 静默退出等待恢复收敛",
+                run_id,
+            )
+            return
         except Exception as e:
             _final_status = "failed"
             _final_response = f"{error_label}: {str(e)}"
             raise
         finally:
+            await _release_uncommitted_continuation_start()
             # 統一處理 round 完成：正常路徑、異常、GeneratorExit、CancelledError
-            if not _round_finished:
+            if not _round_finished and not _round_suspended:
                 try:
                     # 僅在可確認本地 cancel_token 已觸發時視為用戶取消。
                     # 其餘未知異常中斷（如框架級取消、進程退出）保守標記為 failed，
@@ -2923,7 +3407,9 @@ class AgentService:
                         final_response=_final_response or accumulated_content or final_response or _fallback_response,
                         step_count=step_count,
                         status=_actual_status,
+                        continuation_fence=_terminal_continuation_fence(),
                     )
+                    status = _actual_status
                     stored_event = self.history_service.last_terminal_event
                     if isinstance(stored_event, StoredEvent):
                         await get_agui_event_bus().publish_committed(run_id, stored_event.event)
@@ -2932,8 +3418,19 @@ class AgentService:
                         "Round %s 異常退出（disconnect/cancel/error），已標記為 %s (steps=%d)",
                         run_id, _actual_status, step_count,
                     )
+                except InteractionConflictError:
+                    _round_suspended = True
+                    logger.info(
+                        "Round %s 的 continuation 在异常收敛前已被接管，跳过旧 worker 终态",
+                        run_id,
+                    )
                 except Exception:
                     logger.error("Round %s 異常退出後無法更新 DB", run_id, exc_info=True)
+            if _round_finished:
+                from src.api.models.round import Round
+
+                if status in Round.COMPLETE_TERMINAL_STATUSES:
+                    self.discard_pending_runtime_state(owner_round_id=run_id)
             self.agent.set_llm_call_hook(None)
             if callable(compaction_hook_setter):
                 compaction_hook_setter(None)

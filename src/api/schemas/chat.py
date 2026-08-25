@@ -165,7 +165,6 @@ class RoundData(BaseModel):
     """对话轮次数据"""
     round_id: str
     parent_run_id: Optional[str] = None
-    control_kind: Optional[Literal["tool_approval"]] = None
     idempotency_key: Optional[str] = None
     last_event_sequence: int = 0
     user_message: str

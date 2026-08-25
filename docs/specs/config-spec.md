@@ -12,12 +12,14 @@
 
 复用 memory-spec 中的 `user_memory`、`user_skill_configs` 表，并使用 `user_skill_inventory_snapshots` 保存用户 Skill 最近一次完整扫描快照。
 
-### Chat 长程上下文配置
+### Chat runtime 配置
 
 | Settings 字段 | 默认值 | 语义 |
 |---|---:|---|
 | `agent_history_strategy` | `checkpoint_v1` | 默认使用累计替代 checkpoint；`legacy_120` 仅作回滚 |
 | `agent_max_history_messages` | `120` | 只在 legacy 策略生效；默认策略不得按消息条数裁剪 |
+
+Human-in-the-Loop 不提供协议切换配置：`ask_user` 与工具审批始终暂停并继续同一 Round。
 
 模型级 `auto_compact_token_limit` 可覆盖自动压缩阈值，但不得超过 `(context_window - max_tokens) * 80%`；未配置时直接使用该值。模型级 `tool_output_truncation_bytes` 必须大于 0，默认 42,667 bytes；通用工具结果写入历史时使用 1.2 倍序列化余量，默认正文预算为 51,200 UTF-8 bytes，并保留 UTF-8 首尾。截断标记本身不计入正文预算。内建工具只有在自行严格限制模型可见结果、明确标记遗漏并提供续读语义时，成功结果才可跳过该通用 head+tail 截断；失败结果始终受通用上限保护。压缩请求使用完整规范化历史和固定 Codex prompt；replacement 固定为不超过 20,000 近似 token 的最新真实 user 原文，加一条 role=user 的 synthetic summary。不存在首轮锚点、摘要格式校验、文件证据回灌、工具批次保护、单项 10k-token ceiling、确定性摘要或熔断。
 
@@ -48,7 +50,7 @@
 | ReadUserProfileTool | read_user | 读用户画像 |
 | UpdateUserProfileTool | update_user | 显式更新用户画像 |
 | ManageCron | manage_cron | 管理定时任务 |
-| AskUserQuestion | ask_user | 人机交互中断 |
+| AskUserQuestion | ask_user | 同 Round 暂停等待用户输入 |
 | SubAgentTool | sub_agent | 子 Agent 委托（创建 child Round + graph edge，父 Agent 等待结果） |
 | GetSkillTool | get_skill | 渐进式加载 L2 |
 | GLMSearchTool | glm_search | 搜索（条件加载）|

@@ -10,16 +10,18 @@
 - React 18 + TypeScript 5 + Vite
 - 路由：`react-router-dom`
 - 样式：TailwindCSS（`claude-*` token 见 §5）
-- HTTP：`axios`（集中在 `services/api.ts`）
-- SSE：`EventSource`（由 `services/api.ts` 封装为 `subscribeToRound`/`sendMessage` 回调）
-- 状态管理：**不引入 Redux/Zustand**，使用组件 state + ref + props 透传。复杂跨组件通信通过 `App.tsx` 顶层 state 协调。
+- HTTP：认证、history 与普通 REST 由 `services/api.ts` 的 axios client 负责。
+- SSE：聊天 POST/subscribe 的 fetch、解析、序号恢复与控制面分类均由 `services/chatStreamClient.ts` 负责。
+- 状态管理：**不引入 Redux/Zustand**；聊天运行态由 `ChatRuntimeProvider + useReducer` 统一管理，组件本地 state 只保留草稿、面板和视觉交互。跨页面执行标记仍由 `App.tsx` 协调。
 
 ## 2. 模块职责边界
 
 | 模块 | 职责 | 不职责 |
 |---|---|---|
 | `App.tsx` | 路由、顶层 state（sessionId、model、panel）、未读计数轮询 | 业务逻辑、SSE 处理 |
-| `components/ChatV2.tsx` | 会话内消息流、SSE 消费、滚动、取消 | 会话列表、面板内容 |
+| `runtime/ChatRuntimeProvider.tsx` | Round/Run 投影、transport epoch、history 合并、waiting/resume/subscribe/abort 生命周期 | 消息视觉渲染 |
+| `runtime/chatRuntimeReducer.ts` | 纯状态迁移与 AG-UI 事件归并 | 网络请求、定时器 |
+| `components/ChatV2.tsx` | 会话内消息渲染、草稿、滚动、交互卡与用户动作 | 直接拥有 SSE transport |
 | `components/SessionList.tsx` | 会话 CRUD、运行中检测、入口按钮 | 消息渲染 |
 | `components/Round.tsx` | 单轮（user+assistant+reasoning）视觉渲染 | 消息状态管理 |
 | `components/ReasoningPanel.tsx` | `StepData[]` → Display Blocks 可视化 | 事件接收 |
@@ -27,7 +29,8 @@
 | `components/SettingsCenter.tsx` | 设置中心居中弹窗：MEMORY/USER 记忆编辑 + SOUL/Skills 能力设定 | Skill 执行（后端负责）/Cron |
 | `components/CronSchedule.tsx` / `CronMessageCenter.tsx` | Cron 列表与执行历史 | Cron 调度（后端 worker）|
 | `components/AdminConsole.tsx` | 管理后台概览、Session 监控、用户管理、系统监控 | 业务执行、用户认证判定 |
-| `services/api.ts` | 所有 HTTP/SSE 调用封装 | 业务决策 |
+| `services/api.ts` | 认证、history、配置等普通 HTTP API | chat SSE transport |
+| `services/chatStreamClient.ts` | direct/resume/subscribe fetch + SSE 解析、序号恢复与控制面错误分类 | React 状态更新 |
 | `services/configApi.ts` | 记忆文件、Skills、未读计数 API | 聊天相关 |
 | `utils/messageParser.ts` | AG-UI 事件 → RoundData/StepData | 渲染 |
 | `utils/displayBlocks.ts` | `StepData[]` → `DisplayBlock[]`（跨 step 合并工具调用）| — |
@@ -36,15 +39,16 @@
 
 ```
 后端 SSE (AG-UI events)
-  → services/api.ts (subscribeToRound / sendMessage)
-    → StreamCallbacks (onTextMessageContent / onToolCallStart / onStateDelta ...)
-      → ChatV2 setRounds/setAgentState (useState)
-        → Round → ReasoningPanel → DisplayBlock 渲染
+  → services/chatStreamClient.ts（fetch/解析 + StreamEnvelope + recovery）
+      → ChatRuntimeProvider（transport ownership/epoch guard）
+        → chatRuntimeReducer（Round/Run 单一投影）
+          → ChatV2 → Round → ReasoningPanel → DisplayBlock 渲染
 ```
 
 **关键不变量**：
-- 所有后端事件必须经过 `services/api.ts` 的回调分发，不允许组件直接 `new EventSource`。
-- 所有 state 更新必须经过 `boundSessionId` 校验（见 frontend-chat-spec §3）。
+- 所有后端事件必须形成带 `ownerSessionId/clientRunKey/transportEpoch/connectionId` 的 `StreamEnvelope`，不允许组件直接拥有 EventSource。
+- Provider 必须按 connection identity 丢弃迟到 transport；history 必须受 request id 与 stream watermark 双重保护。
+- `running` 与 `waiting_interaction` 都保持同一 Round 的 subscribe；waiting 不计为 sending。
 
 ## 4. 全局行为契约
 
@@ -61,17 +65,17 @@
 
 ### 4.1 会话隔离（最重要）
 
-**任何异步回调（SSE、fetch、轮询）回调到 React state 之前，必须校验 `sessionIdRef.current === boundSessionId`。**
+**任何异步回调（SSE、history、轮询）进入 React 状态前，必须证明其 owner session 与当前 transport/request identity 仍有效。**
 
 原因：用户可能在等待期间切换会话。不校验会导致 A 会话的消息污染 B 会话的 UI。
 
-实现：在 `ChatV2.tsx` 的 `createStreamCallbacks({ boundSessionId })` 工厂函数中统一 `isStale()` 检查。
+实现：`ChatRuntimeProvider.guardAndDispatch()` 校验 `ownerSessionId + clientRunKey + transportEpoch + connectionId`，再把 envelope 交给 reducer；history 请求还必须校验 request id 与发起时的 stream watermark。状态按 session 分区保存，不再依赖 ChatV2 的 `sessionIdRef/boundSessionId` 闭包。
 
 ### 4.2 SSE 断连恢复
 
 - 每个 `RUN_STARTED` 事件返回 `runId`，客户端记录。
-- SSE 断开后，通过 `history API` 查询 round 终态（见 `_tryRecoverRoundFinished`），如已终态则触发 `onRunFinished`。
-- 如仍 running，则走 `subscribeToRound` 重新订阅（携带 `lastSequence`）。
+- SSE 断开后，由 `chatStreamClient` / `ChatRuntimeProvider.loadSessionHistory` 查询权威 Round；终态交给 reducer 收敛，running/waiting 则按最后 sequence 续订。
+- 如仍 `running` 或 `waiting_interaction`，则按同一 `round_id` 走 subscribe（携带 `lastSequence`）。waiting subscribe 用于跨标签页接收恢复、再次交互、取消及终态。
 
 ### 4.3 幂等请求
 
@@ -80,8 +84,10 @@
 
 ### 4.4 网络错误
 
-- `HttpError` 携带 status，**4xx 不重试**（用户错误），**5xx 可重试一次**。
-- 所有错误必须触发 `onStreamError` 回调，由 ChatV2 转为 UI 可见的错误提示。
+- `HttpError` 携带确定的 HTTP status；响应头已到达的 **4xx/5xx 都是 definite rejection，客户端不得自动重发**。5xx 显示可重试错误，由用户显式发起重试。
+- 错误先由 `chatStreamClient` 按 transport 阶段分类，再由 Provider 投影为 session error 或真正的 Round terminal。
+- same-Round resume 在 `interaction_resolved` 前收到的控制面 `RUN_ERROR` 不得终态化原 Round；必须回拉权威 history。
+- 已持久化 `interaction_requested` 后的断线不得覆盖新问题卡，应从最新 sequence 建立 waiting subscribe。
 
 ### 4.5 轮询策略
 
@@ -121,6 +127,8 @@
 
 - `AdminConsole` 的 Session 监控页必须通过 `services/adminApi.ts` 调用 `/admin/rounds-tree` 获取 session 级分页聚合，再在展开单个 session 时调用 `/admin/sessions/{session_id}/rounds` 懒加载 round + 轻量 step 数据。
 - `/admin/rounds-tree` 首屏只返回 session 级字段，`rounds_loaded=false` 且 `rounds=[]`；前端不得假设首屏已包含 round 树。
+- 状态筛选必须覆盖 `all` 以及后端完整 Round 状态：`running`、`waiting_interaction`、`completed`、`failed`、`cancelled`、`max_steps_reached`。
+- Session 聚合状态按 `running > waiting_interaction > error > completed` 展示；pending `waiting_interaction` 不得显示为已完成。
 - Step 原始详情通过 `/admin/llm-call-records/{llm_record_id}` 按需加载。
 - 筛选条件（status/search/user/page/pageSize）变化后必须折叠已展开 session，避免用旧展开状态展示新查询下的空 rounds。
 - 管理后台是审计视图，可以展示 `sub_agent` child round；但每个 round 必须明确展示 `主Agent` / `子Agent`，并在子 Agent 行展示父 run 与 subagent 类型/描述。
@@ -261,7 +269,7 @@
 - [ ] 无障碍：文本对比度 WCAG AA (4.5:1)
 - [ ] 动画：尊重 `prefers-reduced-motion`
 - [ ] 交互：长耗时操作必须有 loading 或实时预览
-- [ ] 会话隔离：异步回调必须校验 `boundSessionId`（见 §4.1）
+- [ ] 会话隔离：SSE envelope 必须通过 owner session + transport epoch/connection identity；history 必须通过 request id + stream watermark（见 §4.1）
 - [ ] 不挤压：右侧抽屉必须覆盖式（见 §5.6）
 
 ## 7. 测试约定
@@ -270,14 +278,14 @@
 - 测试位置：`frontend/src/__tests__/`。
 - 覆盖优先级：
   1. `utils/` 纯函数（messageParser、displayBlocks、fileUtils）
-  2. `services/api.ts` 的 SSE 分发逻辑
-  3. 组件的关键行为契约（会话切换、取消、断连恢复）
+  2. `services/chatStreamClient.ts` 的 transport/recovery 与 `chatRuntimeReducer.ts` 纯状态迁移
+  3. `ChatRuntimeProvider` ownership/epoch/history 竞态及组件关键行为（会话切换、取消、断连恢复）
 - 不要求：覆盖纯视觉/样式（交给 Storybook 或人工验证）。
 
 ## 8. 已知易错点（跨模块）
 
 1. **useEffect 依赖漏 `sessionId`** → 跨会话污染。
-2. **SSE 回调里直接 setState** 而不校验 boundSessionId → 切会话后老事件污染新会话。
+2. **绕过 Provider/reducer 直接用 SSE 回调 setState**，或漏检 transport identity → 旧连接污染当前 session/run。
 3. **使用 `transition-all`** → 性能抖动，违反 §5.11。
 4. **历史消息入场用 `animate-fade-in`** → 瀑布动效，违反 §5.8。
 5. **右侧面板用 `padding-right`** → reflow 抖动，违反 §5.6。

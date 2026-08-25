@@ -17,14 +17,16 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from src.agent.agent import Agent
+from src.agent.agent import Agent, ContinuationOwnershipLostError
 from src.agent.schema import FunctionCall, LLMResponse, Message, ToolCall
 from src.agent.schema.agui_events import EventType
+from src.agent.schema.run_context import AgentRunContext
 from src.agent.tools.base import ToolExposure, ToolRef as AgentToolRef, ToolResult
 from src.agent.tools.mcp_tool import McpRemoteTool
 from src.api.models.database import Base
 from src.api.models.auth_user import AuthUser
 from src.api.models.database import get_db
+from src.api.models.agent_interaction import AgentInteraction
 from src.api.models.mcp import (
     McpInstallation,
     McpServer,
@@ -36,9 +38,12 @@ from src.api.models.tool_permission import (
     ToolPermissionAudit,
     ToolPermissionRule,
 )
+from src.api.models.round import Round
+from src.api.models.session import Session as ChatSession
 from src.api.deps import get_current_admin_user, get_current_user
 from src.api.routes import admin_permissions, permissions
-from src.api.services.agent_service import AgentService
+from src.api.services.agent_service import AgentService, InvalidInteractionResponseError
+from src.api.services.history_service import HistoryService
 from src.api.services.mcp_runtime import (
     EffectiveMcpInstallation,
     McpToolSnapshot as RuntimeMcpToolSnapshot,
@@ -46,6 +51,7 @@ from src.api.services.mcp_runtime import (
 )
 from src.api.services.secret_crypto import decrypt_secret
 from src.api.services.tool_permission_service import (
+    APPROVAL_CANCELLABLE_STATUSES,
     APPROVAL_EXECUTION_FAILED_ERROR,
     APPROVAL_OUTCOME_UNKNOWN_ERROR,
     RULE_CONDITIONS_VERSION,
@@ -57,9 +63,11 @@ from src.api.services.tool_permission_service import (
     clear_user_tool_selection,
     create_approval_request,
     create_permission_rule,
+    dispatch_approval_request,
     evaluate_tool_permission,
     evaluate_tool_permissions,
     finish_approval_request,
+    prepare_approval_request,
     record_permission_audit,
     reconcile_expired_approval_leases,
     renew_approval_execution_lease,
@@ -1612,6 +1620,319 @@ def test_session_scope_and_specificity_precede_rule_priority(permission_db):
     assert _decision(permission_db, target).effect == "deny"
 
 
+def test_prepared_approval_survives_process_boundary_until_dispatch(permission_db):
+    create_approval_request(
+        permission_db,
+        request_id="approval-prepared-recovery",
+        user_id="alice",
+        session_id="session-a",
+        run_id="run-prepared-recovery",
+        tool_call_id="call-prepared-recovery",
+        ref=ToolRef(provider="builtin", tool_name="shell_exec"),
+        model_tool_name="shell_exec",
+        arguments={"command": "pwd", "nested": {"value": 1}},
+    )
+
+    prepared = prepare_approval_request(
+        permission_db,
+        request_id="approval-prepared-recovery",
+        user_id="alice",
+        resolution="allow_once",
+    )
+
+    assert prepared.should_execute is True
+    assert prepared.request.status == "approved"
+    assert prepared.request.resolution == "allow_once"
+    assert prepared.request.resolved_at is not None
+    assert prepared.request.execution_started_at is None
+    assert prepared.request.execution_claim_token is None
+    assert prepared.request.execution_lease_expires_at is None
+    assert prepared.request.completed_at is None
+
+    # A fresh database session represents continuation recovery after the
+    # process that accepted the answer has gone away.
+    fresh_factory = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=permission_db.get_bind(),
+    )
+    with fresh_factory() as recovered_db:
+        recovered = recovered_db.get(
+            ToolApprovalRequest,
+            "approval-prepared-recovery",
+        )
+        assert recovered is not None
+        assert recovered.status == "approved"
+        assert recovered.execution_claim_token is None
+
+        claim = dispatch_approval_request(
+            recovered_db,
+            request_id=recovered.id,
+            user_id="alice",
+        )
+
+    assert claim.should_execute is True
+    assert claim.arguments == {"command": "pwd", "nested": {"value": 1}}
+    assert claim.request.status == "executing"
+    assert claim.claim_token
+    assert claim.request.execution_claim_token == claim.claim_token
+    assert claim.request.execution_started_at is not None
+    assert claim.lease_expires_at is not None
+
+
+def test_same_round_approval_retry_persists_only_normalized_decision(permission_db):
+    permission_db.add(ChatSession(id="session-approval-canonical", user_id="alice"))
+    permission_db.add(Round(
+        id="round-approval-canonical",
+        session_id="session-approval-canonical",
+        user_message="original",
+        status="waiting_interaction",
+    ))
+    permission_db.add(AgentInteraction(
+        id="approval-canonical",
+        session_id="session-approval-canonical",
+        round_id="round-approval-canonical",
+        kind="tool_approval",
+        tool_call_id="call-approval-canonical",
+        status="pending",
+        request_payload='{"kind":"tool_approval"}',
+    ))
+    permission_db.commit()
+    create_approval_request(
+        permission_db,
+        request_id="approval-canonical",
+        user_id="alice",
+        session_id="session-approval-canonical",
+        run_id="round-approval-canonical",
+        tool_call_id="call-approval-canonical",
+        ref=ToolRef(provider="builtin", tool_name="protected_tool"),
+        model_tool_name="protected_tool",
+        arguments={"param1": "value"},
+    )
+
+    service = AgentService.__new__(AgentService)
+    service.user_id = "alice"
+    service.session_id = "session-approval-canonical"
+    service.history_service = HistoryService(permission_db)
+    service._pending_interrupt_round_ids = {
+        "approval-canonical": "round-approval-canonical"
+    }
+    service._refresh_runtime_messages_from_history = MagicMock()
+    service.agent = MagicMock()
+    service.agent.messages = []
+    service.agent._pending_interrupt = {"interrupt_id": "approval-canonical"}
+
+    with pytest.raises(
+        InvalidInteractionResponseError,
+        match="tool approval requires answers.approval",
+    ):
+        service._prepare_tool_approval_resume_locked(
+            interrupt_id="approval-canonical",
+            answers={"approval": "bogus"},
+            parent_run_id="round-approval-canonical",
+            preferred_skills_origin_user_message_id="round-approval-canonical:user",
+            requested_context=None,
+            run_context=AgentRunContext(),
+        )
+
+    for answers in (
+        {"approval": " Allow_Once ", "ignored": "first"},
+        {"ignored": "different", "approval": "allow_once"},
+    ):
+        prepared = service._prepare_tool_approval_resume_locked(
+            interrupt_id="approval-canonical",
+            answers=answers,
+            parent_run_id="round-approval-canonical",
+            preferred_skills_origin_user_message_id="round-approval-canonical:user",
+            requested_context=None,
+            run_context=AgentRunContext(),
+        )
+        assert prepared.tool_approval_resolution == "allow_once"
+
+    permission_db.expire_all()
+    interaction = permission_db.get(AgentInteraction, "approval-canonical")
+    approval = permission_db.get(ToolApprovalRequest, "approval-canonical")
+    assert interaction.answer_payload == '{"approval": "allow_once"}'
+    assert approval.resolution == "allow_once"
+    assert approval.status == "approved"
+
+
+def test_approval_dispatch_cas_allows_only_one_winner(permission_db):
+    create_approval_request(
+        permission_db,
+        request_id="approval-dispatch-cas",
+        user_id="alice",
+        session_id="session-a",
+        run_id="run-dispatch-cas",
+        tool_call_id="call-dispatch-cas",
+        ref=ToolRef(provider="builtin", tool_name="shell_exec"),
+        model_tool_name="shell_exec",
+        arguments={"command": "pwd"},
+    )
+    prepare_approval_request(
+        permission_db,
+        request_id="approval-dispatch-cas",
+        user_id="alice",
+        resolution="allow_once",
+    )
+    contender_factory = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=permission_db.get_bind(),
+    )
+
+    with contender_factory() as first, contender_factory() as second:
+        winner = dispatch_approval_request(
+            first,
+            request_id="approval-dispatch-cas",
+            user_id="alice",
+        )
+        with pytest.raises(RuntimeError, match="not dispatchable: executing"):
+            dispatch_approval_request(
+                second,
+                request_id="approval-dispatch-cas",
+                user_id="alice",
+            )
+
+    assert winner.claim_token
+    assert winner.request.execution_claim_token == winner.claim_token
+
+
+@pytest.mark.parametrize("resolution", ["allow_once", "deny"])
+def test_prepare_approval_is_idempotent_for_same_durable_answer(
+    permission_db,
+    resolution: str,
+):
+    request_id = f"approval-idempotent-{resolution}"
+    create_approval_request(
+        permission_db,
+        request_id=request_id,
+        user_id="alice",
+        session_id="session-a",
+        run_id=f"run-{resolution}",
+        tool_call_id=f"call-{resolution}",
+        ref=ToolRef(provider="builtin", tool_name="shell_exec"),
+        model_tool_name="shell_exec",
+        arguments={"command": "pwd"},
+    )
+
+    first = prepare_approval_request(
+        permission_db,
+        request_id=request_id,
+        user_id="alice",
+        resolution=resolution,
+    )
+    original_resolved_at = first.request.resolved_at
+    original_completed_at = first.request.completed_at
+
+    retried = prepare_approval_request(
+        permission_db,
+        request_id=request_id,
+        user_id="alice",
+        resolution=resolution,
+    )
+
+    assert retried.request.status == (
+        "denied" if resolution == "deny" else "approved"
+    )
+    assert retried.request.resolved_at == original_resolved_at
+    assert retried.request.completed_at == original_completed_at
+
+    conflicting = "deny" if resolution != "deny" else "allow_once"
+    with pytest.raises(RuntimeError, match="already resolved"):
+        prepare_approval_request(
+            permission_db,
+            request_id=request_id,
+            user_id="alice",
+            resolution=conflicting,
+        )
+
+
+def test_prepared_deny_is_terminal_and_never_dispatchable(permission_db):
+    request = create_approval_request(
+        permission_db,
+        request_id="approval-prepared-deny",
+        user_id="alice",
+        session_id="session-a",
+        run_id="run-prepared-deny",
+        tool_call_id="call-prepared-deny",
+        ref=ToolRef(provider="builtin", tool_name="shell_exec"),
+        model_tool_name="shell_exec",
+        arguments={"command": "pwd"},
+    )
+
+    prepared = prepare_approval_request(
+        permission_db,
+        request_id=request.id,
+        user_id="alice",
+        resolution="deny",
+    )
+
+    assert prepared.should_execute is False
+    assert prepared.request.status == "denied"
+    assert prepared.request.resolution == "deny"
+    assert prepared.request.execution_started_at is None
+    assert prepared.request.execution_claim_token is None
+    assert prepared.request.execution_lease_expires_at is None
+    assert prepared.request.completed_at is not None
+    with pytest.raises(RuntimeError, match="not dispatchable: denied"):
+        dispatch_approval_request(
+            permission_db,
+            request_id=request.id,
+            user_id="alice",
+        )
+
+
+@pytest.mark.parametrize(
+    ("resolution", "expected_scope", "expected_scope_id"),
+    [
+        ("allow_session", "session", "session-a"),
+        ("allow_always", "user", "alice"),
+    ],
+)
+def test_prepared_remembered_approval_persists_rule_before_dispatch(
+    permission_db,
+    resolution: str,
+    expected_scope: str,
+    expected_scope_id: str,
+):
+    request_id = f"approval-prepared-{resolution}"
+    create_approval_request(
+        permission_db,
+        request_id=request_id,
+        user_id="alice",
+        session_id="session-a",
+        run_id=f"run-prepared-{resolution}",
+        tool_call_id=f"call-prepared-{resolution}",
+        ref=ToolRef(provider="builtin", tool_name="shell_exec"),
+        model_tool_name="shell_exec",
+        arguments={"command": "pwd"},
+    )
+
+    prepared = prepare_approval_request(
+        permission_db,
+        request_id=request_id,
+        user_id="alice",
+        resolution=resolution,
+    )
+
+    assert prepared.request.status == "approved"
+    assert prepared.request.execution_claim_token is None
+    persisted_rule = (
+        permission_db.query(ToolPermissionRule)
+        .filter(ToolPermissionRule.description == f"Created from approval {request_id}")
+        .one()
+    )
+    assert persisted_rule.scope_type == expected_scope
+    assert persisted_rule.scope_id == expected_scope_id
+    assert persisted_rule.effect == "allow"
+
+
+def test_pre_execution_cancellation_statuses_include_requested_and_approved_only():
+    assert APPROVAL_CANCELLABLE_STATUSES == {"requested", "approved"}
+    assert "executing" not in APPROVAL_CANCELLABLE_STATUSES
+
+
 @pytest.mark.parametrize(
     ("resolution", "expected_scope", "expected_scope_id"),
     [
@@ -2300,7 +2621,7 @@ def _tool_call_response(
 
 
 @pytest.mark.asyncio
-async def test_agent_ask_emits_human_approval_interrupt_without_execution(tmp_path):
+async def test_agent_same_round_approval_parks_without_run_finished(tmp_path):
     tool = MockTool("protected_tool")
     llm = MockLLMClient()
     llm.stream_responses = [_tool_call_response(tool.name)]
@@ -2331,20 +2652,25 @@ async def test_agent_ask_emits_human_approval_interrupt_without_execution(tmp_pa
             agent,
             "_create_tool_approval",
             return_value=("approval-1", payload),
-        ) as create_approval,
+        ),
         patch.object(agent, "_record_permission_audit"),
     ):
         events = [event async for event in agent.run_agui("session-a", "run-a")]
 
     assert tool.execute_count == 0
-    create_approval.assert_called_once()
-    finished = next(event for event in events if event.type == EventType.RUN_FINISHED)
-    assert finished.outcome == "interrupt"
-    assert finished.interrupt is not None
-    assert finished.interrupt.id == "approval-1"
-    assert finished.interrupt.reason == "human_approval"
-    assert finished.interrupt.payload["kind"] == "tool_approval"
-    assert agent.get_pending_interrupt()["interrupt_id"] == "approval-1"
+    assert not any(event.type == EventType.RUN_FINISHED for event in events)
+    requested = next(
+        event
+        for event in events
+        if event.type == EventType.CUSTOM and event.name == "interaction_requested"
+    )
+    assert requested.value["interactionId"] == "approval-1"
+    assert requested.value["kind"] == "tool_approval"
+    assert not any(
+        event.type == EventType.TOOL_CALL_RESULT
+        and event.content == "[Awaiting tool approval]"
+        for event in events
+    )
 
 
 @pytest.mark.asyncio
@@ -2415,7 +2741,6 @@ async def test_authenticated_builtin_fails_closed_when_policy_store_is_unavailab
     assert tool.execute_count == 0
     result = next(event for event in events if event.type == EventType.TOOL_CALL_RESULT)
     assert result.content == "Tool is unavailable in this conversation"
-
 
 @pytest.mark.asyncio
 async def test_deny_precedes_argument_validation_without_schema_leak(tmp_path):
@@ -2559,6 +2884,171 @@ async def test_claimed_approval_executes_once_before_resume_llm(tmp_path):
     ]
     assert len(placeholders) == 1
     assert placeholders[0].content == "Mock tool executed"
+
+
+@pytest.mark.asyncio
+async def test_aborted_approved_tool_cannot_execute_in_next_round(tmp_path):
+    tool = MockTool("protected_tool")
+    llm = MockLLMClient()
+    llm.stream_responses = [
+        LLMResponse(content="new round done", tool_calls=[], finish_reason="stop"),
+    ]
+    agent = Agent(
+        llm_client=llm,
+        system_prompt="test",
+        tools=[tool],
+        workspace_dir=str(tmp_path / "workspace"),
+    )
+    agent.queue_tool_approval_resume(
+        request_id="approval-aborted",
+        tool_call_id="call-aborted",
+        function_name=tool.name,
+        arguments={"param1": "value"},
+        provider="builtin",
+        tool_name=tool.name,
+        server_id=None,
+        installation_id=None,
+        schema_hash=None,
+        resolution="allow_once",
+        should_execute=True,
+        claim_token="claim-aborted",
+        owner_round_id="round-aborted",
+    )
+
+    # 模拟 approve 已写入热缓存、continuation prelude 尚未开始时 abort，
+    # 随后同一个 Agent 被池复用来处理普通新消息。
+    agent.discard_pending_runtime_state(owner_round_id="round-aborted")
+    events = [event async for event in agent.run_agui("session-a", "round-new")]
+
+    assert tool.execute_count == 0
+    assert agent._pending_approved_tool is None
+    assert not [
+        event for event in events if event.type == EventType.TOOL_CALL_RESULT
+    ]
+
+
+@pytest.mark.asyncio
+async def test_approved_tool_owner_round_mismatch_fails_closed(tmp_path):
+    tool = MockTool("protected_tool")
+    llm = MockLLMClient()
+    llm.stream_responses = [
+        LLMResponse(content="new round done", tool_calls=[], finish_reason="stop"),
+    ]
+    agent = Agent(
+        llm_client=llm,
+        system_prompt="test",
+        tools=[tool],
+        workspace_dir=str(tmp_path / "workspace"),
+    )
+    agent.queue_tool_approval_resume(
+        request_id="approval-old-round",
+        tool_call_id="call-old-round",
+        function_name=tool.name,
+        arguments={"param1": "value"},
+        provider="builtin",
+        tool_name=tool.name,
+        server_id=None,
+        installation_id=None,
+        schema_hash=None,
+        resolution="allow_once",
+        should_execute=True,
+        claim_token="claim-old-round",
+        owner_round_id="round-old",
+    )
+
+    events = [event async for event in agent.run_agui("session-a", "round-new")]
+
+    assert tool.execute_count == 0
+    assert agent._pending_approved_tool is None
+    assert not [
+        event for event in events if event.type == EventType.TOOL_CALL_RESULT
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stale_interaction_claim_cannot_dispatch_approved_tool(
+    tmp_path,
+    permission_db,
+):
+    permission_db.add(ChatSession(id="session-fenced", user_id="alice"))
+    permission_db.add(Round(
+        id="round-fenced",
+        session_id="session-fenced",
+        user_message="original",
+        status="running",
+    ))
+    permission_db.add(AgentInteraction(
+        id="approval-fenced",
+        session_id="session-fenced",
+        round_id="round-fenced",
+        kind="tool_approval",
+        tool_call_id="call-fenced",
+        status="pending",
+        request_payload="{}",
+        answer_payload='{"approval": "allow_once"}',
+        tool_result_content="[Tool approval execution pending]",
+        claim_token="new-worker-claim",
+        claim_lease_expires_at=now_naive() + timedelta(minutes=1),
+    ))
+    permission_db.commit()
+    create_approval_request(
+        permission_db,
+        request_id="approval-fenced",
+        user_id="alice",
+        session_id="session-fenced",
+        run_id="round-fenced",
+        tool_call_id="call-fenced",
+        ref=ToolRef(provider="builtin", tool_name="protected_tool"),
+        model_tool_name="protected_tool",
+        arguments={"param1": "value"},
+    )
+    prepare_approval_request(
+        permission_db,
+        request_id="approval-fenced",
+        user_id="alice",
+        resolution="allow_once",
+    )
+
+    tool = MockTool("protected_tool")
+    agent = Agent(
+        llm_client=MockLLMClient(),
+        system_prompt="test",
+        tools=[tool],
+        workspace_dir=str(tmp_path / "workspace"),
+        user_id="alice",
+    )
+    agent.queue_tool_approval_resume(
+        request_id="approval-fenced",
+        tool_call_id="call-fenced",
+        function_name=tool.name,
+        arguments={"param1": "value"},
+        provider="builtin",
+        tool_name=tool.name,
+        server_id=None,
+        installation_id=None,
+        schema_hash=None,
+        resolution="allow_once",
+        should_execute=True,
+        owner_round_id="round-fenced",
+        interaction_claim_token="stale-worker-claim",
+    )
+    session_factory = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=permission_db.get_bind(),
+    )
+
+    with patch("src.api.models.database.SessionLocal", session_factory):
+        with pytest.raises(ContinuationOwnershipLostError):
+            await agent._execute_pending_approved_tool(
+                thread_id="session-fenced",
+                run_id="round-fenced",
+                cancel_token=None,
+            )
+
+    permission_db.expire_all()
+    assert tool.execute_count == 0
+    assert permission_db.get(ToolApprovalRequest, "approval-fenced").status == "approved"
 
 
 def _queue_mcp_approval_resume(
@@ -3128,29 +3618,3 @@ async def test_subagent_mode_hides_ask_tools_and_never_creates_approval(tmp_path
     assert not agent.has_pending_interrupt()
     result = next(event for event in events if event.type == EventType.TOOL_CALL_RESULT)
     assert result.content == "Tool is unavailable in this conversation"
-
-
-def test_resume_tool_result_event_is_not_replayed_as_orphan_history_message():
-    events = [
-        SimpleNamespace(payload={
-            "type": "CUSTOM",
-            "name": "tool_approval_resume",
-            "value": {"toolCallId": "call-1"},
-        }),
-        SimpleNamespace(payload={
-            "type": "TOOL_CALL_RESULT",
-            "toolCallId": "call-1",
-            "content": "executed",
-        }),
-        SimpleNamespace(payload={
-            "type": "TEXT_MESSAGE_CONTENT",
-            "delta": "done",
-        }),
-        SimpleNamespace(payload={"type": "STEP_FINISHED"}),
-    ]
-
-    messages = AgentService._events_to_messages(events, round_id="resume-1")
-
-    assert [(message.role, message.content) for message in messages] == [
-        ("assistant", "done")
-    ]

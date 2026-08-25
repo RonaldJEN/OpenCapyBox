@@ -455,8 +455,6 @@ export interface PreferredSkillSnapshot {
 // 对话轮次
 export interface RoundData {
   round_id: string;
-  parent_run_id?: string | null;
-  control_kind?: 'tool_approval' | null;
   idempotency_key?: string | null;
   last_event_sequence?: number;
   user_message: string;

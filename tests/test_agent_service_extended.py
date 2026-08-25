@@ -10,6 +10,7 @@ from src.agent.schema.agui_events import (
     TextMessageEndEvent,
     StepFinishedEvent,
     RunFinishedEvent,
+    RunErrorEvent,
     CustomEvent,
     ToolCallStartEvent,
     ToolCallArgsEvent,
@@ -18,6 +19,7 @@ from src.agent.schema.agui_events import (
     EventType,
 )
 from src.agent.schema import Message as AgentHistoryMessage
+from src.api.services.agui_event_bus import RoundTerminalWriteSuppressed, StoredEvent
 from tests.helpers import (
     make_mock_sandbox, make_agent_service, MockLLMClient, MockRegistry,
     make_mock_agent, make_tool_call_agui_events,
@@ -379,60 +381,6 @@ class TestAgentServiceRestoreHistory:
         service = make_agent_service()
         service._restore_history()  # should not raise
 
-    def test_load_persisted_interrupt_releases_read_transaction(self):
-        history_service = MagicMock()
-        mock_db = MagicMock()
-        round_row = MagicMock()
-        round_row.id = "round-1"
-        round_row.interrupt_payload = '{"id":"interrupt-1","payload":{"tool_call_id":"tc-1","questions":[{"text":"ok?"}]}}'
-        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [round_row]
-        history_service.db = mock_db
-
-        service = make_agent_service(history_service=history_service)
-        service.session_id = "session-123"
-
-        result = service._load_persisted_interrupt("interrupt-1")
-
-        assert result == {
-            "interrupt_id": "interrupt-1",
-            "round_id": "round-1",
-            "tool_call_id": "tc-1",
-            "questions": [{"text": "ok?"}],
-        }
-        mock_db.rollback.assert_called_once()
-
-    @pytest.mark.parametrize(
-        "approval_status",
-        ["executing", "executed", "failed", "denied", "unknown"],
-    )
-    def test_cold_restore_never_reoffers_claimed_tool_approval(
-        self,
-        approval_status,
-    ):
-        history_service = MagicMock()
-        mock_db = MagicMock()
-        round_row = MagicMock()
-        round_row.id = "round-approval"
-        round_row.interrupt_payload = (
-            '{"id":"approval-1","reason":"human_approval",'
-            '"payload":{"kind":"tool_approval","tool_call_id":"tc-1"}}'
-        )
-        round_query = MagicMock()
-        round_query.filter.return_value.order_by.return_value.all.return_value = [
-            round_row
-        ]
-        approval_query = MagicMock()
-        approval_query.filter.return_value.first.return_value = SimpleNamespace(
-            status=approval_status
-        )
-        mock_db.query.side_effect = [round_query, approval_query]
-        history_service.db = mock_db
-        service = make_agent_service(history_service=history_service)
-
-        assert service._load_persisted_interrupt("approval-1") is None
-        mock_db.rollback.assert_called_once()
-
-
 class TestAgentServiceChatAgui:
     @pytest.fixture(autouse=True)
     def _mock_registry(self):
@@ -450,7 +398,6 @@ class TestAgentServiceChatAgui:
         history_service.complete_round = MagicMock()
         history_service.save_agui_event = AsyncMock()
         history_service.save_llm_call_record = AsyncMock()
-        history_service.resolve_interrupted_rounds = MagicMock(return_value=1)
 
         service = make_agent_service(history_service=history_service)
 
@@ -466,20 +413,48 @@ class TestAgentServiceChatAgui:
         return service
 
     @pytest.mark.asyncio
-    async def test_chat_agui_clears_interrupted_rounds_when_skipping_pending_interrupt(self, service):
+    async def test_new_message_does_not_abandon_same_round_interaction(self, service):
+        from src.api.services.agent_interaction_service import InteractionConflictError
+
         service.agent._pending_interrupt = {
             "interrupt_id": "iid-1",
             "tool_call_id": "tc-1",
-            "questions": [{"question": "Q?"}],
+            "kind": "ask_user",
         }
 
-        async for _ in service.chat_agui([
-            {"type": "text", "text": "new request"},
-        ]):
-            pass
+        with patch.object(
+            service,
+            "_load_persisted_interrupt",
+            return_value={
+                "interrupt_id": "iid-1",
+                "round_id": "round-original",
+                "tool_call_id": "tc-1",
+                "kind": "ask_user",
+            },
+        ):
+            with pytest.raises(InteractionConflictError, match="等待用户回答"):
+                await service.prepare_chat_round(
+                    user_content=[{"type": "text", "text": "new request"}],
+                )
 
-        service.agent.clear_pending_interrupt.assert_called_once()
-        service.history_service.resolve_interrupted_rounds.assert_called_once_with("session-123")
+        service.agent.clear_pending_interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_new_message_discards_cancelled_same_round_hot_interrupt(self, service):
+        service.agent._pending_interrupt = {
+            "interrupt_id": "iid-cancelled",
+            "round_id": "round-cancelled",
+            "tool_call_id": "tc-cancelled",
+            "kind": "ask_user",
+        }
+
+        with patch.object(service, "_load_persisted_interrupt", return_value=None):
+            prepared = await service.prepare_chat_round(
+                user_content=[{"type": "text", "text": "new request"}],
+            )
+
+        assert prepared.run_id
+        assert service.agent._pending_interrupt is None
 
     @pytest.mark.asyncio
     async def test_chat_agui_basic(self, service):
@@ -495,6 +470,151 @@ class TestAgentServiceChatAgui:
         assert service.history_service.save_agui_event.await_count == 3
         complete_kwargs = service.history_service.complete_round.call_args.kwargs
         assert complete_kwargs["terminal_event"].type == EventType.RUN_FINISHED
+
+    @pytest.mark.asyncio
+    async def test_abort_race_suppresses_ephemeral_delta_and_raw_yield(self):
+        history_service = MagicMock()
+        history_service.db = MagicMock()
+        history_service.is_round_terminal = MagicMock(return_value=False)
+        history_service.get_round_status = MagicMock(return_value="cancelled")
+        history_service.save_agui_event = AsyncMock(
+            side_effect=RoundTerminalWriteSuppressed("round-delta-race")
+        )
+        history_service.complete_round = MagicMock()
+        history_service.reset_session = MagicMock()
+        history_service.last_terminal_event = None
+        service = make_agent_service(history_service=history_service)
+        service._save_conversation_message = MagicMock()
+
+        async def _run_agui(**_kwargs):
+            yield TextMessageContentEvent(messageId="m-race", delta="late")
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+        terminal = StoredEvent(
+            "round-delta-race",
+            4,
+            {"type": "RUN_FINISHED", "sequence": 4, "outcome": "interrupt"},
+        )
+        with patch(
+            "src.api.services.agent_service.RunCompletionService"
+        ) as completion_cls:
+            completion_cls.return_value.ensure_terminal_sync.return_value = terminal
+            events = [
+                event
+                async for event in service._run_round_stream(
+                    run_id="round-delta-race",
+                    user_message="hello",
+                )
+            ]
+
+        assert events == [terminal.event]
+        service._save_conversation_message.assert_not_called()
+        history_service.complete_round.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_abort_race_suppresses_durable_text_end_side_effects(self):
+        history_service = MagicMock()
+        history_service.db = MagicMock()
+        history_service.is_round_terminal = MagicMock(return_value=False)
+        history_service.get_round_status = MagicMock(return_value="cancelled")
+        history_service.save_agui_event = AsyncMock(
+            side_effect=[
+                None,
+                RoundTerminalWriteSuppressed("round-end-race"),
+            ]
+        )
+        history_service.complete_round = MagicMock()
+        history_service.reset_session = MagicMock()
+        history_service.last_terminal_event = None
+        service = make_agent_service(history_service=history_service)
+        service._save_conversation_message = MagicMock()
+
+        async def _run_agui(**_kwargs):
+            yield TextMessageContentEvent(messageId="m-race", delta="accepted")
+            yield TextMessageEndEvent(messageId="m-race")
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+        terminal = StoredEvent(
+            "round-end-race",
+            8,
+            {"type": "RUN_FINISHED", "sequence": 8, "outcome": "interrupt"},
+        )
+        with patch(
+            "src.api.services.agent_service.RunCompletionService"
+        ) as completion_cls:
+            completion_cls.return_value.ensure_terminal_sync.return_value = terminal
+            events = [
+                event
+                async for event in service._run_round_stream(
+                    run_id="round-end-race",
+                    user_message="hello",
+                )
+            ]
+
+        assert events[0].type == EventType.TEXT_MESSAGE_CONTENT
+        assert events[1:] == [terminal.event]
+        service._save_conversation_message.assert_not_called()
+        history_service.complete_round.assert_not_called()
+
+    @pytest.mark.parametrize("late_terminal_kind", ["finished", "error"])
+    @pytest.mark.asyncio
+    async def test_abort_between_terminal_precheck_and_completion_yields_committed_terminal(
+        self,
+        late_terminal_kind,
+    ):
+        history_service = MagicMock()
+        history_service.db = MagicMock()
+        # The Agent-side precheck wins first; abort commits before
+        # complete_round takes the authoritative Round lock.
+        history_service.is_round_terminal = MagicMock(return_value=False)
+        history_service.complete_round = MagicMock(
+            return_value=SimpleNamespace(status="cancelled"),
+        )
+        history_service.last_terminal_event = None
+        history_service.reset_session = MagicMock()
+        service = make_agent_service(history_service=history_service)
+
+        async def _run_agui(**kwargs):
+            if late_terminal_kind == "finished":
+                yield RunFinishedEvent(
+                    threadId="session-123",
+                    runId=kwargs["run_id"],
+                    outcome="success",
+                    result={"finalResponse": "late success"},
+                )
+            else:
+                yield RunErrorEvent(
+                    message="late failure",
+                    code="LATE_AGENT_FAILURE",
+                )
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+        terminal = StoredEvent(
+            "round-terminal-race",
+            7,
+            {
+                "type": "RUN_FINISHED",
+                "sequence": 7,
+                "outcome": "interrupt",
+                "result": {"reason": "user_cancelled"},
+            },
+        )
+        with patch(
+            "src.api.services.agent_service.RunCompletionService"
+        ) as completion_cls:
+            completion_cls.return_value.ensure_terminal_sync.return_value = terminal
+            events = [
+                event
+                async for event in service._run_round_stream(
+                    run_id="round-terminal-race",
+                    user_message="hello",
+                )
+            ]
+
+        assert events == [terminal.event]
+        completion_cls.return_value.ensure_terminal_sync.assert_called_once_with(
+            "round-terminal-race"
+        )
 
     @pytest.mark.asyncio
     async def test_run_round_stream_synthetic_user_event_is_lightweight(self):
@@ -550,6 +670,7 @@ class TestAgentServiceChatAgui:
             round_id="round-synthetic",
             is_synthetic=True,
             raise_on_error=True,
+            commit=False,
         )
 
     @pytest.mark.asyncio
@@ -594,6 +715,154 @@ class TestAgentServiceChatAgui:
         history_service.save_agui_event.assert_not_awaited()
         complete_kwargs = history_service.complete_round.call_args.kwargs
         assert complete_kwargs["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_run_round_stream_parks_interaction_without_completion(self):
+        history_service = MagicMock()
+        history_service.db = MagicMock()
+        history_service.is_round_terminal = MagicMock(return_value=False)
+        history_service.save_agui_event = AsyncMock(return_value=None)
+        history_service.complete_round = MagicMock()
+        history_service.save_waiting_round_progress = MagicMock()
+        history_service.reset_session = MagicMock()
+        history_service.last_terminal_event = None
+        service = make_agent_service(history_service=history_service)
+
+        async def _run_agui(**kwargs):
+            yield CustomEvent(
+                name="interaction_requested",
+                value={
+                    "interactionId": "interaction-1",
+                    "runId": kwargs["run_id"],
+                    "kind": "user_input",
+                    "toolCallId": "tool-1",
+                    "payload": {"questions": [{"question": "Continue?"}]},
+                },
+            )
+            yield StepFinishedEvent(stepName="step-1")
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+        service.agent._pending_interrupt = {
+            "interrupt_id": "interaction-1",
+            "tool_call_id": "tool-1",
+            "kind": "ask_user",
+        }
+
+        with patch(
+            "src.api.services.agent_service.AgentInteractionService.create_pending"
+        ) as create_pending:
+            events = []
+            async for event in service._run_round_stream(
+                run_id="round-1",
+                user_message="hello",
+            ):
+                events.append(event)
+
+        assert [event.type for event in events] == [EventType.CUSTOM, EventType.STEP_FINISHED]
+        create_pending.assert_called_once()
+        assert create_pending.call_args.kwargs["step_count"] == 1
+        history_service.complete_round.assert_not_called()
+        history_service.save_waiting_round_progress.assert_called_once_with(
+            "round-1",
+            step_count=1,
+        )
+
+    @pytest.mark.asyncio
+    async def test_step_finished_write_failure_keeps_atomic_waiting_step_count(self):
+        history_service = MagicMock()
+        history_service.db = MagicMock()
+        history_service.is_round_terminal = MagicMock(return_value=False)
+        history_service.save_agui_event = AsyncMock(
+            side_effect=[None, RuntimeError("step persistence failed")],
+        )
+        history_service.complete_round = MagicMock()
+        history_service.save_waiting_round_progress = MagicMock()
+        history_service.reset_session = MagicMock()
+        history_service.last_terminal_event = None
+        service = make_agent_service(history_service=history_service)
+
+        async def _run_agui(**kwargs):
+            yield CustomEvent(
+                name="interaction_requested",
+                value={
+                    "interactionId": "interaction-step-crash",
+                    "runId": kwargs["run_id"],
+                    "kind": "user_input",
+                    "toolCallId": "tool-step-crash",
+                    "payload": {"questions": [{"question": "Continue?"}]},
+                },
+            )
+            yield StepFinishedEvent(stepName="step-1")
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+        service.agent._pending_interrupt = {
+            "interrupt_id": "interaction-step-crash",
+            "tool_call_id": "tool-step-crash",
+            "kind": "ask_user",
+        }
+
+        with patch(
+            "src.api.services.agent_service.AgentInteractionService.create_pending"
+        ) as create_pending:
+            events = []
+            with pytest.raises(RuntimeError, match="step persistence failed"):
+                async for event in service._run_round_stream(
+                    run_id="round-step-crash",
+                    user_message="hello",
+                ):
+                    events.append(event)
+
+        assert [event.type for event in events] == [EventType.CUSTOM]
+        assert create_pending.call_args.kwargs["step_count"] == 1
+        history_service.complete_round.assert_not_called()
+        history_service.save_waiting_round_progress.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_interaction_and_requested_event_share_one_commit_boundary(self):
+        history_service = MagicMock()
+        history_service.db = MagicMock()
+        history_service.is_round_terminal = MagicMock(return_value=False)
+        history_service.save_agui_event = AsyncMock(
+            side_effect=RuntimeError("event persistence failed"),
+        )
+        history_service.complete_round = MagicMock()
+        history_service.reset_session = MagicMock()
+        history_service.last_terminal_event = None
+        service = make_agent_service(history_service=history_service)
+
+        async def _run_agui(**kwargs):
+            yield CustomEvent(
+                name="interaction_requested",
+                value={
+                    "interactionId": "interaction-atomic",
+                    "runId": kwargs["run_id"],
+                    "kind": "user_input",
+                    "toolCallId": "tool-atomic",
+                    "payload": {"questions": [{"question": "Continue?"}]},
+                },
+            )
+
+        service.agent = make_mock_agent(run_agui_fn=_run_agui)
+        service.agent._pending_interrupt = {
+            "interrupt_id": "interaction-atomic",
+            "tool_call_id": "tool-atomic",
+            "kind": "ask_user",
+        }
+
+        with patch(
+            "src.api.services.agent_service.AgentInteractionService.create_pending"
+        ) as create_pending:
+            with pytest.raises(RuntimeError, match="event persistence failed"):
+                async for _ in service._run_round_stream(
+                    run_id="round-atomic",
+                    user_message="hello",
+                ):
+                    pass
+
+        assert create_pending.call_args.kwargs["commit"] is False
+        assert create_pending.call_args.kwargs["step_count"] == 1
+        history_service.db.rollback.assert_called()
+        assert history_service.complete_round.call_args.kwargs["status"] == "failed"
 
     @pytest.mark.asyncio
     async def test_chat_agui_max_steps_reached_is_terminal_status(self, service):
@@ -1337,10 +1606,8 @@ class TestAgentServiceResumeAgui:
     def service(self):
         history_service = MagicMock()
         history_service.create_round = MagicMock()
-        history_service.create_resume_round = MagicMock()
         history_service.complete_round = MagicMock()
         history_service.save_agui_event = AsyncMock()
-        history_service.resolve_interrupted_rounds = MagicMock(return_value=1)
 
         service = make_agent_service(history_service=history_service)
 
@@ -1358,40 +1625,520 @@ class TestAgentServiceResumeAgui:
         return service
 
     @pytest.mark.asyncio
-    async def test_resume_agui_persists_resume_user_message(self, service):
+    async def test_resume_reuses_original_round(self, service):
         answers = {"Which DB?": "PostgreSQL"}
+        service.history_service.db.query.return_value.filter.return_value.first.return_value = (
+            SimpleNamespace(step_count=1, user_message="original request")
+        )
+        service.history_service.is_round_terminal = MagicMock(return_value=False)
+        service.history_service.save_agui_event = AsyncMock(side_effect=[
+            StoredEvent(
+                "round-original",
+                1,
+                {"type": "CUSTOM", "name": "interaction_resolved", "sequence": 1},
+            ),
+            None,
+            StoredEvent(
+                "round-original",
+                2,
+                {"type": "TEXT_MESSAGE_END", "messageId": "m1", "sequence": 2},
+            ),
+            StoredEvent(
+                "round-original",
+                3,
+                {"type": "STEP_FINISHED", "stepName": "step-1", "sequence": 3},
+            ),
+        ])
+        service.history_service.last_terminal_event = None
 
-        with patch.object(
-            service,
-            "_load_persisted_interrupt",
-            return_value={
-                "interrupt_id": "iid-1",
-                "round_id": "round-interrupted",
-                "tool_call_id": "tc-ask",
-            },
+        with (
+            patch.object(
+                service,
+                "_load_persisted_interrupt",
+                return_value={
+                    "interrupt_id": "iid-1",
+                    "round_id": "round-original",
+                    "tool_call_id": "tc-ask",
+                    "kind": "ask_user",
+                },
+            ),
+            patch.object(service, "_save_conversation_message") as save_message,
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.answer_pending"
+            ) as answer_pending,
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.claim_answered_continuation",
+                return_value=SimpleNamespace(claim_token="interaction-claim"),
+            ) as claim_continuation,
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.release_continuation_claim"
+            ),
         ):
-            with patch.object(service, "_save_conversation_message") as save_message:
-                async for _ in service.resume_agui("iid-1", answers):
-                    pass
+            events = []
+            async for event in service.resume_agui("iid-1", answers):
+                events.append(event)
 
         service.agent.resume_from_interrupt.assert_called_once_with("iid-1", answers)
-        service.history_service.create_resume_round.assert_called_once()
-        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
-        assert create_kwargs["parent_run_id"] == "round-interrupted"
-        assert create_kwargs["interrupt_id"] == "iid-1"
-        assert create_kwargs["tool_call_id"] == "tc-ask"
-        assert create_kwargs["answers"] == answers
-        assert create_kwargs["tool_result_content"] == "User answered:\n- Which DB?: PostgreSQL"
-        assert create_kwargs["restore_strategy"] == "hot_replace"
-        service.history_service.create_round.assert_not_called()
-        service.history_service.resolve_interrupted_rounds.assert_not_called()
+        answer_pending.assert_called_once()
+        claim_continuation.assert_called_once()
+        persisted_calls = service.history_service.save_agui_event.await_args_list
+        assert persisted_calls[0].kwargs["continuation_fence"].transition == "start"
+        assert persisted_calls[1].kwargs["continuation_fence"].transition == "complete"
+        assert persisted_calls[2].kwargs["continuation_fence"].transition == "complete"
+        assert persisted_calls[3].kwargs["continuation_fence"] is None
+        complete_kwargs = service.history_service.complete_round.call_args.kwargs
+        assert complete_kwargs["round_id"] == "round-original"
         assert any(
-            call.args and call.args[0] == "user" and "Q: Which DB?" in call.args[1]
+            event.type == EventType.CUSTOM
+            and event.name == "interaction_resolved"
+            and event.value["runId"] == "round-original"
+            for event in events
+        )
+        assert not any(
+            call.args and call.args[0] == "user"
             for call in save_message.call_args_list
         )
-        assert any(
-            call.args and call.args[0] == "assistant" and "resume done" in call.args[1]
-            for call in save_message.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_retry_reuses_first_durable_tool_result_order(
+        self,
+        service,
+    ):
+        incoming = "User answered:\n- First?: Yes\n- Second?: No"
+        # Retries must reuse the first durable rendering even if wire key order differs.
+        frozen = "User answered:\n- Second?: No\n- First?: Yes"
+        tool_message = AgentHistoryMessage(
+            role="tool",
+            content="[Awaiting user response]",
+            tool_call_id="tc-ask",
+            name="ask_user",
+        )
+        service.agent.messages = [tool_message]
+        service.agent._pending_interrupt = {
+            "interrupt_id": "iid-order",
+            "round_id": "round-original",
+            "tool_call_id": "tc-ask",
+            "kind": "ask_user",
+        }
+        service.history_service.db.query.return_value.filter.return_value.first.return_value = (
+            SimpleNamespace(step_count=1, user_message="original request")
+        )
+
+        def _resume(_interrupt_id, _answers):
+            tool_message.content = incoming
+            service.agent._pending_interrupt = None
+
+        service.agent.resume_from_interrupt.side_effect = _resume
+        with (
+            patch.object(service, "_refresh_runtime_messages_from_history"),
+            patch.object(
+                service,
+                "_load_persisted_interrupt",
+                return_value={
+                    "interrupt_id": "iid-order",
+                    "round_id": "round-original",
+                    "tool_call_id": "tc-ask",
+                    "kind": "ask_user",
+                },
+            ),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.answer_pending",
+                return_value=SimpleNamespace(tool_result_content=frozen),
+            ),
+        ):
+            prepared = await service.prepare_resume_round(
+                interrupt_id="iid-order",
+                answers={"Second?": "No", "First?": "Yes"},
+            )
+
+        assert prepared.interaction_tool_result_content == frozen
+        assert tool_message.content == frozen
+
+    @pytest.mark.asyncio
+    async def test_same_round_continuation_completes_on_first_durable_agent_event(
+        self,
+        service,
+    ):
+        service.history_service.is_round_terminal = MagicMock(return_value=False)
+        service.history_service.last_terminal_event = None
+        service.history_service.save_agui_event = AsyncMock(side_effect=[
+            StoredEvent(
+                "round-original",
+                1,
+                {"type": "CUSTOM", "name": "interaction_resolved", "sequence": 1},
+            ),
+            None,
+            StoredEvent(
+                "round-original",
+                2,
+                {"type": "TEXT_MESSAGE_END", "messageId": "m1", "sequence": 2},
+            ),
+        ])
+
+        with (
+            patch.object(service, "_save_conversation_message"),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.claim_answered_continuation",
+                return_value=SimpleNamespace(claim_token="interaction-claim"),
+            ),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.release_continuation_claim"
+            ) as release_continuation,
+        ):
+            stream = service._run_round_stream(
+                run_id="round-original",
+                user_message="original request",
+                is_continuation=True,
+                interaction_id="iid-1",
+                interaction_tool_call_id="tc-ask",
+                interaction_tool_result_content="User answered:\n- Which DB?: PostgreSQL",
+                interaction_kind="user_input",
+            )
+            prelude = await stream.__anext__()
+            assert prelude.type == EventType.CUSTOM
+
+            live_delta = await stream.__anext__()
+            assert live_delta.type == EventType.TEXT_MESSAGE_CONTENT
+            assert (
+                service.history_service.save_agui_event.await_args_list[1]
+                .kwargs["continuation_fence"]
+                .transition
+                == "complete"
+            )
+
+            durable_event = await stream.__anext__()
+            assert durable_event.type == EventType.TEXT_MESSAGE_END
+            assert (
+                service.history_service.save_agui_event.await_args_list[2]
+                .kwargs["continuation_fence"]
+                .transition
+                == "complete"
+            )
+            await stream.aclose()
+
+        release_continuation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_uncommitted_continuation_start_releases_claim_and_stays_waiting(
+        self,
+        service,
+    ):
+        service.history_service.is_round_terminal = MagicMock(return_value=False)
+        service.history_service.save_agui_event = AsyncMock(
+            side_effect=RuntimeError("interaction_resolved persistence failed"),
+        )
+        service.history_service.get_round_status = MagicMock(
+            return_value="waiting_interaction",
+        )
+        service.history_service.last_terminal_event = None
+
+        with (
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.claim_answered_continuation",
+                return_value=SimpleNamespace(claim_token="interaction-claim"),
+            ),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.release_continuation_claim"
+            ) as release_continuation,
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="interaction_resolved persistence failed",
+            ):
+                async for _event in service._run_round_stream(
+                    run_id="round-original",
+                    user_message="original request",
+                    is_continuation=True,
+                    interaction_id="iid-uncommitted",
+                    interaction_tool_call_id="tc-ask",
+                    interaction_tool_result_content="User answered:\n- Continue?: Yes",
+                    interaction_kind="user_input",
+                ):
+                    pass
+
+        release_continuation.assert_called_once_with(
+            service.history_service.db,
+            session_id=service.session_id,
+            interaction_id="iid-uncommitted",
+            claim_token="interaction-claim",
+        )
+        service.history_service.complete_round.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_commit_fanout_failure_never_releases_started_continuation(
+        self,
+        service,
+    ):
+        service.history_service.is_round_terminal = MagicMock(return_value=False)
+        # AguiEventBus commits before awaiting fanout.  The missing return
+        # value therefore cannot by itself prove that start was uncommitted.
+        service.history_service.save_agui_event = AsyncMock(
+            side_effect=RuntimeError("committed fanout failed"),
+        )
+        service.history_service.get_round_status = MagicMock(return_value="running")
+        service.history_service.last_terminal_event = None
+
+        with (
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.claim_answered_continuation",
+                return_value=SimpleNamespace(claim_token="interaction-claim"),
+            ),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.release_continuation_claim"
+            ) as release_continuation,
+        ):
+            with pytest.raises(RuntimeError, match="committed fanout failed"):
+                async for _event in service._run_round_stream(
+                    run_id="round-original",
+                    user_message="original request",
+                    is_continuation=True,
+                    interaction_id="iid-post-commit",
+                    interaction_tool_call_id="tc-ask",
+                    interaction_tool_result_content="User answered:\n- Continue?: Yes",
+                    interaction_kind="user_input",
+                ):
+                    pass
+
+        release_continuation.assert_not_called()
+        complete_kwargs = service.history_service.complete_round.call_args.kwargs
+        assert complete_kwargs["status"] == "failed"
+        assert complete_kwargs["continuation_fence"].transition == "validate"
+        assert complete_kwargs["continuation_fence"].claim_token == "interaction-claim"
+
+    @pytest.mark.asyncio
+    async def test_committed_continuation_startup_failure_uses_owned_terminal_fence(
+        self,
+        service,
+    ):
+        async def _failed_start(**_kwargs):
+            raise RuntimeError("agent startup failed")
+            yield  # pragma: no cover - keeps this an async generator
+
+        service.agent.run_agui = _failed_start
+        service.history_service.is_round_terminal = MagicMock(return_value=False)
+        service.history_service.last_terminal_event = None
+        service.history_service.save_agui_event = AsyncMock(return_value=StoredEvent(
+            "round-original",
+            1,
+            {"type": "CUSTOM", "name": "interaction_resolved", "sequence": 1},
+        ))
+
+        with (
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.claim_answered_continuation",
+                return_value=SimpleNamespace(claim_token="interaction-claim"),
+            ),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.release_continuation_claim"
+            ) as release_continuation,
+        ):
+            stream = service._run_round_stream(
+                run_id="round-original",
+                user_message="original request",
+                is_continuation=True,
+                interaction_id="iid-startup",
+                interaction_tool_call_id="tc-ask",
+                interaction_tool_result_content="User answered:\n- Continue?: Yes",
+                interaction_kind="user_input",
+            )
+            prelude = await stream.__anext__()
+            assert prelude.type == EventType.CUSTOM
+            with pytest.raises(RuntimeError, match="agent startup failed"):
+                await stream.__anext__()
+
+        release_continuation.assert_not_called()
+        complete_kwargs = service.history_service.complete_round.call_args.kwargs
+        assert complete_kwargs["status"] == "failed"
+        assert complete_kwargs["continuation_fence"].transition == "validate"
+        assert complete_kwargs["continuation_fence"].claim_token == "interaction-claim"
+
+    @pytest.mark.asyncio
+    async def test_committed_tool_approval_queue_failure_uses_owned_terminal_fence(
+        self,
+        service,
+    ):
+        service.history_service.is_round_terminal = MagicMock(return_value=False)
+        service.history_service.last_terminal_event = None
+        service.history_service.save_agui_event = AsyncMock(return_value=StoredEvent(
+            "round-original",
+            1,
+            {"type": "CUSTOM", "name": "interaction_resolved", "sequence": 1},
+        ))
+
+        with (
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.claim_answered_continuation",
+                return_value=SimpleNamespace(claim_token="interaction-claim"),
+            ),
+            patch.object(
+                service,
+                "_claim_and_queue_tool_approval",
+                side_effect=RuntimeError("approval queue failed"),
+            ),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.release_continuation_claim"
+            ) as release_continuation,
+        ):
+            stream = service._run_round_stream(
+                run_id="round-original",
+                user_message="original request",
+                is_continuation=True,
+                interaction_id="approval-startup",
+                interaction_tool_call_id="tool-1",
+                interaction_tool_result_content="[Tool approval execution pending]",
+                interaction_kind="tool_approval",
+                tool_approval_resolution="allow_once",
+            )
+            prelude = await stream.__anext__()
+            assert prelude.type == EventType.CUSTOM
+            with pytest.raises(RuntimeError, match="approval queue failed"):
+                await stream.__anext__()
+
+        release_continuation.assert_not_called()
+        complete_kwargs = service.history_service.complete_round.call_args.kwargs
+        assert complete_kwargs["status"] == "failed"
+        assert complete_kwargs["continuation_fence"].transition == "validate"
+        assert complete_kwargs["continuation_fence"].claim_token == "interaction-claim"
+
+    @pytest.mark.asyncio
+    async def test_tool_approval_continuation_waits_for_durable_tool_result(
+        self,
+        service,
+    ):
+        async def _approval_events(**_kwargs):
+            yield CustomEvent(
+                name="tool_approval_resume",
+                value={"toolCallId": "tool-1"},
+            )
+            yield ToolCallResultEvent(
+                messageId="tool-1:result",
+                toolCallId="tool-1",
+                content="tool result",
+            )
+
+        service.agent.run_agui = _approval_events
+        service.history_service.is_round_terminal = MagicMock(return_value=False)
+        service.history_service.last_terminal_event = None
+        service.history_service.save_agui_event = AsyncMock(side_effect=[
+            StoredEvent(
+                "round-original",
+                1,
+                {"type": "CUSTOM", "name": "interaction_resolved", "sequence": 1},
+            ),
+            StoredEvent(
+                "round-original",
+                2,
+                {"type": "CUSTOM", "name": "tool_approval_resume", "sequence": 2},
+            ),
+            StoredEvent(
+                "round-original",
+                3,
+                {"type": "TOOL_CALL_RESULT", "toolCallId": "tool-1", "sequence": 3},
+            ),
+        ])
+
+        with (
+            patch.object(service, "_claim_and_queue_tool_approval"),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.claim_answered_continuation",
+                return_value=SimpleNamespace(claim_token="interaction-claim"),
+            ),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.release_continuation_claim"
+            ) as release_continuation,
+        ):
+            stream = service._run_round_stream(
+                run_id="round-original",
+                user_message="original request",
+                is_continuation=True,
+                interaction_id="approval-1",
+                interaction_tool_call_id="tool-1",
+                interaction_tool_result_content="[Tool approval execution pending]",
+                interaction_kind="tool_approval",
+                tool_approval_resolution="allow_once",
+            )
+            await stream.__anext__()  # interaction_resolved
+            approval_marker = await stream.__anext__()
+            assert approval_marker.type == EventType.CUSTOM
+            assert (
+                service.history_service.save_agui_event.await_args_list[1]
+                .kwargs["continuation_fence"]
+                .transition
+                == "validate"
+            )
+
+            tool_result = await stream.__anext__()
+            assert tool_result.type == EventType.TOOL_CALL_RESULT
+            assert (
+                service.history_service.save_agui_event.await_args_list[2]
+                .kwargs["continuation_fence"]
+                .transition
+                == "complete"
+            )
+            await stream.aclose()
+
+        release_continuation.assert_not_called()
+
+    def test_tool_approval_reuses_original_round(self, service):
+        from src.agent.schema.run_context import AgentRunContext
+
+        request = SimpleNamespace(
+            id="approval-1",
+            tool_call_id="tool-1",
+            model_tool_name="protected_tool",
+            provider="builtin",
+            tool_name="protected_tool",
+            server_id=None,
+            installation_id=None,
+            schema_hash=None,
+            connection_fingerprint=None,
+            status="requested",
+            resolution=None,
+        )
+        service.history_service.db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = request
+        round_row = SimpleNamespace(
+            id="round-original",
+            status="waiting_interaction",
+            step_count=2,
+            user_message="original request",
+        )
+
+        with (
+            patch.object(service, "_refresh_runtime_messages_from_history"),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.lock_pending_for_update",
+                return_value=(round_row, SimpleNamespace(id="approval-1")),
+            ),
+            patch(
+                "src.api.services.agent_service.AgentInteractionService.answer_pending"
+            ) as answer_pending,
+            patch(
+                "src.api.services.tool_permission_service.prepare_approval_request"
+            ) as prepare_approval,
+        ):
+            prepared = service._prepare_tool_approval_resume_locked(
+                interrupt_id="approval-1",
+                answers={"approval": "allow_once"},
+                parent_run_id="round-original",
+                preferred_skills_origin_user_message_id="round-original:user",
+                requested_context=None,
+                run_context=AgentRunContext(),
+            )
+
+        assert prepared.run_id == "round-original"
+        assert prepared.is_continuation is True
+        assert prepared.initial_step == 2
+        assert prepared.interaction_id == "approval-1"
+        assert prepared.interaction_kind == "tool_approval"
+        assert prepared.tool_approval_resolution == "allow_once"
+        service.agent.queue_tool_approval_resume.assert_not_called()
+        answer_pending.assert_called_once()
+        prepare_approval.assert_called_once_with(
+            service.history_service.db,
+            request_id="approval-1",
+            user_id=service.user_id,
+            resolution="allow_once",
+            commit=False,
         )
 
     def test_has_pending_interrupt_falls_back_to_persisted_interrupt(self, service):
@@ -1400,310 +2147,15 @@ class TestAgentServiceResumeAgui:
         with patch.object(service, "_load_persisted_interrupt", return_value={"interrupt_id": "iid-1"}):
             assert service.has_pending_interrupt("iid-1") is True
 
-    @pytest.mark.asyncio
-    async def test_resume_agui_uses_cold_fallback_when_memory_interrupt_missing(self, service):
-        answers = {"Which DB?": "PostgreSQL"}
-        service.agent.has_pending_interrupt.return_value = False
-
-        with patch.object(
-            service,
-            "_load_persisted_interrupt",
-            return_value={"interrupt_id": "iid-1", "round_id": "round-interrupted"},
-        ):
-            with patch.object(service, "_save_conversation_message") as save_message:
-                async for _ in service.resume_agui("iid-1", answers):
-                    pass
-
-        service.agent.resume_from_interrupt.assert_not_called()
-        service.agent.add_user_message.assert_called_once()
-        injected_user_message = service.agent.add_user_message.call_args.args[0]
-        assert "Q: Which DB?" in injected_user_message
-        assert "A: PostgreSQL" in injected_user_message
-        service.history_service.create_resume_round.assert_called_once()
-        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
-        assert create_kwargs["parent_run_id"] == "round-interrupted"
-        assert create_kwargs["interrupt_id"] == "iid-1"
-        assert create_kwargs["tool_call_id"] is None
-        assert create_kwargs["tool_result_content"] == "User answered:\n- Which DB?: PostgreSQL"
-        assert create_kwargs["restore_strategy"] == "cold_fallback_user_message"
-        assert create_kwargs["fallback_reason"] == "tool_call_id missing"
-        service.history_service.create_round.assert_not_called()
-        service.history_service.resolve_interrupted_rounds.assert_not_called()
-        assert any(
-            call.args and call.args[0] == "user" and "Q: Which DB?" in call.args[1]
-            for call in save_message.call_args_list
-        )
-
-    @pytest.mark.asyncio
-    async def test_resume_agui_cold_path_replaces_restored_tool_placeholder(self, service):
-        """冷 resume 有 tool_call_id 时应替换历史恢复出的 ask_user tool result。"""
-        answers = {"Which DB?": "PostgreSQL"}
-        service.agent.has_pending_interrupt.return_value = False
-        service._build_restored_history_messages.return_value = [
-            AgentHistoryMessage(
-                role="tool",
-                content="[Awaiting user response]",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-        service.agent.messages = [
-            AgentHistoryMessage(
-                role="tool",
-                content="[Awaiting user response]",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-
-        with patch.object(
-            service,
-            "_load_persisted_interrupt",
-            return_value={
-                "interrupt_id": "iid-1",
-                "round_id": "round-interrupted",
-                "tool_call_id": "tc-ask",
-            },
-        ):
-            with patch.object(service, "_save_conversation_message"):
-                async for _ in service.resume_agui("iid-1", answers):
-                    pass
-
-        service.agent.resume_from_interrupt.assert_not_called()
-        service.agent.add_user_message.assert_not_called()
-        assert service.agent.messages[0].content == "User answered:\n- Which DB?: PostgreSQL"
-        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
-        assert create_kwargs["interrupt_id"] == "iid-1"
-        assert create_kwargs["tool_call_id"] == "tc-ask"
-        assert create_kwargs["tool_result_content"] == "User answered:\n- Which DB?: PostgreSQL"
-        assert create_kwargs["restore_strategy"] == "cold_replace"
-        assert create_kwargs["fallback_reason"] is None
-
-    @pytest.mark.asyncio
-    async def test_resume_agui_cold_path_records_fallback_reason_when_replace_fails(self, service):
-        """冷 resume 替换失败时应降级 user message，并把原因写入 resolution。"""
-        answers = {"Which DB?": "PostgreSQL"}
-        service.agent.has_pending_interrupt.return_value = False
-        service._build_restored_history_messages.return_value = [
-            AgentHistoryMessage(
-                role="tool",
-                content="already resolved",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-        service.agent.messages = [
-            AgentHistoryMessage(
-                role="tool",
-                content="already resolved",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-
-        with patch.object(
-            service,
-            "_load_persisted_interrupt",
-            return_value={
-                "interrupt_id": "iid-1",
-                "round_id": "round-interrupted",
-                "tool_call_id": "tc-ask",
-            },
-        ):
-            with patch.object(service, "_save_conversation_message"):
-                async for _ in service.resume_agui("iid-1", answers):
-                    pass
-
-        service.agent.add_user_message.assert_called_once()
-        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
-        assert create_kwargs["restore_strategy"] == "cold_fallback_user_message"
-        assert create_kwargs["fallback_reason"] == "tool placeholder not found or already resolved"
-        assert create_kwargs["interrupt_id"] == "iid-1"
-
-    @pytest.mark.asyncio
-    async def test_resume_agui_restores_hot_state_when_resume_round_create_fails(self, service):
-        """DB 创建 resume round 失败时，热路径不应留下已恢复的内存状态。"""
-        answers = {"Which DB?": "PostgreSQL"}
-        pending = {
-            "interrupt_id": "iid-1",
-            "tool_call_id": "tc-ask",
-            "questions": [{"question": "Which DB?"}],
-        }
-        service.agent._pending_interrupt = dict(pending)
-        service._build_restored_history_messages.return_value = [
-            AgentHistoryMessage(
-                role="tool",
-                content="[Awaiting user response]",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-        service.agent.messages = [
-            AgentHistoryMessage(
-                role="tool",
-                content="[Awaiting user response]",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-        service.history_service.create_resume_round.side_effect = [
-            ValueError("Round is not resumable: round-interrupted status=resumed"),
-            None,
-        ]
-
-        def _resume_from_interrupt(_interrupt_id, _answers):
-            service.agent.messages[0].content = "User answered:\n- Which DB?: PostgreSQL"
-            service.agent._pending_interrupt = None
-
-        service.agent.resume_from_interrupt.side_effect = _resume_from_interrupt
-
-        with patch.object(
-            service,
-            "_load_persisted_interrupt",
-            return_value={
-                "interrupt_id": "iid-1",
-                "round_id": "round-interrupted",
-                "tool_call_id": "tc-ask",
-            },
-        ):
-            with patch.object(service, "_save_conversation_message"):
-                with pytest.raises(ValueError, match="Round is not resumable"):
-                    async for _ in service.resume_agui("iid-1", answers):
-                        pass
-
-                assert service.agent.messages[0].content == "[Awaiting user response]"
-                assert service.agent._pending_interrupt == pending
-
-                async for _ in service.resume_agui("iid-1", answers):
-                    pass
-
-        assert service.agent.resume_from_interrupt.call_count == 2
-        assert service.agent.messages[0].content == "User answered:\n- Which DB?: PostgreSQL"
-        assert service.agent._pending_interrupt is None
-
-    @pytest.mark.asyncio
-    async def test_resume_agui_restores_cold_replace_when_resume_round_create_fails(self, service):
-        """DB 创建 resume round 失败时，冷替换路径应还原 tool 占位。"""
-        answers = {"Which DB?": "PostgreSQL"}
-        service.agent.has_pending_interrupt.return_value = False
-        service._build_restored_history_messages.return_value = [
-            AgentHistoryMessage(
-                role="tool",
-                content="[Awaiting user response]",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-        service.agent.messages = [
-            AgentHistoryMessage(
-                role="tool",
-                content="[Awaiting user response]",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-        service.history_service.create_resume_round.side_effect = ValueError(
-            "Interrupt already resumed: iid-1"
-        )
-
-        with patch.object(
-            service,
-            "_load_persisted_interrupt",
-            return_value={
-                "interrupt_id": "iid-1",
-                "round_id": "round-interrupted",
-                "tool_call_id": "tc-ask",
-            },
-        ):
-            with patch.object(service, "_save_conversation_message"):
-                with pytest.raises(ValueError, match="Interrupt already resumed"):
-                    async for _ in service.resume_agui("iid-1", answers):
-                        pass
-
-        assert service.agent.messages[0].content == "[Awaiting user response]"
-        service.agent.add_user_message.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_resume_agui_restores_cold_fallback_when_resume_round_create_fails(self, service):
-        """DB 创建 resume round 失败时，冷 fallback 不应留下重复 Q/A user。"""
-        answers = {"Which DB?": "PostgreSQL"}
-        service.agent.has_pending_interrupt.return_value = False
-        service._build_restored_history_messages.return_value = [
-            AgentHistoryMessage(
-                role="tool",
-                content="already resolved",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-        service.agent.messages = [
-            AgentHistoryMessage(
-                role="tool",
-                content="already resolved",
-                tool_call_id="tc-ask",
-                name="ask_user",
-            )
-        ]
-        service.history_service.create_resume_round.side_effect = ValueError(
-            "Interrupt already resumed: iid-1"
-        )
-
-        def _add_user_message(content):
-            service.agent.messages.append(AgentHistoryMessage(role="user", content=content))
-
-        service.agent.add_user_message.side_effect = _add_user_message
-
-        with patch.object(
-            service,
-            "_load_persisted_interrupt",
-            return_value={
-                "interrupt_id": "iid-1",
-                "round_id": "round-interrupted",
-                "tool_call_id": "tc-ask",
-            },
-        ):
-            with patch.object(service, "_save_conversation_message"):
-                with pytest.raises(ValueError, match="Interrupt already resumed"):
-                    async for _ in service.resume_agui("iid-1", answers):
-                        pass
-
-        assert [msg.role for msg in service.agent.messages] == ["tool"]
-        assert service.agent.messages[0].content == "already resolved"
-
-    @pytest.mark.asyncio
-    async def test_resume_agui_uses_hot_parent_cache_before_interrupt_commit(self, service):
-        """热恢复可用内存态 parent 映射覆盖 RUN_FINISHED 刚发出但 DB 尚未标 interrupted 的窗口。"""
-        answers = {"Which DB?": "PostgreSQL"}
-        service._pending_interrupt_round_ids["iid-1"] = "round-interrupted"
-
-        with patch.object(service, "_load_persisted_interrupt", return_value=None):
-            with patch.object(service, "_save_conversation_message"):
-                async for _ in service.resume_agui("iid-1", answers):
-                    pass
-
-        service.agent.resume_from_interrupt.assert_called_once_with("iid-1", answers)
-        assert service.history_service.create_resume_round.call_args.kwargs["parent_run_id"] == "round-interrupted"
-        service.history_service.create_round.assert_not_called()
-        assert "iid-1" not in service._pending_interrupt_round_ids
-
-    @pytest.mark.asyncio
-    async def test_resume_agui_uses_hot_pending_snapshot_parent_without_side_map(self, service):
-        """热恢复应能直接从 pending interrupt 快照拿到 parent round。"""
-        answers = {"Which DB?": "PostgreSQL"}
+    def test_has_pending_interrupt_discards_cancelled_same_round_hot_cache(self, service):
         service.agent._pending_interrupt = {
-            "interrupt_id": "iid-1",
-            "round_id": "round-interrupted",
-            "tool_call_id": "tc-ask",
-            "questions": [{"question": "Which DB?"}],
+            "interrupt_id": "iid-cancelled",
+            "round_id": "round-cancelled",
+            "kind": "ask_user",
         }
 
         with patch.object(service, "_load_persisted_interrupt", return_value=None):
-            with patch.object(service, "_save_conversation_message"):
-                async for _ in service.resume_agui("iid-1", answers):
-                    pass
+            assert service.has_pending_interrupt("iid-cancelled") is False
 
-        service.agent.resume_from_interrupt.assert_called_once_with("iid-1", answers)
-        create_kwargs = service.history_service.create_resume_round.call_args.kwargs
-        assert create_kwargs["parent_run_id"] == "round-interrupted"
-        assert create_kwargs["tool_call_id"] == "tc-ask"
-        service.history_service.create_round.assert_not_called()
+        assert service.agent._pending_interrupt is None
+        assert "iid-cancelled" not in service._pending_interrupt_round_ids

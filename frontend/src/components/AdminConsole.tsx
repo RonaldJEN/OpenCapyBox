@@ -59,6 +59,8 @@ import {
   type AdminSandboxProfilesResponse,
   type AdminCreateSimpleUserRequest,
   type AdminOverview,
+  type AdminRoundStatus,
+  type AdminRoundStatusFilter,
   type AdminRoundStepItem,
   type AdminRoundTreeResponse,
   type AdminSystemResponse,
@@ -82,6 +84,15 @@ type UserRoleFilter = 'all' | 'admin' | 'user';
 type UserAuthFilter = 'all' | 'simple' | 'ldap';
 type UserSortKey = 'recent' | 'name' | 'tokens';
 type OverviewDays = 7 | 14 | 30;
+
+const ADMIN_ROUND_STATUS_OPTIONS: readonly AdminRoundStatus[] = [
+  'running',
+  'waiting_interaction',
+  'completed',
+  'failed',
+  'cancelled',
+  'max_steps_reached',
+];
 
 interface UserCreateFormValues {
   authType: UserCreateMode;
@@ -373,7 +384,6 @@ function buildStepAnalysis(step: AdminRoundStepItem): {
 
 function statusClass(status: string): string {
   if (status === 'running') return 'running';
-  if (status === 'resumed') return 'paused';
   if (status === 'ok' || status === 'active' || status === 'completed' || status === 'success') return 'ok';
   if (status === 'failed' || status === 'error' || status === 'cancelled') return 'error';
   if (status === 'admin' || status === 'user') return status;
@@ -464,7 +474,7 @@ export default function AdminConsole() {
   const adminMcpDiscardDialogRef = useRef<HTMLElement>(null);
   const adminMcpNavigationReturnFocusRef = useRef<HTMLElement | null>(null);
 
-  const [roundStatus, setRoundStatus] = useState('all');
+  const [roundStatus, setRoundStatus] = useState<AdminRoundStatusFilter>('all');
   const [roundSearch, setRoundSearch] = useState('');
   const debouncedRoundSearch = useDebouncedValue(roundSearch, 350);
   const [roundPage, setRoundPage] = useState(1);
@@ -1409,7 +1419,7 @@ function RoundsPanel({
   onStepDetailOpen,
 }: {
   data: AdminRoundTreeResponse | null;
-  roundStatus: string;
+  roundStatus: AdminRoundStatusFilter;
   roundSearch: string;
   roundPage: number;
   roundPageSize: number;
@@ -1422,7 +1432,7 @@ function RoundsPanel({
   onDismissReviewError: () => void;
   onDismissStepDetailError: () => void;
   onDismissSessionRoundLoadError: () => void;
-  onStatusChange: (value: string) => void;
+  onStatusChange: (value: AdminRoundStatusFilter) => void;
   onSearchChange: (value: string) => void;
   onPageChange: (value: number) => void;
   onPageSizeChange: (value: number) => void;
@@ -1476,13 +1486,16 @@ function RoundsPanel({
         <h3 className="admin-card-header-title">Session监控（Session → Round → Step）</h3>
         <div style={{ flex: 1 }} />
         <div className="admin-toolbar">
-          <select className="admin-select" value={roundStatus} onChange={(e) => onStatusChange(e.target.value)}>
+          <select
+            aria-label="Round 状态"
+            className="admin-select"
+            value={roundStatus}
+            onChange={(e) => onStatusChange(e.target.value as AdminRoundStatusFilter)}
+          >
             <option value="all">全部状态</option>
-            <option value="running">running</option>
-            <option value="completed">completed</option>
-            <option value="failed">failed</option>
-            <option value="interrupted">interrupted</option>
-            <option value="cancelled">cancelled</option>
+            {ADMIN_ROUND_STATUS_OPTIONS.map((status) => (
+              <option key={status} value={status}>{status}</option>
+            ))}
           </select>
           <input
             className="admin-input"

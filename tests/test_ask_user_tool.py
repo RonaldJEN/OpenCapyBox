@@ -90,24 +90,6 @@ class TestAgentInterrupt:
     """测试 Agent 在遇到 ask_user 时正确中断"""
 
     @pytest.mark.asyncio
-    async def test_ask_user_triggers_interrupt(self, tmp_path):
-        """ask_user 应触发 RUN_FINISHED(outcome=interrupt)"""
-        llm = MockLLMClient()
-        llm.responses = [_make_ask_user_response()]
-
-        agent = make_agent(tmp_path, llm=llm, tools=[AskUserQuestionTool()])
-        agent.add_user_message("Help me choose a database")
-
-        events, event_types = await collect_agui_events(agent)
-
-        assert "RUN_FINISHED" in event_types
-        run_finished = [e for e in events if e.type.value == "RUN_FINISHED"][0]
-        assert run_finished.outcome == "interrupt"
-        assert run_finished.interrupt is not None
-        assert run_finished.interrupt.reason == "input_required"
-        assert "questions" in run_finished.interrupt.payload
-
-    @pytest.mark.asyncio
     async def test_interrupt_saves_pending_state(self, tmp_path):
         """中断后 agent._pending_interrupt 应有正确状态"""
         llm = MockLLMClient()
@@ -140,8 +122,8 @@ class TestAgentInterrupt:
         assert tool_msgs[0].tool_call_id == "tc_ask_1"
 
     @pytest.mark.asyncio
-    async def test_tool_call_events_emitted_before_interrupt(self, tmp_path):
-        """中断前应发出 TOOL_CALL_START/ARGS/END/RESULT 事件"""
+    async def test_tool_call_events_emitted_before_interaction(self, tmp_path):
+        """等待交互前发出调用边界，但不把内部占位投影到 wire。"""
         llm = MockLLMClient()
         llm.responses = [_make_ask_user_response()]
 
@@ -152,7 +134,77 @@ class TestAgentInterrupt:
 
         assert "TOOL_CALL_START" in event_types
         assert "TOOL_CALL_END" in event_types
-        assert "TOOL_CALL_RESULT" in event_types
+        assert "TOOL_CALL_RESULT" not in event_types
+
+    @pytest.mark.asyncio
+    async def test_interaction_parks_without_run_finished(self, tmp_path):
+        llm = MockLLMClient()
+        llm.responses = [_make_ask_user_response()]
+        agent = make_agent(tmp_path, llm=llm, tools=[AskUserQuestionTool()])
+        agent.add_user_message("Help")
+
+        events, event_types = await collect_agui_events(agent)
+
+        assert "RUN_FINISHED" not in event_types
+        assert not any(
+            event.type.value == "TOOL_CALL_RESULT"
+            and event.content == "[Awaiting user response]"
+            for event in events
+        )
+        requested = [
+            event
+            for event in events
+            if event.type.value == "CUSTOM" and event.name == "interaction_requested"
+        ]
+        assert len(requested) == 1
+        assert requested[0].value["runId"] == "test_run"
+        assert requested[0].value["toolCallId"] == "tc_ask_1"
+
+    @pytest.mark.asyncio
+    async def test_continuation_suppresses_second_run_started(self, tmp_path):
+        llm = MockLLMClient()
+        llm.responses = [
+            _make_ask_user_response(),
+            LLMResponse(
+                content="Use PostgreSQL",
+                thinking=None,
+                finish_reason="stop",
+                tool_calls=[],
+            ),
+        ]
+        agent = make_agent(tmp_path, llm=llm, tools=[AskUserQuestionTool()])
+        agent.add_user_message("Help")
+
+        first_events, _ = await collect_agui_events(agent)
+        interaction_id = next(
+            event.value["interactionId"]
+            for event in first_events
+            if event.type.value == "CUSTOM" and event.name == "interaction_requested"
+        )
+        agent.resume_from_interrupt(
+            interaction_id,
+            {"Which database should we use?": "PostgreSQL"},
+        )
+
+        continuation = []
+        async for event in agent.run_agui(
+            thread_id="test_thread",
+            run_id="test_run",
+            emit_run_started=False,
+            initial_step=1,
+        ):
+            continuation.append(event)
+
+        assert not any(event.type.value == "RUN_STARTED" for event in continuation)
+        assert next(
+            event.step_name
+            for event in continuation
+            if event.type.value == "STEP_STARTED"
+        ) == "step_2"
+        assert any(
+            event.type.value == "RUN_FINISHED" and event.outcome == "success"
+            for event in continuation
+        )
 
     @pytest.mark.asyncio
     async def test_remaining_tool_calls_skipped(self, tmp_path):
@@ -255,9 +307,17 @@ class TestAgentResume:
 
     def test_format_interrupt_tool_result_is_shared_resume_format(self):
         """结构化 resolution 持久化应复用热 resume 的 tool result 格式。"""
-        content = Agent.format_interrupt_tool_result({"Q1?": "A1", "Q2?": "A2"})
+        definitions = [{"question": "Z?"}, {"question": "A?"}]
+        content = Agent.format_interrupt_tool_result(
+            {"A?": "A2", "Z?": "A1"},
+            definitions,
+        )
+        pre_normalized = Agent.format_interrupt_tool_result(
+            {"Z?": "A1", "A?": "A2"}
+        )
 
-        assert content == "User answered:\n- Q1?: A1\n- Q2?: A2"
+        assert content == "User answered:\n- Z?: A1\n- A?: A2"
+        assert pre_normalized == content
 
     @pytest.mark.asyncio
     async def test_resume_wrong_id_raises(self, tmp_path):
@@ -365,25 +425,6 @@ class TestResumeRequestSchema:
 
 
 # ============== Bug-fix 回归测试 ==============
-
-
-class TestInterruptOutcomeMapping:
-    """回归：interrupt outcome 应映射为 'interrupted'（而非 'failed'）"""
-
-    @pytest.mark.asyncio
-    async def test_interrupt_run_finished_outcome(self, tmp_path):
-        """RUN_FINISHED 中 interrupt 的 outcome 值验证"""
-        llm = MockLLMClient()
-        llm.responses = [_make_ask_user_response()]
-
-        agent = make_agent(tmp_path, llm=llm, tools=[AskUserQuestionTool()])
-        agent.add_user_message("Choose")
-
-        events, _ = await collect_agui_events(agent)
-        rf = [e for e in events if e.type.value == "RUN_FINISHED"][0]
-        # outcome 应严格为 "interrupt"，agent_service 据此映射 status
-        assert rf.outcome == "interrupt"
-        assert rf.outcome != "failed"
 
 
 class TestAnswerKeyIsQuestionText:

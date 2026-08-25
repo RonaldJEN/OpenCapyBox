@@ -944,6 +944,77 @@ def test_rounds_tree_real_sql_supports_limit_offset_status_search(admin_integrat
     assert searched_data["sessions"][0]["session_id"] == "s-mid"
 
 
+def test_rounds_tree_session_status_priority_includes_waiting(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    now = now_naive()
+    cases = {
+        "s-completed": ("completed",),
+        "s-error": ("completed", "max_steps_reached"),
+        "s-waiting": ("completed", "failed", "waiting_interaction"),
+        "s-running": ("failed", "waiting_interaction", "running"),
+    }
+    db = SessionLocal()
+    try:
+        for session_offset, (session_id, statuses) in enumerate(cases.items()):
+            created_at = now + timedelta(minutes=session_offset)
+            db.add(Session(
+                id=session_id,
+                user_id="admin",
+                title=session_id,
+                status="active",
+                created_at=created_at,
+                updated_at=created_at,
+            ))
+            db.flush()
+            for round_offset, round_status in enumerate(statuses):
+                round_created_at = created_at + timedelta(seconds=round_offset)
+                db.add(Round(
+                    id=f"{session_id}-{round_status}",
+                    thread_id=session_id,
+                    session_id=session_id,
+                    user_message=round_status,
+                    final_response="",
+                    step_count=0,
+                    status=round_status,
+                    created_at=round_created_at,
+                    completed_at=(
+                        None
+                        if round_status in {"running", "waiting_interaction"}
+                        else round_created_at + timedelta(seconds=1)
+                    ),
+                ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/admin/rounds-tree", params={"status": "all", "limit": 10})
+    assert response.status_code == 200
+    status_by_session = {
+        item["session_id"]: item["status"]
+        for item in response.json()["sessions"]
+    }
+    assert status_by_session == {
+        "s-completed": "completed",
+        "s-error": "error",
+        "s-waiting": "waiting_interaction",
+        "s-running": "running",
+    }
+
+    waiting_only = client.get(
+        "/admin/rounds-tree",
+        params={"status": "waiting_interaction", "limit": 10},
+    )
+    assert waiting_only.status_code == 200
+    assert {
+        item["session_id"]: item["status"]
+        for item in waiting_only.json()["sessions"]
+    } == {
+        "s-waiting": "waiting_interaction",
+        "s-running": "waiting_interaction",
+    }
+
+
 def test_rounds_tree_step_list_is_lightweight_and_detail_is_full(admin_integration_client):
     client, SessionLocal = admin_integration_client
 
@@ -1132,40 +1203,6 @@ def test_rounds_tree_marks_subagent_child_rounds(admin_integration_client):
     assert by_id["child-run"]["parent_run_id"] == "parent-run"
     assert by_id["child-run"]["subagent_type"] == "general-purpose"
     assert by_id["child-run"]["subagent_description"] == "vlog完整制作方案+分镜脚本+爆款标题"
-
-
-def test_rounds_tree_resumed_round_does_not_make_session_running(admin_integration_client):
-    client, SessionLocal = admin_integration_client
-
-    now = now_naive()
-    db = SessionLocal()
-    _insert_round_with_step(
-        db,
-        session_id="s-resumed",
-        user_id="admin",
-        title="ResumedSession",
-        round_id="round-resumed",
-        status="resumed",
-        created_at=now,
-        user_message="你用subagent解决下问题",
-        final_response="resumed by follow-up",
-        request_messages=json.dumps([{"role": "user", "content": "resume"}], ensure_ascii=False),
-        response_content="resume response",
-    )
-    db.commit()
-    db.close()
-
-    response = client.get("/admin/rounds-tree", params={"limit": 5, "offset": 0, "status": "all"})
-
-    assert response.status_code == 200
-    session = response.json()["sessions"][0]
-    assert session["session_id"] == "s-resumed"
-    assert session["status"] == "completed"
-    assert session["rounds"] == []
-
-    response = client.get("/admin/sessions/s-resumed/rounds", params={"status": "all"})
-    assert response.status_code == 200
-    assert response.json()["rounds"][0]["status"] == "resumed"
 
 
 def test_users_payload_counts_recent_user_run_lock_as_running(admin_integration_client):

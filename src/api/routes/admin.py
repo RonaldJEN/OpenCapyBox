@@ -1119,6 +1119,34 @@ def _build_overview_payload(db: DBSession, days: int) -> dict[str, Any]:
         "trends": [trend_map[day] for day in day_labels],
     }
 
+_ADMIN_SESSION_ERROR_ROUND_STATUSES = (
+    "failed",
+    "cancelled",
+    "max_steps_reached",
+)
+
+
+def _admin_session_monitor_status(
+    *,
+    running_rounds: int,
+    waiting_rounds: int,
+    error_rounds: int,
+) -> str:
+    """Project matching Round states to one Session monitor status.
+
+    A live producer wins over a durable human wait; either wins over an older
+    terminal error. Only a Session without active, waiting, or error Rounds is
+    presented as completed.
+    """
+    if running_rounds > 0:
+        return "running"
+    if waiting_rounds > 0:
+        return "waiting_interaction"
+    if error_rounds > 0:
+        return "error"
+    return "completed"
+
+
 def _build_rounds_tree_payload(
     db: DBSession,
     *,
@@ -1185,7 +1213,11 @@ def _build_rounds_tree_payload(
                 0,
             ).label("running_rounds"),
             func.coalesce(
-                func.sum(case((matching_rounds.c.status.in_({"failed", "cancelled", "interrupted"}), 1), else_=0)),
+                func.sum(case((matching_rounds.c.status == "waiting_interaction", 1), else_=0)),
+                0,
+            ).label("waiting_rounds"),
+            func.coalesce(
+                func.sum(case((matching_rounds.c.status.in_(_ADMIN_SESSION_ERROR_ROUND_STATUSES), 1), else_=0)),
                 0,
             ).label("error_rounds"),
             func.coalesce(usage_by_session.c.total_tokens, 0).label("total_tokens"),
@@ -1216,12 +1248,11 @@ def _build_rounds_tree_payload(
 
     ordered_sessions: list[dict[str, Any]] = []
     for row in session_rows:
-        if int(row.running_rounds or 0) > 0:
-            session_status = "running"
-        elif int(row.error_rounds or 0) > 0:
-            session_status = "error"
-        else:
-            session_status = "completed"
+        session_status = _admin_session_monitor_status(
+            running_rounds=int(row.running_rounds or 0),
+            waiting_rounds=int(row.waiting_rounds or 0),
+            error_rounds=int(row.error_rounds or 0),
+        )
 
         ordered_sessions.append({
             "session_id": row.session_id,
@@ -2103,7 +2134,7 @@ async def get_admin_rounds_tree(
     offset: int = Query(0, ge=0),
     status: str = Query(
         "all",
-        description="all|running|completed|failed|interrupted|resumed|cancelled|max_steps_reached",
+        description="all|running|waiting_interaction|completed|failed|cancelled|max_steps_reached",
     ),
     user_id: str | None = Query(None),
     search: str | None = Query(None),
@@ -2149,7 +2180,7 @@ async def get_admin_session_rounds(
     session_id: str,
     status: str = Query(
         "all",
-        description="all|running|completed|failed|interrupted|resumed|cancelled|max_steps_reached",
+        description="all|running|waiting_interaction|completed|failed|cancelled|max_steps_reached",
     ),
     search: str | None = Query(None),
     _: str = Depends(get_current_admin_user),

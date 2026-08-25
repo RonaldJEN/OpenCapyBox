@@ -20,8 +20,21 @@ from sqlalchemy.orm import Session as DBSession
 from src.agent.schema.agui_events import AGUIEvent, EventType
 from src.api.models.agui_event import AGUIEventLog
 from src.api.models.round import Round
+from src.api.services.agent_interaction_service import (
+    AgentInteractionService,
+    ContinuationWriteFence,
+    InteractionConflictError,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class RoundTerminalWriteSuppressed(RuntimeError):
+    """The authoritative Round became terminal before this event could emit."""
+
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        super().__init__(f"Round is already terminal: {run_id}")
 
 
 @dataclass(frozen=True)
@@ -193,7 +206,13 @@ class AguiEventBus:
         finally:
             db.close()
 
-    async def publish(self, run_id: str, event: AGUIEvent | dict[str, Any]) -> StoredEvent | None:
+    async def publish(
+        self,
+        run_id: str,
+        event: AGUIEvent | dict[str, Any],
+        *,
+        continuation_fence: ContinuationWriteFence | None = None,
+    ) -> StoredEvent | None:
         """Persist a durable event and fan it out after commit.
 
         Streaming delta events are live-only and return ``None``.  Their
@@ -210,16 +229,45 @@ class AguiEventBus:
                 raise RuntimeError("AguiEventBus has no DB session")
 
             if self._is_round_terminal(db, run_id):
-                db.commit()
+                db.rollback()
                 self._terminal_runs.add(run_id)
                 logger.info("Run %s 已终态，丢弃迟到事件: %s", run_id, event_type)
-                return None
+                raise RoundTerminalWriteSuppressed(run_id)
 
             enum_type = self._event_type_to_enum(event_type)
             if enum_type in self._STREAM_DELTA_EVENTS:
-                self._buffer_delta(run_id, enum_type, event, event_dict)
-                db.commit()
-                await self.publish_ephemeral(run_id, event_dict)
+                try:
+                    if continuation_fence is not None:
+                        AgentInteractionService.fence_continuation_write(
+                            db,
+                            run_id=run_id,
+                            fence=continuation_fence,
+                            durable=False,
+                            commit=False,
+                        )
+                    else:
+                        round_obj = self._lock_round_row_if_possible(db, run_id)
+                        if (
+                            round_obj is not None
+                            and getattr(round_obj, "status", None)
+                            in Round.SUBSCRIBE_TERMINAL_STATUSES
+                        ):
+                            self._terminal_runs.add(run_id)
+                            logger.info(
+                                "Run %s reached terminal state before ephemeral fanout; dropping",
+                                run_id,
+                            )
+                            db.rollback()
+                            raise RoundTerminalWriteSuppressed(run_id)
+                    # Fanout while the Round lock is held. A concurrent abort
+                    # therefore orders after this delta instead of committing a
+                    # terminal event first and then receiving stale output.
+                    self._buffer_delta(run_id, enum_type, event, event_dict)
+                    await self.publish_ephemeral(run_id, event_dict)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
                 return None
 
             pending_payloads: list[dict[str, Any]] = []
@@ -234,7 +282,19 @@ class AguiEventBus:
 
             pending_payloads.append(event_dict)
             pending_meta.append(self._extract_event_meta(event, event_dict))
-            stored_events = self._write_events_with_sequences(db, run_id, pending_payloads, pending_meta)
+            try:
+                stored_events = self._write_events_with_sequences(
+                    db,
+                    run_id,
+                    pending_payloads,
+                    pending_meta,
+                    continuation_fence=continuation_fence,
+                )
+            except Exception:
+                db.rollback()
+                raise
+            if not stored_events:
+                return None
             stored = stored_events[-1]
 
         for committed in stored_events:
@@ -248,6 +308,51 @@ class AguiEventBus:
     async def publish_committed(self, run_id: str, event: dict[str, Any]) -> None:
         """Fan out an already-committed durable event."""
         await self._fanout(run_id, event)
+
+    def publish_committed_nowait(self, run_id: str, event: dict[str, Any]) -> None:
+        """Wake live subscribers from a synchronous convergence boundary.
+
+        Recovery paths such as stale-worker cleanup and history reconciliation
+        are intentionally synchronous DB transactions.  Their durable terminal
+        event still has to wake a subscriber already blocked in ``queue.get``.
+        When that queue belongs to another event-loop thread, schedule the put
+        on its bound loop instead of touching the asyncio primitive directly.
+        """
+        event_dict = self._event_to_dict(event)
+        with self._subscribers_lock:
+            subscribers = list(self._subscribers.get(run_id, []))
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        failed_queues: list[asyncio.Queue] = []
+        for queue in subscribers:
+            try:
+                target_loop = getattr(queue, "_loop", None)
+                if (
+                    target_loop is not None
+                    and target_loop is not current_loop
+                    and target_loop.is_running()
+                ):
+                    target_loop.call_soon_threadsafe(queue.put_nowait, event_dict)
+                else:
+                    queue.put_nowait(event_dict)
+            except Exception:
+                failed_queues.append(queue)
+
+        if not failed_queues:
+            return
+        with self._subscribers_lock:
+            active = self._subscribers.get(run_id)
+            if not active:
+                return
+            for queue in failed_queues:
+                if queue in active:
+                    active.remove(queue)
+            if not active:
+                del self._subscribers[run_id]
 
     async def replay(self, run_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
         """Load durable events from PostgreSQL, injecting top-level sequence."""
@@ -285,6 +390,24 @@ class AguiEventBus:
                 return
 
         if await self.ensure_terminal(run_id):
+            # A terminal can commit after the initial replay has returned but
+            # before this subscriber owns a live queue.  In that window the
+            # commit has nobody to fan out to, so observing the terminal row
+            # must be followed by one last durable replay.  When the caller's
+            # cursor already includes the terminal this replay is empty and a
+            # clean EOF remains the correct result.
+            for event in await self.replay(run_id, latest_sequence):
+                seq = self._parse_sequence(event)
+                if seq is not None:
+                    if seq in seen_sequences:
+                        continue
+                    latest_sequence = max(latest_sequence, seq)
+                    seen_sequences.add(seq)
+                if stream_view_filter.is_duplicate(event):
+                    continue
+                yield event
+                if event.get("type") in self._TERMINAL_TYPES:
+                    return
             return
 
         queue: asyncio.Queue = asyncio.Queue()
@@ -390,6 +513,8 @@ class AguiEventBus:
         run_id: str,
         payloads: Iterable[dict[str, Any]],
         metadata: Iterable[dict[str, Any]],
+        *,
+        continuation_fence: ContinuationWriteFence | None = None,
     ) -> list[StoredEvent]:
         payload_list = list(payloads)
         metadata_list = list(metadata)
@@ -399,29 +524,57 @@ class AguiEventBus:
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                self._lock_round_row_if_possible(db, run_id)
-                next_sequence = self._current_high_water(db, run_id) + 1
-                stored_events: list[StoredEvent] = []
-                for offset, (payload, meta) in enumerate(zip(payload_list, metadata_list)):
-                    sequence = next_sequence + offset
-                    payload_with_sequence = dict(payload)
-                    payload_with_sequence["sequence"] = sequence
-                    event_log = AGUIEventLog(
-                        run_id=run_id,
-                        event_type=meta["event_type"],
-                        message_id=meta.get("message_id"),
-                        tool_call_id=meta.get("tool_call_id"),
-                        timestamp=meta.get("timestamp"),
-                        payload=json.dumps(payload_with_sequence, ensure_ascii=False),
-                        sequence=sequence,
-                    )
-                    db.add(event_log)
-                    stored_events.append(StoredEvent(run_id, sequence, payload_with_sequence))
+                # Preserve caller-owned state (notably create_pending +
+                # Round->waiting) across a sequence collision. Only the event
+                # allocation attempt and any continuation boundary transition
+                # live inside the savepoint and are replayed on retry.
+                with db.begin_nested():
+                    round_obj = self._lock_round_row_if_possible(db, run_id)
+                    if (
+                        round_obj is not None
+                        and getattr(round_obj, "status", None)
+                        in Round.SUBSCRIBE_TERMINAL_STATUSES
+                    ):
+                        self._terminal_runs.add(run_id)
+                        logger.info(
+                            "Run %s reached terminal state before durable event lock; dropping",
+                            run_id,
+                        )
+                        raise RoundTerminalWriteSuppressed(run_id)
+                    if continuation_fence is not None:
+                        AgentInteractionService.fence_continuation_write(
+                            db,
+                            run_id=run_id,
+                            fence=continuation_fence,
+                            durable=True,
+                            commit=False,
+                        )
+                    next_sequence = self._current_high_water(db, run_id) + 1
+                    stored_events: list[StoredEvent] = []
+                    for offset, (payload, meta) in enumerate(zip(payload_list, metadata_list)):
+                        sequence = next_sequence + offset
+                        payload_with_sequence = dict(payload)
+                        payload_with_sequence["sequence"] = sequence
+                        event_log = AGUIEventLog(
+                            run_id=run_id,
+                            event_type=meta["event_type"],
+                            message_id=meta.get("message_id"),
+                            tool_call_id=meta.get("tool_call_id"),
+                            timestamp=meta.get("timestamp"),
+                            payload=json.dumps(payload_with_sequence, ensure_ascii=False),
+                            sequence=sequence,
+                        )
+                        db.add(event_log)
+                        stored_events.append(
+                            StoredEvent(run_id, sequence, payload_with_sequence)
+                        )
+                    db.flush()
                 db.commit()
                 return stored_events
+            except InteractionConflictError:
+                raise
             except IntegrityError as exc:
                 last_exc = exc
-                db.rollback()
                 if attempt == 2:
                     raise
                 logger.warning(
@@ -431,16 +584,21 @@ class AguiEventBus:
                 )
         raise last_exc  # type: ignore[misc]
 
-    def _lock_round_row_if_possible(self, db: DBSession, run_id: str) -> None:
+    def _lock_round_row_if_possible(
+        self,
+        db: DBSession,
+        run_id: str,
+    ) -> Round | None:
         round_obj = db.query(Round).filter(Round.id == run_id).first()
         if round_obj is None:
-            return
+            return None
         if not self._is_mapped_instance(round_obj):
-            return
+            return round_obj
         try:
             db.refresh(round_obj, with_for_update=True)
         except TypeError:
             db.refresh(round_obj)
+        return round_obj
 
     @staticmethod
     def _is_mapped_instance(obj: Any) -> bool:

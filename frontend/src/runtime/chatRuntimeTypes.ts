@@ -10,9 +10,19 @@ import type {
 
 export type StreamSource = 'direct' | 'subscribe' | 'resume';
 
+/** Internal event used to project a complete history snapshot before advancing a run cursor. */
+export const RUNTIME_HISTORY_SNAPSHOT = 'RUNTIME_HISTORY_SNAPSHOT' as const;
+
+export interface RuntimeHistorySnapshotEvent {
+  type: typeof RUNTIME_HISTORY_SNAPSHOT;
+  rounds: RoundData[];
+  sequence?: number;
+}
+
 export type RunStatus =
   | 'starting'
   | 'streaming'
+  | 'waiting'
   | 'cancelled'
   | 'finished'
   | 'error'
@@ -26,6 +36,8 @@ export interface StreamEnvelope {
   connectionId: string;
   event: AGUIEvent | any;
   source: StreamSource;
+  /** Event synthesized from an authoritative history snapshot after transport loss. */
+  authoritativeRecovery?: boolean;
   sequence?: number;
   isAggregate?: boolean;
   eventId?: string;
@@ -42,10 +54,18 @@ export interface HistoryLoadedAction {
   source: 'history';
 }
 
+export interface StreamSegmentState {
+  open: boolean;
+  dirty: boolean;
+}
+
 export interface StreamBuffers {
   textByMessageId: Record<string, string>;
   thinkingByMessageId: Record<string, string>;
   toolArgsByToolCallId: Record<string, string>;
+  textSegmentStateByMessageId: Record<string, StreamSegmentState>;
+  thinkingSegmentStateByMessageId: Record<string, StreamSegmentState>;
+  toolArgsSegmentStateByToolCallId: Record<string, StreamSegmentState>;
   currentTextMessageId?: string | null;
   currentThinkingMessageId?: string | null;
 }
@@ -59,6 +79,8 @@ export interface ChatRunRuntimeState {
   source: StreamSource | 'history' | 'init';
   status: RunStatus;
   lastSequence: number;
+  /** Latest durable interaction_requested / interaction_resolved boundary. */
+  lastInteractionSequence?: number;
   buffers: StreamBuffers;
   backendTerminal?: any;
   debugMetadata?: Record<string, any>;
@@ -103,8 +125,21 @@ export type ChatRuntimeAction =
       round?: RoundData;
     }
   | { type: 'STREAM_EVENT'; envelope: StreamEnvelope }
+  | {
+      type: 'LOCAL_CONTROL_CONFLICT';
+      sessionId: string;
+      clientRunKey: string;
+      serverRunId?: string;
+    }
   | { type: 'LOCAL_CANCELLED'; sessionId: string; clientRunKey?: string }
-  | { type: 'SET_PENDING_INTERRUPT'; sessionId: string; interrupt: InterruptDetails | null }
+  | { type: 'LOCAL_INIT_SLOT_CLEARED'; sessionId: string }
+  | {
+      type: 'RESTORE_PENDING_INTERACTION';
+      sessionId: string;
+      clientRunKey: string;
+      round: RoundData;
+      interrupt: InterruptDetails;
+    }
   | {
       type: 'RUNNING_SESSIONS_SNAPSHOT';
       runningSessions: Array<{ session_id: string; round_id: string | null }>;
@@ -138,6 +173,9 @@ export const emptyBuffers = (): StreamBuffers => ({
   textByMessageId: {},
   thinkingByMessageId: {},
   toolArgsByToolCallId: {},
+  textSegmentStateByMessageId: {},
+  thinkingSegmentStateByMessageId: {},
+  toolArgsSegmentStateByToolCallId: {},
   currentTextMessageId: null,
   currentThinkingMessageId: null,
 });

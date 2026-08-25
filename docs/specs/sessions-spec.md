@@ -83,7 +83,7 @@
   "final_response": "...",
   "steps": [StepData],
   "step_count": 0,
-  "status": "...",
+  "status": "running | waiting_interaction | completed | failed | cancelled | max_steps_reached",
   "created_at": "...",
   "completed_at": "...",
   "interrupt": null
@@ -91,8 +91,13 @@
 ```
 
 `idempotency_key` 由客户端发送消息时生成；history/v2 必须返回该字段，供 accepted 但尚未收到 `runId` 的断线恢复路径按因果标识定位本次 round，不能用时间窗口猜测旧 round。
-`last_event_sequence` 是该 round 已持久化 AG-UI 事件的最大 sequence；前端在 history 已经重建 running round 后订阅 SSE 时必须从该 sequence 之后接续，避免重复消费已展示事件。
-`history/v2` 只返回主聊天流可见 round；被 `subagent_runs.child_run_id` 指向的 child round 属于 sidechain，不得作为普通用户/助手对话返回。注意不能用 `parent_run_id != null` 过滤，因为 ask_user resume round 也有 `parent_run_id` 且必须保留在主聊天流。
+`last_event_sequence` 是该 Round 已持久化 AG-UI 事件的最大 sequence；前端在 history 已经重建 `running` 或 `waiting_interaction` Round 后订阅 SSE 时必须从该 sequence 之后接续，避免重复消费已展示事件。
+
+当 `status=waiting_interaction` 时，`interrupt` 必须由该 Round 的 pending `agent_interactions` 投影：`id` 为 Interaction id，`reason` 按 kind 映射为 `input_required` / `human_approval`，`payload` 包含 kind-specific 请求和 `tool_call_id`。same-Round 路径不生成额外 Q/A Round。
+
+history 读取前会处理过期 continuation claim：仅 `continuation_started_at` 为空的 pre-start ask_user / 审批可停回 `waiting_interaction`；started continuation 必须生成 durable `RUN_ERROR` 并收敛 failed，不得恢复旧卡。工具审批若已处于 `executing`，还必须先按 execution lease 收敛 unknown，绝不自动重放。
+
+`history/v2` 只返回主聊天流可见 Round；被 `subagent_runs.child_run_id` 指向的 child Round 属于 sidechain，不得作为普通用户/助手对话返回。不能只用 `parent_run_id != null` 过滤，因为该字段还可表达非 subagent 的分支关系；sidechain 身份以 `subagent_runs.child_run_id` 为准。
 
 其中 `StepData`:
 
@@ -144,7 +149,7 @@
 
 - Response 200: `{message: "会话已删除"}`
 - Error 404
-- 级联删除：Round (CASCADE) → AGUIEventLog (CASCADE)、ConversationMessage、LLMCallRecord、AgentPoolService 缓存移除
+- 级联删除：Round (CASCADE) → AGUIEventLog、ConversationMessage、LLMCallRecord、AgentInteraction、ToolApprovalRequest 等从属事实，随后移除 AgentPoolService 缓存
 - 沙箱清理：尝试删除 workspace 目录，沙箱过期时仅删 DB 记录
 
 ### GET /api/sessions/{id}/files
@@ -167,6 +172,7 @@
 - Response 200: `{running_sessions: [{session_id: str, round_id: str|null}]}`
 - `running_sessions` 返回当前用户所有持有新鲜 `UserRunLock` slot 的 session；新鲜判定为 `updated_at >= now - SSE_SUBSCRIBE_TIMEOUT`。
 - `round_id=null` 表示仍处于 Agent 初始化窗口，尚未写入 running round。
+- `waiting_interaction` 已释放 slot，因此不属于 running-sessions；客户端是否展示问题卡必须以 history/Interaction 为准，不能因该集合不含 session 而清除 waiting UI。
 - 单次查询避免 N+1
 
 ### POST /api/sessions/{id}/upload
@@ -180,10 +186,10 @@
 ## 4. 行为语义与不变量
 
 - 一个 Session = 一个 AG-UI Thread
-- Session 删除是级联的：rounds → agui_events → conversation_messages → llm_call_records 全部删除
+- Session 删除是级联的：rounds → agui_events / conversation_messages / llm_call_records / agent_interactions / tool_approval_requests 全部删除
 - 文件路径校验：必须在沙箱 mount 路径内（`is_within_sandbox_root`），否则 403
-- running-sessions 查询通过 `UserRunLock` + `Session` + `Round` 实现单次查询，返回所有活跃且未超过 `SSE_SUBSCRIBE_TIMEOUT` 的 slot
-- 历史 v2 通过 AGUI 事件动态重建 Step 结构，而非直接查表
+- running-sessions 查询通过 `UserRunLock` + `Session` + `Round` 实现单次查询，返回所有活跃且未超过 `SSE_SUBSCRIBE_TIMEOUT` 的 slot；它不等于“有未解决 Interaction 的 session 集合”
+- 历史 v2 通过 AGUI 事件动态重建 Step 结构，并结合 `agent_interactions` 投影 waiting interrupt；`interaction_requested` / `interaction_resolved` 以同一 Round sequence 重建 tool result
 
 ## 5. 失败模式与错误处理
 

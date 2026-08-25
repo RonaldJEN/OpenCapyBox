@@ -27,7 +27,7 @@
 | 消息发送与 SSE 流式响应 | 接收用户消息，启动 Agent 执行，通过 SSE 实时推送事件流 |
 | Agent 执行生命周期 | 管理从启动到终态的完整流程：启动 → 工具调用 → 完成/中断/取消/错误 |
 | SSE 订阅与断线重连 | 支持客户端重连后从指定 sequence 恢复事件流 |
-| 执行中断与恢复 | Human-in-the-Loop：`ask_user` 补充输入及工具权限审批均可暂停执行并通过结构化 resolution 恢复 |
+| 执行暂停与恢复 | Human-in-the-Loop：`ask_user` 补充输入及工具权限审批暂停同一 Round，并通过结构化 resolution 恢复 |
 | 执行取消 | 支持主动取消当前单 worker 进程内正在运行的 Agent；跨 worker 投递不属于第一版能力 |
 | 幂等性保证 | 前端重复提交相同 `idempotency_key` 不会产生多次执行 |
 | AG-UI 事件生成与持久化 | 生成标准 AG-UI 事件并写入数据库，支持事后重放 |
@@ -49,22 +49,21 @@
 
 ### 2.1 `rounds` 表（别名：Run）
 
-一条 Round 对应一次完整的 Agent 执行周期。用户每发送一条消息（或恢复一次中断）都会创建一条 Round。
+一条 Round 对应一次完整的逻辑执行周期。用户发送一条新消息会创建一条 Round；Human-in-the-Loop 恢复始终复用原 Round，不创建 child Round。
 
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
 | `id` | String(36) | PK | UUID，全局唯一 |
 | `thread_id` | String(36) | FK → `sessions.id` (CASCADE), indexed | 所属线程（当前等同于 session） |
 | `session_id` | String(36) | FK → `sessions.id` (CASCADE, `use_alter`), indexed | 所属会话 |
-| `parent_run_id` | String(36) | nullable, indexed | 链接 interrupt → resume，指向被中断的 Round |
-| `outcome` | String(20) | nullable | 执行结果：`success` / `interrupt` |
+| `parent_run_id` | String(36) | nullable, indexed | 子 Agent / 分支关系 |
+| `outcome` | String(20) | nullable | 执行结果：`success` / `interrupt`；`interrupt` 仅用于取消或最大步数终止，Human-in-the-Loop waiting 不发终态 outcome |
 | `user_message` | Text | NOT NULL | 用户原始消息内容 |
 | `user_attachments` | Text | nullable | JSON 序列化的附件列表 |
-| `preferred_skills` | Text | nullable | JSON：`[{key, display_name}]`；普通 direct Round 在本次发送开始时解析出的有效“优先 Skill”展示快照，旧数据 `null` 按 `[]` 处理 |
+| `preferred_skills` | Text | nullable | JSON：`[{key, display_name}]`；普通 direct Round 在本次发送开始时解析出的有效“优先 Skill”展示快照，没有数据时按 `[]` 处理 |
 | `final_response` | Text | nullable | Agent 最终文本响应 |
 | `step_count` | Integer | default=0 | Agent 执行步数 |
 | `status` | String(20) | default=`"running"` | 当前状态（见下方状态机） |
-| `interrupt_payload` | Text | nullable | JSON：`{id, reason, payload, runtime_context?, preferred_skills_origin_user_message_id?}`；后两项由服务端写入 |
 | `idempotency_key` | String(64) | nullable | 前端生成的幂等键 |
 | `created_at` | DateTime | default=now, indexed | 创建时间 |
 | `completed_at` | DateTime | nullable | 终态达成时间 |
@@ -74,20 +73,17 @@
 **Round 状态机**:
 
 ```
-                    ┌─────────────┐
-                    │   running   │ ← 初始状态
-                    └──────┬──────┘
-                           │
-            ┌──────────────┼──────────────┬───────────────┐
-            ▼              ▼              ▼               ▼
-      ┌───────────┐ ┌───────────┐ ┌────────────┐ ┌────────────┐
-      │ completed │ │  failed   │ │ interrupted│ │ cancelled  │
-      └───────────┘ └───────────┘ └─────┬──────┘ └────────────┘
-                                        │
-                                        ▼
-                                  ┌───────────┐
-                                  │  resumed  │
-                                  └───────────┘
+                         ┌─────────────┐
+                         │   running   │ ← 初始状态
+                         └──────┬──────┘
+                                │
+                     请求交互   │   完成 / 失败 / 取消
+                                ▼
+                    ┌─────────────────────┐
+                    │ waiting_interaction │
+                    └──────────┬──────────┘
+                               │ 回答被 continuation 接管
+                               └──────────────→ running
 ```
 
 **终态集合**:
@@ -95,9 +91,10 @@
 | 集合名称 | 包含状态 | 用途 |
 |----------|----------|------|
 | `COMPLETE_TERMINAL` | `completed`, `failed`, `cancelled`, `max_steps_reached` | 判断 Round 是否已彻底结束（不可恢复） |
-| `SUBSCRIBE_TERMINAL` | `completed`, `failed`, `interrupted`, `resumed`, `cancelled`, `max_steps_reached` | 判断 SSE 订阅是否应关闭连接 |
+| `SUBSCRIBE_TERMINAL` | `completed`, `failed`, `cancelled`, `max_steps_reached` | 判断 SSE 订阅是否应关闭连接 |
+| `QUIESCENT` | `waiting_interaction` | 当前没有 producer，但 Round 可由同一 runId 恢复；不是终态，订阅必须继续有效 |
 
-> **设计决策**: `interrupted` 和 `resumed` 被纳入 `SUBSCRIBE_TERMINAL` 但不在 `COMPLETE_TERMINAL` 中——中断态的 Round 虽然暂停了 SSE 推送，但仍可通过 resume 恢复执行。`resumed` 表示该 Round 已由后续 Round 接替，其 SSE 订阅也应关闭。
+> **设计决策**: `waiting_interaction` 不发 `RUN_FINISHED`，也不结束该 Round；回答后 continuation 继续使用同一 `runId`。
 
 ### 2.2 `agui_events` 表
 
@@ -272,32 +269,35 @@ adapter 复用，未来外部 channel adapter 可用本表将 peer 映射到 ses
 `ChannelMessageReplyRoute` 上的终态 `RUN_FINISHED` 投影为 `DeliveryIntent`，
 不会发送外部网络消息。Web SSE 仍由 chat route 直接返回。
 
-### 2.8 `interrupt_resolutions` 表
+### 2.8 `agent_interactions` 表
 
-Human-in-the-Loop 中断恢复的结构化事实表，兼容 `ask_user` 与工具权限审批。它记录某个 `interrupt_id` 被哪一个 resume round 接管，以及热路径当时写入/拼接的 tool result 文本，用于冷启动后还原等价上下文，并为历史 API 提供不依赖展示文本的控制轮次身份。
+Human-in-the-Loop 的 runtime-neutral 事实源。一条记录描述同一 Round 内的一次提问或工具审批请求；回答不会创建新的用户 Round。
 
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
-| `interrupt_id` | String(36) | PK | Human-in-the-Loop 中断 ID；工具审批时同时是 `tool_approval_requests.id`；同一个 interrupt 只能恢复一次 |
-| `session_id` | String(36) | FK → `sessions.id` (CASCADE), NOT NULL, indexed | 所属会话 |
-| `parent_round_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL, indexed | 被中断并被接管的父 Round |
-| `resume_round_id` | String(36) | FK → `rounds.id` (CASCADE), NOT NULL, indexed, unique | 承载恢复后执行的新 Round |
-| `tool_call_id` | String(64) | nullable | 原交互/审批对应的 tool call ID；旧数据或异常 payload 缺失时可为空 |
-| `answers_json` | Text | NOT NULL | 用户回答的结构化 JSON |
-| `resume_user_message` | Text | NOT NULL | resume round 的内部文本；`ask_user` 为 Q/A，工具审批可为 `Tool approval: <resolution>`，但不得据此判断轮次类型 |
-| `tool_result_content` | Text | NOT NULL | 热路径实际注入/拼接的 tool result 文本，例如用户回答或审批执行占位/拒绝结果 |
-| `restore_strategy` | String(40) | nullable | resume 策略：`hot_replace` / `cold_replace` / `cold_fallback_user_message` / `approval_queued` |
-| `fallback_reason` | Text | nullable | 降级原因；运行时 fallback 或后续冷启动 stitching 失败时写入/更新 |
-| `created_at` | DateTime | default=now, indexed | 写入时间 |
+| `id` | String(36) | PK | interaction id；工具审批时与 `tool_approval_requests.id` 相同 |
+| `session_id` | String(36) | FK → `sessions.id` (CASCADE), indexed | 所属会话 |
+| `round_id` | String(36) | FK → `rounds.id` (CASCADE), indexed | 暂停并继续的同一个 Round |
+| `kind` | String(32) | NOT NULL | `user_input` / `tool_approval` |
+| `tool_call_id` | String(64) | nullable, indexed | 对应模型 tool call |
+| `status` | String(20) | NOT NULL | `pending` → `answered`；Round 终态收敛时也可为 `cancelled` / `failed` |
+| `request_payload` | Text | NOT NULL | `interaction_requested.value` 的规范 JSON |
+| `answer_payload` | Text | nullable | 已接受回答的规范 JSON；有值、status 仍为 pending 且 `continuation_started_at` 为空时表示 continuation 可恢复 |
+| `tool_result_content` | Text | nullable | 注入模型历史的冻结文本 |
+| `external_request_id` | String(128) | nullable | 外部 runtime 的请求关联 ID |
+| `claim_token` | String(64) | nullable | continuation 所有权围栏；不是工具执行授权 |
+| `claim_lease_expires_at` | DateTime | nullable | continuation 可回收租约 |
+| `continuation_started_at` | DateTime | nullable, indexed | 与 durable `interaction_resolved` / `Round → running` 同事务写入；一旦有值，claim 过期只能 fenced failed，不得 repark |
+| `requested_at` / `resolved_at` | DateTime | | 请求与最终解决时间 |
+| `created_at` / `updated_at` | DateTime | NOT NULL | 审计时间 |
 
-**唯一约束**: `UniqueConstraint(resume_round_id)`
+**不变量**：
 
-**语义约束**:
-
-- 每个 `interrupt_id` 最多对应一条 resolution，防止同一中断被并发恢复成多个 child round。
-- `parent_round_id` 必须与 `rounds.parent_run_id == parent_round_id` 的 `resume_round_id` 对齐；冷启动重建时若无法对齐，该 resolution 会被忽略并记录告警。
-- 同时保存 `answers_json` 与 `tool_result_content` 是有意冗余：前者是结构化事实源，后者固定当时注入 LLM 的文本格式，避免 formatter 变更导致旧会话冷恢复 prompt 漂移。
-- 历史 API 通过 `InterruptResolution.resume_round_id` JOIN `ToolApprovalRequest.id == InterruptResolution.interrupt_id` 返回 `RoundData.control_kind="tool_approval"`；普通 `ask_user` 与用户真实发送的 `Tool approval: ...` 文本均不带该标记。前端只允许依据 `control_kind` 合并/隐藏审批控制轮次。
+- 同一 Round 最多有一条 `status=pending` 的 Interaction。
+- 创建 Interaction、把 Round 改为 `waiting_interaction`、持久化 `CUSTOM interaction_requested` 必须在同一数据库事务提交；不得留下“history 显示等待但 subscribe 无事件”的崩溃窗口。
+- 接受回答后先保持 `status=pending`，由 continuation 取得可续租 claim；只有回答已跨过按 kind 定义的最终持久化完成边界后才转 `answered`。
+- `continuation_started_at` 为空时，进程在启动 continuation 前崩溃可释放/回收 claim，并把 Round 原子停回 `waiting_interaction`。该字段已有值时，恢复路径必须写 durable `RUN_ERROR` 并将 Round/Interaction 收敛 failed；不得重新显示旧问题卡。工具 `executing` 仍须先按 execution lease 收敛 unknown，绝不自动重试。
+- 所有复合写入固定锁序为 `Round → AgentInteraction → ToolApprovalRequest`，避免 PostgreSQL 反向锁序死锁。
 
 ---
 
@@ -341,20 +341,20 @@ Content-Type: application/json
 - 每次新 `message/stream` 独立解析该字段。未传或传空数组表示本次发送没有 Skill 偏好；不得从同一 session 的前序普通消息继承。
 - 服务端把请求转换为版本化上下文 `bsbox.preferred_skills.v1`（`{"mode":"preferred","keys":[...]}`），并在 run 启动前根据该用户当时可见且已启用的 Skill registry 重新解析。未知、已删除或已禁用的 key 被忽略，不导致整次发送失败。
 - 普通 `message/stream` direct Round 把本次解析后仍有效的 Skill 按顺序固化为 `preferred_skills: [{"key":"...","display_name":"..."}]`。这是发送当时的不可变展示快照：`key` 为稳定内部标识，`display_name` 为当时的展示名；不得在读取历史时用最新 registry 改写。空选择或全部 key 无效时保存/返回空数组。
-- direct 流的 `RUN_STARTED` 必须同步携带同一份权威快照 `preferredSkills: [{key, display_name}]`（包括显式空数组），让前端立即用解析结果替换 optimistic key；resume child 的 `RUN_STARTED.preferredSkills` 固定为空数组。重连订阅重放该事件时语义不变。
+- direct 流的 `RUN_STARTED` 必须同步携带同一份权威快照 `preferredSkills: [{key, display_name}]`（包括显式空数组），让前端立即用解析结果替换 optimistic key。same-Round resume 不发新的 `RUN_STARTED`。
 - `preferred_skills` 只表示该 direct Round 的请求级“优先考虑”偏好，不证明 Agent 已加载 Skill、调用 `get_skill` 或实际使用了该 Skill。每个后续独立 direct Round 只记录自己当次提交并解析出的快照，不从前一 Round 继承或累积。
-- 解析后的上下文只投影到精确匹配的**原始 user message 锚点**的 provider 请求副本，作用于 `agent_step` / `tool_followup`；不得写回 `agent.messages`、`conversation_messages`、长期 system prompt，也不得注入标题生成或对话摘要请求。child resume 的回答消息不是该投影锚点。
+- 解析后的上下文只投影到精确匹配的**原始 user message 锚点**的 provider 请求副本，作用于 `agent_step` / `tool_followup`；不得写回 `agent.messages`、`conversation_messages`、长期 system prompt，也不得注入标题生成或对话摘要请求。Interaction 回答不是该投影锚点。
 - 该上下文是用户通过 UI 控件提交的请求元数据，不是用户正文。provider 请求必须同时携带系统级解释策略；模型不得仅因该上下文出现就声称“用户提到/点名/要求加载了这些 Skill”，也不得在与正文无关时主动复述选择。仅在用户询问选择状态或需要解释实际 Skill 动作时才可提及。
-- 若本轮因 `ask_user` 或工具权限审批中断，原始请求 key 与服务端生成的 `preferred_skills_origin_user_message_id` 会同时写入热路径 pending interrupt 和持久化 `interrupt_payload`。`resume` 时按最新 registry 和启停状态重新解析，并把同一锚点原样继承到 child resume round；因此 R1 → R2 → R3 连续中断/恢复始终投影到 R1 的原始 user message，而不是逐级改为父 Round 的回答。该继承仅延续同一次被中断的执行意图，不得扩散到之后独立发送的新消息。
-- resume child Round 运行时继续继承并重新解析原请求偏好，但自身 `preferred_skills` 必须为空，不重复展示父 direct Round 已记录的标签，也不得覆盖父 Round 的发送时快照。
-- `preferred_skills_origin_user_message_id` 是服务端专用元数据，不属于 `bsbox.preferred_skills.v1` 的客户端 payload。发送和 resume 请求均不能提交或覆盖它；客户端在 runtime context 中夹带同名字段必须被忽略。旧中断记录缺少该字段时，仅可用命中中断的父 Round user message 作为兼容回退，并在下一次中断时持久化服务端确认的锚点。
+- 若本轮产生 Interaction，原始请求 key 与服务端生成的 `preferred_skills_origin_user_message_id` 会写入热路径 pending state 和持久化 request payload。`resume` 时按最新 registry/启停状态重新解析并保持同一锚点；连续暂停/恢复始终投影到最初 user message，不得改成回答，也不得扩散到之后独立消息。
+- same-Round continuation 不改写原 Round 的 `preferred_skills` 展示快照。
+- `preferred_skills_origin_user_message_id` 是服务端专用元数据，不属于 `bsbox.preferred_skills.v1` 的客户端 payload。发送和 resume 请求均不能提交或覆盖它；客户端在 runtime context 中夹带同名字段必须被忽略。该锚点必须来自产生 Interaction 的原始 direct Round user message，并随 Interaction 请求持久化。
 
 **本轮推理选择契约**:
 
 - `thinking_mode` 与 `reasoning_effort` 是发送瞬间的不可变快照，只覆盖当前逻辑执行链；两者均省略时必须把当前模型目录默认值物化到快照与 direct Round，不得用 `NULL / NULL` 延迟解析。`disabled` 必须清除并拒绝同时携带的强度。
 - 后端先按 session 的精确 `model_id` 校验：仅 OpenAI 兼容且显式声明非空 `supported_reasoning_efforts` 的模型可切换；`disabled` 校验目录中的 `off`，无强度的 `enabled` 校验 `on`，具体强度精确命中同一有序目录，失效或伪造值在建立 SSE 前返回 400。`reasoning_effort` 中的 `off` / `on` 必须拒绝，它们只能通过 `thinking_mode` 表达。
 - 归一化后写入独立版本化上下文 `bsbox.reasoning.v1`，不得混入 Skill 上下文；OpenAI 同步、流式、工具 follow-up、retry 和 failover 在同一 run 中都从 `ContextVar` 读取同一冻结快照。failover 不按备用模型白名单过滤或降级，但只能尝试能够编码该快照的客户端：`provider_default + null` 可跨 provider；显式开关或具体强度不能交给 Anthropic 客户端；OpenAI `thinking_wire_format=none` 只能承载具体 `reasoning_effort`，不能承载纯 On/Off。协议不兼容的备用模型必须跳过，继续尝试后续模型；若没有任何备用模型兼容，保留并抛出主模型的原始失败。
-- direct Round 将最终 `thinking_mode` / `reasoning_effort` 持久化用于审计和历史恢复。若执行因 `ask_user` 或工具审批中断，child resume Round 从父 Round 继承同一快照；`resume` API 不接受新的推理选择。
+- direct Round 将最终 `thinking_mode` / `reasoning_effort` 持久化用于审计和历史恢复。same-Round continuation 沿用该快照；`resume` API 不接受新的推理选择。
 - `enabled` / `disabled` 由模型 DB 的 `thinking_wire_format` 编码：DashScope 类网关使用 `enable_thinking=true|false`，DeepSeek 原生协议使用 `thinking: {type: enabled|disabled}`；`disabled` 同时移除强度，非空强度作为顶层 `reasoning_effort` 发送。选择 Off 不能退化成字段缺省。
 
 **file block 注入语义**:
@@ -402,7 +402,10 @@ SSE 事件流格式遵循 AG-UI 协议（详见 [第 4.6 节](#46-ag-ui-事件�
 |----------|----------|
 | `AGENT_INIT_FAILED` | Agent 初始化失败（沙箱连接、历史加载、技能初始化等） |
 | `ROUND_IN_PROGRESS` | 幂等键冲突：相同 `idempotency_key` 的 Round 已在执行中 |
+| `INTERACTION_PENDING` | 当前 session 已有同一 Round 的 pending Interaction；这是未创建新 Round 的控制面拒绝，客户端必须恢复权威 waiting 状态与未受理草稿 |
 | `INTERNAL_ERROR` | 其他内部错误 |
+
+无 durable sequence 的流内错误只结束当前 HTTP transport，不自动证明任何既有 Round 已终态。客户端必须依据错误类型与 `history/v2` 区分控制面拒绝、订阅故障和真正的运行终态。
 
 #### 并发控制机制
 
@@ -445,19 +448,20 @@ Content-Type: application/json
 SSE 事件流，格式与 `message/stream` 相同。
 Agent 初始化和中断状态校验在 SSE generator 内执行；入口只做会话、token、用户并发 slot 等前置校验，避免请求级 DB Session 跨 Agent / sandbox 初始化长时间持有连接。
 
+响应继续使用原 `runId == round_id`，不再发送第二个 `RUN_STARTED`。持久化的 `CUSTOM interaction_resolved` 是 continuation 已接管原 Round 的 wire 边界；HTTP 200 或客户端本地 `stream_accepted` 只表示传输已建立，不表示 Round 已恢复运行。
+
 #### 恢复路径
 
 | 路径 | 条件 | 行为 |
 |------|------|------|
-| **热路径** (Hot Path) | Agent 仍在内存中（未被 Pool 回收） | 将用户答案作为 `tool_result` 注入 → Agent 继续执行循环 |
-| **冷实时路径** (Cold Resume Path) | AgentPool 已回收 pending interrupt，但本次用户正在提交 resume | 先用 `_restore_history()` 重建旧历史，再优先将用户答案回填到恢复出的 ask_user `tool_result`；若找不到可替换占位，退化为注入新 `user` 消息并记录 `fallback_reason` |
-| **冷启动历史重建** (Cold Restore Path) | resume 已完成过，之后服务重启/AgentPool 回收再加载整个 session | 读取 `interrupt_resolutions`，把 child Q/A 回填到 parent ask_user `tool_result`，并跳过对应 child resume user 消息；若回填失败，则保留 child user 消息避免语义丢失 |
+| **same-Round 热路径** | Agent 仍在内存中 | 在 `agent_interactions` 幂等冻结答案 → continuation claim → 持久化 `interaction_resolved` → 原 Round 恢复 `running` |
+| **same-Round 冷路径** | AgentPool 已回收 | 从 Round 事件与 `agent_interactions` 重建占位，将冻结的 `tool_result_content` 回填后继续同一 `runId` |
 
-恢复请求都会创建新的 Round，其 `parent_run_id` 指向被 `interrupt_id` 命中的中断 Round，并在同一事务中写入 `interrupt_resolutions`。原 Round 只在命中该 `interrupt_id` 时迁移为 `resumed`，不得批量 resolve 同 session 的其他 interrupted rounds。
+恢复不创建新 Round。回答、claim、`interaction_resolved` 以及后续 Agent 事件都属于原 Round。
 
-若父 Round 携带 `preferred_skill_keys` 生成的版本化 runtime context，热路径 pending interrupt 与持久化 `interrupt_payload` 都必须保留该请求上下文及服务端生成的原始 user message 锚点。`resume` 请求本身不接收新的 `preferred_skill_keys` 或锚点；服务端从中断快照恢复原始 key 和锚点，并按 resume 当时可见且已启用的 Skill registry 重新解析。恢复后仍不可用的 key 静默忽略，解析结果仅作用于新建的 child resume round；该 child 若再次中断，必须继续写回同一锚点，不能改成当前父 Round 的 user message。
+若原 Round 携带 `preferred_skill_keys` 生成的版本化 runtime context，pending Interaction 必须保留该请求上下文及服务端生成的原始 user message 锚点。`resume` 请求不接收新的 key 或锚点；服务端按 resume 当时可见且已启用的 Skill registry 重新解析，但展示快照仍属于原 direct Round。连续交互始终锚定最初用户消息，不得改成回答文本。
 
-父 Round 已固化的 `thinking_mode` / `reasoning_effort` 同样由服务端继承到 child resume Round，确保审批或回答之后的 provider follow-up 不会因为用户后来调整输入框选择而改变推理强度。
+原 Round 已固化的 `thinking_mode` / `reasoning_effort` 在 continuation 中保持不变，确保审批或回答之后的 provider follow-up 不会因为用户后来调整输入框选择而改变推理强度。
 
 #### 错误码
 
@@ -472,7 +476,13 @@ Agent 初始化和中断状态校验在 SSE generator 内执行；入口只做�
 | RUN_ERROR code | 含义 | 场景 |
 |----------------|------|------|
 | `NO_PENDING_INTERRUPT` | 没有待处理的中断 | 会话没有匹配的 pending interrupt，或中断 ID 已过期/已恢复 |
+| `RESUME_CONFLICT` | 回答与持久化事实冲突 | 并发恢复已获胜，或同一 interaction 收到不同答案 |
+| `INVALID_INTERACTION_RESPONSE` | 回答格式或枚举值不符合 Interaction kind | 例如工具审批缺少 `answers.approval`，或值不在允许枚举中 |
 | `AGENT_INIT_FAILED` | Agent 初始化失败 | AgentPool 获取或初始化失败 |
+| `USER_ABORT` | 恢复初始化期间被取消 | 较新的 abort 已经收敛该会话 |
+| `INTERNAL_ERROR` | continuation 尚未启动的内部错误 | 服务端保留或恢复权威 waiting 状态 |
+
+在 `interaction_resolved` 之前收到上述 `RUN_ERROR` 属于 **resume 控制面错误**，不得把原 `waiting_interaction` Round 改为 `failed`。客户端必须查询 `history/v2`，按权威的 `waiting_interaction` / `running` / 终态恢复。越过 `interaction_resolved` 后的运行异常也必须先与原 Round 原子提交为带 durable sequence 的 `RUN_ERROR`；无 sequence 的 adapter/transport 错误仍只能触发 history 恢复，不能单独终态化 Round。
 
 ### 3.3 `GET /api/chat/{session_id}/round/{round_id}/subscribe`
 
@@ -499,10 +509,12 @@ SSE 事件流。
 |------------|------|
 | 已在终态 (`SUBSCRIBE_TERMINAL`) | 回放 `sequence > last_sequence` 的所有事件 → 关闭连接 |
 | 仍在运行 (`running`) | 回放历史事件 → 切换到实时模式，从 subscriber queue 推送新事件 |
+| 暂停等待 (`waiting_interaction`) | 回放（至少包含持久化的 `interaction_requested`）→ 保持订阅，等待其他标签页的 `interaction_resolved`、后续输出、取消或终态 |
 
 - 心跳间隔：15 秒
-- 订阅超时：5 分钟（可通过 `SSE_SUBSCRIBE_TIMEOUT=300` 配置）
-- 超时后推送 `RUN_ERROR(TIMEOUT)` 事件
+- 服务端不设置应用级订阅最大时长；连接持续到 Round 终态、客户端断开或基础设施关闭
+- `SSE_SUBSCRIBE_TIMEOUT` 是 UserRunLock/runtime 心跳陈旧判定阈值，不关闭健康的 running/waiting 订阅
+- 首次 replay 与 subscriber queue 注册之间必须有无缝 handoff：若终态在首次 replay 后提交，`ensure_terminal` 检出终态时仍须从最新已投递 sequence 二次 replay 并把 terminal 发给客户端；只有客户端 cursor 已包含该 terminal 时才允许直接 clean EOF
 
 #### 错误码
 
@@ -510,7 +522,7 @@ SSE 事件流。
 |-------------|------|
 | 404 | Round 不存在 |
 
-流内错误：`TIMEOUT`（订阅超时）
+订阅建立后还可能收到无 durable sequence 的 `RUN_ERROR(code=SUBSCRIBE_FAILED)`；它只表示当前 transport 失败，客户端必须按最后 sequence 重连或回拉 history，不得把 Round 置为 failed。只有带 durable sequence 的 Round `RUN_FINISHED` / `RUN_ERROR`，或由权威 history 投影出的终态，才能终态化客户端 Round；heartbeat 不改变状态。
 
 ### 3.4 `POST /api/chat/{session_id}/abort`
 
@@ -523,21 +535,24 @@ SSE 事件流。
 {
     "status": "cancelled",
     "request_id": "uuid",
-    "reason": "force_aborted"
+    "reason": "force_aborted",
+    "outcome_warning": null
 }
 
 // Worker 已死亡，直接清理
 {
   "status": "cancelled",
   "request_id": "uuid",
-  "reason": "worker_dead"
+  "reason": "worker_dead",
+  "outcome_warning": null
 }
 
 // init-window（有会话锁但尚未创建 round）即时解锁
 {
     "status": "cancelled",
     "request_id": "uuid",
-    "reason": "force_unlocked"
+    "reason": "force_unlocked",
+    "outcome_warning": null
 }
 ```
 
@@ -548,6 +563,8 @@ SSE 事件流。
 | `cancelled` + `reason: "force_unlocked"` | init-window（无 running round）也立即释放会话锁，允许用户立刻重发 |
 
 > 约束：`cancelled(*)` 仅在目标会话锁确认已释放时返回；若释放失败（例如数据库锁冲突），接口返回 `HTTP 503`，不会返回“假成功”。
+
+`abort` 同时覆盖 `running`、`waiting_interaction` 和 init-window。取消 waiting Round 时必须把 pending Interaction 以及尚未 dispatch 的审批 `requested` / `approved` 一并收敛，并向已注册 subscriber fanout 同一 durable 终态。REST 响应只通过 nullable `outcome_warning` 暴露风险：能证明尚未 dispatch 时为 `null`，审批为 `executing` / `unknown` 或普通 running Round 无法证明尚未派发时返回保守警告。durable `RUN_FINISHED.result` 另以 `outcomeUncertain` 布尔值表达同一判断。风险判断、审批收敛、Round terminal event 必须在同一 `Round → AgentInteraction → ToolApprovalRequest` 锁事务内完成，不能先无锁读取再写终态。
 
 #### 错误码
 
@@ -603,10 +620,12 @@ SSE 事件流。
 
 `preferred_skills` 类型为 `Array<{key: string, display_name: string}>`，并遵循以下投影规则：
 
-- 普通 direct Round 返回该次 `message/stream` 在运行开始时解析并持久化的有效 Skill 展示快照；没有有效偏好或读取旧版 `null` 数据时返回 `[]`。
-- resume child Round 固定返回 `[]`。其运行时虽然继承父逻辑执行链的偏好，但历史 UI 只在最初的 direct Round 用户消息旁展示一次，不能在每个 child 重复展示。
+- 普通 direct Round 返回该次 `message/stream` 在运行开始时解析并持久化的有效 Skill 展示快照；没有有效偏好或字段为空时返回 `[]`。
+- same-Round continuation 仍是原 direct Round，因此继续返回原先冻结的展示快照，不新增重复标签。
 - 该数组是不可变的历史展示数据，不是 Skill 使用审计；不能据此声称 Skill 已加载、已调用或对结果有贡献。
 - 各个独立 direct Round 的数组彼此隔离，不继承、不合并，也不根据当前启停状态、改名或删除情况重算。
+
+当 Round 为 `waiting_interaction` 时，`history/v2` 必须从 pending `agent_interactions` 投影 `interrupt={id, reason, payload}`，并与已持久化的 `interaction_requested` 指向同一 interaction id。读取历史会先处理过期 continuation claim：仅 `continuation_started_at` 为空的 pre-start 项可停回 waiting；已持久化 `interaction_resolved` 的 started continuation 必须写 durable `RUN_ERROR` 并收敛 failed。工具审批若已跨过 dispatch 且结果未知，还必须先按 execution lease 收敛 `unknown`，绝不自动重放。
 
 
 ---
@@ -732,7 +751,7 @@ Agent 在每个可能长时间等待的边界都读取或等待当前 run 的 `c
 每次 `send` / `resume` 真正启动 Agent run 前，`AgentService` 必须从 DB 权威历史重建本轮 runtime messages：
 
 1. 保留当前 Agent 的 system prompt。
-2. `checkpoint_v1` 优先读取最新 v4 replacement，并从精确 message/event 游标回放同轮 suffix 与后续 Round；无有效 v4 时从 `rounds` + `conversation_messages` + `agui_events` + `interrupt_resolutions` 重建完整权威历史。只有 `legacy_120` 回滚策略按消息条数裁剪。
+2. `checkpoint_v1` 优先读取最新 v4 replacement，并从精确 message/event 游标回放同轮 suffix 与后续 Round；无有效 v4 时从 `rounds` + `conversation_messages` + `agui_events` + `agent_interactions` 重建完整权威历史。只有 `legacy_120` 回滚策略按消息条数裁剪。
 3. 用重建结果替换本进程内旧 `agent.messages`，不得追加到旧热缓存后面。
 4. 再注入本轮用户输入或 resume 答案后进入 LLM 调用。
 5. LLM 调用前由请求组装层临时构造 provider-bound messages，并在副本的 system 消息前加入 request-only runtime context（当前时间、时区、workspace、平台执行语义等）；不得回写 `agent.messages` 或 `conversation_messages`。
@@ -760,7 +779,7 @@ INSERT INTO rounds (..., idempotency_key)
          │
          ├── 已在终态 → 返回已有 Round（前端可 subscribe 重放）
          │
-         └── 仍在运行 → 重定向到 subscribe 模式
+         └── running / waiting_interaction → 重定向到 subscribe 模式
               └── 推送 ROUND_IN_PROGRESS 错误事件
 ```
 
@@ -787,10 +806,10 @@ INSERT INTO rounds (..., idempotency_key)
 #### Worker 死亡检测
 
 - 每 15s 心跳刷新 `user_run_locks.updated_at`（由 `SSE_HEARTBEAT_INTERVAL` 控制）
-- 超过 `SSE_SUBSCRIBE_TIMEOUT`（默认 300s）未刷新 → 视为 stale lock；下一次获取用户 slot 时回收该锁并清理对应 session 的孤儿 running round
+- 超过 `SSE_SUBSCRIBE_TIMEOUT`（默认 300s）未刷新 → 视为 stale lock；下一次获取用户 slot 时先检查 continuation ownership：仍有效的 continuation claim 或工具 execution lease 保留原 lock/slot；两类 lease 都已过期且 Round 为 `running` 时一律视为已越过 started 边界并收敛 durable failed，不得停回 `waiting_interaction`。过期的 `executing` 工具必须先收敛 `unknown`，再以工具审批保守文案终态化；没有 continuation 的孤儿 running Round 按普通失败终态收敛
 - `abort` 统一采用“接口即时收敛”策略：
     1. 写入 append-only 取消审计行（用于本进程 registry 命中状态与诊断）
-    2. 若存在 running round，直接标记 `cancelled` 并补发 `RUN_FINISHED(outcome=interrupt)`
+    2. 若存在 running 或 waiting_interaction Round，原子收敛其 Interaction/未 dispatch 审批并标记 `cancelled`，持久化并 fanout `RUN_FINISHED(outcome=interrupt)`
     3. 立即释放 `user_run_locks`（不等待执行 worker 自行结束）
     4. 完成取消请求状态（`completed`）
 - `abort` 若命中本进程 active runner，仅向本地 cancel token 投递协作式取消信号并记录审计状态；接口不等待 runner 自行结束，也不执行 task-level `runner.cancel()`
@@ -808,8 +827,12 @@ INSERT INTO rounds (..., idempotency_key)
 在“abort 即时释放锁”语义下，存在短时窗口：旧 run 正在退出而新 run 已启动（无锁重叠执行）。为避免状态污染，后端执行以下约束：
 
 1. round 一旦进入终态（尤其 `cancelled`），后续迟到 AG-UI 事件一律丢弃
-2. `complete_round` 不允许覆写终态 round
-3. 订阅端以终态事件为准，不再回跳 `running`
+2. terminal producer 只能返回 `RunCompletionService` 在 Round 锁下确认的 committed terminal，不允许把迟到的原始 Agent event 发给 direct SSE
+3. 订阅端以权威终态事件为准，不再回跳 `running`
+
+回收 stale `UserRunLock` 时，删除旧锁、收敛其孤儿 Round、分配同一 user 的新锁必须受同一个 ownership mutex/epoch 保护。PostgreSQL 使用 session-level advisory lock 时，获取锁、期间所有 commit 与最终 unlock 必须固定在同一条物理连接；不得让普通 ORM Session 在 commit 后把持锁连接退回连接池。每次分配 slot 前都必须先完成该用户所有无 surviving lock running / waiting Round 的 active-session 分类，不能依赖“本次刚好删除到 stale 行”或 Round UUID 顺序：任一 parent 的 active claim / execution lease 都保护同 session 的 running subagent child，并作为一个虚拟占用计入并发容量。第二阶段才可处理非 active session：waiting pre-start claim 过期时先在 Round 锁下清除 token/lease 并提交 fence；started 或 dispatch-crossed lease 过期时先保守收敛后才能分配。若本次删除的旧锁仍对应 active work，必须恢复原 lock/slot；该恢复只占用原 slot，在 `AGENT_USER_CONCURRENCY_LIMIT > 1` 且仍有空 slot 时不得阻塞同一用户的其他 session。
+
+rolling startup 清理采用同一判定：heartbeat CAS 删除 stale lock 后，若细粒度 continuation / execution lease 仍有效，必须在终态化前原样恢复该 lock/slot；即使锁行已被更早的崩溃清理器删掉，也必须把 active work 视为受保护，而不能按 generic orphan 杀死。waiting pre-start claim 过期先清 token/lease；started / dispatch-crossed lease 过期才允许终态化，且过期 `executing` 工具先转 `unknown` 再写工具审批保守终态。任一 session 在二次检查时发现新鲜锁，只能跳过该 session；不得回滚此前其他 session 已完成的 stale lock 删除或 claim 清理，返回的清理计数必须与已提交事实一致。
 
 - worker 心跳过期时仅回收对应 session 的孤儿 round，不影响同用户其他仍健康的并发 session。
 
@@ -897,15 +920,12 @@ pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后�
 
 默认 `checkpoint_v1` 的恢复顺序固定为：`checkpoint replacement + source Round 游标后的同轮 suffix + 后续 Round`。消息数不是预算单位，`agent_max_history_messages=120` 只服务 `legacy_120` 回滚开关。
 
-对 `status=completed` 且事件无法重建 assistant 文本的 Round，仍按 `rounds.final_response`、普通 assistant conversation message 的顺序兜底。resume stitching 保持不变；压缩 replacement 不强保首轮 user。
+对 `status=completed` 且事件无法重建 assistant 文本的 Round，仍按 `rounds.final_response`、普通 assistant conversation message 的顺序兜底。压缩 replacement 不强保首轮 user。
 
-**Resume resolution stitching**:
+**Human-in-the-Loop 历史投影**:
 
-- `_rebuild_messages_from_events()` 会预载本 session 的 `interrupt_resolutions`，构建 `resolution_by_parent_round_id` 与 `resolution_by_resume_round_id` 两个索引。
-- 遇到 `status=resumed` 的 parent round 时，按 `tool_call_id` 将 ask_user 占位 `tool_result` 替换为 `tool_result_content`。
-- 替换成功后，对应 child resume round 的第一条匹配 `resume_user_message` 的真实 user 消息会被跳过；child round 的 assistant/tool 输出继续保留。
-- 替换失败时，不跳过 child user 消息，并更新该 resolution 的 `fallback_reason`，避免冷恢复丢失用户回答。
-- 连续 ask_user 链允许同一个 round 同时是上一个 interrupt 的 child、下一个 interrupt 的 parent；parent/child 两个索引互不冲突。
+- same-Round 通过同一 Round 内的 `interaction_requested` / `interaction_resolved` 重建占位及真实 tool result；不会插入额外 user message。
+- 工具审批的最终 `TOOL_CALL_RESULT` 替换预派发占位；已跨 dispatch 且结果未知时不得从历史自动重试。
 
 ### 4.6 AG-UI 事件体系
 
@@ -935,7 +955,46 @@ pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后�
 | | `MESSAGES_SNAPSHOT` | 消息列表快照 |
 | **Custom** | `heartbeat` | 心跳保活 |
 | | `title_updated` | 会话标题更新 |
+| | `interaction_requested` | 同一 Round 已持久化提问/审批并进入 `waiting_interaction` |
+| | `interaction_resolved` | 回答已由同一 `runId` 的 continuation 接管 |
+| | `tool_approval_resume` | 同一 Round 的审批结果即将回填原工具占位 |
 | | 其他自定义事件 | 按需扩展 |
+
+#### Human-in-the-Loop CUSTOM wire schema
+
+```json
+{
+  "type": "CUSTOM",
+  "name": "interaction_requested",
+  "value": {
+    "interactionId": "interaction-uuid",
+    "runId": "original-round-uuid",
+    "kind": "user_input | tool_approval",
+    "toolCallId": "tool-call-id",
+    "payload": {"questions": []}
+  },
+  "sequence": 12
+}
+```
+
+```json
+{
+  "type": "CUSTOM",
+  "name": "interaction_resolved",
+  "value": {
+    "interactionId": "interaction-uuid",
+    "runId": "original-round-uuid",
+    "toolCallId": "tool-call-id",
+    "toolResultContent": "frozen model-visible result",
+    "resolution": "answered"
+  },
+  "sequence": 13
+}
+```
+
+`interactionId`、`runId`、`kind` 与 `toolCallId` 是关联字段；`payload` 为 kind-specific 结构。`toolResultContent` 是历史重建所需的冻结文本，不得包含解密后的敏感工具参数。两种事件都必须进入 `agui_events` 并参与 sequence 重放；`heartbeat` 和仅传输层的 `stream_accepted` 不是持久化事实。
+
+工具审批 continuation 在最终结果前还会持久化 `CUSTOM tool_approval_resume`，其 `value={toolCallId}` 指向原审批工具调用。历史重建据此让紧随其后的匹配 `TOOL_CALL_RESULT` 替换预派发占位，而不是追加第二份工具结果。该 marker 不创建新 Round，也不是 Interaction 的完成边界；只有匹配的最终 `TOOL_CALL_RESULT` 持久化后，工具审批 Interaction 才转为 `answered`。
 
 #### ID 生成规则
 
@@ -946,94 +1005,70 @@ pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后�
 | `messageId` | `msg_{runId}_{step}` | `msg_e5f6g7h8_3` |
 | `toolCallId` | `tc_{runId}_{step}` | `tc_e5f6g7h8_3` |
 
-### 4.7 Ask-User 中断与恢复
+### 4.7 Human-in-the-Loop 暂停与恢复
 
-Human-in-the-Loop 机制允许 Agent 在执行过程中向用户提问并等待答复。
+Human-in-the-Loop 机制允许 Agent 在执行过程中向用户提问或请求工具审批。默认语义是暂停并继续同一个逻辑 Round。
 
-#### 中断流程
+#### same-Round 暂停流程
 
 ```
 Agent 调用 ask_user 工具
     │
     ▼
-保存中断状态到 Round:
-  - interrupt_payload = {id, reason, payload, runtime_context?, preferred_skills_origin_user_message_id?}
-  - status = "interrupted"
+同一事务提交：
+  - agent_interactions(status=pending)
+  - Round.status = waiting_interaction
+  - Round.step_count 记入当前已完成 step（interaction_requested 是其隐式完成边界）
+  - CUSTOM interaction_requested
     │
     ▼
-填充占位 tool_result（标记为待替换）
-    │
-    ▼
-发射 TOOL_CALL_RESULT (ask_user 结果，含占位内容)
-    │
-    ▼
-发射 RUN_FINISHED (outcome="interrupt")
-    │
-    ▼
-释放 UserRunLock
+结束当前 producer 并释放 UserRunLock；不发 RUN_FINISHED，Round 仍可恢复
 ```
 
-#### 恢复流程
+内存中可以保留模型占位 tool result，但默认 wire 不向前端发送待替换的 `TOOL_CALL_RESULT`。`interaction_requested` 是 UI 显示卡片、订阅重放和当前 step 已完成的权威边界；后续真实 `STEP_FINISHED` 只补齐事件序列，不得把 `step_count` 再加一次。若该事件缺失，history 重建也必须把包含 `interaction_requested` 的 step 投影为 completed。
+
+首条消息在此处暂停仍必须完成标题生成生命周期：waiting 被视为本段流已稳定落库，服务端等待标题任务完成并把 `CUSTOM title_updated` 追加到原 SSE；若原客户端已断开，标题任务不得被取消，仍须落库并向 waiting Round 的现有 subscriber 投递临时标题事件。
+
+#### same-Round 恢复流程
 
 ```
 用户提交答案 → POST /resume
     │
     ▼
-获取 asyncio.Lock (_resume_lock) ── 防止并发 resume
+Round → Interaction 固定锁序校验 waiting + pending
     │
     ▼
-按 interrupt_id 定位被中断的 Round
+按问题定义顺序冻结 answer_payload / tool_result_content（重复同答案幂等）
     │
     ▼
-创建新 Round (parent_run_id = 被中断的 Round)
+continuation 取得可续租 claim；此时 Round 仍 waiting_interaction
     │
     ▼
-将该 interrupted Round 状态设为 "resumed"
+同一围栏事务：校验 claim + Round → running
+             + 持久化 CUSTOM interaction_resolved（runId 仍为原 Round）
     │
     ▼
-判断恢复路径:
-    │
-    ├── 热路径: Agent 仍在内存
-    │     │
-    │     ▼
-    │   替换占位 tool_result 为用户答案
-    │     │
-    │     ▼
-    │   Agent 继续执行循环
-    │
-        └── 冷实时路径: Agent pending interrupt 已丢失
-          │
-          ▼
-                优先替换 _restore_history 重建出的 ask_user tool_result
-                    │
-                    ├── 替换成功: 继续执行循环
-                    │
-                    └── 替换失败: 将用户答案作为新 user 消息注入，并记录 fallback_reason
-          │
-          ▼
-        启动新 Agent 执行
+按 Interaction kind 回填 tool result；继续 Agent loop
+claim 完成前所有 durable / ephemeral / terminal 写均须校验同一 token
+    ├─ user_input：下一条可恢复的 durable Agent 边界
+    │              + Interaction → answered
+    └─ tool_approval：匹配原 tool_call_id 的最终 TOOL_CALL_RESULT
+                     + Interaction → answered
 ```
 
-**Resolution 写入时机**:
+**恢复不变量**：
 
-- `POST /resume` 创建新 Round 时，同时写入 `interrupt_resolutions`。
-- 定位被中断 Round 时，优先使用持久化 interrupt；热路径的 Agent pending interrupt 快照必须携带触发它的 `round_id`，用于覆盖 `RUN_FINISHED` 已发出但 DB 状态尚未提交为 interrupted 的窗口。
-- `answers_json` 保存用户回答结构；`tool_result_content` 保存热路径实际注入 LLM 的文本。
-- `restore_strategy` 记录本次 resume 采用 `hot_replace`、`cold_replace` 或 `cold_fallback_user_message`。
-- `fallback_reason` 在运行时 fallback 时写入；若后续冷启动 stitching 发现已创建的 resolution 无法回填 parent tool result，也允许更新该字段。
+- 相同键值的多问题答案即使 JSON key 顺序不同也必须幂等；展示/模型文本按原问题定义顺序冻结，不能依赖客户端对象插入顺序。
+- `interaction_resolved` 之前的失败释放 claim 并保留/恢复 `waiting_interaction`；客户端回拉 history，不把控制面 `RUN_ERROR` 当作原 Round 终态。
+- `interaction_resolved` 一旦与 `Round → running` 原子提交，后续启动或运行异常必须保留 ownership fence，并把原 Round 与 durable `RUN_ERROR` 原子收敛为 failed；不得再释放 claim、回停 waiting 后发送无 sequence 的运行期错误。
+- `interaction_resolved` 尚未提交时，过期 continuation claim 可被其他 worker 围栏式回收并恢复 waiting；`interaction_resolved` 已提交后，started claim 过期必须收敛 durable failed，不得重新认领或恢复旧问题卡。若旧 worker 继续输出，token/epoch 守卫必须阻止其写入。
+- AG-UI sequence 唯一冲突只能回滚本次 event/fence savepoint；不得撤销同一外层事务中已经 flush 的 Interaction、Round waiting 投影或 synthetic conversation message，再单独提交事件。
+- EventBus 因持锁后发现 Round 已终态而拒写时，必须返回专用终态抑制信号；调用方不得把它与正常 ephemeral `None` 混同，不得继续累计正文、写 conversation history、递增 step 或把原事件发给 direct SSE。
+- 用户 abort、UserRunLock liveness 丢失和 continuation ownership 丢失是三类独立信号。后两者不得伪装成 `user_cancelled`；旧 worker 必须静默退出并交由 durable recovery 收敛。
+- ask_user 回答属于模型可见的真实用户信息，但在 same-Round 模式不新增一个聊天 user bubble；历史通过 requested/resolved 事件重建该 tool result。
+- 工具审批的 resolution 是控制决策，不作为 user message；其两阶段执行状态见 [tool-permission-spec.md](tool-permission-spec.md)。
 
-**连续 ask_user 链规则**:
-
-- parent round 用 `resolution_by_parent_round_id[parent.id]` 回填 tool result。
-- child round 若 `resolution_by_resume_round_id[child.id]` 命中，仅跳过与 `resume_user_message` 完全匹配的 child resume Q/A user 消息。
-- child round 的 assistant/tool 输出继续保留。
-- 同一个 round 可以同时是上一段恢复链的 child、下一段恢复链的 parent，两个身份不冲突。
-
-**并发保护**: `_resume_lock` 使用 `asyncio.Lock`，确保同一会话的 resume 请求不会并发执行。
-
-**冷恢复占位归一化**:
-
-- 当原中断轮次状态已为 `resumed` 且没有 resolution 可回填时，历史重建阶段会将旧的 ask_user 占位 `tool_result`（`[Awaiting user response]`）归一化为 `[Interrupt resolved in subsequent round]`，避免刷新后继续暴露过期等待状态。
+**连续交互规则**：每次新的 `interaction_requested` 替换 pending 卡片，但所有事件继续写入同一个 Round 的递增 sequence；收到新请求后即使网络断开，客户端也必须保留该卡片并通过 subscribe/history 恢复，不得合成失败终态。
 
 ### 4.8 LLM 调用快照持久化
 
@@ -1111,7 +1146,7 @@ models:
 - **One-shot Failover**: 当 Fallback 模型成功后，下一次 LLM 调用仍优先尝试 Primary 模型
 - 不会永久切换到 Fallback 模型
 
-### 4.9 Lazy Agent Init
+### 4.10 Lazy Agent Init
 
 Agent 初始化采用延迟模式，确保 SSE 连接不会因初始化耗时而超时。
 
@@ -1134,18 +1169,19 @@ SSE 连接建立
 
 > **设计决策**: SSE 连接先建立再初始化，避免浏览器/网关因等待过久而断开连接。心跳在初始化期间就已开始发送。
 
-### 4.10 Round 状态不变量
+### 4.11 Round 状态不变量
 
-**核心不变量**: 每个 Round 最终都必须达到终态。
+**核心不变量**: 每个 Round 最终都必须达到终态；`waiting_interaction` 只是可恢复的 quiescent 暂停态，不是完成态。
 
 #### 实现保证
 
-1. **Finally Block**: Agent 执行的 finally 块确保无论正常完成、异常、断开还是取消，Round 都会被设置为终态
-2. **防止跨 Worker 覆写**: `complete_round` 在更新前检查 Round 当前状态——若已处于终态（`completed`/`failed`/`cancelled`/`resumed`），则跳过状态覆写。这防止了以下场景：
+1. **Finally Block**: producer 正常完成、异常或取消时收敛终态；合法的 Interaction 暂停则保留 `waiting_interaction`，等待回答或 abort 后再终态化。
+2. **防止跨 Worker 覆写**: 所有 terminal event 都必须在 Round 锁下经 `RunCompletionService` 完成。若 Round 已处于终态（`completed`/`failed`/`cancelled`/`max_steps_reached`），执行侧只能返回既有 committed terminal 或静默退出，禁止把迟到的原始 Agent terminal 发给 direct SSE。这防止了以下场景：
    - Worker A 执行 Round，被 abort 设为 `cancelled`
    - Worker A 的 finally 块随后执行，尝试将 Round 设为 `completed`
    - 检查发现 Round 已在终态，跳过更新
-3. **Resume 竞争窗口处理**: 若 resume 已先将 parent round 标记为 `resumed`，旧 run 的迟到 `complete_round(status="interrupted")` 只允许补写展示元数据（如 `final_response`、`step_count`），不得把状态改回 `interrupted`。
+3. **Resume 竞争窗口处理**: same-Round continuation 使用 interaction claim token 与 run/abort epoch 围栏陈旧 worker；`interaction_resolved` 提交后不得重新显示原 Interaction。
+4. **同步收敛唤醒订阅**: abort、startup cleanup、worker-dead 等同步终态写入必须在 durable event 提交后 fanout 到现有 subscriber，不能只落库让连接永远 heartbeat。
 
 ---
 
@@ -1154,17 +1190,18 @@ SSE 连接建立
 | 失败场景 | 检测方式 | 处理策略 | 用户感知 |
 |----------|----------|----------|----------|
 | **LLM 调用失败** | 异常捕获 + 重试耗尽 (`RetryExhaustedError`) | 发射 `RUN_ERROR` 事件，Round 标记 `failed` | SSE 收到错误事件，前端展示错误提示 |
-| **Agent 初始化失败** | 初始化异常捕获 | 发射 `AGENT_INIT_FAILED` 事件，Round 标记 `failed` | 同上 |
+| **新消息 Agent 初始化失败** | 初始化异常捕获 | 发射 `AGENT_INIT_FAILED`，已创建的 Round 标记 `failed` | 前端展示错误 |
+| **resume 在 continuation 前失败** | `interaction_resolved` 尚未持久化即收到 `NO_PENDING_INTERRUPT` / `RESUME_CONFLICT` / `INVALID_INTERACTION_RESPONSE` / `AGENT_INIT_FAILED` 等 | 视为控制面错误，不终态化原 Round；释放 claim/slot并保留权威 waiting 或并发 winner 状态 | 前端回拉 history 后恢复卡片、运行态或既有终态 |
 | **工具执行超时** | `tool_timeout=300s` | 工具返回超时错误信息并标记 `outcome_uncertain=true`；Agent 继续执行，权限审计记 `unknown` 而非 `failed` | Agent 告知用户超时；远端副作用可能已经发生，不应把它当作确定失败 |
 | **LLM 返回空响应** | 检测空内容 | 给予一次 nudge 机会（注入提示重新生成）；连续空响应 → `RUN_ERROR` | 首次空响应用户无感知；连续空响应收到错误 |
 | **输出截断** | `finish_reason=length` | 自动重试一次（调整 prompt 或 context） | 用户无感知（自动恢复） |
 | **SSE 断开** | 连接关闭检测 | Producer 继续运行在 `_active_runners` 中，等待客户端重连通过 subscribe 恢复 | 前端检测断开，自动重连并通过 subscribe 恢复事件流 |
-| **Subscribe 超时** | 5 分钟定时器 | 发射 `RUN_ERROR(TIMEOUT)` 事件，关闭连接 | 前端收到超时事件，提示用户 |
-| **resume 冷实时替换失败** | 未找到 ask_user `tool_call_id` 或 tool result 占位 | 写入 `interrupt_resolutions.fallback_reason`，将用户答案作为新 user 消息注入 | Agent 仍继续执行，冷恢复可通过 child user 消息保留语义 |
-| **resume 冷启动 stitching 失败** | resolution 与 parent/child 不对齐，或 parent tool result 无法替换 | 不跳过 child resume user 消息，并更新/记录 `fallback_reason` | 刷新后不会丢失用户回答，但上下文形态会退化为 user Q/A |
-| **用户主动 abort（任意 worker）** | `POST /abort` 被调用且会话处于 running / init-window | 接口直接收敛 round 并尝试释放锁；释放成功返回 `cancelled(force_aborted/force_unlocked)`；本地命中 runner 时投递协作式 cancel token | 释放成功后用户可立即重发 |
+| **Subscribe 基础设施断连** | 连接关闭/网络错误 | 服务端 producer 不因 Web consumer 断开而取消；客户端按最后 sequence 重连 running/waiting Round | 短暂断线自动恢复；无应用级 5 分钟 TIMEOUT |
+| **same-Round continuation 启动崩溃** | `interaction_resolved` 尚未提交时 claim 过期或显式释放 | 安全回收后停回 `waiting_interaction`；工具审批仅允许重放 `requested` / `approved` / 可投影 denial，不重放 `executing` | 刷新后仍可继续或看到保守 unknown |
+| **same-Round continuation 启动后失败** | `interaction_resolved` 已提交，但 queue、Agent 首次迭代或后续运行失败 | 保留 continuation fence，把原 Round 与 durable `RUN_ERROR` 原子收敛为 failed；不得回停 waiting 后发送 transport error | 所有客户端最终看到同一 failed 终态 |
+| **用户主动 abort（任意 worker）** | `POST /abort` 命中 running / waiting_interaction / init-window | 原子收敛 Round、Interaction 和未 dispatch 审批，释放锁并 fanout terminal；本地 runner 同时收到 cancel token | 释放成功后用户可立即重发 |
 | **abort 收敛后释放锁失败** | `POST /abort` 执行到锁释放阶段但 DB 冲突/异常 | 返回 `HTTP 503`，不返回 `cancelled` 假成功 | 前端保持运行态或提示重试，避免误判“已可重发” |
-| **abort 后旧 run 迟到输出** | round 已终态但仍收到后续 AG-UI 事件 | 丢弃迟到事件，不再入库，不污染 replay/UI | 前端状态保持 cancelled，不再回跳 running |
+| **abort 后旧 run 迟到输出** | round 已终态但仍收到后续 AG-UI 事件 | 持 Round 锁后二次检查并发出专用终态抑制；不入库、不写 conversation history、不累计本地 step，也不向原 direct SSE / subscriber fanout 原事件 | 前端状态保持 cancelled，不再回跳 running |
 | **DB 锁冲突** | 数据库异常捕获 | 返回 HTTP 503 | 前端提示稍后重试 |
 | **Worker 死亡** | 锁超时检测（> `SSE_SUBSCRIBE_TIMEOUT`） | abort 接口直接清理锁和 Round 状态 | 用户调用 abort 时得到即时响应 |
 
@@ -1180,7 +1217,7 @@ SSE 连接断开
 GET /subscribe?last_sequence={last_seq}
     │
     ▼ (后端)
-    ├── Round 仍在运行
+    ├── Round 为 running / waiting_interaction
     │     │
     │     ▼
     │   从 DB 回放 sequence > last_seq 的事件
@@ -1194,7 +1231,7 @@ GET /subscribe?last_sequence={last_seq}
         从 DB 回放所有剩余事件 → 关闭连接
 ```
 
-若初始 POST 在客户端收到响应头前断开，是否已创建 Round 属于歧义状态。前端不得重发 POST，而应在固定确认窗口内按原 `idempotency_key` 查询会话历史（当前最多 3 次）：命中 running Round 时立即从其 `round_id` 订阅，命中终态 Round 时直接收敛对应终态；该确认路径与正常 2xx 响应一样只发出一次 `stream_accepted`。
+若初始 POST 在客户端收到响应头前断开，是否已创建 Round 属于歧义状态。前端不得重发 POST，而应在固定确认窗口内按原 `idempotency_key` 查询会话历史（当前最多 3 次）：命中 running / waiting_interaction Round 时立即从其 `round_id` 订阅，命中终态 Round 时直接收敛；该确认路径与正常 2xx 响应一样只发出一次 `stream_accepted`。
 
 只有规定的 3 次 history 请求**全部成功**且每次均无匹配 Round，才能确认请求未被接受、触发一次接受前拒绝回调并恢复乐观清空的草稿。只要任一次 history 请求失败，确认窗口耗尽后仍必须保持 `ambiguous`：提示“暂时无法确认请求是否已受理，请刷新页面查看结果”，不得恢复草稿、不得提示重新发送，也不得以新幂等键重发。确定性的接受前 HTTP 4xx/5xx 不进入该歧义分支，可立即按拒绝处理。
 
@@ -1214,7 +1251,6 @@ GET /subscribe?last_sequence={last_seq}
 | LLM 重试 | WARNING | 模型名称, 错误信息, 重试次数, 延迟时间 | 每次重试时 |
 | LLM Failover | WARNING | Primary 模型, Fallback 模型, 原始错误 | 切换 Fallback 时 |
 | 取消请求状态变化 | INFO | `session_id`, `request_id`, 新状态 | 每次状态流转时 |
-| resume resolution fallback | WARNING | `session_id`, `interrupt_id`, `parent_round_id`, `resume_round_id`, `tool_call_id`, `fallback_reason` | 冷实时替换失败或冷启动 stitching 失败时 |
 | 工具执行耗时 | DEBUG | 工具名称, `session_id`, 耗时 | 每次工具执行完成时 |
 | 心跳发送 | DEBUG | `session_id`, `round_id` | 每次心跳时 |
 | Worker 死亡检测 | WARNING | `user_id`, `session_id`, 锁龄 | abort 检测到死锁时 |

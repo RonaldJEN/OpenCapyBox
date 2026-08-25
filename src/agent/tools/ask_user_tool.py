@@ -1,9 +1,9 @@
 """AskUserQuestionTool — 让 Agent 主动向用户提问
 
-通过 AG-UI 的 Interrupt-Resume 机制实现 Human-in-the-Loop：
-1. Agent 调用 ask_user → agent loop 拦截，发出 RUN_FINISHED(outcome="interrupt")
+通过 AG-UI 的 same-Round Interaction 机制实现 Human-in-the-Loop：
+1. Agent 调用 ask_user → agent loop 拦截并发出 interaction_requested，Round 进入 waiting_interaction
 2. 前端渲染问题卡片 → 用户选择/输入答案
-3. 前端 POST /resume → Agent 恢复执行，答案作为 tool_result 注入对话历史
+3. 前端 POST /resume → 原 Round 发出 interaction_resolved 并继续执行，答案作为 tool_result 注入历史
 """
 
 from typing import Any
@@ -18,7 +18,7 @@ class AskUserQuestionTool(Tool):
     """向用户提出问题并等待回答
 
     此工具的 execute() 不会被正常调用 — agent 主循环在检测到 ask_user
-    调用时会拦截并触发 AG-UI interrupt 流程。
+    调用时会拦截并触发 AG-UI Interaction 流程。
     """
 
     exposure = ToolExposure.DIRECT_MODEL_ONLY
