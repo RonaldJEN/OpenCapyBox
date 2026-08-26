@@ -287,7 +287,7 @@ export function ChatInput({
 
   return (
     <div className="bg-claude-bg px-4 pb-5 pt-3 md:px-8">
-      <div data-testid="chat-input-column" className="max-w-5xl">
+      <div data-testid="chat-input-column" className="mx-auto w-full max-w-5xl">
         {/* 附件列表 */}
         {attachedFiles.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2">

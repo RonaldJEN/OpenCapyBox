@@ -620,8 +620,8 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(screen.getByTestId('artifacts-panel')).toBeInTheDocument();
     });
-    expect(screen.getByTestId('chat-message-column')).not.toHaveClass('mx-auto');
-    expect(screen.getByTestId('chat-input-column')).not.toHaveClass('mx-auto');
+    expect(screen.getByTestId('chat-message-column')).toHaveClass('mx-auto', 'w-full', 'max-w-5xl');
+    expect(screen.getByTestId('chat-input-column')).toHaveClass('mx-auto', 'w-full', 'max-w-5xl');
 
     // 初始状态面板关闭
     expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'false');

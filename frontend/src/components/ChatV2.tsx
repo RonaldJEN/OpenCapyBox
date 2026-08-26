@@ -1268,7 +1268,7 @@ function ChatV2View(props: ChatV2Props) {
               </div>
             </div>
           ) : (
-            <div data-testid="chat-message-column" className="max-w-5xl space-y-6 px-4 py-6 md:px-8">
+            <div data-testid="chat-message-column" className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6 md:px-8">
               {rounds.map((round, index) => (
                 <div
                   key={round.round_id}
@@ -1323,7 +1323,7 @@ function ChatV2View(props: ChatV2Props) {
 
         {displayError && (
           <div className="px-6 py-3 bg-red-50 border-t border-red-100">
-            <div className="max-w-5xl">
+            <div className="mx-auto w-full max-w-5xl">
               <div className="flex items-start gap-3">
                 <AlertCircle className="w-4 h-4 text-claude-error flex-shrink-0 mt-0.5" />
                 <div className="flex-1 min-w-0 overflow-hidden">
@@ -1347,7 +1347,7 @@ function ChatV2View(props: ChatV2Props) {
         )}
 
         {pendingInterrupt && pendingInterrupt.reason === 'input_required' && pendingInterrupt.payload?.questions && (pendingInterrupt.payload.questions as AskUserQuestion[]).length > 0 && (
-          <div className="relative z-20 mb-[-3.5rem] w-full max-w-5xl px-4 md:px-8">
+          <div className="relative z-20 mx-auto mb-[-3.5rem] w-full max-w-5xl px-4 md:px-8">
             <QuestionCard
               key={pendingInterrupt.id}
               questions={pendingInterrupt.payload.questions as AskUserQuestion[]}
@@ -1358,7 +1358,7 @@ function ChatV2View(props: ChatV2Props) {
         )}
 
         {pendingInterrupt && pendingInterrupt.reason === 'human_approval' && pendingInterrupt.payload?.kind === 'tool_approval' && (
-          <div className="relative z-20 mb-[-3.5rem] w-full max-w-5xl px-4 md:px-8">
+          <div className="relative z-20 mx-auto mb-[-3.5rem] w-full max-w-5xl px-4 md:px-8">
             <ToolApprovalCard
               approval={pendingInterrupt.payload as ToolApprovalPayload}
               onSubmit={handleResumeSubmit}
