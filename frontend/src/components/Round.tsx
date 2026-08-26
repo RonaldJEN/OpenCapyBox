@@ -1,6 +1,18 @@
 import { RoundData, FileInfo, AttachmentInfo } from '../types';
 import { useState } from 'react';
-import { Check, Copy, ExternalLink, User } from 'lucide-react';
+import {
+  AlignLeft,
+  Archive,
+  Check,
+  Code2,
+  Copy,
+  File,
+  Image,
+  Presentation,
+  Table2,
+  User,
+  type LucideIcon,
+} from 'lucide-react';
 import { ReasoningPanel } from './ReasoningPanel';
 import { FileAttachment } from './FileAttachment';
 import { CodeBlock } from './CodeBlock';
@@ -11,7 +23,7 @@ import {
   createAssistantFileInfoFromHref,
   extractAssistantFiles,
 } from '../utils/assistantFileRefs';
-import { getFileIcon, getFileExtLabel, getFileCategoryLabel, getFileBadgeClass, getFileIconClass, toFileInfo, buildSandboxFileUrl, isImageFile } from '../utils/fileUtils';
+import { detectFileCategory, getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, toFileInfo, buildSandboxFileUrl, isImageFile } from '../utils/fileUtils';
 import { AuthenticatedImage } from './AuthenticatedImage';
 
 interface RoundProps {
@@ -224,54 +236,71 @@ function AssistantActions({ content }: { content: string }) {
   );
 }
 
+function getAssistantFileGlyph(file: FileInfo): LucideIcon {
+  switch (detectFileCategory(file)) {
+    case 'doc':
+    case 'pdf':
+      return AlignLeft;
+    case 'code':
+      return Code2;
+    case 'sheet':
+      return Table2;
+    case 'ppt':
+      return Presentation;
+    case 'archive':
+      return Archive;
+    case 'image':
+      return Image;
+    default:
+      return File;
+  }
+}
+
+function AssistantFileTypeIcon({ file }: { file: FileInfo }) {
+  const Glyph = getAssistantFileGlyph(file);
+  const category = detectFileCategory(file);
+
+  return (
+    <span
+      className="relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-[7px] bg-claude-file text-white shadow-[0_1px_2px_rgba(39,67,170,0.22)] transition-colors group-hover:bg-claude-file-strong"
+      data-file-category={category}
+      aria-hidden="true"
+    >
+      <span className="absolute right-0 top-0 h-2.5 w-2.5 rounded-bl-[3px] bg-white/25" />
+      <Glyph size={18} strokeWidth={2.4} aria-hidden="true" />
+    </span>
+  );
+}
+
 function AssistantFileCard({ file, onOpen }: { file: FileInfo; onOpen?: (file: FileInfo) => void }) {
-  const Icon = getFileIcon(file);
   const previewSessionId = file.session_id;
   const showImagePreview = isImageFile(file) && (file.data_url || (previewSessionId && file.path));
-  const meta = file.size > 0
-    ? `${getFileCategoryLabel(file)} · ${getFileExtLabel(file)} · ${formatAssistantFileSize(file.size)}`
-    : `${getFileCategoryLabel(file)} · ${getFileExtLabel(file)}`;
 
   return (
     <button
       type="button"
       onClick={() => onOpen?.(file)}
-      className="not-prose group flex w-full items-center gap-3 rounded-xl border border-claude-border bg-white px-4 py-3 text-left transition-colors hover:border-claude-border-strong hover:bg-claude-hover active:scale-[0.99]"
+      className="not-prose group flex min-h-[52px] w-full max-w-[520px] items-center gap-2.5 rounded-[10px] border border-transparent bg-claude-surface px-2.5 py-2 text-left transition-[background-color,border-color,transform] hover:border-claude-border hover:bg-claude-hover active:scale-[0.995] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/35 sm:w-fit sm:min-w-[280px]"
       aria-label={`查看 ${file.name}`}
       title={`查看 ${file.name}`}
     >
-      <span className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-claude-surface">
-        {showImagePreview ? (
+      {showImagePreview ? (
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-[7px] bg-white/75">
           <AuthenticatedImage
             src={file.data_url || buildSandboxFileUrl(previewSessionId!, file.path, true)}
             alt={file.name}
-            className="h-full w-full object-cover transition-transform group-hover:scale-105"
-            fallback={<Icon className={`h-5 w-5 ${getFileIconClass(file)}`} />}
+            className="h-full w-full object-cover"
+            fallback={<AssistantFileTypeIcon file={file} />}
           />
-        ) : (
-          <Icon className={`h-5 w-5 ${getFileIconClass(file)}`} />
-        )}
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-[15px] font-semibold leading-tight text-claude-text">
-          {file.name}
         </span>
-        <span className="mt-1 block text-[12px] text-claude-muted">
-          {meta}
-        </span>
-      </span>
-      <span className="inline-flex shrink-0 items-center gap-1 text-[12px] font-medium text-claude-accent transition-colors group-hover:text-claude-text">
-        查看
-        <ExternalLink size={13} />
+      ) : (
+        <AssistantFileTypeIcon file={file} />
+      )}
+      <span className="min-w-0 flex-1 truncate text-[15px] font-medium leading-6 text-claude-text sm:max-w-[430px] sm:flex-none">
+        {file.name}
       </span>
     </button>
   );
-}
-
-function formatAssistantFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export function Round({ round, isStreaming = false, disableMotion = false, userAttachments = [], sessionId, assistantFileMatches, onPreviewAttachment, onOpenFileInPanel }: RoundProps) {
@@ -420,7 +449,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
               )}
               {/* 底部文件卡片（去重） */}
               {visibleAssistantFiles.length > 0 && (
-                <div className="not-prose mt-4 flex flex-col gap-2">
+                <div className="not-prose mt-3 flex max-w-[520px] flex-col items-stretch gap-1.5 sm:items-start">
                   {visibleAssistantFiles.map((file) => (
                     <AssistantFileCard
                       key={`file-${file.path}`}

@@ -6,7 +6,9 @@ import { makeChatV2DefaultProps } from '../utils/chatv2-helpers';
 
 let lastChatInputProps: any = null;
 let lastArtifactsPanelProps: any = null;
+let artifactsPanelPropsHistory: any[] = [];
 let lastRoundProps: any = null;
+let lastFilePreviewProps: any = null;
 
 vi.mock('../../services/api', () => ({
   apiService: {
@@ -79,6 +81,7 @@ vi.mock('../../components/ChatInput', () => ({
 vi.mock('../../components/Round', () => ({
   Round: (props: any) => {
     lastRoundProps = props;
+    const matchedFile = props.assistantFileMatches?.['quick_sort.py'];
     return (
       <button
         type="button"
@@ -89,6 +92,7 @@ vi.mock('../../components/Round', () => ({
           size: 0,
           modified: '',
           type: 'py',
+          ...matchedFile,
         })}
       >
         open file
@@ -100,12 +104,16 @@ vi.mock('../../components/Round', () => ({
 vi.mock('../../components/ArtifactsPanel', () => ({
   ArtifactsPanel: (props: any) => {
     lastArtifactsPanelProps = props;
+    artifactsPanelPropsHistory.push(props);
     return <div data-testid="artifacts-panel" data-open={String(props.isOpen)} />;
   },
 }));
 
 vi.mock('../../components/FilePreview', () => ({
-  FilePreview: () => <div data-testid="file-preview" />,
+  FilePreview: (props: any) => {
+    lastFilePreviewProps = props;
+    return <div data-testid="file-preview" />;
+  },
 }));
 
 describe('ChatV2 preview callback wiring', () => {
@@ -115,7 +123,9 @@ describe('ChatV2 preview callback wiring', () => {
     vi.clearAllMocks();
     lastChatInputProps = null;
     lastArtifactsPanelProps = null;
+    artifactsPanelPropsHistory = [];
     lastRoundProps = null;
+    lastFilePreviewProps = null;
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       rounds: [],
       session_id: 'test-session',
@@ -151,7 +161,105 @@ describe('ChatV2 preview callback wiring', () => {
     });
   });
 
-  it('assistant file callback should open Files panel with target file', async () => {
+  it('assistant file callback should open the workspace before directory verification resolves', async () => {
+    let resolveFileList: (value: { total: number; files: any[] }) => void = () => {};
+    vi.mocked(apiService.getSessionFiles).mockImplementation(() => new Promise((resolve) => {
+      resolveFileList = resolve;
+    }));
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      session_id: 'test-session',
+      total: 1,
+      rounds: [
+        {
+          round_id: 'round-1',
+          user_message: '写个快排给我',
+          final_response: '文件位置： quick_sort.py',
+          steps: [],
+          step_count: 0,
+          status: 'completed',
+          created_at: new Date().toISOString(),
+          completed_at: new Date().toISOString(),
+        },
+      ],
+    });
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('round-open-file')).toBeInTheDocument();
+      expect(apiService.getSessionFiles).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.click(screen.getByTestId('round-open-file'));
+
+    expect(lastArtifactsPanelProps.isOpen).toBe(true);
+    expect(lastArtifactsPanelProps.targetFile).toMatchObject({
+      name: 'quick_sort.py',
+      path: 'quick_sort.py',
+      session_id: 'test-session',
+    });
+    expect(lastArtifactsPanelProps.targetFileNonce).toBe(1);
+    expect(apiService.getSessionFiles).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveFileList({ files: [], total: 0 });
+      await Promise.resolve();
+    });
+  });
+
+  it('聊天附件弹窗应显式只读', async () => {
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    await waitFor(() => expect(typeof lastChatInputProps?.onPreviewAttachment).toBe('function'));
+
+    await act(async () => {
+      await lastChatInputProps.onPreviewAttachment({
+        name: 'report.md',
+        path: 'report.md',
+        size: 128,
+        modified: '2026-08-26T10:00:00Z',
+        type: 'md',
+        session_id: 'test-session',
+      });
+    });
+
+    expect(lastFilePreviewProps).toMatchObject({
+      sessionId: 'test-session',
+      readOnly: true,
+      file: expect.objectContaining({ path: 'report.md' }),
+    });
+  });
+
+  it('A 的外部 target 在切换到 B 的首帧不得投影到 B 文件工作台', async () => {
+    vi.mocked(apiService.getSessionFiles).mockResolvedValue({ files: [], total: 0 });
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sessionId) => ({
+      session_id: sessionId,
+      total: sessionId === 'session-a' ? 1 : 0,
+      rounds: sessionId === 'session-a' ? [{
+        round_id: 'round-a',
+        user_message: '生成文件',
+        final_response: '文件位置： quick_sort.py',
+        steps: [],
+        step_count: 0,
+        status: 'completed',
+        created_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      }] : [],
+    }));
+
+    const { rerender } = render(<ChatV2 sessionId="session-a" {...defaultProps} />);
+    fireEvent.click(await screen.findByTestId('round-open-file'));
+    expect(lastArtifactsPanelProps.targetFile).toMatchObject({ session_id: 'session-a' });
+
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
+    await waitFor(() => expect(lastArtifactsPanelProps.sessionId).toBe('session-b'));
+
+    const sessionBRenders = artifactsPanelPropsHistory.filter((props) => props.sessionId === 'session-b');
+    expect(sessionBRenders.length).toBeGreaterThan(0);
+    expect(sessionBRenders.every((props) => props.targetFile == null)).toBe(true);
+    expect(sessionBRenders.every((props) => props.ownerEpoch > 0)).toBe(true);
+  });
+
+  it('assistant file callback should reuse verified metadata without a click-time request', async () => {
     vi.mocked(apiService.getSessionFiles).mockResolvedValue({
       total: 1,
       files: [{
@@ -179,110 +287,68 @@ describe('ChatV2 preview callback wiring', () => {
         },
       ],
     });
-
     render(<ChatV2 sessionId="test-session" {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId('round-open-file')).toBeInTheDocument();
+      expect(lastRoundProps.assistantFileMatches?.['quick_sort.py']).toMatchObject({
+        size: 256,
+        modified: '2026-04-22T10:20:00Z',
+      });
     });
+    const requestCountBeforeClick = vi.mocked(apiService.getSessionFiles).mock.calls.length;
 
     fireEvent.click(screen.getByTestId('round-open-file'));
 
-    await waitFor(() => {
-      expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session', undefined);
-      expect(lastArtifactsPanelProps.isOpen).toBe(true);
-      expect(lastArtifactsPanelProps.targetFile).toMatchObject({
+    expect(lastArtifactsPanelProps.isOpen).toBe(true);
+    expect(lastArtifactsPanelProps.targetFile).toMatchObject({
+      name: 'quick_sort.py',
+      size: 256,
+      modified: '2026-04-22T10:20:00Z',
+      session_id: 'test-session',
+    });
+    expect(apiService.getSessionFiles).toHaveBeenCalledTimes(requestCountBeforeClick);
+  });
+
+  it('closing and reopening the same assistant file should issue a new target nonce', async () => {
+    vi.mocked(apiService.getSessionFiles).mockResolvedValue({
+      total: 1,
+      files: [{
         name: 'quick_sort.py',
         path: 'quick_sort.py',
-        session_id: 'test-session',
-      });
-      expect(lastArtifactsPanelProps.targetFileNonce).toBe(1);
+        size: 256,
+        modified: '2026-04-22T10:20:00Z',
+        type: 'py',
+        is_directory: false,
+      }],
     });
-  });
-
-  it('assistant file callback should not open Files panel when target file is missing', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       session_id: 'test-session',
       total: 1,
-      rounds: [
-        {
-          round_id: 'round-1',
-          user_message: '写个快排给我',
-          final_response: '文件位置： quick_sort.py',
-          steps: [],
-          step_count: 0,
-          status: 'completed',
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ],
+      rounds: [{
+        round_id: 'round-1',
+        user_message: '写个快排给我',
+        final_response: '文件位置： quick_sort.py',
+        steps: [],
+        step_count: 0,
+        status: 'completed',
+        created_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      }],
     });
-    vi.mocked(apiService.getSessionFiles).mockResolvedValue({ files: [], total: 0 });
 
     render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    const trigger = await screen.findByTestId('round-open-file');
 
-    await waitFor(() => {
-      expect(screen.getByTestId('round-open-file')).toBeInTheDocument();
-    });
+    fireEvent.click(trigger);
+    await waitFor(() => expect(lastArtifactsPanelProps.targetFileNonce).toBe(1));
 
-    fireEvent.click(screen.getByTestId('round-open-file'));
+    act(() => lastArtifactsPanelProps.onClose());
+    await waitFor(() => expect(lastArtifactsPanelProps.isOpen).toBe(false));
 
-    await waitFor(() => {
-      expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session', undefined);
-      expect(lastArtifactsPanelProps.isOpen).toBe(false);
-    });
-    expect(screen.getByText('文件不存在或尚未生成：quick_sort.py')).toBeInTheDocument();
-  });
-
-  it('assistant file callback should clear stale missing-file error after a later success', async () => {
-    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      session_id: 'test-session',
-      total: 1,
-      rounds: [
-        {
-          round_id: 'round-1',
-          user_message: '写个快排给我',
-          final_response: '文件位置： quick_sort.py',
-          steps: [],
-          step_count: 0,
-          status: 'completed',
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ],
-    });
-    vi.mocked(apiService.getSessionFiles)
-      .mockResolvedValueOnce({ files: [], total: 0 })
-      .mockResolvedValueOnce({ files: [], total: 0 })
-      .mockResolvedValueOnce({
-        total: 1,
-        files: [{
-          name: 'quick_sort.py',
-          path: 'quick_sort.py',
-          size: 256,
-          modified: '2026-04-22T10:20:00Z',
-          type: 'py',
-          is_directory: false,
-        }],
-      });
-
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(screen.getByTestId('round-open-file')).toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByTestId('round-open-file'));
-
-    await waitFor(() => {
-      expect(screen.getByText('文件不存在或尚未生成：quick_sort.py')).toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByTestId('round-open-file'));
-
+    fireEvent.click(trigger);
     await waitFor(() => {
       expect(lastArtifactsPanelProps.isOpen).toBe(true);
-      expect(screen.queryByText('文件不存在或尚未生成：quick_sort.py')).not.toBeInTheDocument();
+      expect(lastArtifactsPanelProps.targetFileNonce).toBe(2);
     });
   });
 

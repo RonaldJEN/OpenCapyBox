@@ -157,15 +157,32 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 - Query: `path: str = ""`（相对子目录）
 - Response 200: `{files: [{name, path, size, modified, type, is_directory}], total}`
 - `modified` 为带显式时区偏移的 ISO 8601 时间字符串，当前统一返回 UTC（如 `2026-05-08T02:30:00+00:00`）。
-- Error 404, 403（"路径越界"）, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）
-- 当 `sandbox_use_server_proxy=True` 时使用 `find` 命令替代 SDK
+- 只有成功枚举出的零项才返回 `200 + files=[]`；沙箱连接、目录命令或 JSON 解析失败会强制重连一次，仍失败返回 503，不得伪装成空目录。
+- Error 404, 403（"路径越界"）, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 503（沙箱或目录读取不可用）
+- 目录枚举统一在用户沙箱内执行 Python `os.listdir/stat`，不依赖 proxy 模式下会丢 query 参数的 `files.search`
 
 ### GET /api/sessions/{id}/files/{path:path}
 
-- Query: `preview: bool = False`
+- Query:
+  - `preview: bool = False`
+  - `render: "pdf" | null = null`；仅在 `preview=true` 时有效
 - Response: 文件字节流，`Content-Disposition` = attachment（下载）或 inline（预览）
 - 可预览类型：text/\*、image/\*、PDF、JSON、XML
-- Error 404, 400（"文件路径不合法"）, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 503（"沙箱不可用"）
+- 非 ASCII 路径的内联预览优先使用一次沙箱命令读取，失败再走 ASCII 临时别名；下载仍优先别名 + SDK 字节传输，避免大文件进入 base64 stdout。
+- `render=pdf`：仅接受 DOC/DOCX/PPT/PPTX。在**用户 OpenSandbox 内**以单一进程完成源文件的 50 MiB 有界快照、SHA-256 与复制，API 主机不得读取或执行不可信 Office 内容；随后在沙箱内调用 LibreOffice。派生 PDF 缓存在 session 根目录下的隐藏 `.opencapybox-preview/{content_hash}/`，不得出现在文件列表中，并随 session 删除。
+- 派生预览以文件内容 hash + 扩展名 + renderer 版本为缓存键；同内容重复预览直接复用 PDF。
+- 相同内容通过沙箱内原子目录锁收敛为一次转换；每请求使用唯一 scratch/LibreOffice profile，先验证临时 PDF 的 `%PDF-` magic 与大小，再原子发布，禁止命中 partial cache。
+- Office 源文件最大 50 MiB、派生 PDF 最大 100 MiB；shell `timeout -k` 与 OpenSandbox SDK timeout 双重限制转换时间。成功响应优先流式读取派生 PDF。
+- 失败只影响当前预览，不改变 Session/Round 状态。
+- Error 404（源文件不存在）, 400（"文件路径不合法" 或未开启 preview 却请求 render）, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 413（源或派生预览文件过大）, 415（不支持的派生格式）, 422（文档损坏/转换失败）, 503（沙箱或 renderer 不可用）, 504（转换超时）
+
+### PUT /api/sessions/{id}/files/{path:path}
+
+- 支持 `.md/.markdown` 的 UTF-8 `content`，以及 `.csv/.xlsx` 的 `content_base64`；旧二进制 `.xls`、`.et` 与其余扩展名返回 415，只允许下载/只读预览。
+- Request 同时携带 `expected_size + expected_modified`。服务端在沙箱内复核当前 stat，再通过同目录临时文件与 `os.replace` 原子发布；版本不一致返回 409，禁止静默覆盖 Agent 或其他标签页的新版本。
+- 存在新鲜 `UserRunLock` 时返回 409，避免网页编辑器与 Agent 同时写 Session 文件。
+- Markdown 最大 5 MiB；电子表格解码后最大 20 MiB。CSV 必须是无 NUL 的有效 UTF-8；XLSX 必须是完整且有界的 OOXML ZIP，校验必要 XML、条目路径、重复/加密条目、CRC、总解压大小，以及 Content Types、根 `officeDocument`、workbook sheet 清单和 worksheet target 组成的完整关系图；Base64、文本编码、容器结构或关系图无效返回 422。
+- Response 200: 最新 `{name, path, size, modified, type, is_directory}`，其中 `modified` 是 UTC ISO 8601，用作下一次保存的版本令牌和前端“最近修改”时间。
 
 ### GET /api/sessions/running-sessions
 

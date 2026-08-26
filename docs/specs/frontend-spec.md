@@ -3,7 +3,8 @@
 > 本文是 OpenCapyBox 前端的**单一事实源**。细分模块见：
 > - [frontend-chat-spec.md](./frontend-chat-spec.md) — 聊天/SSE/推理面板
 > - [frontend-session-spec.md](./frontend-session-spec.md) — 会话列表与切换
-> - [frontend-panel-spec.md](./frontend-panel-spec.md) — 抽屉/弹窗类面板（Files/SettingsCenter/Cron）
+> - [frontend-session-files-spec.md](./frontend-session-files-spec.md) — Session 文件分栏、多标签与格式预览
+> - [frontend-panel-spec.md](./frontend-panel-spec.md) — 日程/Skills/数据一级页与 SettingsCenter/二级面板
 
 ## 1. 技术栈与版本
 
@@ -18,16 +19,19 @@
 
 | 模块 | 职责 | 不职责 |
 |---|---|---|
-| `App.tsx` | 路由、顶层 state（sessionId、model、panel）、未读计数轮询 | 业务逻辑、SSE 处理 |
+| `App.tsx` | data router、日程/Skills/数据一级 surface 保活、顶层 state（sessionId、model、panel）、dirty blocker、未读轮询 | 业务逻辑、SSE 处理 |
 | `runtime/ChatRuntimeProvider.tsx` | Round/Run 投影、transport epoch、history 合并、waiting/resume/subscribe/abort 生命周期 | 消息视觉渲染 |
 | `runtime/chatRuntimeReducer.ts` | 纯状态迁移与 AG-UI 事件归并 | 网络请求、定时器 |
 | `components/ChatV2.tsx` | 会话内消息渲染、草稿、滚动、交互卡与用户动作 | 直接拥有 SSE transport |
-| `components/SessionList.tsx` | 会话 CRUD、运行中检测、入口按钮 | 消息渲染 |
+| `components/SessionList.tsx` | 会话 CRUD、运行中检测、日程/Skills/数据一级入口 | 消息渲染 |
 | `components/Round.tsx` | 单轮（user+assistant+reasoning）视觉渲染 | 消息状态管理 |
 | `components/ReasoningPanel.tsx` | `StepData[]` → Display Blocks 可视化 | 事件接收 |
-| `components/ArtifactsPanel.tsx` | 沙箱文件浏览（覆盖式抽屉） | 文件内容预览（由 `FilePreview` 负责）|
-| `components/SettingsCenter.tsx` | 设置中心居中弹窗：MEMORY/USER 记忆编辑 + SOUL/Skills 能力设定 | Skill 执行（后端负责）/Cron |
-| `components/CronSchedule.tsx` / `CronMessageCenter.tsx` | Cron 列表与执行历史 | Cron 调度（后端 worker）|
+| `components/ArtifactsPanel.tsx` + `components/session-files/*` | Session 文件目录、多标签、分栏/全屏状态 | 聊天运行态、用户级工作区 |
+| `components/FilePreview.tsx` + `components/file-preview/*` | 按文件类型选择安全预览器；为当前 Session 的 Markdown、CSV、XLSX 提供受限编辑 | Word/PowerPoint 在线编辑、Round 状态管理 |
+| `components/SettingsCenter.tsx` | 设置中心居中弹窗：MEMORY/USER/SOUL 编辑 + 权限管控 | Skills/MCP 入口与状态、Cron |
+| `components/SkillsPage.tsx` / `SkillsPanel.tsx` | Skills 一级页、搜索/筛选/刷新/乐观启停与降级状态 | Skill 执行、Settings 状态 |
+| `components/ConnectionsPage.tsx` / `McpConnectionsPanel.tsx` | “数据”一级页、MCP 配置/测试/发布工具与 dirty 状态 | 工具调用权限裁决 |
+| `components/SchedulePage.tsx` / `CronSchedule.tsx` / `CronMessageCenter.tsx` | 日程一级页、Cron 列表与执行历史 | Cron 调度（后端 worker）|
 | `components/AdminConsole.tsx` | 管理后台概览、Session 监控、用户管理、系统监控 | 业务执行、用户认证判定 |
 | `services/api.ts` | 认证、history、配置等普通 HTTP API | chat SSE transport |
 | `services/chatStreamClient.ts` | direct/resume/subscribe fetch + SSE 解析、序号恢复与控制面错误分类 | React 状态更新 |
@@ -168,9 +172,10 @@
 
 - 消息：左对齐文档流，**无气泡**。用户/助手通过圆形头像 + 角色标签区分。
 - 间距：8px 网格系统，消息间用细分隔线（`border-b border-claude-border/50`）。
-- 主内容区 `max-w-3xl`，输入框同宽。
-- 左侧栏 260px 可折叠。
-- 右侧面板：**覆盖式抽屉（Overlay Drawer）**，不挤压主内容（见 §5.6）。
+- 聊天消息列与输入区使用 `max-w-5xl`，共享左侧 gutter。
+- 左侧栏展开宽度 220px，折叠后保留 64px rail。
+- 普通右侧面板：**覆盖式抽屉（Overlay Drawer）**，不挤压主内容（见 §5.6）。
+- Session 文件工作台：用户主动打开的主布局分栏，遵循 [frontend-session-files-spec.md](./frontend-session-files-spec.md)，是 §5.6 的唯一例外。
 
 ### 5.3 色彩 Token
 
@@ -217,6 +222,8 @@
 - 动效仅作用于 `transform/opacity`，避免布局属性动画（防止长列表 reflow 抖动）。
 - 推荐：`transition-transform duration-300 ease-out`，backdrop `transition-opacity duration-200`。
 - 打开右侧面板时，左侧栏可自动折叠释放空间；**不锁定聊天滚动**。
+
+**Session 文件工作台例外**：它不是临时抽屉，而是用户显式选择的聊天/文件双工作区，可以通过 flex/grid 分配宽度并提供 splitter；不得用 fixed backdrop 模拟。分栏切换必须保留聊天 transport、草稿、滚动和 Interaction，详见 `frontend-session-files-spec.md`。
 
 ### 5.7 会话滚动策略
 
@@ -270,7 +277,7 @@
 - [ ] 动画：尊重 `prefers-reduced-motion`
 - [ ] 交互：长耗时操作必须有 loading 或实时预览
 - [ ] 会话隔离：SSE envelope 必须通过 owner session + transport epoch/connection identity；history 必须通过 request id + stream watermark（见 §4.1）
-- [ ] 不挤压：右侧抽屉必须覆盖式（见 §5.6）
+- [ ] 普通右侧抽屉必须覆盖式；Session 文件工作台只能按专属分栏契约实现（见 §5.6）
 
 ## 7. 测试约定
 
@@ -288,5 +295,5 @@
 2. **绕过 Provider/reducer 直接用 SSE 回调 setState**，或漏检 transport identity → 旧连接污染当前 session/run。
 3. **使用 `transition-all`** → 性能抖动，违反 §5.11。
 4. **历史消息入场用 `animate-fade-in`** → 瀑布动效，违反 §5.8。
-5. **右侧面板用 `padding-right`** → reflow 抖动，违反 §5.6。
+5. **普通右侧面板用 `padding-right`** → reflow 抖动，违反 §5.6；Session 文件工作台则应使用显式 flex/grid 分栏，不能混用抽屉语义。
 6. **普通进入会话时恢复旧 `scrollTop`** → 切回会话与刷新后的语义不一致，违反 §5.7。

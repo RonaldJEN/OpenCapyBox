@@ -388,16 +388,26 @@ class TestSessionsRouter:
         mock_pool.remove_async = AsyncMock(return_value=True)
         mock_sandbox_service = MagicMock()
         mock_sandbox_service.get_cached.return_value = None
+        mock_sandbox_service.get_mount_path.return_value = "/home/user"
+        recovered_sandbox = MagicMock()
+        recovered_sandbox.commands.run = AsyncMock(return_value=make_fake_execution())
 
         with (
             patch("src.api.routes.sessions.get_agent_pool", return_value=mock_pool),
             patch("src.api.routes.sessions.get_sandbox_service", return_value=mock_sandbox_service),
+            patch(
+                "src.api.routes.sessions._ensure_sandbox",
+                new=AsyncMock(return_value=recovered_sandbox),
+            ) as ensure_sandbox,
         ):
             response = sessions_client.delete("/sessions/delete-me")
 
         assert response.status_code == 200
         assert response.json() == {"message": "会话已删除"}
         mock_pool.remove_async.assert_awaited_once_with("delete-me")
+        ensure_sandbox.assert_awaited_once()
+        recovered_sandbox.commands.run.assert_awaited_once()
+        assert "rm -rf /home/user/sessions/delete-me" in recovered_sandbox.commands.run.await_args.args[0]
 
         with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
             from src.api.models.session import Session as SessionModel
@@ -2194,6 +2204,48 @@ class TestAsciiAliasRead:
         assert result == b"pptx-content"
 
 
+class TestReadNonAsciiFileBytes:
+    """Unicode 路徑依預覽/下載情境選擇最低往返讀取策略。"""
+
+    @pytest.mark.asyncio
+    async def test_preview_prefers_single_command(self, monkeypatch):
+        from src.api.routes import sessions
+
+        command_read = AsyncMock(return_value=b"html-preview")
+        alias_read = AsyncMock(return_value=b"alias-preview")
+        monkeypatch.setattr(sessions, "_read_bytes_via_command", command_read)
+        monkeypatch.setattr(sessions, "_read_bytes_via_ascii_alias", alias_read)
+
+        result = await sessions._read_non_ascii_file_bytes(
+            MagicMock(),
+            "/home/user/随便写写.html",
+            preview=True,
+        )
+
+        assert result == b"html-preview"
+        command_read.assert_awaited_once()
+        alias_read.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_download_keeps_alias_transport_first(self, monkeypatch):
+        from src.api.routes import sessions
+
+        command_read = AsyncMock(return_value=b"command-download")
+        alias_read = AsyncMock(return_value=b"large-download")
+        monkeypatch.setattr(sessions, "_read_bytes_via_command", command_read)
+        monkeypatch.setattr(sessions, "_read_bytes_via_ascii_alias", alias_read)
+
+        result = await sessions._read_non_ascii_file_bytes(
+            MagicMock(),
+            "/home/user/报告.pptx",
+            preview=False,
+        )
+
+        assert result == b"large-download"
+        alias_read.assert_awaited_once()
+        command_read.assert_not_awaited()
+
+
 class TestReadBytesViaCommand:
     """_read_bytes_via_command 輔助函數測試"""
 
@@ -2368,7 +2420,7 @@ class TestSandboxListDir:
 
     @pytest.mark.asyncio
     async def test_list_dir_json_parse_failure(self):
-        """JSON 解析失敗時返回空列表"""
+        """JSON 解析失敗必須報錯，不能偽裝成空目錄。"""
         from src.api.routes.sessions import _sandbox_list_dir
 
         sandbox = MagicMock()
@@ -2376,8 +2428,12 @@ class TestSandboxListDir:
             return_value=make_fake_execution(stdout_text="not-json")
         )
 
-        items = await _sandbox_list_dir(sandbox, "/home/user/sessions/s1", "/home/user/sessions/s1")
-        assert items == []
+        with pytest.raises(RuntimeError, match="目录列表响应格式无效"):
+            await _sandbox_list_dir(
+                sandbox,
+                "/home/user/sessions/s1",
+                "/home/user/sessions/s1",
+            )
 
     @pytest.mark.asyncio
     async def test_list_dir_relative_path_from_session_root(self):

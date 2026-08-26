@@ -10,7 +10,7 @@ const FILE_PREVIEW_EXTS = new Set([
   'txt', 'log', 'ini', 'conf', 'cfg', 'toml',
   'md', 'markdown', 'html', 'htm',
   'js', 'ts', 'jsx', 'tsx', 'py', 'java', 'cpp', 'c', 'go', 'rs', 'sh', 'bash', 'sql', 'css', 'json', 'xml', 'yaml', 'yml', 'rb', 'php', 'swift', 'kt', 'scala', 'r', 'dart', 'lua',
-  'docx', 'doc', 'csv', 'xlsx', 'xls', 'pptx', 'ppt',
+  'docx', 'doc', 'csv', 'xlsx', 'xls', 'et', 'pptx', 'ppt',
   'jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp', 'pdf',
   'zip',
 ]);

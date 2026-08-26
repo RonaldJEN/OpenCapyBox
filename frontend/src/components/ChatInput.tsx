@@ -286,8 +286,8 @@ export function ChatInput({
   const canSend = hasContent && !disabled && !sendDisabled;
 
   return (
-    <div className="px-4 pb-5 pt-3 bg-claude-bg">
-      <div className="mx-auto max-w-3xl">
+    <div className="bg-claude-bg px-4 pb-5 pt-3 md:px-8">
+      <div data-testid="chat-input-column" className="max-w-5xl">
         {/* 附件列表 */}
         {attachedFiles.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2">

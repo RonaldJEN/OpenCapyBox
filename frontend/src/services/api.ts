@@ -17,6 +17,16 @@ import type {
 import { buildSandboxFileUrl } from '../utils/fileUtils';
 import { formatHttpErrorMessage } from '../utils/errorMessages';
 
+function arrayBufferToBase64(content: ArrayBuffer): string {
+  const bytes = new Uint8Array(content);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return window.btoa(binary);
+}
+
 export interface AbortChatResponse {
   status: 'cancelled';
   request_id: string;
@@ -1074,6 +1084,60 @@ class APIService {
       }
     );
     return response.data;
+  }
+
+  /** 原子保存当前 Session 内的 Markdown 文件。 */
+  async updateSessionMarkdown(
+    chatSessionId: string,
+    file: Pick<FileInfo, 'path' | 'size' | 'modified'>,
+    content: string,
+  ): Promise<FileInfo> {
+    const response = await fetch(buildSandboxFileUrl(chatSessionId, file.path, false), {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...this.getAuthHeaders(),
+      },
+      body: JSON.stringify({
+        content,
+        expected_size: file.size,
+        expected_modified: file.modified,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new HttpError(response.status, formatHttpErrorMessage(response.status, errorText));
+    }
+
+    return response.json() as Promise<FileInfo>;
+  }
+
+  /** 原子保存当前 Session 内的 UTF-8 CSV/XLSX 文件。 */
+  async updateSessionSpreadsheet(
+    chatSessionId: string,
+    file: Pick<FileInfo, 'path' | 'size' | 'modified'>,
+    content: ArrayBuffer,
+  ): Promise<FileInfo> {
+    const response = await fetch(buildSandboxFileUrl(chatSessionId, file.path, false), {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...this.getAuthHeaders(),
+      },
+      body: JSON.stringify({
+        content_base64: arrayBufferToBase64(content),
+        expected_size: file.size,
+        expected_modified: file.modified,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new HttpError(response.status, formatHttpErrorMessage(response.status, errorText));
+    }
+
+    return response.json() as Promise<FileInfo>;
   }
 
   /**

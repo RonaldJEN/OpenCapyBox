@@ -174,11 +174,20 @@ vi.mock('../../components/Round', () => ({
 }));
 
 vi.mock('../../components/ArtifactsPanel', () => ({
-  ArtifactsPanel: ({ isOpen, onClose, variant }: any) => (
-    <div data-testid="artifacts-panel" data-open={String(isOpen)} data-variant={variant}>
-      <button onClick={onClose}>Close Panel</button>
-    </div>
-  ),
+  ArtifactsPanel: ({ sessionId, isOpen, onClose, variant, isExpanded, onToggleExpanded }: any) => {
+    if (!sessionId) return null;
+    return (
+      <div
+        data-testid="artifacts-panel"
+        data-open={String(isOpen)}
+        data-variant={variant}
+        data-expanded={String(isExpanded)}
+      >
+        <button onClick={onClose}>Close Panel</button>
+        <button onClick={onToggleExpanded}>Toggle Expand</button>
+      </div>
+    );
+  },
 }));
 
 vi.mock('../../components/FilePreview', () => ({
@@ -346,7 +355,7 @@ describe('ChatV2 组件', () => {
     expect(screen.getByText('帮我写一个 Python 爬虫')).toBeInTheDocument();
   });
 
-  it('没有 sessionId 时不显示会话资源面板入口', () => {
+  it('没有 sessionId 时不显示查看文件入口', () => {
     render(
       <ChatV2
         sessionId=""
@@ -354,7 +363,7 @@ describe('ChatV2 组件', () => {
       />
     );
 
-    expect(screen.queryByTitle('会话资源')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '查看文件' })).not.toBeInTheDocument();
     expect(screen.queryByTestId('artifacts-panel')).not.toBeInTheDocument();
   });
 
@@ -468,7 +477,7 @@ describe('ChatV2 组件', () => {
     });
 
     expect(screen.queryByText('正在开启对话')).not.toBeInTheDocument();
-    expect(screen.getByTitle('会话资源')).not.toHaveClass('animate-fade-in');
+    expect(screen.getByRole('button', { name: '查看文件' })).not.toHaveClass('animate-fade-in');
   });
 
   it('欢迎页创建会话失败应该显示错误', async () => {
@@ -600,8 +609,8 @@ describe('ChatV2 组件', () => {
     expect(screen.getByLabelText('新回复正在生成，回到底部')).toBeInTheDocument();
   });
 
-  it('点击文件夹按钮应该打开 Artifacts 面板', async () => {
-    render(
+  it('查看文件应该进入分栏且保留聊天输入框', async () => {
+    const { container } = render(
       <ChatV2
         sessionId="test-session"
         {...defaultProps}
@@ -611,20 +620,265 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(screen.getByTestId('artifacts-panel')).toBeInTheDocument();
     });
+    expect(screen.getByTestId('chat-message-column')).not.toHaveClass('mx-auto');
+    expect(screen.getByTestId('chat-input-column')).not.toHaveClass('mx-auto');
 
     // 初始状态面板关闭
     expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'false');
 
-    // 点击文件夹按钮
-    const folderButton = screen.getByTitle('会话资源');
-    fireEvent.click(folderButton);
+    const filesButton = screen.getByRole('button', { name: '查看文件' });
+    expect(filesButton).toHaveClass('h-6', 'w-6');
+    expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
+    fireEvent.click(filesButton);
 
-    // 面板应该打开
     await waitFor(() => {
       expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'true');
       expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-variant', 'workspace');
-      expect(screen.queryByPlaceholderText('输入指令...')).not.toBeInTheDocument();
+      expect(screen.getByPlaceholderText('输入指令...')).toBeInTheDocument();
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+      expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '查看文件' })).toHaveAttribute('aria-expanded', 'true');
+      expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
     });
+
+    fireEvent.click(filesButton);
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+  });
+
+  it('移动端文件覆盖层应该禁用聊天交互并管理焦点', async () => {
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn(() => ({
+        matches: true,
+        media: '(max-width: 1199px)',
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    });
+
+    try {
+      render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+      const filesButton = screen.getByRole('button', { name: '查看文件' });
+      filesButton.focus();
+      fireEvent.click(filesButton);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'true');
+        expect(screen.getByTestId('chat-pane')).toHaveAttribute('inert');
+        expect(screen.getByRole('button', { name: 'Close Panel' })).toHaveFocus();
+        expect(screen.queryByRole('button', { name: '收起面板' })).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: '展开面板' })).not.toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Close Panel' }));
+      await waitFor(() => {
+        expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'false');
+        expect(screen.getByTestId('chat-pane')).not.toHaveAttribute('inert');
+        expect(filesButton).toHaveFocus();
+      });
+    } finally {
+      Object.defineProperty(window, 'matchMedia', {
+        configurable: true,
+        value: originalMatchMedia,
+      });
+    }
+  });
+
+  it('文件面板应该在 split 与 full 之间切换', async () => {
+    const { container } = render(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
+    await waitFor(() => {
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle Expand' }));
+    await waitFor(() => {
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'full');
+      expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'true');
+      expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-expanded', 'true');
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle Expand' }));
+    await waitFor(() => {
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+      expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'false');
+    });
+  });
+
+  it('文件布局应该按 session 隔离并在返回时恢复', async () => {
+    const { container, rerender } = render(
+      <ChatV2 sessionId="test-session" {...defaultProps} />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
+    await waitFor(() => {
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    });
+
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
+    await waitFor(() => {
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
+      expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'false');
+    });
+
+    rerender(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    await waitFor(() => {
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+      expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'true');
+    });
+  });
+
+  it('聊天面板按钮在 closed/split 间切换右侧文件工作台', async () => {
+    const { container } = render(
+      <ChatV2 sessionId="test-session" {...defaultProps} />
+    );
+
+    expect(screen.getByRole('button', { name: '展开面板' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: '收起面板' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    await waitFor(() => {
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    });
+    expect(screen.getByRole('button', { name: '收起面板' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
+    expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' }))
+      .toHaveAttribute('aria-valuenow', '100');
+    expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
+  });
+
+  it('session 切换保留当前 split，关闭后再打开固定恢复 45/55', async () => {
+    const { container, rerender } = render(
+      <ChatV2 sessionId="session-a" {...defaultProps} />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
+    const splitter = await screen.findByRole('separator', { name: '调整聊天和文件面板宽度' });
+    fireEvent.keyDown(splitter, { key: 'ArrowRight' });
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '47%',
+    });
+    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
+    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '45%',
+    });
+
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
+    fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '45%',
+    });
+
+    rerender(<ChatV2 sessionId="session-a" {...defaultProps} />);
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '45%',
+    });
+  });
+
+  it('splitter 到达端点时切换为 full/closed，并用最后可见比例重新展开', async () => {
+    window.localStorage.setItem('opencapybox.sessionFiles.chatRatio', '48');
+    const { container } = render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    const shell = container.querySelector('.session-files-shell') as HTMLDivElement;
+    vi.spyOn(shell, 'getBoundingClientRect').mockReturnValue({
+      x: 100,
+      y: 0,
+      left: 100,
+      right: 1100,
+      top: 0,
+      bottom: 600,
+      width: 1000,
+      height: 600,
+      toJSON: () => ({}),
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
+    let splitter = await screen.findByRole('separator', { name: '调整聊天和文件面板宽度' });
+    fireEvent.keyDown(splitter, { key: 'End' });
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
+    expect(screen.getByRole('button', { name: '查看文件' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
+    expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' }))
+      .toHaveAttribute('aria-valuenow', '100');
+
+    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '45%',
+    });
+
+    splitter = screen.getByRole('separator', { name: '调整聊天和文件面板宽度' });
+    fireEvent.keyDown(splitter, { key: 'Home' });
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'full');
+    splitter = screen.getByRole('separator', { name: '调整聊天和文件面板宽度' });
+    expect(splitter).toHaveAttribute('aria-valuenow', '0');
+    fireEvent.keyDown(splitter, { key: 'ArrowRight' });
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '2%',
+    });
+
+    fireEvent.keyDown(splitter, { key: 'Home' });
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'full');
+
+    vi.stubGlobal('PointerEvent', MouseEvent);
+    fireEvent.pointerDown(splitter, { button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 250, pointerId: 1 });
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '15%',
+    });
+    fireEvent.pointerMove(window, { clientX: 500, pointerId: 1 });
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '40%',
+    });
+    fireEvent.pointerUp(window, { pointerId: 1 });
+
+    splitter = screen.getByRole('separator', { name: '调整聊天和文件面板宽度' });
+    fireEvent.pointerDown(splitter, { button: 0, pointerId: 2 });
+    fireEvent.pointerMove(window, { clientX: 1050, pointerId: 2 });
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '95%',
+    });
+    fireEvent.pointerMove(window, { clientX: 1100, pointerId: 2 });
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
+    fireEvent.pointerUp(window, { pointerId: 2 });
+    vi.unstubAllGlobals();
+    window.localStorage.removeItem('opencapybox.sessionFiles.chatRatio');
+  });
+
+  it('旧的 0/100 持久化比例不会让文件面板以零宽度重新打开', () => {
+    window.localStorage.setItem('opencapybox.sessionFiles.chatRatio', '100');
+    const { container } = render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+    expect(container.querySelector('.session-files-shell')).toHaveStyle({
+      '--session-files-chat-ratio': '45%',
+    });
+    expect(screen.getByRole('button', { name: '查看文件' })).toHaveAttribute('aria-pressed', 'true');
+    window.localStorage.removeItem('opencapybox.sessionFiles.chatRatio');
   });
 
   it('打开 Files 后切到新对话应该恢复欢迎页输入框', async () => {
@@ -635,11 +889,11 @@ describe('ChatV2 组件', () => {
       />
     );
 
-    fireEvent.click(screen.getByTitle('会话资源'));
+    fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
 
     await waitFor(() => {
       expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'true');
-      expect(screen.queryByPlaceholderText('输入指令...')).not.toBeInTheDocument();
+      expect(screen.getByPlaceholderText('输入指令...')).toBeInTheDocument();
     });
 
     rerender(
@@ -653,6 +907,16 @@ describe('ChatV2 组件', () => {
       expect(screen.queryByTestId('artifacts-panel')).not.toBeInTheDocument();
       expect(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...')).toBeInTheDocument();
     });
+
+    rerender(
+      <ChatV2
+        sessionId="test-session"
+        {...defaultProps}
+      />
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'true');
+    });
   });
 
   it('打开面板不应该弹出全屏文件预览', async () => {
@@ -664,7 +928,7 @@ describe('ChatV2 组件', () => {
     );
 
     // 打开 Artifacts 面板
-    const folderButton = screen.getByTitle('会话资源');
+    const folderButton = screen.getByRole('button', { name: '查看文件' });
     fireEvent.click(folderButton);
 
     await waitFor(() => {
@@ -2119,7 +2383,7 @@ describe('ChatV2 组件', () => {
       expect(await screen.findByRole('button', { name: /推理等级 Off/ })).toBeInTheDocument();
     });
 
-    it('会话标题栏不使用固定宽度占位对齐 Files 按钮', async () => {
+    it('会话标题栏始终显示动态聊天面板按钮', async () => {
       const { container } = render(
         <ChatV2
           sessionId="test-session"
@@ -2130,8 +2394,13 @@ describe('ChatV2 组件', () => {
       );
 
       const header = container.querySelector('header')!;
+      expect(header).toHaveClass('h-14', 'shrink-0', 'border-b', 'border-claude-border');
       expect(header.querySelectorAll('.w-\\[88px\\]')).toHaveLength(0);
-      expect(await screen.findByTitle('会话资源')).toHaveClass('ml-auto');
+      expect(await screen.findByRole('button', { name: '查看文件' })).toHaveClass('h-6', 'w-6');
+      expect(screen.getByRole('button', { name: '展开面板' })).toHaveClass('h-6', 'w-6');
+      fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
+      expect(await screen.findByRole('button', { name: '收起面板' })).toHaveClass('h-6', 'w-6');
+      expect(header.querySelector('.ml-auto')).toBeInTheDocument();
     });
   });
 

@@ -35,7 +35,7 @@ function getFileIcon(filename: string) {
   }
 
   // 文档文件
-  if (['pdf', 'doc', 'docx', 'txt', 'md', 'csv', 'xlsx', 'xls'].includes(ext)) {
+  if (['pdf', 'doc', 'docx', 'txt', 'md', 'csv', 'xlsx', 'xls', 'et'].includes(ext)) {
     return <FileText className="w-5 h-5 text-red-500" />;
   }
 

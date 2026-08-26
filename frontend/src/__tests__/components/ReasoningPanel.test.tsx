@@ -59,6 +59,10 @@ describe('ReasoningPanel 组件', () => {
 
     expect(screen.getByText('活动')).toBeInTheDocument();
     expect(screen.getAllByText('分析用户问题...').length).toBeGreaterThanOrEqual(1);
+    const drawer = screen.getByRole('dialog', { name: '活动详情' });
+    expect(drawer).toHaveClass('-top-1', '-bottom-1');
+    expect(drawer.parentElement).toBe(document.body);
+    expect(screen.getByTestId('activity-drawer-backdrop')).toHaveClass('-inset-y-1');
   });
 
   it('主聊天区不直接渲染工具组，活动抽屉中显示工具摘要', () => {
@@ -163,13 +167,14 @@ describe('ReasoningPanel 组件', () => {
     expect(screen.getByText(/完成方案/)).toBeInTheDocument();
   });
   it('工具描述应使用粗体样式', () => {
-    const { container } = render(
+    render(
       <ReasoningPanel steps={mockSteps} isStreaming={false} isCompleted={true} />
     );
 
     fireEvent.click(screen.getByText(/已完成思考\s*3s/));
 
-    const boldDescriptions = container.querySelectorAll('.font-semibold');
+    const drawer = screen.getByRole('dialog', { name: '活动详情' });
+    const boldDescriptions = drawer.querySelectorAll('.font-semibold');
     expect(boldDescriptions.length).toBeGreaterThanOrEqual(2);
   });
   it('空步骤时不应该渲染面板', () => {
@@ -572,8 +577,23 @@ describe('ReasoningPanel 组件', () => {
     expect(screen.getByText('file content...')).toBeInTheDocument();
   });
 
+  it('活动抽屉 Portal 到 body，遮罩不受聊天滚动层裁剪', () => {
+    render(
+      <ReasoningPanel steps={mockSteps} isStreaming={false} isCompleted={true} />
+    );
+
+    fireEvent.click(screen.getByText(/已完成思考\s*3s/));
+
+    const backdrop = screen.getByTestId('activity-drawer-backdrop');
+    const drawer = screen.getByRole('dialog', { name: '活动详情' });
+    expect(backdrop.parentElement).toBe(document.body);
+    expect(drawer.parentElement).toBe(document.body);
+    expect(backdrop).toHaveClass('fixed', 'inset-x-0', '-inset-y-1');
+    expect(backdrop).not.toHaveClass('backdrop-blur-[2px]');
+  });
+
   it('活动抽屉中编辑工具应显示 diff 统计（独立行）', () => {
-    const { container } = render(
+    render(
       <ReasoningPanel steps={mockSteps} isStreaming={false} isCompleted={true} />
     );
 
@@ -581,7 +601,7 @@ describe('ReasoningPanel 组件', () => {
 
     expect(screen.getByText('+5')).toBeInTheDocument();
     expect(screen.getByText('-2')).toBeInTheDocument();
-    const diffLine = container.querySelector('.font-mono');
+    const diffLine = screen.getByRole('dialog', { name: '活动详情' }).querySelector('.font-mono');
     expect(diffLine).toBeTruthy();
   });
 

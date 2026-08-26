@@ -1,0 +1,100 @@
+.session-files-shell {
+  --session-files-chat-ratio: 48%;
+  min-width: 0;
+}
+
+.session-files-chat-pane,
+.session-files-pane {
+  min-width: 0;
+}
+
+.session-files-shell[data-layout='closed'] .session-files-chat-pane {
+  flex: 1 1 100%;
+}
+
+.session-files-shell[data-layout='closed'] .session-files-pane {
+  display: none;
+}
+
+.session-files-shell[data-layout='split'] .session-files-chat-pane {
+  flex: 0 1 var(--session-files-chat-ratio);
+}
+
+.session-files-shell[data-layout='split'] .session-files-pane {
+  display: flex;
+  flex: 1 1 calc(100% - var(--session-files-chat-ratio));
+  border-left: 1px solid rgb(231 229 228 / 0.92);
+}
+
+.session-files-shell[data-layout='full'] .session-files-chat-pane {
+  display: none;
+}
+
+.session-files-shell[data-layout='full'] .session-files-pane {
+  display: flex;
+  flex: 1 1 100%;
+}
+
+.session-files-splitter {
+  position: relative;
+  z-index: 30;
+  width: 8px;
+  flex: 0 0 8px;
+  margin-inline: -4px;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+
+.session-files-splitter[data-edge='end'] {
+  margin-left: -8px;
+  margin-right: 0;
+}
+
+.session-files-splitter > span {
+  position: absolute;
+  inset-block: 0;
+  left: 4px;
+  width: 1px;
+  background: transparent;
+  transition: background-color 150ms ease, width 150ms ease;
+}
+
+.session-files-splitter[data-edge='end'] > span {
+  left: 7px;
+}
+
+.session-files-splitter:hover > span,
+.session-files-splitter:focus-visible > span {
+  width: 2px;
+  background: rgb(47 111 84 / 0.55);
+}
+
+@media (max-width: 1199px) {
+  .session-files-shell[data-layout='split'] .session-files-chat-pane {
+    display: flex;
+    flex: 1 1 100%;
+    width: auto;
+    min-width: 0;
+  }
+
+  .session-files-shell[data-layout='split'] .session-files-pane,
+  .session-files-shell[data-layout='full'] .session-files-pane {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    width: 100%;
+    min-width: 0;
+    border-left: 0;
+  }
+
+  .session-files-splitter {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-files-splitter > span {
+    transition: none;
+  }
+}

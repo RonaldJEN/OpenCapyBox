@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type Ref } from 'react';
 
 import { apiService } from '../services/api';
 import {
@@ -26,19 +26,24 @@ import {
   messageTooLongText,
 } from '../utils/errorMessages';
 import { Round } from './Round';
-import { ArtifactsPanel } from './ArtifactsPanel';
-import { FilePreview } from './FilePreview';
+import { ArtifactsPanel, type ArtifactsPanelHandle } from './ArtifactsPanel';
+import { FilePreview, type SessionFileOwnerIdentity } from './FilePreview';
 import { ModelSelector } from './ModelSelector';
 import { ChatInput } from './ChatInput';
 import { QuestionCard } from './QuestionCard';
 import { ToolApprovalCard } from './ToolApprovalCard';
+import {
+  ChatPaneButton,
+  SessionFilesButton,
+} from './session-files/SessionFilesControls';
+import { SessionFilesSplitter } from './session-files/SessionFilesSplitter';
+import './session-files/session-files.css';
 import {
   Loader2,
   AlertCircle,
   Paperclip,
   X,
   ArrowDown,
-  Folder,
 } from 'lucide-react';
 
 const WELCOME_SUGGESTIONS = [
@@ -49,6 +54,47 @@ const WELCOME_SUGGESTIONS = [
 ] as const;
 
 const NEW_SESSION_DRAFT_KEY = '__new_session__';
+const SESSION_FILES_RATIO_STORAGE_KEY = 'opencapybox.sessionFiles.chatRatio';
+const MOBILE_FILES_QUERY = '(max-width: 1199px)';
+const DEFAULT_SESSION_FILES_CHAT_RATIO = 45;
+
+type SessionFilesLayout = 'closed' | 'split' | 'full';
+
+interface SessionFilesViewState {
+  layout: SessionFilesLayout;
+  chatRatio: number;
+}
+
+function normalizeVisibleChatRatio(value: number): number {
+  return Number.isFinite(value) && value > 0 && value < 100
+    ? value
+    : DEFAULT_SESSION_FILES_CHAT_RATIO;
+}
+
+function createSessionFilesViewState(chatRatio: number): SessionFilesViewState {
+  return {
+    layout: 'closed',
+    chatRatio: normalizeVisibleChatRatio(chatRatio),
+  };
+}
+
+function readInitialChatRatio(): number {
+  try {
+    const storedValue = window.localStorage.getItem(SESSION_FILES_RATIO_STORAGE_KEY);
+    if (storedValue === null) return DEFAULT_SESSION_FILES_CHAT_RATIO;
+    const stored = Number(storedValue);
+    if (Number.isFinite(stored) && stored > 0 && stored < 100) return stored;
+  } catch {
+    // Storage may be unavailable in privacy-restricted contexts.
+  }
+  return DEFAULT_SESSION_FILES_CHAT_RATIO;
+}
+
+function readIsMobileFilesViewport(): boolean {
+  return typeof window.matchMedia === 'function'
+    ? window.matchMedia(MOBILE_FILES_QUERY).matches
+    : false;
+}
 
 function defaultTurnReasoning(model?: ModelInfo): TurnReasoningSelection | null {
   const supportsControl = model?.supports_reasoning_control
@@ -125,12 +171,14 @@ interface ChatV2Props {
   onTitleUpdated?: () => void;
   onExecutionStart?: (sessionId: string) => void;
   onExecutionEnd?: (sessionId?: string) => void;
-  onPanelToggle?: (isOpen: boolean) => void;
   selectedModelId: string;
   onModelChange: (modelId: string) => void;
   availableModels?: ModelInfo[];
   onCreateSession?: (modelId?: string) => Promise<string>;
   onSessionCreated?: (sessionId: string) => void;
+  onFilesFullChange?: (full: boolean) => void;
+  sessionFilesHandleRef?: Ref<ArtifactsPanelHandle>;
+  onStartEdgeCollapseSidebar?: () => void;
   activeSlotSessionIds?: Set<string>;
   scrollTarget?: {
     sessionId: string;
@@ -163,6 +211,9 @@ function ChatV2View(props: ChatV2Props) {
     availableModels = [],
     onCreateSession,
     onSessionCreated,
+    onFilesFullChange,
+    sessionFilesHandleRef,
+    onStartEdgeCollapseSidebar,
     activeSlotSessionIds,
     scrollTarget,
   } = props;
@@ -191,8 +242,12 @@ function ChatV2View(props: ChatV2Props) {
   }));
   const [localError, setLocalError] = useState('');
   const [creatingDraftId, setCreatingDraftId] = useState<string | null>(null);
-  const [isFilesOpen, setIsFilesOpen] = useState(false);
-  const [filePanelTarget, setFilePanelTarget] = useState<{ file: FileInfo; nonce: number } | null>(null);
+  const [defaultChatRatio] = useState(readInitialChatRatio);
+  const [sessionFilesStates, setSessionFilesStates] = useState<Record<string, SessionFilesViewState>>({});
+  const [isMobileFilesViewport, setIsMobileFilesViewport] = useState(readIsMobileFilesViewport);
+  const [filePanelTarget, setFilePanelTarget] = useState<(
+    SessionFileOwnerIdentity & { file: FileInfo; nonce: number }
+  ) | null>(null);
   const [assistantFileMatches, setAssistantFileMatches] = useState<Record<string, FileInfo>>({});
   const [previewFile, setPreviewFile] = useState<FileInfo | null>(null);
   const [previewSessionId, setPreviewSessionId] = useState<string>('');
@@ -207,9 +262,14 @@ function ChatV2View(props: ChatV2Props) {
   const pendingAssistantFileRoundCountsRef = useRef<Record<string, number>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
-  const chatScrollTopBeforeFilesRef = useRef(0);
-  const filesWereOpenRef = useRef(false);
-  const focusBeforeFilesRef = useRef<HTMLElement | null>(null);
+  const chatPaneRef = useRef<HTMLDivElement>(null);
+  const sessionFilesShellRef = useRef<HTMLDivElement>(null);
+  const sessionFilesPaneRef = useRef<HTMLElement>(null);
+  const chatScrollTopBeforeFilesRef = useRef<Record<string, number>>({});
+  const focusBeforeFilesRef = useRef<Record<string, HTMLElement | null>>({});
+  const previousFilesStateRef = useRef({ sessionId, isOpen: false });
+  const previousMobileOverlayRef = useRef(false);
+  const filePanelTargetNonceRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const prevRoundsLengthRef = useRef<number>(0);
   const isInitialLoadRef = useRef<boolean>(true);
@@ -240,35 +300,167 @@ function ChatV2View(props: ChatV2Props) {
   const uploadingCurrentDraft = uploadingDraftIds.has(currentDraftId);
   const displayError = localError || runtimeError;
   const hasActiveSlot = activeSlotSessionIds?.has(sessionId) ?? false;
+  const sessionFilesState = sessionId
+    ? sessionFilesStates[sessionId] ?? createSessionFilesViewState(defaultChatRatio)
+    : createSessionFilesViewState(defaultChatRatio);
+  const filesLayout = sessionFilesState.layout;
+  const chatRatio = sessionFilesState.chatRatio;
+  const isFilesOpen = filesLayout !== 'closed';
+  const isFilesExpanded = filesLayout === 'full';
+  const isMobileFilesOverlay = isMobileFilesViewport && isFilesOpen;
+  const chatInteractionHidden = isFilesExpanded || isMobileFilesOverlay;
+  const lastRoundStatus = rounds[rounds.length - 1]?.status || 'empty';
+  const filesRefreshNonce = `${rounds.length}:${lastRoundStatus}:${Number(sending)}:${Number(resuming)}`;
   const activeSlotSessionIdsRef = useRef(activeSlotSessionIds);
   const previousActiveSlotRef = useRef({ sessionId, hasActiveSlot });
+  const committedFilesOwnerRef = useRef<SessionFileOwnerIdentity>({
+    ownerSessionId: sessionId,
+    ownerEpoch: 0,
+  });
+  const sessionFilesOwner = useMemo(() => {
+    const previousFilesOwner = committedFilesOwnerRef.current;
+    return previousFilesOwner.ownerSessionId === sessionId
+      ? previousFilesOwner
+      : { ownerSessionId: sessionId, ownerEpoch: previousFilesOwner.ownerEpoch + 1 };
+  }, [sessionId]);
+  const ownedFilePanelTarget = filePanelTarget
+    && filePanelTarget.ownerSessionId === sessionFilesOwner.ownerSessionId
+    && filePanelTarget.ownerEpoch === sessionFilesOwner.ownerEpoch
+    ? filePanelTarget
+    : null;
 
   sessionIdRef.current = sessionId;
   composerDraftsRef.current = composerDrafts;
   activeSlotSessionIdsRef.current = activeSlotSessionIds;
 
+  useLayoutEffect(() => {
+    committedFilesOwnerRef.current = sessionFilesOwner;
+  }, [sessionFilesOwner]);
+
+  useLayoutEffect(() => {
+    onFilesFullChange?.(isFilesExpanded);
+    return () => onFilesFullChange?.(false);
+  }, [isFilesExpanded, onFilesFullChange]);
+
+  const updateCurrentFilesState = (
+    updater: (current: SessionFilesViewState) => SessionFilesViewState,
+  ) => {
+    if (!sessionId) return;
+    setSessionFilesStates((previous) => {
+      const current = previous[sessionId] ?? createSessionFilesViewState(defaultChatRatio);
+      const next = updater(current);
+      return next === current ? previous : { ...previous, [sessionId]: next };
+    });
+  };
+
+  const setCurrentFilesLayout = (layout: SessionFilesLayout) => {
+    updateCurrentFilesState((current) => {
+      if (current.layout === layout) return current;
+      return { ...current, layout };
+    });
+  };
+
   const openFilesPanel = () => {
+    if (!sessionId) return;
     if (!isFilesOpen) {
-      chatScrollTopBeforeFilesRef.current = chatAreaRef.current?.scrollTop ?? 0;
-      focusBeforeFilesRef.current = document.activeElement instanceof HTMLElement
+      chatScrollTopBeforeFilesRef.current[sessionId] = chatAreaRef.current?.scrollTop ?? 0;
+      focusBeforeFilesRef.current[sessionId] = document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
     }
-    setIsFilesOpen(true);
+    const visibleRatio = isFilesOpen
+      ? normalizeVisibleChatRatio(chatRatio)
+      : DEFAULT_SESSION_FILES_CHAT_RATIO;
+    updateCurrentFilesState((current) => (
+      current.layout === 'split' && current.chatRatio === visibleRatio
+        ? current
+        : { ...current, layout: 'split', chatRatio: visibleRatio }
+    ));
+    if (visibleRatio !== chatRatio) {
+      try {
+        window.localStorage.setItem(SESSION_FILES_RATIO_STORAGE_KEY, String(visibleRatio));
+      } catch {
+        // The repaired ratio still applies for this page when storage is unavailable.
+      }
+    }
   };
 
   const closeFilesPanel = () => {
-    setIsFilesOpen(false);
+    setCurrentFilesLayout('closed');
     setFilePanelTarget(null);
   };
 
   useLayoutEffect(() => {
-    if (filesWereOpenRef.current && !isFilesOpen && chatAreaRef.current) {
-      chatAreaRef.current.scrollTop = chatScrollTopBeforeFilesRef.current;
-      focusBeforeFilesRef.current?.focus({ preventScroll: true });
+    const previous = previousFilesStateRef.current;
+    if (
+      previous.sessionId === sessionId
+      && previous.isOpen
+      && !isFilesOpen
+      && chatAreaRef.current
+    ) {
+      chatAreaRef.current.scrollTop = chatScrollTopBeforeFilesRef.current[sessionId] ?? 0;
+      const previousFocus = focusBeforeFilesRef.current[sessionId];
+      const returnFocus = previousFocus?.isConnected
+        ? previousFocus
+        : chatPaneRef.current?.querySelector<HTMLElement>('[data-session-files-trigger="true"]');
+      returnFocus?.focus({ preventScroll: true });
     }
-    filesWereOpenRef.current = isFilesOpen;
-  }, [isFilesOpen]);
+    previousFilesStateRef.current = { sessionId, isOpen: isFilesOpen };
+  }, [isFilesOpen, sessionId]);
+
+  useLayoutEffect(() => {
+    const wasMobileOverlay = previousMobileOverlayRef.current;
+    if (!wasMobileOverlay && isMobileFilesOverlay) {
+      sessionFilesPaneRef.current
+        ?.querySelector<HTMLButtonElement>('button:not([disabled])')
+        ?.focus({ preventScroll: true });
+    }
+    previousMobileOverlayRef.current = isMobileFilesOverlay;
+  }, [isMobileFilesOverlay, sessionId]);
+
+  useLayoutEffect(() => {
+    const pane = chatPaneRef.current;
+    if (!pane) return;
+    if (chatInteractionHidden) pane.setAttribute('inert', '');
+    else pane.removeAttribute('inert');
+  }, [chatInteractionHidden]);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return undefined;
+    const mediaQuery = window.matchMedia(MOBILE_FILES_QUERY);
+    const handleChange = (event: MediaQueryListEvent) => {
+      setIsMobileFilesViewport(event.matches);
+    };
+    setIsMobileFilesViewport(mediaQuery.matches);
+    mediaQuery.addEventListener('change', handleChange);
+    return () => mediaQuery.removeEventListener('change', handleChange);
+  }, []);
+
+  const handleFilesRatioChange = (ratio: number) => {
+    if (ratio <= 0) {
+      setCurrentFilesLayout('full');
+      return;
+    }
+    if (ratio >= 100) {
+      closeFilesPanel();
+      return;
+    }
+    updateCurrentFilesState((current) => (
+      current.chatRatio === ratio && current.layout === 'split'
+        ? current
+        : { ...current, layout: 'split', chatRatio: ratio }
+    ));
+    try {
+      window.localStorage.setItem(SESSION_FILES_RATIO_STORAGE_KEY, String(ratio));
+    } catch {
+      // The resize still applies for this page when persistent storage is unavailable.
+    }
+  };
+
+  const toggleChatPane = () => {
+    if (isFilesOpen) closeFilesPanel();
+    else openFilesPanel();
+  };
 
   useEffect(() => {
     setComposerDrafts((previous) => {
@@ -371,7 +563,6 @@ function ChatV2View(props: ChatV2Props) {
 
   useEffect(() => {
     if (!sessionId) {
-      setIsFilesOpen(false);
       setFilePanelTarget(null);
     }
   }, [sessionId]);
@@ -454,7 +645,6 @@ function ChatV2View(props: ChatV2Props) {
       setLocalError('');
       setPreviewFile(null);
       setPreviewSessionId('');
-      setIsFilesOpen(false);
       setFilePanelTarget(null);
       resetAssistantFileMatches();
       setIsDragging(false);
@@ -779,34 +969,22 @@ function ChatV2View(props: ChatV2Props) {
     setPreviewFile(normalizedFile);
   };
 
-  const handleOpenAssistantFile = async (file: FileInfo) => {
+  const handleOpenAssistantFile = (file: FileInfo) => {
     if (!sessionId) return;
     setLocalError('');
     const normalizedFile = toFileInfo(file, sessionId);
     const targetPath = normalizeAssistantTargetPath(normalizedFile.path);
-    const parentPath = getAssistantTargetParentPath(targetPath);
-    try {
-      const list = await apiService.getSessionFiles(sessionId, parentPath || undefined);
-      const matchedFile = list.files.find((item) => (
-        !item.is_directory && normalizeAssistantTargetPath(item.path) === targetPath
-      ));
-      if (!matchedFile) {
-        setLocalError(`文件不存在或尚未生成：${normalizedFile.name}`);
-        return;
-      }
-      setFilePanelTarget((prev) => ({
-        file: {
-          ...matchedFile,
-          path: normalizeAssistantTargetPath(matchedFile.path),
-          session_id: sessionId,
-        },
-        nonce: (prev?.nonce ?? 0) + 1,
-      }));
-      openFilesPanel();
-    } catch (err) {
-      console.warn('Failed to verify assistant file target:', err);
-      setLocalError(`无法确认文件是否存在：${normalizedFile.name}`);
-    }
+    filePanelTargetNonceRef.current += 1;
+    setFilePanelTarget({
+      ...sessionFilesOwner,
+      file: {
+        ...normalizedFile,
+        path: targetPath,
+        session_id: sessionId,
+      },
+      nonce: filePanelTargetNonceRef.current,
+    });
+    openFilesPanel();
   };
 
   const handleInputChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -1011,9 +1189,17 @@ function ChatV2View(props: ChatV2Props) {
   const hasLiveReplyBelow = showScrollButton && (sending || resuming);
 
   return (
-    <div className="flex-1 flex h-screen bg-claude-bg relative">
+    <div
+      ref={sessionFilesShellRef}
+      className="session-files-shell relative flex h-screen flex-1 bg-claude-bg"
+      data-layout={filesLayout}
+      style={{ '--session-files-chat-ratio': `${chatRatio}%` } as CSSProperties}
+    >
       <div
-        className="flex-1 flex flex-col relative"
+        ref={chatPaneRef}
+        className="session-files-chat-pane relative flex flex-col"
+        data-testid="chat-pane"
+        aria-hidden={chatInteractionHidden}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
@@ -1028,53 +1214,28 @@ function ChatV2View(props: ChatV2Props) {
           </div>
         )}
 
-        <header className="h-14 flex items-center px-6 bg-claude-bg/80 backdrop-blur-sm border-b border-claude-border sticky top-0 z-20">
-          {sessionId && (
-            <button
-              type="button"
-              onClick={() => {
-                setFilePanelTarget(null);
-                if (isFilesOpen) closeFilesPanel();
-                else openFilesPanel();
-              }}
-              className={`ml-auto h-9 px-3 rounded-xl border transition-[background-color,color,border-color,transform] active:scale-95 flex items-center gap-2 ${
-                isFilesOpen
-                  ? 'border-[#2f6f54] bg-[#eef8f2] text-[#234d3c]'
-                  : 'border-transparent text-claude-secondary hover:bg-claude-hover'
-              }`}
-              title="会话资源"
-            >
-              <Folder size={16} />
-              <span className="text-sm hidden sm:inline">Files</span>
-            </button>
-          )}
+        <header
+          data-testid="chat-toolbar"
+          className="sticky top-0 z-20 flex h-14 shrink-0 items-center border-b border-claude-border bg-claude-bg/80 px-6 backdrop-blur-sm"
+        >
+          <div className="ml-auto flex items-center gap-1">
+            {sessionId && (
+              <SessionFilesButton
+                open={isFilesOpen}
+                onToggle={openFilesPanel}
+              />
+            )}
+            {sessionId && !isFilesExpanded && !isMobileFilesViewport && (
+              <ChatPaneButton
+                filesOpen={isFilesOpen}
+                onToggle={toggleChatPane}
+              />
+            )}
+          </div>
         </header>
 
-        <div ref={chatAreaRef} className={`flex-1 relative bg-claude-bg ${isFilesOpen ? 'overflow-hidden' : 'overflow-y-auto'}`}>
-          {sessionId && !isFilesOpen && (
-            <ArtifactsPanel
-              sessionId={sessionId}
-              isOpen={false}
-              onClose={() => {
-                closeFilesPanel();
-              }}
-              targetFile={filePanelTarget?.file || null}
-              targetFileNonce={filePanelTarget?.nonce}
-              variant="workspace"
-            />
-          )}
-          {isFilesOpen && sessionId ? (
-            <ArtifactsPanel
-              sessionId={sessionId}
-              isOpen={isFilesOpen}
-              onClose={() => {
-                closeFilesPanel();
-              }}
-              targetFile={filePanelTarget?.file || null}
-              targetFileNonce={filePanelTarget?.nonce}
-              variant="workspace"
-            />
-          ) : loading && rounds.length === 0 ? (
+        <div ref={chatAreaRef} className="relative flex-1 overflow-y-auto bg-claude-bg">
+          {loading && rounds.length === 0 ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
                 <Loader2 className="w-6 h-6 text-claude-muted animate-spin mx-auto mb-3" />
@@ -1107,7 +1268,7 @@ function ChatV2View(props: ChatV2Props) {
               </div>
             </div>
           ) : (
-            <div className="mx-auto px-4 md:px-8 py-6 space-y-6 max-w-3xl">
+            <div data-testid="chat-message-column" className="max-w-5xl space-y-6 px-4 py-6 md:px-8">
               {rounds.map((round, index) => (
                 <div
                   key={round.round_id}
@@ -1137,7 +1298,7 @@ function ChatV2View(props: ChatV2Props) {
             </div>
           )}
 
-          {!isFilesOpen && showScrollButton && (
+          {showScrollButton && (
             <button
               type="button"
               onClick={() => scrollToBottom(true)}
@@ -1162,7 +1323,7 @@ function ChatV2View(props: ChatV2Props) {
 
         {displayError && (
           <div className="px-6 py-3 bg-red-50 border-t border-red-100">
-            <div className="mx-auto max-w-3xl">
+            <div className="max-w-5xl">
               <div className="flex items-start gap-3">
                 <AlertCircle className="w-4 h-4 text-claude-error flex-shrink-0 mt-0.5" />
                 <div className="flex-1 min-w-0 overflow-hidden">
@@ -1186,7 +1347,7 @@ function ChatV2View(props: ChatV2Props) {
         )}
 
         {pendingInterrupt && pendingInterrupt.reason === 'input_required' && pendingInterrupt.payload?.questions && (pendingInterrupt.payload.questions as AskUserQuestion[]).length > 0 && (
-          <div className="relative z-20 px-4 md:px-8 mb-[-3.5rem] mx-auto w-full max-w-3xl">
+          <div className="relative z-20 mb-[-3.5rem] w-full max-w-5xl px-4 md:px-8">
             <QuestionCard
               key={pendingInterrupt.id}
               questions={pendingInterrupt.payload.questions as AskUserQuestion[]}
@@ -1197,7 +1358,7 @@ function ChatV2View(props: ChatV2Props) {
         )}
 
         {pendingInterrupt && pendingInterrupt.reason === 'human_approval' && pendingInterrupt.payload?.kind === 'tool_approval' && (
-          <div className="relative z-20 px-4 md:px-8 mb-[-3.5rem] mx-auto w-full max-w-3xl">
+          <div className="relative z-20 mb-[-3.5rem] w-full max-w-5xl px-4 md:px-8">
             <ToolApprovalCard
               approval={pendingInterrupt.payload as ToolApprovalPayload}
               onSubmit={handleResumeSubmit}
@@ -1206,8 +1367,7 @@ function ChatV2View(props: ChatV2Props) {
           </div>
         )}
 
-        {!isFilesOpen && (
-          <ChatInput
+        <ChatInput
             textareaRef={composerTextareaRef}
             value={input}
             onChange={(value) => updateMessageDraft(currentDraftKey, (draft) => (
@@ -1265,13 +1425,46 @@ function ChatV2View(props: ChatV2Props) {
               />
             )}
           />
-        )}
       </div>
+
+      {sessionId && !isMobileFilesViewport && (
+        <SessionFilesSplitter
+          containerRef={sessionFilesShellRef}
+          chatRatio={filesLayout === 'full' ? 0 : filesLayout === 'closed' ? 100 : chatRatio}
+          onRatioChange={handleFilesRatioChange}
+          onStartEdgeCollapse={onStartEdgeCollapseSidebar}
+        />
+      )}
+
+      <aside
+        ref={sessionFilesPaneRef}
+        className="session-files-pane min-h-0 bg-white"
+        data-testid="session-files-pane"
+        aria-label="会话文件"
+        aria-hidden={!isFilesOpen}
+      >
+        <ArtifactsPanel
+          ref={sessionFilesHandleRef}
+          sessionId={sessionId}
+          ownerEpoch={sessionFilesOwner.ownerEpoch}
+          isOpen={isFilesOpen}
+          onClose={closeFilesPanel}
+          targetFile={ownedFilePanelTarget?.file || null}
+          targetFileNonce={ownedFilePanelTarget?.nonce}
+          refreshNonce={filesRefreshNonce}
+          variant="workspace"
+          isExpanded={isFilesExpanded}
+          onToggleExpanded={() => {
+            setCurrentFilesLayout(isFilesExpanded ? 'split' : 'full');
+          }}
+        />
+      </aside>
 
       {previewFile && previewSessionId && (
         <FilePreview
           sessionId={previewSessionId}
           file={previewFile}
+          readOnly
           onClose={() => {
             setPreviewFile(null);
             setPreviewSessionId('');

@@ -64,3 +64,12 @@ class FileListResponse(BaseModel):
 
     files: list[FileInfo]
     total: int = Field(..., description="文件总数")
+
+
+class UpdateSessionFileRequest(BaseModel):
+    """乐观并发更新可在线编辑的 Session 文件。"""
+
+    content: Optional[str] = Field(None, description="UTF-8 文本正文")
+    content_base64: Optional[str] = Field(None, description="二进制文件的 Base64 正文")
+    expected_size: int = Field(..., ge=0, description="编辑开始时的文件大小")
+    expected_modified: str = Field(..., min_length=1, description="编辑开始时的 ISO 修改时间")

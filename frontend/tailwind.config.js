@@ -28,6 +28,8 @@ export default {
           success: '#16A34A',      // 功能色：成功
           error: '#DC2626',        // 功能色：错误
           warning: '#D97706',      // 功能色：警告
+          file: '#516EF5',         // 成果文件：高识别度实心文件标
+          'file-strong': '#405DDF', // 成果文件 hover / active
         },
         // 保留 primary 色系以兼容
         primary: {

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { isImageFile, getFileIcon, inferFileType, getFileExtLabel, getFileBadgeClass, getFileIconClass, normalizeFileType } from '../../utils/fileUtils';
-import { FileImage, FileText } from 'lucide-react';
+import { FileImage, FileSpreadsheet, FileText } from 'lucide-react';
 
 describe('fileUtils.isImageFile', () => {
   it('MIME 為 image/* 時應判斷為圖片', () => {
@@ -45,6 +45,10 @@ describe('fileUtils.normalizeFileType', () => {
     expect(normalizeFileType('screenshot', 'image/png')).toBe('png');
   });
 
+  it('WPS ET 檔應回傳試算表 icon', () => {
+    expect(getFileIcon({ name: 'budget.et', type: 'application/octet-stream' })).toBe(FileSpreadsheet);
+  });
+
   it('有副檔名時優先使用副檔名', () => {
     expect(normalizeFileType('report.docx', 'application/octet-stream')).toBe('docx');
   });
@@ -62,6 +66,7 @@ describe('fileUtils.readable labels and classes', () => {
     expect(getFileExtLabel({ name: 'proposal.docx' })).toBe('DOCX');
     expect(getFileExtLabel({ name: 'slides.pptx' })).toBe('PPTX');
     expect(getFileExtLabel({ name: 'manual.pdf' })).toBe('PDF');
+    expect(getFileExtLabel({ name: 'budget.et' })).toBe('ET');
   });
 
   it('應為不同類型返回對應 token 類別', () => {

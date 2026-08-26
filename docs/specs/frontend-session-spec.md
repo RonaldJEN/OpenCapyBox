@@ -196,14 +196,27 @@ const handleExecutionEnd = (sessionId?: string) => {
 
 ## 7. 折叠交互
 
-- 打开右侧 Cron 抽屉时自动折叠左侧栏：`setIsSidebarCollapsed(true)`。
-- SettingsCenter 为居中弹窗（非右侧抽屉），打开时**不折叠**左侧栏：`setIsSidebarCollapsed(false)`。
-- 关闭抽屉/弹窗时恢复：`setIsSidebarCollapsed(false)`。
-- 聊天区的 ArtifactsPanel 打开**不折叠**左侧栏（用户可能需要对照会话）。
+- 左侧栏由 App 级 collapsed 状态管理：展开宽度固定为 220px，不得向右扩宽；向左拖动低于 220px 时吸附为 64px rail。
+- rail 顶部保留 OpenCapyBox Logo、底部保留当前用户头像，二者点击均可展开；右边缘保留 8px splitter 和 32px 圆形“展开左侧栏”按钮。会话文件处于 `full` 时，这一物理边界只能渲染一个由会话工作台接管的 splitter：首次向左拖动锁定为收起导航，首次向右拖动锁定为拉出会话，同一手势中不得改换操作。正常展开态不显示悬浮按钮，避免长期遮挡内容。拖动、Home/End/方向键和 rail 入口都必须可恢复，不能只有拖拽路径。
+- rail 向右拖动超过 24px 即立即展开到至少 220px，不得要求把指针先拖到完整侧栏宽度；圆形展开按钮位于 Logo 下方（`top-16`），不能漂到侧栏中段。
+- splitter 与 rail 按钮的层级必须低于设置 modal、活动抽屉和其 backdrop；打开设置时不得在遮罩上穿出一条竖线。
+- SessionList 与其内容容器必须 `h-full`；账户菜单及其中“设置”入口固定保留在侧栏底部，不得被历史列表高度顶出视口。
+- 进入 `/schedule` 日程一级页时保留用户当前左侧栏展开/rail 状态，不得自动折叠。
+- SettingsCenter 为居中弹窗（非右侧抽屉），不得改写用户的左栏折叠状态。
+- Session 文件工作台打开、聊天 pane 的 24×24“展开面板/收起面板”操作均**不得折叠**左侧栏；该按钮只在桌面控制右侧文件工作台 `closed/split`，详见 [frontend-session-files-spec.md](./frontend-session-files-spec.md)。
+- Skills 与数据一级页面不折叠左侧栏；ChatRuntimeProvider 和真实 ChatV2 保持挂载。
 
-折叠动画：`width: 260px ↔ 0` + `opacity: 1 ↔ 0`，`transition-all duration-300 ease-in-out`。
+左侧栏的 220px/64px 切换不做 width 过渡，SessionList 也不得再维护第二套 width/opacity/padding 折叠动画；主内容边界必须一次落位，避免刚点击展开后立即拖动会话 splitter 时，两个水平布局变化叠加造成先内缩再弹出的跳动。
 
 **注意**：这是**侧边栏折叠**，不是抽屉。右侧抽屉仍必须覆盖式（见 frontend-spec §5.6）。
+
+## 7.1 一级能力入口
+
+- 左侧主导航提供 `日程管理`、`Skills`、`数据`：右侧提示分别为“安排自动任务”“复用优质经验”“连接内外部数据”。路由分别为 `/schedule`、`/skills`、`/connections`，移动端有等价入口；当前项使用 `aria-current="page"`。
+- 右侧提示必须允许收缩和截断，不得撑破默认 220px 侧栏；移动端不强制展示该提示。
+- 一级页面和历史 session 不能同时暴露 `aria-current="page"`；只有 chat surface 的选中 session 才是 current page。
+- Back/Forward 与按钮导航统一经过数据连接 dirty blocker；取消留在当前页面，确认只重放一次导航。
+- `/skills/`、`/connections/` 与无尾斜杠路由等价。
 
 ## 8. 错误处理
 
@@ -225,6 +238,10 @@ const handleExecutionEnd = (sessionId?: string) => {
 - [ ] 欢迎页输入第一条消息才创建会话
 - [ ] 新会话创建成功后立即投影到列表，不等待全量刷新且不重复
 - [ ] 切换会话不重新请求列表、不显示列表 loading
+- [ ] Skills/数据入口、右侧提示、深链、尾斜杠与移动端导航恢复正确
+- [ ] 左侧栏展开态固定 220px、不可向右扩宽；向左可吸附为 64px rail，顶部 Logo、底部用户头像、圆形按钮、键盘与反向拖动均可恢复，一级页面切换不擅自展开
+- [ ] 数据连接 dirty 时按钮导航与 Back/Forward 均弹应用内确认，按钮 Enter 语义正确
+- [ ] 切换一级页面时真实 ChatV2 草稿、waiting Interaction 和订阅保持挂载
 - [ ] A/B 多会话并行时，侧栏同时显示多个执行标记
 - [ ] 非当前会话后台完成后，周期收敛会清理对应执行标记
 - [ ] 本地 run 在 `RUN_STARTED` 前的 init-window 会保留执行标记；429 不污染执行标记

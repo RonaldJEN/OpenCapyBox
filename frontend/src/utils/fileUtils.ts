@@ -6,6 +6,7 @@
 
 import {
   File,
+  FileArchive,
   FileCode,
   FileImage,
   FileSpreadsheet,
@@ -50,30 +51,32 @@ export function normalizeFileType(filename: string, mimeOrType?: string): string
 
 // ─── 文件圖標映射 ────────────────────────────────────────────────
 
-const SPREADSHEET_EXTS = new Set(['xlsx', 'xls', 'csv']);
+const SPREADSHEET_EXTS = new Set(['xlsx', 'xls', 'csv', 'et']);
 const DOCUMENT_EXTS = new Set(['doc', 'docx', 'txt', 'md', 'markdown', 'pdf']);
 const CODE_EXTS = new Set([
   'js', 'ts', 'jsx', 'tsx', 'py', 'json', 'yaml', 'yml',
   'xml', 'html', 'css', 'sql',
 ]);
 const PRESENTATION_EXTS = new Set(['ppt', 'pptx']);
+const ARCHIVE_EXTS = new Set(['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz']);
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif', 'heic', 'heif']);
 
-type FileCategory = 'image' | 'sheet' | 'pdf' | 'doc' | 'ppt' | 'code' | 'other';
+export type FileCategory = 'image' | 'sheet' | 'pdf' | 'doc' | 'ppt' | 'code' | 'archive' | 'other';
 
 function getExtFromName(filename: string): string {
   return filename.split('.').pop()?.toLowerCase() || '';
 }
 
-function detectFileCategory(file: { name: string; type?: string }): FileCategory {
+export function detectFileCategory(file: { name: string; type?: string }): FileCategory {
   const ext = getExtFromName(file.name);
   const rawType = (file.type || '').toLowerCase();
 
   if (isImageFile(file)) return 'image';
-  if (['xlsx', 'xls', 'csv'].includes(ext) || rawType.includes('spreadsheet') || rawType.includes('excel')) return 'sheet';
+  if (['xlsx', 'xls', 'csv', 'et'].includes(ext) || rawType.includes('spreadsheet') || rawType.includes('excel')) return 'sheet';
   if (ext === 'pdf' || rawType.includes('pdf')) return 'pdf';
   if (['doc', 'docx', 'txt', 'md', 'markdown', 'rtf'].includes(ext) || rawType.includes('wordprocessingml') || rawType.includes('msword') || rawType.includes('document')) return 'doc';
   if (['ppt', 'pptx'].includes(ext) || rawType.includes('presentationml') || rawType.includes('powerpoint')) return 'ppt';
+  if (ARCHIVE_EXTS.has(ext) || rawType.includes('zip') || rawType.includes('archive') || rawType.includes('compressed')) return 'archive';
   if (CODE_EXTS.has(ext) || rawType.includes('json') || rawType.includes('javascript') || rawType.includes('python') || rawType.includes('code')) return 'code';
   return 'other';
 }
@@ -93,12 +96,13 @@ export function isImageFile(file: { name: string; type?: string }): boolean {
  * 根據文件信息返回對應的 Lucide 圖標組件。
  */
 export function getFileIcon(file: { name: string; type?: string }): LucideIcon {
-  const type = inferFileType(file.name, file.type);
+  const type = normalizeFileType(file.name, file.type);
   if (isImageFile(file)) return FileImage;
   if (SPREADSHEET_EXTS.has(type)) return FileSpreadsheet;
   if (DOCUMENT_EXTS.has(type)) return FileText;
   if (CODE_EXTS.has(type)) return FileCode;
   if (PRESENTATION_EXTS.has(type)) return Presentation;
+  if (ARCHIVE_EXTS.has(type)) return FileArchive;
   return File;
 }
 
@@ -147,6 +151,8 @@ export function getFileCategoryLabel(file: { name: string; type?: string }): str
       return 'Presentation';
     case 'code':
       return 'Code';
+    case 'archive':
+      return 'Archive';
     default:
       return 'File';
   }
@@ -166,6 +172,8 @@ export function getFileBadgeClass(file: { name: string; type?: string }): string
       return 'bg-claude-text/10 text-claude-secondary';
     case 'image':
       return 'bg-claude-accent/20 text-claude-accent';
+    case 'archive':
+      return 'bg-claude-file/12 text-claude-file-strong';
     default:
       return 'bg-black/65 text-white';
   }
@@ -185,6 +193,8 @@ export function getFileIconClass(file: { name: string; type?: string }): string 
       return 'text-claude-secondary';
     case 'image':
       return 'text-claude-accent';
+    case 'archive':
+      return 'text-claude-file';
     default:
       return 'text-claude-muted';
   }

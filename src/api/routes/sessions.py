@@ -1,12 +1,18 @@
 """会话管理 API"""
+import asyncio
 import logging
 import base64 as b64_mod
+import binascii
+import io
 import inspect
 import json
 import mimetypes
 import os
 import posixpath
 import re as _re
+import zipfile
+from typing import Literal
+from xml.etree import ElementTree
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import exists, func, or_
@@ -17,7 +23,7 @@ from src.api.models.session import Session
 from src.api.models.round import Round
 from src.api.models.agui_event import AGUIEventLog
 from src.api.models.llm_call_record import LLMCallRecord
-from src.api.schemas.session import CreateSessionResponse, SessionResponse, SessionListResponse, FileListResponse, FileInfo, UpdateSessionTitleRequest
+from src.api.schemas.session import CreateSessionResponse, SessionResponse, SessionListResponse, FileListResponse, FileInfo, UpdateSessionFileRequest, UpdateSessionTitleRequest
 from src.api.schemas.chat import HistoryResponseV2
 from src.api.services.sandbox_service import (
     get_sandbox_service,
@@ -27,6 +33,15 @@ from src.api.services.sandbox_service import (
 )
 from src.api.services.history_service import HistoryService
 from src.api.services.agent_service import AgentService
+from src.api.services.file_preview_service import (
+    FilePreviewConversionError,
+    FilePreviewSourceNotFoundError,
+    FilePreviewTimeoutError,
+    FilePreviewTooLargeError,
+    FilePreviewUnavailableError,
+    FilePreviewUnsupportedError,
+    render_office_document_to_pdf,
+)
 from src.api.services.running_rounds import main_running_round_join_condition
 from src.api.services.model_access_service import assert_user_can_access_model, resolve_default_model_for_user
 from src.api.models.user_run_lock import UserRunLock
@@ -40,11 +55,218 @@ import shlex
 
 logger = logging.getLogger(__name__)
 import uuid
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 router = APIRouter()
 
 _SESSION_SEARCH_RESULT_LIMIT = 50
+_MAX_MARKDOWN_EDIT_BYTES = 5 * 1024 * 1024
+_MAX_SPREADSHEET_EDIT_BYTES = 20 * 1024 * 1024
+_EDITABLE_MARKDOWN_EXTENSIONS = {".md", ".markdown"}
+_EDITABLE_SPREADSHEET_EXTENSIONS = {".csv", ".xlsx"}
+_MAX_XLSX_ENTRY_COUNT = 10_000
+_MAX_XLSX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+_MAX_XLSX_REQUIRED_XML_BYTES = 5 * 1024 * 1024
+_XLSX_REQUIRED_XML_PARTS = (
+    "[Content_Types].xml",
+    "_rels/.rels",
+    "xl/workbook.xml",
+    "xl/_rels/workbook.xml.rels",
+)
+_XLSX_WORKBOOK_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+)
+_XLSX_WORKSHEET_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+)
+
+
+def _validate_csv_edit_payload(content: bytes) -> None:
+    """Reject non UTF-8 CSV instead of silently replacing undecodable bytes."""
+
+    try:
+        decoded = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("CSV 不是有效的 UTF-8 文本") from exc
+    if "\x00" in decoded:
+        raise ValueError("CSV 文本包含 NUL 字符")
+
+
+def _validate_xlsx_edit_payload(content: bytes) -> None:
+    """Validate the complete bounded OOXML ZIP before replacing the original."""
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content), "r") as archive:
+            entries = archive.infolist()
+            if not entries or len(entries) > _MAX_XLSX_ENTRY_COUNT:
+                raise ValueError("XLSX ZIP 条目数量无效")
+
+            names = [entry.filename.replace("\\", "/") for entry in entries]
+            if len(names) != len(set(names)):
+                raise ValueError("XLSX 包含重复 ZIP 条目")
+            for name in names:
+                path = name[:-1] if name.endswith("/") else name
+                if (
+                    not path
+                    or name.startswith("/")
+                    or any(part in {"", ".", ".."} for part in path.split("/"))
+                ):
+                    raise ValueError("XLSX ZIP 路径无效")
+            if any(entry.flag_bits & 0x1 for entry in entries):
+                raise ValueError("加密 XLSX 不支持在线编辑")
+            if sum(entry.file_size for entry in entries) > _MAX_XLSX_UNCOMPRESSED_BYTES:
+                raise ValueError("XLSX 解压后内容过大")
+
+            name_set = set(names)
+            if not set(_XLSX_REQUIRED_XML_PARTS).issubset(name_set):
+                raise ValueError("XLSX 缺少必要的 OOXML 结构")
+            if not any(
+                name.startswith("xl/worksheets/") and name.endswith(".xml")
+                for name in names
+            ):
+                raise ValueError("XLSX 缺少工作表")
+
+            parsed_parts: dict[str, ElementTree.Element] = {}
+            for part in _XLSX_REQUIRED_XML_PARTS:
+                info = archive.getinfo(part)
+                if info.file_size > _MAX_XLSX_REQUIRED_XML_BYTES:
+                    raise ValueError(f"XLSX 必要结构过大: {part}")
+                parsed_parts[part] = ElementTree.fromstring(archive.read(info))
+
+            def local_name(tag: str) -> str:
+                return tag.rsplit("}", 1)[-1]
+
+            def resolve_relationship_target(source_part: str, target: str) -> str:
+                parsed_target = urlsplit(target)
+                if (
+                    parsed_target.scheme
+                    or parsed_target.netloc
+                    or parsed_target.query
+                    or parsed_target.fragment
+                ):
+                    raise ValueError("XLSX 关系目标无效")
+                target_path = unquote(parsed_target.path).replace("\\", "/")
+                if target_path.startswith("/"):
+                    resolved = posixpath.normpath(target_path.lstrip("/"))
+                else:
+                    resolved = posixpath.normpath(
+                        posixpath.join(posixpath.dirname(source_part), target_path)
+                    )
+                if not resolved or resolved == ".." or resolved.startswith("../"):
+                    raise ValueError("XLSX 关系目标越界")
+                return resolved
+
+            content_types = parsed_parts["[Content_Types].xml"]
+            root_relationships = parsed_parts["_rels/.rels"]
+            workbook = parsed_parts["xl/workbook.xml"]
+            workbook_relationships = parsed_parts["xl/_rels/workbook.xml.rels"]
+            if local_name(content_types.tag) != "Types":
+                raise ValueError("XLSX Content Types 结构无效")
+            if local_name(root_relationships.tag) != "Relationships":
+                raise ValueError("XLSX 根关系结构无效")
+            if local_name(workbook.tag) != "workbook":
+                raise ValueError("XLSX workbook 结构无效")
+            if local_name(workbook_relationships.tag) != "Relationships":
+                raise ValueError("XLSX workbook 关系结构无效")
+
+            overrides = {
+                element.attrib.get("PartName", "").lstrip("/"): element.attrib.get("ContentType", "")
+                for element in content_types
+                if local_name(element.tag) == "Override"
+            }
+            if overrides.get("xl/workbook.xml") != _XLSX_WORKBOOK_CONTENT_TYPE:
+                raise ValueError("XLSX workbook Content Type 无效")
+
+            office_document_targets = []
+            for relationship in root_relationships:
+                if local_name(relationship.tag) != "Relationship":
+                    continue
+                relationship_type = relationship.attrib.get("Type", "")
+                if not relationship_type.endswith("/officeDocument"):
+                    continue
+                if relationship.attrib.get("TargetMode", "Internal") != "Internal":
+                    raise ValueError("XLSX workbook 不能使用外部关系")
+                office_document_targets.append(
+                    resolve_relationship_target("", relationship.attrib.get("Target", ""))
+                )
+            if office_document_targets != ["xl/workbook.xml"]:
+                raise ValueError("XLSX 根关系未唯一指向 workbook")
+
+            relationship_by_id: dict[str, ElementTree.Element] = {}
+            for relationship in workbook_relationships:
+                if local_name(relationship.tag) != "Relationship":
+                    continue
+                relationship_id = relationship.attrib.get("Id", "")
+                if not relationship_id or relationship_id in relationship_by_id:
+                    raise ValueError("XLSX workbook 关系 ID 无效")
+                relationship_by_id[relationship_id] = relationship
+
+            sheets = next(
+                (element for element in workbook if local_name(element.tag) == "sheets"),
+                None,
+            )
+            sheet_entries = [] if sheets is None else [
+                element for element in sheets if local_name(element.tag) == "sheet"
+            ]
+            if not sheet_entries:
+                raise ValueError("XLSX workbook 没有工作表")
+
+            sheet_ids: set[str] = set()
+            relationship_ids: set[str] = set()
+            worksheet_targets: set[str] = set()
+            for sheet in sheet_entries:
+                sheet_name = sheet.attrib.get("name", "").strip()
+                sheet_id = sheet.attrib.get("sheetId", "")
+                relationship_id = next(
+                    (
+                        value
+                        for attribute, value in sheet.attrib.items()
+                        if local_name(attribute) == "id"
+                    ),
+                    "",
+                )
+                if not sheet_name or not sheet_id.isdigit() or int(sheet_id) < 1:
+                    raise ValueError("XLSX 工作表声明无效")
+                if sheet_id in sheet_ids or relationship_id in relationship_ids:
+                    raise ValueError("XLSX 工作表声明重复")
+                sheet_ids.add(sheet_id)
+                relationship_ids.add(relationship_id)
+
+                relationship = relationship_by_id.get(relationship_id)
+                if relationship is None:
+                    raise ValueError("XLSX 工作表关系缺失")
+                if not relationship.attrib.get("Type", "").endswith("/worksheet"):
+                    raise ValueError("XLSX 工作表关系类型无效")
+                if relationship.attrib.get("TargetMode", "Internal") != "Internal":
+                    raise ValueError("XLSX 工作表不能使用外部关系")
+                worksheet_target = resolve_relationship_target(
+                    "xl/workbook.xml",
+                    relationship.attrib.get("Target", ""),
+                )
+                if worksheet_target in worksheet_targets or worksheet_target not in name_set:
+                    raise ValueError("XLSX 工作表目标无效")
+                if overrides.get(worksheet_target) != _XLSX_WORKSHEET_CONTENT_TYPE:
+                    raise ValueError("XLSX 工作表 Content Type 无效")
+                worksheet_info = archive.getinfo(worksheet_target)
+                if worksheet_info.file_size > _MAX_XLSX_REQUIRED_XML_BYTES:
+                    raise ValueError(f"XLSX 工作表结构过大: {worksheet_target}")
+                worksheet = ElementTree.fromstring(archive.read(worksheet_info))
+                if local_name(worksheet.tag) != "worksheet":
+                    raise ValueError("XLSX 工作表 XML 结构无效")
+                worksheet_targets.add(worksheet_target)
+
+            corrupt_entry = archive.testzip()
+            if corrupt_entry is not None:
+                raise ValueError(f"XLSX ZIP 条目损坏: {corrupt_entry}")
+    except (
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+        KeyError,
+        RuntimeError,
+        NotImplementedError,
+        ElementTree.ParseError,
+    ) as exc:
+        raise ValueError("XLSX 文件结构无效") from exc
 
 
 # 使用 AgentPoolService 管理 Agent 實例
@@ -162,6 +384,29 @@ async def _read_bytes_via_ascii_alias(sandbox, sandbox_path: str) -> bytes | Non
             await sandbox.commands.run(f"rm -f {shlex.quote(alias_path)}")
         except Exception:
             pass
+
+
+async def _read_non_ascii_file_bytes(
+    sandbox,
+    sandbox_path: str,
+    *,
+    preview: bool,
+) -> bytes | None:
+    """Read a Unicode path with the lowest-round-trip strategy for its use case.
+
+    Inline previews prefer the single base64 command. Downloads keep the ASCII
+    alias first so large files can continue using the SDK byte transport.
+    """
+    if preview:
+        file_bytes = await _read_bytes_via_command(sandbox, sandbox_path)
+        if file_bytes is not None:
+            return file_bytes
+        return await _read_bytes_via_ascii_alias(sandbox, sandbox_path)
+
+    file_bytes = await _read_bytes_via_ascii_alias(sandbox, sandbox_path)
+    if file_bytes is not None:
+        return file_bytes
+    return await _read_bytes_via_command(sandbox, sandbox_path)
 
 
 def _sanitize_filename(raw: str) -> str:
@@ -404,13 +649,15 @@ async def _sandbox_list_dir(
 ) -> list[FileInfo]:
     """列出沙箱中指定目錄的直接子項（目錄 + 文件）。"""
     py_cmd = f"""python3 - <<'PY'
-import os, json
+import os, json, sys
 d = {target_dir!r}
 out = []
 try:
     names = os.listdir(d)
+except FileNotFoundError:
+    sys.exit(2)
 except OSError:
-    names = []
+    sys.exit(3)
 for n in names:
     p = os.path.join(d, n)
     try:
@@ -421,17 +668,18 @@ for n in names:
 print(json.dumps(out, ensure_ascii=False))
 PY"""
     result = await sandbox.commands.run(py_cmd)
+    if _extract_exit_code(result) != 0:
+        raise RuntimeError("目录读取命令失败")
     stdout_text = _command_stdout_text(result)
 
     items: list[FileInfo] = []
     try:
         rows = json.loads(stdout_text) if stdout_text else []
-    except Exception:
-        logger.debug("目錄列表 JSON 解析失敗，返回空列表")
-        return []
+    except Exception as exc:
+        raise RuntimeError("目录列表响应格式无效") from exc
 
     if not isinstance(rows, list):
-        return []
+        raise RuntimeError("目录列表响应格式无效")
 
     for row in rows:
         full_path = str(row.get("path", ""))
@@ -788,13 +1036,13 @@ async def delete_session(
     # 沙箱屬於用戶，刪除 session 時不 kill 沙箱，只清理 session 子目錄
     user_id = session.user_id
     sandbox_service = get_sandbox_service()
-    sandbox = sandbox_service.get_cached(user_id)
-    if sandbox:
-        try:
-            sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
-        except Exception as e:
-            logger.warning("無法連接沙箱清理 session 子目錄: %s", e)
-            sandbox = None
+    # 不能只看当前 worker 的进程内缓存：重启或多 worker 时沙箱仍可能
+    # 持久存在。始终尝试按 DB 绑定恢复，以免 session 文件和隐藏预览缓存孤儿化。
+    try:
+        sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
+    except Exception as e:
+        logger.warning("無法連接沙箱清理 session 子目錄: %s", e)
+        sandbox = None
 
     if sandbox:
         import shlex as _shlex
@@ -867,7 +1115,7 @@ async def get_session_files(
         raise
     except Exception as e:
         logger.warning("無法連接沙箱獲取文件列表: %s", e)
-        return FileListResponse(files=[], total=0)
+        raise HTTPException(status_code=503, detail="沙箱不可用") from e
 
     try:
         files = await _sandbox_list_dir(sandbox, target_dir, session_root)
@@ -881,8 +1129,161 @@ async def get_session_files(
             return FileListResponse(files=files, total=len(files))
         except HTTPException:
             raise
+        except Exception as retry_error:
+            logger.warning("重連後仍無法獲取文件列表: %s", retry_error)
+            raise HTTPException(status_code=503, detail="无法读取会话文件") from retry_error
+
+
+@router.put("/{chat_session_id}/files/{file_path:path}", response_model=FileInfo)
+async def update_session_file(
+    chat_session_id: str,
+    file_path: str,
+    request: UpdateSessionFileRequest,
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """原子覆盖当前 Session 内支持在线编辑的文件。
+
+    Markdown 使用 UTF-8 正文，CSV/XLS/XLSX 使用 Base64 二进制正文。保存前复核
+    编辑开始时的 size + mtime，避免覆盖 Agent 或其他标签页已经写入的新版本。
+    Agent 运行期间禁止保存。
+    """
+    session = (
+        db.query(Session)
+        .filter(Session.id == chat_session_id, Session.user_id == user_id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    extension = posixpath.splitext(file_path)[1].lower()
+    if extension in _EDITABLE_MARKDOWN_EXTENSIONS:
+        if request.content is None or request.content_base64 is not None:
+            raise HTTPException(status_code=422, detail="Markdown 保存内容格式无效")
+        content_bytes = request.content.encode("utf-8")
+        if len(content_bytes) > _MAX_MARKDOWN_EDIT_BYTES:
+            raise HTTPException(status_code=413, detail="Markdown 文件超过 5 MiB，无法在线编辑")
+    elif extension in _EDITABLE_SPREADSHEET_EXTENSIONS:
+        if request.content_base64 is None or request.content is not None:
+            raise HTTPException(status_code=422, detail="电子表格保存内容格式无效")
+        max_encoded_size = ((_MAX_SPREADSHEET_EDIT_BYTES + 2) // 3) * 4 + 4
+        if len(request.content_base64) > max_encoded_size:
+            raise HTTPException(status_code=413, detail="电子表格超过 20 MiB，无法在线编辑")
+        try:
+            content_bytes = b64_mod.b64decode(request.content_base64, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise HTTPException(status_code=422, detail="电子表格内容不是有效的 Base64") from exc
+        if len(content_bytes) > _MAX_SPREADSHEET_EDIT_BYTES:
+            raise HTTPException(status_code=413, detail="电子表格超过 20 MiB，无法在线编辑")
+        try:
+            if extension == ".csv":
+                _validate_csv_edit_payload(content_bytes)
+            else:
+                await asyncio.to_thread(_validate_xlsx_edit_payload, content_bytes)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    else:
+        raise HTTPException(status_code=415, detail="当前文件类型不支持在线编辑")
+
+    try:
+        expected_modified = datetime.fromisoformat(
+            request.expected_modified.replace("Z", "+00:00")
+        )
+        if expected_modified.tzinfo is None:
+            expected_modified = expected_modified.replace(tzinfo=timezone.utc)
+        expected_mtime = expected_modified.timestamp()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="文件版本时间无效") from exc
+
+    settings = get_settings()
+    stale_cutoff = now_naive() - timedelta(
+        seconds=max(settings.sse_subscribe_timeout, 1)
+    )
+    active_lock = (
+        db.query(UserRunLock.lock_id)
+        .filter(
+            UserRunLock.user_id == user_id,
+            UserRunLock.session_id == chat_session_id,
+            UserRunLock.updated_at >= stale_cutoff,
+        )
+        .first()
+    )
+    if active_lock:
+        raise HTTPException(status_code=409, detail="Agent 正在使用此会话，结束后再保存文件")
+
+    sandbox_service = get_sandbox_service()
+    session_root = f"{sandbox_service.get_mount_path(session.user_id)}/sessions/{chat_session_id}"
+    sandbox_path = resolve_sandbox_path(file_path, session_root)
+    if not is_within_sandbox_root(sandbox_path, session_root):
+        raise HTTPException(status_code=400, detail="文件路径不合法")
+
+    try:
+        sandbox = await _ensure_sandbox(sandbox_service, session.user_id, db)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="沙箱不可用") from exc
+
+    edit_root = f"{session_root}/.opencapybox-edit"
+    temp_path = f"{edit_root}/.{uuid.uuid4().hex}.tmp"
+    try:
+        await sandbox.commands.run(f"mkdir -p {shlex.quote(edit_root)}")
+        write = getattr(sandbox.files, "write", None)
+        if callable(write):
+            await write(temp_path, content_bytes)
+        else:
+            await sandbox.files.write_file(temp_path, content_bytes)
+
+        update_command = f"""python3 - <<'PY'
+import json, os, stat, sys
+target = {sandbox_path!r}
+temp = {temp_path!r}
+expected_size = {request.expected_size!r}
+expected_mtime = {expected_mtime!r}
+try:
+    current = os.stat(target)
+except FileNotFoundError:
+    sys.exit(2)
+if not stat.S_ISREG(current.st_mode):
+    sys.exit(4)
+if current.st_size != expected_size or abs(current.st_mtime - expected_mtime) > 0.001:
+    print(json.dumps({{"status": "conflict", "size": current.st_size, "mtime": current.st_mtime}}))
+    sys.exit(3)
+os.replace(temp, target)
+updated = os.stat(target)
+print(json.dumps({{"status": "saved", "size": updated.st_size, "mtime": updated.st_mtime}}))
+PY"""
+        result = await sandbox.commands.run(update_command)
+        exit_code = _extract_exit_code(result)
+        if exit_code == 2:
+            raise HTTPException(status_code=404, detail="文件不存在")
+        if exit_code == 3:
+            raise HTTPException(status_code=409, detail="文件已被其他操作修改，请刷新后重试")
+        if exit_code == 4:
+            raise HTTPException(status_code=400, detail="目标不是可编辑文件")
+        if exit_code != 0:
+            raise RuntimeError("Session 文件原子保存失败")
+
+        payload = json.loads(_command_stdout_text(result))
+        modified = datetime.fromtimestamp(float(payload["mtime"]), timezone.utc).isoformat()
+        return FileInfo(
+            name=posixpath.basename(sandbox_path),
+            path=to_sandbox_relative_path(sandbox_path, session_root) or file_path,
+            size=int(payload["size"]),
+            modified=modified,
+            type=extension.lstrip("."),
+            is_directory=False,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Session 文件保存失败: %s", exc)
+        raise HTTPException(status_code=500, detail="文件保存失败") from exc
+    finally:
+        try:
+            await sandbox.commands.run(f"rm -f {shlex.quote(temp_path)}")
         except Exception:
-            return FileListResponse(files=[], total=0)
+            logger.debug("清理 Session 文件编辑临时文件失败: %s", temp_path)
 
 
 @router.get("/{chat_session_id}/files/{file_path:path}")
@@ -891,13 +1292,21 @@ async def download_file(
     file_path: str,
     user_id: str = Depends(get_current_user),
     preview: bool = Query(False, description="是否预览模式（inline）"),
+    render: Literal["pdf"] | None = Query(
+        None,
+        description="可选派生渲染格式；当前支持 Word/PowerPoint 转 PDF",
+    ),
     db: DBSession = Depends(get_db),
 ):
     """下载或预览沙箱中的文件（代理模式）
 
     Args:
         preview: True 表示内联预览，False 表示强制下载
+        render: ``pdf`` 表示在用户沙箱内将 Office 文件转换为 PDF
     """
+    if render is not None and not preview:
+        raise HTTPException(status_code=400, detail="派生渲染仅可用于预览")
+
     action = "预览" if preview else "下载"
     logger.debug(f"文件{action}请求: session={chat_session_id}, path={file_path}")
 
@@ -934,6 +1343,85 @@ async def download_file(
     filename = posixpath.basename(sandbox_path)
     mime_type, _ = mimetypes.guess_type(filename)
 
+    if render == "pdf":
+        try:
+            rendered = await render_office_document_to_pdf(
+                sandbox,
+                source_filename=filename,
+                source_path=sandbox_path,
+                session_root=session_root,
+            )
+        except FilePreviewUnsupportedError as exc:
+            raise HTTPException(status_code=415, detail=str(exc)) from exc
+        except FilePreviewTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except FilePreviewSourceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FilePreviewTimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except FilePreviewConversionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except FilePreviewUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        rendered_headers = {
+            "Content-Disposition": encode_filename_header(
+                rendered.filename,
+                "inline",
+            ),
+            "Content-Length": str(rendered.size),
+            "X-OpenCapyBox-Preview-Cache": rendered.cache_key[:16],
+        }
+        rendered_stream_reader = getattr(sandbox.files, "read_bytes_stream", None)
+        if callable(rendered_stream_reader):
+            try:
+                if inspect.iscoroutinefunction(rendered_stream_reader):
+                    rendered_stream = await rendered_stream_reader(
+                        rendered.sandbox_path,
+                        chunk_size=64 * 1024,
+                    )
+                else:
+                    rendered_stream = rendered_stream_reader(
+                        rendered.sandbox_path,
+                        chunk_size=64 * 1024,
+                    )
+                return StreamingResponse(
+                    rendered_stream,
+                    media_type="application/pdf",
+                    headers=rendered_headers,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "派生 PDF 流式讀取失敗，回退到有界一次性讀取: %s — %s",
+                    rendered.sandbox_path,
+                    exc,
+                )
+
+        try:
+            rendered_bytes = await sandbox.files.read_bytes(rendered.sandbox_path)
+        except Exception as exc:
+            logger.warning(
+                "files API 讀取派生 PDF 失敗，嘗試命令回退: %s — %s",
+                rendered.sandbox_path,
+                exc,
+            )
+            rendered_bytes = await _read_bytes_via_command(
+                sandbox,
+                rendered.sandbox_path,
+            )
+        if rendered_bytes is None or len(rendered_bytes) != rendered.size:
+            raise HTTPException(status_code=422, detail="无法读取转换后的 PDF")
+
+        fallback_headers = {
+            **rendered_headers,
+            "Content-Length": str(len(rendered_bytes)),
+        }
+        return Response(
+            content=rendered_bytes,
+            media_type="application/pdf",
+            headers=fallback_headers,
+        )
+
     # 可預覽的類型
     previewable_types = {'text/', 'image/', 'application/pdf', 'application/json', 'application/xml'}
     can_preview = preview and mime_type and any(
@@ -949,17 +1437,20 @@ async def download_file(
     file_bytes: bytes | None = None
     has_non_ascii = _contains_non_ascii(sandbox_path)
 
-    # 非 ASCII 路徑（中文等）：proxy 必定 500，跳過 SDK API 直接走別名/命令回退
+    # 非 ASCII 路徑（中文等）：proxy 必定 500。预览优先单次命令读取，
+    # 下载仍优先 ASCII 别名，以免大文件经过 base64 stdout。
     if has_non_ascii:
         logger.debug("非 ASCII 路徑，跳過 SDK API 直接走回退: %s", sandbox_path)
-        file_bytes = await _read_bytes_via_ascii_alias(sandbox, sandbox_path)
-        if file_bytes is None:
-            file_bytes = await _read_bytes_via_command(sandbox, sandbox_path)
+        file_bytes = await _read_non_ascii_file_bytes(
+            sandbox,
+            sandbox_path,
+            preview=preview,
+        )
     else:
         # ASCII 路徑：正常嘗試 SDK API
         # 1) 流式讀取（SDK read_bytes_stream）
         read_bytes_stream = getattr(sandbox.files, "read_bytes_stream", None)
-        if callable(read_bytes_stream):
+        if render is None and callable(read_bytes_stream):
             try:
                 if inspect.iscoroutinefunction(read_bytes_stream):
                     stream = await read_bytes_stream(sandbox_path, chunk_size=64 * 1024)

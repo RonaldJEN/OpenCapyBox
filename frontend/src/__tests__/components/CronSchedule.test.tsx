@@ -14,6 +14,10 @@ vi.mock('../../services/configApi', () => ({
     runs: [{ id: 'run-1', job_name: 'daily_report', cron_expr: '0 9 * * *', started_at: '2026-04-14T09:00:00Z', completed_at: '2026-04-14T09:01:00Z', status: 'success', output: 'done', is_read: true, artifacts: null, run_workspace: null }],
     total: 1, offset: 0, limit: 20,
   }),
+  getUnreadCount: vi.fn().mockResolvedValue({ count: 1 }),
+  markCronRunsRead: vi.fn().mockResolvedValue({ marked: 1 }),
+  getCronRunFiles: vi.fn().mockResolvedValue({ files: [] }),
+  downloadCronRunFile: vi.fn().mockResolvedValue(undefined),
   previewSchedule: vi.fn().mockResolvedValue({
     cron_expr: '0 9 * * *',
     next_fires: ['2026-04-22T09:00:00Z'],
@@ -176,6 +180,33 @@ describe('CronSchedule', () => {
     expect(closeButton).toHaveAttribute('title', '关闭日程');
     closeButton.click();
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('page 形态只渲染页面内工具栏，不提供顶层关闭按钮', async () => {
+    render(<CronSchedule variant="page" />);
+
+    const schedule = await screen.findByTestId('cron-schedule');
+    expect(schedule).toHaveAttribute('data-variant', 'page');
+    expect(screen.queryByRole('heading', { name: '日程' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '关闭日程' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '日历' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: '列表' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('执行记录在页面流内替换日程内容，不再使用 absolute 覆盖层', async () => {
+    render(<CronSchedule variant="page" unreadCount={1} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /^执行记录/ }));
+
+    const historyView = await screen.findByTestId('schedule-history-view');
+    expect(historyView).not.toHaveClass('absolute', 'inset-0');
+    expect(screen.getByRole('button', { name: '返回日程' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '全部标已读' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '+ 新建任务' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '返回日程' }));
+    expect(screen.queryByTestId('schedule-history-view')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '+ 新建任务' })).toBeInTheDocument();
   });
 
   it('日历导航和任务表单关闭图标具有明确可访问名称', async () => {

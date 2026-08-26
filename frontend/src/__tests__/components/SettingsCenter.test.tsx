@@ -1,34 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '../utils/test-utils';
 import SettingsCenter from '../../components/SettingsCenter';
-import {
-  getAgentFile,
-  getSkills,
-  toggleSkill,
-  updateAgentFile,
-  type SkillsResponse,
-} from '../../services/configApi';
+import { getAgentFile, updateAgentFile } from '../../services/configApi';
 
 vi.mock('../../services/configApi', () => ({
   getAgentFile: vi.fn(),
-  getSkills: vi.fn(),
-  toggleSkill: vi.fn(),
   updateAgentFile: vi.fn(),
-}));
-
-vi.mock('../../components/McpConnectionsPanel', () => ({
-  default: ({
-    onDirtyChange,
-    onPermissionsInvalidated,
-  }: {
-    onDirtyChange?: (dirty: boolean) => void;
-    onPermissionsInvalidated?: () => void;
-  }) => (
-    <>
-      <button type="button" onClick={() => onDirtyChange?.(true)}>模拟修改 MCP</button>
-      <button type="button" onClick={() => onPermissionsInvalidated?.()}>模拟 MCP 工具变化</button>
-    </>
-  ),
 }));
 
 vi.mock('../../components/ToolPermissionsPanel', () => ({
@@ -43,13 +20,8 @@ describe('SettingsCenter', () => {
   beforeEach(() => {
     resolveSave = null;
     vi.clearAllMocks();
-
     vi.mocked(getAgentFile).mockImplementation(async (name: string) => {
-      const contents = {
-        memory: 'old memory',
-        user: 'old user',
-        soul: 'old soul',
-      };
+      const contents = { memory: 'old memory', user: 'old user', soul: 'old soul' };
       return {
         name,
         file_type: name,
@@ -57,24 +29,16 @@ describe('SettingsCenter', () => {
         version: 1,
       };
     });
-    vi.mocked(getSkills).mockResolvedValue({
-      skills: [],
-      sandbox_status: 'not_created',
-    });
   });
 
   it('保存期间锁定编辑区，并提交点击保存时的内容', async () => {
     vi.mocked(updateAgentFile).mockImplementation(
-      () => new Promise((resolve) => {
-        resolveSave = resolve;
-      }),
+      () => new Promise((resolve) => { resolveSave = resolve; }),
     );
-
     render(<SettingsCenter />);
 
     await screen.findByText('old user');
     fireEvent.click(screen.getByRole('button', { name: '编辑' }));
-
     const textarea = await screen.findByPlaceholderText('记录用户画像、偏好和背景信息...');
     fireEvent.change(textarea, { target: { value: '第一版用户画像' } });
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
@@ -82,588 +46,50 @@ describe('SettingsCenter', () => {
     expect(updateAgentFile).toHaveBeenCalledWith('user', '第一版用户画像');
     expect(textarea).toBeDisabled();
     expect(screen.getByRole('button', { name: '取消' })).toBeDisabled();
-
-    await act(async () => {
-      resolveSave?.({ version: 2 });
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('第一版用户画像')).toBeInTheDocument();
-    });
+    await act(async () => { resolveSave?.({ version: 2 }); });
+    await waitFor(() => expect(screen.getByText('第一版用户画像')).toBeInTheDocument());
   });
 
   it('编辑内容变化时上报未保存状态', async () => {
     const onUnsavedChangesChange = vi.fn();
-
     render(<SettingsCenter onUnsavedChangesChange={onUnsavedChangesChange} />);
 
     await screen.findByText('old user');
     fireEvent.click(screen.getByRole('button', { name: '编辑' }));
-
     fireEvent.change(await screen.findByPlaceholderText('记录用户画像、偏好和背景信息...'), {
       target: { value: '未保存的用户画像' },
     });
-
-    await waitFor(() => {
-      expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(true);
-    });
-
-    fireEvent.click(screen.getByRole('button', { name: '取消' }));
-
-    await waitFor(() => {
-      expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(false);
-    });
-  });
-
-  it('进入技能 tab 时才加载技能清单', async () => {
-    render(<SettingsCenter />);
-
-    await screen.findByText('old user');
-    expect(getSkills).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole('button', { name: '能力设定' }));
-    fireEvent.click(screen.getByRole('button', { name: '技能' }));
-
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(1));
-  });
-
-  it('普通进入读取快照，用户点击刷新时才要求远程重扫', async () => {
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(1));
-    expect(getSkills).toHaveBeenNthCalledWith(1, { refresh: undefined });
-
-    fireEvent.click(screen.getByRole('button', { name: '刷新 Skill 清单' }));
-
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2));
-    expect(getSkills).toHaveBeenLastCalledWith({ refresh: true });
-  });
-
-  it('强制刷新期间重新进入 Skills tab 会复用刷新请求并应用其结果', async () => {
-    let resolveRefresh: ((value: SkillsResponse) => void) | null = null;
-    vi.mocked(getSkills)
-      .mockResolvedValueOnce({
-        skills: [{
-          name: 'old-skill',
-          description: 'Old snapshot',
-          category: 'general',
-          source: 'user',
-          enabled: true,
-        }],
-        sandbox_status: 'available',
-        inventory_state: 'current',
-      })
-      .mockImplementationOnce(() => new Promise((resolve) => {
-        resolveRefresh = resolve;
-      }));
-
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-    expect(await screen.findByText('old-skill')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '刷新 Skill 清单' }));
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2));
-
-    fireEvent.click(screen.getByRole('button', { name: '角色设定' }));
-    fireEvent.click(screen.getByRole('button', { name: '技能' }));
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(getSkills).toHaveBeenCalledTimes(2);
-
-    await act(async () => {
-      resolveRefresh?.({
-        skills: [{
-          name: 'fresh-skill',
-          description: 'Fresh scan',
-          category: 'general',
-          source: 'user',
-          enabled: true,
-        }],
-        sandbox_status: 'available',
-        inventory_state: 'current',
-      });
-    });
-
-    expect(await screen.findByText('fresh-skill')).toBeInTheDocument();
-    expect(screen.queryByText('old-skill')).not.toBeInTheDocument();
-  });
-
-  it('进入数据连接后才加载 MCP，并把表单 dirty 状态上报给外层', async () => {
-    const onUnsavedChangesChange = vi.fn();
-    render(<SettingsCenter onUnsavedChangesChange={onUnsavedChangesChange} />);
-
-    await screen.findByText('old user');
-    expect(screen.queryByRole('button', { name: '模拟修改 MCP' })).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '数据连接' }));
-    fireEvent.click(await screen.findByRole('button', { name: '模拟修改 MCP' }));
-
     await waitFor(() => expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(true));
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    await waitFor(() => expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(false));
   });
 
-  it('把权限管控作为与数据连接独立的设置分区', async () => {
+  it('不在设置中重复展示 Skills 与数据连接一级入口', async () => {
     render(<SettingsCenter />);
-
     await screen.findByText('old user');
-    expect(screen.queryByText('独立权限策略面板')).not.toBeInTheDocument();
 
+    expect(screen.queryByRole('button', { name: '打开 Skills' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '打开数据连接' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '数据连接' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+  });
+
+  it('权限管控保留独立分区并接收外部刷新版本', async () => {
+    render(<SettingsCenter permissionsRefreshToken={4} />);
+    await screen.findByText('old user');
     fireEvent.click(screen.getByRole('button', { name: '权限管控' }));
     expect(await screen.findByText('独立权限策略面板')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '模拟修改 MCP' })).not.toBeInTheDocument();
-  });
-
-  it('MCP mutation 会让保活的权限面板刷新', async () => {
-    render(<SettingsCenter initialSection="permissions" />);
-    await screen.findByText('独立权限策略面板');
-    expect(screen.getByRole('status', { name: '权限刷新版本' })).toHaveTextContent('0');
-
-    fireEvent.click(screen.getByRole('button', { name: '数据连接' }));
-    fireEvent.click(await screen.findByRole('button', { name: '模拟 MCP 工具变化' }));
-    fireEvent.click(screen.getByRole('button', { name: '权限管控' }));
-
-    expect(screen.getByRole('status', { name: '权限刷新版本' })).toHaveTextContent('1');
+    expect(screen.getByRole('status', { name: '权限刷新版本' })).toHaveTextContent('4');
   });
 
   it('为窄屏提供顶部横向设置导航并收紧内容留白', async () => {
     render(<SettingsCenter />);
     await screen.findByText('old user');
-
     const navigation = screen.getByRole('navigation', { name: '设置分区' });
     const content = screen.getByRole('main');
-
     expect(navigation).toHaveClass('w-full', 'flex-row', 'overflow-x-auto');
     expect(navigation).toHaveClass('sm:w-[180px]', 'sm:flex-col');
     expect(content).toHaveClass('px-4', 'pt-5', 'sm:px-8', 'sm:pt-8');
-  });
-
-  it('多个技能切换请求并发时分别锁定对应开关', async () => {
-    let resolveSkillA: (() => void) | null = null;
-    let resolveSkillB: (() => void) | null = null;
-
-    vi.mocked(getSkills).mockResolvedValue({
-      skills: [
-        {
-          name: 'skill-a',
-          description: 'Skill A',
-          category: 'general',
-          source: 'official',
-          enabled: true,
-        },
-        {
-          name: 'skill-b',
-          description: 'Skill B',
-          category: 'general',
-          source: 'user',
-          enabled: false,
-        },
-      ],
-      sandbox_status: 'available',
-    });
-    vi.mocked(toggleSkill).mockImplementation(
-      (skillName: string) => new Promise<void>((resolve) => {
-        if (skillName === 'skill-a') {
-          resolveSkillA = resolve;
-        } else {
-          resolveSkillB = resolve;
-        }
-      }),
-    );
-
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-
-    await screen.findByText('skill-a');
-
-    fireEvent.click(screen.getByRole('switch', { name: '禁用 skill-a' }));
-
-    await waitFor(() => {
-      expect(screen.getByRole('switch', { name: '启用 skill-a' })).toBeDisabled();
-    });
-
-    fireEvent.click(screen.getByRole('switch', { name: '启用 skill-b' }));
-
-    await waitFor(() => {
-      expect(screen.getByRole('switch', { name: '启用 skill-a' })).toBeDisabled();
-      expect(screen.getByRole('switch', { name: '禁用 skill-b' })).toBeDisabled();
-    });
-
-    fireEvent.click(screen.getByRole('switch', { name: '启用 skill-a' }));
-    expect(toggleSkill).toHaveBeenCalledTimes(2);
-
-    await act(async () => {
-      resolveSkillA?.();
-    });
-
-    await waitFor(() => {
-      expect(screen.getByRole('switch', { name: '启用 skill-a' })).not.toBeDisabled();
-      expect(screen.getByRole('switch', { name: '禁用 skill-b' })).toBeDisabled();
-    });
-
-    await act(async () => {
-      resolveSkillB?.();
-    });
-
-    await waitFor(() => {
-      expect(screen.getByRole('switch', { name: '禁用 skill-b' })).not.toBeDisabled();
-    });
-  });
-
-  it('使用 display_name 展示并以稳定 key 切换 Skill', async () => {
-    vi.mocked(getSkills).mockResolvedValue({
-      skills: [{
-        key: 'stable-pdf-key',
-        name: 'internal-pdf-name',
-        display_name: 'PDF 处理',
-        description: 'PDF documents',
-        category: 'document',
-        source: 'official',
-        enabled: true,
-      }],
-      sandbox_status: 'available',
-      inventory_state: 'current',
-    });
-    vi.mocked(toggleSkill).mockResolvedValue();
-
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-
-    expect(await screen.findByText('PDF 处理')).toBeInTheDocument();
-    expect(screen.queryByText('internal-pdf-name')).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('switch', { name: '禁用 PDF 处理' }));
-
-    await waitFor(() => {
-      expect(toggleSkill).toHaveBeenCalledWith('stable-pdf-key', false);
-      expect(screen.getByRole('switch', { name: '启用 PDF 处理' })).not.toBeDisabled();
-    });
-  });
-
-  it('沙箱不可用时提示用户，同时保留官方技能', async () => {
-    vi.mocked(getSkills).mockResolvedValue({
-      skills: [
-        {
-          name: 'pdf',
-          description: 'PDF documents',
-          category: 'document',
-          source: 'official',
-          enabled: true,
-        },
-      ],
-      sandbox_status: 'unavailable',
-    });
-
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-
-    expect(await screen.findByText('pdf')).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent(
-      '工作沙箱暂时不可用，目前仅显示官方技能。',
-    );
-    const retryButton = screen.getByRole('button', { name: '重新加载' });
-    expect(retryButton).toHaveClass(
-      'cursor-pointer',
-      'hover:bg-[#f8ead5]',
-      'focus-visible:ring-2',
-      'active:scale-95',
-      'motion-reduce:transition-none',
-    );
-    expect(screen.getByText('官方')).toBeInTheDocument();
-  });
-
-  it('严格刷新失败时说明正在显示上次快照而不是声称仅有官方技能', async () => {
-    vi.mocked(getSkills).mockResolvedValue({
-      skills: [
-        {
-          name: 'pdf',
-          description: 'PDF documents',
-          category: 'document',
-          source: 'official',
-          enabled: true,
-        },
-        {
-          name: 'cached-user-skill',
-          description: 'Cached user skill',
-          category: 'user',
-          source: 'user',
-          enabled: true,
-        },
-      ],
-      sandbox_status: 'unavailable',
-      inventory_state: 'stale',
-    });
-
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-
-    expect(await screen.findByText('cached-user-skill')).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent(
-      '刷新失败，正在显示上次成功加载的 Skill 清单。',
-    );
-    expect(screen.queryByText('工作沙箱暂时不可用，目前仅显示官方技能。')).not.toBeInTheDocument();
-  });
-
-  it('手动重试期间保留现有官方技能并在成功后加载用户技能', async () => {
-    let resolveRetry: ((value: SkillsResponse) => void) | null = null;
-    vi.mocked(getSkills)
-      .mockResolvedValueOnce({
-        skills: [{
-          name: 'pdf',
-          description: 'PDF documents',
-          category: 'document',
-          source: 'official',
-          enabled: true,
-        }],
-        sandbox_status: 'unavailable',
-      })
-      .mockImplementationOnce(() => new Promise((resolve) => {
-        resolveRetry = resolve;
-      }));
-
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-    expect(await screen.findByText('pdf')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
-
-    expect(screen.getByText('pdf')).toBeInTheDocument();
-    expect(screen.getByText('正在加载技能清单…')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '重新加载' })).toBeDisabled();
-
-    await act(async () => {
-      resolveRetry?.({
-        skills: [
-          {
-            name: 'pdf',
-            description: 'PDF documents',
-            category: 'document',
-            source: 'official',
-            enabled: true,
-          },
-          {
-            name: 'my-skill',
-            description: 'User skill',
-            category: 'user',
-            source: 'user',
-            enabled: true,
-          },
-        ],
-        sandbox_status: 'available',
-      });
-    });
-
-    expect(await screen.findByText('my-skill')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '重新加载' })).not.toBeInTheDocument();
-  });
-
-  it('尚未创建沙箱时说明当前仅展示官方技能', async () => {
-    vi.mocked(getSkills).mockResolvedValue({
-      skills: [{
-        name: 'docx',
-        description: 'Word documents',
-        category: 'document',
-        source: 'official',
-        enabled: true,
-      }],
-      sandbox_status: 'not_created',
-    });
-
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-
-    expect(await screen.findByText('docx')).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent(
-      '尚未创建工作沙箱，以下仅显示官方技能。',
-    );
-  });
-
-  it('旧技能请求先完成时不会提前结束最新请求的加载态', async () => {
-    let resolveFirst: ((value: SkillsResponse) => void) | null = null;
-    let resolveSecond: ((value: SkillsResponse) => void) | null = null;
-    vi.mocked(getSkills)
-      .mockImplementationOnce(() => new Promise((resolve) => {
-        resolveFirst = resolve;
-      }))
-      .mockImplementationOnce(() => new Promise((resolve) => {
-        resolveSecond = resolve;
-      }));
-
-    render(<SettingsCenter />);
-    await screen.findByText('old user');
-    fireEvent.click(screen.getByRole('button', { name: '能力设定' }));
-    fireEvent.click(screen.getByRole('button', { name: '技能' }));
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(1));
-
-    fireEvent.click(screen.getByRole('button', { name: '角色设定' }));
-    fireEvent.click(screen.getByRole('button', { name: '技能' }));
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2));
-
-    await act(async () => {
-      resolveFirst?.({
-        skills: [{
-          name: 'stale-skill',
-          description: 'Stale',
-          category: 'general',
-          source: 'official',
-          enabled: true,
-        }],
-        sandbox_status: 'available',
-      });
-    });
-
-    expect(screen.getAllByText('正在加载技能清单…')).not.toHaveLength(0);
-    expect(screen.queryByText('stale-skill')).not.toBeInTheDocument();
-
-    await act(async () => {
-      resolveSecond?.({
-        skills: [{
-          name: 'current-skill',
-          description: 'Current',
-          category: 'general',
-          source: 'official',
-          enabled: true,
-        }],
-        sandbox_status: 'available',
-      });
-    });
-
-    expect(await screen.findByText('current-skill')).toBeInTheDocument();
-  });
-
-  it('旧技能请求后完成时不会覆盖最新列表或乐观切换', async () => {
-    let resolveFirst: ((value: SkillsResponse) => void) | null = null;
-    let resolveSecond: ((value: SkillsResponse) => void) | null = null;
-    vi.mocked(getSkills)
-      .mockImplementationOnce(() => new Promise((resolve) => {
-        resolveFirst = resolve;
-      }))
-      .mockImplementationOnce(() => new Promise((resolve) => {
-        resolveSecond = resolve;
-      }));
-    vi.mocked(toggleSkill).mockResolvedValue();
-
-    render(<SettingsCenter />);
-    await screen.findByText('old user');
-    fireEvent.click(screen.getByRole('button', { name: '能力设定' }));
-    fireEvent.click(screen.getByRole('button', { name: '技能' }));
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(1));
-
-    fireEvent.click(screen.getByRole('button', { name: '角色设定' }));
-    fireEvent.click(screen.getByRole('button', { name: '技能' }));
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2));
-
-    await act(async () => {
-      resolveSecond?.({
-        skills: [{
-          name: 'skill-a',
-          description: 'Current',
-          category: 'general',
-          source: 'official',
-          enabled: true,
-        }],
-        sandbox_status: 'available',
-      });
-    });
-
-    fireEvent.click(await screen.findByRole('switch', { name: '禁用 skill-a' }));
-    await waitFor(() => {
-      expect(screen.getByRole('switch', { name: '启用 skill-a' })).not.toBeDisabled();
-    });
-
-    await act(async () => {
-      resolveFirst?.({
-        skills: [{
-          name: 'skill-a',
-          description: 'Stale',
-          category: 'general',
-          source: 'official',
-          enabled: true,
-        }],
-        sandbox_status: 'available',
-      });
-    });
-
-    expect(screen.getByRole('switch', { name: '启用 skill-a' })).toBeInTheDocument();
-    expect(screen.getByText('Current')).toBeInTheDocument();
-    expect(screen.queryByText('Stale')).not.toBeInTheDocument();
-  });
-
-  it('当前刷新也不会覆盖仍在提交的乐观切换', async () => {
-    const enabledSkill: SkillsResponse = {
-      skills: [{
-        name: 'skill-a',
-        description: 'Current',
-        category: 'general',
-        source: 'official',
-        enabled: true,
-      }],
-      sandbox_status: 'available',
-    };
-    vi.mocked(getSkills)
-      .mockResolvedValueOnce(enabledSkill)
-      .mockResolvedValueOnce(enabledSkill);
-
-    let resolveToggle: (() => void) | null = null;
-    vi.mocked(toggleSkill).mockImplementation(
-      () => new Promise<void>((resolve) => {
-        resolveToggle = resolve;
-      }),
-    );
-
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-
-    fireEvent.click(await screen.findByRole('switch', { name: '禁用 skill-a' }));
-    expect(screen.getByRole('switch', { name: '启用 skill-a' })).toBeDisabled();
-
-    fireEvent.click(screen.getByRole('button', { name: '角色设定' }));
-    fireEvent.click(screen.getByRole('button', { name: '技能' }));
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2));
-
-    expect(await screen.findByRole('switch', { name: '启用 skill-a' })).toBeDisabled();
-
-    await act(async () => {
-      resolveToggle?.();
-    });
-
-    await waitFor(() => {
-      expect(screen.getByRole('switch', { name: '启用 skill-a' })).not.toBeDisabled();
-    });
-  });
-
-  it('切换成功后才返回的重叠刷新也不会回写旧值', async () => {
-    const enabledSkill: SkillsResponse = {
-      skills: [{
-        name: 'skill-a',
-        description: 'Current',
-        category: 'general',
-        source: 'official',
-        enabled: true,
-      }],
-      sandbox_status: 'available',
-    };
-    let resolveRefresh: ((value: SkillsResponse) => void) | null = null;
-    vi.mocked(getSkills)
-      .mockResolvedValueOnce(enabledSkill)
-      .mockImplementationOnce(() => new Promise((resolve) => {
-        resolveRefresh = resolve;
-      }));
-
-    let resolveToggle: (() => void) | null = null;
-    vi.mocked(toggleSkill).mockImplementation(
-      () => new Promise<void>((resolve) => {
-        resolveToggle = resolve;
-      }),
-    );
-
-    render(<SettingsCenter initialSection="soul" initialSoulTab="skills" />);
-    fireEvent.click(await screen.findByRole('switch', { name: '禁用 skill-a' }));
-
-    fireEvent.click(screen.getByRole('button', { name: '角色设定' }));
-    fireEvent.click(screen.getByRole('button', { name: '技能' }));
-    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2));
-
-    await act(async () => {
-      resolveToggle?.();
-    });
-    await act(async () => {
-      resolveRefresh?.(enabledSkill);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByRole('switch', { name: '启用 skill-a' })).not.toBeDisabled();
-    });
   });
 
   it('激活记忆文件 tab 时重新刷新该文件内容', async () => {
@@ -671,25 +97,14 @@ describe('SettingsCenter', () => {
     vi.mocked(getAgentFile).mockImplementation(async (name: string) => {
       const content = name === 'memory'
         ? (memoryCalls++ === 0 ? 'old memory' : 'fresh memory')
-        : name === 'user'
-          ? 'old user'
-          : 'old soul';
-      return {
-        name,
-        file_type: name,
-        content,
-        version: name === 'memory' ? memoryCalls : 1,
-      };
+        : name === 'user' ? 'old user' : 'old soul';
+      return { name, file_type: name, content, version: name === 'memory' ? memoryCalls : 1 };
     });
 
     render(<SettingsCenter />);
-
     await screen.findByText('old user');
     fireEvent.click(screen.getByRole('button', { name: '主记忆' }));
-
-    await waitFor(() => {
-      expect(screen.getByText('fresh memory')).toBeInTheDocument();
-    });
+    await waitFor(() => expect(screen.getByText('fresh memory')).toBeInTheDocument());
     expect(vi.mocked(getAgentFile).mock.calls.filter(([name]) => name === 'memory')).toHaveLength(2);
   });
 
@@ -698,22 +113,13 @@ describe('SettingsCenter', () => {
     vi.mocked(getAgentFile).mockImplementation(async (name: string) => {
       const content = name === 'user'
         ? (userCalls++ === 0 ? 'old user' : 'fresh user')
-        : name === 'memory'
-          ? 'old memory'
-          : 'old soul';
-      return {
-        name,
-        file_type: name,
-        content,
-        version: name === 'user' ? userCalls : 1,
-      };
+        : name === 'memory' ? 'old memory' : 'old soul';
+      return { name, file_type: name, content, version: name === 'user' ? userCalls : 1 };
     });
 
     render(<SettingsCenter />);
-
     await screen.findByText('old user');
     fireEvent.click(screen.getByRole('button', { name: '编辑' }));
-
     await waitFor(() => {
       expect(screen.getByPlaceholderText('记录用户画像、偏好和背景信息...')).toHaveValue('fresh user');
     });

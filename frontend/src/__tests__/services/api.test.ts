@@ -755,6 +755,44 @@ describe('APIService', () => {
       );
     });
 
+    it('updateSessionSpreadsheet 应以版本令牌和 Base64 原子写回', async () => {
+      const updated = {
+        name: 'model.xlsx',
+        path: 'reports/model.xlsx',
+        size: 4,
+        modified: '2026-08-26T06:30:00+00:00',
+        type: 'xlsx',
+        is_directory: false,
+      };
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(updated),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const result = await apiService.updateSessionSpreadsheet(
+        'session-1',
+        {
+          path: 'reports/model.xlsx',
+          size: 2048,
+          modified: '2026-08-26T06:20:00+00:00',
+        },
+        new Uint8Array([0x50, 0x4b, 0x03, 0x04]).buffer,
+      );
+
+      expect(result).toEqual(updated);
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/sessions/session-1/files/reports/model.xlsx',
+        expect.objectContaining({ method: 'PUT' }),
+      );
+      const request = fetchMock.mock.calls[0][1];
+      expect(JSON.parse(request.body)).toEqual({
+        content_base64: 'UEsDBA==',
+        expected_size: 2048,
+        expected_modified: '2026-08-26T06:20:00+00:00',
+      });
+    });
+
     it('resumeStream 在未收到终态事件时应 reject', async () => {
       const encoder = new TextEncoder();
       const reader = {

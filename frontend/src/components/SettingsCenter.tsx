@@ -2,13 +2,10 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
-  Blocks,
-  Cable,
   Check,
   Layers,
   Loader2,
   Pencil,
-  RefreshCw,
   Shield,
   Sparkles,
   UserRound,
@@ -16,30 +13,22 @@ import {
 } from 'lucide-react';
 import {
   getAgentFile,
-  getSkills,
-  toggleSkill,
   updateAgentFile,
   type AgentFileDetail,
-  type SkillInfo,
-  type SkillInventoryState,
-  type SkillScanIssue,
-  type SkillSandboxStatus,
 } from '../services/configApi';
 
-const LazyMcpConnectionsPanel = React.lazy(() => import('./McpConnectionsPanel'));
 const LazyToolPermissionsPanel = React.lazy(() => import('./ToolPermissionsPanel'));
 
 type AgentFileName = 'memory' | 'user' | 'soul';
-type SettingsSection = 'memory' | 'soul' | 'connections' | 'permissions';
+type SettingsSection = 'memory' | 'soul' | 'permissions';
 type MemoryTab = 'main' | 'user';
-type SoulTab = 'role' | 'skills';
 
 interface SettingsCenterProps {
   onClose?: () => void;
   onUnsavedChangesChange?: (hasUnsavedChanges: boolean) => void;
   initialSection?: SettingsSection;
   initialMemoryTab?: MemoryTab;
-  initialSoulTab?: SoulTab;
+  permissionsRefreshToken?: number;
 }
 
 interface FileState {
@@ -91,14 +80,6 @@ function hasDirtyContent(state: FileState): boolean {
   return state.editing && state.content !== state.original;
 }
 
-function skillKey(skill: SkillInfo): string {
-  return skill.key || skill.name;
-}
-
-function skillDisplayName(skill: SkillInfo): string {
-  return skill.display_name || skill.name;
-}
-
 function fileForMemoryTab(tab: MemoryTab): AgentFileName {
   return tab === 'main' ? 'memory' : 'user';
 }
@@ -117,13 +98,10 @@ function MarkdownView({ content }: { content: string }) {
 function getInitialState(
   initialSection?: SettingsSection,
   initialMemoryTab?: MemoryTab,
-  initialSoulTab?: SoulTab,
 ) {
-  const section = initialSection ?? 'memory';
   return {
-    section,
+    section: initialSection ?? 'memory',
     memoryTab: initialMemoryTab ?? 'user',
-    soulTab: initialSoulTab ?? 'role',
   };
 }
 
@@ -132,40 +110,25 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   onUnsavedChangesChange,
   initialSection,
   initialMemoryTab,
-  initialSoulTab,
+  permissionsRefreshToken = 0,
 }) => {
-  const initial = getInitialState(initialSection, initialMemoryTab, initialSoulTab);
+  const initial = getInitialState(initialSection, initialMemoryTab);
   const [activeSection, setActiveSection] = useState<SettingsSection>(initial.section);
-  const [connectionsVisited, setConnectionsVisited] = useState(initial.section === 'connections');
   const [permissionsVisited, setPermissionsVisited] = useState(initial.section === 'permissions');
-  const [mcpDirty, setMcpDirty] = useState(false);
-  const [permissionsRefreshToken, setPermissionsRefreshToken] = useState(0);
   const [memoryTab, setMemoryTab] = useState<MemoryTab>(initial.memoryTab);
-  const [soulTab, setSoulTab] = useState<SoulTab>(initial.soulTab);
   const [files, setFiles] = useState<Record<AgentFileName, FileState>>({
     memory: emptyFileState(),
     user: emptyFileState(),
     soul: emptyFileState(),
   });
-  const [skills, setSkills] = useState<SkillInfo[]>([]);
-  const [skillsLoading, setSkillsLoading] = useState(false);
-  const [skillsError, setSkillsError] = useState('');
-  const [skillSandboxStatus, setSkillSandboxStatus] = useState<SkillSandboxStatus | null>(null);
-  const [skillInventoryState, setSkillInventoryState] = useState<SkillInventoryState | null>(null);
-  const [skillIssues, setSkillIssues] = useState<SkillScanIssue[]>([]);
-  const [togglingSkills, setTogglingSkills] = useState<Set<string>>(() => new Set());
   const [savedFlash, setSavedFlash] = useState<AgentFileName | ''>('');
   const filesRef = useRef(files);
-  const togglingSkillsRef = useRef<Set<string>>(new Set());
-  const skillMutationVersionsRef = useRef<Map<string, number>>(new Map());
   const savedTimerRef = useRef<number | null>(null);
   const fileLoadSeqRef = useRef<Record<AgentFileName, number>>({
     memory: 0,
     user: 0,
     soul: 0,
   });
-  const skillsLoadSeqRef = useRef(0);
-  const skillsRefreshRequestRef = useRef<Promise<void> | null>(null);
   const initialPropsAppliedRef = useRef(false);
 
   useEffect(() => {
@@ -233,102 +196,26 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     }
   }, []);
 
-  const loadSkills = useCallback(async (options: { refresh?: boolean } = {}) => {
-    const inFlightRefresh = skillsRefreshRequestRef.current;
-    if (inFlightRefresh) {
-      await inFlightRefresh;
-      return;
-    }
-
-    const executeLoad = async () => {
-      const seq = ++skillsLoadSeqRef.current;
-      const mutationVersionsAtStart = new Map(skillMutationVersionsRef.current);
-      setSkillsLoading(true);
-      setSkillsError('');
-      try {
-        const result = await getSkills({ refresh: options.refresh });
-        if (seq !== skillsLoadSeqRef.current) return;
-        setSkills((previousSkills) => {
-          const previousByKey = new Map(
-            previousSkills.map((skill) => [skillKey(skill), skill]),
-          );
-          return result.skills.map((skill) => {
-            const key = skillKey(skill);
-            const mutationOverlappedLoad = (
-              (skillMutationVersionsRef.current.get(key) ?? 0)
-              !== (mutationVersionsAtStart.get(key) ?? 0)
-            );
-            if (
-              !mutationOverlappedLoad
-              && !togglingSkillsRef.current.has(key)
-            ) return skill;
-            const optimisticSkill = previousByKey.get(key);
-            return optimisticSkill
-              ? { ...skill, enabled: optimisticSkill.enabled }
-              : skill;
-          });
-        });
-        setSkillSandboxStatus(result.sandbox_status);
-        setSkillInventoryState(result.inventory_state ?? null);
-        setSkillIssues(result.skill_issues ?? []);
-      } catch (err) {
-        if (seq !== skillsLoadSeqRef.current) return;
-        setSkillsError(fileErrorMessage(err));
-      } finally {
-        if (seq === skillsLoadSeqRef.current) {
-          setSkillsLoading(false);
-        }
-      }
-    };
-
-    const request = executeLoad();
-    if (!options.refresh) {
-      await request;
-      return;
-    }
-
-    skillsRefreshRequestRef.current = request;
-    try {
-      await request;
-    } finally {
-      if (skillsRefreshRequestRef.current === request) {
-        skillsRefreshRequestRef.current = null;
-      }
-    }
-  }, []);
-
-  const refreshSkills = useCallback(() => {
-    void loadSkills({ refresh: true });
-  }, [loadSkills]);
-
   useEffect(() => {
-    const next = getInitialState(initialSection, initialMemoryTab, initialSoulTab);
+    const next = getInitialState(initialSection, initialMemoryTab);
     setActiveSection(next.section);
     setMemoryTab(next.memoryTab);
-    setSoulTab(next.soulTab);
 
-    if (next.section === 'connections') setConnectionsVisited(true);
     if (next.section === 'permissions') setPermissionsVisited(true);
     const fileToRefresh = next.section === 'memory'
       ? fileForMemoryTab(next.memoryTab)
-      : next.section === 'soul' && next.soulTab === 'role'
+      : next.section === 'soul'
         ? 'soul'
         : null;
     if (initialPropsAppliedRef.current && fileToRefresh) {
       void loadFile(fileToRefresh, { skipIfDirty: true });
     }
     initialPropsAppliedRef.current = true;
-  }, [initialMemoryTab, initialSection, initialSoulTab, loadFile]);
+  }, [initialMemoryTab, initialSection, loadFile]);
 
   useEffect(() => {
     void Promise.all((['memory', 'user', 'soul'] as AgentFileName[]).map((name) => loadFile(name)));
   }, [loadFile]);
-
-  useEffect(() => {
-    if (activeSection === 'soul' && soulTab === 'skills') {
-      void loadSkills();
-    }
-  }, [activeSection, loadSkills, soulTab]);
 
   useEffect(() => () => {
     if (savedTimerRef.current !== null) {
@@ -336,8 +223,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     }
   }, []);
 
-  const enabledSkillCount = skills.filter((skill) => skill.enabled).length;
-  const hasUnsavedChanges = mcpDirty || Object.values(files).some(
+  const hasUnsavedChanges = Object.values(files).some(
     (state) => state.editing && state.content !== state.original,
   );
 
@@ -352,11 +238,10 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
 
   const activateSection = (section: SettingsSection) => {
     setActiveSection(section);
-    if (section === 'connections') setConnectionsVisited(true);
     if (section === 'permissions') setPermissionsVisited(true);
     const fileToRefresh = section === 'memory'
       ? fileForMemoryTab(memoryTab)
-      : section === 'soul' && soulTab === 'role'
+      : section === 'soul'
         ? 'soul'
         : null;
     if (fileToRefresh) {
@@ -367,13 +252,6 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   const activateMemoryTab = (tab: MemoryTab) => {
     void loadFile(fileForMemoryTab(tab), { skipIfDirty: true });
     setMemoryTab(tab);
-  };
-
-  const activateSoulTab = (tab: SoulTab) => {
-    if (tab === 'role') {
-      void loadFile('soul', { skipIfDirty: true });
-    }
-    setSoulTab(tab);
   };
 
   const cancelEdit = (name: AgentFileName) => {
@@ -432,47 +310,6 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           error: fileErrorMessage(err),
         },
       }));
-    }
-  };
-
-  const handleSkillToggle = async (key: string, currentEnabled: boolean) => {
-    if (togglingSkillsRef.current.has(key)) return;
-    const bumpMutationVersion = () => {
-      const versions = skillMutationVersionsRef.current;
-      versions.set(key, (versions.get(key) ?? 0) + 1);
-    };
-    const setSkillToggling = (isToggling: boolean) => {
-      const next = new Set(togglingSkillsRef.current);
-      if (isToggling) {
-        next.add(key);
-      } else {
-        next.delete(key);
-      }
-      togglingSkillsRef.current = next;
-      setTogglingSkills(next);
-    };
-
-    bumpMutationVersion();
-    setSkillToggling(true);
-    setSkillsError('');
-    setSkills((prev) =>
-      prev.map((skill) =>
-        skillKey(skill) === key ? { ...skill, enabled: !currentEnabled } : skill,
-      ),
-    );
-
-    try {
-      await toggleSkill(key, !currentEnabled);
-    } catch (err) {
-      setSkills((prev) =>
-        prev.map((skill) =>
-          skillKey(skill) === key ? { ...skill, enabled: currentEnabled } : skill,
-        ),
-      );
-      setSkillsError(fileErrorMessage(err));
-    } finally {
-      bumpMutationVersion();
-      setSkillToggling(false);
     }
   };
 
@@ -657,190 +494,9 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     );
   };
 
-  const renderSkills = () => (
-    <section className="mb-4 max-w-[680px] rounded-2xl border border-[#e8e3d9] bg-white px-6 py-6 shadow-[0_1px_3px_rgba(30,26,20,0.05)]">
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs text-[#a39c8e]">
-          {skillsLoading
-            ? '正在加载技能清单…'
-            : `${enabledSkillCount} / ${skills.length} 项技能已启用`}
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={refreshSkills}
-            disabled={skillsLoading}
-            className="inline-flex h-8 items-center gap-1.5 rounded-[9px] border border-[#e8e3d9] bg-white px-3 text-[12px] font-semibold text-[#6f6960] transition hover:bg-[#f6f2ea] disabled:cursor-not-allowed disabled:opacity-50"
-            aria-label="刷新 Skill 清单"
-          >
-            <RefreshCw size={13} className={skillsLoading ? 'animate-spin' : ''} />
-            刷新
-          </button>
-          <button
-            type="button"
-            disabled
-            className="inline-flex h-8 cursor-default items-center gap-2 rounded-[9px] border border-[#e8e3d9] bg-white px-3.5 text-[13px] font-semibold text-[#1c1a16] opacity-60"
-          >
-            浏览更多技能
-            <span className="rounded-md bg-[#f5ece2] px-1.5 py-0.5 text-[10px] font-bold text-[#8a5a2f]">
-              即将上线
-            </span>
-          </button>
-        </div>
-      </div>
-
-      {skillsError && (
-        <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-[#efd0ca] bg-[#fff5f3] px-3 py-2 text-xs font-medium text-claude-error">
-          <span>{skillsError}</span>
-          <button
-            type="button"
-            onClick={refreshSkills}
-            disabled={skillsLoading}
-            className="shrink-0 cursor-pointer rounded-md border border-current px-2 py-1 font-semibold transition-[color,background-color,border-color,box-shadow,transform] duration-200 ease-in-out hover:bg-[#fde9e5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c75c4a]/30 focus-visible:ring-offset-1 focus-visible:ring-offset-[#fff5f3] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent motion-reduce:transition-none"
-          >
-            重新加载
-          </button>
-        </div>
-      )}
-
-      {skillIssues.length > 0 && !skillsError && (
-        <div
-          role="alert"
-          className="mb-3 rounded-lg border border-[#efd0ca] bg-[#fff5f3] px-3 py-2 text-xs text-[#8f3f33]"
-        >
-          <div className="mb-1 font-semibold">
-            已隔离 {skillIssues.length} 个异常 Skill，其他 Skill 可继续使用
-          </div>
-          <ul className="space-y-1.5">
-            {skillIssues.map((issue) => (
-              <li key={`${issue.path}:${issue.field}`} className="break-words">
-                <code>{issue.path}</code>
-                <span> · {issue.field}：{issue.message}。{issue.suggestion}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {skillInventoryState === 'stale' && !skillsError && (
-        <div
-          role="status"
-          className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-[#ead8bd] bg-[#fff8ec] px-3 py-2 text-xs font-medium text-[#8a5a2f]"
-        >
-          <span>刷新失败，正在显示上次成功加载的 Skill 清单。</span>
-          <button
-            type="button"
-            onClick={refreshSkills}
-            disabled={skillsLoading}
-            className="shrink-0 cursor-pointer rounded-md border border-current px-2 py-1 font-semibold transition-[color,background-color,border-color,box-shadow,transform] duration-200 ease-in-out hover:bg-[#f8ead5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8a5a2f]/30 focus-visible:ring-offset-1 focus-visible:ring-offset-[#fff8ec] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent motion-reduce:transition-none"
-          >
-            重新加载
-          </button>
-        </div>
-      )}
-
-      {skillSandboxStatus === 'unavailable' && skillInventoryState !== 'stale' && !skillsError && (
-        <div
-          role="status"
-          className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-[#ead8bd] bg-[#fff8ec] px-3 py-2 text-xs font-medium text-[#8a5a2f]"
-        >
-          <span>工作沙箱暂时不可用，目前仅显示官方技能。</span>
-          <button
-            type="button"
-            onClick={refreshSkills}
-            disabled={skillsLoading}
-            className="shrink-0 cursor-pointer rounded-md border border-current px-2 py-1 font-semibold transition-[color,background-color,border-color,box-shadow,transform] duration-200 ease-in-out hover:bg-[#f8ead5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8a5a2f]/30 focus-visible:ring-offset-1 focus-visible:ring-offset-[#fff8ec] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent motion-reduce:transition-none"
-          >
-            重新加载
-          </button>
-        </div>
-      )}
-
-      {skillSandboxStatus === 'not_created' && (
-        <p
-          role="status"
-          className="mb-3 rounded-lg border border-[#e8e3d9] bg-[#faf8f3] px-3 py-2 text-xs font-medium text-[#6f6960]"
-        >
-          尚未创建工作沙箱，以下仅显示官方技能。
-        </p>
-      )}
-
-      {skillsLoading && skills.length === 0 ? (
-        <div className="flex h-32 items-center justify-center text-sm text-[#a39c8e]">
-          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          正在加载技能清单…
-        </div>
-      ) : skills.length === 0 ? (
-        <div className="flex flex-col items-center justify-center px-5 py-11 text-center text-[#a39c8e]">
-          <Blocks size={34} strokeWidth={1.3} className="mb-3 opacity-60" />
-          <div className="mb-1 text-sm font-semibold text-[#6f6960]">没有可用技能</div>
-          <div className="max-w-[280px] text-xs leading-6">安装或创建技能后，会出现在这里。</div>
-        </div>
-      ) : (
-        <div>
-          {skills.map((skill) => {
-            const key = skillKey(skill);
-            const displayName = skillDisplayName(skill);
-            const isToggling = togglingSkills.has(key);
-            return (
-              <div
-                key={key}
-                className="flex items-center gap-3.5 border-b border-[#f1ede4] px-1 py-3.5 last:border-b-0"
-              >
-                <div className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[9px] bg-[#f4f0e9] text-[#6f6960]">
-                  <Blocks size={16} />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className="truncate font-mono text-[13.5px] font-bold text-[#1c1a16]">
-                      {displayName}
-                    </span>
-                    <span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold ${
-                      skill.source === 'user'
-                        ? 'bg-[#e7f2eb] text-[#477057]'
-                        : 'bg-[#f0ece3] text-[#8a8377]'
-                    }`}>
-                      {skill.source === 'user' ? '用户' : '官方'}
-                    </span>
-                    {skill.category && skill.category !== 'user' && (
-                      <span className="shrink-0 rounded-md bg-[#f0ece3] px-1.5 py-0.5 text-[10.5px] font-semibold text-[#8a8377]">
-                        {skill.category}
-                      </span>
-                    )}
-                  </div>
-                  <div className="mt-0.5 truncate text-xs text-[#a39c8e]">
-                    {skill.description || '无描述'}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={skill.enabled}
-                  aria-label={`${skill.enabled ? '禁用' : '启用'} ${displayName}`}
-                  disabled={isToggling}
-                  onClick={() => handleSkillToggle(key, skill.enabled)}
-                  className={`relative h-[22px] w-[38px] shrink-0 rounded-full transition focus:outline-none focus:ring-2 focus:ring-[#b8814a]/30 ${
-                    skill.enabled ? 'bg-[#b8814a]' : 'bg-[#e3ddd0]'
-                  } ${isToggling ? 'opacity-60' : ''}`}
-                >
-                  <span
-                    className={`absolute top-0.5 h-[18px] w-[18px] rounded-full bg-white shadow-[0_1px_3px_rgba(0,0,0,0.2)] transition ${
-                      skill.enabled ? 'left-[18px]' : 'left-0.5'
-                    }`}
-                  />
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </section>
-  );
-
   const navItems = [
     { id: 'memory' as const, label: '我的记忆', icon: <Layers size={17} /> },
-    { id: 'soul' as const, label: '能力设定', icon: <Sparkles size={17} /> },
-    { id: 'connections' as const, label: '数据连接', icon: <Cable size={17} /> },
+    { id: 'soul' as const, label: '角色设定', icon: <Sparkles size={17} /> },
     { id: 'permissions' as const, label: '权限管控', icon: <Shield size={17} /> },
   ];
 
@@ -920,57 +576,12 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
             </>
           ) : activeSection === 'soul' ? (
             <>
-              <h2 className="mb-1.5 text-2xl font-bold tracking-[-0.01em] text-[#1c1a16]">能力设定</h2>
+              <h2 className="mb-1.5 text-2xl font-bold tracking-[-0.01em] text-[#1c1a16]">角色设定</h2>
               <p className="mb-6 max-w-[640px] text-sm leading-7 text-[#6f6960]">
-                定义 OpenCapyBox 的语气、视角和判断边界，以及可以调用的技能。
+                定义 OpenCapyBox 的语气、视角和判断边界。可以调用的技能请在左侧 Skills 一级页面管理。
               </p>
-              <div className="mb-5 flex gap-5 border-b border-[#e8e3d9]">
-                <button
-                  type="button"
-                  onClick={() => activateSoulTab('role')}
-                  className={`mb-[-1px] border-b-2 px-0.5 pb-2.5 text-[14.5px] font-semibold transition ${
-                    soulTab === 'role'
-                      ? 'border-[#b8814a] text-[#1c1a16]'
-                      : 'border-transparent text-[#a39c8e] hover:text-[#6f6960]'
-                  }`}
-                >
-                  角色设定
-                </button>
-                <button
-                  type="button"
-                  onClick={() => activateSoulTab('skills')}
-                  className={`mb-[-1px] border-b-2 px-0.5 pb-2.5 text-[14.5px] font-semibold transition ${
-                    soulTab === 'skills'
-                      ? 'border-[#b8814a] text-[#1c1a16]'
-                      : 'border-transparent text-[#a39c8e] hover:text-[#6f6960]'
-                  }`}
-                >
-                  技能
-                </button>
-              </div>
-              {soulTab === 'role' ? renderSoul() : renderSkills()}
+              {renderSoul()}
             </>
-          ) : null}
-          {connectionsVisited ? (
-            <div hidden={activeSection !== 'connections'}>
-              <h2 className="mb-1.5 text-2xl font-bold tracking-[-0.01em] text-[#1c1a16]">数据连接</h2>
-              <p className="mb-6 max-w-[680px] text-sm leading-7 text-[#6f6960]">
-                连接官方或个人 MCP 服务，为 OpenCapyBox 增加外部工具。工具执行权限与连接配置独立管理。
-              </p>
-              <React.Suspense
-                fallback={(
-                  <div className="flex h-40 items-center justify-center text-sm text-[#a39c8e]">
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />加载数据连接...
-                  </div>
-                )}
-              >
-                <LazyMcpConnectionsPanel
-                  active={activeSection === 'connections'}
-                  onDirtyChange={setMcpDirty}
-                  onPermissionsInvalidated={() => setPermissionsRefreshToken((token) => token + 1)}
-                />
-              </React.Suspense>
-            </div>
           ) : null}
           {permissionsVisited ? (
             <div hidden={activeSection !== 'permissions'}>

@@ -374,7 +374,7 @@ Authorization: Bearer <access_token>
 
 说明：会话默认使用持久化挂载目录（默认 `/home/user`，可由后端配置 `sandbox_storage_mount_path` 调整）。当旧 sandbox 被回收后，系统会自动重建新 sandbox 并复用同一会话存储目录，因此后续上传/生成的文件可继续读取。
 
-> 说明：当 `sandbox_use_server_proxy=True`（默认）时，由于 OpenSandbox proxy 会丢弃 GET query params 导致 `files.search` SDK 失败，后端会直接使用 `find` 命令列举文件，不再先调用 SDK 再回退。当 `sandbox_use_server_proxy=False`（直连模式）时，优先使用 SDK `files.search`，失败再降级为命令列举。接口始终返回 `200`。
+> 说明：后端在用户沙箱内使用 Python `os.listdir/stat` 枚举指定目录。沙箱连接、目录命令或响应解析失败会强制重连一次；重试仍失败返回 `503`，只有成功读取出的空目录才返回 `200 + files=[]`。
 
 **请求**
 
@@ -397,16 +397,16 @@ Authorization: Bearer <access_token>
       "name": "hello.py",
       "path": "hello.py",
       "size": 0,
-      "modified": "2025-01-14T10:35:00",
-      "type": "py"
+      "modified": "2025-01-14T10:35:00+00:00",
+      "type": "py",
+      "is_directory": false
     }
   ],
   "total": 1
 }
 ```
 
-> 说明：`type` 为文件扩展名（如 `py` / `pdf`），不是 MIME type。
-> 在 `sandbox_use_server_proxy=True` 且走 `find` 回退分支时，列表接口无法稳定获取文件真实大小，`size` 可能为 `0`。
+> 说明：`type` 为文件扩展名（如 `py` / `pdf`），不是 MIME type；`modified` 为带时区的 UTC ISO 8601。
 
 ---
 
@@ -417,7 +417,7 @@ Authorization: Bearer <access_token>
 **请求**
 
 ```
-GET /api/sessions/{chat_session_id}/files/{file_path}?preview=<bool>
+GET /api/sessions/{chat_session_id}/files/{file_path}?preview=<bool>&render=<pdf|null>
 Authorization: Bearer <access_token>
 ```
 
@@ -427,17 +427,23 @@ Authorization: Bearer <access_token>
 | file_path       | string | 是   | 文件相对路径（Path 参数） |
 | user_id         | string | 是   | 用户 ID（由 Authorization Bearer Token 解析） |
 | preview         | bool   | 否   | 是否预览模式，默认 false  |
+| render          | string | 否   | 派生渲染格式；当前仅支持 `pdf`，且要求 `preview=true` |
 
 **响应**
 
 - `preview=false`: 返回文件流，Content-Disposition 为 attachment
 - `preview=true`: 对于可预览文件（文本、图片、PDF），Content-Disposition 为 inline
+- `preview=true&render=pdf`: DOC/DOCX/PPT/PPTX 在用户 OpenSandbox 内完成有界快照、内容 hash、LibreOffice 转换与原子缓存发布，返回流式 `application/pdf`；API 主机不读取 Office 源内容，转换缓存属于 session 隐藏目录且不出现在文件列表中
 
 **常见错误**
 
 - `404 Not Found`：会话不存在，或文件不存在/不可读
 - `400 Bad Request`：文件路径不合法（越界路径）
-- `503 Service Unavailable`：沙箱不可用（连接/恢复失败）
+- `413 Payload Too Large`：Office 源文件超过 50 MiB，或派生 PDF 超过 100 MiB
+- `415 Unsupported Media Type`：请求派生渲染的文件类型不受支持
+- `422 Unprocessable Entity`：Office 文件损坏或沙箱内转换失败
+- `503 Service Unavailable`：沙箱不可用或镜像缺少 Office renderer
+- `504 Gateway Timeout`：Office 转换超时
 
 **可预览的文件类型**
 
@@ -446,6 +452,44 @@ Authorization: Bearer <access_token>
 - application/pdf
 - application/json
 - application/xml
+
+---
+
+### 保存可编辑的 Session 文件
+
+以乐观版本令牌原子保存当前 Session 内的 Markdown、UTF-8 CSV 或 XLSX。旧二进制 XLS/ET 仅支持只读预览。
+
+**请求**
+
+```http
+PUT /api/sessions/{chat_session_id}/files/{file_path}
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+Markdown 请求体：
+
+```json
+{
+  "content": "# 报告\n",
+  "expected_size": 10,
+  "expected_modified": "2026-08-26T02:00:00+00:00"
+}
+```
+
+CSV/XLSX 请求体使用 `content_base64` 传递完整文件字节，并携带相同的 `expected_size + expected_modified`。
+
+**响应** `200 OK`
+
+返回更新后的 `{name, path, size, modified, type, is_directory}`，其版本字段用于下一次保存。
+
+**常见错误**
+
+- `409 Conflict`：文件版本变化或 Session 正被 Agent 使用
+- `413 Payload Too Large`：Markdown 超过 5 MiB，或 CSV/XLSX 超过 20 MiB
+- `415 Unsupported Media Type`：文件不是 Markdown、CSV 或 XLSX；XLS/ET 为只读
+- `422 Unprocessable Entity`：请求体、UTF-8 CSV 或 OOXML XLSX 结构无效
+- `503 Service Unavailable`：沙箱不可用
 
 ---
 

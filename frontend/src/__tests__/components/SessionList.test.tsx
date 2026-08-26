@@ -78,6 +78,15 @@ describe('SessionList 組件', () => {
     });
   });
 
+  it('折叠状态只由外层 AppSidebar 控制，不在列表内重复做宽度动画', async () => {
+    render(<SessionList isCollapsed onSessionSelect={vi.fn()} />);
+    await screen.findByText('測試會話 1');
+
+    const sidebar = screen.getByRole('complementary');
+    expect(sidebar).toHaveClass('w-full', 'p-4');
+    expect(sidebar).not.toHaveClass('w-0', 'opacity-0', 'transition-[width,opacity,padding,border-color]');
+  });
+
   it('创建成功的会话应立即插入本地列表且不触发全量刷新', async () => {
     const { rerender } = render(<SessionList onSessionSelect={vi.fn()} />);
 
@@ -247,6 +256,65 @@ describe('SessionList 組件', () => {
     });
 
     expect(screen.getByText('2')).toBeInTheDocument();
+  });
+
+  it('提供日程、Skills 与数据一级入口、右侧提示并标记当前页面', async () => {
+    const onOpenCron = vi.fn();
+    const onOpenSkills = vi.fn();
+    const onOpenConnections = vi.fn();
+    render(
+      <SessionList
+        onSessionSelect={vi.fn()}
+        activePrimarySurface="schedule"
+        onOpenCron={onOpenCron}
+        onOpenSkills={onOpenSkills}
+        onOpenConnections={onOpenConnections}
+      />,
+    );
+
+    await screen.findByText('測試會話 1');
+    const scheduleButton = screen.getByRole('button', { name: '日程管理' });
+    const skillsButton = screen.getByRole('button', { name: 'Skills' });
+    const dataButton = screen.getByRole('button', { name: '数据' });
+    expect(scheduleButton).toHaveAttribute('aria-current', 'page');
+    expect(skillsButton).not.toHaveAttribute('aria-current');
+    expect(dataButton).not.toHaveAttribute('aria-current');
+    expect(scheduleButton).toHaveAccessibleDescription('安排自动任务');
+    expect(skillsButton).toHaveAccessibleDescription('复用优质经验');
+    expect(dataButton).toHaveAccessibleDescription('连接内外部数据');
+    expect(screen.getByText('安排自动任务')).toHaveClass('truncate');
+    expect(screen.getByText('复用优质经验')).toHaveClass('truncate');
+    expect(screen.getByText('连接内外部数据')).toHaveClass('truncate');
+    expect(screen.queryByText('数据连接')).not.toBeInTheDocument();
+
+    fireEvent.click(scheduleButton);
+    fireEvent.click(skillsButton);
+    fireEvent.click(dataButton);
+    expect(onOpenCron).toHaveBeenCalledTimes(1);
+    expect(onOpenSkills).toHaveBeenCalledTimes(1);
+    expect(onOpenConnections).toHaveBeenCalledTimes(1);
+  });
+
+  it('会话行只在对话 surface 中声明为当前页', async () => {
+    const { rerender } = render(
+      <SessionList
+        currentSessionId="session-1"
+        activePrimarySurface="skills"
+        onSessionSelect={vi.fn()}
+      />,
+    );
+
+    const sessionButton = await screen.findByRole('button', { name: '打开会话 測試會話 1' });
+    expect(sessionButton).not.toHaveAttribute('aria-current');
+
+    rerender(
+      <SessionList
+        currentSessionId="session-1"
+        activePrimarySurface="chat"
+        onSessionSelect={vi.fn()}
+      />,
+    );
+    expect(sessionButton).toHaveAttribute('aria-current', 'page');
   });
 
   it('首次挂载时不应独立请求运行中会话', async () => {

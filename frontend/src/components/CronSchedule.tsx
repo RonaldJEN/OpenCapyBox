@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { CalendarX2, History, Trash2 } from 'lucide-react';
+import { ArrowLeft, CalendarX2, History, Trash2 } from 'lucide-react';
 import {
   getCronJobs,
   getCronRuns,
@@ -199,9 +199,15 @@ interface Props {
   onClose?: () => void;
   unreadCount?: number;
   onUnreadChange?: (count: number) => void;
+  variant?: 'panel' | 'page';
 }
 
-const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChange }) => {
+const CronSchedule: React.FC<Props> = ({
+  onClose,
+  unreadCount = 0,
+  onUnreadChange,
+  variant = 'panel',
+}) => {
   const [tasks, setTasks] = useState<CronTask[]>([]);
   const [allRuns, setAllRuns] = useState<CronJobRun[]>([]);
   const [weekOffset, setWeekOffset] = useState(0);
@@ -401,25 +407,46 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
   }, [loadData]);
 
   return (
-    <div className="relative flex flex-col h-full bg-claude-bg">
+    <div
+      className={`relative flex h-full min-h-0 flex-col ${variant === 'page' ? 'bg-transparent' : 'bg-claude-bg'}`}
+      data-testid="cron-schedule"
+      data-variant={variant}
+    >
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-claude-border">
+      {!showMessages && (
+        <div className={`flex shrink-0 flex-wrap items-center justify-between gap-3 border-b ${
+          variant === 'page'
+            ? 'border-[#e8e3d9] pb-4'
+            : 'border-claude-border px-4 py-3'
+        }`}>
         <div className="flex items-center gap-3">
-          <h2 className="text-lg font-semibold text-claude-text">日程</h2>
+          {variant === 'panel' && <h2 className="text-lg font-semibold text-claude-text">日程</h2>}
           {/* View switcher（去 messages tab，messages 改为顶栏按钮覆盖式弹出） */}
-          <div className="flex text-sm">
+          <div className={`flex text-sm ${variant === 'page' ? 'rounded-[10px] bg-[#f0ede7] p-1' : ''}`}>
             <button
+              type="button"
               onClick={() => setTab('calendar')}
-              className={`px-3 py-1 rounded-l-lg border border-claude-border ${
-                tab === 'calendar' ? 'bg-claude-surface text-claude-text font-medium' : 'text-claude-secondary hover:bg-claude-hover'
+              aria-pressed={tab === 'calendar'}
+              className={`${variant === 'page' ? 'rounded-[7px] border-0 px-3.5 py-1.5' : 'rounded-l-lg border border-claude-border px-3 py-1'} ${
+                tab === 'calendar'
+                  ? variant === 'page'
+                    ? 'bg-white font-semibold text-[#1c1a16] shadow-sm'
+                    : 'bg-claude-surface font-medium text-claude-text'
+                  : 'text-claude-secondary hover:bg-white/70'
               }`}
             >
               日历
             </button>
             <button
+              type="button"
               onClick={() => setTab('manage')}
-              className={`px-3 py-1 rounded-r-lg border border-l-0 border-claude-border ${
-                tab === 'manage' ? 'bg-claude-surface text-claude-text font-medium' : 'text-claude-secondary hover:bg-claude-hover'
+              aria-pressed={tab === 'manage'}
+              className={`${variant === 'page' ? 'rounded-[7px] border-0 px-3.5 py-1.5' : 'rounded-r-lg border border-l-0 border-claude-border px-3 py-1'} ${
+                tab === 'manage'
+                  ? variant === 'page'
+                    ? 'bg-white font-semibold text-[#1c1a16] shadow-sm'
+                    : 'bg-claude-surface font-medium text-claude-text'
+                  : 'text-claude-secondary hover:bg-white/70'
               }`}
             >
               列表
@@ -428,14 +455,17 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
         </div>
         <div className="flex items-center gap-2">
           <button
+            type="button"
             onClick={() => setFormMode('new')}
-            className="px-2.5 py-1 text-xs rounded bg-claude-accent text-white hover:opacity-90"
+            className={`${variant === 'page' ? 'h-9 rounded-[10px] px-3.5 text-[13px]' : 'rounded px-2.5 py-1 text-xs'} bg-claude-accent font-semibold text-white transition hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/35`}
           >
             + 新建任务
           </button>
           <button
+            type="button"
             onClick={() => setShowMessages(true)}
-            className="relative px-2.5 py-1 text-xs rounded border border-claude-border bg-claude-surface text-claude-text hover:bg-claude-hover"
+            aria-label={unreadCount > 0 ? `执行记录，${unreadCount} 条未读` : '执行记录'}
+            className={`${variant === 'page' ? 'h-9 rounded-[10px] px-3.5 text-[13px]' : 'rounded px-2.5 py-1 text-xs'} relative border border-claude-border bg-white font-semibold text-claude-text transition hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/25`}
           >
             执行记录
             {unreadCount > 0 && (
@@ -456,9 +486,10 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
             </button>
           )}
         </div>
-      </div>
+        </div>
+      )}
 
-      {notice && (
+      {!showMessages && notice && (
         <div className="px-4 pt-3">
           <div className={`rounded-md border px-3 py-2 text-sm ${
             notice.type === 'success' ? 'border-green-200 bg-green-50 text-green-700' : 'border-red-200 bg-red-50 text-red-700'
@@ -468,7 +499,26 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
         </div>
       )}
 
-      {loading ? (
+      {showMessages ? (
+        <div className="flex min-h-0 flex-1 flex-col" data-testid="schedule-history-view">
+          <div className={`flex shrink-0 items-center gap-3 border-b ${
+            variant === 'page'
+              ? 'border-[#e8e3d9] pb-4'
+              : 'border-claude-border px-4 py-3'
+          }`}>
+            <button
+              type="button"
+              onClick={() => setShowMessages(false)}
+              className="inline-flex h-9 items-center gap-2 rounded-[10px] border border-claude-border bg-white px-3 text-[13px] font-semibold text-claude-text transition hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/25"
+            >
+              <ArrowLeft size={15} aria-hidden="true" />
+              返回日程
+            </button>
+            <h2 className="text-[15px] font-semibold text-claude-text">执行记录</h2>
+          </div>
+          <CronMessageCenter onUnreadChange={onUnreadChange} />
+        </div>
+      ) : loading ? (
         <div className="flex items-center justify-center h-32 text-claude-muted">加载中...</div>
       ) : tab === 'calendar' ? (
         // ──── Calendar View ────
@@ -534,22 +584,6 @@ const CronSchedule: React.FC<Props> = ({ onClose, unreadCount = 0, onUnreadChang
           togglingSet={togglingSet}
         />
       ) : null}
-
-      {/* 执行记录覆盖式抽屉（顶栏按钮触发） */}
-      {showMessages && (
-        <div className="absolute inset-0 z-40 flex flex-col bg-claude-bg">
-          <div className="flex items-center justify-between px-4 py-3 border-b border-claude-border">
-            <h3 className="text-base font-semibold text-claude-text">执行记录</h3>
-            <button
-              onClick={() => setShowMessages(false)}
-              className="px-2 py-1 text-xs rounded border border-claude-border bg-claude-surface text-claude-text hover:bg-claude-hover"
-            >
-              ← 返回日程
-            </button>
-          </div>
-          <CronMessageCenter onUnreadChange={onUnreadChange} />
-        </div>
-      )}
 
       {/* Task form drawer (新建 / 编辑) */}
       {formMode !== null && (

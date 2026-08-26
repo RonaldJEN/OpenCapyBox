@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
 import type { Session } from '../types';
-import { ChevronDown, MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Clock, Search, ShieldCheck, X } from 'lucide-react';
+import { Blocks, Database, ChevronDown, MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Clock, Search, ShieldCheck, X } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -19,6 +19,9 @@ interface SessionListProps {
   cronUnreadCount?: number;
   onOpenConfig?: () => void;
   onOpenCron?: () => void;
+  activePrimarySurface?: 'chat' | 'schedule' | 'skills' | 'connections';
+  onOpenSkills?: () => void;
+  onOpenConnections?: () => void;
 }
 
 interface DeleteFocusOrigin {
@@ -26,7 +29,7 @@ interface DeleteFocusOrigin {
   adjacentSessionIds: string[];
 }
 
-export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, optimisticSession, executingSessionIds, isCollapsed = false, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenCron }: SessionListProps) {
+export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, optimisticSession, executingSessionIds, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenCron, activePrimarySurface = 'chat', onOpenSkills, onOpenConnections }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -248,9 +251,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
   if (loading) {
     return (
       <aside
-        className={`hidden md:flex flex-col bg-claude-surface border-r border-claude-border transition-[width,opacity,padding,border-color] duration-300 ease-in-out ${
-          isCollapsed ? 'w-0 opacity-0 overflow-hidden' : 'w-[260px] p-4 opacity-100'
-        }`}
+        className="hidden h-full w-full flex-col border-r border-claude-border bg-claude-surface p-4 md:flex"
       >
         <div className="flex-1 flex items-center justify-center">
           <Loader2 className="w-6 h-6 text-claude-muted animate-spin" />
@@ -261,9 +262,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
 
   return (
     <aside
-      className={`hidden md:flex flex-col bg-claude-surface border-r border-claude-border flex-shrink-0 transition-[width,opacity,padding,border-color] duration-300 ease-in-out whitespace-nowrap overflow-hidden ${
-        isCollapsed ? 'w-0 opacity-0 border-r-0' : 'w-[260px] p-4 opacity-100'
-      }`}
+      className="hidden h-full w-full flex-shrink-0 flex-col overflow-hidden whitespace-nowrap border-r border-claude-border bg-claude-surface p-4 md:flex"
     >
       {/* Header */}
       <div className="flex items-center justify-between px-2">
@@ -317,6 +316,62 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
         </div>
       </div>
 
+      <nav aria-label="主要功能" className="mb-3 border-b border-claude-border px-1 pb-3">
+        <button
+          type="button"
+          onClick={onOpenCron}
+          aria-label="日程管理"
+          aria-describedby="primary-schedule-hint"
+          aria-current={activePrimarySurface === 'schedule' ? 'page' : undefined}
+          className={`group flex min-w-0 w-full items-center gap-3 overflow-hidden rounded-lg px-3 py-2 text-sm transition-colors ${
+            activePrimarySurface === 'schedule'
+              ? 'bg-white font-semibold text-[#9a6a36] shadow-sm'
+              : 'text-claude-secondary hover:bg-claude-hover'
+          }`}
+        >
+          <Clock size={16} className={`shrink-0 ${activePrimarySurface === 'schedule' ? 'text-[#9a6a36]' : 'text-claude-muted group-hover:text-claude-secondary'}`} />
+          <span className="shrink-0 text-left">日程管理</span>
+          <span id="primary-schedule-hint" className="ml-auto min-w-0 truncate text-right text-[11px] font-normal text-claude-muted">安排自动任务</span>
+          {cronUnreadCount > 0 && (
+            <span className="inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold leading-none text-white">
+              {cronUnreadCount > 99 ? '99+' : cronUnreadCount}
+            </span>
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={onOpenSkills}
+          aria-label="Skills"
+          aria-describedby="primary-skills-hint"
+          aria-current={activePrimarySurface === 'skills' ? 'page' : undefined}
+          className={`group flex min-w-0 w-full items-center gap-3 overflow-hidden rounded-lg px-3 py-2 text-sm transition-colors ${
+            activePrimarySurface === 'skills'
+              ? 'bg-white font-semibold text-[#8a5a2f] shadow-sm'
+              : 'text-claude-secondary hover:bg-claude-hover'
+          }`}
+        >
+          <Blocks size={16} className={`shrink-0 ${activePrimarySurface === 'skills' ? 'text-[#8a5a2f]' : 'text-claude-muted group-hover:text-claude-secondary'}`} />
+          <span className="shrink-0 text-left">Skills</span>
+          <span id="primary-skills-hint" className="ml-auto min-w-0 truncate text-right text-[11px] font-normal text-claude-muted">复用优质经验</span>
+        </button>
+        <button
+          type="button"
+          onClick={onOpenConnections}
+          aria-label="数据"
+          aria-describedby="primary-data-hint"
+          aria-current={activePrimarySurface === 'connections' ? 'page' : undefined}
+          className={`group flex min-w-0 w-full items-center gap-3 overflow-hidden rounded-lg px-3 py-2 text-sm transition-colors ${
+            activePrimarySurface === 'connections'
+              ? 'bg-white font-semibold text-[#426a59] shadow-sm'
+              : 'text-claude-secondary hover:bg-claude-hover'
+          }`}
+        >
+          <Database size={16} className={`shrink-0 ${activePrimarySurface === 'connections' ? 'text-[#426a59]' : 'text-claude-muted group-hover:text-claude-secondary'}`} />
+          <span className="shrink-0 text-left">数据</span>
+          <span id="primary-data-hint" className="ml-auto min-w-0 truncate text-right text-[11px] font-normal text-claude-muted">连接内外部数据</span>
+        </button>
+      </nav>
+
       {/* History List */}
       <div className="flex-1 overflow-y-auto space-y-1.5 scrollbar-hide -mx-2 px-2">
         <p className="px-3 pb-2 text-xs font-medium text-claude-muted uppercase tracking-widest">History</p>
@@ -346,7 +401,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
                 }}
                 type="button"
                 aria-label={`打开会话 ${session.title || session.id.slice(0, 8)}`}
-                aria-current={currentSessionId === session.id ? 'page' : undefined}
+                aria-current={activePrimarySurface === 'chat' && currentSessionId === session.id ? 'page' : undefined}
                 onClick={() => selectSession(session)}
                 className="absolute inset-0 z-0 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/30"
               />
@@ -403,22 +458,6 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
             </div>
           ))
         )}
-      </div>
-
-      {/* Footer */}
-      <div className="pt-3 border-t border-claude-border">
-        <button
-          onClick={onOpenCron}
-          className="w-full flex items-center gap-3 px-3 py-2 text-sm text-claude-secondary hover:bg-claude-hover rounded-lg transition-colors group"
-        >
-          <Clock size={16} className="text-claude-muted group-hover:text-claude-secondary" />
-          <span className="flex-1 text-left">日程管理</span>
-          {cronUnreadCount > 0 && (
-            <span className="ml-auto inline-flex min-w-[18px] h-[18px] items-center justify-center px-1 text-[10px] font-bold leading-none text-white bg-red-500 rounded-full">
-              {cronUnreadCount > 99 ? '99+' : cronUnreadCount}
-            </span>
-          )}
-        </button>
       </div>
 
       <div className="relative mt-2 border-t border-claude-border pt-2">

@@ -547,7 +547,29 @@ describe('Round 组件', () => {
     );
 
     expect(screen.queryByRole('button', { name: '查看 batch_find_similar.py' })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '查看 db_schema.md' }));
+    const fileCard = screen.getByRole('button', { name: '查看 db_schema.md' });
+    expect(fileCard).toHaveClass(
+      'min-h-[52px]',
+      'max-w-[520px]',
+      'sm:w-fit',
+      'sm:min-w-[280px]',
+    );
+    expect(fileCard.parentElement).toHaveClass('max-w-[520px]', 'gap-1.5', 'sm:items-start');
+    expect(fileCard.querySelector('.min-w-0')).toHaveClass(
+      'text-[15px]',
+      'font-medium',
+      'sm:max-w-[430px]',
+    );
+    expect(fileCard).toHaveTextContent('db_schema.md');
+    expect(fileCard).not.toHaveTextContent('Document');
+    expect(fileCard).not.toHaveTextContent('MD');
+    expect(fileCard).not.toHaveTextContent('42 B');
+    expect(fileCard.querySelector('[data-file-category="doc"]')).toHaveClass(
+      'bg-claude-file',
+      'text-white',
+    );
+    expect(fileCard.querySelectorAll('svg[aria-hidden="true"]')).toHaveLength(1);
+    fireEvent.click(fileCard);
 
     expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
       name: 'db_schema.md',

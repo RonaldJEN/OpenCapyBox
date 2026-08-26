@@ -1,4 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { StepData } from '../types';
 import {
   ChevronDown,
@@ -364,16 +365,23 @@ function ActivityDrawer({ isOpen, onClose, blocks, stepCount, durationText, disa
   durationText?: string;
   disableMotion: boolean;
 }) {
-  if (!isOpen) return null;
+  if (!isOpen || typeof document === 'undefined') return null;
 
-  return (
+  return createPortal(
     <>
       <div
-        className="fixed inset-0 z-30 bg-black/20 backdrop-blur-[2px]"
+        data-testid="activity-drawer-backdrop"
+        className="fixed inset-x-0 -inset-y-1 z-30 bg-black/25"
         onClick={onClose}
         aria-hidden="true"
       />
-      <aside className={`fixed right-0 top-0 bottom-0 z-40 w-[460px] max-w-[calc(100vw-24px)] border-l border-claude-border bg-claude-bg shadow-2xl ${disableMotion ? '' : 'animate-slide-in-right'}`}>
+      <aside
+        data-testid="activity-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label="活动详情"
+        className={`fixed right-0 -top-1 -bottom-1 z-40 w-[460px] max-w-[calc(100vw-24px)] border-l border-claude-border bg-claude-bg shadow-2xl ${disableMotion ? '' : 'animate-slide-in-right'}`}
+      >
         <div className="flex h-full flex-col">
           <div className="flex items-center justify-between border-b border-claude-border px-5 py-4">
             <div className="min-w-0 text-sm text-claude-secondary">
@@ -397,7 +405,8 @@ function ActivityDrawer({ isOpen, onClose, blocks, stepCount, durationText, disa
           </div>
         </div>
       </aside>
-    </>
+    </>,
+    document.body,
   );
 }
 
