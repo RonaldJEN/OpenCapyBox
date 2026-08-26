@@ -61,6 +61,7 @@
 | `user_message`     | Text       | NOT NULL                                               | 用户原始消息内容                                                                                                                |
 | `user_attachments` | Text       | nullable                                               | JSON 序列化的附件列表                                                                                                           |
 | `preferred_skills` | Text       | nullable                                               | JSON：`[{key, display_name}]`；普通 direct Round 在本次发送开始时解析出的有效“优先 Skill”展示快照，没有数据时按 `[]` 处理 |
+| `preferred_mcp_connections` | Text | nullable                                             | JSON：`[{server_id, display_name}]`；普通 direct Round 解析出的“优先数据连接”展示快照，没有数据时按 `[]` 处理              |
 | `final_response`   | Text       | nullable                                               | Agent 最终文本响应                                                                                                              |
 | `step_count`       | Integer    | default=0                                              | Agent 执行步数                                                                                                                  |
 | `status`           | String(20) | default=`"running"`                                  | 当前状态（见下方状态机）                                                                                                        |
@@ -320,6 +321,7 @@ Content-Type: application/json
   "content": ContentBlock[],
   "idempotency_key": "uuid-string",    // 可选
   "preferred_skill_keys": ["pdf", "data_analysis"], // 可选，本轮优先 Skill
+  "preferred_mcp_server_ids": ["server-uuid"], // 可选，本轮优先数据连接
   "thinking_mode": "enabled",          // 可选：provider_default / enabled / disabled
   "reasoning_effort": "max"             // 可选：当前模型声明的精确强度
 }
@@ -334,26 +336,25 @@ Content-Type: application/json
 | `video_url` | `{type: "video_url", video_url: {url: string}}`                                          | 视频                                    |
 | `file`      | `{type: "file", file: {path: string, name?: string, mime_type?: string, size?: number}}` | 文件附件，`path` 为会话工作区相对路径 |
 
-**`preferred_skill_keys` 契约与作用域**:
+**本轮 Skill / MCP 偏好契约与作用域**:
 
 - 值为 Skill 的稳定内部 `key` 数组；最多 50 项。每项先 trim，空项忽略，其余必须不超过 128 个 Unicode 字符；为兼容官方 Skill，允许人类可读 Unicode、空格和括号，禁止 `/`、`\`、`?`、`#`、`%` 及 Unicode General Category 为 `C*` 的控制/格式化/不可见字符。服务端按首次出现顺序去重；其他非法 key 使请求校验失败。
-- 该字段表达用户对**当前逻辑执行链**的偏好，不是强制工具调用指令。Agent 仅在与用户实际请求相关且本轮暴露 `get_skill` 时优先考虑这些 Skill；不得让 Skill 偏好覆盖用户请求。
-- 每次新 `message/stream` 独立解析该字段。未传或传空数组表示本次发送没有 Skill 偏好；不得从同一 session 的前序普通消息继承。
-- 服务端把请求转换为版本化上下文 `bsbox.preferred_skills.v1`（`{"mode":"preferred","keys":[...]}`），并在 run 启动前根据该用户当时可见且已启用的 Skill registry 重新解析。未知、已删除或已禁用的 key 被忽略，不导致整次发送失败。
-- 普通 `message/stream` direct Round 把本次解析后仍有效的 Skill 按顺序固化为 `preferred_skills: [{"key":"...","display_name":"..."}]`。这是发送当时的不可变展示快照：`key` 为稳定内部标识，`display_name` 为当时的展示名；不得在读取历史时用最新 registry 改写。空选择或全部 key 无效时保存/返回空数组。
-- direct 流的 `RUN_STARTED` 必须同步携带同一份权威快照 `preferredSkills: [{key, display_name}]`（包括显式空数组），让前端立即用解析结果替换 optimistic key。same-Round resume 不发新的 `RUN_STARTED`。
-- `preferred_skills` 只表示该 direct Round 的请求级“优先考虑”偏好，不证明 Agent 已加载 Skill、调用 `get_skill` 或实际使用了该 Skill。每个后续独立 direct Round 只记录自己当次提交并解析出的快照，不从前一 Round 继承或累积。
-- 解析后的上下文只投影到精确匹配的**原始 user message 锚点**的 provider 请求副本，作用于 `agent_step` / `tool_followup`；不得写回 `agent.messages`、`conversation_messages`、长期 system prompt，也不得注入标题生成或对话摘要请求。Interaction 回答不是该投影锚点。
-- 该上下文是用户通过 UI 控件提交的请求元数据，不是用户正文。provider 请求必须同时携带系统级解释策略；模型不得仅因该上下文出现就声称“用户提到/点名/要求加载了这些 Skill”，也不得在与正文无关时主动复述选择。仅在用户询问选择状态或需要解释实际 Skill 动作时才可提及。
-- 若本轮产生 Interaction，原始请求 key 与服务端生成的 `preferred_skills_origin_user_message_id` 会写入热路径 pending state 和持久化 request payload。`resume` 时按最新 registry/启停状态重新解析并保持同一锚点；连续暂停/恢复始终投影到最初 user message，不得改成回答，也不得扩散到之后独立消息。
-- same-Round continuation 不改写原 Round 的 `preferred_skills` 展示快照。
-- `preferred_skills_origin_user_message_id` 是服务端专用元数据，不属于 `bsbox.preferred_skills.v1` 的客户端 payload。发送和 resume 请求均不能提交或覆盖它；客户端在 runtime context 中夹带同名字段必须被忽略。该锚点必须来自产生 Interaction 的原始 direct Round user message，并随 Interaction 请求持久化。
+- `preferred_mcp_server_ids` 是稳定 MCP server id 数组（当前 DB 生成 UUID）；最多 20 项，每项 trim 后最长 36 个 ASCII 字符，只允许字母、数字、`.`、`_`、`:`、`-`，空项忽略并按首次出现顺序去重。控制字符、内部空白和其他字符返回 422。客户端不提交 installation、凭证或展示名。
+- 两个字段都是当前逻辑执行链的软偏好，不是强制工具调用或权限白名单。Skill 仅在暴露 `get_skill` 时投影；MCP 仅在暴露 `mcp_tool_search` 时投影。首个相关 MCP 检索把首选连接展示名带入 query；没有合适工具时允许回退其他已启用连接。未选择 MCP 时维持默认联网与自动路由。
+- Web Adapter 把二者合并为唯一的 `bsbox.turn_preferences.v1`：`{"mode":"preferred","skill_keys":[...],"mcp_server_ids":[...]}`。附件沿用独立 `ContentBlock` 输入链路并按下方 file block 语义转换，不得重复写入该偏好上下文。
+- run 启动前，Skill 按该用户当前 registry 解析；MCP 只从当前 Agent 的 `McpCatalogSnapshot.connections` 解析。未知、已禁用、发现失败或没有可见工具的项被忽略，不导致整次发送失败。
+- direct Round 分别固化 `preferred_skills: [{key, display_name}]` 与 `preferred_mcp_connections: [{server_id, display_name}]`。两份展示快照均不可变，读取历史时不得用当前 registry/catalog 改写。
+- direct `RUN_STARTED` 同时携带 `preferredSkills` 与 `preferredMcpConnections`，显式空数组也是权威结果，用于替换或清除 optimistic 标签；same-Round resume 不发新的 `RUN_STARTED`。
+- provider 请求只注入一条短 system 解释策略与一个紧凑 `<ui_context>`，并只前置到精确匹配的原始 user message 请求副本；不得写回 `agent.messages`、`conversation_messages` 或标题/摘要/记忆请求。属性值是数据标签而非指令，正文始终优先。
+- Skill 只有在 `get_skill` 成功后、连接只有在真实远程 MCP 工具调用成功后才能声称“已使用”；成功的 `mcp_tool_search` 只代表发现工具。UI 选择本身不构成使用审计。
+- 若产生 Interaction，服务端把唯一 `runtime_context` 与 `turn_preferences_origin_user_message_id` 写入热 pending state 和持久化 request payload，并先清除 producer 夹带的同名值。resume 按当时 registry/catalog 重新解析运行偏好，连续暂停始终锚定最初 user message。
+- same-Round continuation 不改写原 Round 的两份展示快照。`turn_preferences_origin_user_message_id` 是服务端专用元数据，不属于客户端 payload，发送和 resume 均不能提交或覆盖。
 
 **本轮推理选择契约**:
 
 - `thinking_mode` 与 `reasoning_effort` 是发送瞬间的不可变快照，只覆盖当前逻辑执行链；两者均省略时必须把当前模型目录默认值物化到快照与 direct Round，不得用 `NULL / NULL` 延迟解析。`disabled` 必须清除并拒绝同时携带的强度。
 - 后端先按 session 的精确 `model_id` 校验：仅 OpenAI 兼容且显式声明非空 `supported_reasoning_efforts` 的模型可切换；`disabled` 校验目录中的 `off`，无强度的 `enabled` 校验 `on`，具体强度精确命中同一有序目录，失效或伪造值在建立 SSE 前返回 400。`reasoning_effort` 中的 `off` / `on` 必须拒绝，它们只能通过 `thinking_mode` 表达。
-- 归一化后写入独立版本化上下文 `bsbox.reasoning.v1`，不得混入 Skill 上下文；OpenAI 同步、流式、工具 follow-up、retry 和 failover 在同一 run 中都从 `ContextVar` 读取同一冻结快照。failover 不按备用模型白名单过滤或降级，但只能尝试能够编码该快照的客户端：`provider_default + null` 可跨 provider；显式开关或具体强度不能交给 Anthropic 客户端；OpenAI `thinking_wire_format=none` 只能承载具体 `reasoning_effort`，不能承载纯 On/Off。协议不兼容的备用模型必须跳过，继续尝试后续模型；若没有任何备用模型兼容，保留并抛出主模型的原始失败。
+- 归一化后写入独立版本化上下文 `bsbox.reasoning.v1`，不得混入 `turn_preferences` 上下文；OpenAI 同步、流式、工具 follow-up、retry 和 failover 在同一 run 中都从 `ContextVar` 读取同一冻结快照。failover 不按备用模型白名单过滤或降级，但只能尝试能够编码该快照的客户端：`provider_default + null` 可跨 provider；显式开关或具体强度不能交给 Anthropic 客户端；OpenAI `thinking_wire_format=none` 只能承载具体 `reasoning_effort`，不能承载纯 On/Off。协议不兼容的备用模型必须跳过，继续尝试后续模型；若没有任何备用模型兼容，保留并抛出主模型的原始失败。
 - direct Round 将最终 `thinking_mode` / `reasoning_effort` 持久化用于审计和历史恢复。same-Round continuation 沿用该快照；`resume` API 不接受新的推理选择。
 - `enabled` / `disabled` 由模型 DB 的 `thinking_wire_format` 编码：DashScope 类网关使用 `enable_thinking=true|false`，DeepSeek 原生协议使用 `thinking: {type: enabled|disabled}`；`disabled` 同时移除强度，非空强度作为顶层 `reasoning_effort` 发送。选择 Off 不能退化成字段缺省。
 
@@ -390,7 +391,7 @@ SSE 事件流格式遵循 AG-UI 协议（详见 [第 4.6 节](#46-ag-ui-事件�
 | 404         | 会话不存在             | `session_id` 无效或不属于当前用户                                     |
 | 400         | 本轮推理选择无效       | 模型不支持按轮控制，或强度不在模型白名单                                |
 | 410         | 会话已完成             | 会话处于终态，不再接受新消息                                            |
-| 422         | 请求校验失败           | `content` 或 `preferred_skill_keys` 超出数量/长度限制、字段类型非法 |
+| 422         | 请求校验失败           | `content`、`preferred_skill_keys` 或 `preferred_mcp_server_ids` 超出数量/长度限制、字段类型非法 |
 | 429         | 当前运行任务数已达上限 | 用户 slot 已满，或同 session 已有 active run                            |
 | 503         | 服务不可用             | DB 锁冲突等内部错误                                                     |
 
@@ -459,7 +460,7 @@ Agent 初始化和中断状态校验在 SSE generator 内执行；入口只做�
 
 恢复不创建新 Round。回答、claim、`interaction_resolved` 以及后续 Agent 事件都属于原 Round。
 
-若原 Round 携带 `preferred_skill_keys` 生成的版本化 runtime context，pending Interaction 必须保留该请求上下文及服务端生成的原始 user message 锚点。`resume` 请求不接收新的 key 或锚点；服务端按 resume 当时可见且已启用的 Skill registry 重新解析，但展示快照仍属于原 direct Round。连续交互始终锚定最初用户消息，不得改成回答文本。
+若原 Round 携带 Skill/MCP 偏好生成的 `bsbox.turn_preferences.v1`，pending Interaction 必须保留这个唯一 runtime context 及服务端生成的原始 user message 锚点。`resume` 不接收新的偏好或锚点；服务端按 resume 当时的 Skill registry 与 MCP catalog 重新解析运行偏好，但两份展示快照仍属于原 direct Round。连续交互始终锚定最初用户消息，不得改成回答文本。
 
 原 Round 已固化的 `thinking_mode` / `reasoning_effort` 在 continuation 中保持不变，确保审批或回答之后的 provider follow-up 不会因为用户后来调整输入框选择而改变推理强度。
 
@@ -614,16 +615,19 @@ SSE 事件流。
 {
   "preferred_skills": [
     {"key": "pdf", "display_name": "PDF 处理"}
+  ],
+  "preferred_mcp_connections": [
+    {"server_id": "server-uuid", "display_name": "东方财富数据"}
   ]
 }
 ```
 
-`preferred_skills` 类型为 `Array<{key: string, display_name: string}>`，并遵循以下投影规则：
+`preferred_skills` 与 `preferred_mcp_connections` 分别是 Skill、MCP 连接的不可变展示快照，并遵循以下投影规则：
 
-- 普通 direct Round 返回该次 `message/stream` 在运行开始时解析并持久化的有效 Skill 展示快照；没有有效偏好或字段为空时返回 `[]`。
+- 普通 direct Round 返回该次 `message/stream` 在运行开始时解析并持久化的两份有效展示快照；任一没有有效偏好、字段为空或损坏时独立返回 `[]`。
 - same-Round continuation 仍是原 direct Round，因此继续返回原先冻结的展示快照，不新增重复标签。
-- 该数组是不可变的历史展示数据，不是 Skill 使用审计；不能据此声称 Skill 已加载、已调用或对结果有贡献。
-- 各个独立 direct Round 的数组彼此隔离，不继承、不合并，也不根据当前启停状态、改名或删除情况重算。
+- 这些数组不是使用审计；不能据此声称 Skill 已加载或 MCP 连接已被真实调用。
+- 各个独立 direct Round 的快照彼此隔离，不继承、不合并，也不根据当前启停状态、改名或删除情况重算。
 
 当 Round 为 `waiting_interaction` 时，`history/v2` 必须从 pending `agent_interactions` 投影 `interrupt={id, reason, payload}`，并与已持久化的 `interaction_requested` 指向同一 interaction id。读取历史会先处理过期 continuation claim：仅 `continuation_started_at` 为空的 pre-start 项可停回 waiting；已持久化 `interaction_resolved` 的 started continuation 必须写 durable `RUN_ERROR` 并收敛 failed。工具审批若已跨过 dispatch 且结果未知，还必须先按 execution lease 收敛 `unknown`，绝不自动重放。
 

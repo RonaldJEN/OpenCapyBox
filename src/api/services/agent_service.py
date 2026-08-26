@@ -22,15 +22,16 @@ from src.agent.schema.agui_events import AGUIEvent, Context, CustomEvent, EventT
 from src.agent.schema.run_context import (
     AgentRunContext,
     LLMRequestContext,
-    RequestedPreferredSkillsContext,
     RequestedReasoningContext,
-    ResolvedPreferredSkillsContext,
+    RequestedTurnPreferencesContext,
+    ResolvedMcpConnectionRef,
     ResolvedReasoningContext,
     ResolvedSkillRef,
+    ResolvedTurnPreferencesContext,
     current_run_context,
-    parse_requested_preferred_skills_contexts,
     parse_requested_reasoning_contexts,
-    requested_preferred_skills_to_context,
+    parse_requested_turn_preferences_contexts,
+    requested_turn_preferences_to_context,
     resolve_reasoning_selection,
 )
 
@@ -59,8 +60,8 @@ from pathlib import Path as PathlibPath
 
 logger = logging.getLogger(__name__)
 
-PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY = (
-    "preferred_skills_origin_user_message_id"
+TURN_PREFERENCES_ORIGIN_USER_MESSAGE_ID_KEY = (
+    "turn_preferences_origin_user_message_id"
 )
 
 
@@ -116,7 +117,7 @@ class PreparedAgentRun:
     user_message: str
     user_message_id: str = ""
     context: AgentRunContext = field(default_factory=AgentRunContext)
-    requested_context: RequestedPreferredSkillsContext | None = None
+    requested_context: RequestedTurnPreferencesContext | None = None
     parent_run_id: str | None = None
     is_continuation: bool = False
     initial_step: int = 0
@@ -214,6 +215,7 @@ class AgentService:
         self._last_saved_index = 0
         self._pending_interrupt_round_ids: dict[str, str] = {}
         self.skill_loader = None  # 保存 skill_loader 引用
+        self.mcp_connections: tuple[object, ...] = ()
         self.mcp_catalog_fingerprint: str | None = None
         self.mcp_catalog_configuration_fingerprint: str | None = None
         self.mcp_catalog_retry_required = False
@@ -354,11 +356,17 @@ class AgentService:
         self.mcp_catalog_retry_required = (
             tool_build_metadata.get("mcp_catalog_retry_required") is True
         )
+        raw_mcp_connections = tool_build_metadata.get("mcp_connections", ())
+        self.mcp_connections = (
+            tuple(raw_mcp_connections)
+            if isinstance(raw_mcp_connections, (list, tuple))
+            else ()
+        )
 
         # 技能和数据连接元数据按 LLM 请求动态生成，不写入长期 system message。
         runtime_prompt_provider = None
         mcp_connections_prompt = _render_mcp_connections_runtime_prompt(
-            tool_build_metadata.get("mcp_connections", ())
+            self.mcp_connections
         )
         if self.skill_loader or mcp_connections_prompt:
             def _build_tools_runtime_prompt() -> str:
@@ -1779,7 +1787,7 @@ class AgentService:
         if self.agent.has_pending_interrupt():
             self.discard_pending_runtime_state()
 
-        requested_context = parse_requested_preferred_skills_contexts(contexts or [])
+        requested_context = parse_requested_turn_preferences_contexts(contexts or [])
         requested_reasoning = parse_requested_reasoning_contexts(contexts or [])
         run_context = await self._resolve_run_context(
             requested_context,
@@ -1813,8 +1821,19 @@ class AgentService:
                     "display_name": skill.display_name,
                 }
                 for skill in (
-                    run_context.preferred_skills.skills
-                    if run_context.preferred_skills is not None
+                    run_context.preferences.skills
+                    if run_context.preferences is not None
+                    else ()
+                )
+            ],
+            preferred_mcp_connections=[
+                {
+                    "server_id": connection.server_id,
+                    "display_name": connection.display_name,
+                }
+                for connection in (
+                    run_context.preferences.mcp_connections
+                    if run_context.preferences is not None
                     else ()
                 )
             ],
@@ -1871,10 +1890,22 @@ class AgentService:
                     "key": skill.key,
                     "display_name": skill.display_name,
                 }
-                for skill in prepared.context.preferred_skills.skills
+                for skill in prepared.context.preferences.skills
             ]
-            if prepared.parent_run_id is None
-            and prepared.context.preferred_skills is not None
+            if not prepared.is_continuation
+            and prepared.context.preferences is not None
+            else []
+        )
+        preferred_mcp_connections = (
+            [
+                {
+                    "server_id": connection.server_id,
+                    "display_name": connection.display_name,
+                }
+                for connection in prepared.context.preferences.mcp_connections
+            ]
+            if not prepared.is_continuation
+            and prepared.context.preferences is not None
             else []
         )
         async for event in self._run_round_stream(
@@ -1884,6 +1915,7 @@ class AgentService:
             run_context=prepared.context,
             requested_context=prepared.requested_context,
             round_preferred_skills=preferred_skills,
+            round_preferred_mcp_connections=preferred_mcp_connections,
             is_continuation=prepared.is_continuation,
             initial_step=prepared.initial_step,
             interaction_id=prepared.interaction_id,
@@ -1897,12 +1929,16 @@ class AgentService:
 
     async def _resolve_run_context(
         self,
-        requested: RequestedPreferredSkillsContext | None,
+        requested: RequestedTurnPreferencesContext | None,
         requested_reasoning: RequestedReasoningContext | None = None,
     ) -> AgentRunContext:
         """Resolve user-provided keys against the effective registry for this run."""
-        resolved: list[ResolvedSkillRef] = []
-        if requested is not None and self.skill_loader is not None:
+        resolved_skills: list[ResolvedSkillRef] = []
+        if (
+            requested is not None
+            and requested.skill_keys
+            and self.skill_loader is not None
+        ):
             try:
                 refresh_inventory = getattr(self.skill_loader, "refresh_inventory", None)
                 if callable(refresh_inventory):
@@ -1913,25 +1949,60 @@ class AgentService:
                 self.skill_loader.refresh_disabled_skills(force=True)
             except Exception:
                 logger.warning("Preferred Skill 状态刷新失败，按当前 Registry 解析", exc_info=True)
-            for key in requested.keys:
+            for key in requested.skill_keys:
                 skill = self.skill_loader.get_skill(key)
                 if skill is None:
                     logger.info("忽略当前 Run 不可用的 preferred Skill: %s", key)
                     continue
                 metadata = skill.metadata if isinstance(skill.metadata, dict) else {}
                 display_name = str(metadata.get("display_name") or skill.name)
-                resolved.append(ResolvedSkillRef(
+                resolved_skills.append(ResolvedSkillRef(
                     key=skill.name,
                     load_name=skill.name,
                     display_name=display_name,
                 ))
-        preferred = (
-            ResolvedPreferredSkillsContext(skills=tuple(resolved))
-            if resolved
+        available_connections: dict[str, object] = {}
+        for connection in getattr(self, "mcp_connections", ()):
+            server_id = (
+                connection.get("server_id")
+                if isinstance(connection, dict)
+                else getattr(connection, "server_id", None)
+            )
+            if isinstance(server_id, str) and server_id:
+                available_connections[server_id] = connection
+        resolved_mcp_connections: list[ResolvedMcpConnectionRef] = []
+        for server_id in requested.mcp_server_ids if requested is not None else ():
+            connection = available_connections.get(server_id)
+            if connection is None:
+                logger.info(
+                    "忽略当前 Run 不可用的 preferred MCP connection: %r",
+                    server_id,
+                )
+                continue
+            display_name = (
+                connection.get("server_name")
+                if isinstance(connection, dict)
+                else getattr(connection, "server_name", None)
+            )
+            normalized_display_name = " ".join(str(display_name or "").split())
+            if not normalized_display_name:
+                continue
+            resolved_mcp_connections.append(
+                ResolvedMcpConnectionRef(
+                    server_id=server_id,
+                    display_name=normalized_display_name,
+                )
+            )
+        preferences = (
+            ResolvedTurnPreferencesContext(
+                skills=tuple(resolved_skills),
+                mcp_connections=tuple(resolved_mcp_connections),
+            )
+            if resolved_skills or resolved_mcp_connections
             else None
         )
         reasoning = self._resolve_reasoning_context(requested_reasoning)
-        return AgentRunContext(preferred_skills=preferred, reasoning=reasoning)
+        return AgentRunContext(preferences=preferences, reasoning=reasoning)
 
     def _resolve_reasoning_context(
         self,
@@ -2050,10 +2121,10 @@ class AgentService:
                 if isinstance(request.get("runtime_context"), dict):
                     result["runtime_context"] = request["runtime_context"]
                 origin_user_message_id = request.get(
-                    PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY
+                    TURN_PREFERENCES_ORIGIN_USER_MESSAGE_ID_KEY
                 )
                 if isinstance(origin_user_message_id, str):
-                    result[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = (
+                    result[TURN_PREFERENCES_ORIGIN_USER_MESSAGE_ID_KEY] = (
                         origin_user_message_id
                     )
                 return result
@@ -2064,7 +2135,7 @@ class AgentService:
     @staticmethod
     def _requested_context_from_interrupt(
         snapshot: dict[str, Any] | None,
-    ) -> RequestedPreferredSkillsContext | None:
+    ) -> RequestedTurnPreferencesContext | None:
         raw = (snapshot or {}).get("runtime_context")
         if not isinstance(raw, dict):
             return None
@@ -2073,16 +2144,16 @@ class AgentService:
         except Exception:
             logger.warning("忽略中断元数据中的非法 Runtime Context")
             return None
-        return parse_requested_preferred_skills_contexts([wire])
+        return parse_requested_turn_preferences_contexts([wire])
 
     @staticmethod
-    def _preferred_skills_origin_user_message_id_from_interrupt(
+    def _turn_preferences_origin_user_message_id_from_interrupt(
         snapshot: dict[str, Any] | None,
         *,
         parent_run_id: str,
     ) -> str:
-        """Read the server-owned preferred-Skill anchor with a deterministic default."""
-        raw = (snapshot or {}).get(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY)
+        """Read the server-owned turn-preference anchor with a deterministic default."""
+        raw = (snapshot or {}).get(TURN_PREFERENCES_ORIGIN_USER_MESSAGE_ID_KEY)
         if isinstance(raw, str):
             candidate = raw.strip()
             if candidate and candidate != ":user" and candidate.endswith(":user"):
@@ -2090,23 +2161,25 @@ class AgentService:
         return f"{parent_run_id}:user"
 
     @staticmethod
-    def _attach_preferred_skills_interaction_context(
+    def _attach_turn_preferences_interaction_context(
         interaction_payload: dict[str, Any],
         pending_interrupt: dict[str, Any] | None,
         *,
-        requested_context: RequestedPreferredSkillsContext | None,
+        requested_context: RequestedTurnPreferencesContext | None,
         origin_user_message_id: str,
     ) -> None:
         """Persist requested keys and their original user-message anchor."""
         # The anchor is server-owned. Drop any value serialized by an interaction
         # producer before assigning the trusted value derived from PreparedAgentRun.
-        interaction_payload.pop(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY, None)
+        interaction_payload.pop(TURN_PREFERENCES_ORIGIN_USER_MESSAGE_ID_KEY, None)
+        interaction_payload.pop("runtime_context", None)
         if isinstance(pending_interrupt, dict):
-            pending_interrupt.pop(PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY, None)
+            pending_interrupt.pop(TURN_PREFERENCES_ORIGIN_USER_MESSAGE_ID_KEY, None)
+            pending_interrupt.pop("runtime_context", None)
         if requested_context is None:
             return
 
-        runtime_wire = requested_preferred_skills_to_context(
+        runtime_wire = requested_turn_preferences_to_context(
             requested_context
         ).model_dump()
         interaction_payload["runtime_context"] = runtime_wire
@@ -2119,11 +2192,11 @@ class AgentService:
             or trusted_anchor == ":user"
             or not trusted_anchor.endswith(":user")
         ):
-            logger.warning("Preferred Skill 原始用户消息锚点无效，未写入中断元数据")
+            logger.warning("Turn preference 原始用户消息锚点无效，未写入中断元数据")
             return
-        interaction_payload[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = trusted_anchor
+        interaction_payload[TURN_PREFERENCES_ORIGIN_USER_MESSAGE_ID_KEY] = trusted_anchor
         if isinstance(pending_interrupt, dict):
-            pending_interrupt[PREFERRED_SKILLS_ORIGIN_USER_MESSAGE_ID_KEY] = trusted_anchor
+            pending_interrupt[TURN_PREFERENCES_ORIGIN_USER_MESSAGE_ID_KEY] = trusted_anchor
 
     def discard_pending_runtime_state(
         self,
@@ -2241,8 +2314,8 @@ class AgentService:
         interrupt_id: str,
         answers: dict[str, str],
         parent_run_id: str,
-        preferred_skills_origin_user_message_id: str,
-        requested_context: RequestedPreferredSkillsContext | None,
+        turn_preferences_origin_user_message_id: str,
+        requested_context: RequestedTurnPreferencesContext | None,
         run_context: AgentRunContext,
     ) -> PreparedAgentRun:
         """Persist an approval answer and prepare its continuation.
@@ -2351,7 +2424,7 @@ class AgentService:
         return PreparedAgentRun(
             run_id=parent_run_id,
             user_message=original_user_message,
-            user_message_id=preferred_skills_origin_user_message_id,
+            user_message_id=turn_preferences_origin_user_message_id,
             context=run_context,
             requested_context=requested_context,
             parent_run_id=None,
@@ -2509,8 +2582,8 @@ class AgentService:
             interrupt_kind = persisted_interrupt.get("kind")
             interrupt_snapshot = persisted_interrupt
             requested_context = self._requested_context_from_interrupt(interrupt_snapshot)
-            preferred_skills_origin_user_message_id = (
-                self._preferred_skills_origin_user_message_id_from_interrupt(
+            turn_preferences_origin_user_message_id = (
+                self._turn_preferences_origin_user_message_id_from_interrupt(
                     interrupt_snapshot,
                     parent_run_id=parent_run_id,
                 )
@@ -2519,7 +2592,7 @@ class AgentService:
             parent_reasoning = self._reasoning_context_from_round(parent_run_id)
             if parent_reasoning is not None:
                 run_context = AgentRunContext(
-                    preferred_skills=run_context.preferred_skills,
+                    preferences=run_context.preferences,
                     reasoning=parent_reasoning,
                 )
             if interrupt_kind == "tool_approval":
@@ -2527,8 +2600,8 @@ class AgentService:
                     interrupt_id=interrupt_id,
                     answers=answers,
                     parent_run_id=parent_run_id,
-                    preferred_skills_origin_user_message_id=(
-                        preferred_skills_origin_user_message_id
+                    turn_preferences_origin_user_message_id=(
+                        turn_preferences_origin_user_message_id
                     ),
                     requested_context=requested_context,
                     run_context=run_context,
@@ -2634,7 +2707,7 @@ class AgentService:
             return PreparedAgentRun(
                 run_id=parent_run_id,
                 user_message=original_user_message,
-                user_message_id=preferred_skills_origin_user_message_id,
+                user_message_id=turn_preferences_origin_user_message_id,
                 context=run_context,
                 requested_context=requested_context,
                 parent_run_id=None,
@@ -2652,8 +2725,9 @@ class AgentService:
         user_message: str,
         user_message_id: str = "",
         run_context: AgentRunContext | None = None,
-        requested_context: RequestedPreferredSkillsContext | None = None,
+        requested_context: RequestedTurnPreferencesContext | None = None,
         round_preferred_skills: list[dict[str, str]] | None = None,
+        round_preferred_mcp_connections: list[dict[str, str]] | None = None,
         is_continuation: bool = False,
         initial_step: int = 0,
         interaction_id: str | None = None,
@@ -3038,7 +3112,10 @@ class AgentService:
 
                 if (
                     event.type == EventType.RUN_STARTED
-                    and round_preferred_skills is not None
+                    and (
+                        round_preferred_skills is not None
+                        or round_preferred_mcp_connections is not None
+                    )
                 ):
                     event = event.model_copy(update={
                         "preferred_skills": [
@@ -3046,7 +3123,14 @@ class AgentService:
                                 "key": item["key"],
                                 "display_name": item["display_name"],
                             }
-                            for item in round_preferred_skills
+                            for item in (round_preferred_skills or [])
+                        ],
+                        "preferred_mcp_connections": [
+                            {
+                                "server_id": item["server_id"],
+                                "display_name": item["display_name"],
+                            }
+                            for item in (round_preferred_mcp_connections or [])
                         ],
                     })
 
@@ -3066,7 +3150,7 @@ class AgentService:
                     if not isinstance(interaction_id_value, str) or not interaction_id_value:
                         raise RuntimeError("interaction_requested is missing interactionId")
                     pending = getattr(self.agent, "_pending_interrupt", None)
-                    self._attach_preferred_skills_interaction_context(
+                    self._attach_turn_preferences_interaction_context(
                         value,
                         pending if isinstance(pending, dict) else None,
                         requested_context=requested_context,

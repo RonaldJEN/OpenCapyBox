@@ -72,6 +72,7 @@ export interface RunStartedEvent extends AGUIBaseEvent {
   runId: string;
   parentRunId?: string;
   preferredSkills?: PreferredSkillSnapshot[];
+  preferredMcpConnections?: PreferredMcpConnectionSnapshot[];
 }
 
 export interface RunFinishedEvent extends AGUIBaseEvent {
@@ -452,6 +453,11 @@ export interface PreferredSkillSnapshot {
   display_name: string;
 }
 
+export interface PreferredMcpConnectionSnapshot {
+  server_id: string;
+  display_name: string;
+}
+
 // 对话轮次
 export interface RoundData {
   round_id: string;
@@ -460,6 +466,7 @@ export interface RoundData {
   user_message: string;
   user_attachments?: AttachmentInfo[];
   preferred_skills?: PreferredSkillSnapshot[];
+  preferred_mcp_connections?: PreferredMcpConnectionSnapshot[];
   thinking_mode?: 'provider_default' | 'enabled' | 'disabled' | null;
   reasoning_effort?: string | null;
   final_response: string | null;

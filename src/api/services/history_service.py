@@ -119,6 +119,7 @@ class HistoryService:
         user_message: str,
         user_attachments: Optional[List[Dict]] = None,
         preferred_skills: Optional[List[Dict[str, str]]] = None,
+        preferred_mcp_connections: Optional[List[Dict[str, str]]] = None,
         thinking_mode: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         idempotency_key: Optional[str] = None,
@@ -147,6 +148,21 @@ class HistoryService:
                     separators=(",", ":"),
                 )
                 if preferred_skills is not None
+                else None
+            ),
+            preferred_mcp_connections=(
+                json.dumps(
+                    [
+                        {
+                            "server_id": item["server_id"],
+                            "display_name": item["display_name"],
+                        }
+                        for item in preferred_mcp_connections
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                if preferred_mcp_connections is not None
                 else None
             ),
             thinking_mode=thinking_mode,
@@ -546,6 +562,28 @@ class HistoryService:
                 except (json.JSONDecodeError, TypeError):
                     preferred_skills = []
 
+            preferred_mcp_connections: List[Dict[str, str]] = []
+            if round_obj.preferred_mcp_connections:
+                try:
+                    parsed_preferred_mcp_connections = json.loads(
+                        round_obj.preferred_mcp_connections
+                    )
+                    if isinstance(parsed_preferred_mcp_connections, list) and all(
+                        isinstance(item, dict)
+                        and isinstance(item.get("server_id"), str)
+                        and isinstance(item.get("display_name"), str)
+                        for item in parsed_preferred_mcp_connections
+                    ):
+                        preferred_mcp_connections = [
+                            {
+                                "server_id": item["server_id"],
+                                "display_name": item["display_name"],
+                            }
+                            for item in parsed_preferred_mcp_connections
+                        ]
+                except (json.JSONDecodeError, TypeError):
+                    preferred_mcp_connections = []
+
             interrupt_details = None
             if round_obj.status == "waiting_interaction":
                 interaction = pending_interactions.get(round_obj.id)
@@ -583,6 +621,7 @@ class HistoryService:
                     "user_message": round_obj.user_message,
                     "user_attachments": attachments,
                     "preferred_skills": preferred_skills,
+                    "preferred_mcp_connections": preferred_mcp_connections,
                     "thinking_mode": round_obj.thinking_mode,
                     "reasoning_effort": round_obj.reasoning_effort,
                     "final_response": round_obj.final_response,

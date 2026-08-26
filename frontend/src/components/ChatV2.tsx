@@ -7,6 +7,7 @@ import {
   ChatContentBlock,
   FileInfo,
   ModelInfo,
+  PreferredMcpConnectionSnapshot,
   RoundData,
   ToolApprovalPayload,
   TurnReasoningSelection,
@@ -19,7 +20,11 @@ import {
 import { readFileAsDataUrl } from '../utils/imageUtils';
 import { toFileInfo, isImageFile } from '../utils/fileUtils';
 import { extractAssistantFiles } from '../utils/assistantFileRefs';
-import { restoreFailedSkillDraft, type SkillDraft } from '../utils/skillDrafts';
+import {
+  emptyTurnPreferenceDraft,
+  restoreFailedTurnPreferenceDraft,
+  type TurnPreferenceDraft,
+} from '../utils/turnPreferenceDrafts';
 import {
   MAX_TEXT_BLOCK_CHARS,
   formatUploadError,
@@ -143,7 +148,7 @@ interface ReasoningDraft {
 
 interface ComposerDraftState {
   messageDrafts: Record<string, MessageDraft>;
-  skillDrafts: Record<string, SkillDraft>;
+  preferenceDrafts: Record<string, TurnPreferenceDraft>;
   reasoningDrafts: Record<string, ReasoningDraft>;
 }
 
@@ -237,7 +242,7 @@ function ChatV2View(props: ChatV2Props) {
   const initialDraftKey = sessionId || NEW_SESSION_DRAFT_KEY;
   const [composerDrafts, setComposerDrafts] = useState<ComposerDraftState>(() => ({
     messageDrafts: { [initialDraftKey]: createMessageDraft() },
-    skillDrafts: {},
+    preferenceDrafts: {},
     reasoningDrafts: {},
   }));
   const [localError, setLocalError] = useState('');
@@ -288,7 +293,8 @@ function ChatV2View(props: ChatV2Props) {
     input: '',
     attachedFiles: [],
   };
-  const currentSkillDraft = composerDrafts.skillDrafts[currentDraftKey] || { keys: [], revision: 0 };
+  const currentPreferenceDraft = composerDrafts.preferenceDrafts[currentDraftKey]
+    || emptyTurnPreferenceDraft();
   const currentReasoningDraft = composerDrafts.reasoningDrafts[currentDraftKey];
   const turnReasoning = currentReasoningDraft?.modelId === selectedModelId
     ? currentReasoningDraft.selection
@@ -528,13 +534,17 @@ function ChatV2View(props: ChatV2Props) {
       if (!sourceMessage || sourceMessage.draftId !== expectedDraftId) return previous;
 
       const targetMessage = previous.messageDrafts[targetSessionId];
-      const targetSkill = previous.skillDrafts[targetSessionId];
+      const targetPreferences = previous.preferenceDrafts[targetSessionId];
       const targetMessageCompatible = !targetMessage
         || targetMessage.draftId === expectedDraftId
         || isPristineMessageDraft(targetMessage);
-      const targetSkillCompatible = !targetSkill
-        || (targetSkill.revision === 0 && targetSkill.keys.length === 0);
-      if (!targetMessageCompatible || !targetSkillCompatible) return previous;
+      const targetPreferencesCompatible = !targetPreferences
+        || (
+          targetPreferences.revision === 0
+          && targetPreferences.skillKeys.length === 0
+          && targetPreferences.mcpConnections.length === 0
+        );
+      if (!targetMessageCompatible || !targetPreferencesCompatible) return previous;
 
       const nextMessageDrafts = { ...previous.messageDrafts };
       nextMessageDrafts[targetSessionId] = targetMessage?.draftId === expectedDraftId
@@ -543,10 +553,10 @@ function ChatV2View(props: ChatV2Props) {
         : sourceMessage;
       delete nextMessageDrafts[sourceKey];
 
-      const nextSkillDrafts = { ...previous.skillDrafts };
-      const sourceSkill = nextSkillDrafts[sourceKey];
-      if (sourceSkill) nextSkillDrafts[targetSessionId] = sourceSkill;
-      delete nextSkillDrafts[sourceKey];
+      const nextPreferenceDrafts = { ...previous.preferenceDrafts };
+      const sourcePreferences = nextPreferenceDrafts[sourceKey];
+      if (sourcePreferences) nextPreferenceDrafts[targetSessionId] = sourcePreferences;
+      delete nextPreferenceDrafts[sourceKey];
 
       const nextReasoningDrafts = { ...previous.reasoningDrafts };
       const sourceReasoning = nextReasoningDrafts[sourceKey];
@@ -555,7 +565,7 @@ function ChatV2View(props: ChatV2Props) {
 
       return {
         messageDrafts: nextMessageDrafts,
-        skillDrafts: nextSkillDrafts,
+        preferenceDrafts: nextPreferenceDrafts,
         reasoningDrafts: nextReasoningDrafts,
       };
     });
@@ -1013,12 +1023,36 @@ function ChatV2View(props: ChatV2Props) {
   const handleSelectedSkillKeysChange = (keys: string[]) => {
     const draftKey = currentDraftKey;
     setComposerDrafts((previous) => {
-      const current = previous.skillDrafts[draftKey] || { keys: [], revision: 0 };
+      const current = previous.preferenceDrafts[draftKey] || emptyTurnPreferenceDraft();
       return {
         ...previous,
-        skillDrafts: {
-          ...previous.skillDrafts,
-          [draftKey]: { keys, revision: current.revision + 1 },
+        preferenceDrafts: {
+          ...previous.preferenceDrafts,
+          [draftKey]: {
+            ...current,
+            skillKeys: keys,
+            revision: current.revision + 1,
+          },
+        },
+      };
+    });
+  };
+
+  const handleSelectedMcpConnectionsChange = (
+    connections: PreferredMcpConnectionSnapshot[],
+  ) => {
+    const draftKey = currentDraftKey;
+    setComposerDrafts((previous) => {
+      const current = previous.preferenceDrafts[draftKey] || emptyTurnPreferenceDraft();
+      return {
+        ...previous,
+        preferenceDrafts: {
+          ...previous.preferenceDrafts,
+          [draftKey]: {
+            ...current,
+            mcpConnections: connections.map((connection) => ({ ...connection })),
+            revision: current.revision + 1,
+          },
         },
       };
     });
@@ -1042,15 +1076,18 @@ function ChatV2View(props: ChatV2Props) {
     };
     const draftInput = messageSnapshot.input;
     const draftAttachments = messageSnapshot.attachedFiles;
-    const skillSnapshot: SkillDraft = {
-      keys: [...currentSkillDraft.keys],
-      revision: currentSkillDraft.revision,
+    const preferenceSnapshot: TurnPreferenceDraft = {
+      skillKeys: [...currentPreferenceDraft.skillKeys],
+      mcpConnections: currentPreferenceDraft.mcpConnections.map(
+        (connection) => ({ ...connection }),
+      ),
+      revision: currentPreferenceDraft.revision,
     };
     const reasoningSnapshot = turnReasoning
       ? { ...turnReasoning }
       : null;
     const clearedMessageRevision = messageSnapshot.revision + 1;
-    const clearedSkillRevision = skillSnapshot.revision + 1;
+    const clearedPreferenceRevision = preferenceSnapshot.revision + 1;
     let restoreDraftKey = initialSessionKey;
     const restoreSubmissionSnapshot = () => {
       setComposerDrafts((previous) => {
@@ -1068,11 +1105,11 @@ function ChatV2View(props: ChatV2Props) {
         }
         return {
           messageDrafts: nextMessageDrafts,
-          skillDrafts: restoreFailedSkillDraft(
-            previous.skillDrafts,
+          preferenceDrafts: restoreFailedTurnPreferenceDraft(
+            previous.preferenceDrafts,
             restoreDraftKey,
-            skillSnapshot,
-            clearedSkillRevision,
+            preferenceSnapshot,
+            clearedPreferenceRevision,
           ),
           reasoningDrafts: previous.reasoningDrafts,
         };
@@ -1103,9 +1140,13 @@ function ChatV2View(props: ChatV2Props) {
               attachedFiles: [],
             },
           },
-          skillDrafts: {
-            ...previous.skillDrafts,
-            [initialSessionKey]: { keys: [], revision: clearedSkillRevision },
+          preferenceDrafts: {
+            ...previous.preferenceDrafts,
+            [initialSessionKey]: {
+              skillKeys: [],
+              mcpConnections: [],
+              revision: clearedPreferenceRevision,
+            },
           },
           reasoningDrafts: previous.reasoningDrafts,
         };
@@ -1150,7 +1191,8 @@ function ChatV2View(props: ChatV2Props) {
         displayMessage: userMessage,
         content: contentBlocks,
         attachments: draftAttachments,
-        preferredSkillKeys: skillSnapshot.keys,
+        preferredSkillKeys: preferenceSnapshot.skillKeys,
+        preferredMcpConnections: preferenceSnapshot.mcpConnections,
         reasoning: reasoningSnapshot || undefined,
         onRejectedBeforeAccept: restoreSubmissionSnapshot,
       });
@@ -1390,8 +1432,10 @@ function ChatV2View(props: ChatV2Props) {
             uploading={uploadingCurrentDraft}
             onInputChangeRaw={handleInputChange}
             onFileSelected={handleSelectFile}
-            selectedSkillKeys={currentSkillDraft.keys}
+            selectedSkillKeys={currentPreferenceDraft.skillKeys}
             onSelectedSkillKeysChange={handleSelectedSkillKeysChange}
+            selectedMcpConnections={currentPreferenceDraft.mcpConnections}
+            onSelectedMcpConnectionsChange={handleSelectedMcpConnectionsChange}
             modelControl={(
               <ModelSelector
                 selectedModelId={selectedModelId}

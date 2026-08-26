@@ -21,8 +21,8 @@ from .logger import AgentLogger
 from .schema import FunctionCall, Message, ToolCall
 from .schema.run_context import (
     LLMRequestContext,
-    render_preferred_skills_context_block,
-    render_preferred_skills_system_policy,
+    render_turn_preferences_context_block,
+    render_turn_preferences_system_policy,
 )
 from .tools.base import Tool, ToolExposure, ToolResult, ToolRuntimeContext
 from .tools.ask_user_tool import ASK_USER_TOOL_NAME
@@ -716,19 +716,26 @@ class Agent:
         source_messages = self.messages if messages is None else messages
         request_messages = [msg.model_copy(deep=True) for msg in source_messages]
         runtime_context = self._build_runtime_context_block()
-        should_project_preferred_skills = (
+        should_project_preferences = (
             request_context is not None
             and request_context.purpose in {"agent_step", "tool_followup"}
             and bool(request_context.user_message_id)
-            and "get_skill" in (exposed_tool_names or set())
         )
-        preferred_skills_policy = render_preferred_skills_system_policy(
+        include_skills = should_project_preferences and "get_skill" in (
+            exposed_tool_names or set()
+        )
+        include_mcp = should_project_preferences and MCP_TOOL_SEARCH_NAME in (
+            exposed_tool_names or set()
+        )
+        preferences_policy = render_turn_preferences_system_policy(
             request_context.run_context
-            if should_project_preferred_skills and request_context is not None
-            else None
+            if should_project_preferences and request_context is not None
+            else None,
+            include_skills=include_skills,
+            include_mcp=include_mcp,
         )
-        if preferred_skills_policy:
-            runtime_context += f"{preferred_skills_policy}\n\n---\n\n"
+        if preferences_policy:
+            runtime_context += f"{preferences_policy}\n\n---\n\n"
         dynamic_prompt = self._build_dynamic_runtime_prompt()
         if dynamic_prompt:
             runtime_context += f"{dynamic_prompt}\n\n---\n\n"
@@ -761,29 +768,29 @@ class Agent:
         exposed_tool_names: set[str] | None,
     ) -> None:
         """Prepend user-authority context to the exact request-only turn copy."""
-        if (
-            request_context is None
-            or request_context.purpose not in {"agent_step", "tool_followup"}
-            or not request_context.user_message_id
-            or "get_skill" not in (exposed_tool_names or set())
-        ):
+        if request_context is None or request_context.purpose not in {
+            "agent_step",
+            "tool_followup",
+        } or not request_context.user_message_id:
             return
-        block = render_preferred_skills_context_block(request_context.run_context)
+        tool_names = exposed_tool_names or set()
+        block = render_turn_preferences_context_block(
+            request_context.run_context,
+            include_skills="get_skill" in tool_names,
+            include_mcp=MCP_TOOL_SEARCH_NAME in tool_names,
+        )
         if not block:
             return
         for message in messages:
             if message.role != "user" or message.id != request_context.user_message_id:
                 continue
+            context_part = {"type": "text", "text": block}
             if (
                 isinstance(message.content, list)
                 and message.content
-                and message.content[0].get("type") == "text"
-                and str(message.content[0].get("text") or "").startswith(
-                    '<runtime_context type="preferred_skills"'
-                )
+                and message.content[0] == context_part
             ):
                 return
-            context_part = {"type": "text", "text": block}
             if isinstance(message.content, str):
                 message.content = [context_part, {"type": "text", "text": message.content}]
             else:
@@ -2937,8 +2944,10 @@ class Agent:
                     *[message.model_copy(deep=True) for message in working],
                     Message(role="user", content=SUMMARIZATION_PROMPT, is_synthetic=True),
                 ],
-                request_context=request_context,
-                exposed_tool_names=exposed_tool_names,
+                # Compaction is a summary request, not an agent step. UI-selected
+                # run preferences must never be summarized into a durable checkpoint.
+                request_context=None,
+                exposed_tool_names=None,
             )
             try:
                 response = await self._await_compaction_generate(

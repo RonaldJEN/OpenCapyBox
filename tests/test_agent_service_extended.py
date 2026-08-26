@@ -2120,7 +2120,7 @@ class TestAgentServiceResumeAgui:
                 interrupt_id="approval-1",
                 answers={"approval": "allow_once"},
                 parent_run_id="round-original",
-                preferred_skills_origin_user_message_id="round-original:user",
+                turn_preferences_origin_user_message_id="round-original:user",
                 requested_context=None,
                 run_context=AgentRunContext(),
             )

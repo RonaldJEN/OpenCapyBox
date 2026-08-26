@@ -165,6 +165,7 @@ vi.mock('../../components/Round', () => ({
       data-steps={JSON.stringify(round.steps)}
       data-status={round.status}
       data-preferred-skills={JSON.stringify(round.preferred_skills || [])}
+      data-preferred-mcp={JSON.stringify(round.preferred_mcp_connections || [])}
     >
       <span>Round: {round.round_id}</span>
       <span>Streaming: {String(isStreaming)}</span>
@@ -188,6 +189,33 @@ vi.mock('../../components/ArtifactsPanel', () => ({
       </div>
     );
   },
+}));
+
+vi.mock('../../services/mcpApi', () => ({
+  getMcpServers: vi.fn(async () => [{
+    id: 'server-a',
+    name: '东方财富数据',
+    description: '查询金融市场实时数据',
+    source: 'official',
+    status: 'published',
+    enabled: true,
+    required: false,
+    auth_type: 'none',
+    credential_set: false,
+    header_names: [],
+    allow_private_network: false,
+    allow_insecure_http: false,
+    installation_id: 'installation-a',
+    tools_count: 2,
+    enabled_tools_count: 2,
+    enabled_tools: null,
+    disabled_tools: [],
+    last_tested_at: null,
+    last_error: null,
+    created_at: null,
+    updated_at: null,
+    version: 1,
+  }]),
 }));
 
 vi.mock('../../components/FilePreview', () => ({
@@ -323,20 +351,76 @@ describe('ChatV2 组件', () => {
 
     render(<ChatV2 sessionId="test-session" {...defaultProps} />);
 
-    fireEvent.click(await screen.findByRole('button', { name: '选择本轮 Skill' }));
+    fireEvent.click(await screen.findByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /专家 Skills/ }));
     fireEvent.click(await screen.findByText('PDF 处理'));
-    expect(screen.getByLabelText('已选择 Skill')).toHaveTextContent('PDF 处理');
+    expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('PDF 处理');
 
     const textarea = screen.getByPlaceholderText('输入指令...');
     fireEvent.change(textarea, { target: { value: '分析这份文档' } });
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
 
     await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1));
-    expect(screen.queryByLabelText('已选择 Skill')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('已选择本轮偏好')).not.toBeInTheDocument();
     const renderedRound = await screen.findByTestId('round');
     expect(JSON.parse(renderedRound.getAttribute('data-preferred-skills') || '[]')).toEqual([
       { key: 'pdf', display_name: 'pdf' },
     ]);
+  });
+
+  it('发送后清空数据连接草稿并冻结 optimistic server id 快照', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [],
+      session_id: 'test-session',
+      total: 0,
+    });
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /数据连接/ }));
+    fireEvent.click(await screen.findByText('东方财富数据'));
+    expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('东方财富数据');
+
+    const textarea = screen.getByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '查询最新行情' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+    await waitFor(() => expect(startSendStream).toHaveBeenCalled());
+    const startSendCalls = vi.mocked(startSendStream).mock.calls;
+    expect(startSendCalls[startSendCalls.length - 1]?.[0]).toEqual(
+      expect.objectContaining({ preferredMcpServerIds: ['server-a'] }),
+    );
+    expect(screen.queryByLabelText('已选择本轮偏好')).not.toBeInTheDocument();
+    const renderedRound = await screen.findByTestId('round');
+    expect(JSON.parse(renderedRound.getAttribute('data-preferred-mcp') || '[]')).toEqual([
+      { server_id: 'server-a', display_name: '东方财富数据' },
+    ]);
+  });
+
+  it('按 session 隔离并恢复 MCP 偏好草稿', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
+      rounds: [],
+      session_id: targetSessionId,
+      total: 0,
+    }));
+    const { rerender } = render(<ChatV2 sessionId="session-a" {...defaultProps} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /数据连接/ }));
+    fireEvent.click(await screen.findByText('东方财富数据'));
+    expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('东方财富数据');
+
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
+    await waitFor(() => {
+      expect(screen.queryByLabelText('已选择本轮偏好')).not.toBeInTheDocument();
+    });
+
+    rerender(<ChatV2 sessionId="session-a" {...defaultProps} />);
+    await waitFor(() => {
+      expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('东方财富数据');
+    });
   });
 
   it('没有 sessionId 时应该显示欢迎页（含输入框）', () => {
@@ -1429,7 +1513,7 @@ describe('ChatV2 组件', () => {
     });
   });
 
-  it('隐式创建会话后应协调迁移正文、附件和 Skill 草稿', async () => {
+  it('隐式创建会话后应协调迁移正文、附件和统一偏好草稿', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
       rounds: [],
       session_id: targetSessionId,
@@ -1447,8 +1531,13 @@ describe('ChatV2 组件', () => {
     const { container, rerender } = render(
       <ChatV2 sessionId="" {...defaultProps} onCreateSession={onCreateSession} />,
     );
-    fireEvent.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /专家 Skills/ }));
     fireEvent.click(await screen.findByText('PDF 处理'));
+    fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /数据连接/ }));
+    fireEvent.click(await screen.findByText('东方财富数据'));
     fireEvent.change(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...'), {
       target: { value: '组合草稿' },
     });
@@ -1465,7 +1554,8 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('组合草稿');
       expect(screen.getByText('combined.txt')).toBeInTheDocument();
-      expect(screen.getByLabelText('已选择 Skill')).toHaveTextContent('PDF 处理');
+      expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('PDF 处理');
+      expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('东方财富数据');
     });
   });
 
@@ -1529,7 +1619,7 @@ describe('ChatV2 组件', () => {
     });
   });
 
-  it('欢迎页创建会话后若在 stream accepted 前被拒绝，应在新会话恢复 Skill 草稿', async () => {
+  it('欢迎页创建会话后若在 stream accepted 前被拒绝，应恢复统一偏好草稿', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
       rounds: [],
       session_id: targetSessionId,
@@ -1550,9 +1640,15 @@ describe('ChatV2 组件', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /专家 Skills/ }));
     fireEvent.click(await screen.findByText('PDF 处理'));
-    expect(screen.getByLabelText('已选择 Skill')).toHaveTextContent('PDF 处理');
+    expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('PDF 处理');
+    fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /数据连接/ }));
+    fireEvent.click(await screen.findByText('东方财富数据'));
+    expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('东方财富数据');
 
     const textarea = screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...');
     fireEvent.change(textarea, { target: { value: '触发发送前拒绝' } });
@@ -1582,7 +1678,8 @@ describe('ChatV2 组件', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByLabelText('已选择 Skill')).toHaveTextContent('PDF 处理');
+      expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('PDF 处理');
+      expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('东方财富数据');
       expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('触发发送前拒绝');
     });
   });

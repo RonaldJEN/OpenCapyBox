@@ -191,7 +191,7 @@ class TestDatabaseConfig:
 class TestDatabaseMigration:
     """测试数据库迁移逻辑"""
 
-    def test_round_preferred_skills_uses_cross_dialect_add_column_migration(self):
+    def test_round_preference_snapshots_use_cross_dialect_add_column_migration(self):
         from sqlalchemy import create_engine, inspect, text
 
         from src.api.models import database as database_module
@@ -201,6 +201,7 @@ class TestDatabaseMigration:
             for table_name, column_name, column_type in database_module._PENDING_COLUMNS
         }
         assert ("rounds", "preferred_skills", "TEXT") in pending
+        assert ("rounds", "preferred_mcp_connections", "TEXT") in pending
 
         sqlite_engine = create_engine("sqlite://")
         try:
@@ -219,6 +220,7 @@ class TestDatabaseMigration:
                 for column in inspect(sqlite_engine).get_columns("rounds")
             }
             assert "preferred_skills" in columns
+            assert "preferred_mcp_connections" in columns
         finally:
             sqlite_engine.dispose()
 

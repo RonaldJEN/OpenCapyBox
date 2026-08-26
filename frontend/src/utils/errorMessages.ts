@@ -45,6 +45,7 @@ export function messageTooLongLimitText(maxLength = MAX_TEXT_BLOCK_CHARS): strin
 function fieldLabelFromLoc(loc: unknown): string {
   if (!Array.isArray(loc)) return '';
   if (loc.includes('preferred_skill_keys')) return '优先 Skill';
+  if (loc.includes('preferred_mcp_server_ids')) return '优先数据连接';
   if (loc.includes('text')) return '消息内容';
   if (loc.includes('content')) return '消息内容';
   if (loc.includes('idempotency_key')) return '请求标识';
@@ -55,18 +56,25 @@ function fieldLabelFromLoc(loc: unknown): string {
 function isMessageContentLoc(loc: unknown): boolean {
   return Array.isArray(loc)
     && !loc.includes('preferred_skill_keys')
+    && !loc.includes('preferred_mcp_server_ids')
     && (loc.includes('text') || loc.includes('content'));
 }
 
-function preferredSkillLimitMessage(record: ValidationErrorLike): string {
-  if (!Array.isArray(record.loc) || !record.loc.includes('preferred_skill_keys')) return '';
+function preferenceLimitMessage(record: ValidationErrorLike): string {
+  if (!Array.isArray(record.loc)) return '';
+  const label = record.loc.includes('preferred_skill_keys')
+    ? '优先 Skill'
+    : record.loc.includes('preferred_mcp_server_ids')
+      ? '优先数据连接'
+      : '';
+  if (!label) return '';
   const maxLength = Number(record.ctx?.max_length);
   if (!Number.isFinite(maxLength) || maxLength <= 0) return '';
   if (record.type === 'string_too_long') {
-    return `优先 Skill：每项最多 ${maxLength} 字符`;
+    return `${label}：每项最多 ${maxLength} 字符`;
   }
   if (record.type === 'too_long') {
-    return `优先 Skill：最多 ${maxLength} 项`;
+    return `${label}：最多 ${maxLength} 项`;
   }
   return '';
 }
@@ -93,8 +101,8 @@ export function validationDetailToMessage(detail: unknown): string {
       .map((item) => {
         if (!item || typeof item !== 'object') return String(item);
         const record = item as ValidationErrorLike;
-        const preferredSkillLimit = preferredSkillLimitMessage(record);
-        if (preferredSkillLimit) return preferredSkillLimit;
+        const preferenceLimit = preferenceLimitMessage(record);
+        if (preferenceLimit) return preferenceLimit;
         const label = fieldLabelFromLoc(record.loc);
         const msg = String(record.msg || '').trim();
         return label && msg ? `${label}: ${msg}` : msg;

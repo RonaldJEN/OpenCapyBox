@@ -64,6 +64,10 @@ describe('chatRuntimeReducer', () => {
         { key: 'pdf', display_name: 'pdf' },
         { key: 'removed', display_name: 'removed' },
       ],
+      preferred_mcp_connections: [
+        { server_id: 'server-a', display_name: 'server-a' },
+        { server_id: 'removed', display_name: 'removed' },
+      ],
     });
 
     state = stream(state, {
@@ -71,6 +75,9 @@ describe('chatRuntimeReducer', () => {
       threadId: 'sess-a',
       runId: 'server-r1',
       preferredSkills: [{ key: 'pdf', display_name: 'PDF 文档' }],
+      preferredMcpConnections: [
+        { server_id: 'server-a', display_name: '东方财富数据' },
+      ],
     });
 
     expect(state.sessions['sess-a'].rounds[0].round_id).toBe('server-r1');
@@ -80,6 +87,9 @@ describe('chatRuntimeReducer', () => {
     expect(state.tempRoundIdToServerRoundId['temp-r1']).toBe('server-r1');
     expect(state.sessions['sess-a'].rounds[0].preferred_skills).toEqual([
       { key: 'pdf', display_name: 'PDF 文档' },
+    ]);
+    expect(state.sessions['sess-a'].rounds[0].preferred_mcp_connections).toEqual([
+      { server_id: 'server-a', display_name: '东方财富数据' },
     ]);
   });
 
@@ -151,6 +161,21 @@ describe('chatRuntimeReducer', () => {
       open: true,
       dirty: false,
     });
+  });
+
+  it('clears optimistic MCP chips when RUN_STARTED resolves no valid connection', () => {
+    let state = startRun(initialChatRuntimeState, {
+      preferred_mcp_connections: [{ server_id: 'removed', display_name: 'removed' }],
+    });
+
+    state = stream(state, {
+      type: 'RUN_STARTED',
+      threadId: 'sess-a',
+      runId: 'server-r1',
+      preferredMcpConnections: [],
+    });
+
+    expect(state.sessions['sess-a'].rounds[0].preferred_mcp_connections).toEqual([]);
   });
 
   it('keeps tool argument buffers scoped by tool call id', () => {
@@ -375,6 +400,7 @@ describe('chatRuntimeReducer', () => {
   it('uses the server preferred Skill snapshot while merging a running history round', () => {
     let state = startRun(initialChatRuntimeState, {
       preferred_skills: [{ key: 'pdf', display_name: 'pdf' }],
+      preferred_mcp_connections: [{ server_id: 'server-a', display_name: 'server-a' }],
     });
 
     state = chatRuntimeReducer(state, {
@@ -386,6 +412,9 @@ describe('chatRuntimeReducer', () => {
           idempotency_key: 'idem-a',
           status: 'running',
           preferred_skills: [{ key: 'pdf', display_name: 'PDF 处理' }],
+          preferred_mcp_connections: [
+            { server_id: 'server-a', display_name: '东方财富数据' },
+          ],
         }),
       ],
       loadedAt: Date.parse('2026-01-01T00:00:03.000Z'),
@@ -395,11 +424,15 @@ describe('chatRuntimeReducer', () => {
     expect(state.sessions['sess-a'].rounds[0].preferred_skills).toEqual([
       { key: 'pdf', display_name: 'PDF 处理' },
     ]);
+    expect(state.sessions['sess-a'].rounds[0].preferred_mcp_connections).toEqual([
+      { server_id: 'server-a', display_name: '东方财富数据' },
+    ]);
   });
 
-  it('keeps the optimistic preferred Skill snapshot until history provides one', () => {
+  it('keeps optimistic preferences until history provides each field', () => {
     let state = startRun(initialChatRuntimeState, {
       preferred_skills: [{ key: 'pdf', display_name: 'pdf' }],
+      preferred_mcp_connections: [{ server_id: 'server-a', display_name: 'server-a' }],
     });
 
     state = chatRuntimeReducer(state, {
@@ -419,6 +452,30 @@ describe('chatRuntimeReducer', () => {
     expect(state.sessions['sess-a'].rounds[0].preferred_skills).toEqual([
       { key: 'pdf', display_name: 'pdf' },
     ]);
+    expect(state.sessions['sess-a'].rounds[0].preferred_mcp_connections).toEqual([
+      { server_id: 'server-a', display_name: 'server-a' },
+    ]);
+  });
+
+  it('treats an explicit empty MCP history snapshot as authoritative', () => {
+    let state = startRun(initialChatRuntimeState, {
+      preferred_mcp_connections: [{ server_id: 'server-a', display_name: 'server-a' }],
+    });
+
+    state = chatRuntimeReducer(state, {
+      type: 'HISTORY_LOADED',
+      sessionId: 'sess-a',
+      rounds: [round({
+        round_id: 'server-r1',
+        idempotency_key: 'idem-a',
+        status: 'running',
+        preferred_mcp_connections: [],
+      })],
+      loadedAt: Date.parse('2026-01-01T00:00:03.000Z'),
+      source: 'history',
+    });
+
+    expect(state.sessions['sess-a'].rounds[0].preferred_mcp_connections).toEqual([]);
   });
 
   it('keeps the running round lastSequence when a subscribe run is (re)started', () => {

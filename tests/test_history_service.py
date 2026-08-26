@@ -45,6 +45,13 @@ class TestHistoryServiceRound:
             preferred_skills=[
                 {"key": "pdf", "display_name": "PDF 文档", "ignored": "drop"},
             ],
+            preferred_mcp_connections=[
+                {
+                    "server_id": "server-a",
+                    "display_name": "东方财富数据",
+                    "ignored": "drop",
+                },
+            ],
         )
         
         mock_db.add.assert_called_once()
@@ -55,6 +62,9 @@ class TestHistoryServiceRound:
         assert added_round.user_message == "Hello"
         assert json.loads(added_round.preferred_skills) == [
             {"key": "pdf", "display_name": "PDF 文档"},
+        ]
+        assert json.loads(added_round.preferred_mcp_connections) == [
+            {"server_id": "server-a", "display_name": "东方财富数据"},
         ]
         assert added_round.status == "running"
         mock_db.refresh.assert_called_once_with(added_round)
@@ -83,6 +93,9 @@ class TestHistoryServiceRound:
             preferred_skills=json.dumps([
                 {"key": "pdf", "display_name": "Original PDF"},
             ]),
+            preferred_mcp_connections=json.dumps([
+                {"server_id": "server-a", "display_name": "Original data"},
+            ]),
             idempotency_key="idem-1",
         )
         mock_db.commit.side_effect = IntegrityError(
@@ -99,12 +112,18 @@ class TestHistoryServiceRound:
             preferred_skills=[
                 {"key": "xlsx", "display_name": "New XLSX"},
             ],
+            preferred_mcp_connections=[
+                {"server_id": "server-b", "display_name": "New data"},
+            ],
             idempotency_key="idem-1",
         )
 
         assert result is existing
         assert json.loads(result.preferred_skills) == [
             {"key": "pdf", "display_name": "Original PDF"},
+        ]
+        assert json.loads(result.preferred_mcp_connections) == [
+            {"server_id": "server-a", "display_name": "Original data"},
         ]
 
     def test_complete_round(self, history_service, mock_db):
@@ -202,6 +221,13 @@ class TestHistoryServiceGetSessionRounds:
                 "ignored": "not returned",
             },
         ])
+        mock_round.preferred_mcp_connections = json.dumps([
+            {
+                "server_id": "server-a",
+                "display_name": "东方财富数据",
+                "ignored": "not returned",
+            },
+        ])
         mock_round.parent_run_id = "round-parent"
         
         # 模拟 AG-UI 事件（用于重建 steps）
@@ -234,6 +260,9 @@ class TestHistoryServiceGetSessionRounds:
         assert rounds[0]["preferred_skills"] == [
             {"key": "pdf", "display_name": "PDF 文档"},
         ]
+        assert rounds[0]["preferred_mcp_connections"] == [
+            {"server_id": "server-a", "display_name": "东方财富数据"},
+        ]
         # steps 從事件重建
         assert "steps" in rounds[0]
 
@@ -243,10 +272,10 @@ class TestHistoryServiceGetSessionRounds:
         history_service._get_subagent_child_round_ids = MagicMock(return_value=set())
         history_service._rebuild_steps_from_events = MagicMock(return_value=([], 0))
         rows = []
-        for round_id, preferred_skills in (
-            ("old", None),
-            ("corrupt", "not-json"),
-            ("wrong-shape", '[{"key":"pdf"}]'),
+        for round_id, preferred_skills, preferred_mcp_connections in (
+            ("old", None, None),
+            ("corrupt", "not-json", "not-json"),
+            ("wrong-shape", '[{"key":"pdf"}]', '[{"server_id":"server-a"}]'),
         ):
             rows.append(MagicMock(
                 id=round_id,
@@ -258,6 +287,7 @@ class TestHistoryServiceGetSessionRounds:
                 completed_at=datetime.now(),
                 user_attachments=None,
                 preferred_skills=preferred_skills,
+                preferred_mcp_connections=preferred_mcp_connections,
                 parent_run_id=None,
                 idempotency_key=None,
             ))
@@ -266,6 +296,11 @@ class TestHistoryServiceGetSessionRounds:
         rounds = history_service.get_session_rounds("session-123")
 
         assert [round_data["preferred_skills"] for round_data in rounds] == [
+            [],
+            [],
+            [],
+        ]
+        assert [round_data["preferred_mcp_connections"] for round_data in rounds] == [
             [],
             [],
             [],

@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
+import { flushSync } from 'react-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const enabledSkillsResponse = {
@@ -42,6 +43,15 @@ function Harness() {
   );
 }
 
+async function openSkillPicker(user: ReturnType<typeof userEvent.setup>) {
+  void user;
+  flushSync(() => {
+    fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
+  });
+  fireEvent.click(screen.getByRole('menuitem', { name: /专家 Skills/ }));
+  await Promise.resolve();
+}
+
 describe('ChatInput preferred skills', () => {
   beforeEach(() => {
     vi.mocked(getSkills).mockReset();
@@ -54,7 +64,7 @@ describe('ChatInput preferred skills', () => {
 
     expect(screen.queryByText('PDF 处理')).not.toBeInTheDocument();
     await act(async () => {
-      await user.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+      await openSkillPicker(user);
     });
     await screen.findByText('PDF 处理');
     expect(screen.queryByText('已禁用')).not.toBeInTheDocument();
@@ -73,11 +83,11 @@ describe('ChatInput preferred skills', () => {
       await user.click(dataAnalysisButton!);
     });
     expect(dataAnalysisButton).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByLabelText('已选择 Skill')).toHaveTextContent('数据分析');
+    expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('数据分析');
     await act(async () => {
       await user.click(screen.getByRole('button', { name: '移除 Skill 数据分析' }));
     });
-    expect(screen.queryByLabelText('已选择 Skill')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('已选择本轮偏好')).not.toBeInTheDocument();
   });
 
   it('加载失败后保持错误态且不在打开期间自动重试', async () => {
@@ -86,7 +96,7 @@ describe('ChatInput preferred skills', () => {
     render(<Harness />);
 
     await act(async () => {
-      await user.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+      await openSkillPicker(user);
     });
 
     expect(await screen.findByText('Skill 列表加载失败')).toBeInTheDocument();
@@ -104,10 +114,10 @@ describe('ChatInput preferred skills', () => {
       .mockResolvedValueOnce(enabledSkillsResponse);
     const user = userEvent.setup();
     render(<Harness />);
-    const pickerButton = screen.getByRole('button', { name: '选择本轮 Skill' });
+    const pickerButton = screen.getByRole('button', { name: '添加内容' });
 
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
     expect(await screen.findByText('Skill 列表加载失败')).toBeInTheDocument();
     expect(getSkills).toHaveBeenCalledTimes(1);
@@ -116,7 +126,7 @@ describe('ChatInput preferred skills', () => {
       await user.click(pickerButton);
     });
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
 
     expect(await screen.findByText('PDF 处理')).toBeInTheDocument();
@@ -130,10 +140,10 @@ describe('ChatInput preferred skills', () => {
       .mockReturnValueOnce(refresh.promise);
     const user = userEvent.setup();
     render(<Harness />);
-    const pickerButton = screen.getByRole('button', { name: '选择本轮 Skill' });
+    const pickerButton = screen.getByRole('button', { name: '添加内容' });
 
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
     expect(await screen.findByText('PDF 处理')).toBeInTheDocument();
     act(() => {
@@ -147,7 +157,7 @@ describe('ChatInput preferred skills', () => {
       await user.click(pickerButton);
     });
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
 
     expect(screen.getByText('PDF 处理')).toBeInTheDocument();
@@ -169,17 +179,17 @@ describe('ChatInput preferred skills', () => {
     vi.mocked(getSkills).mockReturnValue(initial.promise);
     const user = userEvent.setup();
     render(<Harness />);
-    const pickerButton = screen.getByRole('button', { name: '选择本轮 Skill' });
+    const pickerButton = screen.getByRole('button', { name: '添加内容' });
 
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
     expect(screen.getByText('加载中')).toBeInTheDocument();
     await act(async () => {
       await user.click(pickerButton);
     });
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
 
     expect(getSkills).toHaveBeenCalledTimes(1);
@@ -196,17 +206,17 @@ describe('ChatInput preferred skills', () => {
       .mockRejectedValueOnce(new Error('refresh failed'));
     const user = userEvent.setup();
     render(<Harness />);
-    const pickerButton = screen.getByRole('button', { name: '选择本轮 Skill' });
+    const pickerButton = screen.getByRole('button', { name: '添加内容' });
 
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
     expect(await screen.findByText('PDF 处理')).toBeInTheDocument();
     await act(async () => {
       await user.click(pickerButton);
     });
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
 
     expect(await screen.findByText('Skill 列表刷新失败，已显示上次结果')).toBeInTheDocument();
@@ -223,7 +233,7 @@ describe('ChatInput preferred skills', () => {
     render(<Harness />);
 
     await act(async () => {
-      await user.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+      await openSkillPicker(user);
     });
 
     expect(await screen.findByText('PDF 处理')).toBeInTheDocument();
@@ -235,10 +245,10 @@ describe('ChatInput preferred skills', () => {
   it('支持 Escape 和点击面板外关闭选择器', async () => {
     const user = userEvent.setup();
     render(<Harness />);
-    const pickerButton = screen.getByRole('button', { name: '选择本轮 Skill' });
+    const pickerButton = screen.getByRole('button', { name: '添加内容' });
 
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
     await screen.findByText('PDF 处理');
     fireEvent.keyDown(document, { key: 'Escape' });
@@ -246,7 +256,7 @@ describe('ChatInput preferred skills', () => {
     expect(pickerButton).toHaveAttribute('aria-expanded', 'false');
 
     await act(async () => {
-      await user.click(pickerButton);
+      await openSkillPicker(user);
     });
     await screen.findByText('PDF 处理');
     fireEvent.mouseDown(document.body);
@@ -282,7 +292,7 @@ describe('ChatInput preferred skills', () => {
     );
 
     await act(async () => {
-      await user.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+      await openSkillPicker(user);
     });
     const skillOption = await screen.findByRole('button', { name: /ARXIV\s+WATCHER/i });
     expect(skillOption.querySelectorAll('span.block.truncate')).toHaveLength(1);
@@ -340,14 +350,14 @@ describe('ChatInput preferred skills', () => {
 
     const firstAccount = render(<Harness />);
     await act(async () => {
-      await user.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+      await openSkillPicker(user);
     });
     expect(await screen.findByText('账号 A 私有 Skill')).toBeInTheDocument();
     firstAccount.unmount();
 
     render(<Harness />);
     await act(async () => {
-      await user.click(screen.getByRole('button', { name: '选择本轮 Skill' }));
+      await openSkillPicker(user);
     });
     expect(await screen.findByText('账号 B 私有 Skill')).toBeInTheDocument();
     expect(screen.queryByText('账号 A 私有 Skill')).not.toBeInTheDocument();

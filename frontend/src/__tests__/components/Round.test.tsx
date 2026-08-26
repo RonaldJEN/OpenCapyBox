@@ -60,7 +60,7 @@ describe('Round 组件', () => {
     expect(screen.getByText('请帮我分析这个问题')).toBeInTheDocument();
   });
 
-  it('在原始用户消息下渲染本轮优先 Skill 快照', () => {
+  it('在用户正文上方渲染独立 Skill 资源胶囊', () => {
     const round = createMockRound({
       preferred_skills: [
         { key: 'pdf', display_name: 'PDF 处理' },
@@ -70,10 +70,26 @@ describe('Round 组件', () => {
 
     render(<Round round={round} isStreaming={false} />);
 
-    const preferredSkills = screen.getByLabelText('本轮优先 Skill');
-    expect(preferredSkills).toHaveTextContent('PDF 处理');
-    expect(preferredSkills).toHaveTextContent('数据分析');
+    const resources = screen.getByLabelText('本轮已选资源');
+    expect(resources).toHaveTextContent('PDF 处理');
+    expect(resources).toHaveTextContent('数据分析');
+    expect(screen.getByLabelText('Skill PDF 处理')).toBeInTheDocument();
     expect(screen.getByTitle('pdf')).toHaveTextContent('PDF 处理');
+  });
+
+  it('在原始用户消息下渲染优先数据连接冻结快照', () => {
+    const round = createMockRound({
+      preferred_mcp_connections: [
+        { server_id: 'server-a', display_name: '东方财富数据' },
+      ],
+    });
+
+    render(<Round round={round} isStreaming={false} />);
+
+    const resources = screen.getByLabelText('本轮已选资源');
+    expect(resources).toHaveTextContent('东方财富数据');
+    expect(screen.getByLabelText('数据连接 东方财富数据')).toBeInTheDocument();
+    expect(screen.getByTitle('server-a')).toHaveTextContent('东方财富数据');
   });
 
   it('普通用户发送审批格式文本时仍渲染用户消息气泡', () => {

@@ -1730,7 +1730,7 @@ def test_same_round_approval_retry_persists_only_normalized_decision(permission_
             interrupt_id="approval-canonical",
             answers={"approval": "bogus"},
             parent_run_id="round-approval-canonical",
-            preferred_skills_origin_user_message_id="round-approval-canonical:user",
+            turn_preferences_origin_user_message_id="round-approval-canonical:user",
             requested_context=None,
             run_context=AgentRunContext(),
         )
@@ -1743,7 +1743,7 @@ def test_same_round_approval_retry_persists_only_normalized_decision(permission_
             interrupt_id="approval-canonical",
             answers=answers,
             parent_run_id="round-approval-canonical",
-            preferred_skills_origin_user_message_id="round-approval-canonical:user",
+            turn_preferences_origin_user_message_id="round-approval-canonical:user",
             requested_context=None,
             run_context=AgentRunContext(),
         )

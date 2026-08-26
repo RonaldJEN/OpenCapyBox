@@ -24,6 +24,7 @@ _PUBLIC_LOCATION_FIELDS = {
     "content",
     "file",
     "idempotency_key",
+    "preferred_mcp_server_ids",
     "preferred_skill_keys",
     "text",
 }

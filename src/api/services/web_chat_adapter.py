@@ -13,10 +13,11 @@ from src.api.schemas.turn import (
 )
 from src.agent.schema.run_context import (
     RequestedReasoningContext,
-    RequestedPreferredSkillsContext,
+    RequestedTurnPreferencesContext,
+    normalize_preferred_mcp_server_ids,
     normalize_preferred_skill_keys,
-    requested_preferred_skills_to_context,
     requested_reasoning_to_context,
+    requested_turn_preferences_to_context,
 )
 
 
@@ -33,11 +34,19 @@ class WebChatAdapter:
         request: SendMessageRequest,
     ) -> NormalizedInboundTurn:
         preferred_keys = normalize_preferred_skill_keys(request.preferred_skill_keys)
+        preferred_mcp_server_ids = normalize_preferred_mcp_server_ids(
+            request.preferred_mcp_server_ids
+        )
         contexts = []
-        if preferred_keys:
-            contexts.append(requested_preferred_skills_to_context(
-                RequestedPreferredSkillsContext(keys=preferred_keys)
-            ))
+        if preferred_keys or preferred_mcp_server_ids:
+            contexts.append(
+                requested_turn_preferences_to_context(
+                    RequestedTurnPreferencesContext(
+                        skill_keys=preferred_keys,
+                        mcp_server_ids=preferred_mcp_server_ids,
+                    )
+                )
+            )
         if request.thinking_mode is not None or request.reasoning_effort is not None:
             contexts.append(requested_reasoning_to_context(
                 RequestedReasoningContext(

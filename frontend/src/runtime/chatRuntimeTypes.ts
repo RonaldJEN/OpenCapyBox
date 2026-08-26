@@ -4,6 +4,7 @@ import type {
   ChatContentBlock,
   FileInfo,
   InterruptDetails,
+  PreferredMcpConnectionSnapshot,
   RoundData,
   TurnReasoningSelection,
 } from '../types';
@@ -157,6 +158,7 @@ export interface SendMessageInput {
   content: ChatContentBlock[];
   attachments?: FileInfo[];
   preferredSkillKeys?: string[];
+  preferredMcpConnections?: PreferredMcpConnectionSnapshot[];
   reasoning?: TurnReasoningSelection;
   onStreamAccepted?: () => void;
   onRejectedBeforeAccept?: () => void;

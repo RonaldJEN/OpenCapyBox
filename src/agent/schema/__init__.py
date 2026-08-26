@@ -60,9 +60,10 @@ from .agui_events import (
 from .run_context import (
     AgentRunContext,
     LLMRequestContext,
-    RequestedPreferredSkillsContext,
-    ResolvedPreferredSkillsContext,
+    RequestedTurnPreferencesContext,
+    ResolvedMcpConnectionRef,
     ResolvedSkillRef,
+    ResolvedTurnPreferencesContext,
 )
 from .skill_key import (
     MAX_SKILL_KEY_LENGTH,
@@ -124,9 +125,10 @@ __all__ = [
     "RunFinishedOutcome",
     "AgentRunContext",
     "LLMRequestContext",
-    "RequestedPreferredSkillsContext",
-    "ResolvedPreferredSkillsContext",
+    "RequestedTurnPreferencesContext",
+    "ResolvedMcpConnectionRef",
     "ResolvedSkillRef",
+    "ResolvedTurnPreferencesContext",
     "MAX_SKILL_KEY_LENGTH",
     "PUBLIC_SKILL_KEY_VALIDATION_ERRORS",
     "SkillKeyValidationError",

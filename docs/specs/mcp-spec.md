@@ -144,6 +144,14 @@
 - 在线搜索不重新生成工具文档向量；只有完整索引可用时才为当前 query 生成一次 embedding 并执行 dense 检索。embedding 使用配置的共享服务，因此其数据边界与记忆语义检索相同
 - embedding 未配置、索引尚未完成、API/向量数据库失败或结果不合法时，稳定降级为纯关键词排序；向量写入不递增 MCP config version，避免 Agent 重建风暴
 
+#### 4.3.2 本轮优先数据连接
+- `preferred_mcp_server_ids` 只从当前 Agent 已装配的 `McpCatalogSnapshot.connections` 解析；不得从陈旧 DB installation、管理页列表或其他用户目录补入候选。该 summary 仅包含成功贡献至少一个当前可见工具的连接。
+- 选择是请求级软路由偏好，不过滤 MCP 目录、候选集合、工具权限或审批，也不改变 execution fingerprint。未选择时维持默认联网和现有自动 `mcp_tool_search` 行为。
+- Web Adapter 把 MCP server ids 与 Skill keys 合并为唯一 `bsbox.turn_preferences.v1`；provider 请求只收到一个紧凑 `<ui_context>`。请求相关且暴露 `mcp_tool_search` 时，Agent 首次检索应把首选连接展示名带入 query；首选连接无合适工具时允许回退其他启用连接。
+- direct Round 固化 `preferred_mcp_connections=[{server_id, display_name}]`，`RUN_STARTED.preferredMcpConnections` 与 `history/v2` 投影同一快照。该快照不是远程调用审计；只有真实 MCP 工具调用成功后才可声称连接已使用，成功 discovery 不算使用。
+- Interaction 持久化原 requested context；resume 按当时 catalog 重新解析运行偏好。waiting 期间停用、删除或发现失败的连接不再参与 continuation，但不得改写原 Round 展示快照。
+- 无效/不可用 server id 被忽略而不使发送失败；首选连接没有检索结果时继续执行普通跨连接检索。客户端不得提交 installation id、凭证或展示名。
+
 ### 4.4 快照与执行绑定
 - 每次成功发现刷新 `mcp_tool_snapshots`（`schema_hash` + `connection_fingerprint`）
 - `connection_fingerprint` 为 NULL 的遗留快照不可用于执行回退

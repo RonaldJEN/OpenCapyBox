@@ -117,6 +117,7 @@ interface StartSendArgs extends StreamIdentity, StreamHandlers {
   content: ChatContentBlock[];
   idempotencyKey?: string;
   preferredSkillKeys?: string[];
+  preferredMcpServerIds?: string[];
   reasoning?: TurnReasoningSelection;
   onRejectedBeforeAccept?: () => void;
   onControlConflict?: (message: string, code: string, serverRunId?: string) => void;
@@ -725,6 +726,9 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
           idempotency_key: args.idempotencyKey,
           ...(args.preferredSkillKeys?.length
             ? { preferred_skill_keys: args.preferredSkillKeys }
+            : {}),
+          ...(args.preferredMcpServerIds?.length
+            ? { preferred_mcp_server_ids: args.preferredMcpServerIds }
             : {}),
           ...(args.reasoning
             ? {

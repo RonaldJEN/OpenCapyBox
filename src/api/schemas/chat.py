@@ -7,6 +7,7 @@ from src.agent.schema.skill_key import (
     MAX_SKILL_KEY_LENGTH,
     normalize_optional_skill_key,
 )
+from src.agent.schema.run_context import normalize_optional_mcp_server_id
 
 
 class TextContentBlock(BaseModel):
@@ -70,6 +71,12 @@ SkillKey = Annotated[
     AfterValidator(normalize_optional_skill_key),
 ]
 
+McpServerId = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=36),
+    AfterValidator(normalize_optional_mcp_server_id),
+]
+
 
 class ChatRequest(BaseModel):
     """对话请求"""
@@ -86,6 +93,11 @@ class SendMessageRequest(BaseModel):
         default_factory=list,
         max_length=50,
         description="本轮优先考虑的 Skill 内部 key",
+    )
+    preferred_mcp_server_ids: List[McpServerId] = Field(
+        default_factory=list,
+        max_length=20,
+        description="本轮优先考虑的 MCP 数据连接 server id",
     )
     thinking_mode: Optional[Literal["provider_default", "enabled", "disabled"]] = Field(
         default=None,
@@ -145,6 +157,13 @@ class RoundPreferredSkill(BaseModel):
     display_name: str
 
 
+class RoundPreferredMcpConnection(BaseModel):
+    """本轮实际生效的 Preferred MCP 数据连接展示快照。"""
+
+    server_id: str
+    display_name: str
+
+
 class StepData(BaseModel):
     """执行步骤数据"""
     step_number: int
@@ -170,6 +189,9 @@ class RoundData(BaseModel):
     user_message: str
     user_attachments: List[Dict[str, Any]] = Field(default_factory=list)
     preferred_skills: List[RoundPreferredSkill] = Field(default_factory=list)
+    preferred_mcp_connections: List[RoundPreferredMcpConnection] = Field(
+        default_factory=list
+    )
     thinking_mode: Optional[Literal["provider_default", "enabled", "disabled"]] = None
     reasoning_effort: Optional[str] = None
     final_response: Optional[str] = None

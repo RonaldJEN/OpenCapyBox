@@ -18,6 +18,13 @@ from src.agent.context_compaction import (
     truncate_tool_output,
 )
 from src.agent.schema import FunctionCall, LLMResponse, Message, TokenUsage, ToolCall
+from src.agent.schema.run_context import (
+    AgentRunContext,
+    LLMRequestContext,
+    ResolvedMcpConnectionRef,
+    ResolvedSkillRef,
+    ResolvedTurnPreferencesContext,
+)
 from src.api.services.context_checkpoint_service import canonical_messages_json
 
 
@@ -285,6 +292,45 @@ async def test_compaction_context_overflow_drops_exactly_one_oldest_item_per_ret
     assert len(llm.requests) == 3
     assert [len(request) for request in llm.requests] == [5, 4, 3]
     assert all(request[-1].content == SUMMARIZATION_PROMPT for request in llm.requests)
+
+
+@pytest.mark.asyncio
+async def test_compaction_never_persists_ui_selected_turn_preferences():
+    llm = RecordingLLM()
+    agent = make_agent(llm)
+    source = [
+        Message(role="system", content="system"),
+        Message(role="user", id="run-1:user", run_id="run-1", content="analyze"),
+    ]
+    request_context = LLMRequestContext(
+        purpose="agent_step",
+        user_message_id="run-1:user",
+        run_context=AgentRunContext(
+            preferences=ResolvedTurnPreferencesContext(
+                skills=(ResolvedSkillRef(
+                    key="pdf",
+                    load_name="pdf",
+                    display_name="PDF",
+                ),),
+                mcp_connections=(ResolvedMcpConnectionRef(
+                    server_id="server-a",
+                    display_name="东方财富数据",
+                ),),
+            ),
+        ),
+    )
+
+    await agent._codex_compact_history(
+        source_messages=source,
+        phase="mid_turn",
+        request_context=request_context,
+        exposed_tool_names={"get_skill", "mcp_tool_search"},
+    )
+
+    compact_request = "\n".join(str(message.content) for message in llm.requests[0])
+    assert "<ui_context" not in compact_request
+    assert "trusted UI metadata" not in compact_request
+    assert "东方财富数据" not in compact_request
 
 
 @pytest.mark.asyncio

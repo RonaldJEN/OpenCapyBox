@@ -530,6 +530,8 @@ function mergeActiveRound(
     user_message: localRound.user_message || serverRound.user_message,
     user_attachments: localRound.user_attachments || serverRound.user_attachments,
     preferred_skills: serverRound.preferred_skills ?? localRound.preferred_skills,
+    preferred_mcp_connections: serverRound.preferred_mcp_connections
+      ?? localRound.preferred_mcp_connections,
     final_response: useServerProjection
       ? serverRound.final_response
       : (localRound.final_response || serverRound.final_response),
@@ -871,6 +873,7 @@ function applyRunStarted(
     ownershipTransfer.previousRun,
     serverRunId,
     envelope.event.preferredSkills,
+    envelope.event.preferredMcpConnections,
   );
   const nextState = putSession(state, run.ownerSessionId, {
     ...session,
@@ -1017,6 +1020,7 @@ function reconcileRunStartedRounds(
   previousRun: ChatRunRuntimeState | undefined,
   serverRunId: string,
   preferredSkills: unknown,
+  preferredMcpConnections: unknown,
 ): RoundData[] {
   const matchingRoundIds = new Set([
     serverRunId,
@@ -1046,6 +1050,9 @@ function reconcileRunStartedRounds(
     preferred_skills: Array.isArray(preferredSkills)
       ? preferredSkills
       : mergedRound.preferred_skills,
+    preferred_mcp_connections: Array.isArray(preferredMcpConnections)
+      ? preferredMcpConnections
+      : mergedRound.preferred_mcp_connections,
   };
   const targetIndex = matchingIndexes[0];
   const matchedIndexSet = new Set(matchingIndexes);

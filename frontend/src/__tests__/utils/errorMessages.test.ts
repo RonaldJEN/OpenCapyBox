@@ -42,6 +42,28 @@ describe('send validation error formatting', () => {
     expect(message).not.toContain('消息太长');
   });
 
+  it('attributes MCP connection item and list limits to the data connection field', () => {
+    const itemMessage = formatHttpErrorMessage(422, JSON.stringify({
+      detail: [{
+        type: 'string_too_long',
+        loc: ['body', 'preferred_mcp_server_ids', 0],
+        msg: 'Request validation failed',
+        ctx: { max_length: 36 },
+      }],
+    }));
+    const listMessage = formatHttpErrorMessage(422, JSON.stringify({
+      detail: [{
+        type: 'too_long',
+        loc: ['body', 'preferred_mcp_server_ids'],
+        msg: 'Request validation failed',
+        ctx: { max_length: 20 },
+      }],
+    }));
+
+    expect(itemMessage).toBe('优先数据连接：每项最多 36 字符');
+    expect(listMessage).toBe('优先数据连接：最多 20 项');
+  });
+
   it('keeps the dedicated wording for an overlong message text block', () => {
     const message = formatHttpErrorMessage(422, JSON.stringify({
       detail: [{

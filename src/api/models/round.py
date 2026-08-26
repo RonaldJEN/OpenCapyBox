@@ -75,6 +75,10 @@ class Round(Base):
     # JSON 数组项固定为 {"key": str, "display_name": str}；旧数据为 NULL。
     preferred_skills = Column(Text, nullable=True)
 
+    # 本轮已解析且实际可用的 Preferred MCP 数据连接展示快照。
+    # JSON 数组项固定为 {"server_id": str, "display_name": str}。
+    preferred_mcp_connections = Column(Text, nullable=True)
+
     # 本轮实际请求的思考模式与推理强度快照；旧数据为 NULL（模型默认）。
     thinking_mode = Column(String(24), nullable=True)
     reasoning_effort = Column(String(40), nullable=True)

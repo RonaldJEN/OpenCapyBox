@@ -251,6 +251,12 @@ Authorization: Bearer <access_token>
           "display_name": "PDF 处理"
         }
       ],
+      "preferred_mcp_connections": [
+        {
+          "server_id": "server-uuid",
+          "display_name": "东方财富数据"
+        }
+      ],
       "final_response": "已经为你创建了 hello.py 文件",
       "steps": [
         {
@@ -284,9 +290,9 @@ Authorization: Bearer <access_token>
 }
 ```
 
-`preferred_skills` 始终为 `[{key, display_name}]` 数组。普通 direct Round 返回本次发送开始时根据可见且已启用 Skill 清单解析并持久化的有效“优先 Skill”展示快照；空选择、全部 key 无效或没有该数据时返回 `[]`。`display_name` 是发送当时的不可变展示名，历史读取不会因 Skill 后续改名、禁用或删除而重算。
+`preferred_skills` 与 `preferred_mcp_connections` 始终为数组。普通 direct Round 返回发送时解析并持久化的 Skill / MCP 展示快照；任一空选择、全部无效或损坏时独立返回 `[]`。`display_name` 是发送当时的不可变展示名，历史读取不会因后续改名、禁用或删除而重算。
 
-该字段仅说明这次请求要求 Agent 优先考虑这些 Skill，不代表 Skill 已被加载、调用或实际参与结果。same-Round continuation 继续使用原 Round 的冻结快照，不新增额外 Q/A 或审批消息。之后每个独立 direct Round 仍只返回自己当次选择的快照。
+这些字段只说明本轮软偏好，不代表 Skill 已加载或 MCP 已真实调用。same-Round continuation 继续使用原 Round 的冻结快照，不新增额外 Q/A 或审批消息。
 
 `status=waiting_interaction` 表示该 Round 暂停等待 `ask_user` 回答或工具审批，不是终态。此时 `interrupt` 由 pending `agent_interactions` 投影，形如 `{id, reason, payload}`；刷新后客户端应显示卡片，并用该 Round 的 `round_id` 与 `last_event_sequence` 继续订阅。
 
@@ -610,6 +616,7 @@ Content-Type: application/json
 {
   "idempotency_key": "550e8400-e29b-41d4-a716-446655440000",
   "preferred_skill_keys": ["pdf", "data_analysis"],
+  "preferred_mcp_server_ids": ["server-uuid"],
   "content": [
     {
       "type": "text",
@@ -650,12 +657,13 @@ Content-Type: application/json
 | content          | array    | 是   | 内容块数组（见上方类型说明） |
 | idempotency_key  | string   | 否   | 幂等键（UUID），防止同一请求被重复处理。前端自动生成 |
 | preferred_skill_keys | string[] | 否 | 本次逻辑执行链优先考虑的 Skill 稳定内部 `key`；最多 50 项，每项最多 128 个字符 |
+| preferred_mcp_server_ids | string[] | 否 | 本次逻辑执行链优先考虑的 MCP server id；最多 20 项，每项最多 36 个字符 |
 
-`preferred_skill_keys` 表达偏好而非强制调用。服务端按首次出现顺序去重，并在每次运行（包括 same-Round continuation）按当时可见且已启用的 Skill 清单重新解析；未知、已删除或已禁用的 key 会被忽略。该偏好不会从同一会话的前序独立消息继承。
+两个字段都表达软偏好而非强制调用或权限白名单。服务端按首次出现顺序去重；Skill 按当前启用清单解析，MCP 只从当前 Agent 实际 catalog connections 解析。未知、已删除、已禁用或没有可见工具的项被忽略，偏好不会从前序独立消息继承。未选择 MCP 时仍默认联网并自动路由。
 
-该字段来自 UI 控件元数据，不属于用户消息正文。Agent 不得仅因收到这些 key 就声称用户在正文中提到、点名或要求加载了对应 Skill；与正文无关时也不应主动复述选择。
+这些字段合并为内部 `bsbox.turn_preferences.v1`，来自 UI 控件而非用户正文；附件仍是 `content` block，不进入偏好上下文。Agent 不得主动复述选择，且只有 Skill 加载或真实远程 MCP 工具调用成功后才能声称已使用。
 
-普通 direct Round 会把首次运行时解析出的有效项以 `preferred_skills: [{key, display_name}]` 固化到 Round，并由 `history/v2` 返回。same-Round resume 不改写这份快照。之后的独立 direct Round 不继承或累积它。
+普通 direct Round 会分别固化 `preferred_skills` 与 `preferred_mcp_connections`，并由 `RUN_STARTED` 和 `history/v2` 返回。same-Round resume 按当前 registry/catalog 重解析运行偏好，但不改写原展示快照。
 
 有效 key 经 trim 后必须非空且不超过 128 个 Unicode 字符；兼容人类可读 Unicode、空格和括号，禁止 `/`、`\`、`?`、`#`、`%` 及 Unicode `C*` 控制/不可见类别字符。请求数组中的空白项会被忽略，其他非法 key 返回校验错误。
 
@@ -975,7 +983,7 @@ Content-Type: application/json
 
 工具审批复用同一 wire，`answers` 必须为 `{"approval":"allow_once|allow_session|allow_always|deny"}`。审批值按 trim/lower 规范化；同一 canonical resolution 的重试幂等，不同 resolution 返回控制面冲突。顶层 `resolution` 不是公开请求字段。
 
-`resume` 不接收 `preferred_skill_keys`，也不允许覆盖服务端保存的原始用户消息锚点。服务端从 Interaction request 继承原请求的 Skill key 与锚点；连续多次暂停/恢复仍锚定最初 user message，并按本次 resume 时的有效 Skill 清单重新解析。
+`resume` 不接收 `preferred_skill_keys` 或 `preferred_mcp_server_ids`，也不允许覆盖服务端保存的原始用户消息锚点。服务端从 Interaction request 继承统一 turn preferences；连续多次暂停/恢复仍锚定最初 user message，并按本次 resume 时的 Skill registry 与 MCP catalog 重新解析。
 
 **响应** `200 OK`
 
@@ -1048,11 +1056,14 @@ Agent 运行开始。
   "preferredSkills": [
     {"key": "pdf", "display_name": "PDF 处理"}
   ],
+  "preferredMcpConnections": [
+    {"server_id": "server-uuid", "display_name": "东方财富数据"}
+  ],
   "timestamp": 1699000000000
 }
 ```
 
-普通 direct Round 的 `preferredSkills` 是与该 Round 持久化数据相同的权威展示快照；没有有效选择时也显式返回 `[]`。same-Round resume 不发新的 `RUN_STARTED`，原快照不变。该字段表示请求级偏好，不代表 Skill 已实际加载或调用。
+普通 direct Round 的 `preferredSkills` / `preferredMcpConnections` 是与该 Round 持久化数据相同的两份权威展示快照；任一没有有效选择时也显式返回 `[]`。same-Round resume 不发新的 `RUN_STARTED`，原快照不变。字段只表示请求级偏好，不代表 Skill 已加载或 MCP 已真实调用。
 
 #### RUN_FINISHED
 

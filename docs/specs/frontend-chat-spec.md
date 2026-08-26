@@ -9,7 +9,7 @@
 - 发送用户消息（含附件、引用图片）
 - 消费后端 SSE（AG-UI 事件）增量构建 `RoundData[]`
 - 渲染消息流（user → reasoning → assistant）
-- 选择并发送仅作用于当前逻辑执行链的优先 Skill
+- 选择并发送仅作用于当前逻辑执行链的 Skill/MCP 统一偏好
 - 将助手回复中的会话文件引用抽取为回复底部的可点击文件卡片，同时保留 markdown 正文原样显示
 - 处理暂停/恢复：断连重连、same-Round ask_user/工具审批、用户主动取消
 - 滚动控制：普通进入定位最新消息、搜索命中定位 round、流式底部跟随
@@ -28,6 +28,7 @@ RoundData {
   user_message: string
   user_attachments?: AttachmentInfo[]
   preferred_skills: PreferredSkillSnapshot[]
+  preferred_mcp_connections: PreferredMcpConnectionSnapshot[]
   final_response: string | null
   steps: StepData[]
   step_count: number
@@ -39,6 +40,11 @@ RoundData {
 
 PreferredSkillSnapshot {
   key: string
+  display_name: string
+}
+
+PreferredMcpConnectionSnapshot {
+  server_id: string
   display_name: string
 }
 
@@ -62,9 +68,10 @@ AgentState {
   // ...其余字段通过 JSON Patch 增量更新
 }
 
-SkillDraft {
-  keys: string[]   // GET /api/config/skills 返回的稳定内部 key
-  revision: number // 乐观清空与失败恢复的并发保护版本
+TurnPreferenceDraft {
+  skillKeys: string[]     // GET /api/config/skills 返回的稳定内部 key
+  mcpConnections: PreferredMcpConnectionSnapshot[] // client-only id + 冻结展示名
+  revision: number        // 乐观清空与失败恢复的并发保护版本
 }
 ```
 
@@ -223,42 +230,44 @@ pre_accept_pending
 
 ### 3.8 Resume 后的 Round 关系
 
-`ask_user` / 工具审批恢复始终复用原 Round：`waiting_interaction → running`，`round_id`、用户消息、Skill 展示快照和推理快照均不变，回答不生成新的聊天气泡或临时 child Round。
+`ask_user` / 工具审批恢复始终复用原 Round：`waiting_interaction → running`，`round_id`、用户消息、Skill/MCP 展示快照和推理快照均不变，回答不生成新的聊天气泡或临时 child Round。
 
-### 3.9 本轮 Skill 偏好
+### 3.9 本轮 Skill / 数据连接偏好
 
 #### 选择器交互
 
-- `ChatInput` 仅在用户显式打开 Skill 选择器时加载普通 `GET /api/config/skills`，每次重新打开都从服务端 DB 快照刷新清单，列表只展示 `enabled === true` 的项目；不得在页面初始化时预取或使用 `refresh=true` 触发远程恢复。已有成功清单时采用 stale-while-refresh：立即展示旧清单并以轻量状态提示请求，不得重新用整面 loading 遮住列表。
+- 输入框底部使用唯一 `+` 根菜单，固定包含“上传文件”“专家 Skills”“数据连接”；模型/推理等级仍常驻底栏。三个入口互斥，桌面端向上展开，移动端使用底部浮层；`Escape` 关闭并把焦点还给 `+`，点击外部关闭。
+- `ChatInput` 仅在用户显式进入 Skill 子菜单时加载普通 `GET /api/config/skills`，每次重新打开都从服务端 DB 快照刷新清单，列表只展示 `enabled === true` 的项目；不得在页面初始化时预取或使用 `refresh=true` 触发远程恢复。已有成功清单时采用 stale-while-refresh：立即展示旧清单并以轻量状态提示请求，不得重新用整面 loading 遮住列表。
+- 数据连接子菜单延迟调用 `GET /api/mcp/servers`，只展示 `enabled && installation_id !== null && enabled_tools_count > 0` 的连接；提交稳定 `server.id`，展示 `name`、说明及官方/个人来源。搜索匹配 id/name/description，最多选择 20 项。
 - 当前实现不跨组件实例缓存清单。组件实例内关闭后尚未完成的同一请求可在重开时复用，避免重复远程恢复沙箱；请求完成后的下一次重开仍须发起新刷新。若以后增加更长生命周期缓存，缓存与进行中的请求必须按认证用户隔离，并在登录用户、token 身份或 Skill 启停状态变化时立即失效，禁止跨账号复用私有 Skill 名称、描述或启停状态。
 - “尚未加载”“首次加载中”“已成功加载空列表”“后台刷新中”“首次加载失败”“后台刷新失败”必须是可区分状态。成功空列表或一次失败都不得因弹窗仍打开而触发自动请求循环；首次失败只能由用户显式重试，后台刷新失败须保留旧清单并提供重试入口；服务端返回 `inventory_state=stale` 时也必须保留清单并明确说明正在显示上次成功结果。
 - 列表用 `display_name` 展示名称（缺失时回退 `name`），用 `key` 作为选择、去重和请求标识；不得把展示名称提交给后端。
 - 搜索同时匹配 `display_name`、`name`、`key` 和 `description`，忽略大小写与首尾空白；每次重新打开选择器时清空上次搜索词。
 - 选择项以可移除标签显示，最多选择 50 项；已达到上限时不得继续新增，但仍允许取消现有选择。每个可切换行必须通过 `aria-pressed` 暴露当前选中态。
-- 桌面端选择器锚定在输入框上方，通过点击外部或按 `Escape` 关闭；移动端使用底部浮层并额外提供关闭按钮。关闭不清空已选择的 Skill。
-- 文案必须明确“优先考虑，不强制调用”；是否加载 Skill 仍由 Agent 根据当前请求相关性决定。
+- 选择器关闭不清空已选项。上传 pending 只禁用“上传文件”行，不阻止用户编辑 Skill/MCP 偏好；整个 composer 禁用时才禁用 `+`。
+- 文案必须明确软偏好：Skill“相关时优先考虑，不强制调用”；MCP“相关时优先检索，无匹配会自动回退”。默认始终联网，不提供联网开关。
 
 #### 已发送消息展示
 
-- `Round` 在普通 direct Round 的用户消息旁展示只读“优先 Skill”标签，数据源为该 Round 的 `preferred_skills`。标签显示持久化的 `display_name`，需要辅助提示时可同时暴露稳定 `key`；不得重新查询当前 Skill 清单来替换历史展示名。
-- 标签表达“这次发送要求 Agent 优先考虑”，不表示该 Skill 已加载、被调用或实际参与生成结果。UI 不得使用“已使用”“已调用”等成功态文案或图标。
-- `preferred_skills=[]` 时不渲染标签容器。same-Round resume 不新增消息或标签，继续展示原 direct Round 的冻结快照。
+- `Round` 在用户名下方、用户正文上方展示独立资源胶囊，不再渲染“本轮优先 Skill/优先数据连接”说明行。Skill 使用暖色 Skill 图标，MCP 使用绿色数据库图标；两类可在同一行换行排列。
+- 胶囊名称只读：Skill 来自 `preferred_skills[].display_name`，MCP 来自 `preferred_mcp_connections[].display_name`；title 可分别暴露稳定 `key` / `server_id`，不得查询当前目录改写历史名称。
+- 胶囊只表达本轮 UI 选择，不表示 Skill 已加载或 MCP 已调用；不得使用“已使用”“已调用”等成功态文案。任一快照为 `[]` 时不渲染对应胶囊，same-Round resume 不新增重复资源行。
 - 每个独立 direct Round 只展示自己当次发送的快照，不继承或合并前一 Round 的标签。后续 Skill 被禁用、改名或删除也不得改写已有历史标签。
-- 新消息尚未拿到服务端 Round 数据时，可用本次 composer 快照做 optimistic 展示；收到 `RUN_STARTED.preferredSkills`（显式空数组也算权威结果）后立即替换，刷新/断线恢复再以 `history/v2` 的持久化快照为准，确保无效 key 被清除且实时视图与历史一致。
+- 新消息尚未拿到服务端 Round 数据时，可用本次 composer 快照做 optimistic 展示；收到 `RUN_STARTED.preferredSkills` / `preferredMcpConnections`（显式空数组也算权威结果）后分别替换，刷新/断线恢复再以 `history/v2` 的完整 Round 快照为准。
 
 #### 会话草稿与发送
 
-- Skill 选择是输入草稿的一部分，按 session key 隔离保存；切换会话不得把 A 会话选择带到 B 会话。尚未创建 session 时使用独立的新会话草稿，创建成功后须迁移到实际 session，后续恢复也以实际目标 session 为准。
+- Skill 与 MCP 选择合并为 `TurnPreferenceDraft {skillKeys, mcpConnections, revision}`，按 session key 隔离保存。MCP 客户端快照冻结 `{server_id, display_name}` 供 optimistic 首帧直接显示中文；HTTP 仍只从中映射 `server_id[]`，服务端 `RUN_STARTED/history` 继续权威覆盖。
 - 正文与附件使用独立的 `MessageDraft` 按相同 session key 隔离；草稿包含稳定 `draftId` 与递增 `revision`。正文编辑、附件增删递增 revision，session key 迁移不得改变 draftId。
 - 新会话仍以 `__new_session__` 作为客户端映射 key，但附件上传必须先取得真实 server session ID。上传等异步回调绑定发起时的 `draftId + serverSessionId`，不得根据回调执行时的当前活跃会话决定写入位置。
-- 从 `__new_session__` 迁移到真实 session 时，MessageDraft 与 SkillDraft 必须在同一转换路径协调迁移；目标已有较新草稿或 draftId 已变化时，迟到响应不得覆盖或重新创建旧草稿。
-- 发送时对当前草稿创建不可变快照，并将其作为 `preferred_skill_keys` 与正文、附件一并提交；空数组可省略。之后用户对选择器的编辑不得改变已经发出的请求。
-- 提交发送时乐观清空该目标 session 的 Skill 草稿。服务端确认 SSE 已接受（`stream_accepted` 或 `RUN_STARTED`）后保持清空；执行已被接受后的流式失败、中断或取消不得恢复旧选择。
-- composer 清空只影响下一条待发送草稿，不得删除或隐藏已经固化在当前 direct Round 用户消息旁的 `preferred_skills` 标签。
+- 从 `__new_session__` 迁移到真实 session 时，MessageDraft 与 TurnPreferenceDraft 必须在同一转换路径协调迁移；目标已有较新草稿或 draftId 已变化时，迟到响应不得覆盖或重新创建旧草稿。
+- 发送时冻结正文、附件与 TurnPreferenceDraft，并分别提交 `preferred_skill_keys`、`preferred_mcp_server_ids`；空数组省略。之后编辑不得改变在途请求。
+- 提交发送时乐观清空目标 session 的两类偏好。服务端确认 SSE 已接受后保持清空；执行已接受后的流式失败、中断或取消不得恢复旧选择。
+- composer 清空只影响下一条发送，不得删除或隐藏当前 direct Round 已固化的资源胶囊。
 - 若 POST 在收到响应头前发生网络错误，前端须按 §3.3.1 用同一 `idempotency_key` 查询历史：匹配到 running/waiting/终态 Round 即视为已接受，补发一次 `stream_accepted`，随后立即订阅或收敛终态；从历史恢复的失败终态也必须携带真实 `threadId`、`runId` 和末事件序号。只有 3 次 history 均成功且均无匹配时才恢复发送快照并报请求失败；任一次 history 失败则保持歧义、草稿保持清空并提示刷新。确定性的 HTTP 4xx/5xx 仍立即恢复；恢复回调最多执行一次。
-- 从 history 直接收敛已完成/失败终态时，必须先合成一个无 sequence 的 `RUN_STARTED`，携带该 Round 的 `preferred_skills`（没有数据时按 `[]`），再派发 terminal；已知 run 的订阅终态兜底同样如此。Reducer 必须允许这个补偿事件按 server run id 命中已绑定 Round，以纠正 optimistic 展示名并清除无效 key。
-- 失败恢复必须带 revision 保护：若乐观清空后用户没有新编辑，精确恢复快照；若用户已新增或移除选择，则保留当前编辑，并把快照中缺失的 key 按原顺序无重复合并，不能用旧快照覆盖新编辑。
-- `ask_user` 或工具审批 continuation 由后端按原请求锚点重新解析 Skill；前端 `resume` 不重复发送 `preferred_skill_keys`，也不改写原 Round 的展示快照。用户之后独立发送的新消息只使用当时的新草稿。
+- 从 history 直接收敛终态时，先投影完整 `RUNTIME_HISTORY_SNAPSHOT`（同时含两份权威快照），再处理 terminal；不得合成伪 `RUN_STARTED`。live direct 的真实 `RUN_STARTED` 仍负责即时纠正 optimistic 标签。
+- 失败恢复必须带 revision 保护：未发生新编辑时精确恢复；已有新编辑时分别对 Skill key 与 MCP server id 保序、去重、按各自上限合并，不能用旧快照覆盖新编辑。
+- `ask_user` 或工具审批 continuation 由后端按原请求锚点重新解析统一偏好；前端 `resume` 不重复提交两个偏好字段，也不改写原 Round 展示快照。
 
 #### 模型与本轮推理等级
 
@@ -389,16 +398,19 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] Skill 选择器仅在显式打开时加载并在重新打开时后台刷新；已有清单立即展示，未完成请求可复用，只展示 enabled 项
 - [ ] Skill 清单不跨组件实例/账号复用，退出后切换账号不泄露上一账号的私有 Skill；成功空列表与请求失败均不产生自动重载循环，刷新失败保留旧清单
 - [ ] Skill 使用 `display_name` 展示、`key` 提交；搜索重开清空；选择、标签移除、50 项上限、桌面点击外部/`Escape` 与移动端关闭按钮行为正确
-- [ ] 普通 direct Round 在用户消息旁按 `preferred_skills` 展示只读标签；空数组不展示，same-Round resume 不新增标签，文案不暗示 Skill 已加载或调用
-- [ ] Skill 草稿按 session 隔离；A/B 会话切换互不污染，新会话创建后草稿迁移到实际 session
+- [ ] `+` 根菜单包含上传文件、专家 Skills、数据连接；子菜单互斥，Escape/外部点击/焦点回退正确，上传 pending 不禁用偏好编辑
+- [ ] 数据连接只在显式打开时加载，仅展示当前启用且有工具的 installation；按 `name/id/description` 搜索、提交 server id、20 项上限、清单不跨账号复用
+- [ ] 普通 direct Round 在用户正文上方按 Skill/MCP 快照展示独立图标胶囊，无说明行；空数组不展示，same-Round resume 不重复，文案不暗示已使用
+- [ ] `preferredMcpConnections=[]` 能清除 optimistic MCP 胶囊；历史刷新仍按冻结名称恢复
+- [ ] TurnPreferenceDraft 按 session 隔离；A/B 会话的 Skill/MCP 均互不污染，新会话创建后统一迁移
 - [ ] 正文与附件草稿按 session 隔离；切回会话可恢复，迟到上传只更新其捕获的 `draftId + serverSessionId`
-- [ ] 新会话的正文、附件与 Skill 协调迁移；重复或迟到的创建结果不得覆盖真实 session 下的较新草稿
-- [ ] 发送携带快照中的 `preferred_skill_keys`，空选择不发送该字段；发送后目标 session 的选择清空
-- [ ] composer 清空后已发送 Round 的 Skill 标签仍保留；刷新或断线恢复后以 `history/v2` 的持久化 `display_name` 快照还原，独立多轮不继承或累积
-- [ ] 接受前 4xx/5xx 立即恢复 Skill 快照；网络歧义按同一幂等键查询 3 次 history，确认 Round 后不恢复，仅 3 次均成功且无匹配时恢复一次；任一次 history 失败则保持 ambiguous、提示刷新且不恢复/重发
+- [ ] 新会话的正文、附件与 TurnPreferenceDraft 协调迁移；重复或迟到的创建结果不得覆盖真实 session 下的较新草稿
+- [ ] 发送携带 `preferred_skill_keys` 与 `preferred_mcp_server_ids`，空选择省略；发送后目标 session 的两类选择清空
+- [ ] composer 清空后已发送 Round 的资源胶囊仍保留；刷新或断线恢复后以 `history/v2` 的持久化 `display_name` 快照还原，独立多轮不继承或累积
+- [ ] 接受前 4xx/5xx 立即恢复两类偏好快照；网络歧义按同一幂等键查询 3 次 history，确认 Round 后不恢复，仅 3 次均成功且无匹配时恢复一次
 - [ ] 响应头前取消会 abort POST 且不查 history、不恢复草稿；等待 history 时取消会忽略迟到结果、不建立 subscribe、不恢复草稿
-- [ ] 接受前拒绝后若用户已修改 Skill 草稿，保留新编辑并无重复合并旧快照
-- [ ] ask_user 与工具审批 resume 延续原请求的 Skill 偏好；下一条独立消息不继承
+- [ ] 接受前拒绝后若用户已修改偏好草稿，分别保留 Skill/MCP 新编辑并无重复合并旧快照
+- [ ] ask_user 与工具审批 resume 延续原请求的统一偏好；下一条独立消息不继承
 
 ## 11. 已知易错点
 

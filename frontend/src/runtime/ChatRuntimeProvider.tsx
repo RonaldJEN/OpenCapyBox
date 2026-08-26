@@ -655,6 +655,7 @@ export function ChatRuntimeProvider({
     content,
     attachments = [],
     preferredSkillKeys = [],
+    preferredMcpConnections = [],
     reasoning,
     onStreamAccepted,
     onRejectedBeforeAccept,
@@ -671,6 +672,9 @@ export function ChatRuntimeProvider({
         key,
         display_name: key,
       })),
+      preferred_mcp_connections: preferredMcpConnections.map(
+        (connection) => ({ ...connection }),
+      ),
       thinking_mode: reasoning?.mode,
       reasoning_effort: reasoning?.effort,
       final_response: '',
@@ -713,6 +717,9 @@ export function ChatRuntimeProvider({
         content,
         idempotencyKey,
         preferredSkillKeys,
+        preferredMcpServerIds: preferredMcpConnections.map(
+          (connection) => connection.server_id,
+        ),
         reasoning,
         onRejectedBeforeAccept: () => {
           if (isCurrentTransport(clientRunKey, transportEpoch, connectionId)) {

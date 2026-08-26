@@ -92,3 +92,31 @@ def test_preferred_skill_key_location_and_length_context_remain_public():
     assert error["type"] == "string_too_long"
     assert error["loc"] == ["body", "preferred_skill_keys", 0]
     assert error["ctx"] == {"max_length": 128}
+
+
+def test_preferred_mcp_location_is_public_without_echoing_rejected_id():
+    app = FastAPI()
+    app.add_exception_handler(
+        RequestValidationError,
+        safe_request_validation_exception_handler,
+    )
+
+    @app.post("/preferred-mcp-validation-probe")
+    async def probe(_payload: SendMessageRequest):
+        return {"ok": True}
+
+    rejected_id = "SENSITIVE_" + "x" * 40
+    response = TestClient(app).post(
+        "/preferred-mcp-validation-probe",
+        json={
+            "content": [{"type": "text", "text": "hello"}],
+            "preferred_mcp_server_ids": [rejected_id],
+        },
+    )
+
+    assert response.status_code == 422
+    assert rejected_id not in response.text
+    error = response.json()["detail"][0]
+    assert error["type"] == "string_too_long"
+    assert error["loc"] == ["body", "preferred_mcp_server_ids", 0]
+    assert error["ctx"] == {"max_length": 36}

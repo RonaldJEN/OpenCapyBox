@@ -312,6 +312,7 @@ _PENDING_COLUMNS = [
     ("sessions", "model_id", "VARCHAR(50)"),
     ("rounds", "user_attachments", "TEXT"),
     ("rounds", "preferred_skills", "TEXT"),
+    ("rounds", "preferred_mcp_connections", "TEXT"),
     ("rounds", "thinking_mode", "VARCHAR(24)"),
     ("rounds", "reasoning_effort", "VARCHAR(40)"),
     ("rounds", "idempotency_key", "VARCHAR(64)"),

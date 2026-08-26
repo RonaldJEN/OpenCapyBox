@@ -123,6 +123,10 @@ class RunStartedEvent(BaseEvent):
         None,
         alias="preferredSkills",
     )
+    preferred_mcp_connections: Optional[List[Dict[str, str]]] = Field(
+        None,
+        alias="preferredMcpConnections",
+    )
 
 
 class RunFinishedEvent(BaseEvent):

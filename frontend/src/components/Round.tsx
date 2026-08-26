@@ -3,9 +3,11 @@ import { useState } from 'react';
 import {
   AlignLeft,
   Archive,
+  BookOpenCheck,
   Check,
   Code2,
   Copy,
+  Database,
   File,
   Image,
   Presentation,
@@ -343,23 +345,49 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
         </div>
         <div className="group/reply flex-1 min-w-0 pt-0.5">
           <p className="text-xs font-medium text-claude-secondary mb-1.5">你</p>
+          {((round.preferred_skills?.length || 0) > 0
+            || (round.preferred_mcp_connections?.length || 0) > 0) && (
+            <div
+              className="mb-2.5 flex flex-wrap items-center gap-2"
+              aria-label="本轮已选资源"
+            >
+              {round.preferred_skills?.map((skill, index) => {
+                const label = skill.display_name?.trim() || skill.key;
+                return (
+                  <span
+                    key={`${skill.key}-${index}`}
+                    className="inline-flex max-w-full items-center gap-2 rounded-xl border border-claude-border bg-white px-3 py-2 text-sm font-medium text-claude-text shadow-sm"
+                    title={skill.key}
+                    aria-label={`Skill ${label}`}
+                  >
+                    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-[#fff1e6] text-[#d97706]">
+                      <BookOpenCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                    </span>
+                    <span className="truncate">{label}</span>
+                  </span>
+                );
+              })}
+              {round.preferred_mcp_connections?.map((connection, index) => {
+                const label = connection.display_name?.trim() || connection.server_id;
+                return (
+                  <span
+                    key={`${connection.server_id}-${index}`}
+                    className="inline-flex max-w-full items-center gap-2 rounded-xl border border-claude-border bg-white px-3 py-2 text-sm font-medium text-claude-text shadow-sm"
+                    title={connection.server_id}
+                    aria-label={`数据连接 ${label}`}
+                  >
+                    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-[#eef7f0] text-[#4d795d]">
+                      <Database className="h-3.5 w-3.5" aria-hidden="true" />
+                    </span>
+                    <span className="truncate">{label}</span>
+                  </span>
+                );
+              })}
+            </div>
+          )}
           <div className="text-[15px] text-claude-text leading-relaxed whitespace-pre-wrap break-words">
             {cleanContent}
           </div>
-          {round.preferred_skills && round.preferred_skills.length > 0 && (
-            <div className="mt-2.5 flex flex-wrap items-center gap-1.5" aria-label="本轮优先 Skill">
-              <span className="mr-0.5 text-[11px] font-medium text-claude-muted">本轮优先 Skill</span>
-              {round.preferred_skills.map((skill, index) => (
-                <span
-                  key={`${skill.key}-${index}`}
-                  className="inline-flex max-w-full items-center rounded-full border border-claude-border bg-claude-surface px-2 py-0.5 text-[11px] font-medium text-claude-secondary"
-                  title={skill.key}
-                >
-                  <span className="truncate">{skill.display_name?.trim() || skill.key}</span>
-                </span>
-              ))}
-            </div>
-          )}
           {/* 附件展示 */}
           {userAttachments.length > 0 ? (
             <div className="mt-3 flex flex-wrap gap-2">
