@@ -24,6 +24,7 @@ from src.api.models.round import Round
 from src.api.models.session import Session
 from src.api.models.tool_permission import ToolApprovalRequest
 from src.api.models.user_run_lock import UserRunLock
+from src.api.models.user_memory import CronJobRun
 from src.api.routes.chat import _acquire_user_run_lock, _release_user_run_lock
 from src.api.services.agent_interaction_service import (
     AgentInteractionService,
@@ -280,6 +281,41 @@ class TestUserRunLockHelpers:
             # Worker crash 是失败，不应伪装成用户取消。
             orphan = db.query(Round).filter(Round.id == "orphan-round").first()
             assert orphan.status == "failed"
+
+    async def test_acquire_preserves_running_cron_with_fresh_claim(self):
+        """普通任务准入不得把仍有有效执行租约的 Cron Round 当成孤儿。"""
+        with self._TestingSessionLocal() as db:
+            _add_session(db, session_id="cron-session", user_id="user-1")
+            db.add(CronJobRun(
+                id="cron-session",
+                user_id="user-1",
+                job_name="daily",
+                cron_expr="0 8 * * *",
+                status="running",
+                phase="executing",
+                claim_token="fresh-cron-claim",
+                claim_lease_expires_at=now_naive() + timedelta(minutes=5),
+            ))
+            db.add(Round(
+                id="cron-round",
+                session_id="cron-session",
+                user_message="cron",
+                status="running",
+            ))
+            db.commit()
+
+        with patch("src.api.routes.chat.SessionLocal", self._TestingSessionLocal):
+            lock_id = await _acquire_user_run_lock(
+                user_id="user-1",
+                session_id="session-new",
+            )
+
+        assert isinstance(lock_id, str)
+        with self._TestingSessionLocal() as db:
+            assert db.get(Round, "cron-round").status == "running"
+            assert db.get(CronJobRun, "cron-session").status == "running"
+            lock_row = db.query(UserRunLock).filter_by(user_id="user-1").one()
+            assert lock_row.session_id == "session-new"
 
     async def test_stale_lock_fails_expired_started_continuation(self):
         with self._TestingSessionLocal() as db:

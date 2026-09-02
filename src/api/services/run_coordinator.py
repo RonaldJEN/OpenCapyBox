@@ -22,6 +22,7 @@ from src.api.models.database import SessionLocal
 from src.api.models.round import Round
 from src.api.models.session import Session
 from src.api.models.user_run_lock import UserRunLock
+from src.api.models.user_memory import CronJobRun
 from src.api.services.agent_interaction_service import AgentInteractionService
 from src.api.services.agui_event_bus import get_agui_event_bus
 from src.api.services.run_completion_service import RunCompletionService
@@ -413,6 +414,21 @@ class RunCoordinator:
             )
             if isinstance(row[0], str) and row[0]
         }
+        surviving_lock_sessions.update(
+            str(row[0])
+            for row in (
+                db.query(CronJobRun.id)
+                .filter(
+                    CronJobRun.user_id == user_id,
+                    CronJobRun.status == "running",
+                    CronJobRun.claim_token.isnot(None),
+                    CronJobRun.claim_lease_expires_at.isnot(None),
+                    CronJobRun.claim_lease_expires_at > now_naive(),
+                )
+                .all()
+            )
+            if isinstance(row[0], str) and row[0]
+        )
         active_unlocked_sessions: set[str] = set()
         failed_round_ids: list[str] = []
 
