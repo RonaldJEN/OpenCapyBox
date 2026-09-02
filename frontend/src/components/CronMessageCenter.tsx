@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Download, FileText, ChevronDown, ChevronUp } from 'lucide-react';
+import { Download, FileText, ChevronDown, ChevronUp, FolderTree } from 'lucide-react';
 import { FilePreview } from './FilePreview';
 import {
   getCronRuns,
@@ -13,6 +13,7 @@ import {
   type ArtifactFile,
 } from '../services/configApi';
 import type { FileInfo } from '../types';
+import { emitWorkspaceChangeInvalidations, requestOpenWorkspace } from '../services/workspaceEvents';
 
 // ────────────────────────────────────────────
 // Helpers
@@ -22,6 +23,9 @@ function statusIcon(s: string) {
   switch (s) {
     case 'success': return '✓';
     case 'failed': return '✕';
+    case 'conflict': return '!';
+    case 'unknown': return '?';
+    case 'queued': return '…';
     case 'running': return '⟳';
     default: return '○';
   }
@@ -30,7 +34,10 @@ function statusIcon(s: string) {
 function statusColor(s: string) {
   switch (s) {
     case 'success': return 'text-green-600';
-    case 'failed': return 'text-red-500';
+    case 'failed':
+    case 'conflict':
+    case 'unknown': return 'text-red-500';
+    case 'queued':
     case 'running': return 'text-yellow-500';
     default: return 'text-claude-muted';
   }
@@ -39,7 +46,10 @@ function statusColor(s: string) {
 function statusBg(s: string) {
   switch (s) {
     case 'success': return 'bg-green-50 border-green-200';
-    case 'failed': return 'bg-red-50 border-red-200';
+    case 'failed':
+    case 'conflict':
+    case 'unknown': return 'bg-red-50 border-red-200';
+    case 'queued':
     case 'running': return 'bg-yellow-50 border-yellow-200';
     default: return 'bg-claude-surface border-claude-border';
   }
@@ -49,6 +59,9 @@ function statusLabel(s: string) {
   switch (s) {
     case 'success': return '成功';
     case 'failed': return '失败';
+    case 'conflict': return '冲突';
+    case 'unknown': return '状态未知';
+    case 'queued': return '排队中';
     case 'running': return '运行中';
     default: return s;
   }
@@ -228,14 +241,18 @@ const RunArtifacts: React.FC<{ run: CronJobRun; onPreview: (runId: string, file:
 // ────────────────────────────────────────────
 
 interface Props {
+  unreadCount?: number;
   onUnreadChange?: (count: number) => void;
 }
 
 const PAGE_SIZE = 20;
 
-const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
+function invalidateCronWorkspaceChanges(runs: CronJobRun[]) {
+  emitWorkspaceChangeInvalidations(runs.flatMap((run) => run.workspace_changes || []));
+}
+
+const CronMessageCenter: React.FC<Props> = ({ unreadCount = 0, onUnreadChange = () => undefined }) => {
   const [runs, setRuns] = useState<CronJobRun[]>([]);
-  const [unreadCount, setUnreadCount] = useState(0);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -273,11 +290,11 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
           getCronRuns(undefined, PAGE_SIZE, 0),
           getUnreadCount(),
         ]);
+        invalidateCronWorkspaceChanges(resp.runs);
         setRuns(resp.runs);
         setTotal(resp.total);
         offsetRef.current = resp.runs.length;
-        setUnreadCount(unreadResp.count);
-        onUnreadChange?.(unreadResp.count);
+        onUnreadChange(unreadResp.count);
       } catch (e) {
         console.error('加载消息中心失败', e);
       } finally {
@@ -291,6 +308,7 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
     setLoadingMore(true);
     try {
       const resp = await getCronRuns(undefined, PAGE_SIZE, offsetRef.current);
+      invalidateCronWorkspaceChanges(resp.runs);
       setRuns((prev) => [...prev, ...resp.runs]);
       setTotal(resp.total);
       offsetRef.current += resp.runs.length;
@@ -305,24 +323,16 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
     setExpandedRun(isExpanded ? null : run.id);
 
     // 仅在首次展开「终态且未读」记录时做单条已读标记。
-    // running 记录不自动标记，避免把进行中的失败风险提前“读掉”。
-    if (isExpanded || run.is_read || run.status === 'running') return;
+    // queued/running 记录不自动标记，避免把进行中的失败风险提前“读掉”。
+    if (isExpanded || run.is_read || run.status === 'queued' || run.status === 'running') return;
 
     setRuns((prev) => {
       const next = prev.map((r) => (r.id === run.id ? { ...r, is_read: true } : r));
       return next;
     });
-    setUnreadCount((prev) => {
-      const next = Math.max(0, prev - 1);
-      onUnreadChange?.(next);
-      return next;
-    });
-
     try {
-      await markCronRunsRead(run.id);
-      const unreadResp = await getUnreadCount();
-      setUnreadCount(unreadResp.count);
-      onUnreadChange?.(unreadResp.count);
+      const result = await markCronRunsRead(run.id);
+      onUnreadChange(result.unread_count);
     } catch (e) {
       console.error('标记单条已读失败', e);
       setRuns((prev) => {
@@ -330,22 +340,19 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
         return next;
       });
       const unreadResp = await getUnreadCount();
-      setUnreadCount(unreadResp.count);
-      onUnreadChange?.(unreadResp.count);
+      onUnreadChange(unreadResp.count);
     }
   }, [onUnreadChange]);
 
   const handleMarkAllRead = useCallback(async () => {
     try {
       const resp = await markCronRunsRead();
-      const unreadResp = await getUnreadCount();
       // 并发场景下可能出现 marked=0 但服务端未读已归零（例如其他端已先标记），
       // 此时也需要把当前列表的红点同步清掉，避免本地状态残留。
-      if (resp.marked > 0 || unreadResp.count === 0) {
+      if (resp.marked > 0 || resp.unread_count === 0) {
         setRuns((prev) => prev.map((r) => (r.is_read ? r : { ...r, is_read: true })));
       }
-      setUnreadCount(unreadResp.count);
-      onUnreadChange?.(unreadResp.count);
+      onUnreadChange(resp.unread_count);
     } catch (e) {
       console.error('全部标已读失败', e);
     }
@@ -355,15 +362,16 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
   const groupedRuns = useMemo(() => {
     const groups = new Map<string, CronJobRun[]>();
     for (const r of runs) {
-      const key = runDateGroupKey(r.started_at);
+      const key = runDateGroupKey(r.started_at || r.queued_at || null);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key)!.push(r);
     }
     for (const arr of groups.values()) {
       arr.sort((a, b) => {
-        // 仅 failed && unread 置顶；其余全部按时间倒序。
-        const aTop = a.status === 'failed' && !a.is_read;
-        const bTop = b.status === 'failed' && !b.is_read;
+        // 明确失败/冲突/未知且未读置顶；其余全部按时间倒序。
+        const failureStatuses = new Set(['failed', 'conflict', 'unknown']);
+        const aTop = failureStatuses.has(a.status) && !a.is_read;
+        const bTop = failureStatuses.has(b.status) && !b.is_read;
         if (aTop !== bTop) return aTop ? -1 : 1;
         const at = a.started_at ? new Date(a.started_at).getTime() : 0;
         const bt = b.started_at ? new Date(b.started_at).getTime() : 0;
@@ -412,7 +420,7 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
         </span>
         <button
           onClick={() => { void handleMarkAllRead(); }}
-          disabled={unreadCount === 0}
+          disabled={!runs.some((run) => !run.is_read)}
           className="px-2.5 py-1 text-xs rounded border border-claude-border bg-claude-surface text-claude-text hover:bg-claude-hover disabled:opacity-40 disabled:cursor-not-allowed"
         >
           全部标已读
@@ -451,6 +459,12 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
                     {run.started_at && (
                       <span>{new Date(run.started_at).toLocaleString('zh-CN')}</span>
                     )}
+                    {!run.started_at && run.queued_at && (
+                      <span>{new Date(run.queued_at).toLocaleString('zh-CN')}</span>
+                    )}
+                    {(run.status === 'queued' || run.status === 'running') && run.phase && (
+                      <span className="text-claude-muted">{run.phase}</span>
+                    )}
                     {run.started_at && run.completed_at && (
                       <span className="text-claude-muted">
                         耗时 {formatDuration(run.started_at, run.completed_at)}
@@ -487,7 +501,29 @@ const CronMessageCenter: React.FC<Props> = ({ onUnreadChange }) => {
                   </div>
                 )}
 
-                {/* Artifacts（支持 lazy fetch） */}
+                {run.workspace_changes && run.workspace_changes.length > 0 && (
+                  <div className="border-t border-claude-border px-4 py-3">
+                    <div className="mb-2 text-xs font-medium text-claude-secondary">已提交的工作区变更</div>
+                    <div className="space-y-1.5">
+                      {run.workspace_changes.map((change) => (
+                        <button
+                          key={change.mutation_id || `${change.entry_id}:${change.revision}:${change.operation}`}
+                          type="button"
+                          disabled={change.operation.toUpperCase() === 'DELETED'}
+                          title={change.operation.toUpperCase() === 'DELETED' ? '已删除，无法恢复' : undefined}
+                          onClick={() => requestOpenWorkspace(change.entry_id)}
+                          className="flex min-h-11 w-full items-center gap-2 rounded-lg border border-claude-border bg-white px-3 text-left text-xs hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
+                          aria-label={`在工作区打开 ${change.name || change.path}`}
+                        >
+                          <FolderTree size={15} className="shrink-0 text-claude-accent" />
+                          <span className="min-w-0 flex-1"><span className="block truncate font-medium text-claude-text">{change.name || change.path.split('/').pop()}</span><span className="block truncate text-[10px] text-claude-muted">{change.operation} · 工作区/{change.path}</span></span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 运行目录产物（支持 lazy fetch） */}
                 <RunArtifacts
                   run={run}
                   onPreview={(runId, file) => setPreviewTarget({ runId, file })}

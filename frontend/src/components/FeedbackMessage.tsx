@@ -10,6 +10,8 @@ import './FeedbackMessage.css';
 
 export type FeedbackTone = 'success' | 'info' | 'warning' | 'error';
 
+export const DEFAULT_FEEDBACK_AUTO_DISMISS_MS = 3000;
+
 interface FeedbackMessageProps {
   children: ReactNode;
   className?: string;
@@ -29,9 +31,11 @@ export default function FeedbackMessage({
   tone,
   autoDismissMs,
 }: FeedbackMessageProps) {
+  const resolvedAutoDismissMs = autoDismissMs
+    ?? (tone === 'success' || tone === 'info' ? DEFAULT_FEEDBACK_AUTO_DISMISS_MS : 0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const startedAtRef = useRef(0);
-  const remainingRef = useRef(autoDismissMs ?? 0);
+  const remainingRef = useRef(resolvedAutoDismissMs);
   const dismissRef = useRef(onDismiss);
 
   useEffect(() => {
@@ -47,19 +51,19 @@ export default function FeedbackMessage({
 
   const startTimer = useCallback(() => {
     clearTimer();
-    if (!autoDismissMs || remainingRef.current <= 0) return;
+    if (!resolvedAutoDismissMs || remainingRef.current <= 0) return;
     startedAtRef.current = Date.now();
     timerRef.current = setTimeout(() => {
       timerRef.current = null;
       dismissRef.current();
     }, remainingRef.current);
-  }, [autoDismissMs, clearTimer]);
+  }, [clearTimer, resolvedAutoDismissMs]);
 
   useEffect(() => {
-    remainingRef.current = autoDismissMs ?? 0;
+    remainingRef.current = resolvedAutoDismissMs;
     startTimer();
     return clearTimer;
-  }, [autoDismissMs, children, clearTimer, startTimer]);
+  }, [children, clearTimer, resolvedAutoDismissMs, startTimer]);
 
   const pauseTimer = () => {
     if (timerRef.current === null) return;
@@ -68,7 +72,7 @@ export default function FeedbackMessage({
   };
 
   const resumeTimer = () => {
-    if (!autoDismissMs || timerRef.current !== null || remainingRef.current <= 0) return;
+    if (!resolvedAutoDismissMs || timerRef.current !== null || remainingRef.current <= 0) return;
     startTimer();
   };
 

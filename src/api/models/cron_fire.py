@@ -34,4 +34,7 @@ class CronFire(Base):
     job_id = Column(Integer, ForeignKey("cron_jobs.id"), nullable=False, index=True)
     scheduled_at = Column(DateTime, nullable=False, index=True)
     rule_version = Column(Integer, nullable=False, default=1)
+    definition_version = Column(Integer, nullable=False, default=1)
+    # 与 Fire 同一事务创建的 durable queued run。
+    run_id = Column(String(36), nullable=True, unique=True, index=True)
     created_at = Column(DateTime, default=now_naive)

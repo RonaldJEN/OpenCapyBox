@@ -125,7 +125,10 @@ class TestSandboxBashTool:
         tool = SandboxBashTool(mock_sandbox)
         assert tool.name == "bash"
         assert len(tool.description) > 0
+        assert "current execution Workspace" in tool.description
+        assert "configured sandbox workspace root" not in tool.description
         assert "command" in tool.parameters.get("properties", {})
+
 
     def test_description_tells_model_to_set_timeout_for_tests(self, mock_sandbox):
         """工具描述应提醒模型 pytest/build/install 需要显式传 timeout。"""
@@ -154,7 +157,48 @@ class TestSandboxBashTool:
 
         assert result.success is True
         assert "Hello World" in result.content
-        mock_sandbox.commands.run.assert_awaited_once()
+        assert any(
+            call.args and call.args[0] == "echo Hello World"
+            for call in mock_sandbox.commands.run.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_foreground_command_reports_changed_session_artifact(
+        self, mock_sandbox, monkeypatch
+    ):
+        import src.agent.tools.sandbox_bash_tool as bash_module
+
+        before = {}
+        after = {
+            "report.md": {
+                "source": "session",
+                "name": "report.md",
+                "path": "report.md",
+                "size": 42,
+                "modified": "2026-08-28T10:00:00Z",
+                "type": "md",
+                "revision": "v1:42:100",
+            }
+        }
+        monkeypatch.setattr(
+            bash_module,
+            "snapshot_session_files",
+            AsyncMock(side_effect=[before, after]),
+        )
+        execution = MagicMock(exit_code=0)
+        execution.logs.stdout = []
+        execution.logs.stderr = []
+        mock_sandbox.commands.run = AsyncMock(return_value=execution)
+
+        result = await SandboxBashTool(mock_sandbox).execute(
+            command="python build_report.py"
+        )
+
+        assert result.success is True
+        assert result.assistant_file_references == [{
+            **after["report.md"],
+            "operation": "CREATED",
+        }]
 
     @pytest.mark.asyncio
     async def test_foreground_uses_custom_workspace(self, mock_sandbox):
@@ -540,8 +584,8 @@ class TestBackgroundCommandTracker:
         tracker.add("bg-1", mock_sandbox, "cmd-1")
         entry = tracker.get("bg-1")
         assert entry is not None
-        assert entry[0] is mock_sandbox
-        assert entry[1] == "cmd-1"
+        assert entry.sandbox is mock_sandbox
+        assert entry.command_id == "cmd-1"
 
     def test_remove(self, mock_sandbox):
         tracker = _BackgroundCommandTracker()

@@ -51,6 +51,9 @@ class FileInfo(BaseModel):
     modified: str = Field(..., description="修改时间（ISO格式）")
     type: str = Field(..., description="文件类型（扩展名）")
     is_directory: bool = Field(False, description="是否为目录")
+    revision: Optional[str] = Field(None, description="用于稳定复制的 opaque 文件版本")
+    edit_base_token: Optional[str] = Field(None, description="绑定用户、Session、路径和不可变内容的编辑基线")
+    session_auto_merged: bool = False
 
 
 class UpdateSessionTitleRequest(BaseModel):
@@ -71,5 +74,11 @@ class UpdateSessionFileRequest(BaseModel):
 
     content: Optional[str] = Field(None, description="UTF-8 文本正文")
     content_base64: Optional[str] = Field(None, description="二进制文件的 Base64 正文")
-    expected_size: int = Field(..., ge=0, description="编辑开始时的文件大小")
-    expected_modified: str = Field(..., min_length=1, description="编辑开始时的 ISO 修改时间")
+    expected_revision: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="编辑开始时的 opaque 文件版本（v1:size:mtime_ns）",
+    )
+    edit_base_token: Optional[str] = Field(None, max_length=256)
+    save_id: Optional[str] = Field(None, min_length=1, max_length=128)

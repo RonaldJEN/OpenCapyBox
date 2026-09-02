@@ -14,6 +14,7 @@ interface AppSidebarProps {
   children: ReactNode;
   collapsed: boolean;
   boundaryClaimed?: boolean;
+  mobileOpen?: boolean;
   userId: string;
   onCollapsedChange: (collapsed: boolean) => void;
 }
@@ -22,6 +23,7 @@ export function AppSidebar({
   children,
   collapsed,
   boundaryClaimed = false,
+  mobileOpen = false,
   userId,
   onCollapsedChange,
 }: AppSidebarProps) {
@@ -93,19 +95,46 @@ export function AppSidebar({
     onCollapsedChange(false);
   };
 
+  const trapMobileDialogFocus = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (!mobileOpen || event.key !== 'Tab') return;
+    const content = shellRef.current?.firstElementChild;
+    const focusable = Array.from(content?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+    ) || []);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      shellRef.current?.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
   return (
     <div
       ref={shellRef}
       data-testid="app-sidebar-shell"
       data-collapsed={collapsed ? 'true' : 'false'}
-      className="relative hidden h-screen shrink-0 bg-claude-surface md:flex"
-      style={{ width: `${renderedWidth}px` }}
+      role={mobileOpen ? 'dialog' : undefined}
+      aria-modal={mobileOpen ? 'true' : undefined}
+      aria-label={mobileOpen ? '会话与工作区' : undefined}
+      tabIndex={mobileOpen ? -1 : undefined}
+      onKeyDown={trapMobileDialogFocus}
+      className={`${mobileOpen ? 'fixed inset-0 z-[140] flex' : 'relative hidden'} h-screen shrink-0 bg-claude-surface md:relative md:inset-auto md:z-auto md:flex`}
+      style={{ width: mobileOpen ? '100%' : `${renderedWidth}px` }}
     >
-      <div className={`h-full min-w-0 overflow-hidden ${collapsed ? 'w-0 opacity-0' : 'w-full opacity-100'}`}>
+      <div className={`h-full min-w-0 w-full overflow-hidden opacity-100 ${collapsed ? 'md:w-0 md:opacity-0' : 'md:w-full md:opacity-100'}`}>
         {children}
       </div>
       {collapsed && (
-        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-between py-4">
+        <div className="pointer-events-none absolute inset-0 hidden flex-col items-center justify-between py-4 md:flex">
           <button
             type="button"
             onClick={expandSidebar}
@@ -137,7 +166,7 @@ export function AppSidebar({
           tabIndex={0}
           onPointerDown={handlePointerDown}
           onKeyDown={handleKeyDown}
-          className="group absolute right-0 inset-y-0 z-10 w-2 cursor-col-resize touch-none outline-none"
+          className="group absolute right-0 inset-y-0 z-10 hidden w-2 cursor-col-resize touch-none outline-none md:block"
         >
           <span className="absolute inset-y-0 right-0 w-px bg-claude-border transition-[width,background-color] group-hover:w-0.5 group-hover:bg-claude-accent/55 group-focus-visible:w-0.5 group-focus-visible:bg-claude-accent" />
         </div>
@@ -148,7 +177,7 @@ export function AppSidebar({
           onClick={expandSidebar}
           aria-label="展开左侧栏"
           title="展开左侧栏"
-          className="absolute right-0 top-16 z-[15] flex h-8 w-8 translate-x-1/2 items-center justify-center rounded-full border border-claude-border bg-white text-claude-secondary shadow-sm transition-[background-color,color,transform,box-shadow] hover:bg-claude-hover hover:text-claude-text active:translate-x-1/2 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
+          className="absolute right-0 top-16 z-[15] hidden h-8 w-8 translate-x-1/2 items-center justify-center rounded-full border border-claude-border bg-white text-claude-secondary shadow-sm transition-[background-color,color,transform,box-shadow] hover:bg-claude-hover hover:text-claude-text active:translate-x-1/2 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40 md:flex"
         >
           <ChevronRight size={16} aria-hidden="true" />
         </button>

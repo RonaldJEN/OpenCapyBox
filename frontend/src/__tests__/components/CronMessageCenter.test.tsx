@@ -3,6 +3,7 @@ import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 
 import CronMessageCenter, { runDateGroupKey } from '../../components/CronMessageCenter';
 import * as configApi from '../../services/configApi';
+import { subscribeWorkspaceMutation } from '../../services/workspaceEvents';
 
 vi.mock('../../components/FilePreview', () => ({
   FilePreview: () => null,
@@ -12,7 +13,7 @@ vi.mock('../../services/configApi', () => ({
   getCronRuns: vi.fn(),
   getUnreadCount: vi.fn(),
   getCronRunFiles: vi.fn().mockResolvedValue({ files: [] }),
-  markCronRunsRead: vi.fn().mockResolvedValue({ marked: 1 }),
+  markCronRunsRead: vi.fn().mockResolvedValue({ marked: 1, unread_count: 0 }),
   downloadCronRunFile: vi.fn(),
 }));
 
@@ -75,6 +76,64 @@ describe('CronMessageCenter unread behavior', () => {
     });
   });
 
+  it('does not mark queued run as read when expanded', async () => {
+    vi.mocked(configApi.getCronRuns).mockResolvedValue({
+      runs: [{ ...baseRun, status: 'queued', queued_at: '2026-04-16T18:31:00Z', started_at: null, completed_at: null, phase: 'claiming', is_read: false }],
+      total: 1, offset: 0, limit: 20,
+    });
+    vi.mocked(configApi.getUnreadCount).mockResolvedValue({ count: 1 });
+    render(<CronMessageCenter onUnreadChange={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: /daily_iraq_news/i }));
+    expect(configApi.markCronRunsRead).not.toHaveBeenCalled();
+    expect(screen.getByText('排队中')).toBeInTheDocument();
+    expect(screen.getByText('claiming')).toBeInTheDocument();
+  });
+
+  it('separates committed workspace changes and opens stable workspace entry', async () => {
+    vi.mocked(configApi.getCronRuns).mockResolvedValue({
+      runs: [{
+        ...baseRun,
+        is_read: true,
+        workspace_changes: [{ entry_id: 'entry-1', operation: 'updated', path: 'reports/daily.md', name: 'daily.md', revision: 2, mutation_id: 'm1' }],
+      }],
+      total: 1, offset: 0, limit: 20,
+    });
+    vi.mocked(configApi.getUnreadCount).mockResolvedValue({ count: 0 });
+    const navigation = vi.fn();
+    window.addEventListener('workspace:navigate', navigation);
+    render(<CronMessageCenter />);
+    fireEvent.click(await screen.findByRole('button', { name: /daily_iraq_news/i }));
+    fireEvent.click(screen.getByRole('button', { name: '在工作区打开 daily.md' }));
+    expect((navigation.mock.calls[0][0] as CustomEvent).detail).toEqual({ entryId: 'entry-1' });
+    window.removeEventListener('workspace:navigate', navigation);
+  });
+
+  it('加载 Cron workspace_changes 时通过统一入口只失效同一 entry 的最新 revision', async () => {
+    const invalidations: Array<{ entryId?: string; revision?: number }> = [];
+    const unsubscribe = subscribeWorkspaceMutation((detail) => {
+      if (detail.entryId === 'cron-entry-refresh') invalidations.push(detail);
+    });
+    vi.mocked(configApi.getCronRuns).mockResolvedValue({
+      runs: [{
+        ...baseRun,
+        is_read: true,
+        workspace_changes: [
+          { entry_id: 'cron-entry-refresh', operation: 'updated', path: 'daily.md', revision: 2 },
+          { entry_id: 'cron-entry-refresh', operation: 'updated', path: 'daily.md', revision: 3 },
+          { entry_id: 'cron-entry-refresh', operation: 'updated', path: 'daily.md', revision: 1 },
+        ],
+      }],
+      total: 1, offset: 0, limit: 20,
+    });
+    vi.mocked(configApi.getUnreadCount).mockResolvedValue({ count: 0 });
+
+    render(<CronMessageCenter />);
+    await screen.findByText('daily_iraq_news');
+
+    expect(invalidations).toEqual([expect.objectContaining({ entryId: 'cron-entry-refresh', revision: 3 })]);
+    unsubscribe();
+  });
+
   it('expanding unread run marks it as read immediately', async () => {
     vi.mocked(configApi.getCronRuns).mockResolvedValue({
       runs: [{ ...baseRun, status: 'success', is_read: false }],
@@ -113,7 +172,7 @@ describe('CronMessageCenter unread behavior', () => {
     vi.mocked(configApi.getUnreadCount)
       .mockResolvedValueOnce({ count: 2 })
       .mockResolvedValueOnce({ count: 0 });
-    vi.mocked(configApi.markCronRunsRead).mockResolvedValue({ marked: 2 });
+    vi.mocked(configApi.markCronRunsRead).mockResolvedValue({ marked: 2, unread_count: 0 });
 
     const onUnreadChange = vi.fn();
     render(<CronMessageCenter onUnreadChange={onUnreadChange} />);
@@ -140,7 +199,7 @@ describe('CronMessageCenter unread behavior', () => {
     vi.mocked(configApi.getUnreadCount)
       .mockResolvedValueOnce({ count: 1 })
       .mockResolvedValueOnce({ count: 0 });
-    vi.mocked(configApi.markCronRunsRead).mockResolvedValue({ marked: 0 });
+    vi.mocked(configApi.markCronRunsRead).mockResolvedValue({ marked: 0, unread_count: 0 });
 
     const onUnreadChange = vi.fn();
     render(<CronMessageCenter onUnreadChange={onUnreadChange} />);

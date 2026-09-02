@@ -116,9 +116,13 @@
 5. 状态查询失败、`connect` 失败或 `resume` 失败均视为暂时性故障，不得继续尝试另一种生命周期操作，也不得创建新沙箱。
 6. 没有持久化 ID 且调用允许创建时才直接创建；`get_existing` 等只读既有代际的调用必须失败而不是创建。
 
+高频文件服务不得为每次命令都进入 per-user 生命周期锁。允许复用 ID/Profile 匹配且在短 TTL 内已验证健康的缓存对象；TTL 到期在锁外做一次轻量健康检查，失败后才失效缓存并进入上述恢复链。这样既不能永久信任 stale cache，也不能让正在初始化 Agent 的长生命周期临界区阻塞预览、新建和拖拽。
+
+Session/Workspace 文件面板属于被动消费者：读取持久绑定与有效 `UserRunLock` 后必须先提交/回滚请求事务，再等待 OpenSandbox。存在运行锁时只允许 `get_existing(user_id, persisted_sandbox_id)`，远端 404/不可用直接令当前文件请求失败，禁止创建候选容器或 CAS 改绑。Chat/Cron 工具持有该轮启动时取得的 Sandbox 对象，运行中不重新读取全局缓存来切换代际。
+
 创建、连接、恢复使用当前有效 Profile 的 `domain/protocol/api_key/use_server_proxy` 连接 OpenSandbox。按既有 `sandbox_id` 执行 kill/清理时，若进程内仍有 live cached sandbox 对象，可以直接使用该对象清理；若需要根据 `sandbox_id` 重新连接/恢复，则只能使用 `user_sandboxes.active_profile_id` + `active_profile_version` 对应的 Profile。此时若指纹缺失、Profile 不存在、版本已变化或 DB 查询失败，`kill()` 必须返回不可清理，不得回退到当前用户有效 Profile 或 `.env` 默认后端。调用方必须按业务风险处理该返回值：删除用户路径必须阻断；管理员切换用户 Profile 路径允许继续切换并依赖 OpenSandbox TTL 回收旧 sandbox。管理端创建 Profile 时 `api_key` 必填，不支持无 key 后端；镜像、资源限制、宿主存储根和容器 `mount_path` 使用全局配置，不按 Profile 自定义。
 
-MVP 说明：Profile runtime 字段、默认 Profile 变更或用户 Profile 重新分配导致旧 sandbox 指纹过期时，系统在下次使用时按新 Profile 重建，不主动跨 OpenSandbox 后端迁移旧文件。若旧 sandbox 未命中 live cache 且无法按 active Profile 指纹重新连接，系统不尝试回退连接；旧 sandbox 依赖 OpenSandbox 空闲 TTL 回收，TTL 由 `SANDBOX_TIMEOUT_MINUTES` 控制，默认 60 分钟。当前版本不保存 sandbox 创建时的连接快照或 Profile revision history。后续若实现跨 Profile 数据迁移，应同步设计旧 sandbox 的主动清理、连接快照和失败回滚方案。
+MVP 说明：Profile runtime 字段、默认 Profile 变更或用户 Profile 重新分配导致旧 sandbox 指纹过期时，空工作区用户可在下次使用时按新 Profile 重建，不主动跨 OpenSandbox 后端迁移文件。`workdir` 非空时，当前 destructive kill/清挂载路径必须阻断 Profile 切换、force recreate 和 stale-profile rebuild；只有先清空/迁移工作区，或后续实现明确保留持久卷的重建路径后才能继续。若旧 sandbox 未命中 live cache 且无法按 active Profile 指纹重新连接，系统不尝试回退连接；旧 sandbox 依赖 OpenSandbox 空闲 TTL 回收，TTL 由 `SANDBOX_TIMEOUT_MINUTES` 控制，默认 60 分钟。当前版本不保存 sandbox 创建时的连接快照或 Profile revision history。后续若实现跨 Profile 数据迁移，应同步设计旧 sandbox 的主动清理、连接快照和失败回滚方案。
 
 运维建议：需要切换到新的 OpenSandbox 后端时，应新建 Profile 并重新分配用户，不应原地修改既有 Profile 的 runtime 连接字段来表达换后端。
 

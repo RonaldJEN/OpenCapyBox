@@ -116,6 +116,12 @@ def ensure_default_sandbox_profile(db: DBSession) -> SandboxProfile:
 
     existing_default = _normalize_default_sandbox_profiles(db)
     if existing_default:
+        # pg_advisory_xact_lock is transaction-scoped. Returning an unchanged
+        # existing profile without ending the transaction leaves the bootstrap
+        # lock held while callers may perform slow OpenSandbox network I/O,
+        # blocking every later runtime-config request in the process.
+        db.commit()
+        db.refresh(existing_default)
         return existing_default
 
     first_profile = db.query(SandboxProfile).order_by(SandboxProfile.created_at.asc()).first()
@@ -186,7 +192,12 @@ def get_effective_sandbox_profile(db: DBSession, user_id: str) -> tuple[SandboxP
             raise HTTPException(status_code=409, detail="用户绑定的沙箱后端已禁用")
         return profile, "explicit"
 
-    profile = get_default_sandbox_profile(db)
+    # Startup guarantees a default profile in healthy deployments. Normal
+    # request paths use a lock-free read so resolving runtime configuration
+    # cannot queue the whole event loop behind the bootstrap advisory lock.
+    profile = get_existing_default_sandbox_profile(db)
+    if profile is None:
+        profile = ensure_default_sandbox_profile(db)
     if not profile.enabled:
         raise HTTPException(status_code=409, detail="默认沙箱后端已禁用")
     return profile, "default"

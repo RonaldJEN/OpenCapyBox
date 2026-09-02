@@ -13,15 +13,22 @@ import { SessionList } from './components/SessionList';
 import { AppSidebar } from './components/AppSidebar';
 import { ChatV2 } from './components/ChatV2';
 import type { ArtifactsPanelHandle } from './components/ArtifactsPanel';
+import type { WorkspaceFilesPanelHandle } from './components/workspace/WorkspaceFilesPanel';
 import AdminConsole from './components/AdminConsole';
 import SettingsCenter from './components/SettingsCenter';
 import SkillsPage from './components/SkillsPage';
 import ConnectionsPage from './components/ConnectionsPage';
 import SchedulePage from './components/SchedulePage';
+import FeedbackMessage from './components/FeedbackMessage';
 import { apiService } from './services/api';
-import { getUnreadCount } from './services/configApi';
+import { getCronRuns, getUnreadCount } from './services/configApi';
+import { startSessionDraftOutbox } from './services/sessionDraftOutbox';
+import { startWorkspaceDraftOutbox } from './services/workspaceDraftOutbox';
 import { ChatRuntimeProvider, useChatRuntime } from './runtime/ChatRuntimeProvider';
 import { SessionStatus, type ModelInfo, type Session } from './types';
+import type { WorkspaceEntry } from './types/workspace';
+import { workspaceApi } from './services/workspaceApi';
+import { emitWorkspaceChangeInvalidations, subscribeWorkspaceMutation } from './services/workspaceEvents';
 
 type ConfigPanel = 'config' | null;
 type PrimarySurface = 'chat' | 'schedule' | 'skills' | 'connections';
@@ -45,6 +52,12 @@ type SessionScrollTarget = {
 };
 
 const RUNNING_SESSIONS_RECONCILE_INTERVAL_MS = 5000;
+const WORKSPACE_CRON_INVALIDATION_INTERVAL_MS = 15_000;
+const WORKSPACE_CRON_INVALIDATION_PAGE_SIZE = 10;
+
+function isWorkspacePath(pathname: string): boolean {
+  return pathname.replace(/\/+$/, '') === '/workspace';
+}
 
 function primarySurfaceForPath(pathname: string): PrimarySurface {
   const normalizedPath = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
@@ -84,6 +97,10 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const activeSurface = primarySurfaceForPath(location.pathname);
+  const workspaceRouteActive = isWorkspacePath(location.pathname);
+  const workspaceRouteEntryId = workspaceRouteActive
+    ? new URLSearchParams(location.search).get('entry')
+    : null;
   const {
     getActiveSlotSessionIds,
     getExecutingSessionIds,
@@ -91,6 +108,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   } = useChatRuntime();
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sessionFilesOwnsBoundary, setSessionFilesOwnsBoundary] = useState(false);
   const [selectedModelId, setSelectedModelId] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
@@ -106,6 +124,14 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   const [cronUnreadCount, setCronUnreadCount] = useState(0);
   const [sessionScrollTarget, setSessionScrollTarget] = useState<SessionScrollTarget | null>(null);
   const [sessionSwitchSaveError, setSessionSwitchSaveError] = useState('');
+  const [sidebarMode, setSidebarMode] = useState<'sessions' | 'workspace'>(() => (
+    workspaceRouteActive ? 'workspace' : 'sessions'
+  ));
+  const [workspaceFileTarget, setWorkspaceFileTarget] = useState<WorkspaceEntry | null>(null);
+  const [workspaceFilesMounted, setWorkspaceFilesMounted] = useState(false);
+  // 首帧仍由路由初始化 sidebarMode；进入页面后左右标签只切换浏览列表，
+  // 不能因为查看会话列表就关闭右侧工作区或丢掉 entry 深链。
+  const effectiveSidebarMode = sidebarMode;
   const shouldBlockConnectionsNavigation = useCallback(({
     currentLocation,
     nextLocation,
@@ -121,19 +147,39 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   const sessionScrollNonceRef = useRef(0);
   const currentSessionIdRef = useRef(currentSessionId);
   const sessionFilesHandleRef = useRef<ArtifactsPanelHandle>(null);
-  const sessionNavigationRequestEpochRef = useRef(0);
+  const workspaceFilesHandleRef = useRef<WorkspaceFilesPanelHandle | null>(null);
+  const captureWorkspaceFilesHandle = useCallback((handle: WorkspaceFilesPanelHandle | null) => {
+    workspaceFilesHandleRef.current = handle;
+    setWorkspaceFilesMounted((mounted) => mounted === Boolean(handle) ? mounted : Boolean(handle));
+  }, []);
+  const workspaceOpenRequestEpochRef = useRef(0);
+  // Last URL whose owner switch actually completed, so a rejected deep link
+  // (address bar edit, back/forward) can be handed back to the browser.
+  const committedUrlRef = useRef('/');
   const initialRunningSessionsHandledRef = useRef(false);
   const pendingSurfaceActionRef = useRef<PendingSurfaceAction | null>(null);
   const mainContentRef = useRef<HTMLDivElement>(null);
+  const primaryContentRef = useRef<HTMLDivElement>(null);
   const settingsDialogRef = useRef<HTMLDivElement>(null);
   const unsavedConfirmDialogRef = useRef<HTMLDivElement>(null);
   const confirmReturnFocusRef = useRef<HTMLElement | null>(null);
+  const mobileSidebarReturnFocusRef = useRef<HTMLElement | null>(null);
   currentSessionIdRef.current = currentSessionId;
   const executingSessionIds = getExecutingSessionIds();
   const activeSlotSessionIds = getActiveSlotSessionIds();
   const effectiveSidebarCollapsed = isSidebarCollapsed;
+  const workspaceCronWatchActive = Boolean(workspaceFileTarget) || workspaceFilesMounted;
+  const workspaceTargetResolving = Boolean(
+    workspaceRouteEntryId
+    && workspaceFileTarget?.entry_id !== workspaceRouteEntryId,
+  );
   const unsavedConfirmSource: DirtySource | null = pendingNavigation?.source
     ?? (connectionsNavigationBlocker.state === 'blocked' ? 'connections' : null);
+
+  useEffect(() => {
+    void startSessionDraftOutbox();
+    void startWorkspaceDraftOutbox();
+  }, []);
 
   useEffect(() => {
     setVisitedPrimarySurfaces((visited) => {
@@ -160,6 +206,28 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [connectionsHaveUnsavedChanges]);
+
+  useEffect(() => {
+    if (!mobileSidebarOpen) return undefined;
+    mobileSidebarReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    const primaryContent = primaryContentRef.current;
+    const primaryContentWasInert = primaryContent?.hasAttribute('inert') ?? false;
+    document.body.style.overflow = 'hidden';
+    primaryContent?.setAttribute('inert', '');
+    const frame = requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('[aria-label="关闭侧栏"]')?.focus());
+    const handleEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileSidebarOpen(false);
+    };
+    document.addEventListener('keydown', handleEscape);
+    return () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener('keydown', handleEscape);
+      document.body.style.overflow = previousOverflow;
+      if (!primaryContentWasInert) primaryContent?.removeAttribute('inert');
+      mobileSidebarReturnFocusRef.current?.focus();
+    };
+  }, [mobileSidebarOpen]);
 
   const applyActivePanel = useCallback((nextPanel: ConfigPanel) => {
     if (activePanel === 'config' && nextPanel !== 'config') {
@@ -410,8 +478,12 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   // 統一加載模型列表（只請求一次）
   useEffect(() => {
     apiService.getModels().then((res) => {
-      setAvailableModels(res.models);
-      setSelectedModelId((current) => current || res.default_model);
+      const models = Array.isArray(res.models) ? res.models : [];
+      const defaultModelId = typeof res.default_model === 'string'
+        ? res.default_model
+        : models[0]?.id || '';
+      setAvailableModels(models);
+      setSelectedModelId((current) => current || defaultModelId);
     }).catch((err) => {
       console.error('Failed to load models:', err);
     });
@@ -427,6 +499,46 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    if (!workspaceCronWatchActive) return undefined;
+    let disposed = false;
+    let inFlight = false;
+    let failureReported = false;
+
+    const pollWorkspaceChanges = async () => {
+      if (disposed || inFlight || document.visibilityState === 'hidden') return;
+      inFlight = true;
+      try {
+        const response = await getCronRuns(undefined, WORKSPACE_CRON_INVALIDATION_PAGE_SIZE, 0);
+        if (disposed) return;
+        emitWorkspaceChangeInvalidations(response.runs.flatMap((run) => run.workspace_changes || []));
+        failureReported = false;
+      } catch (error) {
+        if (!disposed && !failureReported) {
+          failureReported = true;
+          console.error('Failed to poll Cron workspace changes:', error);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void pollWorkspaceChanges();
+    };
+    void pollWorkspaceChanges();
+    const timer = window.setInterval(
+      () => { void pollWorkspaceChanges(); },
+      WORKSPACE_CRON_INVALIDATION_INTERVAL_MS,
+    );
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [workspaceCronWatchActive]);
+
   const applySessionSelection = useCallback((sessionId: string, target?: { roundId: string }) => {
     currentSessionIdRef.current = sessionId;
     setCurrentSessionId(sessionId);
@@ -441,66 +553,218 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     }
   }, []);
 
-  const saveThenSelectSession = useCallback(async (
+  const saveThenSelectSession = useCallback((
     sessionId: string,
     target?: { roundId: string },
   ) => {
-    const requestEpoch = ++sessionNavigationRequestEpochRef.current;
     const ownerSessionId = currentSessionIdRef.current;
     setSessionSwitchSaveError('');
 
     if (ownerSessionId && ownerSessionId !== sessionId) {
       const filesHandle = sessionFilesHandleRef.current;
-      if (!filesHandle || filesHandle.ownerSessionId !== ownerSessionId) {
-        setSessionSwitchSaveError('文件编辑状态仍在同步，已留在当前会话。请稍后重试。');
-        return;
-      }
-      const expectedOwner = {
-        ownerSessionId,
-        ownerEpoch: filesHandle.ownerEpoch,
-      };
-      if (filesHandle.hasDirty(expectedOwner)) {
-        let result: Awaited<ReturnType<ArtifactsPanelHandle['saveDirty']>>;
-        try {
-          result = await filesHandle.saveDirty(expectedOwner);
-        } catch (error) {
-          console.error('Failed to save dirty Session files before navigation:', error);
-          if (
-            requestEpoch === sessionNavigationRequestEpochRef.current
-            && currentSessionIdRef.current === ownerSessionId
-          ) {
-            setSessionSwitchSaveError('文件保存失败，已留在当前会话。请处理保存错误后重试。');
-          }
-          return;
-        }
-        if (
-          requestEpoch !== sessionNavigationRequestEpochRef.current
-          || currentSessionIdRef.current !== ownerSessionId
-        ) return;
-        if (
-          !result.ok
-          || result.stale
-          || result.ownerSessionId !== expectedOwner.ownerSessionId
-          || result.ownerEpoch !== expectedOwner.ownerEpoch
-        ) {
-          setSessionSwitchSaveError('文件保存失败，已留在当前会话。请处理保存错误后重试。');
-          return;
+      if (filesHandle?.ownerSessionId === ownerSessionId) {
+        const expectedOwner = {
+          ownerSessionId,
+          ownerEpoch: filesHandle.ownerEpoch,
+        };
+        if (filesHandle.hasDirty(expectedOwner)) {
+          // saveDirty 在第一个网络等待前已把编辑器内容交给应用级草稿队列。
+          // 切换不再等待服务器；失败的远端同步由草稿队列静默重试。
+          void filesHandle.saveDirty(expectedOwner).catch((error) => {
+            console.error('Failed to sync Session drafts in background:', error);
+          });
         }
       }
     }
-
-    if (
-      requestEpoch !== sessionNavigationRequestEpochRef.current
-      || currentSessionIdRef.current !== ownerSessionId
-    ) return;
     applySessionSelection(sessionId, target);
   }, [applySessionSelection]);
 
+  const flushCurrentSessionFiles = useCallback((): void => {
+    const ownerSessionId = currentSessionIdRef.current;
+    if (!ownerSessionId) return;
+    const filesHandle = sessionFilesHandleRef.current;
+    if (!filesHandle || filesHandle.ownerSessionId !== ownerSessionId) return;
+    const expectedOwner = { ownerSessionId, ownerEpoch: filesHandle.ownerEpoch };
+    if (!filesHandle.hasDirty(expectedOwner)) return;
+    void filesHandle.saveDirty(expectedOwner).catch((error) => {
+      console.error('Failed to sync Session drafts in background:', error);
+    });
+  }, []);
+
+  const openWorkspaceEntry = useCallback(async (
+    entry: WorkspaceEntry,
+    options?: { replace?: boolean; preserveSidebarMode?: boolean },
+  ) => {
+    const requestEpoch = ++workspaceOpenRequestEpochRef.current;
+    setSessionSwitchSaveError('');
+    flushCurrentSessionFiles();
+    if (requestEpoch !== workspaceOpenRequestEpochRef.current) return;
+    if (!options?.preserveSidebarMode) setSidebarMode('workspace');
+    // 同一文件标签可能已在右侧本地关闭，但 App 仍持有上一次 target。
+    // 每次用户点击都投影成新的目标事件，不能被 React 的同引用去重吞掉。
+    setWorkspaceFileTarget(entry.kind === 'file' ? { ...entry } : null);
+    const params = new URLSearchParams({ entry: entry.entry_id });
+    navigate(`/workspace?${params.toString()}`, { replace: options?.replace });
+  }, [flushCurrentSessionFiles, navigate]);
+
+  const handleWorkspaceTabSelect = useCallback((entry: WorkspaceEntry, options?: { replace?: boolean }) => {
+    void openWorkspaceEntry(entry, { ...options, preserveSidebarMode: true });
+  }, [openWorkspaceEntry]);
+
+  const requestWorkspaceEntry = useCallback((entry: WorkspaceEntry) => {
+    requestPrimarySurface('chat', () => { void openWorkspaceEntry(entry); });
+  }, [openWorkspaceEntry, requestPrimarySurface]);
+
+  useEffect(() => {
+    const handleWorkspaceNavigation = (event: Event) => {
+      const detail = (event as CustomEvent<{ entryId?: string }>).detail;
+      setSidebarMode('workspace');
+      if (!detail?.entryId) {
+        requestPrimarySurface('chat');
+        return;
+      }
+      const requestEpoch = ++workspaceOpenRequestEpochRef.current;
+      void workspaceApi.getEntry(detail.entryId).then((entry) => {
+        if (requestEpoch !== workspaceOpenRequestEpochRef.current) return;
+        requestWorkspaceEntry(entry);
+      }).catch((error) => {
+        console.error('Failed to open workspace entry:', error);
+        setSessionSwitchSaveError('无法打开工作区文件，请刷新工作区后重试。');
+      });
+    };
+    window.addEventListener('workspace:navigate', handleWorkspaceNavigation);
+    return () => window.removeEventListener('workspace:navigate', handleWorkspaceNavigation);
+  }, [requestPrimarySurface, requestWorkspaceEntry]);
+
+  useEffect(() => {
+    const currentUrl = `${location.pathname}${location.search}`;
+    if (!workspaceRouteActive) {
+      committedUrlRef.current = currentUrl;
+      return;
+    }
+    setSidebarMode('workspace');
+    const entryId = new URLSearchParams(location.search).get('entry');
+    if (!entryId) {
+      committedUrlRef.current = '/workspace';
+      if (currentUrl !== '/workspace') navigate('/workspace', { replace: true });
+      return;
+    }
+    const canonicalUrl = `/workspace?${new URLSearchParams({ entry: entryId }).toString()}`;
+    if (workspaceFileTarget?.entry_id === entryId) {
+      committedUrlRef.current = canonicalUrl;
+      if (currentUrl !== canonicalUrl) navigate(canonicalUrl, { replace: true });
+      return;
+    }
+    const requestEpoch = ++workspaceOpenRequestEpochRef.current;
+    void (async () => {
+      setSessionSwitchSaveError('');
+      flushCurrentSessionFiles();
+      if (requestEpoch !== workspaceOpenRequestEpochRef.current) return;
+      try {
+        const entry = await workspaceApi.getEntry(entryId);
+        if (requestEpoch !== workspaceOpenRequestEpochRef.current) return;
+        if (entry.kind !== 'file' || entry.status !== 'active') {
+          throw new Error('Workspace deep link does not resolve to an active file');
+        }
+        setWorkspaceFileTarget(entry);
+        committedUrlRef.current = canonicalUrl;
+        if (currentUrl !== canonicalUrl) navigate(canonicalUrl, { replace: true });
+      } catch (error) {
+        if (requestEpoch !== workspaceOpenRequestEpochRef.current) return;
+        console.error('Failed to resolve workspace deep link:', error);
+        setSessionSwitchSaveError('无法解析工作区深链，请从左侧工作区重新选择文件。');
+        const committedUrl = committedUrlRef.current;
+        const committedLocation = new URL(committedUrl, window.location.origin);
+        const committedEntryId = isWorkspacePath(committedLocation.pathname)
+          ? committedLocation.searchParams.get('entry')
+          : null;
+        const fallbackUrl = workspaceFileTarget?.entry_id
+          && committedEntryId === workspaceFileTarget.entry_id
+          ? `${committedLocation.pathname}${committedLocation.search}`
+          : '/workspace';
+        if (currentUrl !== fallbackUrl) navigate(fallbackUrl, { replace: true });
+      }
+    })();
+  }, [
+    flushCurrentSessionFiles,
+    location.pathname,
+    location.search,
+    navigate,
+    workspaceFileTarget?.entry_id,
+    workspaceRouteActive,
+  ]);
+
+  const handleWorkspaceFilesClose = useCallback(() => {
+    ++workspaceOpenRequestEpochRef.current;
+    setWorkspaceFileTarget(null);
+    if (
+      workspaceRouteActive
+      && new URLSearchParams(location.search).has('entry')
+    ) {
+      navigate('/workspace', { replace: true });
+    }
+  }, [location.search, navigate, workspaceRouteActive]);
+
+  useEffect(() => subscribeWorkspaceMutation((detail) => {
+    const affectedEntryIds = [...(detail.affectedEntryIds
+      || (detail.tombstone && detail.entryId ? [detail.entryId] : []))];
+    const activeEntryId = workspaceFileTarget?.entry_id;
+    if (!activeEntryId || !affectedEntryIds.includes(activeEntryId)) return;
+    handleWorkspaceFilesClose();
+  }), [handleWorkspaceFilesClose, workspaceFileTarget?.entry_id]);
+
+  const flushWorkspaceFiles = useCallback((): void => {
+    const handle = workspaceFilesHandleRef.current;
+    if (!handle?.hasDirty()) return;
+    void handle.saveDirty().catch((error) => {
+      console.error('Failed to sync workspace files in background:', error);
+    });
+  }, []);
+
+  const runAfterWorkspaceFlush = useCallback((action: () => void) => {
+    // 先触发编辑器内容抓取，再立即完成用户选择；远端发布在后台收尾。
+    flushWorkspaceFiles();
+    action();
+  }, [flushWorkspaceFiles]);
+
   const handleSessionSelect = useCallback((sessionId: string, target?: { roundId: string }) => {
     requestPrimarySurface('chat', () => {
-      void saveThenSelectSession(sessionId, target);
+      runAfterWorkspaceFlush(() => {
+        setSidebarMode('sessions');
+        setWorkspaceFileTarget(null);
+        if (workspaceRouteActive) navigate('/');
+        void saveThenSelectSession(sessionId, target);
+      });
     });
-  }, [requestPrimarySurface, saveThenSelectSession]);
+  }, [navigate, requestPrimarySurface, runAfterWorkspaceFlush, saveThenSelectSession, workspaceRouteActive]);
+
+  const handleNewChat = useCallback(() => {
+    requestPrimarySurface('chat', () => {
+      runAfterWorkspaceFlush(() => {
+        setSidebarMode('sessions');
+        setWorkspaceFileTarget(null);
+        if (workspaceRouteActive) navigate('/');
+        void saveThenSelectSession('');
+      });
+    });
+  }, [navigate, requestPrimarySurface, runAfterWorkspaceFlush, saveThenSelectSession, workspaceRouteActive]);
+
+  const handleSidebarModeChange = useCallback((mode: 'sessions' | 'workspace') => {
+    if (mode === 'workspace') {
+      requestPrimarySurface('chat', () => {
+        setSidebarMode('workspace');
+        // 工作区模式必须写入 URL，浏览器刷新才能恢复同一投影。已有 entry
+        // 深链保持原 URL，不能被无参数 /workspace 覆盖。
+        if (!workspaceRouteActive) navigate('/workspace');
+      });
+      return;
+    }
+    if (workspaceRouteActive) {
+      setSidebarMode('sessions');
+      return;
+    }
+    requestPrimarySurface('chat', () => setSidebarMode('sessions'));
+  }, [navigate, requestPrimarySurface, workspaceRouteActive]);
 
   const reconcileRunningSessions = useCallback(async () => {
     try {
@@ -562,32 +826,41 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
         <AppSidebar
           collapsed={effectiveSidebarCollapsed}
           boundaryClaimed={activeSurface === 'chat' && sessionFilesOwnsBoundary}
+          mobileOpen={mobileSidebarOpen}
           userId={apiService.getUserId() || 'user'}
           onCollapsedChange={setIsSidebarCollapsed}
         >
           <SessionList
+            mobileSheet={mobileSidebarOpen}
+            onCloseMobileSheet={() => setMobileSidebarOpen(false)}
             currentSessionId={currentSessionId}
-            onSessionSelect={handleSessionSelect}
+            onSessionSelect={(sessionId, target) => {
+              setMobileSidebarOpen(false);
+              handleSessionSelect(sessionId, target);
+            }}
             refreshTrigger={refreshTrigger}
             optimisticSession={optimisticSession}
             executingSessionIds={executingSessionIds}
             isCollapsed={effectiveSidebarCollapsed}
             onModelChange={setSelectedModelId}
-            onNewChat={() => {
-              requestPrimarySurface('chat', () => {
-                void saveThenSelectSession('');
-              });
-            }}
+            onNewChat={() => { setMobileSidebarOpen(false); handleNewChat(); }}
             cronUnreadCount={cronUnreadCount}
-            onOpenConfig={toggleSettingsPanel}
-            onOpenCron={() => requestPrimarySurface('schedule')}
+            onOpenConfig={() => { setMobileSidebarOpen(false); toggleSettingsPanel(); }}
+            onOpenCron={() => { setMobileSidebarOpen(false); requestPrimarySurface('schedule'); }}
             activePrimarySurface={activeSurface}
-            onOpenSkills={() => requestPrimarySurface('skills')}
-            onOpenConnections={() => requestPrimarySurface('connections')}
+            onOpenSkills={() => { setMobileSidebarOpen(false); requestPrimarySurface('skills'); }}
+            onOpenConnections={() => { setMobileSidebarOpen(false); requestPrimarySurface('connections'); }}
+            sidebarMode={effectiveSidebarMode}
+            onSidebarModeChange={handleSidebarModeChange}
+            activeWorkspaceEntryId={workspaceFileTarget?.entry_id}
+            onOpenWorkspaceEntry={(entry) => {
+              setMobileSidebarOpen(false);
+              requestWorkspaceEntry(entry);
+            }}
           />
         </AppSidebar>
-        <div className="relative flex min-w-0 flex-1 overflow-hidden">
-          {!activePanel && (
+        <div ref={primaryContentRef} aria-hidden={mobileSidebarOpen || undefined} className="relative flex min-w-0 flex-1 overflow-hidden">
+          {!activePanel && !sessionFilesOwnsBoundary && (
             <nav
               aria-label="移动端主导航"
               className="fixed left-3 top-2 z-30 flex items-center gap-1 rounded-xl border border-[#e8e3d9] bg-white/95 p-1 shadow-[0_6px_20px_rgba(30,26,20,0.10)] backdrop-blur md:hidden"
@@ -602,7 +875,15 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
                   key={item.id}
                   type="button"
                   aria-current={activeSurface === item.id ? 'page' : undefined}
-                  onClick={() => requestPrimarySurface(item.id)}
+                  onClick={() => {
+                    if (item.id === 'chat') {
+                      requestPrimarySurface('chat');
+                      setMobileSidebarOpen(true);
+                    } else {
+                      setMobileSidebarOpen(false);
+                      requestPrimarySurface(item.id);
+                    }
+                  }}
                   className={`flex h-8 items-center gap-1.5 rounded-lg px-2 text-[12px] font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#b8814a]/30 ${
                     activeSurface === item.id
                       ? 'bg-[#f5ece2] text-[#8a5a2f]'
@@ -630,9 +911,14 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
               onSessionCreated={handleSessionCreatedForChat}
               onFilesFullChange={setSessionFilesOwnsBoundary}
               sessionFilesHandleRef={sessionFilesHandleRef}
+              workspaceFilesHandleRef={captureWorkspaceFilesHandle}
               onStartEdgeCollapseSidebar={() => setIsSidebarCollapsed(true)}
               scrollTarget={sessionScrollTarget}
               activeSlotSessionIds={activeSlotSessionIds}
+              workspaceFileTarget={workspaceFileTarget}
+              workspaceTargetResolving={workspaceTargetResolving}
+              onWorkspaceFilesClose={handleWorkspaceFilesClose}
+              onWorkspaceTabSelect={handleWorkspaceTabSelect}
             />
           </div>
 
@@ -766,13 +1052,14 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
             </div>
       )}
       {sessionSwitchSaveError && (
-        <div
-          role="alert"
-          aria-live="assertive"
-          data-testid="session-switch-save-error"
-          className="fixed bottom-5 left-1/2 z-50 w-[min(520px,calc(100vw-32px))] -translate-x-1/2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[13px] font-medium text-red-800 shadow-lg"
-        >
-          {sessionSwitchSaveError}
+        <div data-testid="session-switch-save-error">
+          <FeedbackMessage
+            className="fixed bottom-5 left-1/2 z-50 w-[min(520px,calc(100vw-32px))] -translate-x-1/2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[13px] font-medium text-red-800 shadow-lg"
+            tone="error"
+            onDismiss={() => setSessionSwitchSaveError('')}
+          >
+            {sessionSwitchSaveError}
+          </FeedbackMessage>
         </div>
       )}
     </div>
@@ -852,6 +1139,7 @@ function createAppRouter() {
         { path: 'schedule', element: null },
         { path: 'skills', element: null },
         { path: 'connections', element: null },
+        { path: 'workspace', element: null },
       ],
     },
     {

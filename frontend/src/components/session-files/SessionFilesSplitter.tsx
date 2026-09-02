@@ -9,6 +9,7 @@ interface SessionFilesSplitterProps {
 
 const MIN_CHAT_RATIO = 0;
 const MAX_CHAT_RATIO = 100;
+const CHAT_RATIO_CSS_PROPERTY = '--session-files-chat-ratio';
 
 function clampRatio(value: number): number {
   return Math.min(MAX_CHAT_RATIO, Math.max(MIN_CHAT_RATIO, value));
@@ -22,6 +23,9 @@ export function SessionFilesSplitter({
 }: SessionFilesSplitterProps) {
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
+    const container = containerRef.current;
+    const bounds = container?.getBoundingClientRect();
+    if (!container || !bounds?.width) return;
     event.preventDefault();
     const separator = event.currentTarget;
     separator.setPointerCapture?.(event.pointerId);
@@ -29,6 +33,19 @@ export function SessionFilesSplitter({
     const startX = event.clientX;
     let dragOwner: 'pending' | 'sidebar' | 'files' = startsAtLeftEdge ? 'pending' : 'files';
     let sidebarCollapsed = false;
+    let animationFrameId: number | null = null;
+    let pendingRatio: number | null = null;
+    let renderedRatio = chatRatio;
+    let committedRatio = chatRatio;
+    let endpointReleaseCommitted = chatRatio > MIN_CHAT_RATIO && chatRatio < MAX_CHAT_RATIO;
+
+    const renderPendingRatio = () => {
+      animationFrameId = null;
+      if (pendingRatio === null) return;
+      renderedRatio = pendingRatio;
+      pendingRatio = null;
+      container.style.setProperty(CHAT_RATIO_CSS_PROPERTY, `${renderedRatio}%`);
+    };
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
       if (dragOwner === 'pending') {
@@ -43,13 +60,33 @@ export function SessionFilesSplitter({
         }
         return;
       }
-      const bounds = containerRef.current?.getBoundingClientRect();
-      if (!bounds?.width) return;
       const nextRatio = ((moveEvent.clientX - bounds.left) / bounds.width) * 100;
-      onRatioChange(clampRatio(nextRatio));
+      const clampedRatio = clampRatio(nextRatio);
+      if (!endpointReleaseCommitted) {
+        if (clampedRatio <= MIN_CHAT_RATIO || clampedRatio >= MAX_CHAT_RATIO) return;
+        // 端点依赖 React 切换 display；首次离开端点必须同步恢复 split。
+        endpointReleaseCommitted = true;
+        renderedRatio = clampedRatio;
+        committedRatio = clampedRatio;
+        container.style.setProperty(CHAT_RATIO_CSS_PROPERTY, `${clampedRatio}%`);
+        onRatioChange(clampedRatio);
+        return;
+      }
+      pendingRatio = clampedRatio;
+      if (animationFrameId === null) {
+        animationFrameId = window.requestAnimationFrame(renderPendingRatio);
+      }
     };
 
     const finish = () => {
+      if (animationFrameId !== null) {
+        window.cancelAnimationFrame(animationFrameId);
+        renderPendingRatio();
+      }
+      if (dragOwner === 'files' && renderedRatio !== committedRatio) {
+        committedRatio = renderedRatio;
+        onRatioChange(renderedRatio);
+      }
       separator.releasePointerCapture?.(event.pointerId);
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', finish);

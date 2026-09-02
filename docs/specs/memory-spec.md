@@ -35,6 +35,7 @@
 | chunk_index | Integer | nullable |
 | chunk_text | Text | NOT NULL |
 | embedding | PostgreSQL pgvector `vector(2560)` | nullable（float 数组；不足 2560 维右侧补 0） |
+| conversation_round_id | String(36) | nullable，FK → `rounds.id`，ON DELETE CASCADE |
 | created_at | DateTime | default=now |
 
 ### user_skill_configs 表
@@ -213,6 +214,7 @@
 
 - 当前没有任何轮后、token 阈值或 compaction 联动的模型记忆写入流程；Round 收尾只同步本轮已经显式发生的 dirty 文件写入，并为本轮对话维护 `conversation/*` episodic embedding
 - `conversation/*` 是可检索的对话索引，不是 canonical Memory，也不得被当作自动提炼结果写回 `MEMORY.md`
+- 新建对话索引必须写 `conversation_round_id`，Session 删除经 Round 级联删除这些索引。升级前旧索引不回填，允许永久为 NULL，且不阻断旧 Session 删除。
 - 后续若引入候选提炼，必须在会话真正空闲后由持久化后台 job 执行，允许明确 no-op，并在进入模型前过滤 compaction summary、AGENTS/developer 指令、测试夹具及临时任务状态
 - 后续候选只能写 append-only staging；在 consolidator 去重、解决冲突并按 scope 晋升前，不得更新 canonical Memory。该 candidate/consolidator 管道当前尚未实现
 

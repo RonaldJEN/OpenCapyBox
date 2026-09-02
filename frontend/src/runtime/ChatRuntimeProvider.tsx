@@ -10,6 +10,10 @@ import React, {
 
 import { apiService } from '../services/api';
 import {
+  emitWorkspaceInvalidations,
+  subscribeWorkspaceMutation,
+} from '../services/workspaceEvents';
+import {
   RuntimeSubscription,
   startResumeStream,
   startSendStream,
@@ -71,6 +75,7 @@ interface ChatRuntimeContextValue {
     sessionId: string,
     interrupt: InterruptDetails,
     answers: Record<string, string>,
+    pendingFileDrafts?: import('../types').PendingFileDraftInfo[],
   ) => Promise<void>;
   stopSessionRun: (sessionId: string) => Promise<void>;
   clearSessionView: (sessionId: string) => void;
@@ -154,6 +159,12 @@ export function ChatRuntimeProvider({
   const initPollTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const terminalRunKeysRef = useRef<Set<string>>(new Set());
   const stoppingRunKeysRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => subscribeWorkspaceMutation((detail) => {
+    if (!detail.tombstone) return;
+    const entryIds = detail.affectedEntryIds || (detail.entryId ? [detail.entryId] : []);
+    if (entryIds.length > 0) dispatch({ type: 'WORKSPACE_ENTRIES_DELETED', entryIds });
+  }), []);
 
   const notifyStart = useCallback((sessionId: string) => {
     onExecutionStart?.(sessionId);
@@ -320,6 +331,23 @@ export function ChatRuntimeProvider({
 
     if (envelope.event?.type === 'CUSTOM' && envelope.event.name === 'title_updated') {
       onTitleUpdated?.();
+    }
+    if (envelope.event?.type === 'CUSTOM' && envelope.event.name === 'workspace_resource_changed') {
+      const value = envelope.event.value && typeof envelope.event.value === 'object'
+        ? envelope.event.value as Record<string, unknown>
+        : {};
+      emitWorkspaceInvalidations([{
+        operation: typeof value.operation === 'string' ? value.operation : 'updated',
+        entryId: typeof value.entry_id === 'string' ? value.entry_id : undefined,
+        tombstone: String(value.operation).toUpperCase() === 'DELETED',
+        affectedEntryIds: Array.isArray(value.affected_entry_ids)
+          ? value.affected_entry_ids.filter((id): id is string => typeof id === 'string')
+          : undefined,
+        path: typeof value.path === 'string' ? value.path : undefined,
+        revision: typeof value.revision === 'number' ? value.revision : undefined,
+        versionId: typeof value.current_version_id === 'string' ? value.current_version_id : null,
+        origin: 'server',
+      }]);
     }
     if (
       (envelope.event?.type === 'CUSTOM'
@@ -657,6 +685,7 @@ export function ChatRuntimeProvider({
     preferredSkillKeys = [],
     preferredMcpConnections = [],
     reasoning,
+    pendingFileDrafts = [],
     onStreamAccepted,
     onRejectedBeforeAccept,
   }: SendMessageInput) => {
@@ -720,9 +749,16 @@ export function ChatRuntimeProvider({
         preferredMcpServerIds: preferredMcpConnections.map(
           (connection) => connection.server_id,
         ),
-        reasoning,
+      reasoning,
+        pendingFileDrafts,
         onRejectedBeforeAccept: () => {
           if (isCurrentTransport(clientRunKey, transportEpoch, connectionId)) {
+            controlConflictHandled = true;
+            dispatch({
+              type: 'LOCAL_CONTROL_CONFLICT',
+              sessionId,
+              clientRunKey,
+            });
             onRejectedBeforeAccept?.();
           }
         },
@@ -854,6 +890,7 @@ export function ChatRuntimeProvider({
     sessionId: string,
     interrupt: InterruptDetails,
     answers: Record<string, string>,
+    pendingFileDrafts: import('../types').PendingFileDraftInfo[] = [],
   ) => {
     if (!interrupt.id) return;
     const waitingRound = stateRef.current.sessions[sessionId]?.rounds.find(
@@ -923,6 +960,7 @@ export function ChatRuntimeProvider({
         source: 'resume',
         interruptId: interrupt.id,
         answers,
+        pendingFileDrafts,
         serverRunId,
         lastSequence: existingRunKey
           ? stateRef.current.runs[existingRunKey]?.lastSequence

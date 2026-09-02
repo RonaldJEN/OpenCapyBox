@@ -85,6 +85,8 @@
 3. 无本地规则时：平台 managed ALLOW → allow；否则用 provider 默认（builtin=allow，mcp=allow）
 4. **平台 managed ASK 是天花板**：下级可收紧到 DENY，但不可放宽到 ALLOW（ALLOW 会被抬回 ASK）
 
+混合读写能力的内置工具可以在参数校验后通过 `permission_ref_for(arguments)` 投影更窄的调用身份，并通过 `permission_default_effect_for(arguments)` 把该身份的默认策略收紧为 `ask`。模型可见工具名不变，但审批请求、记住选择、执行前复核和权限审计必须始终使用同一组参数解析出的身份；不得让一次无害操作的 `builtin=allow` 授权覆盖高风险参数。
+
 ### 4.2 条件匹配（无效授权不命中，限制规则保守生效）
 - `conditions_json` NULL = 无条件适用
 - 解析/校验失败：该条件 **ALLOW 规则不参与裁决**，ASK/DENY 仍保守适用，避免损坏的限制规则被意外移除

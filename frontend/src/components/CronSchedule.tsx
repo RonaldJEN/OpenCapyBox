@@ -15,6 +15,7 @@ import TaskFormDrawer from './cron/TaskFormDrawer';
 import WeekAgenda from './cron/WeekAgenda';
 import ScheduleList from './cron/ScheduleList';
 import { ConfirmDialog } from './ConfirmDialog';
+import FeedbackMessage from './FeedbackMessage';
 
 // ────────────────────────────────────────────
 // Helpers
@@ -291,12 +292,6 @@ const CronSchedule: React.FC<Props> = ({
     loadData();
   }, [loadData]);
 
-  useEffect(() => {
-    if (!notice) return;
-    const timer = setTimeout(() => setNotice(null), 2500);
-    return () => clearTimeout(timer);
-  }, [notice]);
-
   const handleTrigger = useCallback(async (name: string) => {
     setTriggeringSet((prev) => new Set(prev).add(name));
     const clearTriggering = () => {
@@ -307,7 +302,7 @@ const CronSchedule: React.FC<Props> = ({
     try {
       const result = await triggerCronJob(name);
 
-      // 轮询执行状态，直到退出 running。
+      // queued/running 都是执行中；只在明确终态后停止轮询。
       const runId = result.run_id;
       const poll = async () => {
         while (mountedRef.current) {
@@ -315,11 +310,11 @@ const CronSchedule: React.FC<Props> = ({
           if (!mountedRef.current) return;
           try {
             const run = await getCronRunStatus(runId);
-            if (run.status !== 'running') {
+            if (run.status !== 'queued' && run.status !== 'running') {
               if (!mountedRef.current) return;
               // 执行完成后：成功静默，失败才提示。
               if (run.status !== 'success') {
-                setNotice({ type: 'error', text: `任务 ${name} 执行失败` });
+                setNotice({ type: 'error', text: `任务 ${name} 执行${run.status === 'conflict' ? '发生冲突' : run.status === 'unknown' ? '状态未知' : '失败'}` });
               }
               const allResp = await getCronRuns(undefined, 100);
               if (!mountedRef.current) return;
@@ -491,11 +486,15 @@ const CronSchedule: React.FC<Props> = ({
 
       {!showMessages && notice && (
         <div className="px-4 pt-3">
-          <div className={`rounded-md border px-3 py-2 text-sm ${
-            notice.type === 'success' ? 'border-green-200 bg-green-50 text-green-700' : 'border-red-200 bg-red-50 text-red-700'
-          }`}>
+          <FeedbackMessage
+            className={`rounded-md border px-3 py-2 text-sm ${
+              notice.type === 'success' ? 'border-green-200 bg-green-50 text-green-700' : 'border-red-200 bg-red-50 text-red-700'
+            }`}
+            tone={notice.type}
+            onDismiss={() => setNotice(null)}
+          >
             {notice.text}
-          </div>
+          </FeedbackMessage>
         </div>
       )}
 
@@ -516,7 +515,10 @@ const CronSchedule: React.FC<Props> = ({
             </button>
             <h2 className="text-[15px] font-semibold text-claude-text">执行记录</h2>
           </div>
-          <CronMessageCenter onUnreadChange={onUnreadChange} />
+          <CronMessageCenter
+            unreadCount={unreadCount}
+            onUnreadChange={onUnreadChange || (() => undefined)}
+          />
         </div>
       ) : loading ? (
         <div className="flex items-center justify-center h-32 text-claude-muted">加载中...</div>

@@ -253,6 +253,7 @@ Content for skill {i}
         assert "## Available Skills" in prompt
         assert "test_skill" in prompt
         assert "A test skill for testing" in prompt
+        assert "Load a skill's full content" not in prompt
 
     def test_load_skill_with_extra_frontmatter_ignored(self, skills_dir):
         """测试非标准 frontmatter 字段被忽略"""

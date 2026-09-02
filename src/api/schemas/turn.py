@@ -69,6 +69,7 @@ class NormalizedResumeTurn(StrictModel):
     session_id: str
     interrupt_id: str
     answers: dict[str, str]
+    context: list[Context] = Field(default_factory=list)
     reply_route: ReplyRoute
     metadata: dict[str, Any] = Field(default_factory=dict)
 

@@ -13,6 +13,7 @@ import asyncio
 import logging
 import posixpath
 import uuid
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
@@ -20,6 +21,10 @@ from opensandbox import Sandbox
 from opensandbox.models.execd import RunCommandOpts
 
 from .base import Tool, ToolResult
+from .session_file_references import (
+    changed_session_file_references,
+    snapshot_session_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +237,15 @@ class SandboxBashOutputResult(ToolResult):
 BashOutputResult = SandboxBashOutputResult
 
 
+@dataclass
+class _TrackedBackgroundCommand:
+    sandbox: Sandbox
+    command_id: str
+    workspace_dir: str
+    files_before: dict[str, dict[str, Any]] | None = None
+    artifacts_emitted: bool = False
+
+
 class _BackgroundCommandTracker:
     """追蹤沙箱中的後台命令（按實例隔離，避免跨用戶/跨會話泄露）
 
@@ -240,15 +254,28 @@ class _BackgroundCommandTracker:
     """
 
     def __init__(self) -> None:
-        self._commands: dict[str, tuple[Sandbox, str]] = {}
+        self._commands: dict[str, _TrackedBackgroundCommand] = {}
 
-    def add(self, bash_id: str, sandbox: Sandbox, command_id: str) -> None:
-        self._commands[bash_id] = (sandbox, command_id)
+    def add(
+        self,
+        bash_id: str,
+        sandbox: Sandbox,
+        command_id: str,
+        *,
+        workspace_dir: str = "/home/user",
+        files_before: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        self._commands[bash_id] = _TrackedBackgroundCommand(
+            sandbox=sandbox,
+            command_id=command_id,
+            workspace_dir=workspace_dir,
+            files_before=files_before,
+        )
 
-    def get(self, bash_id: str) -> tuple[Sandbox, str] | None:
+    def get(self, bash_id: str) -> _TrackedBackgroundCommand | None:
         return self._commands.get(bash_id)
 
-    def remove(self, bash_id: str) -> tuple[Sandbox, str] | None:
+    def remove(self, bash_id: str) -> _TrackedBackgroundCommand | None:
         return self._commands.pop(bash_id, None)
 
     def get_available_ids(self) -> list[str]:
@@ -256,7 +283,11 @@ class _BackgroundCommandTracker:
 
     def cleanup_by_sandbox(self, sandbox: Sandbox) -> int:
         """清理指定 sandbox 關聯的所有後台命令追蹤"""
-        to_remove = [bid for bid, (sbx, _) in self._commands.items() if sbx is sandbox]
+        to_remove = [
+            bid
+            for bid, tracked in self._commands.items()
+            if tracked.sandbox is sandbox
+        ]
         for bid in to_remove:
             del self._commands[bid]
         return len(to_remove)
@@ -318,9 +349,9 @@ class _BackgroundCommandTracker:
     async def interrupt_by_sandbox(self, sandbox: Sandbox) -> dict[str, int]:
         """Interrupt tracked background commands for a sandbox, then clear local state."""
         matched = [
-            (bash_id, command_id)
-            for bash_id, (sbx, command_id) in self._commands.items()
-            if sbx is sandbox
+            (bash_id, tracked.command_id)
+            for bash_id, tracked in self._commands.items()
+            if tracked.sandbox is sandbox
         ]
         stats = {
             "matched": len(matched),
@@ -431,8 +462,7 @@ Parameters:
 
 Tips:
   - This is a Linux environment (not Windows)
-    - Working directory is the configured sandbox workspace root
-    - Skills are available at <workspace_root>/skills/
+    - Working directory is the current execution Workspace shown in the system context
   - You can install any package: pip install xxx, npm install xxx
   - Chain commands with &&: cd project && python app.py
   - For pytest/test/build/install commands, pass timeout=300 or timeout=600.
@@ -505,6 +535,15 @@ Examples:
         """前台執行命令"""
         logger.debug("沙箱前台命令: %s (timeout=%ds)", command, timeout)
 
+        try:
+            files_before = await snapshot_session_files(
+                self._sandbox,
+                self._workspace_dir,
+            )
+        except Exception:
+            files_before = None
+            logger.debug("命令执行前的 Session 文件快照失败", exc_info=True)
+
         opts = RunCommandOpts(
             background=False,
             timeout=timedelta(seconds=timeout),
@@ -562,6 +601,20 @@ Examples:
                 exit_code = 0
 
         is_success = exit_code == 0
+        changed_files: list[dict[str, Any]] = []
+        if is_success and files_before is not None:
+            try:
+                files_after = await snapshot_session_files(
+                    self._sandbox,
+                    self._workspace_dir,
+                )
+                if files_after is not None:
+                    changed_files = changed_session_file_references(
+                        files_before,
+                        files_after,
+                    )
+            except Exception:
+                logger.debug("命令执行后的 Session 文件快照失败", exc_info=True)
 
         # 诊断日志：当结果为空时记录 execution 对象细节，便于排查
         if not stdout and not stderr and not is_success:
@@ -603,12 +656,22 @@ Examples:
             stderr=stderr,
             exit_code=exit_code,
             error=error_msg,
+            assistant_file_references=changed_files or None,
         )
 
     async def _run_background(self, command: str) -> SandboxBashOutputResult:
         """後台執行命令"""
         bash_id = str(uuid.uuid4())[:8]
         logger.debug("沙箱後台命令: %s (bash_id=%s)", command, bash_id)
+
+        try:
+            files_before = await snapshot_session_files(
+                self._sandbox,
+                self._workspace_dir,
+            )
+        except Exception:
+            files_before = None
+            logger.debug("后台命令执行前的 Session 文件快照失败", exc_info=True)
 
         opts_kwargs: dict[str, Any] = {
             "background": True,
@@ -631,7 +694,13 @@ Examples:
 
         # 追蹤後台命令
         command_id = execution.id if hasattr(execution, 'id') else bash_id
-        self._tracker.add(bash_id, self._sandbox, command_id)
+        self._tracker.add(
+            bash_id,
+            self._sandbox,
+            command_id,
+            workspace_dir=self._workspace_dir,
+            files_before=files_before,
+        )
         logger.info(
             "沙箱后台命令已启动: bash_id=%s, command_id=%s, timeout_seconds=%s",
             bash_id,
@@ -695,7 +764,8 @@ Example: bash_output(bash_id="abc12345")"""
                     error=f"Background command not found: {bash_id}. Available: {available or 'none'}",
                 )
 
-            sandbox, command_id = tracked
+            sandbox = tracked.sandbox
+            command_id = tracked.command_id
 
             command_logs = await sandbox.commands.get_background_command_logs(command_id)
             command_status = await sandbox.commands.get_command_status(command_id)
@@ -708,6 +778,25 @@ Example: bash_output(bash_id="abc12345")"""
             exit_code = getattr(command_status, "exit_code", 0)
             if exit_code is None:
                 exit_code = 0
+            changed_files: list[dict[str, Any]] = []
+            if (
+                not self._tracker._status_is_running(command_status)
+                and not tracked.artifacts_emitted
+                and tracked.files_before is not None
+            ):
+                try:
+                    files_after = await snapshot_session_files(
+                        sandbox,
+                        tracked.workspace_dir,
+                    )
+                    if files_after is not None:
+                        changed_files = changed_session_file_references(
+                            tracked.files_before,
+                            files_after,
+                        )
+                        tracked.artifacts_emitted = True
+                except Exception:
+                    logger.debug("后台命令完成后的 Session 文件快照失败", exc_info=True)
 
             return SandboxBashOutputResult(
                 success=True,
@@ -715,6 +804,7 @@ Example: bash_output(bash_id="abc12345")"""
                 stderr=stderr,
                 exit_code=exit_code,
                 bash_id=bash_id,
+                assistant_file_references=changed_files or None,
             )
 
         except Exception as e:
@@ -775,7 +865,8 @@ Example: bash_kill(bash_id="abc12345")"""
                     error=f"Background command not found: {bash_id}. Available: {available or 'none'}",
                 )
 
-            sandbox, command_id = tracked
+            sandbox = tracked.sandbox
+            command_id = tracked.command_id
 
             # 嘗試終止命令
             try:

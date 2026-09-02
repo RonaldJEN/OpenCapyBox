@@ -873,6 +873,7 @@ class MemoryService:
                 chunk_index=i,
                 chunk_text=chunk,
                 embedding=normalize_embedding_vector(emb),
+                conversation_round_id=round_id,
             )
             self.db.add(record)
 

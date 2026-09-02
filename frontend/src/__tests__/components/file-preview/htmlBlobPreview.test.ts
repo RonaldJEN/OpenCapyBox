@@ -58,6 +58,30 @@ describe('HTML Blob 单独查看', () => {
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:wrapper');
   });
 
+  it('不添加额外 CSP，保留原始 HTML 和同源隔离，标题不能注入包装页脚本', async () => {
+    vi.useRealTimers();
+    const html = '<h1>加载中</h1><script>document.querySelector("h1").textContent="已就绪"</script>';
+    const title = '看板"><script>alert(1)</script>';
+    const openedWindow = { opener: window } as unknown as Window;
+
+    openHtmlBlobPreview(html, title, () => openedWindow);
+
+    expect(await readBlobText(createObjectURL.mock.calls[0][0] as Blob)).toBe(html);
+    const wrapper = new DOMParser().parseFromString(
+      await readBlobText(createObjectURL.mock.calls[1][0] as Blob),
+      'text/html',
+    );
+    expect(wrapper.querySelector('meta[http-equiv="Content-Security-Policy"]')).toBeNull();
+    expect(wrapper.querySelector('script')).toBeNull();
+    expect(wrapper.title).toBe(title);
+    const iframe = wrapper.querySelector('iframe');
+    expect(iframe?.getAttribute('src')).toBe('blob:content');
+    expect(iframe?.getAttribute('sandbox')).toBe('allow-scripts');
+    expect(iframe?.getAttribute('referrerpolicy')).toBe('no-referrer');
+    expect(iframe?.getAttribute('title')).toBe(title);
+    expect(openedWindow.opener).toBeNull();
+  });
+
   it('成功打开后断开 opener 并在有界 TTL 到期时回收', () => {
     const openedWindow = { opener: window } as unknown as Window;
     const openWindow = vi.fn(() => openedWindow);
@@ -116,6 +140,7 @@ describe('HTML Blob 单独查看', () => {
     expect(wrapper).toContain('sandbox="allow-scripts"');
     expect(wrapper).not.toContain('allow-same-origin');
     expect(wrapper).not.toContain('accessToken');
+    expect(wrapper).not.toContain('Content-Security-Policy');
   });
 
   it('预先打开的窗口按调用方 TTL 回收内容与包装页 URL', () => {

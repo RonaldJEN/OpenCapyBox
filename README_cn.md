@@ -532,6 +532,8 @@ AG-UI 协议详见 [docs/Capy-project-md/ag-ui-md/](docs/Capy-project-md/ag-ui-m
 
 ### 运行测试
 
+项目回归只保留少量关键门槛：优先复用或改写已有用例，不为一次功能修改默认新增多套测试文件。UI、编辑器和切换性能必须直接在真实浏览器中高频验证；持久化功能还要同时核对数据库记录、物理文件 SHA 和真实格式解析结果，并派 Terra 只读扫描实际 Sandbox 文件与版本快照，不能只看 API 回包。下面的全量命令用于发布门禁或排查污染，不代替上述真实链路验收。
+
 ```bash
 # Python 后端测试
 uv run pytest tests/ -v
@@ -547,7 +549,7 @@ cd frontend && npm run test
 
 1. 在 `src/agent/tools/` 创建工具类，继承 `Tool` 基类
 2. 在 `src/api/services/tool_factory.py` 的 `create_agent_tools()` 中注册
-3. 编写 `tests/` 测试
+3. 复用或改写最少量的关键回归用例；涉及交互/持久化时补真实浏览器与数据库/物理文件验证
 4. 同步更新 `docs/specs/` 下对应的 spec
 
 ```python

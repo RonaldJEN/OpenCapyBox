@@ -1,13 +1,13 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '../utils/test-utils';
 import { ChatV2 } from '../../components/ChatV2';
 import { apiService } from '../../services/api';
+import { workspaceApi } from '../../services/workspaceApi';
+import { emitWorkspaceMutation, resetWorkspaceEventsForTests } from '../../services/workspaceEvents';
 import { makeChatV2DefaultProps } from '../utils/chatv2-helpers';
 
 let lastChatInputProps: any = null;
 let lastArtifactsPanelProps: any = null;
-let artifactsPanelPropsHistory: any[] = [];
-let lastRoundProps: any = null;
 let lastFilePreviewProps: any = null;
 
 vi.mock('../../services/api', () => ({
@@ -19,57 +19,29 @@ vi.mock('../../services/api', () => ({
     getRunningSessions: vi.fn(),
     createSession: vi.fn(),
     getUserId: vi.fn(() => 'demo-session'),
+    getAuthHeaders: vi.fn(() => ({})),
   },
 }));
 
-vi.mock('../../services/chatStreamClient', async () => {
-  const { apiService } = await import('../../services/api');
-  const envelope = (args: any, event: any, meta?: any) => ({
-    ownerSessionId: args.ownerSessionId,
-    clientRunKey: args.clientRunKey,
-    serverRunId: event?.runId,
-    transportEpoch: args.transportEpoch,
-    connectionId: args.connectionId,
-    event,
-    source: args.source,
-    sequence: meta?.sequence ?? event?.sequence ?? event?._sequence,
-    isAggregate: meta?.isAggregate ?? event?.isAggregate,
-    messageId: event?.messageId,
-    toolCallId: event?.toolCallId,
-    receivedAt: Date.now(),
-  });
-  const emit = (args: any, event: any, meta?: any) => args.onEnvelope(envelope(args, event, meta));
-  const callbacksFor = (args: any) => ({
-    onStreamAccepted: () => emit(args, { type: 'CUSTOM', name: 'stream_accepted', value: {} }),
-    onRunStarted: (threadId: string, runId: string) => emit(args, { type: 'RUN_STARTED', threadId, runId }),
-    onRunFinished: (threadId: string, runId: string, result: any, outcome: string, interrupt?: any) => (
-      emit(args, { type: 'RUN_FINISHED', threadId, runId, result, outcome, interrupt })
-    ),
-    onRunError: (message: string, code?: string) => {
-      args.onError?.(message, code);
-      emit(args, { type: 'RUN_ERROR', message, code });
-    },
-    onTextMessageContent: (messageId: string, delta: string, meta?: any) => (
-      emit(args, { type: 'TEXT_MESSAGE_CONTENT', messageId, delta }, meta)
-    ),
-  });
+vi.mock('../../services/chatStreamClient', () => ({
+  startSendStream: vi.fn(() => ({ abort: vi.fn(), promise: Promise.resolve() })),
+  startResumeStream: vi.fn(() => ({ abort: vi.fn(), promise: Promise.resolve() })),
+  startSubscribeStream: vi.fn(() => ({
+    abort: vi.fn(),
+    promise: Promise.resolve(),
+    getLatestSequence: () => 0,
+  })),
+}));
 
-  return {
-    startSendStream: vi.fn((args: any) => ({
-      abort: vi.fn(),
-      promise: apiService.sendMessageStreamV2(args.ownerSessionId, args.content, callbacksFor(args)),
-    })),
-    startResumeStream: vi.fn((_args: any) => ({
-      abort: vi.fn(),
-      promise: Promise.resolve(),
-    })),
-    startSubscribeStream: vi.fn(() => ({
-      abort: vi.fn(),
-      promise: Promise.resolve(),
-      getLatestSequence: () => 0,
-    })),
-  };
-});
+vi.mock('../../services/workspaceApi', () => ({
+  workspaceApi: {
+    getEntry: vi.fn(),
+    versionContentUrl: vi.fn((versionId: string, preview = false) => (
+      `/api/workspace/versions/${versionId}/content${preview ? '?preview=true' : ''}`
+    )),
+    contentPathUrl: vi.fn((path: string) => `/api/workspace/content?path=${encodeURIComponent(path)}&preview=true`),
+  },
+}));
 
 vi.mock('../../components/ChatInput', () => ({
   ChatInput: (props: any) => {
@@ -80,23 +52,55 @@ vi.mock('../../components/ChatInput', () => ({
 
 vi.mock('../../components/Round', () => ({
   Round: (props: any) => {
-    lastRoundProps = props;
-    const matchedFile = props.assistantFileMatches?.['quick_sort.py'];
+    const reference = props.round.assistant_file_references?.[0];
+    const userAttachment = props.userAttachments?.[0];
+    if (!reference) return (
+      <div data-testid="round-without-file" data-user-attachments={props.userAttachments?.length || 0}>
+        {userAttachment && (
+          <button
+            type="button"
+            data-testid="open-user-attachment"
+            onClick={() => props.onPreviewAttachment?.(userAttachment)}
+          >
+            user attachment
+          </button>
+        )}
+      </div>
+    );
+    const file = reference.source === 'session'
+      ? {
+          source: 'session',
+          session_id: reference.session_id,
+          name: reference.name,
+          path: reference.path,
+          snapshot_path: reference.snapshot_path,
+          size: reference.size,
+          modified: reference.modified,
+          type: reference.type,
+          revision: reference.revision,
+          content_mode: 'current',
+          assistant_ref_id: reference.ref_id,
+        }
+      : {
+          source: 'workspace',
+          entry_id: reference.entry_id,
+          workspace_path: reference.workspace_path,
+          name: reference.name,
+          path: reference.workspace_path,
+          size: reference.size,
+          modified: reference.modified,
+          type: reference.type,
+          revision: reference.revision,
+          version_id: reference.version_id,
+          content_mode: 'current',
+          assistant_ref_id: reference.ref_id,
+        };
     return (
-      <button
-        type="button"
-        data-testid="round-open-file"
-        onClick={() => props.onOpenFileInPanel?.({
-          name: 'quick_sort.py',
-          path: 'quick_sort.py',
-          size: 0,
-          modified: '',
-          type: 'py',
-          ...matchedFile,
-        })}
-      >
-        open file
+      <div data-user-attachments={props.userAttachments?.length || 0}>
+      <button type="button" data-testid="open-captured" onClick={() => props.onOpenFileInPanel?.(file)}>
+        captured
       </button>
+      </div>
     );
   },
 }));
@@ -104,7 +108,6 @@ vi.mock('../../components/Round', () => ({
 vi.mock('../../components/ArtifactsPanel', () => ({
   ArtifactsPanel: (props: any) => {
     lastArtifactsPanelProps = props;
-    artifactsPanelPropsHistory.push(props);
     return <div data-testid="artifacts-panel" data-open={String(props.isOpen)} />;
   },
 }));
@@ -116,15 +119,14 @@ vi.mock('../../components/FilePreview', () => ({
   },
 }));
 
-describe('ChatV2 preview callback wiring', () => {
+describe('ChatV2 structured assistant file wiring', () => {
   const defaultProps = makeChatV2DefaultProps();
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resetWorkspaceEventsForTests();
     lastChatInputProps = null;
     lastArtifactsPanelProps = null;
-    artifactsPanelPropsHistory = [];
-    lastRoundProps = null;
     lastFilePreviewProps = null;
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       rounds: [],
@@ -132,523 +134,217 @@ describe('ChatV2 preview callback wiring', () => {
       total: 0,
     });
     vi.mocked(apiService.getSessionFiles).mockResolvedValue({ files: [], total: 0 });
-  });
-
-  it('no sessionId: should not pass onPreviewAttachment to ChatInput', async () => {
-    render(<ChatV2 sessionId="" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(lastChatInputProps).toBeTruthy();
-      expect(lastChatInputProps.onPreviewAttachment).toBeUndefined();
+    vi.mocked(workspaceApi.getEntry).mockResolvedValue({
+      entry_id: 'entry-1', parent_id: null, name: 'daily.md', kind: 'file',
+      path: 'reports/daily.md', size_bytes: 80, mime_type: 'text/markdown',
+      sha256: 'a'.repeat(64),
+      revision: 4, current_version_id: 'version-4', tree_revision: 1,
+      status: 'active', created_at: '2026-08-28T10:00:00Z', updated_at: '2026-08-28T10:10:00Z',
     });
   });
 
-  it('with sessionId: should pass onPreviewAttachment to ChatInput', async () => {
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(lastChatInputProps).toBeTruthy();
-      expect(typeof lastChatInputProps.onPreviewAttachment).toBe('function');
-    });
-  });
-
-  it('should pass onInputDropHandled to ChatInput', async () => {
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(lastChatInputProps).toBeTruthy();
-      expect(typeof lastChatInputProps.onInputDropHandled).toBe('function');
-    });
-  });
-
-  it('assistant file callback should open the workspace before directory verification resolves', async () => {
-    let resolveFileList: (value: { total: number; files: any[] }) => void = () => {};
-    vi.mocked(apiService.getSessionFiles).mockImplementation(() => new Promise((resolve) => {
-      resolveFileList = resolve;
-    }));
+  it('optimistic Workspace 附件没有 snapshot 时不进入 Session 预览', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      session_id: 'test-session',
-      total: 1,
-      rounds: [
-        {
-          round_id: 'round-1',
-          user_message: '写个快排给我',
-          final_response: '文件位置： quick_sort.py',
-          steps: [],
-          step_count: 0,
-          status: 'completed',
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ],
-    });
-
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(screen.getByTestId('round-open-file')).toBeInTheDocument();
-      expect(apiService.getSessionFiles).toHaveBeenCalledTimes(1);
-    });
-
-    fireEvent.click(screen.getByTestId('round-open-file'));
-
-    expect(lastArtifactsPanelProps.isOpen).toBe(true);
-    expect(lastArtifactsPanelProps.targetFile).toMatchObject({
-      name: 'quick_sort.py',
-      path: 'quick_sort.py',
-      session_id: 'test-session',
-    });
-    expect(lastArtifactsPanelProps.targetFileNonce).toBe(1);
-    expect(apiService.getSessionFiles).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      resolveFileList({ files: [], total: 0 });
-      await Promise.resolve();
-    });
-  });
-
-  it('聊天附件弹窗应显式只读', async () => {
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-    await waitFor(() => expect(typeof lastChatInputProps?.onPreviewAttachment).toBe('function'));
-
-    await act(async () => {
-      await lastChatInputProps.onPreviewAttachment({
-        name: 'report.md',
-        path: 'report.md',
-        size: 128,
-        modified: '2026-08-26T10:00:00Z',
-        type: 'md',
-        session_id: 'test-session',
-      });
-    });
-
-    expect(lastFilePreviewProps).toMatchObject({
-      sessionId: 'test-session',
-      readOnly: true,
-      file: expect.objectContaining({ path: 'report.md' }),
-    });
-  });
-
-  it('A 的外部 target 在切换到 B 的首帧不得投影到 B 文件工作台', async () => {
-    vi.mocked(apiService.getSessionFiles).mockResolvedValue({ files: [], total: 0 });
-    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sessionId) => ({
-      session_id: sessionId,
-      total: sessionId === 'session-a' ? 1 : 0,
-      rounds: sessionId === 'session-a' ? [{
-        round_id: 'round-a',
-        user_message: '生成文件',
-        final_response: '文件位置： quick_sort.py',
-        steps: [],
-        step_count: 0,
-        status: 'completed',
-        created_at: new Date().toISOString(),
-        completed_at: new Date().toISOString(),
-      }] : [],
-    }));
-
-    const { rerender } = render(<ChatV2 sessionId="session-a" {...defaultProps} />);
-    fireEvent.click(await screen.findByTestId('round-open-file'));
-    expect(lastArtifactsPanelProps.targetFile).toMatchObject({ session_id: 'session-a' });
-
-    rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
-    await waitFor(() => expect(lastArtifactsPanelProps.sessionId).toBe('session-b'));
-
-    const sessionBRenders = artifactsPanelPropsHistory.filter((props) => props.sessionId === 'session-b');
-    expect(sessionBRenders.length).toBeGreaterThan(0);
-    expect(sessionBRenders.every((props) => props.targetFile == null)).toBe(true);
-    expect(sessionBRenders.every((props) => props.ownerEpoch > 0)).toBe(true);
-  });
-
-  it('assistant file callback should reuse verified metadata without a click-time request', async () => {
-    vi.mocked(apiService.getSessionFiles).mockResolvedValue({
-      total: 1,
-      files: [{
-        name: 'quick_sort.py',
-        path: 'quick_sort.py',
-        size: 256,
-        modified: '2026-04-22T10:20:00Z',
-        type: 'py',
-        is_directory: false,
+      session_id: 'test-session', total: 1, rounds: [{
+        round_id: 'temp-round', user_message: '读取工作区附件', final_response: '',
+        user_attachments: [{
+          source: 'workspace', entry_id: 'entry-1', name: 'rates.xlsx',
+          path: 'reports/rates.xlsx', origin_path: 'reports/rates.xlsx',
+          revision: 4, size: 18_367, type: 'xlsx',
+        }],
+        steps: [], step_count: 0, status: 'running', created_at: '2026-09-02T09:20:00Z',
       }],
     });
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    fireEvent.click(await screen.findByTestId('open-user-attachment'));
+
+    expect(await screen.findByText('工作区附件正在冻结，请稍后再打开。')).toBeInTheDocument();
+    expect(lastArtifactsPanelProps).toMatchObject({ isOpen: false });
+    expect(lastArtifactsPanelProps.targetFile).toBeFalsy();
+    expect(apiService.getSessionFiles).not.toHaveBeenCalled();
+  });
+
+  it('authoritative Workspace snapshot 仍以只读 Session 快照打开', async () => {
+    const snapshotPath = '.workspace-snapshots/entry-1/capture-1/rates.xlsx';
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      session_id: 'test-session',
-      total: 1,
-      rounds: [
-        {
-          round_id: 'round-1',
-          user_message: '写个快排给我',
-          final_response: '文件位置： quick_sort.py',
-          steps: [],
-          step_count: 0,
-          status: 'completed',
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ],
+      session_id: 'test-session', total: 1, rounds: [{
+        round_id: 'round-1', user_message: '读取工作区附件', final_response: 'done',
+        user_attachments: [{
+          source: 'workspace', entry_id: 'entry-1', name: 'rates.xlsx',
+          path: snapshotPath, snapshot_path: snapshotPath,
+          origin_path: 'reports/rates.xlsx', version_id: 'version-1',
+          revision: '4', size: 18_367, type: 'xlsx',
+        }],
+        steps: [], step_count: 0, status: 'completed', created_at: '2026-09-02T09:20:00Z',
+      }],
     });
     render(<ChatV2 sessionId="test-session" {...defaultProps} />);
 
-    await waitFor(() => {
-      expect(lastRoundProps.assistantFileMatches?.['quick_sort.py']).toMatchObject({
-        size: 256,
-        modified: '2026-04-22T10:20:00Z',
-      });
-    });
-    const requestCountBeforeClick = vi.mocked(apiService.getSessionFiles).mock.calls.length;
+    fireEvent.click(await screen.findByTestId('open-user-attachment'));
 
-    fireEvent.click(screen.getByTestId('round-open-file'));
-
-    expect(lastArtifactsPanelProps.isOpen).toBe(true);
-    expect(lastArtifactsPanelProps.targetFile).toMatchObject({
-      name: 'quick_sort.py',
-      size: 256,
-      modified: '2026-04-22T10:20:00Z',
-      session_id: 'test-session',
-    });
-    expect(apiService.getSessionFiles).toHaveBeenCalledTimes(requestCountBeforeClick);
+    await waitFor(() => expect(lastArtifactsPanelProps).toMatchObject({
+      isOpen: true,
+      targetFile: expect.objectContaining({
+        path: snapshotPath,
+        snapshot_path: snapshotPath,
+        content_mode: 'captured',
+      }),
+    }));
   });
 
-  it('closing and reopening the same assistant file should issue a new target nonce', async () => {
-    vi.mocked(apiService.getSessionFiles).mockResolvedValue({
-      total: 1,
-      files: [{
-        name: 'quick_sort.py',
-        path: 'quick_sort.py',
-        size: 256,
-        modified: '2026-04-22T10:20:00Z',
-        type: 'py',
-        is_directory: false,
-      }],
-    });
+  it('Workspace 永久删除后立即移除当前 Chat 投影中的附件和助手文件引用', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       session_id: 'test-session',
       total: 1,
       rounds: [{
-        round_id: 'round-1',
-        user_message: '写个快排给我',
-        final_response: '文件位置： quick_sort.py',
-        steps: [],
-        step_count: 0,
-        status: 'completed',
-        created_at: new Date().toISOString(),
-        completed_at: new Date().toISOString(),
+        round_id: 'round-workspace-delete',
+        user_message: '请读取附件',
+        user_attachments: [{
+          source: 'workspace', entry_id: 'entry-1', name: 'daily.md',
+          path: '.workspace-snapshots/entry-1/version-1/daily.md',
+          origin_path: 'reports/daily.md', revision: '4', version_id: 'version-4',
+          size: 80, type: 'text/markdown',
+        }],
+        assistant_file_references: [{
+          ref_id: 'workspace:entry-1:version-4', source: 'workspace',
+          entry_id: 'entry-1', version_id: 'version-4', workspace_path: 'reports/daily.md',
+          name: 'daily.md', path: 'reports/daily.md', size: 80, modified: '',
+          type: 'md', revision: '4',
+        }],
+        preferred_skills: [], preferred_mcp_connections: [], final_response: 'done',
+        steps: [], step_count: 0, status: 'completed', created_at: '2026-09-01T00:00:00Z',
       }],
     });
-
     render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-    const trigger = await screen.findByTestId('round-open-file');
+    expect(await screen.findByTestId('open-captured')).toBeInTheDocument();
+    expect(screen.getByTestId('open-captured').parentElement).toHaveAttribute('data-user-attachments', '1');
 
-    fireEvent.click(trigger);
-    await waitFor(() => expect(lastArtifactsPanelProps.targetFileNonce).toBe(1));
-
-    act(() => lastArtifactsPanelProps.onClose());
-    await waitFor(() => expect(lastArtifactsPanelProps.isOpen).toBe(false));
-
-    fireEvent.click(trigger);
-    await waitFor(() => {
-      expect(lastArtifactsPanelProps.isOpen).toBe(true);
-      expect(lastArtifactsPanelProps.targetFileNonce).toBe(2);
-    });
-  });
-
-  it('should verify assistant file refs against session files before passing matches to Round', async () => {
-    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      session_id: 'test-session',
-      total: 1,
-      rounds: [
-        {
-          round_id: 'round-1',
-          user_message: '整理一下文件',
-          final_response: [
-            '文件位置： `results/report.md`',
-            '文件位置： `missing.py`',
-          ].join('\n'),
-          steps: [],
-          step_count: 0,
-          status: 'completed',
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ],
-    });
-    vi.mocked(apiService.getSessionFiles).mockImplementation(async (_sessionId, path) => {
-      if (path === 'results') {
-        return {
-          total: 1,
-          files: [{
-            name: 'report.md',
-            path: 'results/report.md',
-            size: 128,
-            modified: '2026-06-12T10:20:00Z',
-            type: 'md',
-            is_directory: false,
-          }],
-        };
-      }
-      return { files: [], total: 0 };
-    });
-
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session', 'results');
-      expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session', undefined);
-    });
-
-    await waitFor(() => {
-      expect(lastRoundProps.assistantFileMatches['results/report.md']).toMatchObject({
-        name: 'report.md',
-        path: 'results/report.md',
-        session_id: 'test-session',
-      });
-      expect(
-        Object.prototype.hasOwnProperty.call(lastRoundProps.assistantFileMatches, 'missing.py'),
-      ).toBe(false);
-    });
-  });
-
-  it('should keep assistant file refs unknown when verification request fails', async () => {
-    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      session_id: 'test-session',
-      total: 1,
-      rounds: [
-        {
-          round_id: 'round-1',
-          user_message: '生成文件',
-          final_response: '文件位置： `unstable.md`',
-          steps: [],
-          step_count: 0,
-          status: 'completed',
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ],
-    });
-    vi.mocked(apiService.getSessionFiles).mockRejectedValue(new Error('temporary failure'));
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session', undefined);
-    });
-
-    expect(
-      Object.prototype.hasOwnProperty.call(lastRoundProps.assistantFileMatches, 'unstable.md'),
-    ).toBe(false);
-    warnSpy.mockRestore();
-  });
-
-  it('should recheck a missing assistant file ref after later rounds are added', async () => {
-    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      session_id: 'test-session',
-      total: 1,
-      rounds: [
-        {
-          round_id: 'round-1',
-          user_message: '先生成文件',
-          final_response: '文件位置： `later.md`',
-          steps: [],
-          step_count: 0,
-          status: 'completed',
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ],
-    });
-
-    let fileExists = false;
-    vi.mocked(apiService.getSessionFiles).mockImplementation(async () => (
-      fileExists
-        ? {
-            total: 1,
-            files: [{
-              name: 'later.md',
-              path: 'later.md',
-              size: 64,
-              modified: '2026-06-12T11:00:00Z',
-              type: 'md',
-              is_directory: false,
-            }],
-          }
-        : { files: [], total: 0 }
-    ));
-    vi.mocked(apiService.sendMessageStreamV2).mockImplementationOnce(async (_sessionId, _content, callbacks) => {
-      callbacks.onRunFinished?.(
-        'test-session',
-        'round-2',
-        { finalResponse: '', stepCount: 0 },
-        'success',
-      );
-    });
-
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(
-        Object.prototype.hasOwnProperty.call(lastRoundProps.assistantFileMatches, 'later.md'),
-      ).toBe(false);
-    });
-
-    fileExists = true;
     act(() => {
-      lastChatInputProps.onChange('再检查一次');
-    });
-    act(() => {
-      lastChatInputProps.onSend();
-    });
-
-    await waitFor(() => {
-      expect(vi.mocked(apiService.getSessionFiles).mock.calls.length).toBeGreaterThanOrEqual(2);
-      expect(lastRoundProps.assistantFileMatches['later.md']).toMatchObject({
-        name: 'later.md',
-        path: 'later.md',
-        session_id: 'test-session',
+      emitWorkspaceMutation({
+        operation: 'delete',
+        tombstone: true,
+        affectedEntryIds: ['entry-1'],
+        origin: 'local',
       });
     });
+
+    await waitFor(() => expect(screen.queryByTestId('open-captured')).not.toBeInTheDocument());
+    expect(screen.getByTestId('round-without-file')).toHaveAttribute('data-user-attachments', '0');
   });
 
-  it('should clear stale missing assistant file refs while later-round recheck is unknown', async () => {
-    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      session_id: 'test-session',
-      total: 1,
-      rounds: [
-        {
-          round_id: 'round-1',
-          user_message: '先生成文件',
-          final_response: '文件位置： `later.md`',
-          steps: [],
-          step_count: 0,
-          status: 'completed',
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ],
+  it('没有 session 时仍按 entry_id 打开工作区附件', async () => {
+    render(<ChatV2 sessionId="" {...defaultProps} />);
+    await waitFor(() => expect(lastChatInputProps).toBeTruthy());
+    const navigation = vi.fn();
+    window.addEventListener('workspace:navigate', navigation);
+    await act(async () => {
+      await lastChatInputProps.onPreviewAttachment({
+        source: 'workspace', entry_id: 'entry-1', workspace_path: 'workspace.md',
+        path: 'workspace.md', name: 'workspace.md', revision: 2,
+        size: 10, modified: 'now', type: 'md',
+      });
     });
-
-    let fileListCalls = 0;
-    vi.mocked(apiService.getSessionFiles).mockImplementation(async () => {
-      fileListCalls += 1;
-      if (fileListCalls === 1) {
-        return { files: [], total: 0 };
-      }
-      throw new Error('temporary failure');
+    expect((navigation.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      entryId: 'entry-1',
     });
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    vi.mocked(apiService.sendMessageStreamV2).mockImplementationOnce(async (_sessionId, _content, callbacks) => {
-      callbacks.onRunFinished?.(
-        'test-session',
-        'round-2',
-        { finalResponse: '', stepCount: 0 },
-        'success',
-      );
-    });
-
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(
-        Object.prototype.hasOwnProperty.call(lastRoundProps.assistantFileMatches, 'later.md'),
-      ).toBe(false);
-    });
-
-    act(() => {
-      lastChatInputProps.onChange('再检查一次');
-    });
-    act(() => {
-      lastChatInputProps.onSend();
-    });
-
-    await waitFor(() => {
-      expect(apiService.getSessionFiles).toHaveBeenCalledTimes(2);
-      expect(
-        Object.prototype.hasOwnProperty.call(lastRoundProps.assistantFileMatches, 'later.md'),
-      ).toBe(false);
-    });
-    warnSpy.mockRestore();
+    window.removeEventListener('workspace:navigate', navigation);
   });
 
-  it('should ignore stale pending assistant file verification after later rounds are added', async () => {
+  it('Session 卡重新核验并打开当前文件', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
-      session_id: 'test-session',
-      total: 1,
-      rounds: [
-        {
-          round_id: 'round-1',
-          user_message: '先生成文件',
-          final_response: '文件位置： `race.md`',
-          steps: [],
-          step_count: 0,
-          status: 'completed',
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ],
-    });
-
-    let resolveFirst: (value: { files: any[]; total: number }) => void = () => {};
-    let resolveSecond: (value: { files: any[]; total: number }) => void = () => {};
-    const firstRequest = new Promise<{ files: any[]; total: number }>((resolve) => {
-      resolveFirst = resolve;
-    });
-    const secondRequest = new Promise<{ files: any[]; total: number }>((resolve) => {
-      resolveSecond = resolve;
-    });
-    vi.mocked(apiService.getSessionFiles)
-      .mockImplementationOnce(async () => firstRequest)
-      .mockImplementationOnce(async () => secondRequest);
-    vi.mocked(apiService.sendMessageStreamV2).mockImplementationOnce(async (_sessionId, _content, callbacks) => {
-      callbacks.onRunFinished?.(
-        'test-session',
-        'round-2',
-        { finalResponse: '', stepCount: 0 },
-        'success',
-      );
-    });
-
-    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(apiService.getSessionFiles).toHaveBeenCalledTimes(1);
-    });
-
-    act(() => {
-      lastChatInputProps.onChange('继续');
-    });
-    act(() => {
-      lastChatInputProps.onSend();
-    });
-
-    await waitFor(() => {
-      expect(apiService.getSessionFiles).toHaveBeenCalledTimes(2);
-    });
-
-    await act(async () => {
-      resolveFirst({ files: [], total: 0 });
-      await firstRequest;
-    });
-    await act(async () => {
-      resolveSecond({
-        total: 1,
-        files: [{
-          name: 'race.md',
-          path: 'race.md',
-          size: 32,
-          modified: '2026-06-12T12:00:00Z',
-          type: 'md',
-          is_directory: false,
+      session_id: 'test-session', total: 1, rounds: [{
+        round_id: 'round-1', user_message: '生成报告', final_response: '已生成。',
+        steps: [], step_count: 1, status: 'completed', created_at: '2026-08-28T10:00:00Z',
+        assistant_file_references: [{
+          ref_id: 'session:test-session:round-1:report', source: 'session',
+          session_id: 'test-session', name: 'report.md', path: 'report.md',
+          snapshot_path: '.assistant-artifacts/round-1/report/report.md',
+          size: 42, modified: '2026-08-28T10:00:00Z', type: 'md', revision: 'v1:42:100',
         }],
-      });
-      await secondRequest;
+      }],
     });
+    vi.mocked(apiService.getSessionFiles).mockResolvedValue({
+      total: 1,
+      files: [{
+        name: 'report.md', path: 'report.md', size: 55,
+        modified: '2026-08-28T11:00:00Z', type: 'md', revision: 'v1:55:200',
+        is_directory: false,
+      }],
+    });
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    fireEvent.click(await screen.findByTestId('open-captured'));
+    await waitFor(() => expect(lastArtifactsPanelProps.targetFile).toMatchObject({
+      path: 'report.md', size: 55, revision: 'v1:55:200', content_mode: 'current',
+    }));
+    expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session', undefined);
+    expect(lastFilePreviewProps).toBeNull();
+  });
 
-    await waitFor(() => {
-      expect(lastRoundProps.assistantFileMatches['race.md']).toMatchObject({
-        name: 'race.md',
-        path: 'race.md',
-        session_id: 'test-session',
-      });
+  it('Session 当前文件删除后只读展示生成时快照', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      session_id: 'test-session', total: 1, rounds: [{
+        round_id: 'round-1', user_message: '生成报告', final_response: '已生成。',
+        steps: [], step_count: 1, status: 'completed', created_at: '2026-08-28T10:00:00Z',
+        assistant_file_references: [{
+          ref_id: 'session:test-session:round-1:report', source: 'session',
+          session_id: 'test-session', name: 'report.md', path: 'report.md',
+          snapshot_path: '.assistant-artifacts/round-1/report/report.md',
+          size: 42, modified: '2026-08-28T10:00:00Z', type: 'md', revision: 'v1:42:100',
+        }],
+      }],
     });
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    fireEvent.click(await screen.findByTestId('open-captured'));
+    await waitFor(() => expect(lastArtifactsPanelProps).toMatchObject({
+      isOpen: true,
+      targetContextNotice: '当前会话文件已删除，正在显示生成时版本。',
+      targetFile: expect.objectContaining({
+        path: '.assistant-artifacts/round-1/report/report.md', content_mode: 'captured',
+      }),
+    }));
+  });
+
+  it('Workspace 卡按稳定 entry_id 打开当前文件', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      session_id: 'test-session', total: 1, rounds: [{
+        round_id: 'round-1', user_message: '更新报告', final_response: '已更新。',
+        steps: [], step_count: 1, status: 'completed', created_at: '2026-08-28T10:00:00Z',
+        assistant_file_references: [{
+          ref_id: 'workspace:entry-1:version-3', source: 'workspace', entry_id: 'entry-1',
+          version_id: 'version-3', workspace_path: 'reports/daily.md', name: 'daily.md',
+          path: 'reports/daily.md', size: 80, modified: '', type: 'md', revision: '3',
+        }],
+      }],
+    });
+    const navigation = vi.fn();
+    window.addEventListener('workspace:navigate', navigation);
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    fireEvent.click(await screen.findByTestId('open-captured'));
+    await waitFor(() => expect(navigation).toHaveBeenCalledTimes(1));
+    expect((navigation.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      entryId: 'entry-1',
+    });
+    expect(lastFilePreviewProps).toBeNull();
+    window.removeEventListener('workspace:navigate', navigation);
+  });
+
+  it('Workspace 文件删除后不回退历史版本也不重建', async () => {
+    vi.mocked(workspaceApi.getEntry).mockRejectedValue({ status: 404 });
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      session_id: 'test-session', total: 1, rounds: [{
+        round_id: 'round-1', user_message: '更新报告', final_response: '已更新。',
+        steps: [], step_count: 1, status: 'completed', created_at: '2026-08-28T10:00:00Z',
+        assistant_file_references: [{
+          ref_id: 'workspace:entry-1:version-3', source: 'workspace', entry_id: 'entry-1',
+          version_id: 'version-3', workspace_path: 'reports/daily.md', name: 'daily.md',
+          path: 'reports/daily.md', size: 80, modified: '', type: 'md', revision: '3',
+        }],
+      }],
+    });
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    fireEvent.click(await screen.findByTestId('open-captured'));
+    expect(await screen.findByText('工作区文件已删除或暂时无法读取；已删除的文件不保留历史副本。')).toBeInTheDocument();
+    expect(lastFilePreviewProps).toBeNull();
   });
 });

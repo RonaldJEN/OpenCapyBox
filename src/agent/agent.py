@@ -21,8 +21,8 @@ from .logger import AgentLogger
 from .schema import FunctionCall, Message, ToolCall
 from .schema.run_context import (
     LLMRequestContext,
+    render_pending_file_drafts_context_block,
     render_turn_preferences_context_block,
-    render_turn_preferences_system_policy,
 )
 from .tools.base import Tool, ToolExposure, ToolResult, ToolRuntimeContext
 from .tools.ask_user_tool import ASK_USER_TOOL_NAME
@@ -716,26 +716,6 @@ class Agent:
         source_messages = self.messages if messages is None else messages
         request_messages = [msg.model_copy(deep=True) for msg in source_messages]
         runtime_context = self._build_runtime_context_block()
-        should_project_preferences = (
-            request_context is not None
-            and request_context.purpose in {"agent_step", "tool_followup"}
-            and bool(request_context.user_message_id)
-        )
-        include_skills = should_project_preferences and "get_skill" in (
-            exposed_tool_names or set()
-        )
-        include_mcp = should_project_preferences and MCP_TOOL_SEARCH_NAME in (
-            exposed_tool_names or set()
-        )
-        preferences_policy = render_turn_preferences_system_policy(
-            request_context.run_context
-            if should_project_preferences and request_context is not None
-            else None,
-            include_skills=include_skills,
-            include_mcp=include_mcp,
-        )
-        if preferences_policy:
-            runtime_context += f"{preferences_policy}\n\n---\n\n"
         dynamic_prompt = self._build_dynamic_runtime_prompt()
         if dynamic_prompt:
             runtime_context += f"{dynamic_prompt}\n\n---\n\n"
@@ -774,11 +754,14 @@ class Agent:
         } or not request_context.user_message_id:
             return
         tool_names = exposed_tool_names or set()
-        block = render_turn_preferences_context_block(
-            request_context.run_context,
-            include_skills="get_skill" in tool_names,
-            include_mcp=MCP_TOOL_SEARCH_NAME in tool_names,
-        )
+        block = "\n".join(filter(None, (
+            render_turn_preferences_context_block(
+                request_context.run_context,
+                include_skills="get_skill" in tool_names,
+                include_mcp=MCP_TOOL_SEARCH_NAME in tool_names,
+            ),
+            render_pending_file_drafts_context_block(request_context.run_context),
+        )))
         if not block:
             return
         for message in messages:
@@ -888,11 +871,14 @@ class Agent:
                 self._pending_approved_tool = None
 
     @staticmethod
-    def _permission_ref(tool: Tool):
+    def _permission_ref(
+        tool: Tool,
+        arguments: dict[str, Any] | None = None,
+    ):
         """Translate an Agent tool identity into the policy-domain identity."""
         from src.api.services.tool_permission_service import ToolRef as PermissionToolRef
 
-        ref = tool.tool_ref
+        ref = tool.permission_ref_for(arguments)
         return PermissionToolRef(
             provider=ref.provider,
             tool_name=ref.name,
@@ -924,6 +910,7 @@ class Agent:
         tool: Tool,
         *,
         session_id: str,
+        arguments: dict[str, Any] | None = None,
     ) -> _ToolPolicyDecision:
         """Resolve the latest policy immediately before exposing/executing a tool."""
         if not self.user_id:
@@ -939,7 +926,8 @@ class Agent:
                     db,
                     user_id=self.user_id,
                     session_id=session_id,
-                    ref=self._permission_ref(tool),
+                    ref=self._permission_ref(tool, arguments),
+                    default_effect=tool.permission_default_effect_for(arguments),
                     schema_hash=getattr(tool, "schema_hash", None),
                     connection_fingerprint=self._current_connection_fingerprint(tool),
                 )
@@ -1365,7 +1353,7 @@ class Agent:
                     session_id=session_id,
                     run_id=run_id,
                     tool_call_id=tool_call_id,
-                    ref=self._permission_ref(tool),
+                    ref=self._permission_ref(tool, arguments),
                     effect=effect,
                     outcome=outcome,
                     matched_rule_id=matched_rule_id,
@@ -1423,7 +1411,7 @@ class Agent:
         )
 
         request_id = str(uuid.uuid4())
-        ref = tool.tool_ref
+        ref = tool.permission_ref_for(arguments)
         schema_hash = getattr(tool, "schema_hash", None)
         connection_fingerprint = self._snapshot_connection_fingerprint(tool)
         if ref.provider == "mcp":
@@ -1451,7 +1439,7 @@ class Agent:
                 session_id=session_id,
                 run_id=run_id,
                 tool_call_id=tool_call_id,
-                ref=self._permission_ref(tool),
+                ref=self._permission_ref(tool, arguments),
                 model_tool_name=tool.name,
                 arguments=arguments,
                 installation_id=ref.installation_id,
@@ -1467,7 +1455,7 @@ class Agent:
                 session_id=session_id,
                 run_id=run_id,
                 tool_call_id=tool_call_id,
-                ref=self._permission_ref(tool),
+                ref=self._permission_ref(tool, arguments),
                 effect="ask",
                 outcome="requested",
                 matched_rule_id=decision.matched_rule_id,
@@ -1971,7 +1959,11 @@ class Agent:
             exposure_error = self._exposure_execution_error(tool, session_id=thread_id)
             if allow_unactivated_deferred and tool.exposure == ToolExposure.DEFERRED:
                 exposure_error = None
-            latest = self._resolve_tool_permission(tool, session_id=thread_id)
+            latest = self._resolve_tool_permission(
+                tool,
+                session_id=thread_id,
+                arguments=arguments if isinstance(arguments, dict) else None,
+            )
             if exposure_error is not None or latest.effect not in allowed_policy_effects:
                 reason = exposure_error or latest.reason
                 result = ToolResult(success=False, error=_TOOL_UNAVAILABLE_MESSAGE)
@@ -2468,7 +2460,7 @@ class Agent:
                     execution_time_ms=0,
                 )
             else:
-                current_ref = tool.tool_ref
+                current_ref = tool.permission_ref_for(pending.arguments)
                 identity_changed = (
                     current_ref.provider != pending.provider
                     or current_ref.name != pending.tool_name
@@ -2505,7 +2497,11 @@ class Agent:
                 # tool without rediscovery. Hidden is an administrative surface
                 # boundary and always revokes execution.
                 exposure_blocked = tool.exposure == ToolExposure.HIDDEN
-                latest = self._resolve_tool_permission(tool, session_id=thread_id)
+                latest = self._resolve_tool_permission(
+                    tool,
+                    session_id=thread_id,
+                    arguments=pending.arguments,
+                )
                 if (
                     identity_changed
                     or schema_changed
@@ -2683,6 +2679,65 @@ class Agent:
             )
             self.messages.append(tool_msg)
         self._queue_tool_content_blocks(record.result)
+
+    @staticmethod
+    def _workspace_resource_events(
+        emitter: AGUIEventEmitter,
+        record: _ExecutedToolCall,
+    ):
+        """Project structured UI identities without parsing model-visible text."""
+        changes = record.result.resource_changes or []
+        if isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                entry_id = change.get("entry_id")
+                operation = change.get("operation") or change.get("status")
+                if not isinstance(entry_id, str) or not entry_id:
+                    continue
+                if not isinstance(operation, str) or not operation:
+                    continue
+                payload = dict(change)
+                payload["entry_id"] = entry_id
+                payload["operation"] = operation
+                payload["toolCallId"] = record.tool_call_id
+                yield emitter.custom_event("workspace_resource_changed", payload)
+        change_events = record.result.workspace_change_events or []
+        if isinstance(change_events, list):
+            for change in change_events:
+                if not isinstance(change, dict):
+                    continue
+                status = str(change.get("status") or "proposed")
+                payload = dict(change)
+                payload["toolCallId"] = record.tool_call_id
+                event_name = (
+                    "workspace_change_conflict"
+                    if status in {"conflict", "needs_review"}
+                    else "workspace_change_proposed"
+                )
+                yield emitter.custom_event(event_name, payload)
+
+        file_references = record.result.assistant_file_references or []
+        if not isinstance(file_references, list):
+            return
+        for reference in file_references:
+            if not isinstance(reference, dict):
+                continue
+            source = reference.get("source")
+            path = reference.get("path")
+            name = reference.get("name")
+            if source not in {"session", "workspace"}:
+                continue
+            if not isinstance(path, str) or not path or not isinstance(name, str) or not name:
+                continue
+            if source == "workspace" and not reference.get("entry_id"):
+                continue
+            payload = dict(reference)
+            payload["toolCallId"] = record.tool_call_id
+            payload["round_id"] = emitter.run_id
+            if source == "session":
+                payload["session_id"] = emitter.thread_id
+            yield emitter.custom_event("assistant_file_referenced", payload)
 
     def _queue_tool_content_blocks(self, result: ToolResult) -> None:
         blocks = result.content_blocks or []
@@ -3194,6 +3249,8 @@ class Agent:
                     content=approved_record.result_content,
                     execution_time_ms=approved_record.execution_time_ms,
                 )
+                for resource_event in self._workspace_resource_events(emitter, approved_record):
+                    yield resource_event
                 flush_event = _flush_pending_tool_content_event()
                 if flush_event:
                     yield flush_event
@@ -3891,7 +3948,11 @@ class Agent:
 
                     validation_error = self._validate_tool_arguments(function_name, arguments)
                     if tool is not None and validation_error is None:
-                        decision = self._resolve_tool_permission(tool, session_id=thread_id)
+                        decision = self._resolve_tool_permission(
+                            tool,
+                            session_id=thread_id,
+                            arguments=arguments,
+                        )
                         if decision.effect == "ask" and not self.allow_human_interrupts:
                             decision = _ToolPolicyDecision(
                                 effect="deny",
@@ -4120,6 +4181,8 @@ class Agent:
                                     content=record.result_content,
                                     execution_time_ms=record.execution_time_ms,
                                 )
+                                for resource_event in self._workspace_resource_events(emitter, record):
+                                    yield resource_event
                                 self._record_tool_result(record)
                                 _observe_tool_record(record)
 
@@ -4284,6 +4347,8 @@ class Agent:
                         content=record.result_content,
                         execution_time_ms=record.execution_time_ms,
                     )
+                    for resource_event in self._workspace_resource_events(emitter, record):
+                        yield resource_event
                     self._record_tool_result(record)
                     _observe_tool_record(record)
                     tool_call_index += 1

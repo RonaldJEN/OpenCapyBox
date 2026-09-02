@@ -348,7 +348,6 @@ export default function ToolPermissionsPanel({ active = true, refreshToken = 0 }
         <FeedbackMessage
           className="mb-4 rounded-xl border border-[#cfe0ef] bg-[#f2f7fb] px-4 py-3 text-sm text-[#3f6488]"
           tone="info"
-          autoDismissMs={5000}
           icon={<Info size={16} />}
           onDismiss={() => setNotice('')}
         >

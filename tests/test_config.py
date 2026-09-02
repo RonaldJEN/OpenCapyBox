@@ -136,12 +136,30 @@ def test_tool_approval_lease_defaults_allow_multiple_heartbeats():
     )
 
 
+
+
 def test_tool_approval_heartbeat_must_be_shorter_than_lease():
     with pytest.raises(ValidationError, match="must be <"):
         Settings(
             tool_approval_execution_lease_seconds=10,
             tool_approval_lease_heartbeat_seconds=10,
         )
+
+
+
+
+def test_cron_claim_heartbeat_must_be_shorter_than_lease():
+    with pytest.raises(ValidationError, match="cron_claim_heartbeat_seconds must be <"):
+        Settings(
+            cron_claim_lease_seconds=10,
+            cron_claim_heartbeat_seconds=10,
+        )
+
+
+@pytest.mark.parametrize("value", [0, -1, 3601, float("nan"), float("inf")])
+def test_cron_runtime_intervals_are_finite_and_bounded(value: float):
+    with pytest.raises(ValidationError, match="must be > 0 and <= 3600"):
+        Settings(cron_reconcile_interval_seconds=value)
 
 
 @pytest.mark.parametrize(
@@ -214,3 +232,30 @@ def test_production_rejects_reusing_auth_secret_for_mcp_encryption():
                 mcp_secret_key=shared,
             )
         )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "workspace_quota_bytes",
+        "workspace_history_quota_bytes",
+        "workspace_preview_cache_bytes",
+        "workspace_max_file_bytes",
+        "workspace_max_entries",
+        "workspace_mutation_lease_seconds",
+        "workspace_version_retention_count",
+        "workspace_version_retention_days",
+        "workspace_draft_base_retention_days",
+        "workspace_draft_revision_retention_count",
+        "workspace_history_gc_interval_seconds",
+        "workspace_history_gc_batch_size",
+    ],
+)
+def test_workspace_limits_must_be_positive(field):
+    with pytest.raises(ValidationError, match="workspace limits and lease must be > 0"):
+        Settings(**{field: 0})
+
+
+def test_workspace_single_file_limit_cannot_exceed_quota():
+    with pytest.raises(ValidationError, match="workspace_max_file_bytes must be <="):
+        Settings(workspace_quota_bytes=10, workspace_max_file_bytes=11)

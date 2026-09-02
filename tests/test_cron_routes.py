@@ -121,10 +121,11 @@ class TestMarkRead:
     def test_marks_all_unread(self):
         client, mock_db = _make_client()
         mock_db.query.return_value.filter.return_value.update.return_value = 5
+        mock_db.query.return_value.filter.return_value.count.return_value = 0
 
         resp = client.post("/cron/runs/mark-read")
         assert resp.status_code == 200
-        assert resp.json() == {"marked": 5}
+        assert resp.json() == {"marked": 5, "unread_count": 0}
         mock_db.commit.assert_called_once()
         # user_id + is_read=false（全量标记不区分 status）
         filter_args = mock_db.query.return_value.filter.call_args[0]
@@ -133,10 +134,11 @@ class TestMarkRead:
     def test_marks_specific_run(self):
         client, mock_db = _make_client()
         mock_db.query.return_value.filter.return_value.filter.return_value.update.return_value = 1
+        mock_db.query.return_value.filter.return_value.count.return_value = 2
 
         resp = client.post("/cron/runs/mark-read", params={"run_id": "run-1"})
         assert resp.status_code == 200
-        assert resp.json() == {"marked": 1}
+        assert resp.json() == {"marked": 1, "unread_count": 2}
         mock_db.commit.assert_called_once()
 
 
@@ -172,7 +174,10 @@ class TestListRunFiles:
 
     def test_returns_artifacts_from_db(self):
         client, mock_db = _make_client()
-        artifacts = [{"name": "data.csv", "path": "data.csv", "size": 200, "type": "csv"}]
+        artifacts = [
+            {"name": "data.csv", "path": "data.csv", "size": 200, "type": "csv"},
+            {"name": "internal.proposal", "path": ".workspace-change-sets/internal.proposal", "size": 200},
+        ]
         run = _make_run_record(artifacts=artifacts)
         mock_db.query.return_value.filter.return_value.first.return_value = run
 
@@ -181,6 +186,9 @@ class TestListRunFiles:
         files = resp.json()["files"]
         assert len(files) == 1
         assert files[0]["name"] == "data.csv"
+        from src.api.models.user_memory import CronJobRun
+        assert CronJobRun(artifacts=run.artifacts).to_dict()["artifacts"] == files
+        assert client.get("/cron/runs/run-1/files/.workspace-change-sets/internal.proposal").status_code == 404
 
     def test_empty_when_no_workspace(self):
         client, mock_db = _make_client()
@@ -280,6 +288,32 @@ class TestDownloadRunFile:
         sandbox_service.get_or_resume.assert_awaited_once_with("testuser", "sandbox-1")
         sandbox.files.read_bytes.assert_awaited_once()
 
+    def test_download_encodes_unicode_filename_in_content_disposition(self):
+        client, mock_db = _make_client()
+        run = _make_run_record()
+        user_sandbox = MagicMock()
+        user_sandbox.sandbox_id = "sandbox-1"
+        mock_db.query.return_value.filter.return_value.first.side_effect = [run, user_sandbox]
+
+        sandbox = MagicMock()
+        sandbox.files.read_bytes = AsyncMock(return_value=b"content")
+
+        sandbox_service = MagicMock()
+        sandbox_service.get_or_resume = AsyncMock(return_value=sandbox)
+        sandbox_service.get_sandbox_id.return_value = "sandbox-1"
+
+        with patch(
+            "src.api.services.sandbox_service.get_sandbox_service",
+            return_value=sandbox_service,
+        ):
+            resp = client.get("/cron/runs/run-1/files/%E7%BE%8E%E8%81%94%E5%82%A8%E8%AE%B2%E8%AF%9D.md")
+
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"] == (
+            "attachment; filename*=UTF-8''%E7%BE%8E%E8%81%94%E5%82%A8%E8%AE%B2%E8%AF%9D.md"
+        )
+        assert resp.content == b"content"
+
 
 class TestTriggerJob:
     """POST /cron/jobs/{job_name}/run"""
@@ -330,6 +364,9 @@ class TestTriggerJob:
         run_record = mock_db.add.call_args.args[0]
         assert run_record.cron_expr == "0 9 * * *"
         assert run_record.rule_version == 4
+        assert run_record.status == "queued"
+        assert run_record.phase == "queued"
+        assert run_record.definition_snapshot is not None
 
     def test_marks_run_failed_when_worker_unavailable(self):
         """worker 未启动时，trigger_manual_run 抛 503 → run 记录必须被标记为 failed。
@@ -445,7 +482,7 @@ class TestCreateCronJob:
         assert body["job"]["name"] == "daily"
         assert set(body["job"].keys()) == {
             "id", "name", "cron_expr", "schedule", "description", "content", "enabled",
-            "rule_version",
+            "rule_version", "definition_version",
         }
         assert "user_id" not in body["job"]
         assert "created_at" not in body["job"]

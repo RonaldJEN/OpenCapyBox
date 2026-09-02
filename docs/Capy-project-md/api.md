@@ -434,11 +434,14 @@ Authorization: Bearer <access_token>
 | user_id         | string | 是   | 用户 ID（由 Authorization Bearer Token 解析） |
 | preview         | bool   | 否   | 是否预览模式，默认 false  |
 | render          | string | 否   | 派生渲染格式；当前仅支持 `pdf`，且要求 `preview=true` |
+| edit            | bool   | 否   | Markdown/CSV/XLSX 编辑必须为 true，正文与编辑基线成对读取 |
+| base_token      | string | 否   | 配合 edit=true 读取指定不可变基线，接纳自动合并结果 |
 
 **响应**
 
 - `preview=false`: 返回文件流，Content-Disposition 为 attachment
 - `preview=true`: 对于可预览文件（文本、图片、PDF），Content-Disposition 为 inline
+- `edit=true`：从 Session 隐藏缓存读取不可变正文，返回 `X-Session-File-Revision`、`X-Session-File-Modified`、`X-Session-Edit-Base`；不得将目录 metadata 与另一版本正文拼作编辑基线。
 - `preview=true&render=pdf`: DOC/DOCX/PPT/PPTX 在用户 OpenSandbox 内完成有界快照、内容 hash、LibreOffice 转换与原子缓存发布，返回流式 `application/pdf`；API 主机不读取 Office 源内容，转换缓存属于 session 隐藏目录且不出现在文件列表中
 
 **常见错误**
@@ -478,20 +481,21 @@ Markdown 请求体：
 ```json
 {
   "content": "# 报告\n",
-  "expected_size": 10,
-  "expected_modified": "2026-08-26T02:00:00+00:00"
+  "expected_revision": "v1:10:1787709600000000000",
+  "edit_base_token": "<编辑读取响应中的 X-Session-Edit-Base>",
+  "save_id": "<本代草稿稳定的 UUID>"
 }
 ```
 
-CSV/XLSX 请求体使用 `content_base64` 传递完整文件字节，并携带相同的 `expected_size + expected_modified`。
+CSV/XLSX 使用 `content_base64` 传递完整文件字节，并携带相同的 revision/base/save_id。远端内容变化时按原始基线自动三方合并，重叠修改沿用用户草稿优先；`save_id` 重试返回原回执。Agent 运行不阻塞保存。旧客户端不带基线时仅 strict CAS，不能以新 revision 重放旧草稿。
 
 **响应** `200 OK`
 
-返回更新后的 `{name, path, size, modified, type, is_directory}`，其版本字段用于下一次保存。
+返回 `{name, path, size, modified, type, is_directory, revision, edit_base_token, session_auto_merged}`。自动合并后按回执 token 读取固定正文，正文与新基线一并接纳；期间有续写则保留原基线继续保存。Session 基线与回执是有界临时缓存，不创建 Workspace 历史账本。
 
 **常见错误**
 
-- `409 Conflict`：文件版本变化或 Session 正被 Agent 使用
+- `409 Conflict`：`SESSION_EDIT_RETRY` 表示提交期间再次变化，可重试；基线缺失/非法或结构不可合并必须保留草稿。旧客户端 revision 不符返回 `SESSION_FILE_REVISION_CONFLICT`。
 - `413 Payload Too Large`：Markdown 超过 5 MiB，或 CSV/XLSX 超过 20 MiB
 - `415 Unsupported Media Type`：文件不是 Markdown、CSV 或 XLSX；XLS/ET 为只读
 - `422 Unprocessable Entity`：请求体、UTF-8 CSV 或 OOXML XLSX 结构无效
@@ -573,7 +577,8 @@ Content-Type: multipart/form-data
   "path": "document.pdf",
   "size": 102400,
   "modified": "2025-01-14T10:40:00",
-  "type": "application/pdf"
+  "type": "application/pdf",
+  "revision": "v1:102400:1736822400000000000"
 }
 ```
 
@@ -588,6 +593,135 @@ Content-Type: multipart/form-data
 - `404 Not Found`：会话不存在
 - `503 Service Unavailable`：沙箱不可用（连接/恢复失败）
 - `500 Internal Server Error`：文件保存失败
+
+---
+
+## 用户持久工作区 API
+
+所有端点使用 Bearer auth，且只能解析当前用户的 `entry_id`、相对路径和 Session。工作区位于当前 Sandbox Profile 持久挂载的 `workdir`；未启用持久挂载时返回 `503 WORKSPACE_PERSISTENCE_DISABLED`。
+
+### 条目列表与稳定 ID
+
+```http
+GET /api/workspace/entries?parent_id=<directory-entry-id>&q=<name-or-path>&cursor=<opaque>&limit=100
+GET /api/workspace/entries/{entry_id}
+```
+
+列表响应：
+
+```json
+{
+  "items": [
+    {
+      "entry_id": "...",
+      "parent_id": null,
+      "name": "report.md",
+      "kind": "file",
+      "path": "reports/report.md",
+      "size_bytes": 1024,
+      "mime_type": "text/markdown",
+      "sha256": "...",
+      "revision": 3,
+      "current_version_id": "...",
+      "tree_revision": 1,
+      "status": "active",
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ],
+  "next_cursor": null,
+  "workspace_revision": 12
+}
+```
+
+列表只包含 active 条目；跨用户或已删除 ID 返回 404。
+
+### 创建、上传与编辑
+
+```http
+POST /api/workspace/directories
+POST /api/workspace/files
+POST /api/workspace/uploads
+PUT  /api/workspace/entries/{entry_id}/content
+PATCH /api/workspace/entries/{entry_id}
+```
+
+- directory body：`{parent_id,name,idempotency_key?}`。
+- file body：`{parent_id,name,file_type:"markdown"|"xlsx",idempotency_key?}`；空 XLSX 包含 `Sheet1`。
+- upload 使用 multipart `file,parent_id?,idempotency_key?`，API 以有界块传到沙箱临时文件，不聚合整个文件。
+- content PUT 使用原始字节正文，必须携带 `If-Match: "<revision>"`；缺失返回 428。Markdown/TXT 最大 5 MiB，CSV/XLSX 最大 20 MiB。CSV 必须是无 NUL 的有效 UTF-8；XLSX 与 Session 在线编辑共用有界 OOXML/ZIP 关系图校验。无效正文在创建 mutation 或写入沙箱前返回 422 `INVALID_CSV` / `INVALID_XLSX`。
+- 有 current version 时同时携带 `X-Workspace-Base-Version`。每次真实内容变化推进 revision/current version，但相同 SHA 返回 `NO_CHANGE`，不创建新对象。
+- PATCH body：`{parent_id?,name?,expected_revision,idempotency_key?}`。
+
+变更响应统一为：
+
+```json
+{"status":"CREATED|UPDATED|NO_CHANGE|MOVED","entry":{},"mutation_id":"..."}
+```
+
+同名不自动加序号。409 `NAME_CONFLICT` / `REVISION_CONFLICT` 的 `detail.entry` 是当前 authoritative 目标，客户端必须据此重新选择、改名或显式覆盖。
+
+普通 Workspace mutation 的幂等身份是 `当前用户 + idempotency_key + operation`。同 operation 重复提交时，`prepared` 返回 `409 MUTATION_IN_PROGRESS` 及 mutation 身份，`completed` 返回第一次 journal 中冻结的成功回执，`failed` 返回第一次冻结的原始失败；同一 key 用于其他 operation 返回 `409 IDEMPOTENCY_KEY_REUSED`。客户端必须为每个新操作意图及每一代新正文生成新 key，只有在请求参数和正文完全未改变且结果仍未确定的网络重试中复用原 key。批量删除和内部 change set 额外校验请求指纹，不能用同一 key 改变删除范围或提案内容。
+
+### Revision、检查点与固定版本
+
+```http
+POST /api/workspace/entries/{entry_id}/checkpoint
+GET  /api/workspace/entries/{entry_id}/versions
+GET  /api/workspace/versions/{version_id}/content
+POST /api/workspace/entries/{entry_id}/restore
+```
+
+- checkpoint body：`{expected_revision,version_id,checkpoint_kind:"web_idle"|"web_close"|"web_periodic"}`。它只提升已经保存的 current version，不重新上传或复制文件。
+- Web autosave revision 继续作为 CAS/三方合并 base，但不自动进入普通历史列表；停止编辑 30 秒、关闭/切换 owner 或持续编辑满 5 分钟时提升 checkpoint。
+- 初始创建、Session 导入、Chat/Cron 发布和恢复旧版直接生成 checkpoint。恢复旧版会发布新的 current version，旧记录保持不可变。
+- 版本内容按用户内 SHA-256 存入 `.opencapybox/objects/sha256/`；相同用户相同 SHA 只占一份物理内容，不跨用户去重。Round 附件和进行中的 change set 使用显式 content reference 防止 GC。
+
+### 内容预览、下载与 Markdown 相对资源
+
+```http
+GET /api/workspace/entries/{entry_id}/content?preview=true
+GET /api/workspace/content?path=<relative-posix-path>&preview=true
+GET /api/workspace/entries/{entry_id}/content?preview=true&render=pdf
+GET /api/workspace/versions/{version_id}/content?preview=true
+```
+
+- entry 内容端点只冻结当前 head，带 `ETag: "<revision>"`、`X-Workspace-Revision` 和 `X-Workspace-Version`；未传 `preview=true` 时按附件下载。固定历史版本只通过 version 内容端点读取，使用 version ID 作为 ETag；两个端点都直接流式读取相应不可变对象。
+- path 端点只解析当前用户 active metadata，用于 Markdown 相对图片/链接；拒绝绝对路径、`..`、反斜杠和系统目录。
+- `render=pdf` 仅支持预览模式，未带 `preview=true` 返回 400；DOC/DOCX/PPT/PPTX 在沙箱内派生 PDF，其他类型返回 415。Workspace 派生文件位于 `.opencapybox/derived/office/`，按源 SHA 和 renderer version 复用并在独立缓存上限内按 LRU 回收；不可变 Workspace 内容先按数据库 SHA/size 查缓存，命中时不再读取源 Office。
+- 内容与派生 PDF 都通过 OpenSandbox `read_bytes_stream` 流式响应；流建立失败返回 `SANDBOX_READ_FAILED`，不得静默改为全量内存读取。
+
+### Session 文件存入工作区
+
+```http
+POST /api/workspace/imports/session-file
+Content-Type: application/json
+```
+
+```json
+{
+  "session_id": "...",
+  "source_path": "reports/result.pdf",
+  "source_revision": "v1:1024:1736822400000000000",
+  "destination_parent_id": null,
+  "destination_name": "result.pdf",
+  "conflict_policy": "fail",
+  "expected_destination_revision": null,
+  "idempotency_key": "..."
+}
+```
+
+服务端重新验证 Session 所属用户、相对路径和 opaque source revision，并在沙箱内复制稳定快照。源文件已变化返回 `412 SOURCE_REVISION_CONFLICT` 与 `current_revision`；同 hash 返回 `NO_CHANGE`；覆盖必须使用 `conflict_policy=overwrite` 和冲突响应中的目标 revision。
+
+### 直接删除
+
+```http
+POST /api/workspace/entries/delete-batch
+```
+
+单项和批量删除统一使用 `{items:[{entry_id,expected_revision}],idempotency_key}`；最多 200 个选择项，目录覆盖已选后代。删除请求会冻结 items/revision 指纹，同一 key 携带不同范围返回 `409 IDEMPOTENCY_KEY_REUSED`。响应 `{status:"DELETED",mutation_id,affected_entry_ids,root_count,entry_count}`。无单项 DELETE、回收站、恢复删除或 operations 轮询接口。
+
+删除前取得 file/tree claims 并持久化 prepared journal，物理成功后一次性移除 entries、其全部 versions/references/相关提案并结算正式容量。零引用对象立即尝试 GC，并清理该内容 SHA 派生的 Office PDF 缓存；失败由 maintenance 重试。仍被其他文件或版本共享的对象及缓存不误删。删除对象不再受对话引用保留，不提供历史快照兜底。幂等重试返回冻结结果，不会作用于后来创建的同名文件。
 
 ---
 
@@ -617,6 +751,7 @@ Content-Type: application/json
   "idempotency_key": "550e8400-e29b-41d4-a716-446655440000",
   "preferred_skill_keys": ["pdf", "data_analysis"],
   "preferred_mcp_server_ids": ["server-uuid"],
+  "pending_file_drafts": [{"source":"session","path":"reports/current.md"}],
   "content": [
     {
       "type": "text",
@@ -658,10 +793,11 @@ Content-Type: application/json
 | idempotency_key  | string   | 否   | 幂等键（UUID），防止同一请求被重复处理。前端自动生成 |
 | preferred_skill_keys | string[] | 否 | 本次逻辑执行链优先考虑的 Skill 稳定内部 `key`；最多 50 项，每项最多 128 个字符 |
 | preferred_mcp_server_ids | string[] | 否 | 本次逻辑执行链优先考虑的 MCP server id；最多 20 项，每项最多 36 个字符 |
+| pending_file_drafts | object[] | 否 | Agent 启动时仍在 outbox 同步的文件身份 `{source:"session"|"workspace",path}`；最多20项，只含相对路径，不含草稿正文 |
 
 两个字段都表达软偏好而非强制调用或权限白名单。服务端按首次出现顺序去重；Skill 按当前启用清单解析，MCP 只从当前 Agent 实际 catalog connections 解析。未知、已删除、已禁用或没有可见工具的项被忽略，偏好不会从前序独立消息继承。未选择 MCP 时仍默认联网并自动路由。
 
-这些字段合并为内部 `bsbox.turn_preferences.v1`，来自 UI 控件而非用户正文；附件仍是 `content` block，不进入偏好上下文。Agent 不得主动复述选择，且只有 Skill 加载或真实远程 MCP 工具调用成功后才能声称已使用。
+偏好字段合并为内部 `bsbox.turn_preferences.v1`，来自 UI 控件而非用户正文；附件仍是 `content` block，不进入偏好上下文。`pending_file_drafts` 独立生成 user-authority 的 `bsbox.pending_file_drafts.v1` 请求级上下文，提醒 Agent 对相关路径重读并披露可能暂时只能看到最后保存版；服务端不把客户端上报的同步状态提升为系统事实。Agent 不得主动复述偏好选择，且只有 Skill 加载或真实远程 MCP 工具调用成功后才能声称已使用。
 
 普通 direct Round 会分别固化 `preferred_skills` 与 `preferred_mcp_connections`，并由 `RUN_STARTED` 和 `history/v2` 返回。same-Round resume 按当前 registry/catalog 重解析运行偏好，但不改写原展示快照。
 
@@ -745,7 +881,6 @@ Authorization: Bearer <access_token>
 | round_id        | string | 是   | 轮次 ID（Path 参数）             |
 | user_id         | string | 是   | 用户 ID（由 Authorization Bearer Token 解析） |
 | last_sequence   | int    | 否   | 客户端已收到的最后事件序列号，默认 0（从头重放） |
-| last_step       | int    | 否   | 已弃用，保留向下兼容，默认 0 |
 
 **响应** `200 OK`
 
@@ -972,7 +1107,8 @@ Content-Type: application/json
   "answers": {
     "你想用什么语言？": "Python",
     "需要测试吗？": "是"
-  }
+  },
+  "pending_file_drafts": [{"source":"workspace","path":"报告.md"}]
 }
 ```
 
@@ -980,6 +1116,7 @@ Content-Type: application/json
 | ------------ | ----------------- | ---- | ---- |
 | interrupt_id | string            | 是   | 来自 `CUSTOM interaction_requested.value.interactionId` |
 | answers      | dict[string, string] | 是   | 用户回答（问题文本 → 选项值） |
+| pending_file_drafts | object[] | 否 | continuation 启动时仍在同步的文件身份，语义与 direct send 相同 |
 
 工具审批复用同一 wire，`answers` 必须为 `{"approval":"allow_once|allow_session|allow_always|deny"}`。审批值按 trim/lower 规范化；同一 canonical resolution 的重试幂等，不同 resolution 返回控制面冲突。顶层 `resolution` 不是公开请求字段。
 
@@ -1733,7 +1870,14 @@ Authorization: Bearer <access_token>
 ```json
 {
   "jobs": [
-    { "name": "daily_report", "cron_expr": "0 9 * * *", "description": "每天9点生成日报", "enabled": true }
+    {
+      "name": "daily_report",
+      "cron_expr": "0 9 * * *",
+      "description": "每天9点生成日报",
+      "enabled": true,
+      "rule_version": 1,
+      "definition_version": 2
+    }
   ]
 }
 ```
@@ -1753,13 +1897,18 @@ Authorization: Bearer <access_token>
       "id": "uuid",
       "job_name": "daily_report",
       "cron_expr": "0 9 * * *",
+      "queued_at": "2026-03-30T08:59:59",
       "started_at": "2026-03-30T09:00:00",
       "completed_at": "2026-03-30T09:01:30",
       "status": "success",
+      "phase": "terminal",
+      "attempt_count": 1,
+      "error_code": null,
       "output": "日报已生成",
       "is_read": true,
       "artifacts": [{"name": "report.md", "size": 1024}],
-      "run_workspace": "/mnt/user/cron/runs/uuid"
+      "run_workspace": "/mnt/user/cron/runs/uuid",
+      "workspace_changes": [{"entry_id": "entry-id", "operation": "updated", "revision": 3}]
     }
   ],
   "total": 42,
@@ -1775,7 +1924,7 @@ POST /api/cron/jobs/{job_name}/run
 Authorization: Bearer <access_token>
 ```
 
-**说明**: 从 `cron_jobs` 表查找任务并在当前 worker 后台直接执行（立即返回 `run_id`）。Cron 不按用户串行排队；手动触发会立即进入后台执行，且不写入 `cron_fires` 去重表。执行历史以 `cron_job_runs` 为准。执行结果不会注入聊天 Session，用户通过消息中心查看。前端可通过 `GET /api/cron/runs/{run_id}` 轮询执行状态。
+**说明**: 从 `cron_jobs` 冻结 prompt 与 definition version，先创建 `status=queued` 的 durable run，再由 worker claim/lease 执行（接口立即返回 `run_id`）。Cron 不按用户串行排队，手动触发不写 `cron_fires`。执行结果不会注入聊天 Session，用户通过消息中心查看。
 
 **Response**:
 ```json
@@ -1797,17 +1946,22 @@ Authorization: Bearer <access_token>
   "id": "uuid-string",
   "job_name": "daily_report",
   "cron_expr": "0 9 * * *",
+  "queued_at": "2026-04-14T08:59:59",
   "started_at": "2026-04-14T09:00:00",
   "completed_at": "2026-04-14T09:00:15",
   "status": "success",
+  "phase": "terminal",
+  "attempt_count": 1,
+  "error_code": null,
   "output": "日报已生成",
   "is_read": false,
   "artifacts": [{"name": "report.md", "size": 2048}],
-  "run_workspace": "/mnt/user/cron/runs/uuid-string"
+  "run_workspace": "/mnt/user/cron/runs/uuid-string",
+  "workspace_changes": []
 }
 ```
 
-**status 枚举**: `running` | `success` | `failed`
+**status 枚举**: `queued` | `running` | `success` | `failed` | `conflict` | `unknown`。`claim_token`、worker id 与 lease 时间属于服务端 ownership fence，不在 API 中返回。
 
 ### 获取未读执行记录数
 
@@ -1836,7 +1990,7 @@ Authorization: Bearer <access_token>
 
 **Response**:
 ```json
-{ "marked": 3 }
+{ "marked": 3, "unread_count": 0 }
 ```
 
 ### 获取执行产物文件列表

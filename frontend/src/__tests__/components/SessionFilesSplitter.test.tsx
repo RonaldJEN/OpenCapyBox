@@ -1,15 +1,17 @@
 import { useRef, useState } from 'react';
 import { fireEvent, render, screen } from '../utils/test-utils';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SessionFilesSplitter } from '../../components/session-files/SessionFilesSplitter';
 
 function SplitterHarness({
   initialRatio = 48,
   onStartEdgeCollapse,
+  onRatioCommit,
 }: {
   initialRatio?: number;
   onStartEdgeCollapse?: () => void;
+  onRatioCommit?: (ratio: number) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [ratio, setRatio] = useState(initialRatio);
@@ -19,7 +21,10 @@ function SplitterHarness({
       <SessionFilesSplitter
         containerRef={containerRef}
         chatRatio={ratio}
-        onRatioChange={setRatio}
+        onRatioChange={(nextRatio) => {
+          onRatioCommit?.(nextRatio);
+          setRatio(nextRatio);
+        }}
         onStartEdgeCollapse={onStartEdgeCollapse}
       />
     </div>
@@ -27,13 +32,73 @@ function SplitterHarness({
 }
 
 describe('SessionFilesSplitter', () => {
+  let nextAnimationFrameId = 1;
+  let animationFrames = new Map<number, FrameRequestCallback>();
+
+  const flushAnimationFrames = () => {
+    const pending = [...animationFrames.values()];
+    animationFrames.clear();
+    pending.forEach((callback) => callback(16));
+  };
+
+  beforeEach(() => {
+    nextAnimationFrameId = 1;
+    animationFrames = new Map();
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      const id = nextAnimationFrameId++;
+      animationFrames.set(id, callback);
+      return id;
+    });
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => {
+      animationFrames.delete(id);
+    });
+  });
+
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it('指针可以按容器几何拖到 0%、任意中间值和 100%', () => {
+  it('拖动按帧预览最新比例，并只在松手时提交中间比例', () => {
     vi.stubGlobal('PointerEvent', MouseEvent);
-    render(<SplitterHarness />);
+    const onRatioCommit = vi.fn();
+    render(<SplitterHarness onRatioCommit={onRatioCommit} />);
+    const container = screen.getByTestId('splitter-container');
+    const readBounds = vi.spyOn(container, 'getBoundingClientRect').mockReturnValue({
+      x: 100,
+      y: 0,
+      left: 100,
+      right: 1100,
+      top: 0,
+      bottom: 600,
+      width: 1000,
+      height: 600,
+      toJSON: () => ({}),
+    });
+    const splitter = screen.getByRole('separator', { name: '调整聊天和文件面板宽度' });
+
+    fireEvent.pointerDown(splitter, { button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 200, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 300, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 350, pointerId: 1 });
+    expect(screen.getByTestId('splitter-ratio')).toHaveTextContent('48');
+    expect(onRatioCommit).not.toHaveBeenCalled();
+    expect(readBounds).toHaveBeenCalledTimes(1);
+
+    flushAnimationFrames();
+    expect(container.style.getPropertyValue('--session-files-chat-ratio')).toBe('25%');
+    expect(screen.getByTestId('splitter-ratio')).toHaveTextContent('48');
+    expect(onRatioCommit).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(window, { pointerId: 1 });
+    expect(screen.getByTestId('splitter-ratio')).toHaveTextContent('25');
+    expect(onRatioCommit).toHaveBeenCalledTimes(1);
+    expect(onRatioCommit).toHaveBeenLastCalledWith(25);
+  });
+
+  it('松手前仍会冲刷最后一个尚未绘制的比例', () => {
+    vi.stubGlobal('PointerEvent', MouseEvent);
+    const onRatioCommit = vi.fn();
+    render(<SplitterHarness onRatioCommit={onRatioCommit} />);
     const container = screen.getByTestId('splitter-container');
     vi.spyOn(container, 'getBoundingClientRect').mockReturnValue({
       x: 100,
@@ -49,15 +114,13 @@ describe('SessionFilesSplitter', () => {
     const splitter = screen.getByRole('separator', { name: '调整聊天和文件面板宽度' });
 
     fireEvent.pointerDown(splitter, { button: 0, pointerId: 1 });
-    fireEvent.pointerMove(window, { clientX: -500, pointerId: 1 });
-    expect(screen.getByTestId('splitter-ratio')).toHaveTextContent('0');
-
-    fireEvent.pointerMove(window, { clientX: 350, pointerId: 1 });
-    expect(screen.getByTestId('splitter-ratio')).toHaveTextContent('25');
-
     fireEvent.pointerMove(window, { clientX: 2000, pointerId: 1 });
-    expect(screen.getByTestId('splitter-ratio')).toHaveTextContent('100');
     fireEvent.pointerUp(window, { pointerId: 1 });
+
+    expect(container.style.getPropertyValue('--session-files-chat-ratio')).toBe('100%');
+    expect(screen.getByTestId('splitter-ratio')).toHaveTextContent('100');
+    expect(onRatioCommit).toHaveBeenCalledTimes(1);
+    expect(onRatioCommit).toHaveBeenLastCalledWith(100);
   });
 
   it('键盘 Home/End 和方向键覆盖完整 0–100 范围', () => {

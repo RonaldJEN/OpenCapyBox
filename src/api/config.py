@@ -1,6 +1,7 @@
 """应用配置"""
 import hashlib
 import logging
+import math
 import secrets
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
@@ -206,12 +207,27 @@ class Settings(BaseSettings):
     sandbox_storage_mount_path: str = "/home/user"  # 容器內掛載路徑
     sandbox_background_command_timeout_seconds: int = 21600  # 后台 bash 命令服务端超时（秒），0 表示禁用
 
+    # 用户持久工作区（位于 sandbox_storage_mount_path/workdir）
+    workspace_quota_bytes: int = 5 * 1024 * 1024 * 1024
+    workspace_history_quota_bytes: int = 5 * 1024 * 1024 * 1024
+    workspace_preview_cache_bytes: int = 512 * 1024 * 1024
+    workspace_max_file_bytes: int = 512 * 1024 * 1024
+    workspace_max_entries: int = 10_000
+    workspace_mutation_lease_seconds: int = 120
+    workspace_version_retention_count: int = 20
+    workspace_version_retention_days: int = 30
+    workspace_draft_base_retention_days: int = 1
+    workspace_draft_revision_retention_count: int = 5
+    workspace_history_gc_interval_seconds: int = 300
+    workspace_history_gc_batch_size: int = 100
+
     # Agent 配置
     agent_max_steps: int = 100
     # legacy_120 only: the checkpoint strategy is token-budgeted and never
     # slices provider history by message count.
     agent_max_history_messages: int = 120
     agent_history_strategy: str = "checkpoint_v1"
+    agent_init_timeout_seconds: int = 180  # Agent/Sandbox/工具初始化总墙钟期限
     agent_tool_timeout: int = 300  # 单次工具执行超时（秒），0 表示不限
     agent_subagent_max_parallel: int = 3  # 同一父 Agent step 内最多并行执行的 sub_agent 数；1 表示串行
     agent_user_concurrency_limit: int = 1  # 同一用户允许同时运行的不同会话数，至少为 1
@@ -255,6 +271,9 @@ class Settings(BaseSettings):
     # Cron 配置（去中心化 worker）
     cron_fire_max_age_days: int = 7  # cron_fires 清理保留天数（后续清理任务使用）
     cron_dispatch_catch_up_max_minutes: int = 60  # worker 醒来后最多补扫的漏调度分钟数
+    cron_claim_lease_seconds: float = 120.0
+    cron_claim_heartbeat_seconds: float = 30.0
+    cron_reconcile_interval_seconds: float = 30.0
 
     # Agent 資源路徑配置（可通過 .env 覆蓋，預設相對於 src/agent/）
     skills_dir: str = ""          # 留空則自動定位到 src/agent/skills/
@@ -306,6 +325,44 @@ class Settings(BaseSettings):
     def validate_cron_dispatch_catch_up_max_minutes(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("cron_dispatch_catch_up_max_minutes must be > 0")
+        return value
+
+    @field_validator("agent_init_timeout_seconds")
+    @classmethod
+    def validate_agent_init_timeout_seconds(cls, value: int) -> int:
+        if value <= 0 or value > 900:
+            raise ValueError("agent_init_timeout_seconds must be > 0 and <= 900")
+        return value
+
+    @field_validator(
+        "workspace_quota_bytes",
+        "workspace_history_quota_bytes",
+        "workspace_preview_cache_bytes",
+        "workspace_max_file_bytes",
+        "workspace_max_entries",
+        "workspace_mutation_lease_seconds",
+        "workspace_version_retention_count",
+        "workspace_version_retention_days",
+        "workspace_draft_base_retention_days",
+        "workspace_draft_revision_retention_count",
+        "workspace_history_gc_interval_seconds",
+        "workspace_history_gc_batch_size",
+    )
+    @classmethod
+    def validate_positive_workspace_settings(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("workspace limits and lease must be > 0")
+        return value
+
+    @field_validator(
+        "cron_claim_lease_seconds",
+        "cron_claim_heartbeat_seconds",
+        "cron_reconcile_interval_seconds",
+    )
+    @classmethod
+    def validate_positive_cron_runtime_seconds(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0 or value > 3600:
+            raise ValueError("cron runtime lease settings must be > 0 and <= 3600")
         return value
 
     @field_validator("agent_history_strategy")
@@ -458,6 +515,12 @@ class Settings(BaseSettings):
                 "tool_approval_lease_heartbeat_seconds must be < "
                 "tool_approval_execution_lease_seconds"
             )
+        if self.cron_claim_heartbeat_seconds >= self.cron_claim_lease_seconds:
+            raise ValueError(
+                "cron_claim_heartbeat_seconds must be < cron_claim_lease_seconds"
+            )
+        if self.workspace_max_file_bytes > self.workspace_quota_bytes:
+            raise ValueError("workspace_max_file_bytes must be <= workspace_quota_bytes")
         return self
 
     def get_auth_users(self) -> dict[str, str]:

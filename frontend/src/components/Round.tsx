@@ -1,4 +1,9 @@
-import { RoundData, FileInfo, AttachmentInfo } from '../types';
+import {
+  type AssistantFileReference,
+  type AttachmentInfo,
+  type FileInfo,
+  type RoundData,
+} from '../types';
 import { useState } from 'react';
 import {
   AlignLeft,
@@ -22,8 +27,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { parseMessageContent } from '../utils/messageParser';
 import {
-  createAssistantFileInfoFromHref,
-  extractAssistantFiles,
+  assistantFileReferenceToFileInfo,
+  resolveAssistantFileReferenceFromHref,
 } from '../utils/assistantFileRefs';
 import { detectFileCategory, getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, toFileInfo, buildSandboxFileUrl, isImageFile } from '../utils/fileUtils';
 import { AuthenticatedImage } from './AuthenticatedImage';
@@ -34,7 +39,6 @@ interface RoundProps {
   disableMotion?: boolean;
   userAttachments?: AttachmentInfo[];
   sessionId?: string;
-  assistantFileMatches?: Record<string, FileInfo | null | undefined>;
   onPreviewAttachment?: (file: FileInfo) => void;
   onOpenFileInPanel?: (file: FileInfo) => void;
 }
@@ -69,11 +73,11 @@ async function copyTextToClipboard(text: string): Promise<void> {
 
 function AssistantMarkdown({
   content,
-  sessionId,
+  fileReferences,
   onOpenFile,
 }: {
   content: string;
-  sessionId?: string;
+  fileReferences: AssistantFileReference[];
   onOpenFile?: (file: FileInfo) => void;
 }) {
   return (
@@ -133,22 +137,34 @@ function AssistantMarkdown({
           return null;
         },
         a: ({ children, href, ...props }: any) => {
-          const localFile = typeof href === 'string'
-            ? createAssistantFileInfoFromHref(href, sessionId)
+          const reference = typeof href === 'string'
+            ? resolveAssistantFileReferenceFromHref(href, fileReferences)
             : null;
-          if (localFile && onOpenFile) {
+          if (reference && onOpenFile) {
             return (
               <a
                 href={href}
                 className="text-blue-600 hover:underline underline-offset-2 cursor-pointer"
                 onClick={(event) => {
                   event.preventDefault();
-                  onOpenFile(localFile);
+                  onOpenFile(assistantFileReferenceToFileInfo(reference));
                 }}
                 {...props}
               >
                 {children}
               </a>
+            );
+          }
+          const externalHref = typeof href === 'string'
+            && /^(?:https?:|mailto:|#|\/api\/)/i.test(href);
+          if (!externalHref) {
+            return (
+              <span
+                className="text-claude-secondary"
+                title="没有可验证的文件版本，无法打开"
+              >
+                {children}
+              </span>
             );
           }
           return (
@@ -274,38 +290,55 @@ function AssistantFileTypeIcon({ file }: { file: FileInfo }) {
   );
 }
 
-function AssistantFileCard({ file, onOpen }: { file: FileInfo; onOpen?: (file: FileInfo) => void }) {
+function AssistantFileCard({
+  reference,
+  onOpen,
+}: {
+  reference: AssistantFileReference;
+  onOpen?: (file: FileInfo) => void;
+}) {
+  const file = assistantFileReferenceToFileInfo(reference);
   const previewSessionId = file.session_id;
-  const showImagePreview = isImageFile(file) && (file.data_url || (previewSessionId && file.path));
+  const imagePreviewPath = reference.source === 'session'
+    ? reference.snapshot_path
+    : file.path;
+  const showImagePreview = isImageFile(file) && (file.data_url || (previewSessionId && imagePreviewPath));
 
   return (
-    <button
-      type="button"
-      onClick={() => onOpen?.(file)}
-      className="not-prose group flex min-h-[52px] w-full max-w-[520px] items-center gap-2.5 rounded-[10px] border border-transparent bg-claude-surface px-2.5 py-2 text-left transition-[background-color,border-color,transform] hover:border-claude-border hover:bg-claude-hover active:scale-[0.995] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/35 sm:w-fit sm:min-w-[280px]"
-      aria-label={`查看 ${file.name}`}
-      title={`查看 ${file.name}`}
-    >
-      {showImagePreview ? (
-        <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-[7px] bg-white/75">
-          <AuthenticatedImage
-            src={file.data_url || buildSandboxFileUrl(previewSessionId!, file.path, true)}
-            alt={file.name}
-            className="h-full w-full object-cover"
-            fallback={<AssistantFileTypeIcon file={file} />}
-          />
+    <div className="not-prose w-full max-w-[520px] sm:w-fit sm:min-w-[280px]">
+      <button
+        type="button"
+        onClick={() => onOpen?.(file)}
+        className="group flex min-h-[52px] w-full items-center gap-2.5 rounded-[10px] border border-transparent bg-claude-surface px-2.5 py-2 text-left transition-[background-color,border-color,transform] hover:border-claude-border hover:bg-claude-hover active:scale-[0.995] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/35"
+        aria-label={`打开 ${file.name}`}
+        title={`打开 ${file.name}`}
+      >
+        {showImagePreview ? (
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-[7px] bg-white/75">
+            <AuthenticatedImage
+              src={file.data_url || buildSandboxFileUrl(previewSessionId!, imagePreviewPath, true)}
+              alt={file.name}
+              className="h-full w-full object-cover"
+              fallback={<AssistantFileTypeIcon file={file} />}
+            />
+          </span>
+        ) : (
+          <AssistantFileTypeIcon file={file} />
+        )}
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[15px] font-medium leading-5 text-claude-text sm:max-w-[430px]">
+            {file.name}
+          </span>
+          <span className="mt-0.5 block text-[11px] leading-4 text-claude-muted">
+            {reference.source === 'workspace' ? '工作区文件' : '会话文件'}
+          </span>
         </span>
-      ) : (
-        <AssistantFileTypeIcon file={file} />
-      )}
-      <span className="min-w-0 flex-1 truncate text-[15px] font-medium leading-6 text-claude-text sm:max-w-[430px] sm:flex-none">
-        {file.name}
-      </span>
-    </button>
+      </button>
+    </div>
   );
 }
 
-export function Round({ round, isStreaming = false, disableMotion = false, userAttachments = [], sessionId, assistantFileMatches, onPreviewAttachment, onOpenFileInPanel }: RoundProps) {
+export function Round({ round, isStreaming = false, disableMotion = false, userAttachments = [], sessionId, onPreviewAttachment, onOpenFileInPanel }: RoundProps) {
   // 解析用户消息，提取附件信息
   const { attachments, cleanContent } = parseMessageContent(round.user_message);
 
@@ -326,15 +359,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
   const assistantContent = visibleFinalResponse
     || ((effectiveStreaming || round.status === 'cancelled') ? visibleStepContent : undefined);
   const canCopyAssistantContent = round.status === 'completed' && !!round.final_response;
-  const assistantFiles = assistantContent
-    ? extractAssistantFiles(assistantContent, sessionId)
-    : [];
-  const visibleAssistantFiles = assistantFileMatches
-    ? assistantFiles.flatMap((file) => {
-        const matched = assistantFileMatches[file.path];
-        return matched ? [{ ...file, ...matched, path: matched.path.replace(/^\/+/, '') }] : [];
-      })
-    : assistantFiles;
+  const visibleAssistantFiles = round.assistant_file_references || [];
 
   return (
     <div className={`space-y-6 ${disableMotion ? '' : 'animate-fade-in'}`}>
@@ -468,7 +493,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
             <div className="prose max-w-none mt-4">
               <AssistantMarkdown
                 content={assistantContent}
-                sessionId={sessionId}
+                fileReferences={visibleAssistantFiles}
                 onOpenFile={onOpenFileInPanel}
               />
               {/* 流式传输光标 */}
@@ -478,10 +503,10 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
               {/* 底部文件卡片（去重） */}
               {visibleAssistantFiles.length > 0 && (
                 <div className="not-prose mt-3 flex max-w-[520px] flex-col items-stretch gap-1.5 sm:items-start">
-                  {visibleAssistantFiles.map((file) => (
+                  {visibleAssistantFiles.map((reference) => (
                     <AssistantFileCard
-                      key={`file-${file.path}`}
-                      file={file}
+                      key={reference.ref_id}
+                      reference={reference}
                       onOpen={onOpenFileInPanel}
                     />
                   ))}

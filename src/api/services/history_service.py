@@ -6,6 +6,7 @@
 """
 from collections.abc import Callable
 import hashlib
+import posixpath
 from sqlalchemy.orm import Session as DBSession
 from sqlalchemy.exc import IntegrityError
 from src.api.models.session import Session
@@ -15,6 +16,7 @@ from src.api.models.agent_interaction import AgentInteraction
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.subagent_run import SubagentRun
 from src.api.models.tool_permission import ToolApprovalRequest
+from src.api.models.workspace import WorkspaceFileVersion
 from src.agent.schema.agui_events import AGUIEvent, EventType
 from src.agent.context_compaction import SUMMARY_PREFIX
 from src.api.services.agui_event_bus import AguiEventBus, StoredEvent, get_agui_event_bus
@@ -111,6 +113,23 @@ class HistoryService:
         self.db.rollback()
 
     # 🆕 Round 相关方法
+
+    def find_round_by_idempotency_key(
+        self, session_id: str, idempotency_key: str
+    ) -> Optional[Round]:
+        """Look up an already-admitted Round so retries can skip side effects."""
+        existing = (
+            self.db.query(Round)
+            .filter(
+                Round.session_id == session_id,
+                Round.idempotency_key == idempotency_key,
+            )
+            .first()
+        )
+        if existing is not None:
+            self.db.expunge(existing)
+        self.db.rollback()
+        return existing
 
     def create_round(
         self,
@@ -239,6 +258,7 @@ class HistoryService:
         run_id: str,
         *,
         return_last_sequence: bool = False,
+        assistant_file_references: list[dict] | None = None,
     ) -> List[Dict] | tuple[List[Dict], int]:
         """从 AG-UI 事件重建步骤列表
         
@@ -266,6 +286,64 @@ class HistoryService:
         steps = []
         current_step = None
         current_tool_call = None
+
+        def append_assistant_file_reference(value: Any) -> None:
+            if assistant_file_references is None or not isinstance(value, dict):
+                return
+            source = value.get("source")
+            if (
+                source == "session"
+                and str(value.get("operation") or "").upper() == "DELETED"
+                and isinstance(value.get("session_id"), str)
+                and isinstance(value.get("path"), str)
+            ):
+                assistant_file_references[:] = [
+                    reference
+                    for reference in assistant_file_references
+                    if reference.get("source") != "session"
+                    or reference.get("session_id") != value["session_id"]
+                    or reference.get("path") != value["path"]
+                ]
+                return
+            ref_id = value.get("ref_id")
+            path = value.get("path")
+            name = value.get("name")
+            revision = value.get("revision")
+            if source not in {"session", "workspace"}:
+                return
+            if not all(
+                isinstance(item, str) and item
+                for item in (ref_id, path, name, revision)
+            ):
+                return
+            assistant_file_references.append({
+                "ref_id": ref_id,
+                "source": source,
+                "name": name,
+                "path": path,
+                "size": int(value.get("size") or 0),
+                "modified": str(value.get("modified") or ""),
+                "type": str(value.get("type") or ""),
+                "revision": revision,
+                "operation": value.get("operation"),
+                "tool_call_id": value.get("toolCallId"),
+                "sha256": value.get("sha256"),
+                "session_id": value.get("session_id"),
+                "snapshot_path": value.get("snapshot_path"),
+                "entry_id": value.get("entry_id"),
+                "workspace_path": value.get("workspace_path"),
+                "version_id": value.get("version_id"),
+            })
+
+        def remove_workspace_assistant_file_reference(entry_id: str) -> None:
+            if assistant_file_references is None:
+                return
+            assistant_file_references[:] = [
+                reference
+                for reference in assistant_file_references
+                if reference.get("source") != "workspace"
+                or reference.get("entry_id") != entry_id
+            ]
 
         def event_timestamp(event_log, event_data: dict) -> int | None:
             timestamp = getattr(event_log, "timestamp", None)
@@ -416,6 +494,64 @@ class HistoryService:
                             "received_at_ts": timestamp,
                             "execution_time_ms": 0,
                         })
+
+                elif (
+                    event_type == "CUSTOM"
+                    and event_data.get("name") == "workspace_resource_changed"
+                ):
+                    value = event_data.get("value")
+                    if not isinstance(value, dict):
+                        continue
+                    operation_name = str(value.get("operation") or "").upper()
+                    if (
+                        operation_name == "DELETED"
+                        and isinstance(value.get("entry_id"), str)
+                    ):
+                        for deleted_id in value.get("affected_entry_ids") or [value["entry_id"]]:
+                            remove_workspace_assistant_file_reference(deleted_id)
+                    projected_reference = value.get("assistant_file_reference")
+                    if (
+                        not isinstance(projected_reference, dict)
+                        and value.get("kind") == "file"
+                        and str(value.get("status") or "active") == "active"
+                        and operation_name not in {"NO_CHANGE", "DELETED"}
+                        and value.get("entry_id")
+                        and value.get("current_version_id")
+                    ):
+                        # Safe legacy backfill: old events already carried a
+                        # stable Workspace entry + immutable version.  We do
+                        # not infer Session identity from assistant prose.
+                        entry_id = str(value["entry_id"])
+                        version_id = str(value["current_version_id"])
+                        path = str(value.get("path") or "")
+                        name = str(value.get("name") or posixpath.basename(path))
+                        projected_reference = {
+                            "ref_id": f"workspace:{entry_id}:{version_id}",
+                            "source": "workspace",
+                            "entry_id": entry_id,
+                            "version_id": version_id,
+                            "name": name,
+                            "path": path,
+                            "workspace_path": path,
+                            "size": int(value.get("size_bytes") or 0),
+                            "modified": "",
+                            "type": (
+                                name.rsplit(".", 1)[-1].lower()
+                                if "." in name
+                                else ""
+                            ),
+                            "revision": str(value.get("revision") or ""),
+                            "operation": value.get("operation"),
+                            "toolCallId": value.get("toolCallId"),
+                            "sha256": value.get("sha256"),
+                        }
+                    append_assistant_file_reference(projected_reference)
+                elif (
+                    event_type == "CUSTOM"
+                    and event_data.get("name") == "assistant_file_referenced"
+                    and assistant_file_references is not None
+                ):
+                    append_assistant_file_reference(event_data.get("value"))
                     
             except (json.JSONDecodeError, KeyError) as e:
                 print(f"⚠️ 解析事件失败: {e} (run_id={run_id}, id={event_log.id})")
@@ -529,10 +665,20 @@ class HistoryService:
         result = []
         for round_obj in rounds:
             # 从 AG-UI 事件重建步骤
+            assistant_file_references: List[Dict] = []
             steps, last_event_sequence = self._rebuild_steps_from_events(
                 round_obj.id,
                 return_last_sequence=True,
+                assistant_file_references=assistant_file_references,
             )
+            deduplicated_file_references: dict[str, Dict] = {}
+            for reference in assistant_file_references:
+                identity = (
+                    f"workspace:{reference.get('entry_id')}"
+                    if reference.get("source") == "workspace"
+                    else f"session:{reference.get('session_id')}:{reference.get('path')}"
+                )
+                deduplicated_file_references[identity] = reference
             attachments: List[Dict] = []
             if round_obj.user_attachments:
                 try:
@@ -620,6 +766,9 @@ class HistoryService:
                     "last_event_sequence": last_event_sequence,
                     "user_message": round_obj.user_message,
                     "user_attachments": attachments,
+                    "assistant_file_references": list(
+                        deduplicated_file_references.values()
+                    ),
                     "preferred_skills": preferred_skills,
                     "preferred_mcp_connections": preferred_mcp_connections,
                     "thinking_mode": round_obj.thinking_mode,
@@ -635,6 +784,67 @@ class HistoryService:
                     "interrupt": interrupt_details,
                 }
             )
+
+        session_user_id = self.db.query(Session.user_id).filter(
+            Session.id == session_id,
+        ).scalar()
+        workspace_attachment_ids = {
+            str(attachment.get("entry_id"))
+            for item in result for attachment in item.get("user_attachments", [])
+            if attachment.get("source") == "workspace" and attachment.get("entry_id")
+        }
+        workspace_reference_entry_ids = {
+            str(reference.get("entry_id"))
+            for item in result
+            for reference in item.get("assistant_file_references", [])
+            if reference.get("source") == "workspace" and reference.get("entry_id")
+        }
+        workspace_entry_ids = workspace_attachment_ids | workspace_reference_entry_ids
+        active_ids: set[str] = set()
+        if workspace_entry_ids:
+            from src.api.models.workspace import WorkspaceEntry
+            active_ids = {
+                str(row[0]) for row in self.db.query(WorkspaceEntry.entry_id)
+                .filter(
+                    WorkspaceEntry.user_id == session_user_id,
+                    WorkspaceEntry.entry_id.in_(tuple(workspace_entry_ids)),
+                    WorkspaceEntry.status == "active",
+                )
+                .all()
+            }
+        if workspace_attachment_ids:
+            for item in result:
+                item["user_attachments"] = [
+                    attachment for attachment in item["user_attachments"]
+                    if attachment.get("source") != "workspace"
+                    or str(attachment.get("entry_id")) in active_ids
+                ]
+
+        workspace_version_ids = {
+            str(reference.get("version_id"))
+            for item in result
+            for reference in item.get("assistant_file_references", [])
+            if reference.get("source") == "workspace" and reference.get("version_id")
+        }
+        if workspace_version_ids:
+            materialized_versions = {
+                str(row[0])
+                for row in self.db.query(WorkspaceFileVersion.version_id).filter(
+                    WorkspaceFileVersion.user_id == session_user_id,
+                    WorkspaceFileVersion.version_id.in_(tuple(workspace_version_ids)),
+                    WorkspaceFileVersion.state == "materialized",
+                ).all()
+            }
+            for item in result:
+                item["assistant_file_references"] = [
+                    reference
+                    for reference in item.get("assistant_file_references", [])
+                    if reference.get("source") != "workspace"
+                    or (
+                        str(reference.get("entry_id")) in active_ids
+                        and str(reference.get("version_id")) in materialized_versions
+                    )
+                ]
 
         return result
 

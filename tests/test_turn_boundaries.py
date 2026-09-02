@@ -115,6 +115,82 @@ def test_web_chat_adapter_normalizes_send_request_and_attachments():
     assert [attachment.path for attachment in turn.attachments] == ["docs/a.txt"]
 
 
+def test_web_chat_adapter_preserves_workspace_attachment_identity():
+    request = SendMessageRequest(
+        content=[
+            FileContentBlock(
+                type="file",
+                file=FileObject(
+                    source="workspace",
+                    entry_id="entry-1",
+                    name="report.xlsx",
+                    mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    size=42,
+                ),
+            ),
+        ],
+    )
+
+    turn = WebChatAdapter().normalize_send(session_id="s1", user_id="u1", request=request)
+
+    assert turn.attachments[0].path is None
+    assert turn.attachments[0].raw == {
+        "source": "workspace",
+        "entry_id": "entry-1",
+        "name": "report.xlsx",
+        "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "size": 42,
+    }
+
+
+def test_workspace_file_uses_current_head_when_version_is_omitted():
+    file = FileObject(
+        source="workspace",
+        entry_id="entry-1",
+    )
+
+    assert file.version_id is None
+
+
+def test_workspace_file_accepts_explicit_immutable_version():
+    file = FileObject(
+        source="workspace",
+        entry_id="entry-1",
+        version_id="version-1",
+    )
+
+    assert file.version_id == "version-1"
+
+
+def test_workspace_directory_preserves_explicit_entry_kind():
+    file = FileObject(
+        source="workspace",
+        entry_id="folder-1",
+        kind="directory",
+    )
+
+    assert file.kind == "directory"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"source": "session"},
+        {"source": "workspace"},
+        {"source": "workspace", "entry_id": "entry-1", "revision": 1},
+        {"source": "workspace", "entry_id": "entry-1", "tree_revision": 1},
+        {
+            "source": "workspace",
+            "entry_id": "entry-1",
+            "path": "forged.txt",
+        },
+    ],
+)
+def test_file_object_rejects_incomplete_or_forged_source_identity(payload):
+    with pytest.raises(ValueError):
+        FileObject.model_validate(payload)
+
+
 def test_channel_receive_result_contract_carries_dispatch_turn():
     target = MessageTarget(peer_kind="direct", peer_id="peer-1", account_id="bot-1")
     inbound = ChannelReceiveResult(

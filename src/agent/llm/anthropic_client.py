@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 import anthropic
+import httpx
 
 from ..retry import RetryConfig, async_retry
 from ..schema import FunctionCall, LLMResponse, Message, ToolCall
@@ -54,6 +55,8 @@ class AnthropicClient(LLMClientBase):
         self.client = anthropic.AsyncAnthropic(
             base_url=api_base,
             api_key=api_key,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=60.0, pool=10.0),
+            max_retries=0,
         )
 
     @staticmethod

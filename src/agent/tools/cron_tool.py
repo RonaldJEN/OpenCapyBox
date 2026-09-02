@@ -10,7 +10,6 @@ from .base import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
 
-
 def _validate_cron_expr(cron_expr: str) -> str | None:
     """校验 5 字段 cron 表达式，返回错误信息或 None"""
     from src.api.services.cron_engine import CronEngine, CronExpressionError
@@ -38,6 +37,7 @@ class ManageCronTool(Tool):
         return (
             "Manage cron scheduled tasks. Actions:\n"
             "- add: Create a new cron job (requires name, description, and preferably schedule)\n"
+            "- update: Update prompt or schedule for an existing job\n"
             "- remove: Delete a cron job by name\n"
             "- list: List all cron jobs for this user\n"
             "- toggle: Enable/disable a cron job by name\n"
@@ -57,7 +57,7 @@ class ManageCronTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["add", "remove", "list", "toggle", "history"],
+                    "enum": ["add", "update", "remove", "list", "toggle", "history"],
                     "description": "Action to perform",
                 },
                 "name": {
@@ -66,11 +66,17 @@ class ManageCronTool(Tool):
                 },
                 "cron": {
                     "type": "string",
-                    "description": "Linux/Vixie 5-field cron expression. Use only when structured schedule cannot express the plan.",
+                    "description": (
+                        "Linux/Vixie 5-field cron expression. Use only when "
+                        "structured schedule cannot express the plan."
+                    ),
                 },
                 "schedule": {
                     "type": "object",
-                    "description": "Preferred structured schedule. weekly.days uses 0=Sunday, 1=Monday, ..., 6=Saturday.",
+                    "description": (
+                        "Preferred structured schedule. weekly.days uses "
+                        "0=Sunday, 1=Monday, ..., 6=Saturday."
+                    ),
                     "properties": {
                         "kind": {
                             "type": "string",
@@ -91,6 +97,10 @@ class ManageCronTool(Tool):
                     "type": "string",
                     "description": "Job description - what the agent should do when triggered (required for add)",
                 },
+                "content": {
+                    "type": "string",
+                    "description": "Execution prompt. If omitted on add, description is used.",
+                },
             },
             "required": ["action"],
         }
@@ -99,13 +109,28 @@ class ManageCronTool(Tool):
         self,
         action: str,
         name: str = "",
-        cron: str = "",
-        description: str = "",
+        cron: str | None = None,
+        description: str | None = None,
         schedule: dict[str, Any] | None = None,
+        content: str | None = None,
     ) -> ToolResult:
         try:
             if action == "add":
-                return self._do_add(name, cron, description, schedule)
+                return self._do_add(
+                    name,
+                    cron or "",
+                    description or "",
+                    schedule,
+                    content,
+                )
+            elif action == "update":
+                return self._do_update(
+                    name,
+                    cron,
+                    description,
+                    schedule,
+                    content,
+                )
             elif action == "remove":
                 return self._do_remove(name)
             elif action == "list":
@@ -126,6 +151,7 @@ class ManageCronTool(Tool):
         cron_expr: str,
         description: str,
         schedule: dict[str, Any] | None,
+        content: str | None,
     ) -> ToolResult:
         if not name or not name.strip():
             return ToolResult(success=False, error="任务名 name 不能为空")
@@ -144,9 +170,7 @@ class ManageCronTool(Tool):
                     self._user_id,
                     name=name.strip(),
                     description=description.strip(),
-                    # Agent 沿用 description 作为 prompt（与历史行为一致），
-                    # content 留空让 run_cron_job 回退到 description。
-                    content="",
+                    content=(content or "").strip(),
                     schedule=schedule,
                     cron_expr=cron_expr.strip() if cron_expr else None,
                     enabled=True,
@@ -166,6 +190,59 @@ class ManageCronTool(Tool):
                     f"执行计划：{plan}\n"
                     f"Cron：{job.cron_expr}\n"
                     f"未来执行：{future}"
+                ),
+            )
+        finally:
+            db.close()
+
+    def _do_update(
+        self,
+        name: str,
+        cron_expr: str | None,
+        description: str | None,
+        schedule: dict[str, Any] | None,
+        content: str | None,
+    ) -> ToolResult:
+        if not name or not name.strip():
+            return ToolResult(success=False, error="任务名 name 不能为空")
+        cron_expr = cron_expr.strip() if isinstance(cron_expr, str) and cron_expr.strip() else None
+        if all(
+            value is None
+            for value in (
+                cron_expr,
+                description,
+                schedule,
+                content,
+            )
+        ):
+            return ToolResult(success=False, error="update 至少提供一个待修改字段")
+
+        from src.api.services.cron_service import (
+            CronJobBusyError,
+            CronJobNotFoundError,
+            CronJobValidationError,
+            CronService,
+        )
+
+        db = self._db_factory()
+        try:
+            try:
+                job = CronService(db).update_job(
+                    self._user_id,
+                    name.strip(),
+                    description=description,
+                    content=content,
+                    schedule=schedule,
+                    cron_expr=cron_expr,
+                )
+            except (CronJobBusyError, CronJobNotFoundError, CronJobValidationError) as exc:
+                return ToolResult(success=False, error=str(exc))
+            return ToolResult(
+                success=True,
+                content=(
+                    f"已更新定时任务 '{job.name}'\n"
+                    f"Cron：{job.cron_expr}\n"
+                    f"定义版本：{job.definition_version}"
                 ),
             )
         finally:

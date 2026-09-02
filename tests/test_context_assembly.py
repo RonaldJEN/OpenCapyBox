@@ -962,6 +962,7 @@ class TestIndexConversationRound:
             if isinstance(record, MemoryEmbedding):
                 assert record.file_path == "conversation/session-123/round-456"
                 assert record.user_id == "u1"
+                assert record.conversation_round_id == "round-456"
 
     @pytest.mark.asyncio
     async def test_index_stores_embedding_as_padded_float_list(self):

@@ -11,12 +11,17 @@ import {
 import { FUniver } from '@univerjs/core/facade';
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core';
 import UniverPresetSheetsCoreZhCN from '@univerjs/preset-sheets-core/locales/zh-CN';
+import {
+  SetRangeValuesMutation,
+  type ISetRangeValuesMutationParams,
+} from '@univerjs/sheets';
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import * as XLSX from 'xlsx';
 import '@univerjs/preset-sheets-core/lib/index.css';
 
 export interface SpreadsheetEditorHandle {
   exportFile: () => ArrayBuffer;
+  exportFileDeferred?: () => Promise<ArrayBuffer>;
 }
 
 interface SpreadsheetEditorProps {
@@ -47,6 +52,106 @@ type SpreadsheetSnapshotSheet = Partial<NonNullable<IWorkbookData['sheets'][stri
 const spreadsheetSourceMetadata = new WeakMap<XLSX.WorkBook, SpreadsheetSourceMetadata>();
 const OOXML_MAIN_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const OOXML_DOCUMENT_REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+
+function isSpreadsheetContentMutation(command: { id: string; type?: CommandType }): boolean {
+  return command.type === CommandType.MUTATION
+    && command.id === SetRangeValuesMutation.id;
+}
+
+type SpreadsheetMutationParams = Pick<
+  ISetRangeValuesMutationParams,
+  'subUnitId' | 'cellValue'
+> & { unitId?: string };
+
+interface SpreadsheetContentTracker {
+  apply: (params: SpreadsheetMutationParams) => boolean;
+}
+
+export function shouldMarkSpreadsheetDirty(
+  command: { id: string; type?: CommandType; params?: unknown },
+  options: { fromChangeset?: boolean } | undefined,
+  tracker: SpreadsheetContentTracker,
+  workbookId: string,
+  readOnly: boolean,
+): boolean {
+  if (!isSpreadsheetContentMutation(command)) return false;
+  const params = command.params as SpreadsheetMutationParams;
+  if (params.unitId && params.unitId !== workbookId) return false;
+  const contentChanged = tracker.apply(params);
+  // Remote/initial changesets advance the local baseline but must never write
+  // the same content back through the workspace autosave endpoint.
+  return !readOnly && !options?.fromChangeset && contentChanged;
+}
+
+interface SpreadsheetCellContent {
+  formula?: string;
+  value?: string | number | boolean;
+}
+
+function cellContentFromUniver(cell: ICellData | null | undefined): SpreadsheetCellContent {
+  if (!cell) return {};
+  const formula = normalizeFormula(cell.f);
+  const value = typeof cell.v === 'string' || typeof cell.v === 'number' || typeof cell.v === 'boolean'
+    ? cell.v
+    : undefined;
+  return { ...(formula ? { formula } : {}), ...(value !== undefined ? { value } : {}) };
+}
+
+function sameSpreadsheetCellContent(left: SpreadsheetCellContent, right: SpreadsheetCellContent): boolean {
+  if (left.formula || right.formula) return left.formula === right.formula;
+  return Object.is(left.value, right.value);
+}
+
+export function createSpreadsheetContentTracker(workbook: IWorkbookData) {
+  const cells = new Map<string, SpreadsheetCellContent>();
+  Object.entries(workbook.sheets).forEach(([sheetId, sheet]) => {
+    Object.entries(sheet.cellData || {}).forEach(([row, columns]) => {
+      Object.entries(columns || {}).forEach(([column, cell]) => {
+        const content = cellContentFromUniver(cell as ICellData | null);
+        if (content.formula || content.value !== undefined) {
+          cells.set(`${sheetId}:${row}:${column}`, content);
+        }
+      });
+    });
+  });
+
+  return {
+    apply(params: SpreadsheetMutationParams): boolean {
+      let changed = false;
+      Object.entries(params.cellValue || {}).forEach(([row, columns]) => {
+        Object.entries(columns || {}).forEach(([column, patch]) => {
+          const key = `${params.subUnitId}:${row}:${column}`;
+          const previous = cells.get(key) || {};
+          if (patch == null) {
+            if (previous.formula || previous.value !== undefined) changed = true;
+            cells.delete(key);
+            return;
+          }
+
+          const next: SpreadsheetCellContent = { ...previous };
+          if (Object.prototype.hasOwnProperty.call(patch, 'f')) {
+            const formula = normalizeFormula((patch as ICellData).f);
+            if (formula) next.formula = formula;
+            else delete next.formula;
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, 'v')) {
+            const value = (patch as ICellData).v;
+            if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+              next.value = value;
+            } else {
+              delete next.value;
+            }
+          }
+
+          if (!sameSpreadsheetCellContent(previous, next)) changed = true;
+          if (next.formula || next.value !== undefined) cells.set(key, next);
+          else cells.delete(key);
+        });
+      });
+      return changed;
+    },
+  };
+}
 
 function firstCsvRecord(source: string): string {
   let quoted = false;
@@ -198,18 +303,22 @@ function toUniverCell(cell: XLSX.CellObject): ICellData {
     ? `=${cell.f.replace(/^=/, '')}`
     : undefined;
   const value = cell.v instanceof Date ? cell.v.toISOString() : cell.v;
+  const displayStyle = typeof cell.z === 'string' && cell.z !== 'General'
+    ? { s: { n: { pattern: cell.z } } }
+    : {};
   if (formula) {
     return {
       f: formula,
       ...(typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
         ? { v: value }
         : {}),
+      ...displayStyle,
     };
   }
-  if (typeof value === 'number') return { v: value, t: CellValueType.NUMBER };
-  if (typeof value === 'boolean') return { v: value, t: CellValueType.BOOLEAN };
+  if (typeof value === 'number') return { v: value, t: CellValueType.NUMBER, ...displayStyle };
+  if (typeof value === 'boolean') return { v: value, t: CellValueType.BOOLEAN, ...displayStyle };
   if (value == null) return {};
-  return { v: String(value), t: CellValueType.STRING };
+  return { v: String(value), t: CellValueType.STRING, ...displayStyle };
 }
 
 export function sheetJsToUniverWorkbook(workbook: XLSX.WorkBook, fileName: string): IWorkbookData {
@@ -332,15 +441,26 @@ function expectedSheetSize(worksheet: XLSX.WorkSheet | undefined) {
   };
 }
 
-function validateCellData(cell: ICellData | null | undefined) {
+function validateCellData(
+  cell: ICellData | null | undefined,
+) {
   if (cell == null) return;
   if (cell.ref != null) {
     throw new Error('当前不支持保存数组公式，原公式组未被改写');
   }
-  const unsupportedKeys = Object.keys(cell).filter((key) => !['v', 't', 'f', 'si', 'xf'].includes(key));
+  if (cell.p != null || cell.custom != null) {
+    throw new Error('当前仅支持修改单元格值和公式，富文本或扩展内容未保存');
+  }
+  // Univer 在普通文本输入后会显式保留 p/ref/custom: null。
+  // 它们表示“没有富文本/公式组/扩展数据”，不是格式修改。
+  const unsupportedKeys = Object.keys(cell).filter((key) => (
+    !['v', 't', 'f', 'si', 'xf', 's', 'p', 'ref', 'custom'].includes(key)
+  ));
   if (unsupportedKeys.length > 0) {
     throw new Error('当前仅支持修改单元格值和公式，格式修改未保存');
   }
+  // 粘贴和普通输入可能附带 Univer 的默认展示样式。写回只补丁
+  // OOXML 的值/公式节点，原文件样式始终由母包保留，因此安全忽略 s/xf。
   if (cell.v != null && !['string', 'number', 'boolean'].includes(typeof cell.v)) {
     throw new Error('当前单元格值类型无法安全保存');
   }
@@ -374,7 +494,9 @@ function validateSnapshotStructure(snapshot: IWorkbookData, original: XLSX.WorkB
       throw new Error('当前仅支持修改单元格值和公式，行高或列宽修改未保存');
     }
     Object.values(sheet.cellData || {}).forEach((columns) => {
-      Object.values(columns || {}).forEach((cell) => validateCellData(cell as ICellData | null));
+      Object.values(columns || {}).forEach((cell) => {
+        validateCellData(cell as ICellData | null);
+      });
     });
     return sheet;
   });
@@ -801,6 +923,20 @@ export const SpreadsheetEditor = forwardRef<SpreadsheetEditorHandle, Spreadsheet
         if (!snapshot || !original) throw new Error('电子表格编辑器尚未准备好');
         return snapshotToArrayBuffer(snapshot, original, fileType);
       },
+      exportFileDeferred: () => {
+        const snapshot = snapshotRef.current?.();
+        const original = originalWorkbookRef.current;
+        if (!snapshot || !original) return Promise.reject(new Error('电子表格编辑器尚未准备好'));
+        return new Promise<ArrayBuffer>((resolve, reject) => {
+          window.setTimeout(() => {
+            try {
+              resolve(snapshotToArrayBuffer(snapshot, original, fileType));
+            } catch (error) {
+              reject(error);
+            }
+          }, 0);
+        });
+      },
     }), [fileType]);
 
     useEffect(() => {
@@ -818,6 +954,7 @@ export const SpreadsheetEditor = forwardRef<SpreadsheetEditorHandle, Spreadsheet
             const workbook = readSpreadsheetSource(source, fileType);
             originalWorkbookRef.current = workbook;
             const data = sheetJsToUniverWorkbook(workbook, fileName);
+            const contentTracker = createSpreadsheetContentTracker(data);
             const { univerAPI } = createSpreadsheetUniver(container, effectiveReadOnly);
             const activeWorkbook = univerAPI.createWorkbook(data);
             let commandSubscription: { dispose: () => void } | null = null;
@@ -837,9 +974,17 @@ export const SpreadsheetEditor = forwardRef<SpreadsheetEditorHandle, Spreadsheet
               return;
             }
 
-            snapshotRef.current = () => activeWorkbook.getSnapshot();
-            commandSubscription = activeWorkbook.onCommandExecuted((command, options) => {
-              if (!effectiveReadOnly && command.type === CommandType.MUTATION && !options?.fromChangeset) {
+            snapshotRef.current = () => activeWorkbook.save();
+            // FWorkbook.onCommandExecuted drops the command options argument;
+            // subscribe on FUniver so fromChangeset remains observable.
+            commandSubscription = univerAPI.onCommandExecuted((command, options) => {
+              if (shouldMarkSpreadsheetDirty(
+                command,
+                options,
+                contentTracker,
+                data.id,
+                effectiveReadOnly,
+              )) {
                 onMutationRef.current?.();
               }
             });

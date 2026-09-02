@@ -290,15 +290,35 @@ class TestCronServiceDB:
         job.name = "daily"
         job.cron_expr = "0 9 * * *"
         job.rule_version = 3
+        job.definition_version = 2
         job.description = "d"
+        job.content = ""
         job.enabled = True
 
         svc, _ = _make_cron_service(first_return=job)
         svc.update_job("user-1", "daily", description="new")
         assert job.rule_version == 3
+        assert job.definition_version == 3
 
         svc.update_job("user-1", "daily", cron_expr="0 10 * * *")
         assert job.rule_version == 4
+        assert job.definition_version == 4
+
+        svc.update_job("user-1", "daily", enabled=False)
+        assert job.definition_version == 4
+
+    def test_service_enforces_prompt_limits_for_agent_tool_callers(self):
+        from src.api.services.cron_service import CronJobValidationError
+
+        svc, mock_db = _make_cron_service(first_return=None)
+        with pytest.raises(CronJobValidationError, match="content 最多 8000"):
+            svc.create_job(
+                "user-1",
+                name="too-long",
+                cron_expr="0 9 * * *",
+                content="x" * 8001,
+            )
+        mock_db.query.assert_not_called()
 
     def test_update_job_rejects_never_firing_cron_without_mutating_job(self):
         from src.api.services.cron_service import CronJobValidationError
@@ -524,6 +544,37 @@ class TestRunCronJobFallback:
         mock_db.commit.assert_called()
 
     @pytest.mark.asyncio
+    async def test_scheduled_run_fails_when_job_is_disabled_after_enqueue(self):
+        from src.api.services.cron_service import run_cron_job
+
+        auth_user = MagicMock(enabled=True)
+        disabled_job = MagicMock(id=11, rule_version=1, enabled=False)
+        pre_run = MagicMock(id="pre-run-id", status="running")
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.side_effect = [
+            auth_user,
+            disabled_job,
+            pre_run,
+        ]
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+
+        with patch("src.api.models.database.SessionLocal", return_value=mock_db):
+            result = await run_cron_job(
+                "user-1",
+                "daily",
+                run_id="pre-run-id",
+                expected_job_id=11,
+                expected_rule_version=1,
+                trigger_source="scheduled",
+            )
+
+        assert result is None
+        assert pre_run.status == "failed"
+        assert pre_run.error_code == "job_disabled"
+        assert pre_run.output == "任务已暂停"
+
+    @pytest.mark.asyncio
     async def test_manual_run_fails_when_job_was_recreated_with_same_name(self):
         """同名任务被删除后重建时，手动执行不得落到新任务上。"""
         from src.api.services.cron_service import run_cron_job
@@ -622,7 +673,10 @@ class TestScanRunArtifacts:
 
         run_workspace = "/home/user/cron/runs/run-1"
         line = MagicMock()
-        line.text = f"{run_workspace}/report.md\t128\n"
+        line.text = (
+            f"{run_workspace}/report.md\t128\n"
+            f"{run_workspace}/.workspace-change-sets/internal.proposal\t128\n"
+        )
 
         cmd_result = MagicMock()
         cmd_result.logs = MagicMock(stdout=[line])
@@ -676,6 +730,44 @@ class TestScanRunArtifacts:
         assert artifacts[0]["size"] == 0
 
 
+class TestCronSandboxBinding:
+    @pytest.mark.asyncio
+    async def test_frozen_sandbox_is_connected_exactly_without_replacement(self):
+        from src.api.services.cron_service import _get_renewed_cron_sandbox
+
+        sandbox = MagicMock(id="sbx-frozen")
+        service = MagicMock()
+        service.get_existing = AsyncMock(return_value=sandbox)
+        service.renew = AsyncMock(return_value=True)
+        service.get_sandbox_id.return_value = "sbx-frozen"
+        service.get_or_resume_and_renew = AsyncMock()
+
+        result = await _get_renewed_cron_sandbox(
+            service,
+            "user-1",
+            "sbx-frozen",
+        )
+
+        assert result is sandbox
+        service.get_existing.assert_awaited_once_with("user-1", "sbx-frozen")
+        service.renew.assert_awaited_once_with("user-1")
+        service.get_or_resume_and_renew.assert_not_awaited()
+
+    def test_dispatch_fence_rejects_sandbox_generation_swap(self):
+        from src.api.services.cron_service import _set_run_sandbox_id
+
+        record = MagicMock(sandbox_id="sbx-frozen")
+        db = MagicMock()
+        db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = record
+        with patch("src.api.models.database.SessionLocal") as session_local:
+            session_local.return_value.__enter__.return_value = db
+            session_local.return_value.__exit__.return_value = False
+            assert _set_run_sandbox_id("run-1", "sbx-replacement") is False
+
+        assert record.sandbox_id == "sbx-frozen"
+        db.commit.assert_not_called()
+
+
 class TestCronAgentConstruction:
     """Cron Agent 构造参数测试 — 强约束 fail-hard，不允许悄悄回退到 .env。"""
 
@@ -687,6 +779,7 @@ class TestCronAgentConstruction:
             patch("src.api.models.database.SessionLocal") as mock_session_local,
             patch("src.api.services.sandbox_service.get_sandbox_service") as mock_svc,
             patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/mnt"),
+            patch("src.api.services.cron_service._set_run_sandbox_id", return_value=True),
             patch("src.api.services.tool_factory.create_agent_tools", new_callable=AsyncMock, return_value=([], None)),
             patch("src.api.services.cron_service._scan_run_artifacts", new_callable=AsyncMock, return_value=None),
             patch("src.agent.agent.Agent") as MockAgent,
@@ -697,27 +790,31 @@ class TestCronAgentConstruction:
 
             mock_job = MagicMock()
             mock_job.name = "test-job"
+            mock_job.id = 17
             mock_job.description = "desc"
             mock_job.content = ""
             mock_job.cron_expr = "0 * * * *"
+            mock_job.rule_version = 1
+            mock_job.definition_version = 2
             mock_job.enabled = True
             mock_run_record = MagicMock()
             mock_run_record.status = "running"
             mock_run_record.output = None
+            mock_run_record.sandbox_id = "sb-1"
             mock_auth_user = MagicMock(enabled=True)
             mock_db.query.return_value.filter.return_value.first.side_effect = [
                 mock_auth_user,
                 mock_job,
                 mock_run_record,
-                MagicMock(sandbox_id="sb-1"),
                 mock_run_record,
             ]
 
             mock_sandbox = AsyncMock()
+            mock_sandbox.id = "sb-1"
             mock_sandbox.commands.run = AsyncMock(return_value=MagicMock(logs=MagicMock(stdout=[])))
-            mock_svc.return_value.get_or_resume_and_renew = AsyncMock(
-                return_value=mock_sandbox
-            )
+            mock_svc.return_value.get_existing = AsyncMock(return_value=mock_sandbox)
+            mock_svc.return_value.renew = AsyncMock(return_value=True)
+            mock_svc.return_value.get_sandbox_id.return_value = "sb-1"
 
             mock_agent_instance = MagicMock()
 
@@ -781,6 +878,7 @@ class TestCronAgentConstruction:
             patch("src.api.models.database.SessionLocal") as mock_session_local,
             patch("src.api.services.sandbox_service.get_sandbox_service") as mock_svc,
             patch("src.api.services.sandbox_service.get_sandbox_mount_path", return_value="/mnt"),
+            patch("src.api.services.cron_service._set_run_sandbox_id", return_value=True),
             patch("src.api.services.cron_service._ensure_cron_session"),
             patch("src.api.services.turn_orchestrator.get_turn_orchestrator", return_value=FakeOrchestrator()),
             patch("src.api.services.cron_service._scan_run_artifacts", new_callable=AsyncMock, return_value=None),
@@ -804,20 +902,24 @@ class TestCronAgentConstruction:
             mock_job.content = ""
             mock_job.cron_expr = "0 * * * *"
             mock_job.enabled = True
+            mock_job.id = 17
+            mock_job.rule_version = 1
+            mock_job.definition_version = 2
             mock_run_record = MagicMock()
+            mock_run_record.sandbox_id = "sb-1"
             mock_auth_user = MagicMock(enabled=True)
             mock_db.query.return_value.filter.return_value.first.side_effect = [
                 mock_auth_user,
-                mock_job, None,
-                MagicMock(sandbox_id="sb-1"),
+                mock_job, mock_run_record,
                 mock_run_record,
             ]
 
             mock_sandbox = AsyncMock()
+            mock_sandbox.id = "sb-1"
             mock_sandbox.commands.run = AsyncMock(return_value=MagicMock(logs=MagicMock(stdout=[])))
-            mock_svc.return_value.get_or_resume_and_renew = AsyncMock(
-                return_value=mock_sandbox
-            )
+            mock_svc.return_value.get_existing = AsyncMock(return_value=mock_sandbox)
+            mock_svc.return_value.renew = AsyncMock(return_value=True)
+            mock_svc.return_value.get_sandbox_id.return_value = "sb-1"
 
             mock_agent_instance = MagicMock()
 
@@ -839,7 +941,19 @@ class TestCronAgentConstruction:
             assert call_kwargs["max_output_tokens"] == 32768
             assert call_kwargs["workspace_dir"] == "/mnt/cron/runs/run-1"
             assert captured["agent_service"].model_id == "cron-model"
+            assert captured["agent_service"].workspace_access == "manage"
+            assert captured["agent_service"].workspace_actor == "cron"
+            assert captured["agent_service"].workspace_context == {
+                "cron_job_id": "17",
+                "cron_run_id": "run-1",
+            }
+            assert {
+                "SandboxBashTool",
+                "SandboxBashOutputTool",
+                "SandboxBashKillTool",
+            }.isdisjoint(captured["agent_service"].tool_exclude)
             assert captured["turn"].metadata["session_id"] == "run-1"
+            assert "workspace_access" not in captured["turn"].metadata
             assert captured["turn"].content[0].text == (
                 "你是一个定时任务执行器。请执行以下任务：\n\n"
                 "任务名：test-job\n"

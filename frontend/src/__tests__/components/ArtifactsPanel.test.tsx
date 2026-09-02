@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, render, screen, fireEvent, waitFor } from '../utils/test-utils';
 import { ArtifactsPanel, type ArtifactsPanelHandle } from '../../components/ArtifactsPanel';
 import { apiService } from '../../services/api';
+import { emitWorkspaceMutation, resetWorkspaceEventsForTests } from '../../services/workspaceEvents';
 import { FileInfo } from '../../types';
 
 let previewFileEffects: FileInfo[] = [];
@@ -18,6 +19,7 @@ vi.mock('../../components/FilePreview', () => ({
     onSavingChange,
     onSaveFailure,
     saveRequestNonce,
+    canSaveToWorkspace,
   }: {
     file?: FileInfo;
     sessionId: string;
@@ -28,6 +30,7 @@ vi.mock('../../components/FilePreview', () => ({
     onSavingChange?: (saving: boolean) => void;
     onSaveFailure?: () => void;
     saveRequestNonce?: number;
+    canSaveToWorkspace?: boolean;
   }, ref) {
     const dirtyRef = useRef(false);
     useImperativeHandle(ref, () => ({
@@ -56,7 +59,7 @@ vi.mock('../../components/FilePreview', () => ({
       if (file) previewFileEffects.push(file);
     }, [file]);
     return (
-      <div data-testid="file-preview-inline-mock" data-inline={String(inline)} data-save-request-nonce={saveRequestNonce}>
+      <div data-testid="file-preview-inline-mock" data-inline={String(inline)} data-save-request-nonce={saveRequestNonce} data-can-save-to-workspace={String(canSaveToWorkspace)}>
         <span>Inline Preview: {file?.name}</span>
         <button onClick={onClose}>Close Inline Preview</button>
         <button onClick={() => { dirtyRef.current = true; onDirtyChange?.(true); }}>Mark Markdown Dirty</button>
@@ -107,6 +110,7 @@ describe('ArtifactsPanel 组件', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     previewFileEffects = [];
+    resetWorkspaceEventsForTests();
     vi.mocked(apiService.getSessionFiles).mockResolvedValue({
       files: mockFiles,
       total: mockFiles.length,
@@ -167,6 +171,53 @@ describe('ArtifactsPanel 组件', () => {
     expect(screen.queryByText('会话资源管理')).not.toBeInTheDocument();
     expect(screen.queryByText('文件预览')).not.toBeInTheDocument();
     expect(screen.getAllByTitle('~/sessions/test-session').length).toBeGreaterThan(0);
+  });
+
+  it('永久删除会关闭对应 workspace snapshot、清理陈旧目录并禁止重新导入', async () => {
+    const snapshot: FileInfo = {
+      name: 'deleted.md',
+      path: '.workspace-snapshots/deleted-entry/version-1/deleted.md',
+      source: 'session',
+      session_id: 'test-session',
+      size: 65,
+      type: 'md',
+      modified: '2026-09-01T08:00:00Z',
+      content_mode: 'captured',
+    };
+    vi.mocked(apiService.getSessionFiles).mockImplementation(async (_sessionId, path) => ({
+      files: path ? [snapshot] : [],
+      total: path ? 1 : 0,
+    }));
+
+    render(
+      <ArtifactsPanel
+        sessionId="test-session"
+        isOpen
+        onClose={vi.fn()}
+        targetFile={snapshot}
+        targetFileNonce={1}
+      />,
+    );
+
+    expect(await screen.findByText('Inline Preview: deleted.md')).toBeInTheDocument();
+    expect(screen.getByTestId('file-preview-inline-mock')).toHaveAttribute(
+      'data-can-save-to-workspace',
+      'false',
+    );
+
+    act(() => {
+      emitWorkspaceMutation({
+        operation: 'DELETED',
+        entryId: 'deleted-entry',
+        affectedEntryIds: ['deleted-entry'],
+        tombstone: true,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText('Inline Preview: deleted.md')).not.toBeInTheDocument();
+      expect(apiService.getSessionFiles).toHaveBeenCalledWith('test-session', undefined);
+    });
   });
 
   it('工作台顶栏应该与聊天顶栏共享 56px 基准线', () => {
@@ -352,7 +403,7 @@ describe('ArtifactsPanel 组件', () => {
     expect(screen.getByRole('tab', { name: 'report.pdf' })).toHaveAttribute('aria-selected', 'true');
   });
 
-  it('未保存的 Markdown 标签关闭时应该先请求保存，成功后自动关闭', async () => {
+  it('未保存的 Markdown 标签抓取草稿后立即关闭', async () => {
     vi.mocked(apiService.getSessionFiles).mockResolvedValueOnce({
       files: [{
         name: 'notes.md',
@@ -378,13 +429,7 @@ describe('ArtifactsPanel 组件', () => {
     fireEvent.click(screen.getByRole('button', { name: '关闭 notes.md' }));
 
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: 'notes.md' })).toBeInTheDocument();
-    expect(screen.getByTestId('file-preview-inline-mock')).toHaveAttribute('data-save-request-nonce');
-
-    fireEvent.click(screen.getByRole('button', { name: 'Finish Markdown Save' }));
-    await waitFor(() => {
-      expect(screen.queryByRole('tab', { name: 'notes.md' })).not.toBeInTheDocument();
-    });
+    expect(screen.queryByRole('tab', { name: 'notes.md' })).not.toBeInTheDocument();
   });
 
   it('owner handle 会发现并保存当前 epoch 的全部 dirty 文件', async () => {
@@ -423,7 +468,7 @@ describe('ArtifactsPanel 组件', () => {
     expect(panelRef.current?.hasDirty(owner)).toBe(false);
   });
 
-  it('Markdown 保存失败后二次关闭可确认放弃，不会把标签永久锁死', async () => {
+  it('Markdown dirty 标签立即关闭，远端保存不再阻塞或弹放弃确认', async () => {
     vi.mocked(apiService.getSessionFiles).mockResolvedValueOnce({
       files: [{
         name: 'saving.md',
@@ -446,23 +491,9 @@ describe('ArtifactsPanel 组件', () => {
 
     fireEvent.click(await screen.findByText('saving.md'));
     fireEvent.click(screen.getByRole('button', { name: 'Mark Markdown Dirty' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Start Markdown Save' }));
     fireEvent.click(screen.getByRole('button', { name: '关闭 saving.md' }));
 
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: 'saving.md' })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Fail Markdown Save' }));
-    expect(screen.getByRole('tab', { name: 'saving.md' })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '关闭 saving.md' }));
-    expect(screen.getByRole('alertdialog', { name: '放弃未保存修改' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '继续编辑' }));
-    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: 'saving.md' })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '关闭 saving.md' }));
-    fireEvent.click(screen.getByRole('button', { name: '放弃修改并关闭' }));
     expect(screen.queryByRole('tab', { name: 'saving.md' })).not.toBeInTheDocument();
   });
 

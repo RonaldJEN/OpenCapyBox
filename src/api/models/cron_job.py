@@ -38,6 +38,8 @@ class CronJob(Base):
     enabled = Column(Boolean, default=True, nullable=False)
     # 调度规则版本；仅 cron_expr 实际变化时递增，用于丢弃旧规则触发。
     rule_version = Column(Integer, default=1, nullable=False)
+    # 完整执行定义版本。prompt 或调度变化时递增，run 以此冻结快照。
+    definition_version = Column(Integer, default=1, nullable=False)
     created_at = Column(DateTime, default=now_naive)
     updated_at = Column(DateTime, default=now_naive, onupdate=now_naive)
 
@@ -55,6 +57,7 @@ class CronJob(Base):
             "content": self.content or "",
             "enabled": bool(self.enabled),
             "rule_version": int(self.rule_version or 1),
+            "definition_version": int(self.definition_version or 1),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

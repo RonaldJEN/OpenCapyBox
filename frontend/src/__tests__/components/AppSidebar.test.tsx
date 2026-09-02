@@ -106,4 +106,22 @@ describe('AppSidebar', () => {
     expect(screen.queryByRole('separator', { name: '调整左侧栏宽度', hidden: true }))
       .not.toBeInTheDocument();
   });
+
+  it('移动全屏投影声明 modal，并把 Tab 焦点限制在同一个侧栏 owner 内', () => {
+    render(
+      <AppSidebar collapsed={false} mobileOpen userId="test" onCollapsedChange={vi.fn()}>
+        <button type="button">第一个动作</button>
+        <button type="button">最后一个动作</button>
+      </AppSidebar>,
+    );
+    const dialog = screen.getByRole('dialog', { name: '会话与工作区' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    const first = screen.getByRole('button', { name: '第一个动作' });
+    const last = screen.getByRole('button', { name: '最后一个动作' });
+    last.focus();
+    fireEvent.keyDown(last, { key: 'Tab' });
+    expect(first).toHaveFocus();
+    fireEvent.keyDown(first, { key: 'Tab', shiftKey: true });
+    expect(last).toHaveFocus();
+  });
 });

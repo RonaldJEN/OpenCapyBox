@@ -2,10 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
 import type { Session } from '../types';
-import { Blocks, Database, ChevronDown, MessageSquare, Trash2, LogOut, Loader2, PenSquare, Settings, Clock, Search, ShieldCheck, X } from 'lucide-react';
+import { Blocks, Database, ChevronDown, MessageSquare, Trash2, LogOut, Loader2, PenSquare, Plus, Settings, Clock, Search, ShieldCheck, X } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
 import { ConfirmDialog } from './ConfirmDialog';
+import { WorkspaceSidebarContent } from './workspace/WorkspaceSidebarContent';
+import type { WorkspaceEntry } from '../types/workspace';
+import { discardSessionDrafts } from '../services/sessionDraftOutbox';
 
 interface SessionListProps {
   currentSessionId?: string;
@@ -22,6 +25,12 @@ interface SessionListProps {
   activePrimarySurface?: 'chat' | 'schedule' | 'skills' | 'connections';
   onOpenSkills?: () => void;
   onOpenConnections?: () => void;
+  sidebarMode?: 'sessions' | 'workspace';
+  onSidebarModeChange?: (mode: 'sessions' | 'workspace') => void;
+  activeWorkspaceEntryId?: string | null;
+  onOpenWorkspaceEntry?: (entry: WorkspaceEntry) => void;
+  mobileSheet?: boolean;
+  onCloseMobileSheet?: () => void;
 }
 
 interface DeleteFocusOrigin {
@@ -29,18 +38,24 @@ interface DeleteFocusOrigin {
   adjacentSessionIds: string[];
 }
 
-export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, optimisticSession, executingSessionIds, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenCron, activePrimarySurface = 'chat', onOpenSkills, onOpenConnections }: SessionListProps) {
+export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, optimisticSession, executingSessionIds, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenCron, activePrimarySurface = 'chat', onOpenSkills, onOpenConnections, sidebarMode = 'sessions', onSidebarModeChange, activeWorkspaceEntryId, onOpenWorkspaceEntry, mobileSheet = false, onCloseMobileSheet }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const [searchLoading, setSearchLoading] = useState(false);
+  const [sessionLoadError, setSessionLoadError] = useState('');
+  const [mountedSidebarModes, setMountedSidebarModes] = useState(() => ({
+    sessions: sidebarMode === 'sessions',
+    workspace: sidebarMode === 'workspace',
+  }));
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
   const [deletePending, setDeletePending] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const searchRequestSeqRef = useRef(0);
   const debouncedSearchQueryRef = useRef('');
+  const allSessionsRef = useRef<Session[]>([]);
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const sessionItemRefs = useRef(new Map<string, HTMLButtonElement>());
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -58,6 +73,12 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     }, 300);
     return () => clearTimeout(timer);
   }, [searchQuery]);
+
+  useEffect(() => {
+    setMountedSidebarModes((current) => current[sidebarMode]
+      ? current
+      : { ...current, [sidebarMode]: true });
+  }, [sidebarMode]);
 
   // 切换选中项只使用本地列表；仅显式刷新和搜索变化才重新请求列表。
   useEffect(() => {
@@ -133,6 +154,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     const requestSeq = ++searchRequestSeqRef.current;
     const normalizedQuery = query.trim();
     setSearchLoading(normalizedQuery.length > 0);
+    setSessionLoadError('');
 
     try {
       const response = normalizedQuery
@@ -140,12 +162,15 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
         : await apiService.getSessions();
       if (requestSeq !== searchRequestSeqRef.current) return;
       const deletedIds = recentlyDeletedIdsRef.current;
-      setSessions(deletedIds.size
+      const nextSessions = deletedIds.size
         ? response.sessions.filter((session) => !deletedIds.has(session.id))
-        : response.sessions);
+        : response.sessions;
+      if (!normalizedQuery) allSessionsRef.current = nextSessions;
+      setSessions(nextSessions);
     } catch (error) {
       if (requestSeq !== searchRequestSeqRef.current) return;
       console.error('Failed to load sessions:', error);
+      setSessionLoadError('会话加载失败，请重试。');
     } finally {
       if (requestSeq === searchRequestSeqRef.current) {
         setLoading(false);
@@ -205,6 +230,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     setDeleteError(null);
     try {
       await apiService.deleteSession(sessionToDelete.id);
+      await discardSessionDrafts(sessionToDelete.id);
     } catch (error) {
       console.error('Failed to delete session:', error);
       setDeletePending(false);
@@ -242,34 +268,39 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     navigate('/admin');
   };
 
+  const updateSearchQuery = (value: string) => {
+    setSearchQuery(value);
+    if (value.trim()) {
+      setSearchLoading(true);
+      return;
+    }
+    // 清空必须立即恢复最近一次完整列表，并使仍在途的旧搜索响应失效；
+    // 后续 effect 仍会发起一次无查询刷新，缓存只负责消除空白等待。
+    searchRequestSeqRef.current += 1;
+    debouncedSearchQueryRef.current = '';
+    setDebouncedSearchQuery('');
+    setSearchLoading(false);
+    const deletedIds = recentlyDeletedIdsRef.current;
+    setSessions(allSessionsRef.current.filter((session) => !deletedIds.has(session.id)));
+  };
+
   const isSearchActive = debouncedSearchQuery.trim().length > 0;
   const matchSourceLabel: Partial<Record<NonNullable<Session['match_type']>, string>> = {
     user: '我的问题',
     assistant: 'Agent 回复',
   };
 
-  if (loading) {
-    return (
-      <aside
-        className="hidden h-full w-full flex-col border-r border-claude-border bg-claude-surface p-4 md:flex"
-      >
-        <div className="flex-1 flex items-center justify-center">
-          <Loader2 className="w-6 h-6 text-claude-muted animate-spin" />
-        </div>
-      </aside>
-    );
-  }
-
   return (
     <aside
-      className="hidden h-full w-full flex-shrink-0 flex-col overflow-hidden whitespace-nowrap border-r border-claude-border bg-claude-surface p-4 md:flex"
+      className={`${mobileSheet ? 'flex' : 'hidden md:flex'} h-full w-full flex-shrink-0 flex-col overflow-hidden whitespace-nowrap border-r border-claude-border bg-claude-surface p-4`}
     >
       {/* Header */}
       <div className="flex items-center justify-between px-2">
         <div className="flex items-center space-x-3">
           <img src="/logo.jpg" alt="OpenCapyBox" className="w-8 h-8 rounded-lg object-cover transition-transform active:scale-95 cursor-pointer" />
-          <span className="font-sans font-semibold text-lg tracking-tight text-claude-text">OpenCapyBox</span>
+          <span className="font-sans font-semibold text-lg tracking-tight text-claude-text">bsbox</span>
         </div>
+        <div className="flex items-center gap-1">
         {onNewChat && (
           <button
             ref={newChatButtonRef}
@@ -282,37 +313,40 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
             <PenSquare size={18} />
           </button>
         )}
+        {mobileSheet && <button type="button" onClick={onCloseMobileSheet} className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-claude-muted hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40 md:hidden" aria-label="关闭侧栏"><X size={18} /></button>}
+        </div>
       </div>
 
-      <div className="px-1 pt-4 pb-3">
-        <div className="relative">
+      <div data-testid="sidebar-search-slot" className="px-1 pt-4 pb-3">
+        <div data-testid="sidebar-search-control" className="relative h-9">
           <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-claude-muted pointer-events-none" />
           <input
             ref={searchInputRef}
             aria-label="搜索会话"
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(event) => updateSearchQuery(event.target.value)}
             placeholder="搜索对话"
-            className="w-full h-9 rounded-lg border border-claude-border bg-white pl-9 pr-8 text-[13px] text-claude-text placeholder:text-claude-muted focus:outline-none focus:border-claude-accent focus:ring-2 focus:ring-claude-accent/20 transition-colors"
+            className="h-9 w-full rounded-lg border border-claude-border bg-white pl-9 pr-12 text-[13px] text-claude-text placeholder:text-claude-muted focus:outline-none focus:border-claude-accent focus:ring-2 focus:ring-claude-accent/20 transition-colors"
           />
-          {searchLoading ? (
-            <span className="absolute right-3 top-1/2 -translate-y-1/2 flex h-4 w-4 items-center justify-center">
+          {searchLoading && (
+            <span className="absolute right-8 top-1/2 -translate-y-1/2 flex h-4 w-4 items-center justify-center" role="status" aria-label="正在搜索会话">
               <Loader2 size={14} className="text-claude-muted animate-spin" />
             </span>
-          ) : searchQuery ? (
+          )}
+          {searchQuery && (
             <button
               type="button"
               aria-label="清空搜索"
               title="清空搜索"
               onClick={() => {
-                setSearchQuery('');
+                updateSearchQuery('');
                 searchInputRef.current?.focus();
               }}
               className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-claude-muted hover:text-claude-secondary hover:bg-claude-hover rounded transition-colors"
             >
               <X size={13} />
             </button>
-          ) : null}
+          )}
         </div>
       </div>
 
@@ -372,26 +406,108 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
         </button>
       </nav>
 
-      {/* History List */}
-      <div className="flex-1 overflow-y-auto space-y-1.5 scrollbar-hide -mx-2 px-2">
-        <p className="px-3 pb-2 text-xs font-medium text-claude-muted uppercase tracking-widest">History</p>
+      <div data-testid="sidebar-mode-tabs" role="tablist" aria-label="左侧栏内容" className="relative flex h-11 shrink-0 items-stretch border-b border-claude-border px-1">
+        <button
+          id="sidebar-sessions-tab"
+          type="button"
+          role="tab"
+          aria-selected={sidebarMode === 'sessions'}
+          aria-controls="sidebar-sessions-panel"
+          onClick={() => onSidebarModeChange?.('sessions')}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowRight') {
+              event.preventDefault();
+              onSidebarModeChange?.('workspace');
+              document.getElementById('sidebar-workspace-tab')?.focus();
+            }
+          }}
+          className={`relative flex h-11 items-center justify-center px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-claude-accent/45 ${sidebarMode === 'sessions' ? 'text-[15px] font-semibold text-claude-text' : 'text-sm font-medium text-claude-muted hover:text-claude-secondary'}`}
+        >
+          会话
+          {sidebarMode === 'sessions' && <span className="absolute inset-x-3 bottom-0 h-0.5 rounded-full bg-claude-text" aria-hidden="true" />}
+        </button>
+        <button
+          id="sidebar-workspace-tab"
+          type="button"
+          role="tab"
+          aria-selected={sidebarMode === 'workspace'}
+          aria-controls="sidebar-workspace-panel"
+          onClick={() => onSidebarModeChange?.('workspace')}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowLeft') {
+              event.preventDefault();
+              onSidebarModeChange?.('sessions');
+              document.getElementById('sidebar-sessions-tab')?.focus();
+            }
+          }}
+          className={`relative flex h-11 items-center justify-center px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-claude-accent/45 ${sidebarMode === 'workspace' ? 'text-[15px] font-semibold text-[#35658c]' : 'text-sm font-medium text-claude-muted hover:text-claude-secondary'}`}
+        >
+          工作区
+          {sidebarMode === 'workspace' && <span className="absolute inset-x-3 bottom-0 h-0.5 rounded-full bg-[#35658c]" aria-hidden="true" />}
+        </button>
+        {sidebarMode === 'sessions' && onNewChat && (
+          <div data-testid="session-mode-actions" className="absolute inset-y-0 right-1 flex items-center">
+            <button
+              type="button"
+              onClick={onNewChat}
+              aria-label="新建对话"
+              title="新建对话"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
+            >
+              <Plus size={17} />
+            </button>
+          </div>
+        )}
+      </div>
 
-        {sessions.length === 0 ? (
-          <div className="px-2 py-12 text-center">
-            <MessageSquare className="w-8 h-8 mx-auto mb-3 text-claude-border" />
-            <p className="text-sm text-claude-muted">
+      {(mountedSidebarModes.sessions || sidebarMode === 'sessions') && <div id="sidebar-sessions-panel" role="tabpanel" aria-labelledby="sidebar-sessions-tab" hidden={sidebarMode !== 'sessions'} className={sidebarMode === 'sessions' ? 'flex min-h-0 flex-1 flex-col pt-2' : 'hidden'}>
+        {loading ? (
+          <div data-testid="session-loading-state" role="status" aria-label="正在加载会话" className="min-h-0 flex-1 px-1 py-1">
+            <span className="sr-only">正在加载会话</span>
+            <div className="space-y-1.5" aria-hidden="true">
+              {[0, 1, 2].map((index) => (
+                <div key={index} className="h-12 rounded-lg border border-claude-border/55 bg-white/45 px-2.5 py-2 motion-safe:animate-pulse">
+                  <div className="h-3 w-3/5 rounded bg-claude-border/70" />
+                  <div className="mt-2 h-2.5 w-2/5 rounded bg-claude-border/45" />
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : sessionLoadError ? (
+          <div data-testid="session-load-error" role="alert" className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 text-center">
+            <p className="whitespace-normal text-[12px] font-medium text-claude-secondary">{sessionLoadError}</p>
+            <button
+              type="button"
+              onClick={() => {
+                setLoading(true);
+                void loadSessions();
+              }}
+              className="mt-3 h-8 rounded-lg border border-claude-border bg-white px-3 text-[11px] font-medium text-claude-secondary hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/35"
+            >
+              重试
+            </button>
+          </div>
+        ) : sessions.length === 0 ? (
+          <div data-testid="session-empty-state" className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 text-center">
+            <MessageSquare className="mb-3 h-7 w-7 text-claude-border" aria-hidden="true" />
+            <p className="text-[13px] font-medium text-claude-secondary">
               {isSearchActive ? '没有匹配的对话' : '暂无对话记录'}
+            </p>
+            <p className="mt-1.5 max-w-[176px] whitespace-normal text-[11px] leading-5 text-claude-muted">
+              {isSearchActive ? '换个关键词，或清空搜索查看全部会话' : '新建对话后，会话会保存在这里'}
             </p>
           </div>
         ) : (
-          sessions.map((session) => (
+          <div data-testid="session-list-scroll" className="-mx-1 min-h-0 flex-1 space-y-1 overflow-y-auto px-1 scrollbar-hide">
+          {sessions.map((session) => (
             <div
               key={session.id}
+              data-testid={`session-row-${session.id}`}
               className={`
-                group relative px-3 py-2.5 rounded-lg cursor-pointer transition-[background-color,color,border-color,box-shadow] border border-transparent
+                group relative h-12 cursor-pointer rounded-lg border px-2.5 transition-[background-color,color,border-color,box-shadow]
                 ${currentSessionId === session.id
-                  ? 'bg-white text-claude-text shadow-sm border-claude-border'
-                  : 'text-claude-secondary hover:bg-claude-hover hover:text-claude-text'
+                  ? 'border-claude-border bg-white/90 text-claude-text shadow-[0_1px_2px_rgba(30,26,20,0.05)]'
+                  : 'border-transparent text-claude-secondary hover:border-claude-border/70 hover:bg-white/55 hover:text-claude-text'
                 }
               `}>
               <button
@@ -405,8 +521,9 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
                 onClick={() => selectSession(session)}
                 className="absolute inset-0 z-0 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/30"
               />
-              <div className="pointer-events-none relative z-[1] flex items-center justify-between">
-                <span className={`text-[13px] font-medium truncate flex-1 font-sans ${
+              <div className="pointer-events-none relative z-[1] flex h-full min-w-0 flex-col justify-center pr-6">
+                <div className="flex min-w-0 items-center">
+                <span className={`min-w-0 flex-1 truncate font-sans text-[13px] font-medium leading-5 ${
                   currentSessionId === session.id ? 'font-semibold' : ''
                 }`}>
                   {session.title || `会话 ${session.id.slice(0, 8)}`}
@@ -414,12 +531,31 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
 
                 {/* 执行状态动画 */}
                 {executingSessionIds?.has(session.id) && (
-                  <div className="flex items-center ml-2">
-                    <div className="w-1.5 h-1.5 bg-claude-accent rounded-full animate-dot-pulse" />
+                  <div className="ml-2 flex shrink-0 items-center">
+                    <div className="h-1.5 w-1.5 animate-dot-pulse rounded-full bg-claude-accent" />
                   </div>
                 )}
+                </div>
+                {session.match_type && session.match_type !== 'title' && session.match_excerpt ? (
+                  <p className="mt-0.5 flex min-w-0 items-center truncate text-[10.5px] leading-4 text-claude-muted">
+                    {matchSourceLabel[session.match_type] && (
+                      <span className="mr-1 shrink-0 text-claude-secondary">
+                        {matchSourceLabel[session.match_type]}:
+                      </span>
+                    )}
+                    <span className="truncate">{session.match_excerpt}</span>
+                  </p>
+                ) : (
+                  <p className="mt-0.5 truncate text-[10.5px] leading-4 text-claude-muted">
+                    {formatDistanceToNow(new Date(session.updated_at), {
+                      addSuffix: true,
+                      locale: zhCN,
+                    })}
+                  </p>
+                )}
+              </div>
 
-                {/* 删除按钮 - hover 时显示 */}
+                {/* 桌面端悬停显示，移动端始终可见。 */}
                 <button
                   ref={(element) => {
                     if (element) deleteButtonRefs.current.set(session.id, element);
@@ -429,36 +565,16 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
                   aria-label={`删除会话 ${session.title || session.id.slice(0, 8)}`}
                   title={`删除会话 ${session.title || session.id.slice(0, 8)}`}
                   onClick={(event) => requestDeleteSession(session, event)}
-                  className="pointer-events-auto relative z-10 ml-1 rounded p-1 text-claude-muted opacity-0 transition-colors hover:bg-red-50 hover:text-claude-error group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+                  className="pointer-events-auto absolute right-1.5 top-1/2 z-10 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-claude-muted opacity-100 transition-[background-color,color,opacity] hover:bg-red-50 hover:text-claude-error focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/35 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100"
                 >
                   <Trash2 size={12} />
                 </button>
-              </div>
-
-              {/* 时间 - 仅在选中时显示 */}
-              {currentSessionId === session.id && (
-                <p className="pointer-events-none relative z-[1] text-[10px] text-claude-muted mt-1">
-                  {formatDistanceToNow(new Date(session.updated_at), {
-                    addSuffix: true,
-                    locale: zhCN,
-                  })}
-                </p>
-              )}
-
-              {session.match_type && session.match_type !== 'title' && session.match_excerpt && (
-                <p className="pointer-events-none relative z-[1] text-[11px] text-claude-muted mt-1 truncate">
-                  {matchSourceLabel[session.match_type] && (
-                    <span className="mr-1 text-claude-secondary">
-                      {matchSourceLabel[session.match_type]}:
-                    </span>
-                  )}
-                  {session.match_excerpt}
-                </p>
-              )}
             </div>
-          ))
+          ))}
+          </div>
         )}
-      </div>
+      </div>}
+      {(mountedSidebarModes.workspace || sidebarMode === 'workspace') && <div id="sidebar-workspace-panel" role="tabpanel" aria-labelledby="sidebar-workspace-tab" hidden={sidebarMode !== 'workspace'} className={sidebarMode === 'workspace' ? '-mx-3 flex min-h-0 flex-1' : 'hidden'}><WorkspaceSidebarContent activeEntryId={activeWorkspaceEntryId} isActive={sidebarMode === 'workspace'} onOpenEntry={(entry) => onOpenWorkspaceEntry?.(entry)} /></div>}
 
       <div className="relative mt-2 border-t border-claude-border pt-2">
         <button

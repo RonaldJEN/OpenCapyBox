@@ -2,7 +2,7 @@
 
 > 父级：[frontend-spec.md](./frontend-spec.md) · 对应后端：[chat-spec.md](./chat-spec.md)
 
-覆盖组件：`ChatV2.tsx`、`Round.tsx`、`ChatInput.tsx`、`ReasoningPanel.tsx`、`QuestionCard.tsx`。
+覆盖组件：`ChatV2.tsx`、`Round.tsx`、`ChatInput.tsx`、`SessionList.tsx`、`WorkspaceSidebarContent.tsx`、`WorkspaceFilesPanel.tsx`、`WorkspaceFilePicker.tsx`、`ReasoningPanel.tsx`、`QuestionCard.tsx`。
 
 ## 1. 模块职责
 
@@ -10,7 +10,8 @@
 - 消费后端 SSE（AG-UI 事件）增量构建 `RoundData[]`
 - 渲染消息流（user → reasoning → assistant）
 - 选择并发送仅作用于当前逻辑执行链的 Skill/MCP 统一偏好
-- 将助手回复中的会话文件引用抽取为回复底部的可点击文件卡片，同时保留 markdown 正文原样显示
+- 从用户持久工作区选择冻结版本附件，并投影工作区资源变更
+- 将后端结构化助手文件引用投影为回复底部卡片，并统一在聊天右侧文件面板打开
 - 处理暂停/恢复：断连重连、same-Round ask_user/工具审批、用户主动取消
 - 滚动控制：普通进入定位最新消息、搜索命中定位 round、流式底部跟随
 
@@ -27,6 +28,7 @@ RoundData {
   parent_run_id?: string | null
   user_message: string
   user_attachments?: AttachmentInfo[]
+  workspace_resources?: WorkspaceResource[]
   preferred_skills: PreferredSkillSnapshot[]
   preferred_mcp_connections: PreferredMcpConnectionSnapshot[]
   final_response: string | null
@@ -75,36 +77,43 @@ TurnPreferenceDraft {
 }
 ```
 
-### 2.1 助手文件引用卡片
+### 2.1 左栏工作区与右侧文件 owner
 
-`Round` 按原文渲染助手 markdown；`extractAssistantFiles()` 只从 fenced code block 外的可访问会话文件引用中抽取候选，在助手回复底部统一渲染去重文件卡片。解析不得删除、替换或隐藏正文里的路径文本。
+- 右侧标签点击与左树打开复用 App 的 entry 导航入口，同步当前文件与 `entry/path` URL；关闭当前标签时以 replace 更新为相邻标签，关闭非当前标签不改变 URL，关闭最后一个标签清除 entry 深链。普通切标签保留编辑器实例和草稿，不额外请求 metadata。
+- 工作区不是 Schedule/Skills/Data 同级 primary surface。桌面 `SessionList` 使用 WAI-ARIA `tablist` 在“会话 / 工作区”间切换；切换只替换左栏投影，`ChatV2` 始终保持挂载和可见。
+- `/workspace` 是工作区 mode 的可恢复 URL，`/workspace?entry={entry_id}` 是文件深链；两者仍投影 `chat + workspace sidebar (+ WorkspaceFilesPanel)`，不得挂载第二套一级页面。点击工作区必须把 URL 归一到 `/workspace`；仅查看左侧会话列表不得清除工作区深链，选择具体会话或新建对话才归一回 `/`。从会话切回工作区必须立即刷新根目录、已展开目录和当前有效搜索，但不得卸载树或丢失展开、搜索、活动文件状态。硬刷新首帧按 pathname 同步选中 mode，不得等待 effect、会话清单或 entry 请求后再切换。
+- entry 深链与应用内点击共用同一套 owner 切换规则：route effect 在调用栈内触发当前 Session dirty 内容抓取到持久 outbox，然后立即请求 entry，并在请求成功后一次性提交 target 与 URL。渲染目标必须从当前 URL entry 与已解析 target 的一致性同步派生：浏览器 back/forward 已到 B 但 B 尚未解析时，保留 A 的面板实例和草稿但整面隐藏 A，显示加载壳；成功后首帧只展示 B。解析失败必须先以 `replace` 回到 `/workspace` 或最后已提交 URL，再恢复对应 target，并用 `role=alert` 显示错误；任何时刻不得出现 URL 指向 B、右侧仍显示 A 的状态。不得等待远端保存，也不得因编辑器 handle 暂时缺失阻塞导航。
+- `WorkspaceSidebarContent` 负责搜索、cursor 全量分页、lazy 文件树、新建目录/Markdown/XLSX、上传、重命名、拖拽移动和直接删除；树支持方向键和 Enter。mode 行右侧的顶部三点永远以工作区根目录为目标，新建、上传和刷新不得复用最近展开/点击的文件夹。文件行右侧三点通过 Portal 打开 140px 紧凑菜单，只含“重命名 / 删除”；文件夹行右侧三点打开 172px 目录菜单，为该文件夹提供“新建文件夹 / 新建 Markdown / 新建表格 / 上传文件 / 刷新”，在分隔线后保留“重命名 / 删除”。移动不重复提供菜单或 Dialog；任意层级文件/文件夹的“图标 + 名称”主交互面使用可聚焦的 `role=button` 与 Pointer Events，移动超过 6px 后进入拖拽态，并由 `window` 级 `pointermove/up/cancel` 持续跟踪离开源行后的指针，通过实际命中元素的 `data-workspace-drop-target` 选择目标；不能依赖会被原生按钮、文本选择或连续重渲染打断的 HTML5 `draggable`。进入拖拽态后，指针右下必须有 `pointer-events:none` 的固定浮层跟随，展示同一格式图标与文件/文件夹名称；位置更新按 animation frame 合并，不能推动文件树布局，松手或取消时立即移除。文件与文件夹均可直接拖入其他目录；移回根目录只使用拖拽时出现的显式根 drop zone，整个内容区不得充当隐形根目标。拖到当前父目录必须保持 no-op，连续移动必须逐次使用服务端返回的新 revision，不能在第三次拖拽时复用旧 entry。新建 Markdown/XLSX 不弹命名框，直接使用 `未命名.md|xlsx`（冲突时自然递增）并立即在右侧打开；只有文件夹保留紧凑命名 Dialog。文件重命名只编辑主文件名，原格式后缀固定展示并由前端自动拼回；不得要求用户重新输入后缀，也不得通过该入口改变文件格式。
+- 工作区树与搜索结果使用独立于 `activeEntryId` 的稳定 `entry_id` 多选：checkbox 在 hover/focus 时出现，进入选择态后常驻；名称普通点击仍只打开/展开，`Shift` 选择当前可见范围，`Ctrl/Cmd` 切换，`Space` 切换焦点行，`Ctrl/Cmd+A` 只选择当前视图，`Escape` 清空。checkbox 获得焦点时也必须支持这些选择快捷键；anchor 不在当前可见视图时，下一次 Shift 退化为以当前项重建 anchor 的单选。选择状态只保存 ID，提交前从当前目录/搜索响应和已确认 mutation 响应组成的权威实体缓存按最高 revision 重新解析；每个目录与有效搜索作用域的新响应必须淘汰该作用域中已消失且未被更高 revision mutation 取代的旧实体，找不到的 ID 保留选择、显示失效状态并阻止提交，禁止回退到旧 entry 快照。目录代表一个子树根，明显的已选后代可在前端归并，但服务端 batch 是最终权威。新搜索开始、query 清空或 mode 切换时必须同步清旧 results、失效旧 request 并结束对应 searching；旧结果不得继续成为 Shift/Ctrl+A/batch 来源。底部批量栏展示“已选 N / 清除 / 删除”，一次确认后只发送一次 `POST /workspace/entries/delete-batch`，不得并发调用单项 DELETE；单项菜单删除也必须复用同一链路。同一 UI intent 只生成一个 idempotency key，网络失败、响应丢失和用户重试必须复用，只有成功、显式取消或选择范围改变后才能清除。删除确认说明“永久删除，无法恢复，未保存草稿也将丢弃”，不先保存即将删除的内容。服务端成功后按 affected_entry_ids 同步清除本地 outbox/retry/checkpoint 与迟到更新；失败保留草稿和选择。成功响应按 `affected_entry_ids` 一次性移除树/搜索缓存、关闭相关右侧标签并清理失效深链，成功用 `role=status`，冲突/失败保留选择并用 `role=alert`。不提供回收站、恢复、清空、清理进度轮询或旧删除 API 兼容。
+- 展开目录的整个子树区域都是该目录的投放面：目录标题行以自身 `entry_id` 为目标，普通子文件行与子列表空隙继承父目录 `entry_id`；拖到其他文件上或文件之间都必须等价于拖到父目录标题。嵌套目录行仍以自身为目标，根级普通文件不得把整棵树变成隐形根目录投放区。命中父目录时，目录行与子列表区域使用同一轻量高亮。
+- `SessionList` 顶部固定高度 `h-9` 搜索槽始终是“搜索会话”，切到工作区不得改变其 placeholder/value；primary nav 与 44px 轻量文字 tabs 的高度/Y 位置不随 mode 变化。输入搜索词首帧显示忙碌反馈且清空按钮始终可操作；清空时立即恢复最近一次完整列表缓存并使旧搜索响应失效，同时后台刷新无查询列表。会话 mode 右侧固定 32px `+` 新建入口，不显示 `HISTORY` 眉题，列表使用固定 48px 两级信息行。工作区搜索由 mode 行右侧 Search icon 打开 anchored popover；省略号菜单通过 Portal 从按钮右侧 8px 展开，宽 172px、字号 12px，Escape/点击外部/resize/scroll 均关闭且不占侧栏布局。
+- 工作区文件树所有 flex owner 必须 `min-w-0` 并受 tabpanel 实际宽度约束；工作区 tabpanel 抵消侧栏通用 `p-4` 的左右 12px，仅保留 4px 外侧 gutter，把宽度优先留给二级文件名。根目录、一级目录和二级目录内的长目录/文件名都只截断文本，不得撑宽树、产生横向滚动、压缩类型图标或把行尾三点挤出侧栏；悬停截断名称时必须通过原生 `title` 展示完整名称。工作区树、附件选择器和右侧文件标签统一复用 `getFileIcon/getFileIconClass` 的格式族映射，文档、表格、演示、代码、图片、压缩包与其他文件不得退化为同一图标；图标使用固定尺寸和 `shrink-0`。行尾按钮右侧保留至少 12px 视觉间距。
+- 工作区树同层文件与文件夹共用 28px 展开槽；子级 group 仅轻量内缩，选中底色随 group 移动，不使用竖向引导线或大块左留白。目录最多两层：根目录下可建一级文件夹，一级文件夹内可建二级文件夹，二级文件夹菜单不显示“新建文件夹”。收到带 authoritative entry 的 `REVISION_CONFLICT` 时同步刷新树行与当前操作对象；删除等破坏性动作保留确认框并要求基于最新 revision 再次确认，不能让“重试”继续提交旧 revision。
+- 横向裁剪只能放在文件树滚动内容层；`WorkspaceSidebarContent` 根层必须允许垂直溢出，否则向上覆盖 mode 行的搜索/三点工具栏会被裁掉并失去点击能力。
+- 会话或工作区请求 pending/reject 都不得用整栏 spinner 遮住稳定骨架。会话列表使用固定 48px 行形骨架并采用 8 秒导航级请求超时，超时/失败投影在对应 panel 内并提供重试；空会话、空工作区和搜索无结果在账户栏上方的剩余 panel 内水平/垂直居中。
+- 点击工作区文件在聊天右侧 `WorkspaceFilesPanel` 打开多标签可编辑工作台；Markdown 相对资源必须走 authoritative workspace path API，不能回到当前 Markdown 文件内容。
+- 工作区主文件预览 URL 包含 `preview=true` 与选中 entry 的 `version_id=current_version_id`，正文与编辑 base 使用同一版本；Office 转 PDF 在其上追加 `render=pdf`。Markdown 相对资源仍走 authoritative path API，下载不指定版本时读取请求开始时的当前 head。
+- Session 与 Workspace 文件面板使用互斥 owner：`{scope:'session', id:sessionId, epoch}` 与 `{scope:'workspace', id:'persistent', epoch}`。覆盖 owner 前同步抓取原 owner dirty 内容到应用级 outbox，随后立即切换；远端失败由 outbox 重试且不得写入 chat runtime 或显示阻塞提示。
+- `md` 以下从聊天顶栏“对话”入口把同一个常驻 `SessionList / WorkspaceSidebarContent` owner 投影为全屏 Sheet，关闭时只隐藏、不得再挂载第二套树；桌面隐藏实例与移动 Sheet 不能同时发请求或各自维护展开/搜索/选择状态。Sheet 使用 modal dialog 语义，打开时背景内容必须 `inert + aria-hidden`，Tab/Shift+Tab 在侧栏内部回绕，Escape/关闭按钮退出并恢复触发点焦点。不得恢复第五个工作区 primary nav。
 
-识别范围：
-- 仅解析 fenced code block 外的提示行或单一路径引用，用于生成底部文件卡片。
-- 支持标签：`文件位置` / `文件路径` / `保存位置` / `已保存到` / `输出文件` / `生成文件` / `文件`。
-- 支持助手正文中的反引号文件引用，例如 `` `DeepSeek_V4_解读.docx` ``。
-- 行内反引号仅接受单一路径形态；含空白的命令片段（如 `` `python3 quick_sort.py` ``）保持 markdown。
-- 支持当前 session 的绝对沙箱路径：`/home/user/sessions/{sessionId}/path/to/file.ext`。
-- 支持相对路径：`path/to/file.ext`。
-- 文件扩展名必须属于 `FilePreview` 当前处理的类型集合（文本、Markdown、HTML、代码、DOC/DOCX、CSV/XLS/XLSX、PPT/PPTX、图片、PDF）。
+### 2.2 助手文件引用卡片
 
-拒绝范围：
-- 跨 session 的 `/home/user/sessions/{otherSessionId}/...`。
-- URL、目录、含 `.` / `..` 段的路径、当前不可预览的扩展名。
-- 代码块中的命令或文件名，例如 `python3 quick_sort.py`。
+`Round` 按原文渲染助手 markdown；文件身份只来自持久化的 `assistant_file_references`，不得从反引号、提示行、同名路径或工具结果文本猜测 namespace。未知或歧义的本地 Markdown 链接保持不可点击文本；正文内容不因卡片投影被删除或替换。
 
-点击行为：
-- 文件卡片位于助手 markdown 后方，不是正文内联替换。
-- 文件卡片使用单行紧凑附件行：最大宽度 520px、最小高度 52px；桌面端按文件名内容收缩且最小宽度 280px，移动端占满可用宽度。文件类型由左侧类型图标和文件名扩展名表达，不重复显示 category / extension / size 元数据行。
-- 文件名使用与正文同级的 15px 中等字重（500），不得用偏小粗体制造虚假层级；中文、英文和长文件名都保持稳定基线。
-- 整行是唯一点击目标，不在右侧重复放置“查看”、面板或外链符号。长文件名必须在 `min-w-0` 容器内单行截断，移动端宽度不得溢出。
-- 非图片文件使用统一的实心蓝文件标，内部白色符号区分文档/代码/表格/演示/压缩包；不得使用低对比灰色线框或不同视觉家族的图标。图标为装饰，按钮自身保留完整 `aria-label`。
-- 文件卡片调用 `ChatV2` 的 Session 文件入口，打开聊天/文件双工作区并把目标文件传给 `ArtifactsPanel`。
-- 渲染前必须按目标父目录查询当前 session 文件列表；只有命中同路径文件时才渲染文件卡片。
-- 未命中或校验失败说明该文本只是助手描述、文件尚未生成或当前状态不可确认；此类引用必须直接隐藏，不展示文件卡片或错误提示。
-- 文件卡片已经由父目录查询确认存在；点击时必须在同一前端提交内打开文件工作台并投影目标标签，不得再用目录网络请求阻塞首帧。若文件随后失效，由目标标签自己的预览请求显示局部错误，不得回写 Round/Session 状态。
-- `ArtifactsPanel` 直接进入面板内 `FilePreview`，不走全屏预览弹窗。
-- 用户上传附件仍沿用原有 `onPreviewAttachment` 全屏预览链路。
+结构化引用固定分为：
+
+- Session：`source/session_id/path/revision/snapshot_path/ref_id`。工具成功写入后用 no-follow stat 生成 opaque revision，并在 `.assistant-artifacts/{round}/...` 冻结生成时字节；Bash 只在完整、未截断的前后 manifest 都成功时投影变更，删除产生 tombstone。
+- Workspace：`source/entry_id/path/revision/version_id/ref_id`。只接受成功正式 mutation；`workspace_change_proposed/conflict`、`NO_CHANGE`、delete 和内部审计记录不产生卡片。源 entry 存在时保护 version；显式删除 entry 后同时删除其版本与引用，不再提供历史兜底。
+- 同一 Round 内 Session 按 `session_id + path`、Workspace 按 `entry_id` last-write-wins；删除 tombstone 移除此前候选。子 Agent 的结构化引用必须回传父 Round；规范化 Workspace 引用不含原 mutation 的 `kind` 字段，父任务按 `user_id + entry_id + version_id` 校验并保护版本，不能因此丢弃引用或用同名 Session 副本替代。两种来源不按文件名合并。
+
+点击与布局遵循一个入口、一套预览：
+
+- 文件卡片位于助手 markdown 后方，使用最大宽度 520px、最小高度 52px 的紧凑附件行；整行是唯一点击目标，不提供“当前版本 / 生成时版本”双按钮。
+- 点击 Workspace 卡先按原稳定 `entry_id` 读取当前 active 实体；存在则在右侧 `WorkspaceFilesPanel` 打开最新内容。不得按同名路径串到另一个 entry，也不得自动恢复或重建。
+- 点击 Session 卡先按原 `session_id + path` 重新读取父目录 authoritative metadata，再在右侧 `ArtifactsPanel` 打开当前内容；历史 event 的旧 size/mtime/revision 不得直接命中预览缓存。
+- Workspace 实体已删除时显示错误并停止，不请求历史 version 或按同名路径替换；Session 自身产物的既有快照行为不属于工作区删除。
+- 快照只读；恢复到工作区属于独立、用户明确触发的写操作。卡片点击和预览本身永远不得创建、恢复、移动或重命名文件。
+- FilePreview 将 owner identity 与 content identity 分离：同一 current Workspace `entry_id` 的新 version 属于同一 owner，可在 clean/ready 后台刷新；`version_id/snapshot_path/revision/ref_id/preview URL` 只决定内容与缓存。captured 与 current 必须属于不同 owner，captured/read-only 模式禁止读取 outbox 草稿或沿用 current 正文。
 
 ## 3. 核心不变量（Critical Invariants）
 
@@ -236,7 +245,10 @@ pre_accept_pending
 
 #### 选择器交互
 
-- 输入框底部使用唯一 `+` 根菜单，固定包含“上传文件”“专家 Skills”“数据连接”；模型/推理等级仍常驻底栏。三个入口互斥，桌面端向上展开，移动端使用底部浮层；`Escape` 关闭并把焦点还给 `+`，点击外部关闭。
+- 输入框底部使用唯一 `+` 根菜单，固定顺序为“工作区文件 → 上传文件 → 专家 Skills → 数据连接”；模型/推理等级仍常驻底栏。四个入口互斥，桌面端向上展开，移动端使用底部浮层；`Escape` 关闭并把焦点还给 `+`，点击外部关闭。
+- 工作区选择器展示文件和文件夹并支持搜索、lazy 目录与多选；文件夹必须作为一个独立选择项保留稳定 `entry_id/kind`，不得在前端展开成多个后代文件。Composer 与历史消息均渲染单个文件夹卡片；选择时不创建 Session、不上传、不读取 Data URL。普通草稿只以 `entry_id` 去重，发送时 file block 提交 `source/entry_id/kind/name/mime_type/size`，不提交选择时的 revision/current_version/tree_revision；服务端在 Round 受理时解析最新 durable head 或完整目录 manifest。只有明确的历史版本选择才额外提交 `version_id`。
+- `workspace_resource_changed` 仍是正式 mutation 的内部事实与工作区失效信号，但 `Round` 不直接渲染 raw audit。服务端只在成功文件 mutation 上附加受保护的 `assistant_file_reference`，live reducer 与 history 以同一稳定身份投影卡片；deleted tombstone 移除同 Round 旧引用。proposed/conflict/change-set、系统路径和 `NO_CHANGE` 永不进入普通聊天 UI。
+- clean 工作区标签收到更高 version 时，先后台读取新内容，再原子替换正文与版本；dirty 标签保留当前页面内存草稿和原 base version并继续远端保存，服务端自动三方合并，不显示“有新版本”、加载新版本、另存或放弃动作。网络歧义、5xx 和 mutation 尚在处理时由 outbox 使用原 key 重试；确定性终态失败丢弃 Workspace 草稿、恢复服务端 current head，并只在当前文件内显示可关闭错误。只有 authoritative 404 或显式删除 tombstone 时关闭文件。
 - `ChatInput` 仅在用户显式进入 Skill 子菜单时加载普通 `GET /api/config/skills`，每次重新打开都从服务端 DB 快照刷新清单，列表只展示 `enabled === true` 的项目；不得在页面初始化时预取或使用 `refresh=true` 触发远程恢复。已有成功清单时采用 stale-while-refresh：立即展示旧清单并以轻量状态提示请求，不得重新用整面 loading 遮住列表。
 - 数据连接子菜单延迟调用 `GET /api/mcp/servers`，只展示 `enabled && installation_id !== null && enabled_tools_count > 0` 的连接；提交稳定 `server.id`，展示 `name`、说明及官方/个人来源。搜索匹配 id/name/description，最多选择 20 项。
 - 当前实现不跨组件实例缓存清单。组件实例内关闭后尚未完成的同一请求可在重开时复用，避免重复远程恢复沙箱；请求完成后的下一次重开仍须发起新刷新。若以后增加更长生命周期缓存，缓存与进行中的请求必须按认证用户隔离，并在登录用户、token 身份或 Skill 启停状态变化时立即失效，禁止跨账号复用私有 Skill 名称、描述或启停状态。
@@ -261,7 +273,10 @@ pre_accept_pending
 - 正文与附件使用独立的 `MessageDraft` 按相同 session key 隔离；草稿包含稳定 `draftId` 与递增 `revision`。正文编辑、附件增删递增 revision，session key 迁移不得改变 draftId。
 - 新会话仍以 `__new_session__` 作为客户端映射 key，但附件上传必须先取得真实 server session ID。上传等异步回调绑定发起时的 `draftId + serverSessionId`，不得根据回调执行时的当前活跃会话决定写入位置。
 - 从 `__new_session__` 迁移到真实 session 时，MessageDraft 与 TurnPreferenceDraft 必须在同一转换路径协调迁移；目标已有较新草稿或 draftId 已变化时，迟到响应不得覆盖或重新创建旧草稿。
-- 发送时冻结正文、附件与 TurnPreferenceDraft，并分别提交 `preferred_skill_keys`、`preferred_mcp_server_ids`；空数组省略。之后编辑不得改变在途请求。
+- 发送时冻结正文、附件与 TurnPreferenceDraft。若本轮附加的 Workspace 文件正 dirty，必须在发送请求前只等待这些 entry 的 outbox 保存；成功后再让服务端解析 current head，失败或保存回执为 stale 时不创建 Round并保留 composer 草稿。未作为本轮附件的 dirty 文件仍同步抓取到应用级 outbox并在后台保存，不阻断 Agent；这些非附件路径只进入 Agent 的 `pending_file_drafts`，前端不显示全局同步提示。不得传草稿正文。
+- optimistic Round 中尚未取得服务端 `.workspace-snapshots/` 路径的 Workspace 附件不得进入 Session 文件预览；点击时显示“工作区附件正在冻结，请稍后再打开”，不得把原 Workspace path 拼到 `/api/sessions/{id}/files/`。authoritative Round 返回 snapshot 后才按既有 captured/read-only 链路打开。
+- 欢迎页创建 Session、迁移草稿与清空 composer 必须通过同步 submission snapshot 收敛；stream accepted 前拒绝时原子恢复正文、附件和本轮偏好，不依赖 React state 提交时序。
+- HTTP/SSE 响应头不代表 Round 已受理；只有 `RUN_STARTED` 或按幂等键查到 durable Round 才发布 `stream_accepted`。此前收到的无序 `RUN_ERROR` 必须恢复 submission snapshot。
 - 提交发送时乐观清空目标 session 的两类偏好。服务端确认 SSE 已接受后保持清空；执行已接受后的流式失败、中断或取消不得恢复旧选择。
 - composer 清空只影响下一条发送，不得删除或隐藏当前 direct Round 已固化的资源胶囊。
 - 若 POST 在收到响应头前发生网络错误，前端须按 §3.3.1 用同一 `idempotency_key` 查询历史：匹配到 running/waiting/终态 Round 即视为已接受，补发一次 `stream_accepted`，随后立即订阅或收敛终态；从历史恢复的失败终态也必须携带真实 `threadId`、`runId` 和末事件序号。只有 3 次 history 均成功且均无匹配时才恢复发送快照并报请求失败；任一次 history 失败则保持歧义、草稿保持清空并提示刷新。确定性的 HTTP 4xx/5xx 仍立即恢复；恢复回调最多执行一次。
@@ -391,10 +406,14 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] 普通进入长会话时定位到底部；A 滚到中间 → 切 B → 切回 A，A 仍定位到底部
 - [ ] 搜索结果带 `match_round_id` 时定位到命中 round，而不是底部
 - [ ] 首屏历史渲染无瀑布动画
+- [ ] 从 `/` 点击工作区后 URL 为 `/workspace`；硬刷新首帧仍为工作区，且会话请求永久 pending/reject 不出现整栏无限 spinner
+- [ ] 会话/工作区 mode 行保持同一高度和 Y 位置；会话无 `HISTORY`，右侧 `+` 可新建；工作区搜索与省略号为不占布局的锚定浮层
+- [ ] 顶部菜单在展开/点击任意文件夹后仍只向根目录新建、上传和刷新；文件夹三点菜单的创建、上传和刷新只作用于该文件夹
+- [ ] 新建 Markdown/XLSX 不出现命名 Dialog，按未命名自然序列创建并立即打开右侧编辑器；新建文件夹才要求输入名称
 - [ ] 底部跟随：用户滚离底部时新消息不强制滚动
 - [ ] 用户滚离底部且新回复正在生成时，底部按钮显示 live reply 指示
-- [ ] 助手文件提示行/路径保留在 markdown 正文，同时在回复底部渲染去重的单行紧凑文件卡片；图标表达格式、不重复渲染元数据行，点击后打开 Session 文件工作台并直接预览目标文件
-- [ ] 代码块内的文件名/命令不触发文件卡片
+- [ ] 助手文件卡只来自 durable `assistant_file_references`；普通反引号、提示行和代码块文件名均不创建卡片
+- [ ] 点击卡片在既有右侧工作台打开当前稳定实体；Workspace 实体缺失时明确提示已删除，不回退旧版本，不出现遮罩弹窗或第二套预览壳
 - [ ] Skill 选择器仅在显式打开时加载并在重新打开时后台刷新；已有清单立即展示，未完成请求可复用，只展示 enabled 项
 - [ ] Skill 清单不跨组件实例/账号复用，退出后切换账号不泄露上一账号的私有 Skill；成功空列表与请求失败均不产生自动重载循环，刷新失败保留旧清单
 - [ ] Skill 使用 `display_name` 展示、`key` 提交；搜索重开清空；选择、标签移除、50 项上限、桌面点击外部/`Escape` 与移动端关闭按钮行为正确

@@ -45,8 +45,11 @@ interface ChatPaneButtonProps {
 }
 
 export function ChatPaneButton({ filesOpen, onToggle }: ChatPaneButtonProps) {
-  const label = filesOpen ? '收起面板' : '展开面板';
-  const Icon = filesOpen ? PanelRightClose : PanelRightOpen;
+  // The label describes the chat pane, matching AlphaPai: when files are
+  // visible the action expands chat (closing the right pane); when files are
+  // closed the action contracts chat (restoring the right pane).
+  const label = filesOpen ? '展开面板' : '收起面板';
+  const Icon = filesOpen ? PanelRightOpen : PanelRightClose;
   return (
     <button
       type="button"

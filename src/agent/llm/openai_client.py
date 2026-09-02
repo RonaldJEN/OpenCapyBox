@@ -1,6 +1,7 @@
 """OpenAI LLM client implementation."""
 
 import asyncio
+import httpx
 import json
 import logging
 import uuid
@@ -67,6 +68,8 @@ class OpenAIClient(LLMClientBase):
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url=api_base,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=60.0, pool=10.0),
+            max_retries=0,
         )
 
         # All model-specific params are now passed in from ModelConfig

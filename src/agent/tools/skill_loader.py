@@ -420,8 +420,6 @@ class SkillLoader:
             return ""
 
         prompt_parts = ["## Available Skills\n"]
-        prompt_parts.append("You have access to specialized skills. Each skill provides expert guidance for specific tasks.\n")
-        prompt_parts.append("Load a skill's full content using the appropriate skill tool when needed.\n")
 
         for skill in all_skills.values():
             tag = " [用户]" if skill.source == "user" else ""

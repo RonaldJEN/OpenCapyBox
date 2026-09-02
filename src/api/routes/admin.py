@@ -57,6 +57,13 @@ from src.api.services.sandbox_profile_service import (
     sandbox_profile_to_payload,
     set_default_sandbox_profile,
 )
+from src.api.services.workspace_service import (
+    WorkspaceError,
+    ensure_default_workspace_profile_switch_allowed,
+    ensure_workspace_profile_runtime_update_allowed,
+    ensure_workspace_profile_switch_allowed,
+    finish_workspace_profile_switch,
+)
 from src.api.model_registry import (
     ModelConfig,
     VALID_PROVIDERS,
@@ -913,6 +920,22 @@ def _update_sandbox_profile(
     data = payload.model_dump(exclude_unset=True)
     if data.get("api_key") is None:
         data.pop("api_key", None)
+    will_change_runtime = any(
+        field_name in RUNTIME_RECREATE_FIELDS
+        and _runtime_field_changed(profile, field_name, value)
+        for field_name, value in data.items()
+    )
+    if will_change_runtime:
+        try:
+            ensure_workspace_profile_runtime_update_allowed(
+                db,
+                profile_id=profile_id,
+            )
+        except WorkspaceError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message, **exc.extra},
+            ) from exc
     runtime_changed = False
     for field_name, value in data.items():
         if field_name in RUNTIME_RECREATE_FIELDS and _runtime_field_changed(profile, field_name, value):
@@ -1002,6 +1025,7 @@ async def _clear_user_sandbox_binding_after_kill(
 ) -> None:
     user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
     sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+    db.commit()
     if sandbox_id or sandbox_service.get_cached(user_id):
         sandbox_deleted = await sandbox_service.kill(user_id, sandbox_id)
         if not sandbox_deleted:
@@ -1010,6 +1034,7 @@ async def _clear_user_sandbox_binding_after_kill(
                 user_id,
                 sandbox_id,
             )
+    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
     if user_sandbox:
         user_sandbox.sandbox_id = None
         user_sandbox.active_profile_id = None
@@ -1052,7 +1077,10 @@ def _build_overview_payload(db: DBSession, days: int) -> dict[str, Any]:
     )
     cron_failed_24h = (
         db.query(func.count(CronJobRun.id))
-        .filter(CronJobRun.status == "failed", CronJobRun.started_at >= since_24h)
+        .filter(
+            CronJobRun.status.in_(("failed", "conflict", "unknown")),
+            CronJobRun.started_at >= since_24h,
+        )
         .scalar()
     )
 
@@ -1740,7 +1768,7 @@ def _build_users_payload(db: DBSession) -> dict[str, Any]:
             func.count(CronJobRun.id).label("cron_failed_24h"),
         )
         .filter(
-            CronJobRun.status == "failed",
+            CronJobRun.status.in_(("failed", "conflict", "unknown")),
             CronJobRun.started_at >= since_24h,
             CronJobRun.user_id.in_(user_ids),
         )
@@ -2388,6 +2416,16 @@ async def set_admin_sandbox_profile_default(
     db: DBSession = Depends(get_db),
 ):
     """设置全局默认 OpenSandbox 后端。"""
+    try:
+        ensure_default_workspace_profile_switch_allowed(
+            db,
+            desired_profile_id=profile_id,
+        )
+    except WorkspaceError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message, **exc.extra},
+        ) from exc
     profile = set_default_sandbox_profile(db, profile_id)
     counts = _sandbox_profile_bound_counts(db)
     return sandbox_profile_to_payload(profile, bound_users=counts.get(profile.id, 0))
@@ -2458,24 +2496,43 @@ async def update_admin_user_sandbox_profile(
     if not needs_recreate:
         return get_user_sandbox_config_payload(db, user_id)
 
-    if _user_has_running_work(db, user_id) and not payload.force_recreate:
-        raise HTTPException(status_code=409, detail="用户当前有正在运行的任务，无法切换沙箱后端")
+    workspace_draining = False
+    try:
+        ensure_workspace_profile_switch_allowed(
+            db,
+            user_id=user_id,
+            desired_profile_id=desired_profile_id,
+        )
+        workspace_draining = True
+    except WorkspaceError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message, **exc.extra},
+        ) from exc
 
-    sandbox_service = SandboxSessionService()
-    await get_agent_pool().invalidate_user_async(user_id, preserve_running=False)
+    try:
+        if _user_has_running_work(db, user_id) and not payload.force_recreate:
+            raise HTTPException(status_code=409, detail="用户当前有正在运行的任务，无法切换沙箱后端")
+        db.commit()
 
-    await _clear_user_sandbox_binding_after_kill(
-        db,
-        user_id=user_id,
-        sandbox_service=sandbox_service,
-    )
-    assign_user_sandbox_profile(
-        db,
-        user_id=user_id,
-        sandbox_profile_id=desired_profile_id,
-        updated_by=admin_user_id,
-    )
-    return get_user_sandbox_config_payload(db, user_id)
+        sandbox_service = SandboxSessionService()
+        await get_agent_pool().invalidate_user_async(user_id, preserve_running=False)
+
+        await _clear_user_sandbox_binding_after_kill(
+            db,
+            user_id=user_id,
+            sandbox_service=sandbox_service,
+        )
+        assign_user_sandbox_profile(
+            db,
+            user_id=user_id,
+            sandbox_profile_id=desired_profile_id,
+            updated_by=admin_user_id,
+        )
+        return get_user_sandbox_config_payload(db, user_id)
+    finally:
+        if workspace_draining:
+            finish_workspace_profile_switch(db, user_id=user_id)
 
 
 @router.get("/users/{user_id}/login-events")

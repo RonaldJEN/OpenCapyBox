@@ -41,12 +41,20 @@ class TestOpenAIClientInitialization:
     def test_default_initialization(self):
         """測試默認初始化"""
         from src.agent.llm.openai_client import OpenAIClient
-        
-        client = OpenAIClient(
-            api_key="test-key",
-            api_base="https://api.example.com/v1",
-            model="TestModel",
-        )
+
+        with patch('src.agent.llm.openai_client.AsyncOpenAI') as mock_openai:
+            client = OpenAIClient(
+                api_key="test-key",
+                api_base="https://api.example.com/v1",
+                model="TestModel",
+            )
+
+        kwargs = mock_openai.call_args.kwargs
+        assert kwargs["max_retries"] == 0
+        assert kwargs["timeout"].connect == 10.0
+        assert kwargs["timeout"].read == 120.0
+        assert kwargs["timeout"].write == 60.0
+        assert kwargs["timeout"].pool == 10.0
         
         assert client.api_key == "test-key"
         assert client.model == "TestModel"

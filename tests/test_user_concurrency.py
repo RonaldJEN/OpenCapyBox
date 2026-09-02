@@ -1207,6 +1207,8 @@ class TestSendMessageConcurrencyBlock:
             lock_id="lock-1",
             session_id="session-new",
         )
+        pool_instance.get_or_create.assert_awaited_once()
+        assert pool_instance.get_or_create.await_args.kwargs["db"] is None
 
     def test_model_access_failure_releases_user_lock_before_stream(self):
         from tests.helpers import make_test_client
@@ -1432,6 +1434,81 @@ class TestSendMessageConcurrencyBlock:
 
         assert isinstance(response, StreamingResponse)
         get_pool.assert_not_called()
+
+    async def test_send_agent_init_timeout_emits_error_and_releases_lock(self):
+        from src.api.routes.chat import send_message_stream
+        from src.api.schemas.chat import SendMessageRequest
+
+        mock_db = MagicMock()
+        mock_session = MagicMock(
+            id="session-1",
+            user_id="testuser",
+            status="active",
+            model_id="model-1",
+        )
+
+        def query_side_effect(model):
+            from src.api.models.round import Round as RoundModel
+            from src.api.models.session import Session as SessionModel
+            from src.api.models.user_sandbox import UserSandbox
+
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                chain.filter.return_value.first.return_value = None
+            elif model is RoundModel:
+                chain.filter.return_value.count.return_value = 0
+            return chain
+
+        mock_db.query.side_effect = query_side_effect
+
+        async def never_initialize(**_kwargs):
+            await asyncio.Event().wait()
+
+        pool = MagicMock()
+        pool.cleanup_expired_async.return_value = None
+        pool.get_or_create = never_initialize
+        settings = MagicMock(
+            sse_heartbeat_interval=0.02,
+            agent_init_timeout_seconds=0.08,
+        )
+
+        with patch("src.api.routes.chat.enforce_token_limits", return_value=None), patch(
+            "src.api.routes.chat._resolve_session_model_for_user", return_value="model-1"
+        ), patch(
+            "src.api.routes.chat._validate_turn_reasoning_request", return_value=None
+        ), patch(
+            "src.api.routes.chat._acquire_lock_and_clear_cancel",
+            new_callable=AsyncMock,
+            return_value="lock-init-timeout",
+        ), patch(
+            "src.api.routes.chat.get_agent_pool", return_value=pool
+        ), patch(
+            "src.api.routes.chat.get_settings", return_value=settings
+        ), patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as release_lock:
+            response = await send_message_stream(
+                "session-1",
+                SendMessageRequest(content=[{"type": "text", "text": "hello"}]),
+                user_id="testuser",
+                db=mock_db,
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        body = "".join(
+            chunk.decode() if isinstance(chunk, bytes) else chunk
+            for chunk in chunks
+        )
+        assert "AGENT_INIT_TIMEOUT" in body
+        release_lock.assert_awaited_once_with(
+            user_id="testuser",
+            lock_id="lock-init-timeout",
+            session_id="session-1",
+        )
 
     async def test_resume_no_pending_interrupt_stream_error_releases_lock(self):
         """Agent 初始化已进入 SSE 后，无待处理中断应以 RUN_ERROR 结束并释放锁。"""

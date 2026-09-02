@@ -2023,7 +2023,6 @@ function UsersPanel({
         <FeedbackMessage
           className="admin-toast"
           tone="success"
-          autoDismissMs={4000}
           onDismiss={onDismissActionMessage}
         >
           {actionMessage}
@@ -2799,7 +2798,6 @@ function SandboxesPanel({
         <FeedbackMessage
           className="admin-toast"
           tone="success"
-          autoDismissMs={4000}
           onDismiss={onDismissActionMessage}
         >
           {actionMessage}

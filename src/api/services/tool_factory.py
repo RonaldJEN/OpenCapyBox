@@ -37,6 +37,14 @@ from src.agent.tools.sub_agent_tool import SubAgentTool
 from src.agent.tools.skill_loader import Skill, SkillLoader
 from src.agent.tools.skill_tool import GetSkillTool
 from src.agent.tools.mcp_tool import McpRemoteTool
+from src.agent.tools.workspace_tools import (
+    WorkspaceCreateDirectoryTool,
+    WorkspaceListTool,
+    WorkspaceMoveTool,
+    WorkspacePublishTool,
+    WorkspaceStageTool,
+    WorkspaceDeleteTool,
+)
 
 from src.api.services.sandbox_service import get_sandbox_service
 from src.api.services.skill_inventory_service import (
@@ -145,6 +153,11 @@ async def create_agent_tools(
     supports_image: bool = False,
     max_images: int = 0,
     build_metadata: dict[str, object] | None = None,
+    workspace_access: str = "manage",
+    workspace_actor: str = "chat",
+    workspace_fence: Callable[[object], None] | None = None,
+    workspace_change_recorder: Callable[[object, dict], None] | None = None,
+    workspace_context: dict | None = None,
 ) -> tuple[List, Optional[SkillLoader]]:
     """创建标准 Agent 工具列表。
 
@@ -156,7 +169,9 @@ async def create_agent_tools(
     -------
     (tools, skill_loader)  skill_loader 为 None 当 Skills 未加载时
     """
-    exclude = exclude or set()
+    exclude = set(exclude or ())
+    if workspace_access not in {"none", "read", "edit", "manage"}:
+        raise ValueError("workspace_access 必须为 none/read/edit/manage")
     skill_loader_ref: Optional[SkillLoader] = None
     if build_metadata is not None:
         build_metadata["mcp_catalog_fingerprint"] = None
@@ -175,7 +190,10 @@ async def create_agent_tools(
     # 全量候选工具（类名 -> 工厂函数），延迟构造：只有不在 exclude 中的才会被实例化
     _candidates: List[tuple[str, Callable[[], object]]] = [
         # 沙箱文件工具
-        ("SandboxReadTool", lambda: SandboxReadTool(sandbox=sandbox, workspace_dir=workspace_dir)),
+        ("SandboxReadTool", lambda: SandboxReadTool(
+            sandbox=sandbox,
+            workspace_dir=workspace_dir,
+        )),
         ("SandboxReadImageTool", lambda: SandboxReadImageTool(
             sandbox=sandbox,
             workspace_dir=workspace_dir,
@@ -229,6 +247,35 @@ async def create_agent_tools(
         # 子 Agent 委托工具（服务层 runner 创建 child Round）
         ("SubAgentTool", lambda: SubAgentTool(runner=subagent_runner)),
     ]
+
+    workspace_tool_kwargs = {
+        "db_session_factory": db_session_factory,
+        "user_id": user_id,
+        "execution_root": workspace_dir,
+        "sandbox": sandbox,
+        "actor": workspace_actor,
+        "fence": workspace_fence,
+        "change_recorder": workspace_change_recorder,
+        "base_context": workspace_context,
+    }
+    if workspace_access in {"read", "edit", "manage"}:
+        _candidates.extend([
+            ("WorkspaceListTool", lambda: WorkspaceListTool(**workspace_tool_kwargs)),
+            ("WorkspaceStageTool", lambda: WorkspaceStageTool(**workspace_tool_kwargs)),
+        ])
+    if workspace_access in {"edit", "manage"}:
+        _candidates.extend([
+            ("WorkspacePublishTool", lambda: WorkspacePublishTool(**workspace_tool_kwargs)),
+            (
+                "WorkspaceCreateDirectoryTool",
+                lambda: WorkspaceCreateDirectoryTool(**workspace_tool_kwargs),
+            ),
+        ])
+    if workspace_access == "manage":
+        _candidates.extend([
+            ("WorkspaceMoveTool", lambda: WorkspaceMoveTool(**workspace_tool_kwargs)),
+            ("WorkspaceDeleteTool", lambda: WorkspaceDeleteTool(**workspace_tool_kwargs)),
+        ])
 
     tools: List = [factory() for cls_name, factory in _candidates if cls_name not in exclude]
 

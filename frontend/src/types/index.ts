@@ -316,12 +316,25 @@ export interface VideoContentBlock {
 
 export interface FileContentBlock {
   type: "file";
-  file: {
-    path: string;
-    name?: string;
-    mime_type?: string;
-    size?: number;
-  };
+  file: SessionChatFileObject | WorkspaceChatFileObject;
+}
+
+export interface SessionChatFileObject {
+  source?: "session";
+  path: string;
+  name?: string;
+  mime_type?: string;
+  size?: number;
+}
+
+export interface WorkspaceChatFileObject {
+  source: "workspace";
+  entry_id: string;
+  version_id?: string;
+  kind?: 'file' | 'directory';
+  name?: string;
+  mime_type?: string;
+  size?: number;
 }
 
 export type ChatContentBlock =
@@ -446,6 +459,18 @@ export interface AttachmentInfo {
   size?: number;
   data_url?: string;
   session_id?: string;
+  source?: 'session' | 'workspace';
+  entry_id?: string;
+  revision?: number | string;
+  version_id?: string;
+  version_sequence?: number;
+  tree_revision?: number;
+  manifest_sha256?: string;
+  origin_path?: string;
+  snapshot_path?: string;
+  sha256?: string;
+  kind?: 'file' | 'directory';
+  is_directory?: boolean;
 }
 
 export interface PreferredSkillSnapshot {
@@ -458,6 +483,36 @@ export interface PreferredMcpConnectionSnapshot {
   display_name: string;
 }
 
+export type AssistantFileReference = {
+  ref_id: string;
+  name: string;
+  path: string;
+  size: number;
+  modified: string;
+  type: string;
+  revision: string;
+  operation?: string | null;
+  tool_call_id?: string | null;
+  sha256?: string | null;
+} & (
+  | {
+      source: 'session';
+      session_id: string;
+      snapshot_path: string;
+      entry_id?: never;
+      workspace_path?: never;
+      version_id?: never;
+    }
+  | {
+      source: 'workspace';
+      entry_id: string;
+      workspace_path: string;
+      version_id: string;
+      session_id?: never;
+      snapshot_path?: never;
+    }
+);
+
 // 对话轮次
 export interface RoundData {
   round_id: string;
@@ -467,6 +522,7 @@ export interface RoundData {
   user_attachments?: AttachmentInfo[];
   preferred_skills?: PreferredSkillSnapshot[];
   preferred_mcp_connections?: PreferredMcpConnectionSnapshot[];
+  assistant_file_references?: AssistantFileReference[];
   thinking_mode?: 'provider_default' | 'enabled' | 'disabled' | null;
   reasoning_effort?: string | null;
   final_response: string | null;
@@ -489,16 +545,57 @@ export interface HistoryResponseV2 {
 // 🆕 文件管理类型定义
 
 // 文件信息
+export interface PendingFileDraftInfo {
+  source: 'session' | 'workspace';
+  path: string;
+}
+
 export interface FileInfo {
   name: string;
   path: string;
   session_id?: string;
+  source?: 'session' | 'workspace';
+  entry_id?: string;
+  workspace_path?: string;
+  /** Session revision is opaque; workspace revision is numeric. */
+  revision?: string | number;
+  version_id?: string;
+  version_sequence?: number;
+  snapshot_path?: string;
+  tree_revision?: number;
+  manifest_sha256?: string;
+  /** The last Workspace save folded a newer server version into this draft. */
+  workspace_auto_merged?: boolean;
+  /** Internal editor-outbox generation acknowledged by the last save. */
+  outbox_generation?: number;
+  edit_base_token?: string;
+  session_auto_merged?: boolean;
   size: number;
   modified: string;
   type: string;
   is_directory?: boolean;
   data_url?: string;
+  /** Assistant cards use immutable captured bytes; normal panels use current. */
+  content_mode?: 'current' | 'captured';
+  assistant_ref_id?: string;
 }
+
+export type ChatFile = FileInfo & (
+  | {
+    source?: 'session';
+    entry_id?: never;
+    workspace_path?: never;
+  }
+  | {
+    source: 'workspace';
+    entry_id: string;
+    revision: number | string;
+    version_id?: string;
+    tree_revision?: number;
+    manifest_sha256?: string;
+    workspace_path: string;
+  }
+);
 
 // 文件列表响应
 export interface FileListResponse {

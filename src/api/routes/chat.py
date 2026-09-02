@@ -51,6 +51,7 @@ from src.api.services.running_rounds import get_main_running_round
 from src.api.services.subagent_graph_service import get_subagent_graph_service
 from src.api.services.turn_orchestrator import TurnExecution, get_turn_orchestrator
 from src.api.services.web_chat_adapter import WebCancelAdapter, WebChatAdapter, WebResumeAdapter
+from src.api.services.workspace_service import WorkspaceError
 from src.api.services.model_access_service import assert_user_can_access_model, resolve_default_model_for_user
 from src.api.models.round import Round
 from src.api.services.history_service import HistoryService
@@ -227,6 +228,21 @@ def _has_cancel_activity_since(
         return isinstance(requested_at, datetime) and requested_at > started_at
     finally:
         db.rollback()
+
+
+def _has_cancel_activity_since_in_new_session(
+    *,
+    user_id: str,
+    session_id: str,
+    started_at: datetime,
+) -> bool:
+    with SessionLocal() as db:
+        return _has_cancel_activity_since(
+            db,
+            user_id=user_id,
+            session_id=session_id,
+            started_at=started_at,
+        )
 
 
 def _is_retryable_db_error(exc: OperationalError) -> bool:
@@ -471,11 +487,77 @@ class _AgentInitFailed(Exception):
     pass
 
 
+class _AgentInitTimedOut(Exception):
+    """Agent 初始化超过总墙钟期限。"""
+    pass
+
+
+async def _agent_init_heartbeats(
+    init_task: asyncio.Task,
+    *,
+    heartbeat_interval: float,
+    timeout_seconds: float,
+):
+    """Yield SSE heartbeats while enforcing one total Agent-init deadline."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(float(timeout_seconds), 0.01)
+    interval = max(float(heartbeat_interval), 0.01)
+    while not init_task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise _AgentInitTimedOut(
+                f"Agent 初始化超过 {int(timeout_seconds)} 秒，已停止本次请求"
+            )
+        done, _ = await asyncio.wait(
+            {init_task},
+            timeout=min(interval, remaining),
+        )
+        if done:
+            break
+        if loop.time() >= deadline:
+            raise _AgentInitTimedOut(
+                f"Agent 初始化超过 {int(timeout_seconds)} 秒，已停止本次请求"
+            )
+        yield CustomEvent(
+            name="heartbeat",
+            value={"timestamp": int(datetime.now().timestamp() * 1000)},
+        )
+
+
+def _consume_agent_init_task(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Agent 初始化后台任务失败")
+
+
+async def _cancel_agent_init_task(
+    init_task: asyncio.Task,
+    *,
+    drain_timeout_seconds: float = 5.0,
+) -> None:
+    """Cancel init without letting a cancellation-hostile dependency hang SSE."""
+    if init_task.done():
+        _consume_agent_init_task(init_task)
+        return
+    init_task.cancel()
+    done, _ = await asyncio.wait(
+        {init_task},
+        timeout=max(float(drain_timeout_seconds), 0.01),
+    )
+    if done:
+        _consume_agent_init_task(init_task)
+        return
+    logger.error("Agent 初始化任务在取消后仍未退出，转为后台回收")
+    init_task.add_done_callback(_consume_agent_init_task)
+
+
 def _start_agent_init(
     *,
     user_id: str,
     chat_session_id: str,
-    db,
     model_id: str | None,
     sandbox_id: str | None,
 ) -> asyncio.Task:
@@ -499,7 +581,7 @@ def _start_agent_init(
         user_id=user_id,
         session_id=user_id,
         chat_session_id=chat_session_id,
-        db=db,
+        db=None,
         model_id=model_id,
         sandbox_id=sandbox_id,
     ))
@@ -650,22 +732,34 @@ async def send_message_stream(
         init_task = _start_agent_init(
             user_id=user_id,
             chat_session_id=chat_session_id,
-            db=db,
             model_id=model_id,
             sandbox_id=user_sandbox_id,
         )
 
         try:
-            # 在初始化完成前持續發送心跳
-            while not init_task.done():
-                done, _ = await asyncio.wait({init_task}, timeout=settings.sse_heartbeat_interval)
-                if not done:
-                    yield event_encoder.encode(CustomEvent(
-                        name="heartbeat",
-                        value={"timestamp": int(datetime.now().timestamp() * 1000)},
-                    ))
+            # 在初始化完成前持续发送心跳，但不能无限掩盖卡死。
+            async for heartbeat in _agent_init_heartbeats(
+                init_task,
+                heartbeat_interval=settings.sse_heartbeat_interval,
+                timeout_seconds=settings.agent_init_timeout_seconds,
+            ):
+                yield event_encoder.encode(heartbeat)
 
             agent_service = _resolve_agent_init(init_task)
+        except _AgentInitTimedOut as e:
+            logger.error(
+                "Agent 初始化超时: user=%s session=%s timeout=%ss",
+                user_id,
+                chat_session_id,
+                settings.agent_init_timeout_seconds,
+            )
+            yield event_encoder.encode(RunErrorEvent(message=str(e), code="AGENT_INIT_TIMEOUT"))
+            await _release_user_run_lock_in_new_session(
+                user_id=user_id,
+                lock_id=lock_id,
+                session_id=chat_session_id,
+            )
+            return
         except _AgentInitFailed as e:
             yield event_encoder.encode(RunErrorEvent(message=str(e), code="AGENT_INIT_FAILED"))
             await _release_user_run_lock_in_new_session(
@@ -675,16 +769,10 @@ async def send_message_stream(
             )
             return
         finally:
-            if not init_task.done():
-                init_task.cancel()
-                try:
-                    await init_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await _cancel_agent_init_task(init_task)
 
         # init-window 防漏：若初始化期間發生 abort，立刻短路，不允許舊請求繼續創建 round。
-        if _has_cancel_activity_since(
-            db,
+        if _has_cancel_activity_since_in_new_session(
             user_id=user_id,
             session_id=chat_session_id,
             started_at=run_guard_started_at,
@@ -782,6 +870,12 @@ async def send_message_stream(
                     code="INTERACTION_PENDING",
                 ))
                 return
+            except WorkspaceError as e:
+                yield event_encoder.encode(RunErrorEvent(
+                    message=e.message,
+                    code=e.code,
+                ))
+                return
             except Exception:
                 logger.error("submit turn failed before orchestrated SSE started", exc_info=True)
                 yield event_encoder.encode(RunErrorEvent(message="Agent 執行失敗", code="INTERNAL_ERROR"))
@@ -872,34 +966,35 @@ async def resume_interrupt(
         init_task = _start_agent_init(
             user_id=user_id,
             chat_session_id=chat_session_id,
-            db=db,
             model_id=model_id,
             sandbox_id=user_sandbox_id,
         )
         try:
             try:
-                while not init_task.done():
-                    done, _ = await asyncio.wait({init_task}, timeout=settings.sse_heartbeat_interval)
-                    if not done:
-                        yield event_encoder.encode(CustomEvent(
-                            name="heartbeat",
-                            value={"timestamp": int(datetime.now().timestamp() * 1000)},
-                        ))
+                async for heartbeat in _agent_init_heartbeats(
+                    init_task,
+                    heartbeat_interval=settings.sse_heartbeat_interval,
+                    timeout_seconds=settings.agent_init_timeout_seconds,
+                ):
+                    yield event_encoder.encode(heartbeat)
 
                 agent_service = _resolve_agent_init(init_task)
+            except _AgentInitTimedOut as e:
+                logger.error(
+                    "Resume Agent 初始化超时: user=%s session=%s timeout=%ss",
+                    user_id,
+                    chat_session_id,
+                    settings.agent_init_timeout_seconds,
+                )
+                yield event_encoder.encode(RunErrorEvent(message=str(e), code="AGENT_INIT_TIMEOUT"))
+                return
             except _AgentInitFailed as e:
                 yield event_encoder.encode(RunErrorEvent(message=str(e), code="AGENT_INIT_FAILED"))
                 return
             finally:
-                if not init_task.done():
-                    init_task.cancel()
-                    try:
-                        await init_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                await _cancel_agent_init_task(init_task)
 
-            if _has_cancel_activity_since(
-                db,
+            if _has_cancel_activity_since_in_new_session(
                 user_id=user_id,
                 session_id=chat_session_id,
                 started_at=run_guard_started_at,
@@ -968,7 +1063,6 @@ async def resume_interrupt(
 async def subscribe_to_round(
     chat_session_id: str,
     round_id: str,
-    last_step: int = Query(0, description="客户端已收到的最后步骤号（已棄用，保留兼容）"),
     last_sequence: int = Query(0, description="客户端已收到的最后事件序列号（AG-UI 重放機制）"),
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
@@ -1000,6 +1094,11 @@ async def subscribe_to_round(
     if not round_obj:
         raise HTTPException(status_code=404, detail="轮次不存在")
 
+    db.refresh(round_obj)
+    if round_obj.status in Round.SUBSCRIBE_TERMINAL_STATUSES:
+        RunCompletionService(db).ensure_terminal_sync(round_id)
+    db.rollback()
+
     async def subscribe_generator():
         settings = get_settings()
         now_ms = lambda: int(datetime.now().timestamp() * 1000)
@@ -1008,12 +1107,6 @@ async def subscribe_to_round(
         heartbeat_task: asyncio.Task | None = None
 
         try:
-            db.refresh(round_obj)
-            if round_obj.status in Round.SUBSCRIBE_TERMINAL_STATUSES:
-                RunCompletionService(db).ensure_terminal_sync(round_id)
-            else:
-                db.rollback()
-
             event_bus = AguiEventBus(SessionLocal)
             iterator = event_bus.subscribe(round_id, after_sequence=last_sequence).__aiter__()
             next_event_task = asyncio.create_task(iterator.__anext__())

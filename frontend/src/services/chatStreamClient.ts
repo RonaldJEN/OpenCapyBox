@@ -3,6 +3,7 @@ import { eventMessageId, eventSequence, eventToolCallId, flushSSEBuffer, parseSS
 import { formatHttpErrorMessage } from '../utils/errorMessages';
 import type {
   ChatContentBlock,
+  PendingFileDraftInfo,
   RoundData,
   StreamDeltaMeta,
   TurnReasoningSelection,
@@ -119,6 +120,7 @@ interface StartSendArgs extends StreamIdentity, StreamHandlers {
   preferredSkillKeys?: string[];
   preferredMcpServerIds?: string[];
   reasoning?: TurnReasoningSelection;
+  pendingFileDrafts?: PendingFileDraftInfo[];
   onRejectedBeforeAccept?: () => void;
   onControlConflict?: (message: string, code: string, serverRunId?: string) => void;
 }
@@ -134,6 +136,7 @@ interface ResumeArgs extends StreamIdentity, StreamHandlers {
   answers: Record<string, string>;
   serverRunId: string;
   lastSequence?: number;
+  pendingFileDrafts?: PendingFileDraftInfo[];
 }
 
 export interface RuntimeSubscription {
@@ -736,10 +739,13 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
                 reasoning_effort: args.reasoning.effort,
               }
             : {}),
+          ...(args.pendingFileDrafts?.length
+            ? { pending_file_drafts: args.pendingFileDrafts }
+            : {}),
         }),
       },
       abort,
-      markStreamAccepted,
+      undefined,
       (event) => {
         if (!markSequence(event)) return;
         if (interactionRequested && isUnsequencedRunError(event)) {
@@ -750,6 +756,10 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
           currentRunId = currentRunId || event.value?.runId || null;
           currentThreadId = currentThreadId || args.ownerSessionId;
         }
+        if (!currentRunId && isUnsequencedRunError(event)) {
+          notifyRejectedBeforeAccept();
+          runCompleted = true;
+        }
         handleStreamEvent(
           event,
           identity,
@@ -757,6 +767,7 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
           (threadId, runId) => {
             currentThreadId = threadId;
             currentRunId = runId;
+            markStreamAccepted();
           },
           () => {
             runCompleted = true;
@@ -1112,6 +1123,9 @@ export function startResumeStream(args: ResumeArgs): RuntimeSubscription {
           body: JSON.stringify({
             interrupt_id: args.interruptId,
             answers: args.answers,
+            ...(args.pendingFileDrafts?.length
+              ? { pending_file_drafts: args.pendingFileDrafts }
+              : {}),
           }),
         },
         abort,

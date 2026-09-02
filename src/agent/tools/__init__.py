@@ -12,6 +12,14 @@ from .sandbox_bash_tool import (
 from .sandbox_file_tools import SandboxReadTool, SandboxWriteTool, SandboxEditTool
 from .sandbox_note_tool import SandboxSessionNoteTool, SandboxRecallNoteTool
 from .sub_agent_tool import SubAgentTool
+from .workspace_tools import (
+    WorkspaceCreateDirectoryTool,
+    WorkspaceListTool,
+    WorkspaceMoveTool,
+    WorkspacePublishTool,
+    WorkspaceStageTool,
+    WorkspaceDeleteTool,
+)
 
 __all__ = [
     "Tool",
@@ -30,4 +38,10 @@ __all__ = [
     "SandboxSessionNoteTool",
     "SandboxRecallNoteTool",
     "SubAgentTool",
+    "WorkspaceCreateDirectoryTool",
+    "WorkspaceListTool",
+    "WorkspaceMoveTool",
+    "WorkspacePublishTool",
+    "WorkspaceStageTool",
+    "WorkspaceDeleteTool",
 ]

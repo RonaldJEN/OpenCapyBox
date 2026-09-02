@@ -1,7 +1,7 @@
 """测试服务器启动时清理残留 running 轮次的逻辑"""
 import uuid
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -15,7 +15,9 @@ from src.api.models.session import Session
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_memory import CronJobRun
 from src.api.models.tool_permission import ToolApprovalRequest
+from src.api.models.workspace import UserWorkspace, WorkspaceMutation
 from src.api.main import cleanup_stale_runtime_state
+from src.api.services.workspace_service import WorkspaceService, reconcile_workspace_mutations
 from src.api.services.tool_permission_service import (
     APPROVAL_OUTCOME_UNKNOWN_ERROR,
     ToolRef,
@@ -783,8 +785,8 @@ class TestStartupCleanup:
             assert expired.error == APPROVAL_OUTCOME_UNKNOWN_ERROR
             assert expired.execution_claim_token is None
 
-    def test_startup_marks_all_running_cron_failed(self, in_memory_db):
-        """A restart terminates every in-memory cron execution."""
+    def test_startup_marks_unleased_running_cron_unknown(self, in_memory_db):
+        """Startup must not claim a known failure after execution may have started."""
         from datetime import timedelta
         from src.api.utils.timezone import now_naive
 
@@ -847,11 +849,11 @@ class TestStartupCleanup:
             success_run_db = db.query(CronJobRun).filter(CronJobRun.id == success_run.id).first()
             failed_run_db = db.query(CronJobRun).filter(CronJobRun.id == failed_run.id).first()
 
-            assert old_run_db.status == "failed"
-            assert old_run_db.output == "[服务重启，定时任务执行被中断]"
+            assert old_run_db.status == "unknown"
+            assert old_run_db.output == "[执行 lease 已过期；任务可能已产生副作用，不会自动重试]"
             assert old_run_db.completed_at is not None
-            assert recent_run_db.status == "failed"
-            assert recent_run_db.output == "[服务重启，定时任务执行被中断]"
+            assert recent_run_db.status == "unknown"
+            assert recent_run_db.output == "[执行 lease 已过期；任务可能已产生副作用，不会自动重试]"
             assert recent_run_db.completed_at is not None
             assert success_run_db.status == "success"
             assert success_run_db.output == "done"
@@ -859,3 +861,64 @@ class TestStartupCleanup:
             assert failed_run_db.status == "failed"
             assert failed_run_db.output == "already failed"
             assert failed_run_db.completed_at == failed_run.completed_at
+
+    def test_startup_preserves_fresh_cron_lease_and_requeues_expired_prestart(
+        self, in_memory_db,
+    ):
+        from datetime import timedelta
+        from src.api.utils.timezone import now_naive
+
+        _, SessionFactory = in_memory_db
+        with SessionFactory() as db:
+            now = now_naive()
+            old = now - timedelta(minutes=10)
+            active = CronJobRun(
+                id=str(uuid.uuid4()),
+                user_id="u1",
+                job_name="active",
+                cron_expr="* * * * *",
+                status="running",
+                phase="executing",
+                claim_token="active-token",
+                claim_worker_id="worker-a",
+                claim_lease_expires_at=now + timedelta(minutes=5),
+                started_at=now,
+            )
+            active_session = Session(
+                id=active.id,
+                user_id="u1",
+                status="active",
+                model_id="cron-model",
+            )
+            active_round = Round(
+                id=str(uuid.uuid4()),
+                session_id=active.id,
+                thread_id=active.id,
+                user_message="cron",
+                status="running",
+                created_at=old,
+            )
+            prestart = CronJobRun(
+                id=str(uuid.uuid4()),
+                user_id="u1",
+                job_name="prestart",
+                cron_expr="* * * * *",
+                status="running",
+                phase="preparing",
+                claim_token="expired-token",
+                claim_worker_id="dead-worker",
+                claim_lease_expires_at=now - timedelta(seconds=1),
+                started_at=now - timedelta(minutes=1),
+            )
+            db.add_all([active_session, active, active_round, prestart])
+            db.commit()
+
+            *_, cleaned = cleanup_stale_runtime_state(db)
+            assert cleaned == 1
+            assert db.get(CronJobRun, active.id).status == "running"
+            assert db.get(Round, active_round.id).status == "running"
+            recovered = db.get(CronJobRun, prestart.id)
+            assert recovered.status == "queued"
+            assert recovered.phase == "queued"
+            assert recovered.claim_token is None
+            assert recovered.started_at is None

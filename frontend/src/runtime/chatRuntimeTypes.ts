@@ -4,6 +4,7 @@ import type {
   ChatContentBlock,
   FileInfo,
   InterruptDetails,
+  PendingFileDraftInfo,
   PreferredMcpConnectionSnapshot,
   RoundData,
   TurnReasoningSelection,
@@ -108,6 +109,7 @@ export interface ChatRuntimeState {
   tempRoundIdToServerRoundId: Record<string, string>;
   serverRoundIdToLocalRoundId: Record<string, string>;
   idempotencyKeyToClientRunKey: Record<string, string>;
+  workspaceDeletedEntryIds: Record<string, true>;
 }
 
 export type ChatRuntimeAction =
@@ -115,6 +117,7 @@ export type ChatRuntimeAction =
   | { type: 'SESSION_ERROR'; sessionId: string; error: string }
   | { type: 'CLEAR_SESSION_VIEW'; sessionId: string }
   | { type: 'CLEAR_ERROR'; sessionId: string }
+  | { type: 'WORKSPACE_ENTRIES_DELETED'; entryIds: string[] }
   | HistoryLoadedAction
   | {
       type: 'LOCAL_RUN_STARTED';
@@ -160,6 +163,7 @@ export interface SendMessageInput {
   preferredSkillKeys?: string[];
   preferredMcpConnections?: PreferredMcpConnectionSnapshot[];
   reasoning?: TurnReasoningSelection;
+  pendingFileDrafts?: PendingFileDraftInfo[];
   onStreamAccepted?: () => void;
   onRejectedBeforeAccept?: () => void;
 }
@@ -199,4 +203,5 @@ export const initialChatRuntimeState: ChatRuntimeState = {
   tempRoundIdToServerRoundId: {},
   serverRoundIdToLocalRoundId: {},
   idempotencyKeyToClientRunKey: {},
+  workspaceDeletedEntryIds: {},
 };

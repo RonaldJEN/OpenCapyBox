@@ -1,6 +1,13 @@
 import { applyPatch, Operation } from 'fast-json-patch';
 
-import type { AgentState, InterruptDetails, RoundData, StepData, ToolResult } from '../types';
+import type {
+  AgentState,
+  AssistantFileReference,
+  InterruptDetails,
+  RoundData,
+  StepData,
+  ToolResult,
+} from '../types';
 import {
   ChatRuntimeAction,
   ChatRuntimeState,
@@ -51,11 +58,22 @@ export function chatRuntimeReducer(
       return putSession(state, action.sessionId, emptySessionState());
     }
 
+    case 'WORKSPACE_ENTRIES_DELETED':
+      return applyWorkspaceEntryTombstones(state, action.entryIds);
+
     case 'LOCAL_RUN_STARTED':
       return applyLocalRunStarted(state, action);
 
     case 'HISTORY_LOADED':
-      return applyHistoryLoaded(state, action.sessionId, action.rounds, action.loadedAt);
+      return applyHistoryLoaded(
+        state,
+        action.sessionId,
+        action.rounds.map((round) => removeDeletedWorkspaceFiles(
+          round,
+          state.workspaceDeletedEntryIds,
+        )),
+        action.loadedAt,
+      );
 
     case 'STREAM_EVENT':
       return applyStreamEvent(state, action.envelope);
@@ -119,6 +137,142 @@ function putRun(
 
 function unique(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)));
+}
+
+function removeDeletedWorkspaceFiles(
+  round: RoundData,
+  deletedEntryIds: Readonly<Record<string, true>>,
+): RoundData {
+  const userAttachments = (round.user_attachments || []).filter((file) => (
+    file.source !== 'workspace'
+    || !file.entry_id
+    || !deletedEntryIds[file.entry_id]
+  ));
+  const assistantReferences = (round.assistant_file_references || []).filter((file) => (
+    file.source !== 'workspace'
+    || !file.entry_id
+    || !deletedEntryIds[file.entry_id]
+  ));
+  if (
+    userAttachments.length === (round.user_attachments || []).length
+    && assistantReferences.length === (round.assistant_file_references || []).length
+  ) return round;
+  return {
+    ...round,
+    user_attachments: userAttachments,
+    assistant_file_references: assistantReferences,
+  };
+}
+
+function applyWorkspaceEntryTombstones(
+  state: ChatRuntimeState,
+  entryIds: string[],
+): ChatRuntimeState {
+  const normalized = [...new Set(entryIds.filter(Boolean))];
+  if (normalized.length === 0) return state;
+  const workspaceDeletedEntryIds = { ...state.workspaceDeletedEntryIds };
+  normalized.forEach((entryId) => { workspaceDeletedEntryIds[entryId] = true; });
+  let changed = false;
+  const sessions = Object.fromEntries(Object.entries(state.sessions).map(([sessionId, session]) => {
+    const rounds = session.rounds.map((round) => {
+      const next = removeDeletedWorkspaceFiles(round, workspaceDeletedEntryIds);
+      if (next !== round) changed = true;
+      return next;
+    });
+    return [sessionId, changed ? { ...session, rounds } : session];
+  }));
+  return {
+    ...state,
+    sessions: changed ? sessions : state.sessions,
+    workspaceDeletedEntryIds,
+  };
+}
+
+function normalizeAssistantFileReference(value: unknown): AssistantFileReference | null {
+  if (!value || typeof value !== 'object') return null;
+  const item = value as Record<string, unknown>;
+  const source = item.source;
+  const refId = item.ref_id;
+  const name = item.name;
+  const path = item.path;
+  const revision = item.revision;
+  if (source !== 'session' && source !== 'workspace') return null;
+  if (
+    typeof refId !== 'string' || !refId
+    || typeof name !== 'string' || !name
+    || typeof path !== 'string' || !path
+    || typeof revision !== 'string' || !revision
+  ) return null;
+  const common = {
+    ref_id: refId,
+    name,
+    path,
+    size: typeof item.size === 'number' ? item.size : 0,
+    modified: typeof item.modified === 'string' ? item.modified : '',
+    type: typeof item.type === 'string' ? item.type : '',
+    revision,
+    operation: typeof item.operation === 'string' ? item.operation : null,
+    tool_call_id: typeof item.toolCallId === 'string' ? item.toolCallId : null,
+    sha256: typeof item.sha256 === 'string' ? item.sha256 : null,
+  };
+  if (source === 'session') {
+    if (typeof item.session_id !== 'string' || !item.session_id) return null;
+    if (typeof item.snapshot_path !== 'string' || !item.snapshot_path) return null;
+    return {
+      ...common,
+      source,
+      session_id: item.session_id,
+      snapshot_path: item.snapshot_path,
+    };
+  }
+  if (typeof item.entry_id !== 'string' || !item.entry_id) return null;
+  if (typeof item.version_id !== 'string' || !item.version_id) return null;
+  return {
+    ...common,
+    source,
+    entry_id: item.entry_id,
+    workspace_path: typeof item.workspace_path === 'string' && item.workspace_path
+      ? item.workspace_path
+      : path,
+    version_id: item.version_id,
+  };
+}
+
+function appendAssistantFileReference(
+  round: RoundData,
+  reference: AssistantFileReference,
+): RoundData {
+  const identity = reference.source === 'workspace'
+    ? `workspace:${reference.entry_id}`
+    : `session:${reference.session_id}:${reference.path}`;
+  const retained = (round.assistant_file_references || []).filter((item) => (
+    item.source === 'workspace'
+      ? `workspace:${item.entry_id}` !== identity
+      : `session:${item.session_id}:${item.path}` !== identity
+  ));
+  return { ...round, assistant_file_references: [...retained, reference] };
+}
+
+function removeAssistantWorkspaceReference(round: RoundData, entryId: string): RoundData {
+  return {
+    ...round,
+    assistant_file_references: (round.assistant_file_references || []).filter((item) => (
+      item.source !== 'workspace' || item.entry_id !== entryId
+    )),
+  };
+}
+
+function removeAssistantSessionReference(
+  round: RoundData,
+  sessionId: string,
+  path: string,
+): RoundData {
+  return {
+    ...round,
+    assistant_file_references: (round.assistant_file_references || []).filter((item) => (
+      item.source !== 'session' || item.session_id !== sessionId || item.path !== path
+    )),
+  };
 }
 
 function createRun(args: {
@@ -528,7 +682,9 @@ function mergeActiveRound(
     ...serverRound,
     round_id: serverRound.round_id,
     user_message: localRound.user_message || serverRound.user_message,
-    user_attachments: localRound.user_attachments || serverRound.user_attachments,
+    user_attachments: (serverRound.user_attachments?.length || 0) > 0
+      ? serverRound.user_attachments
+      : localRound.user_attachments,
     preferred_skills: serverRound.preferred_skills ?? localRound.preferred_skills,
     preferred_mcp_connections: serverRound.preferred_mcp_connections
       ?? localRound.preferred_mcp_connections,
@@ -832,6 +988,57 @@ function applyStreamEvent(state: ChatRuntimeState, envelope: StreamEnvelope): Ch
       }
       if (event.name === 'interaction_resolved') {
         return applyInteractionResolved(nextState, envelope, nextRun);
+      }
+      if (event.name === 'assistant_file_referenced') {
+        const value = event.value && typeof event.value === 'object'
+          ? event.value as Record<string, unknown>
+          : null;
+        if (
+          value?.source === 'session'
+          && typeof value.operation === 'string'
+          && value.operation.toUpperCase() === 'DELETED'
+          && typeof value.session_id === 'string'
+          && typeof value.path === 'string'
+        ) {
+          nextState = updateRound(nextState, nextRun, (round) => (
+            removeAssistantSessionReference(round, value.session_id as string, value.path as string)
+          ));
+          break;
+        }
+        const reference = normalizeAssistantFileReference(event.value);
+        if (reference) {
+          nextState = updateRound(nextState, nextRun, (round) => (
+            appendAssistantFileReference(round, reference)
+          ));
+        }
+      }
+      if (event.name === 'workspace_resource_changed') {
+        const value = event.value && typeof event.value === 'object'
+          ? event.value as Record<string, unknown>
+          : null;
+        const operation = typeof value?.operation === 'string'
+          ? value.operation.toUpperCase()
+          : '';
+        if (
+          typeof value?.entry_id === 'string'
+          && operation === 'DELETED'
+        ) {
+          const deletedIds = Array.isArray(value.affected_entry_ids)
+            ? value.affected_entry_ids.filter((id): id is string => typeof id === 'string')
+            : [value.entry_id];
+          nextState = updateRound(nextState, nextRun, (round) => (
+            deletedIds.reduce(removeAssistantWorkspaceReference, round)
+          ));
+          break;
+        }
+        const reference = normalizeAssistantFileReference(
+          value?.assistant_file_reference,
+        );
+        if (reference) {
+          nextState = updateRound(nextState, nextRun, (round) => (
+            appendAssistantFileReference(round, reference)
+          ));
+        }
       }
       break;
     case 'RUN_FINISHED':

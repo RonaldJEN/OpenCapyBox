@@ -27,7 +27,7 @@
   background: #fffcf6;
 }
 
-.file-preview-vditor-editor .vditor-wysiwyg > .file-preview-vditor-content {
+.file-preview-vditor-editor :is(.vditor-wysiwyg, .vditor-ir) > .file-preview-vditor-content {
   width: 100%;
   min-height: 100%;
   margin: 0;
@@ -42,19 +42,20 @@
   font-size: 17px;
   line-height: 1.72;
   letter-spacing: 0.025em;
-  white-space: normal;
+  /* Vditor 用文本换行表示软换行；normal 会把它折叠成空格。 */
+  white-space: pre-wrap;
 }
 
-.file-preview-vditor-editor .vditor-wysiwyg > .file-preview-vditor-content:focus-visible {
+.file-preview-vditor-editor :is(.vditor-wysiwyg, .vditor-ir) > .file-preview-vditor-content:focus-visible {
   box-shadow: none;
 }
 
-.file-preview-vditor-editor .vditor-wysiwyg > pre.file-preview-vditor-content:focus {
+.file-preview-vditor-editor :is(.vditor-wysiwyg, .vditor-ir) > pre.file-preview-vditor-content:focus {
   background: #fffcf6;
 }
 
 @media (forced-colors: active) {
-  .file-preview-vditor-editor .vditor-wysiwyg > .file-preview-vditor-content:focus-visible {
+  .file-preview-vditor-editor :is(.vditor-wysiwyg, .vditor-ir) > .file-preview-vditor-content:focus-visible {
     outline: 2px solid Highlight;
     outline-offset: -2px;
   }
@@ -97,6 +98,10 @@
   font-size: clamp(19px, 2cqw, 23px);
   font-weight: 700;
   line-height: 1.5;
+}
+
+.file-preview-vditor-editor .file-preview-vditor-machine-comment {
+  display: none !important;
 }
 
 .file-preview-vditor-editor .vditor-toolbar {

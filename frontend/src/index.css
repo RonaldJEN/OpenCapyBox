@@ -19,6 +19,22 @@ body {
   .container-responsive {
     @apply w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8;
   }
+
+  .workspace-toolbar-button {
+    @apply inline-flex h-10 min-w-10 items-center justify-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-claude-secondary transition-colors hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45 disabled:cursor-wait disabled:opacity-45;
+  }
+
+  .workspace-secondary-button {
+    @apply inline-flex h-10 min-w-10 items-center justify-center gap-1.5 rounded-lg px-2 text-xs font-medium text-claude-secondary transition-colors hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45 disabled:cursor-not-allowed disabled:opacity-35;
+  }
+
+  .workspace-sidebar-menu-item {
+    @apply flex min-h-10 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-xs text-claude-text hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40;
+  }
+
+  .workspace-sidebar-action {
+    @apply inline-flex min-h-8 flex-1 items-center justify-center gap-1 rounded-md px-1.5 text-[10px] text-claude-secondary hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40;
+  }
 }
 
 /* ──────────────────────────────────────────

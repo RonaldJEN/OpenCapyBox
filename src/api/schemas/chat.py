@@ -47,10 +47,65 @@ class VideoContentBlock(BaseModel):
 class FileObject(BaseModel):
     """文件对象"""
 
-    path: str = Field(..., min_length=1, description="文件路径（会话工作区相对路径）")
+    source: Literal["session", "workspace"] = Field(
+        default="session",
+        description="文件来源；session 为会话目录，workspace 为用户持久工作区",
+    )
+    path: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Session 文件路径；workspace 来源由服务端生成快照路径",
+    )
+    entry_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=36,
+        description="WorkspaceEntry 稳定 ID",
+    )
+    revision: Optional[int | str] = Field(
+        default=None,
+        description="服务端冻结后写入的工作区 entry revision",
+    )
+    version_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=36,
+        description="选择文件时的不可变工作区版本 ID",
+    )
+    tree_revision: Optional[int] = Field(default=None, ge=1)
+    manifest_sha256: Optional[str] = Field(default=None, min_length=64, max_length=64)
+    kind: Optional[Literal["file", "directory"]] = Field(
+        default=None,
+        description="WorkspaceEntry 类型；服务端会按 entry_id 重新确认",
+    )
     name: Optional[str] = Field(default=None, description="文件名")
     mime_type: Optional[str] = Field(default=None, description="MIME 类型")
     size: Optional[int] = Field(default=None, description="文件大小（字节）")
+
+    @model_validator(mode="after")
+    def _validate_source_identity(self):
+        if self.source == "session":
+            if not self.path:
+                raise ValueError("session 文件必须提供 path")
+            if any(value is not None for value in (
+                self.entry_id,
+                self.revision,
+                self.version_id,
+                self.tree_revision,
+                self.manifest_sha256,
+            )):
+                raise ValueError("session 文件不能提供 workspace 版本字段")
+            return self
+
+        if not self.entry_id:
+            raise ValueError("workspace 文件必须提供 entry_id")
+        if self.revision is not None:
+            raise ValueError("workspace 文件 revision 只能由服务端生成")
+        if self.tree_revision is not None or self.manifest_sha256 is not None:
+            raise ValueError("workspace 文件夹版本只能由服务端生成")
+        if self.path is not None:
+            raise ValueError("workspace 文件 path 只能由服务端生成")
+        return self
 
 
 class FileContentBlock(BaseModel):
@@ -64,6 +119,23 @@ ContentBlock = Annotated[
     TextContentBlock | ImageContentBlock | VideoContentBlock | FileContentBlock,
     Field(discriminator="type"),
 ]
+
+
+class PendingFileDraftInfo(BaseModel):
+    source: Literal["session", "workspace"]
+    path: str = Field(..., min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def _validate_path(self):
+        if (
+            self.path.startswith("/")
+            or "\\" in self.path
+            or "\x00" in self.path
+            or any(part in {"", ".", ".."} for part in self.path.split("/"))
+        ):
+            raise ValueError("待同步文件路径无效")
+        return self
+
 
 SkillKey = Annotated[
     str,
@@ -99,6 +171,7 @@ class SendMessageRequest(BaseModel):
         max_length=20,
         description="本轮优先考虑的 MCP 数据连接 server id",
     )
+    pending_file_drafts: List[PendingFileDraftInfo] = Field(default_factory=list, max_length=20)
     thinking_mode: Optional[Literal["provider_default", "enabled", "disabled"]] = Field(
         default=None,
         description="本轮思考模式；为空时使用模型配置",
@@ -126,6 +199,7 @@ class ResumeRequest(BaseModel):
         ...,
         description="用户答案，key 为问题文本，value 为选择的答案",
     )
+    pending_file_drafts: List[PendingFileDraftInfo] = Field(default_factory=list, max_length=20)
 
 
 
@@ -164,6 +238,36 @@ class RoundPreferredMcpConnection(BaseModel):
     display_name: str
 
 
+class AssistantFileReference(BaseModel):
+    """One captured file identity produced or explicitly referenced by a Round."""
+
+    ref_id: str
+    source: Literal["session", "workspace"]
+    name: str
+    path: str
+    size: int = 0
+    modified: str = ""
+    type: str = ""
+    revision: str
+    operation: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    sha256: Optional[str] = None
+    session_id: Optional[str] = None
+    snapshot_path: Optional[str] = None
+    entry_id: Optional[str] = None
+    workspace_path: Optional[str] = None
+    version_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_source_identity(self):
+        if self.source == "session":
+            if not self.session_id or not self.snapshot_path:
+                raise ValueError("Session assistant file reference requires session_id and snapshot_path")
+        elif not self.entry_id or not self.version_id:
+            raise ValueError("Workspace assistant file reference requires entry_id and version_id")
+        return self
+
+
 class StepData(BaseModel):
     """执行步骤数据"""
     step_number: int
@@ -188,6 +292,7 @@ class RoundData(BaseModel):
     last_event_sequence: int = 0
     user_message: str
     user_attachments: List[Dict[str, Any]] = Field(default_factory=list)
+    assistant_file_references: List[AssistantFileReference] = Field(default_factory=list)
     preferred_skills: List[RoundPreferredSkill] = Field(default_factory=list)
     preferred_mcp_connections: List[RoundPreferredMcpConnection] = Field(
         default_factory=list

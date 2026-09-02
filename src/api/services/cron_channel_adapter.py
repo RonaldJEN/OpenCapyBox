@@ -20,7 +20,21 @@ class CronChannelAdapter:
         prompt: str,
         cron_expr: str | None = None,
         source: str = "scheduled",
+        definition_version: int | None = None,
+        job_id: int | None = None,
     ) -> NormalizedInboundTurn:
+        metadata = {
+            "session_id": session_id,
+            "job_name": job_name,
+            "run_id": run_id,
+            "cron_expr": cron_expr,
+            "source": source,
+        }
+        if definition_version is not None or job_id is not None:
+            metadata.update({
+                "definition_version": definition_version,
+                "job_id": job_id,
+            })
         return NormalizedInboundTurn(
             channel=self.channel,
             user_id=user_id,
@@ -28,13 +42,7 @@ class CronChannelAdapter:
             peer_id=job_name,
             content=[TextContentBlock(type="text", text=prompt)],
             reply_route=NoReplyRoute(),
-            metadata={
-                "session_id": session_id,
-                "job_name": job_name,
-                "run_id": run_id,
-                "cron_expr": cron_expr,
-                "source": source,
-            },
+            metadata=metadata,
             idempotency_key=f"cron:{run_id}",
         )
 

@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Database,
   FileUp,
+  FolderTree,
   Loader2,
   Plus,
   Search,
@@ -22,6 +23,7 @@ import {
   X,
 } from 'lucide-react';
 import { FileInfo, type PreferredMcpConnectionSnapshot } from '../types';
+import type { WorkspaceEntry } from '../types/workspace';
 import { getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, isImageFile } from '../utils/fileUtils';
 import {
   getSkills,
@@ -33,9 +35,10 @@ import {
   MAX_SELECTED_MCP_SERVERS,
   MAX_SELECTED_SKILLS,
 } from '../utils/turnPreferenceDrafts';
+import { WorkspaceFilePicker } from './workspace/WorkspaceFilePicker';
 
 const MAX_TEXTAREA_HEIGHT = 200;
-type AddMenuPanel = null | 'root' | 'skills' | 'mcp';
+type AddMenuPanel = null | 'root' | 'workspace' | 'skills' | 'mcp';
 
 const skillKey = (skill: SkillInfo) => skill.key || skill.name;
 const skillDisplayName = (skill: SkillInfo) => skill.display_name || skill.name || skillKey(skill);
@@ -69,6 +72,7 @@ interface ChatInputProps {
   attachedFiles?: FileInfo[];
   onRemoveAttachment?: (index: number) => void;
   onFileUpload?: (files: FileList | File[] | null) => void;
+  onWorkspaceFilesSelected?: (entries: WorkspaceEntry[]) => void;
   onInputDropHandled?: () => void;
   onPreviewAttachment?: (file: FileInfo) => void;
   uploading?: boolean;
@@ -108,6 +112,7 @@ export function ChatInput({
   attachedFiles = [],
   onRemoveAttachment,
   onFileUpload,
+  onWorkspaceFilesSelected,
   onInputDropHandled,
   onPreviewAttachment,
   uploading = false,
@@ -554,6 +559,7 @@ export function ChatInput({
             <div className="flex items-center justify-between px-3 pb-2">
               <div className="flex items-center gap-1">
                 {(onFileUpload
+                  || onWorkspaceFilesSelected
                   || onSelectedSkillKeysChange
                   || onSelectedMcpConnectionsChange) && (
                   <div ref={addMenuRef} className="relative">
@@ -596,6 +602,8 @@ export function ChatInput({
                           ? 'composer-skill-picker-title'
                           : addMenuPanel === 'mcp'
                             ? 'composer-mcp-picker-title'
+                            : addMenuPanel === 'workspace'
+                              ? 'composer-workspace-picker-title'
                             : undefined}
                         className={`fixed inset-x-3 bottom-3 z-[120] max-h-[70vh] overflow-hidden rounded-2xl border border-claude-border bg-white shadow-2xl md:absolute md:inset-x-auto md:bottom-full md:left-0 md:mb-2 ${
                           addMenuPanel === 'root' ? 'md:w-[17rem]' : 'md:w-[24rem]'
@@ -609,6 +617,18 @@ export function ChatInput({
                             className="p-2"
                             onKeyDown={handleRootMenuKeyDown}
                           >
+                            {onWorkspaceFilesSelected && (
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => setAddMenuPanel('workspace')}
+                                className="flex min-h-11 w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-claude-text hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
+                              >
+                                <FolderTree className="h-5 w-5 text-[#35658c]" />
+                                <span className="flex-1">工作区文件</span>
+                                <ChevronRight className="h-4 w-4 text-claude-muted" />
+                              </button>
+                            )}
                             {onFileUpload && (
                               <button
                                 type="button"
@@ -663,6 +683,21 @@ export function ChatInput({
                               </button>
                             )}
                           </div>
+                        )}
+
+                        {addMenuPanel === 'workspace' && onWorkspaceFilesSelected && (
+                          <WorkspaceFilePicker
+                            onBack={() => setAddMenuPanel('root')}
+                            onClose={() => {
+                              setAddMenuPanel(null);
+                              addMenuTriggerRef.current?.focus();
+                            }}
+                            onConfirm={(entries) => {
+                              onWorkspaceFilesSelected(entries);
+                              setAddMenuPanel(null);
+                              textareaRef.current?.focus();
+                            }}
+                          />
                         )}
 
                         {addMenuPanel === 'skills' && (

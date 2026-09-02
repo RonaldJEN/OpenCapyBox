@@ -25,9 +25,11 @@ from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.user_memory import CronJobRun
 from src.api.models.user_sandbox import UserSandbox
+from src.api.models.workspace import WorkspaceChangeSet
 from src.api.services.cron_engine import CronEngine, CronExpressionError
 from src.api.services.cron_schedule import schedule_to_cron, ScheduleError
 from src.api.utils.timezone import now_naive
+from src.api.utils.sandbox_helpers import is_workspace_publish_scratch_path
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -54,16 +56,34 @@ def _is_db_busy_error(error: OperationalError) -> bool:
     return pgcode in ("40001", "40P01")
 
 
-def _mark_run_failed(run_id: str, output: str, run_workspace: str | None = None) -> None:
+def _mark_run_failed(
+    run_id: str,
+    output: str,
+    run_workspace: str | None = None,
+    *,
+    error_code: str | None = None,
+    claim_token: str | None = None,
+) -> None:
     from src.api.models.database import SessionLocal
 
     with SessionLocal() as db:
-        record = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
-        if record and record.status == "running":
+        query = db.query(CronJobRun).filter(CronJobRun.id == run_id)
+        if claim_token is not None:
+            query = query.filter(
+                CronJobRun.claim_token == claim_token,
+                CronJobRun.claim_lease_expires_at > now_naive(),
+            )
+        record = query.first()
+        if record and record.status in {"queued", "running"}:
             record.status = "failed"
+            record.phase = "terminal"
             record.output = output
+            record.error_code = error_code
             record.completed_at = now_naive()
             record.run_workspace = run_workspace
+            record.claim_token = None
+            record.claim_worker_id = None
+            record.claim_lease_expires_at = None
             db.commit()
 
 
@@ -124,6 +144,34 @@ def _validate_name(name: str) -> str:
     return name
 
 
+def _validate_job_text(value: str | None, *, field: str, max_length: int) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise CronJobValidationError(f"{field} 必须是字符串")
+    if len(value) > max_length:
+        raise CronJobValidationError(f"{field} 最多 {max_length} 个字符")
+
+
+def build_cron_definition_snapshot(job: CronJob) -> dict:
+    """Freeze every execution-relevant field before a run is queued."""
+    def _text(value: object, default: str = "") -> str:
+        return value if isinstance(value, str) else default
+
+    def _version(value: object) -> int:
+        return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 1
+
+    return {
+        "job_id": int(job.id),
+        "job_name": _text(getattr(job, "name", None)),
+        "cron_expr": _text(getattr(job, "cron_expr", None)),
+        "rule_version": _version(getattr(job, "rule_version", 1)),
+        "definition_version": _version(getattr(job, "definition_version", 1)),
+        "description": _text(getattr(job, "description", None)),
+        "content": _text(getattr(job, "content", None)),
+    }
+
+
 def _resolve_cron_expr(schedule: dict | None, cron_expr: str | None) -> tuple[str, str | None]:
     """根据 schedule / cron_expr 输入决定最终存储值。
 
@@ -176,9 +224,11 @@ class CronTask:
         content: str = "",
         job_id: int | None = None,
         rule_version: int = 1,
+        definition_version: int = 1,
     ):
         self.id = job_id
         self.rule_version = rule_version
+        self.definition_version = definition_version
         self.name = name
         self.cron_expr = cron_expr
         self.description = description
@@ -196,6 +246,7 @@ class CronTask:
             "content": self.content,
             "enabled": self.enabled,
             "rule_version": self.rule_version,
+            "definition_version": self.definition_version,
         }
 
 
@@ -271,6 +322,7 @@ class CronService:
                     content=getattr(j, "content", "") or "",
                     job_id=j.id,
                     rule_version=int(getattr(j, "rule_version", 1) or 1),
+                    definition_version=int(getattr(j, "definition_version", 1) or 1),
                 )
             )
         return result
@@ -294,6 +346,8 @@ class CronService:
     ) -> CronJob:
         """新建 CronJob，schedule 与 cron_expr 二选一（schedule 优先）。"""
         name = _validate_name(name)
+        _validate_job_text(description, field="description", max_length=500)
+        _validate_job_text(content, field="content", max_length=8000)
         expr, schedule_json = _resolve_cron_expr(schedule, cron_expr)
 
         with self._busy_guard():
@@ -313,6 +367,7 @@ class CronService:
             description=description or "",
             content=content or "",
             enabled=bool(enabled),
+            definition_version=1,
         )
         self.db.add(job)
         try:
@@ -336,6 +391,8 @@ class CronService:
         enabled: bool | None = None,
     ) -> CronJob:
         """更新 CronJob。任意字段省略则不动；schedule/cron_expr 至少传一个时才会改时间。"""
+        _validate_job_text(description, field="description", max_length=500)
+        _validate_job_text(content, field="content", max_length=8000)
         with self._busy_guard():
             job = (
                 self.db.query(CronJob)
@@ -346,19 +403,25 @@ class CronService:
         if not job:
             raise CronJobNotFoundError(f"任务 '{name}' 不存在")
 
+        definition_changed = False
         if schedule is not None or cron_expr is not None:
             expr, schedule_json = _resolve_cron_expr(schedule, cron_expr)
             if expr != job.cron_expr:
                 job.rule_version = int(job.rule_version or 1) + 1
+                definition_changed = True
             job.cron_expr = expr
             job.schedule = schedule_json
 
         if description is not None:
+            definition_changed = definition_changed or description != (job.description or "")
             job.description = description
         if content is not None:
+            definition_changed = definition_changed or content != (job.content or "")
             job.content = content
         if enabled is not None:
             job.enabled = bool(enabled)
+        if definition_changed:
+            job.definition_version = int(job.definition_version or 1) + 1
 
         with self._busy_guard():
             self.db.commit()
@@ -391,46 +454,215 @@ class CronService:
         Returns:
             (runs_list, total_count)
         """
-        import json as _json
-
         query = self.db.query(CronJobRun).filter(CronJobRun.user_id == user_id)
         if job_name:
             query = query.filter(CronJobRun.job_name == job_name)
         total = query.count()
-        runs = query.order_by(CronJobRun.started_at.desc()).offset(offset).limit(limit).all()
-        result = []
-        for r in runs:
-            artifacts = None
-            if r.artifacts:
-                try:
-                    artifacts = _json.loads(r.artifacts)
-                except (ValueError, TypeError):
-                    artifacts = None
-            result.append({
-                "id": r.id,
-                "job_name": r.job_name,
-                "cron_expr": r.cron_expr,
-                "rule_version": getattr(r, "rule_version", None),
-                "scheduled_at": (
-                    r.scheduled_at.isoformat()
-                    if getattr(r, "scheduled_at", None)
-                    else None
-                ),
-                "trigger_source": getattr(r, "trigger_source", "scheduled"),
-                "started_at": r.started_at.isoformat() if r.started_at else None,
-                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-                "status": r.status,
-                "output": r.output,
-                "is_read": bool(getattr(r, 'is_read', True)),
-                "artifacts": artifacts,
-                "run_workspace": getattr(r, 'run_workspace', None),
-            })
-        return result, total
+        runs = query.order_by(CronJobRun.queued_at.desc(), CronJobRun.id.desc()).offset(offset).limit(limit).all()
+        return [CronJobRun.to_dict(r) for r in runs], total
 
 
 async def _get_renewed_cron_sandbox(sandbox_service, user_id: str, sandbox_id: str | None):
-    """Get a usable sandbox and renew it before an unattended cron run starts."""
-    return await sandbox_service.get_or_resume_and_renew(user_id, sandbox_id)
+    """Renew the frozen Sandbox, never replacing an existing run generation."""
+    if not sandbox_id:
+        return await sandbox_service.get_or_resume_and_renew(user_id, None)
+
+    sandbox = await sandbox_service.get_existing(user_id, sandbox_id)
+    connected_id = getattr(sandbox, "id", None)
+    if connected_id != sandbox_id:
+        raise RuntimeError("Cron 连接到非冻结 Sandbox")
+    if not await sandbox_service.renew(user_id):
+        raise RuntimeError("Cron 冻结 Sandbox 续租失败")
+    if sandbox_service.get_sandbox_id(user_id) != sandbox_id:
+        raise RuntimeError("Cron Sandbox 在续租期间发生代际切换")
+    return sandbox
+
+
+def _decode_definition_snapshot(record: CronJobRun | None) -> dict | None:
+    raw = getattr(record, "definition_snapshot", None) if record is not None else None
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _set_run_phase(
+    run_id: str,
+    phase: str,
+    *,
+    claim_token: str | None = None,
+    run_workspace: str | None = None,
+) -> bool:
+    """Advance a live run only while the caller still owns its claim."""
+    from src.api.models.database import SessionLocal
+
+    with SessionLocal() as db:
+        query = db.query(CronJobRun).filter(
+            CronJobRun.id == run_id,
+            CronJobRun.status == "running",
+        )
+        if claim_token is not None:
+            query = query.filter(
+                CronJobRun.claim_token == claim_token,
+                CronJobRun.claim_lease_expires_at > now_naive(),
+            )
+        record = query.first()
+        if record is None:
+            return False
+        record.phase = phase
+        if run_workspace is not None:
+            record.run_workspace = run_workspace
+        db.commit()
+        return True
+
+
+def _set_run_sandbox_id(
+    run_id: str,
+    sandbox_id: str,
+    *,
+    claim_token: str | None = None,
+) -> bool:
+    """Freeze the exact Sandbox ID before Agent dispatch under the run claim."""
+    if not isinstance(sandbox_id, str) or not sandbox_id:
+        return False
+    from src.api.models.database import SessionLocal
+
+    with SessionLocal() as db:
+        query = db.query(CronJobRun).filter(
+            CronJobRun.id == run_id,
+            CronJobRun.status == "running",
+        )
+        if claim_token is not None:
+            query = query.filter(
+                CronJobRun.claim_token == claim_token,
+                CronJobRun.claim_lease_expires_at > now_naive(),
+            )
+        record = query.with_for_update().first()
+        if record is None:
+            return False
+        current = record.sandbox_id if isinstance(record.sandbox_id, str) else None
+        if current and current != sandbox_id:
+            return False
+        record.sandbox_id = sandbox_id
+        db.commit()
+        return True
+
+
+def assert_cron_workspace_lease(
+    db: DBSession,
+    *,
+    user_id: str,
+    run_id: str,
+    claim_token: str,
+    at: datetime | None = None,
+    for_update: bool = False,
+) -> CronJobRun:
+    """Fence every Cron workspace tool call against the live execution claim."""
+    if not claim_token:
+        raise PermissionError("Cron workspace claim token 缺失")
+    query = db.query(CronJobRun).filter(
+        CronJobRun.id == run_id,
+        CronJobRun.user_id == user_id,
+        CronJobRun.status == "running",
+        CronJobRun.claim_token == claim_token,
+        CronJobRun.claim_lease_expires_at.isnot(None),
+        CronJobRun.claim_lease_expires_at > (at or now_naive()),
+    )
+    if for_update:
+        query = query.with_for_update()
+    record = query.first()
+    if record is None:
+        raise PermissionError("Cron workspace execution lease 已失效")
+    return record
+
+
+def append_cron_workspace_change(
+    db: DBSession,
+    *,
+    user_id: str,
+    run_id: str,
+    claim_token: str,
+    change: dict,
+) -> bool:
+    """Append one idempotent WorkspaceService mutation to a live Cron run.
+
+    The workspace tool/gateway owns authorization and mutation execution. This
+    helper only links its authoritative result back to CronJobRun without
+    conflating published workspace files with ephemeral run artifacts.
+    """
+    if not isinstance(change, dict):
+        raise TypeError("workspace change must be an object")
+    idempotency_key = change.get("idempotency_key") or change.get("mutation_id")
+    if not isinstance(idempotency_key, str) or not idempotency_key:
+        raise ValueError("workspace change requires idempotency_key or mutation_id")
+
+    record = assert_cron_workspace_lease(
+        db,
+        user_id=user_id,
+        run_id=run_id,
+        claim_token=claim_token,
+        for_update=True,
+    )
+    try:
+        existing = json.loads(record.workspace_changes or "[]")
+    except (TypeError, ValueError):
+        existing = []
+    if not isinstance(existing, list):
+        existing = []
+    if any(
+        isinstance(item, dict)
+        and (item.get("idempotency_key") or item.get("mutation_id")) == idempotency_key
+        for item in existing
+    ):
+        return True
+    if len(existing) >= 100:
+        raise ValueError("workspace_changes exceeds 100 entries")
+    existing.append(change)
+    encoded = json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > 64 * 1024:
+        raise ValueError("workspace_changes exceeds 64 KiB")
+    record.workspace_changes = encoded
+    db.commit()
+    return True
+
+
+def build_cron_workspace_change_set_summaries(
+    db: DBSession,
+    *,
+    run_id: str,
+) -> list[dict]:
+    rows = (
+        db.query(WorkspaceChangeSet)
+        .filter(
+            WorkspaceChangeSet.cron_run_id == run_id,
+            WorkspaceChangeSet.status.in_(("proposed", "conflict", "needs_review")),
+        )
+        .order_by(WorkspaceChangeSet.created_at.asc())
+        .limit(100)
+        .all()
+    )
+    summaries: list[dict] = []
+    for row in rows:
+        try:
+            details = json.loads(row.details_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            details = {}
+        summaries.append({
+            "change_set_id": row.change_set_id,
+            "entry_id": row.entry_id,
+            "operation": row.operation,
+            "status": row.status,
+            "base_version_id": row.base_version_id,
+            "proposed_version_id": row.proposed_version_id,
+            "error_code": row.error_code,
+            "error_message": row.error_message,
+            "target_name": details.get("destination_name"),
+            "target_path": details.get("destination_path"),
+        })
+    return summaries
 
 
 async def run_cron_job(
@@ -442,6 +674,7 @@ async def run_cron_job(
     expected_rule_version: int | None = None,
     scheduled_at: datetime | None = None,
     trigger_source: str | None = None,
+    claim_token: str | None = None,
 ) -> str | None:
     """执行单个 Cron 任务（从 CronJob DB 查任务定义）
 
@@ -462,13 +695,22 @@ async def run_cron_job(
         run_id = str(uuid.uuid4())
 
     run_workspace: str | None = None
+    frozen_snapshot: dict | None = None
+    current_snapshot: dict | None = None
+    effective_job_id: int | None = None
+    frozen_sandbox_id: str | None = None
 
-    # 从 CronJob 表查任务定义
+    # 从 CronJob 表复核任务仍可执行；prompt 来自 queued run 的冻结快照。
     with SessionLocal() as db:
         auth_user = db.query(AuthUser).filter(AuthUser.user_id == user_id).first()
         if not auth_user or not auth_user.enabled:
             logger.warning("Cron 用户不存在或已禁用 (user=%s, job=%s)", user_id, job_name)
-            _mark_run_failed(run_id, "用户不存在或已禁用")
+            _mark_run_failed(
+                run_id,
+                "用户不存在或已禁用",
+                error_code="user_disabled",
+                claim_token=claim_token,
+            )
             return None
 
         job = (
@@ -478,9 +720,23 @@ async def run_cron_job(
         )
         if not job or (expected_job_id is not None and job.id != expected_job_id):
             logger.warning("Cron 任务不存在 (user=%s, job=%s)", user_id, job_name)
-            _mark_run_failed(run_id, "任务不存在")
+            _mark_run_failed(
+                run_id,
+                "任务不存在",
+                error_code="job_missing",
+                claim_token=claim_token,
+            )
+            return None
+        if source == "scheduled" and not bool(job.enabled):
+            _mark_run_failed(
+                run_id,
+                "任务已暂停",
+                error_code="job_disabled",
+                claim_token=claim_token,
+            )
             return None
         rule_version = int(job.rule_version or 1)
+        effective_job_id = int(job.id)
         if expected_rule_version is not None and rule_version != expected_rule_version:
             logger.info(
                 "Cron 丢弃旧规则触发 (user=%s, job=%s, expected=%s, actual=%s)",
@@ -489,30 +745,72 @@ async def run_cron_job(
                 expected_rule_version,
                 rule_version,
             )
-            if source == "manual":
-                _mark_run_failed(run_id, "任务调度规则已修改，请重新执行")
+            _mark_run_failed(
+                run_id,
+                "任务调度规则已修改，请重新执行",
+                error_code="stale_rule_version",
+                claim_token=claim_token,
+            )
             return None
-        # content 是新表单的"执行内容"字段，优先作为 prompt；
-        # 老数据 content 为空时回退到 description（与之前行为一致）。
-        task_description = (job.content or "").strip() or (job.description or job_name)
-        cron_expr = job.cron_expr
+        current_snapshot = build_cron_definition_snapshot(job)
 
-    # 如果 run_id 对应的记录已存在（手动触发预创建），跳过；否则新建
+    # Legacy/direct callers may not have pre-created a durable run. Preserve
+    # compatibility while every worker/manual path now queues before execution.
     with SessionLocal() as db:
         existing = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
+        if claim_token is not None and (
+            existing is None
+            or existing.status != "running"
+            or existing.claim_token != claim_token
+            or existing.claim_lease_expires_at is None
+            or existing.claim_lease_expires_at <= now_naive()
+        ):
+            logger.warning("Cron claim 已丢失，拒绝启动 (run=%s)", run_id)
+            return None
+        candidate_sandbox_id = getattr(existing, "sandbox_id", None)
+        if isinstance(candidate_sandbox_id, str) and candidate_sandbox_id:
+            frozen_sandbox_id = candidate_sandbox_id
+        frozen_snapshot = _decode_definition_snapshot(existing) or current_snapshot
+        if frozen_snapshot is None:
+            raise RuntimeError("Cron 定义快照不可用")
+        task_description = (
+            str(frozen_snapshot.get("content") or "").strip()
+            or str(frozen_snapshot.get("description") or job_name)
+        )
+        cron_expr = str(frozen_snapshot.get("cron_expr") or current_snapshot["cron_expr"])
+        definition_version = int(
+            frozen_snapshot.get("definition_version")
+            or current_snapshot["definition_version"]
+            or 1
+        )
         if not existing:
             run_record = CronJobRun(
                 id=run_id,
                 user_id=user_id,
+                job_id=effective_job_id,
                 job_name=job_name,
                 cron_expr=cron_expr,
                 rule_version=rule_version,
+                definition_version=definition_version,
+                definition_snapshot=json.dumps(
+                    frozen_snapshot,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
                 scheduled_at=scheduled_at,
                 trigger_source=source,
                 status="running",
+                phase="preparing",
+                started_at=now_naive(),
                 is_read=False,
             )
             db.add(run_record)
+            db.commit()
+        elif claim_token is None and existing.status == "queued":
+            existing.status = "running"
+            existing.phase = "preparing"
+            existing.started_at = existing.started_at or now_naive()
+            existing.attempt_count = int(existing.attempt_count or 0) + 1
             db.commit()
 
     try:
@@ -521,17 +819,40 @@ async def run_cron_job(
 
         sandbox_service = get_sandbox_service()
 
-        with SessionLocal() as db:
-            user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
-            sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+        sandbox_id = frozen_sandbox_id
+        if not sandbox_id:
+            with SessionLocal() as db:
+                user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+                candidate_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
+                sandbox_id = (
+                    candidate_sandbox_id
+                    if isinstance(candidate_sandbox_id, str) and candidate_sandbox_id
+                    else None
+                )
 
         sandbox = await _get_renewed_cron_sandbox(
             sandbox_service,
             user_id,
             sandbox_id,
         )
-        latest_sandbox_id = sandbox_service.get_sandbox_id(user_id)
-        if isinstance(latest_sandbox_id, str) and latest_sandbox_id:
+        connected_sandbox_id = getattr(sandbox, "id", None)
+        latest_sandbox_id = (
+            connected_sandbox_id
+            if isinstance(connected_sandbox_id, str) and connected_sandbox_id
+            else sandbox_service.get_sandbox_id(user_id)
+        )
+        if not isinstance(latest_sandbox_id, str) or not latest_sandbox_id:
+            raise RuntimeError("Cron 无法确认冻结 Sandbox ID")
+        if not _set_run_sandbox_id(
+            run_id,
+            latest_sandbox_id,
+            claim_token=claim_token,
+        ):
+            raise RuntimeError("Cron Sandbox 绑定被 claim fence 拒绝")
+
+        # 只有本轮开始时尚无 durable Sandbox 时才建立用户绑定；已有冻结 ID
+        # 的运行不得把后来变化的 UserSandbox 指回旧代际。
+        if frozen_sandbox_id is None:
             with SessionLocal() as db:
                 user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
                 runtime_config = sandbox_service.get_cached_runtime_config(user_id)
@@ -625,11 +946,44 @@ async def run_cron_job(
             prompt=task_description,
             cron_expr=cron_expr,
             source=source,
+            definition_version=definition_version,
+            job_id=int(frozen_snapshot.get("job_id") or expected_job_id or effective_job_id),
         )
         task_prompt = cron_adapter.render_agent_prompt(cron_turn)
         orchestrated_turn = cron_turn.model_copy(
             update={"content": [TextContentBlock(type="text", text=task_prompt)]}
         )
+
+        workspace_fence = None
+        workspace_change_recorder = None
+        if claim_token is not None:
+            def workspace_fence(
+                db,
+                _user_id=user_id,
+                _run_id=run_id,
+                _claim=claim_token,
+            ):
+                assert_cron_workspace_lease(
+                    db,
+                    user_id=_user_id,
+                    run_id=_run_id,
+                    claim_token=_claim,
+                )
+
+            def workspace_change_recorder(
+                db,
+                change,
+                _user_id=user_id,
+                _run_id=run_id,
+                _claim=claim_token,
+            ):
+                append_cron_workspace_change(
+                    db,
+                    user_id=_user_id,
+                    run_id=_run_id,
+                    claim_token=_claim,
+                    change=change,
+                )
 
         history_service = HistoryService(SessionLocal)
         agent_service = AgentService(
@@ -651,9 +1005,19 @@ async def run_cron_job(
             },
             system_prompt_override=(
                 "You are a cron job executor. Complete the task efficiently.\n"
-                f"所有产出文件必须保存在当前工作目录下（{run_workspace}），禁止写入其他路径。"
+                f"所有普通运行产物必须保存在当前工作目录下（{run_workspace}）。\n"
+                "仅当任务 prompt 要求操作用户持久工作区时，使用平台工作区工具完成读取、创建、更新、移动、重命名或永久删除；"
+                "不得用 bash 或通用文件工具绕过工作区审计。"
             ),
             workspace_dir=run_workspace,
+            workspace_access="manage",
+            workspace_actor="cron",
+            workspace_fence=workspace_fence,
+            workspace_change_recorder=workspace_change_recorder,
+            workspace_context={
+                "cron_job_id": str(effective_job_id),
+                "cron_run_id": run_id,
+            },
             allow_human_interrupts=False,
         )
         await agent_service.initialize_agent()
@@ -664,6 +1028,13 @@ async def run_cron_job(
         run_status = "success"
 
         try:
+            if claim_token is not None and not _set_run_phase(
+                run_id,
+                "executing",
+                claim_token=claim_token,
+                run_workspace=run_workspace,
+            ):
+                raise RuntimeError("Cron execution claim 已丢失")
             execution = await get_turn_orchestrator().submit_turn(
                 orchestrated_turn,
                 agent_service=agent_service,
@@ -706,19 +1077,49 @@ async def run_cron_job(
 
         output = "\n\n".join(output_messages) or final_response or "Task completed (no output)"
 
+        if claim_token is not None and not _set_run_phase(
+            run_id,
+            "publishing",
+            claim_token=claim_token,
+            run_workspace=run_workspace,
+        ):
+            raise RuntimeError("Cron publishing claim 已丢失")
+
         # 扫描产物文件
         artifacts_json = await _scan_run_artifacts(sandbox, run_workspace)
 
         # 更新执行记录
         with SessionLocal() as db:
-            record = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
+            query = db.query(CronJobRun).filter(
+                CronJobRun.id == run_id,
+                CronJobRun.status == "running",
+            )
+            if claim_token is not None:
+                query = query.filter(
+                    CronJobRun.claim_token == claim_token,
+                    CronJobRun.claim_lease_expires_at > now_naive(),
+                )
+            record = query.first()
             if record:
+                record.workspace_change_sets = json.dumps(
+                    build_cron_workspace_change_set_summaries(db, run_id=run_id),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
                 record.status = run_status
+                record.phase = "terminal"
                 record.completed_at = now_naive()
                 record.output = output[:10000]  # 截断
                 record.run_workspace = run_workspace
                 record.artifacts = artifacts_json
+                record.error_code = None if run_status == "success" else "agent_failed"
+                record.claim_token = None
+                record.claim_worker_id = None
+                record.claim_lease_expires_at = None
                 db.commit()
+            else:
+                logger.warning("Cron 终态写入被 claim fence 拒绝 (run=%s)", run_id)
+                return None
 
         if run_status != "success":
             logger.warning("Cron 任务失败 (user=%s, job=%s, status=%s)", user_id, job_name, run_status)
@@ -730,7 +1131,13 @@ async def run_cron_job(
 
     except Exception as e:
         logger.error("Cron 任务失败 (user=%s, job=%s): %s", user_id, job_name, e, exc_info=True)
-        _mark_run_failed(run_id, f"Error: {e}", run_workspace)
+        _mark_run_failed(
+            run_id,
+            f"Error: {e}",
+            run_workspace,
+            error_code="execution_error",
+            claim_token=claim_token,
+        )
 
         return None
 
@@ -744,12 +1151,13 @@ async def _scan_run_artifacts(sandbox, run_workspace: str) -> str | None:
     import json
 
     workspace_q = shlex.quote(run_workspace)
+    public_files = f"find {workspace_q} -maxdepth 3 -type f -not -path '*/.workspace-change-sets/*'"
 
     try:
         # find -printf 是 GNU findutils 内置，不依赖外部 stat 命令
         # %p = 完整路径, %s = 文件大小(bytes)
         cmd = (
-            f"find {workspace_q} -maxdepth 3 -type f "
+            f"{public_files} "
             f"-printf '%p\\t%s\\n' 2>/dev/null | head -200"
         )
         result = await sandbox.commands.run(cmd)
@@ -758,7 +1166,7 @@ async def _scan_run_artifacts(sandbox, run_workspace: str) -> str | None:
         # fallback: stat -c（兼容 BusyBox 等不支持 find -printf 的环境）
         if not stdout.strip():
             cmd = (
-                f"find {workspace_q} -maxdepth 3 -type f "
+                f"{public_files} "
                 f"-exec stat -c '%n\\t%s' {{}} \\; 2>/dev/null | head -200"
             )
             result = await sandbox.commands.run(cmd)
@@ -767,7 +1175,7 @@ async def _scan_run_artifacts(sandbox, run_workspace: str) -> str | None:
         # fallback: 仅路径（最大兼容），size 置 0
         path_only_mode = False
         if not stdout.strip():
-            cmd = f"find {workspace_q} -maxdepth 3 -type f 2>/dev/null | head -200"
+            cmd = f"{public_files} 2>/dev/null | head -200"
             result = await sandbox.commands.run(cmd)
             stdout = _extract_command_stdout(result)
             path_only_mode = True
@@ -794,6 +1202,8 @@ async def _scan_run_artifacts(sandbox, run_workspace: str) -> str | None:
                 rel_path = full_path[len(run_workspace) + 1:]
             elif full_path.startswith(run_workspace):
                 rel_path = full_path[len(run_workspace):]
+            if is_workspace_publish_scratch_path(rel_path):
+                continue
             name = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
             ext = name.rsplit(".", 1)[-1] if "." in name else ""
             try:

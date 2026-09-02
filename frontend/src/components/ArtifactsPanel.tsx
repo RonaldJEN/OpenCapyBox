@@ -25,11 +25,13 @@ import {
 } from 'lucide-react';
 
 import { apiService } from '../services/api';
-import { FileInfo } from '../types';
+import { subscribeWorkspaceMutation } from '../services/workspaceEvents';
+import { FileInfo, type PendingFileDraftInfo } from '../types';
 import { getFileIcon, getFileIconClass } from '../utils/fileUtils';
 import {
   FilePreview,
   type FilePreviewHandle,
+  type FilePreviewSaveOptions,
   type SessionFileOwnerIdentity,
 } from './FilePreview';
 import { SessionFilesExpandButton } from './session-files/SessionFilesControls';
@@ -41,17 +43,12 @@ interface ArtifactsPanelProps {
   onClose: () => void;
   targetFile?: FileInfo | null;
   targetFileNonce?: number;
+  targetContextNotice?: string;
   variant?: 'drawer' | 'workspace';
   isExpanded?: boolean;
   onToggleExpanded?: () => void;
   refreshNonce?: string | number;
 }
-
-type OwnedCloseTarget =
-  | (SessionFileOwnerIdentity & { kind: 'tab'; path: string })
-  | (SessionFileOwnerIdentity & { kind: 'panel' });
-
-type PendingClose = OwnedCloseTarget & { requestNonce: number };
 
 export interface ArtifactsPanelSaveResult extends SessionFileOwnerIdentity {
   ok: boolean;
@@ -61,10 +58,19 @@ export interface ArtifactsPanelSaveResult extends SessionFileOwnerIdentity {
 
 export interface ArtifactsPanelHandle extends SessionFileOwnerIdentity {
   hasDirty: (expectedOwner: SessionFileOwnerIdentity) => boolean;
-  saveDirty: (expectedOwner: SessionFileOwnerIdentity) => Promise<ArtifactsPanelSaveResult>;
+  pendingFileDrafts: (expectedOwner: SessionFileOwnerIdentity) => PendingFileDraftInfo[];
+  saveDirty: (
+    expectedOwner: SessionFileOwnerIdentity,
+    options?: FilePreviewSaveOptions,
+  ) => Promise<ArtifactsPanelSaveResult>;
 }
 
 const DIRECTORY_FOCUS_TARGET = '__directory__';
+
+function workspaceSnapshotEntryId(path: string): string | null {
+  const parts = normalizePathForCompare(path).split('/');
+  return parts[0] === '.workspace-snapshots' && parts[1] ? parts[1] : null;
+}
 
 interface SessionPanelState {
   currentPath: string;
@@ -99,7 +105,11 @@ function applyExternalTarget(
   const normalizedPath = normalizePathForCompare(normalizedTarget.path);
   const parentPath = getParentPath(normalizedTarget.path);
   const existingIndex = current.openTabs.findIndex(
-    (file) => normalizePathForCompare(file.path) === normalizedPath,
+    (file) => normalizePathForCompare(file.path) === normalizedPath
+      || Boolean(
+        normalizedTarget.assistant_ref_id
+        && file.assistant_ref_id === normalizedTarget.assistant_ref_id,
+      ),
   );
   const openTabs = existingIndex >= 0
     ? current.openTabs.map((file, index) => (
@@ -128,6 +138,7 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
   onClose,
   targetFile,
   targetFileNonce,
+  targetContextNotice,
   variant = 'drawer',
   isExpanded = false,
   onToggleExpanded,
@@ -139,31 +150,21 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
   const [loadError, setLoadError] = useState('');
   const [sessionStates, setSessionStates] = useState<Record<string, SessionPanelState>>({});
   const [dirtyPaths, setDirtyPaths] = useState<Record<string, boolean>>({});
-  const [savingPaths, setSavingPaths] = useState<Record<string, boolean>>({});
-  const [failedClosePaths, setFailedClosePaths] = useState<Record<string, boolean>>({});
-  const [pendingClose, setPendingClose] = useState<PendingClose | null>(null);
-  const [discardConfirm, setDiscardConfirm] = useState<OwnedCloseTarget | null>(null);
   const directoryRequestSeqRef = useRef(0);
   const listScrollRef = useRef<HTMLDivElement>(null);
   const directoryButtonRef = useRef<HTMLButtonElement>(null);
   const tabButtonRefsRef = useRef(new Map<string, HTMLButtonElement>());
   const pendingFocusPathRef = useRef<string | null>(null);
   const refreshNoncesRef = useRef(new Map<string, string | number | undefined>());
-  const closeTabRef = useRef<(path: string, force?: boolean) => void>(() => {});
-  const closeRequestSeqRef = useRef(0);
-  const pendingCloseRef = useRef(pendingClose);
   const previewHandlesRef = useRef(new Map<string, FilePreviewHandle>());
   const dirtyPathsRef = useRef(dirtyPaths);
   const ownerIdentityRef = useRef<SessionFileOwnerIdentity>({ ownerSessionId: sessionId, ownerEpoch });
-  const discardDialogRef = useRef<HTMLDivElement>(null);
-  const discardReturnFocusRef = useRef<HTMLElement | null>(null);
   const ownerIdentity = useMemo(
     () => ({ ownerSessionId: sessionId, ownerEpoch }),
     [ownerEpoch, sessionId],
   );
   dirtyPathsRef.current = dirtyPaths;
   ownerIdentityRef.current = ownerIdentity;
-  pendingCloseRef.current = pendingClose;
 
   const storedSessionState = sessionStates[sessionId] ?? createSessionPanelState();
   const externalTargetKey = targetFile
@@ -387,62 +388,58 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
 
   const ownerKeyPrefix = `${sessionId}:${ownerEpoch}:`;
   const dirtyKey = (path: string) => `${ownerKeyPrefix}${normalizePathForCompare(path)}`;
-  const hasDirtyFiles = Object.entries(dirtyPaths).some(
-    ([key, dirty]) => dirty && key.startsWith(ownerKeyPrefix),
-  );
-  const hasSavingFiles = Object.entries(savingPaths).some(
-    ([key, saving]) => saving && key.startsWith(ownerKeyPrefix),
-  );
-  const hasFailedDirtyFiles = Object.entries(failedClosePaths).some(
-    ([key, failed]) => failed && key.startsWith(ownerKeyPrefix) && dirtyPaths[key],
-  );
 
-  const requestDiscardConfirm = (target: OwnedCloseTarget) => {
-    discardReturnFocusRef.current = document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-    setDiscardConfirm(target);
-  };
-
-  const cancelDiscardConfirm = () => {
-    setDiscardConfirm(null);
-    const returnFocus = discardReturnFocusRef.current;
-    discardReturnFocusRef.current = null;
-    window.requestAnimationFrame(() => returnFocus?.focus({ preventScroll: true }));
-  };
-
-  const confirmDiscardClose = () => {
-    const target = discardConfirm;
-    if (!target || !sameOwner(target, ownerIdentityRef.current)) {
-      setDiscardConfirm(null);
-      return;
-    }
-    pendingCloseRef.current = null;
-    setPendingClose(null);
-    setDiscardConfirm(null);
-    if (target.kind === 'tab') {
-      closeTabRef.current(target.path, true);
-      return;
-    }
-    const prefix = ownerKey(target);
-    setDirtyPaths((current) => removeRecordPrefix(current, prefix));
-    setSavingPaths((current) => removeRecordPrefix(current, prefix));
-    setFailedClosePaths((current) => removeRecordPrefix(current, prefix));
-    onClose();
-  };
-
-  const discardConfirmOwned = Boolean(discardConfirm && sameOwner(discardConfirm, ownerIdentity));
-
-  useLayoutEffect(() => {
-    if (discardConfirmOwned) discardDialogRef.current?.focus({ preventScroll: true });
-  }, [discardConfirmOwned]);
-
-  useEffect(() => {
-    if (!discardConfirm || sameOwner(discardConfirm, ownerIdentity)) return;
-    setDiscardConfirm(null);
-    discardReturnFocusRef.current = null;
-  }, [discardConfirm, ownerIdentity]);
-
+  useEffect(() => subscribeWorkspaceMutation((detail) => {
+    if (!detail.tombstone) return;
+    const removedEntryIds = new Set(
+      detail.affectedEntryIds || (detail.entryId ? [detail.entryId] : []),
+    );
+    if (removedEntryIds.size === 0) return;
+    const belongsToDeletedWorkspaceEntry = (file: Pick<FileInfo, 'entry_id' | 'path' | 'source'>) => (
+      (file.source === 'workspace' && Boolean(file.entry_id && removedEntryIds.has(file.entry_id)))
+      || Boolean(workspaceSnapshotEntryId(file.path)
+        && removedEntryIds.has(workspaceSnapshotEntryId(file.path)!))
+    );
+    const removedPaths = openTabs
+      .filter(belongsToDeletedWorkspaceEntry)
+      .map((tab) => normalizePathForCompare(tab.path));
+    setItems((current) => current.filter((item) => !belongsToDeletedWorkspaceEntry(item)));
+    updateSessionState((current) => {
+      const removedIndexes = current.openTabs.flatMap((tab, index) => (
+        belongsToDeletedWorkspaceEntry(tab)
+          ? [index]
+          : []
+      ));
+      const currentSnapshotEntryId = workspaceSnapshotEntryId(current.currentPath);
+      const currentDirectoryWasRemoved = Boolean(
+        currentSnapshotEntryId && removedEntryIds.has(currentSnapshotEntryId),
+      );
+      if (removedIndexes.length === 0 && !currentDirectoryWasRemoved) return current;
+      const removed = new Set(removedIndexes);
+      const openTabs = current.openTabs.filter((_tab, index) => !removed.has(index));
+      const activeIndex = current.activePath
+        ? current.openTabs.findIndex((tab) => normalizePathForCompare(tab.path) === current.activePath)
+        : -1;
+      const activeWasRemoved = activeIndex >= 0 && removed.has(activeIndex);
+      return {
+        ...current,
+        currentPath: currentDirectoryWasRemoved ? '' : current.currentPath,
+        pathHistory: currentDirectoryWasRemoved ? [''] : current.pathHistory,
+        historyIndex: currentDirectoryWasRemoved ? 0 : current.historyIndex,
+        openTabs,
+        activePath: currentDirectoryWasRemoved
+          ? null
+          : activeWasRemoved
+          ? normalizePathForCompare(openTabs[Math.min(activeIndex, openTabs.length - 1)]?.path || '') || null
+          : current.activePath,
+      };
+    });
+    setDirtyPaths((current) => {
+      const next = { ...current };
+      removedPaths.forEach((path) => delete next[`${ownerKeyPrefix}${path}`]);
+      return next;
+    });
+  }), [openTabs, ownerKeyPrefix, updateSessionState]);
   useImperativeHandle(ref, () => ({
     ...ownerIdentity,
     hasDirty: (expectedOwner) => {
@@ -457,7 +454,16 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
         ([key, handle]) => key.startsWith(prefix) && handle.isDirty(expectedOwner),
       );
     },
-    saveDirty: async (expectedOwner) => {
+    pendingFileDrafts: (expectedOwner) => {
+      if (!sameOwner(ownerIdentityRef.current, expectedOwner)) return [];
+      const prefix = ownerKey(expectedOwner);
+      return Array.from(previewHandlesRef.current.entries()).flatMap(([key, handle]) => (
+        key.startsWith(prefix) && handle.isDirty(expectedOwner)
+          ? [{ source: 'session' as const, path: key.slice(prefix.length) }]
+          : []
+      ));
+    },
+    saveDirty: async (expectedOwner, options) => {
       const currentOwner = ownerIdentityRef.current;
       if (!sameOwner(currentOwner, expectedOwner)) {
         return { ...expectedOwner, ok: false, stale: true, failedPaths: [] };
@@ -476,7 +482,7 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
         const path = key.slice(prefix.length);
         const handle = previewHandlesRef.current.get(key);
         if (!handle) return { path, ok: false };
-        const result = await handle.saveDirty(expectedOwner);
+        const result = await handle.saveDirty(expectedOwner, options);
         return { path, ok: result.ok && !result.stale };
       }));
       const stale = !sameOwner(ownerIdentityRef.current, expectedOwner);
@@ -490,19 +496,16 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
     },
   }), [ownerIdentity]);
 
-  const closeTab = (path: string, force = false) => {
+  const closeTab = (path: string) => {
     const normalizedPath = normalizePathForCompare(path);
-    if (!force && dirtyPaths[dirtyKey(normalizedPath)] && failedClosePaths[dirtyKey(normalizedPath)]) {
-      requestDiscardConfirm({ ...ownerIdentity, kind: 'tab', path: normalizedPath });
-      return;
-    }
-    if (!force && savingPaths[dirtyKey(normalizedPath)]) {
-      setPendingClose({ ...ownerIdentity, kind: 'tab', path: normalizedPath, requestNonce: ++closeRequestSeqRef.current });
-      return;
-    }
-    if (!force && dirtyPaths[dirtyKey(normalizedPath)]) {
-      setPendingClose({ ...ownerIdentity, kind: 'tab', path: normalizedPath, requestNonce: ++closeRequestSeqRef.current });
-      return;
+    const previewKey = dirtyKey(normalizedPath);
+    const previewHandle = previewHandlesRef.current.get(previewKey);
+    if (previewHandle?.isDirty(ownerIdentity)) {
+      // getMarkdown/exportFile and outbox enqueue happen before the first await.
+      // Closing the tab therefore never waits for the remote PUT.
+      void previewHandle.saveDirty(ownerIdentity).catch((error) => {
+        console.error('Failed to sync Session draft in background:', error);
+      });
     }
     const closingIndex = openTabs.findIndex(
       (tab) => normalizePathForCompare(tab.path) === normalizedPath,
@@ -536,68 +539,22 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
       delete next[dirtyKey(normalizedPath)];
       return next;
     });
-    setSavingPaths((current) => {
-      const next = { ...current };
-      delete next[dirtyKey(normalizedPath)];
-      return next;
-    });
-    setFailedClosePaths((current) => {
-      const next = { ...current };
-      delete next[dirtyKey(normalizedPath)];
-      return next;
-    });
   };
-  closeTabRef.current = closeTab;
 
   const requestPanelClose = () => {
-    if (hasFailedDirtyFiles) {
-      requestDiscardConfirm({ ...ownerIdentity, kind: 'panel' });
-      return;
-    }
-    if (hasSavingFiles || hasDirtyFiles) {
-      setPendingClose({ ...ownerIdentity, kind: 'panel', requestNonce: ++closeRequestSeqRef.current });
-      return;
+    const prefix = ownerKey(ownerIdentity);
+    for (const [key, handle] of previewHandlesRef.current.entries()) {
+      if (!key.startsWith(prefix) || !handle.isDirty(ownerIdentity)) continue;
+      void handle.saveDirty(ownerIdentity).catch((error) => {
+        console.error('Failed to sync Session draft in background:', error);
+      });
     }
     onClose();
   };
 
-  const pendingCloseOwned = Boolean(pendingClose && sameOwner(pendingClose, ownerIdentity));
-  const pendingCloseSaving = Boolean(pendingCloseOwned && pendingClose && (
-    pendingClose.kind === 'tab'
-      ? savingPaths[dirtyKey(pendingClose.path)]
-      : hasSavingFiles
-  ));
-  const pendingCloseDirty = Boolean(pendingCloseOwned && pendingClose && (
-    pendingClose.kind === 'tab'
-      ? dirtyPaths[dirtyKey(pendingClose.path)]
-      : hasDirtyFiles
-  ));
-  useEffect(() => {
-    if (!pendingClose) return;
-    if (!sameOwner(pendingClose, ownerIdentityRef.current)) {
-      setPendingClose((current) => (current === pendingClose ? null : current));
-      return;
-    }
-    if (pendingCloseSaving || pendingCloseDirty) return;
-    const completedClose = pendingClose;
-    setPendingClose(null);
-    if (completedClose.kind === 'tab') {
-      closeTabRef.current(completedClose.path, true);
-    } else {
-      onClose();
-    }
-  }, [onClose, pendingClose, pendingCloseDirty, pendingCloseSaving]);
-
   const handleFileUpdated = (updated: FileInfo, owner: SessionFileOwnerIdentity) => {
     if (!sameOwner(ownerIdentityRef.current, owner)) return;
     const updatedPath = normalizePathForCompare(updated.path);
-    setFailedClosePaths((current) => {
-      const key = `${ownerKey(owner)}${updatedPath}`;
-      if (!current[key]) return current;
-      const next = { ...current };
-      delete next[key];
-      return next;
-    });
     setItems((current) => current.map((item) => (
       normalizePathForCompare(item.path) === updatedPath ? { ...item, ...updated } : item
     )));
@@ -635,7 +592,7 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
     : 'border-b border-claude-border px-4 py-3';
 
   const content = (
-    <div className="relative flex h-full min-h-0 flex-col bg-white">
+    <div className="relative flex h-full min-h-0 w-full min-w-0 flex-col bg-white">
       <div
         className={headerClassName}
         data-testid={variant === 'workspace' ? 'session-files-toolbar' : undefined}
@@ -891,91 +848,28 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
                   sessionId={sessionId}
                   ownerEpoch={ownerEpoch}
                   file={tab}
+                  readOnly={tab.content_mode === 'captured'}
+                  contextNotice={
+                    tab.assistant_ref_id
+                    && tab.assistant_ref_id === targetFile?.assistant_ref_id
+                      ? targetContextNotice
+                      : undefined
+                  }
+                  canSaveToWorkspace={
+                    tab.source !== 'workspace' && workspaceSnapshotEntryId(tab.path) === null
+                  }
                   onClose={() => closeTab(tab.path)}
                   onDirtyChange={(dirty) => {
                     const key = dirtyKey(tab.path);
                     setDirtyPaths((current) => (
                       current[key] === dirty ? current : { ...current, [key]: dirty }
                     ));
-                    if (!dirty) {
-                      setFailedClosePaths((current) => {
-                        if (!current[key]) return current;
-                        const next = { ...current };
-                        delete next[key];
-                        return next;
-                      });
-                    }
                   }}
-                  onSavingChange={(saving) => {
-                    const key = dirtyKey(tab.path);
-                    setSavingPaths((current) => (
-                      current[key] === saving ? current : { ...current, [key]: saving }
-                    ));
-                  }}
-                  onSaveFailure={() => {
-                    const key = dirtyKey(tab.path);
-                    setFailedClosePaths((current) => ({ ...current, [key]: true }));
-                    setPendingClose((current) => {
-                      if (!current || !sameOwner(current, ownerIdentity)) return current;
-                      if (current.kind === 'panel') return null;
-                      return normalizePathForCompare(current.path) === tabPath ? null : current;
-                    });
-                  }}
-                  saveRequestNonce={pendingCloseOwned && pendingClose && (
-                    pendingClose.kind === 'panel'
-                    || normalizePathForCompare(pendingClose.path) === tabPath
-                  ) ? pendingClose.requestNonce : undefined}
                   onFileUpdated={(updated) => handleFileUpdated(updated, ownerIdentity)}
                 />
               </div>
             );
           })}
-        </div>
-      )}
-      {discardConfirmOwned && discardConfirm && (
-        <div
-          className="absolute inset-0 z-50 flex items-center justify-center bg-black/25 px-4"
-          onClick={cancelDiscardConfirm}
-        >
-          <div
-            ref={discardDialogRef}
-            role="alertdialog"
-            aria-modal="true"
-            aria-label="放弃未保存修改"
-            tabIndex={-1}
-            onClick={(event) => event.stopPropagation()}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') {
-                event.stopPropagation();
-                cancelDiscardConfirm();
-              }
-            }}
-            className="w-full max-w-[420px] rounded-2xl border border-claude-border bg-white p-5 shadow-2xl outline-none"
-          >
-            <h3 className="text-base font-semibold text-claude-text">保存失败，仍要关闭吗？</h3>
-            <p className="mt-2 text-sm leading-6 text-claude-secondary">
-              {discardConfirm.kind === 'tab'
-                ? `“${discardConfirm.path}”的本地修改尚未保存。放弃后将关闭此标签。`
-                : '仍有文件未能保存。放弃后将关闭文件面板并丢弃这些本地修改。'}
-            </p>
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                type="button"
-                autoFocus
-                onClick={cancelDiscardConfirm}
-                className="rounded-lg border border-claude-border bg-white px-3 py-2 text-sm font-medium text-claude-text hover:bg-claude-hover"
-              >
-                继续编辑
-              </button>
-              <button
-                type="button"
-                onClick={confirmDiscardClose}
-                className="rounded-lg bg-claude-error px-3 py-2 text-sm font-medium text-white hover:opacity-90"
-              >
-                放弃修改并关闭
-              </button>
-            </div>
-          </div>
         </div>
       )}
     </div>
@@ -1027,14 +921,6 @@ function sameOwner(left: SessionFileOwnerIdentity, right: SessionFileOwnerIdenti
   return left.ownerSessionId === right.ownerSessionId && left.ownerEpoch === right.ownerEpoch;
 }
 
-function removeRecordPrefix(
-  record: Record<string, boolean>,
-  prefix: string,
-): Record<string, boolean> {
-  const entries = Object.entries(record).filter(([key]) => !key.startsWith(prefix));
-  return entries.length === Object.keys(record).length ? record : Object.fromEntries(entries);
-}
-
 function mergeFileInfo(current: FileInfo, incoming: FileInfo): FileInfo {
   const normalized = normalizeTargetFile(incoming);
   const incomingVersionUnknown = normalized.size === 0 && !normalized.modified;
@@ -1046,6 +932,7 @@ function mergeFileInfo(current: FileInfo, incoming: FileInfo): FileInfo {
     type: normalized.type || current.type,
     session_id: normalized.session_id || current.session_id,
     data_url: normalized.data_url || current.data_url,
+    edit_base_token: normalized.edit_base_token || (normalized.revision === current.revision ? current.edit_base_token : undefined),
   };
   return (
     current.name === next.name
@@ -1056,6 +943,15 @@ function mergeFileInfo(current: FileInfo, incoming: FileInfo): FileInfo {
     && current.type === next.type
     && current.is_directory === next.is_directory
     && current.data_url === next.data_url
+    && current.source === next.source
+    && current.entry_id === next.entry_id
+    && current.revision === next.revision
+    && current.edit_base_token === next.edit_base_token
+    && current.version_id === next.version_id
+    && current.snapshot_path === next.snapshot_path
+    && current.workspace_path === next.workspace_path
+    && current.content_mode === next.content_mode
+    && current.assistant_ref_id === next.assistant_ref_id
   ) ? current : next;
 }
 

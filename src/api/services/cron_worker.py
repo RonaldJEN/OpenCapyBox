@@ -9,20 +9,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import uuid
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 
+from sqlalchemy import or_
 from sqlalchemy.exc import OperationalError
 
 from src.api.models.auth_user import AuthUser
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.database import SessionLocal
+from src.api.models.user_memory import CronJobRun
+from src.api.models.user_sandbox import UserSandbox
 from src.api.services.cron_engine import CronEngine
-from src.api.services.cron_service import run_cron_job
+from src.api.services.cron_service import (
+    build_cron_definition_snapshot,
+    build_cron_workspace_change_set_summaries,
+    run_cron_job,
+)
 from src.api.utils.timezone import get_timezone, now_naive
 from src.api.config import get_settings
 
@@ -30,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 # 防止 create_task 返回的 Task 被 GC 回收导致后台任务中途丢失
 _background_tasks: set[asyncio.Task] = set()
+_local_run_ids: set[str] = set()
 
 # Worker 与 API 共用事件循环；当同进程出现短暂阻塞时，醒来后补扫最近的
 # 分钟，避免只看“当前分钟”导致整点任务静默漏发。
@@ -40,16 +49,48 @@ def _spawn(coro) -> asyncio.Task:
     """受控创建后台任务：保留强引用并自动清理。"""
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    def _settled(done: asyncio.Task) -> None:
+        _background_tasks.discard(done)
+        if done.cancelled():
+            return
+        error = done.exception()
+        if error is not None:
+            logger.error(
+                "cron background task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(_settled)
     return task
+
+
+def _spawn_queued_run(run_id: str, worker_id: str) -> asyncio.Task | None:
+    """Avoid duplicate local claim tasks while DB fencing handles other workers."""
+    if run_id in _local_run_ids:
+        return None
+    _local_run_ids.add(run_id)
+
+    async def _guarded() -> None:
+        try:
+            await _run_queued(run_id, worker_id)
+        finally:
+            _local_run_ids.discard(run_id)
+
+    return _spawn(_guarded())
 
 
 async def start_cron_worker(app) -> None:
     """启动当前进程的 cron worker。"""
     worker_id = uuid.uuid4().hex
     app.state.cron_worker_id = worker_id
+    await asyncio.to_thread(reconcile_expired_cron_runs)
+    await _spawn_queued_runs(worker_id)
     app.state.cron_worker_task = asyncio.create_task(
         _cron_worker_loop(worker_id)
+    )
+    app.state.cron_reconciler_task = asyncio.create_task(
+        _cron_reconciler_loop(worker_id)
     )
     logger.info("cron_worker started worker_id=%s", worker_id)
 
@@ -59,11 +100,12 @@ async def stop_cron_worker(app) -> None:
 
     优雅停机：先等待 in-flight 任务最多 30s，超时再强制 cancel。
     """
-    task = getattr(app.state, "cron_worker_task", None)
-    if task:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    for task_name in ("cron_worker_task", "cron_reconciler_task"):
+        task = getattr(app.state, task_name, None)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     pending = [t for t in list(_background_tasks) if not t.done()]
     if pending:
@@ -73,6 +115,24 @@ async def stop_cron_worker(app) -> None:
             with suppress(asyncio.CancelledError, Exception):
                 await t
     _background_tasks.clear()
+    _local_run_ids.clear()
+
+
+async def _cron_reconciler_loop(worker_id: str) -> None:
+    """Recover expired claims and dispatch durable queued runs."""
+    interval = max(
+        1.0,
+        float(get_settings().cron_reconcile_interval_seconds),
+    )
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(reconcile_expired_cron_runs)
+            await _spawn_queued_runs(worker_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("cron reconciler loop error worker=%s", worker_id)
 
 
 async def _cron_worker_loop(worker_id: str) -> None:
@@ -206,7 +266,7 @@ def _cleanup_old_fires() -> None:
         logger.exception("cron_fires 清理失败")
 
 
-def _load_enabled_job_snapshots() -> list[tuple[int, str, str, str, int]]:
+def _load_enabled_job_snapshots() -> list[tuple[int, str, str, str, int, int]]:
     """同步读取所有 enabled job 的轻量快照，供 dispatch 使用。"""
     with SessionLocal() as db:
         jobs = (
@@ -216,7 +276,14 @@ def _load_enabled_job_snapshots() -> list[tuple[int, str, str, str, int]]:
             .all()
         )
         return [
-            (j.id, j.user_id, j.name, j.cron_expr, int(j.rule_version or 1))
+            (
+                j.id,
+                j.user_id,
+                j.name,
+                j.cron_expr,
+                int(j.rule_version or 1),
+                int(j.definition_version or 1),
+            )
             for j in jobs
         ]
 
@@ -228,16 +295,17 @@ async def _dispatch_and_run(
     # 同步 DB 调用一律放线程，避免阻塞事件循环（影响同进程的 SSE / 长连接 jitter）
     job_snapshots = await asyncio.to_thread(_load_enabled_job_snapshots)
 
-    for job_id, user_id, name, cron_expr, rule_version in job_snapshots:
+    for job_id, user_id, name, cron_expr, rule_version, definition_version in job_snapshots:
         # per-job 隔离：单个 job 的解析/匹配/抢占异常不能影响其他 job 的本分钟调度
         try:
             if not _cron_matches_minute(cron_expr, minute):
                 continue
-            won = await asyncio.to_thread(
-                _try_insert_fire,
+            run_id = await asyncio.to_thread(
+                _enqueue_scheduled_run,
                 job_id,
                 minute,
                 rule_version,
+                definition_version,
             )
         except Exception:
             logger.exception(
@@ -245,8 +313,8 @@ async def _dispatch_and_run(
                 job_id, user_id, name, cron_expr,
             )
             continue
-        if won:
-            _spawn(_run_by_id(job_id, worker_id, rule_version, minute))
+        if run_id:
+            _spawn_queued_run(run_id, worker_id)
 
 
 def _cron_matches_minute(expr: str, minute: datetime) -> bool:
@@ -257,27 +325,86 @@ def _cron_matches_minute(expr: str, minute: datetime) -> bool:
     return CronEngine.matches(expr, minute)
 
 
-def _try_insert_fire(job_id: int, minute: datetime, rule_version: int = 1) -> bool:
-    """尝试插入去重记录：成功插入返回 True，唯一约束冲突返回 False。
+def _enqueue_scheduled_run(
+    job_id: int,
+    minute: datetime,
+    rule_version: int = 1,
+    definition_version: int | None = None,
+) -> str | None:
+    """Atomically acquire a Fire and create its durable queued run.
 
-    PostgreSQL 使用 ON CONFLICT DO NOTHING。
+    Fire without a run is not an execution intent. Keeping both writes in one
+    transaction closes the crash window between minute dedupe and task spawn.
     """
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     try:
         with SessionLocal() as db:
+            job = (
+                db.query(CronJob)
+                .join(AuthUser, AuthUser.user_id == CronJob.user_id)
+                .filter(
+                    CronJob.id == job_id,
+                    CronJob.enabled == True,  # noqa: E712
+                    AuthUser.enabled == True,  # noqa: E712
+                    CronJob.rule_version == rule_version,
+                )
+                .first()
+            )
+            if job is None:
+                return None
+            current_definition_version = int(job.definition_version or 1)
+            if (
+                definition_version is not None
+                and current_definition_version != definition_version
+            ):
+                logger.info(
+                    "cron definition advanced before durable enqueue; using latest "
+                    "job_id=%s expected=%s actual=%s",
+                    job_id,
+                    definition_version,
+                    current_definition_version,
+                )
+            snapshot = build_cron_definition_snapshot(job)
+            run_id = str(uuid.uuid4())
+            fire_id = str(uuid.uuid4())
             values = dict(
-                id=str(uuid.uuid4()),
+                id=fire_id,
                 job_id=job_id,
                 scheduled_at=minute,
                 rule_version=rule_version,
+                definition_version=current_definition_version,
+                run_id=run_id,
             )
             stmt = pg_insert(CronFire).values(**values).on_conflict_do_nothing(
                 constraint="uq_cronfire_job_time"
             )
             result = db.execute(stmt)
+            if result.rowcount != 1:
+                db.rollback()
+                return None
+            db.add(CronJobRun(
+                id=run_id,
+                user_id=job.user_id,
+                job_id=job.id,
+                fire_id=fire_id,
+                job_name=job.name,
+                cron_expr=job.cron_expr,
+                rule_version=rule_version,
+                definition_version=current_definition_version,
+                definition_snapshot=json.dumps(
+                    snapshot,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                scheduled_at=minute,
+                trigger_source="scheduled",
+                status="queued",
+                phase="queued",
+                is_read=False,
+            ))
             db.commit()
-            return result.rowcount == 1
+            return run_id
     except OperationalError as e:
         # 只有死锁 / 序列化失败属于预期抢占冲突，其余（例如 no such table）
         # 都是严重配置错误，必须响亮报错，避免静默吞掉导致 cron 看起来"没运行"
@@ -296,7 +423,416 @@ def _try_insert_fire(job_id: int, minute: datetime, rule_version: int = 1) -> bo
                 minute,
                 e,
             )
-        return False
+        return None
+
+
+def _try_insert_fire(
+    job_id: int,
+    minute: datetime,
+    rule_version: int = 1,
+    definition_version: int | None = None,
+) -> bool:
+    """Compatibility wrapper around the durable enqueue operation."""
+    return _enqueue_scheduled_run(
+        job_id,
+        minute,
+        rule_version,
+        definition_version,
+    ) is not None
+
+
+def _claim_queued_run(run_id: str, worker_id: str) -> dict | None:
+    """Claim one durable run with a renewable fencing token."""
+    lease_seconds = max(
+        1.0,
+        float(get_settings().cron_claim_lease_seconds),
+    )
+    claimed_at = now_naive()
+    with SessionLocal() as db:
+        record = (
+            db.query(CronJobRun)
+            .filter(CronJobRun.id == run_id)
+            .with_for_update()
+            .first()
+        )
+        if record is None or record.status != "queued":
+            return None
+        sandbox_row = (
+            db.query(UserSandbox.sandbox_id)
+            .filter(UserSandbox.user_id == record.user_id)
+            .first()
+        )
+        frozen_sandbox_id = sandbox_row[0] if sandbox_row else None
+        record.sandbox_id = (
+            frozen_sandbox_id
+            if isinstance(frozen_sandbox_id, str) and frozen_sandbox_id
+            else None
+        )
+        claim_token = str(uuid.uuid4())
+        record.status = "running"
+        record.phase = "preparing"
+        record.claim_token = claim_token
+        record.claim_worker_id = worker_id
+        record.claim_lease_expires_at = claimed_at + timedelta(seconds=lease_seconds)
+        record.heartbeat_at = claimed_at
+        record.started_at = record.started_at or claimed_at
+        record.attempt_count = int(record.attempt_count or 0) + 1
+        payload = {
+            "run_id": record.id,
+            "user_id": record.user_id,
+            "job_name": record.job_name,
+            "job_id": record.job_id,
+            "rule_version": record.rule_version,
+            "scheduled_at": record.scheduled_at,
+            "trigger_source": record.trigger_source,
+            "claim_token": claim_token,
+            "sandbox_id": record.sandbox_id,
+        }
+        db.commit()
+        return payload
+
+
+def _renew_run_claim(run_id: str, claim_token: str) -> bool:
+    renewed_at = now_naive()
+    lease_seconds = max(
+        1.0,
+        float(get_settings().cron_claim_lease_seconds),
+    )
+    with SessionLocal() as db:
+        updated = (
+            db.query(CronJobRun)
+            .filter(
+                CronJobRun.id == run_id,
+                CronJobRun.status == "running",
+                CronJobRun.claim_token == claim_token,
+                CronJobRun.claim_lease_expires_at > renewed_at,
+            )
+            .update(
+                {
+                    "heartbeat_at": renewed_at,
+                    "claim_lease_expires_at": renewed_at + timedelta(seconds=lease_seconds),
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return updated == 1
+
+
+def _run_claim_state(run_id: str) -> str:
+    with SessionLocal() as db:
+        row = db.query(CronJobRun.status).filter(CronJobRun.id == run_id).first()
+        if row is None:
+            return "missing"
+        return str(row[0])
+
+
+async def _claim_heartbeat_loop(
+    run_id: str,
+    claim_token: str,
+    stop: asyncio.Event,
+    execution_task: asyncio.Task,
+) -> None:
+    interval = max(
+        1.0,
+        float(get_settings().cron_claim_heartbeat_seconds),
+    )
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            renewed = await asyncio.to_thread(_renew_run_claim, run_id, claim_token)
+        except Exception:
+            logger.exception(
+                "cron heartbeat failed; cancelling execution conservatively run=%s",
+                run_id,
+            )
+            execution_task.cancel()
+            return
+        if not renewed:
+            state = await asyncio.to_thread(_run_claim_state, run_id)
+            if state in {"success", "failed", "conflict"}:
+                return
+            logger.error(
+                "cron claim lost; cancelling execution run=%s state=%s",
+                run_id,
+                state,
+            )
+            execution_task.cancel()
+            return
+
+
+def reconcile_expired_cron_runs(
+    *,
+    at: datetime | None = None,
+    db=None,
+    commit: bool = True,
+) -> tuple[int, int]:
+    """Recover pre-execution claims and conservatively close started work.
+
+    A preparing run has not crossed the Agent dispatch boundary and can be
+    queued again with the same run id. Executing/publishing work may already
+    have caused side effects, so it converges to ``unknown`` and is never
+    automatically replayed.
+    """
+    now = at or now_naive()
+    requeued = 0
+    unknown = 0
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
+        expired = (
+            session.query(CronJobRun)
+            .filter(
+                CronJobRun.status == "running",
+                or_(
+                    CronJobRun.claim_lease_expires_at.is_(None),
+                    CronJobRun.claim_lease_expires_at <= now,
+                ),
+            )
+            .with_for_update()
+            .all()
+        )
+        for record in expired:
+            can_requeue = record.phase == "preparing" and bool(record.claim_token)
+            if can_requeue:
+                record.status = "queued"
+                record.phase = "queued"
+                record.started_at = None
+                record.sandbox_id = None
+                record.output = "[执行 worker 在 Agent 启动前失联，任务已重新排队]"
+                record.error_code = None
+                requeued += 1
+            else:
+                record.status = "unknown"
+                record.phase = "terminal"
+                record.completed_at = now
+                record.output = "[执行 lease 已过期；任务可能已产生副作用，不会自动重试]"
+                record.error_code = "worker_lease_expired_after_start"
+                unknown += 1
+            record.claim_token = None
+            record.claim_worker_id = None
+            record.claim_lease_expires_at = None
+        _reconcile_workspace_change_summaries(session)
+        if commit:
+            session.commit()
+        else:
+            session.flush()
+    finally:
+        if owns_session:
+            session.close()
+    return requeued, unknown
+
+
+def _reconcile_workspace_change_summaries(db, *, limit: int = 1000) -> int:
+    """Repair CronJobRun summaries from the authoritative mutation journal."""
+    from src.api.models.workspace import WorkspaceChangeSet, WorkspaceEntry, WorkspaceMutation
+
+    def _mutation_details(mutation) -> dict:
+        try:
+            details = json.loads(mutation.details_json or "{}")
+        except (TypeError, ValueError):
+            details = {}
+        if not isinstance(details, dict):
+            details = {}
+        return details
+
+    def _mutation_path(details, journal, entry) -> str | None:
+        for candidate in (
+            journal.get("target_path"),
+            next((item.get("relative_path") for item in journal.get("root_projections", []) if isinstance(item, dict)), None),
+            details.get("to"),
+            details.get("original_path"),
+            getattr(entry, "relative_path", None),
+        ):
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return None
+
+    rows = (
+        db.query(WorkspaceMutation, WorkspaceEntry)
+        .outerjoin(WorkspaceEntry, WorkspaceEntry.entry_id == WorkspaceMutation.entry_id)
+        .filter(
+            WorkspaceMutation.actor == "cron",
+            WorkspaceMutation.state == "completed",
+            WorkspaceMutation.cron_run_id.isnot(None),
+        )
+        .order_by(WorkspaceMutation.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    by_run: dict[str, list[tuple[object, object]]] = {}
+    for mutation, entry in reversed(rows):
+        by_run.setdefault(str(mutation.cron_run_id), []).append((mutation, entry))
+
+    runs_by_id = {
+        str(run.id): run
+        for run in (
+            db.query(CronJobRun)
+            .filter(CronJobRun.id.in_(tuple(by_run)))
+            .all()
+            if by_run
+            else []
+        )
+    }
+    repaired = 0
+    for run_id, mutations in by_run.items():
+        run = runs_by_id.get(run_id)
+        if run is None:
+            continue
+        try:
+            changes = json.loads(run.workspace_changes or "[]")
+        except (TypeError, ValueError):
+            changes = []
+        if not isinstance(changes, list):
+            changes = []
+        known_ids = {
+            item.get("mutation_id")
+            for item in changes
+            if isinstance(item, dict) and item.get("mutation_id")
+        }
+        changed = False
+        for mutation, entry in mutations:
+            if mutation.mutation_id in known_ids:
+                continue
+            details = _mutation_details(mutation)
+            journal = details.get("journal")
+            if not isinstance(journal, dict):
+                journal = {}
+            roots = journal.get("root_projections") or []
+            deleted_root = roots[0] if roots else {}
+            change = {
+                "affected_entry_ids": journal.get("delete_entry_ids") or [],
+                "mutation_id": mutation.mutation_id,
+                "idempotency_key": mutation.idempotency_key,
+                "entry_id": mutation.entry_id,
+                "action": mutation.operation,
+                "operation": mutation.result_status or mutation.operation,
+                "before_revision": mutation.before_revision,
+                "revision": (int(deleted_root["revision"]) + 1) if deleted_root else mutation.after_revision,
+                "path": _mutation_path(details, journal, entry),
+                "name": getattr(entry, "name", None) or deleted_root.get("name"),
+                "kind": getattr(entry, "kind", None) or deleted_root.get("kind"),
+                "size_bytes": getattr(entry, "size_bytes", None),
+                "mime_type": getattr(entry, "mime_type", None),
+                "sha256": mutation.after_sha256,
+                "status": getattr(entry, "status", None),
+            }
+            candidate = changes + [change]
+            encoded = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+            if len(candidate) > 100 or len(encoded.encode("utf-8")) > 64 * 1024:
+                break
+            changes = candidate
+            known_ids.add(mutation.mutation_id)
+            changed = True
+        if changed:
+            run.workspace_changes = json.dumps(
+                changes,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            repaired += 1
+    change_set_run_ids = [
+        str(item[0])
+        for item in (
+            db.query(WorkspaceChangeSet.cron_run_id)
+            .filter(WorkspaceChangeSet.cron_run_id.isnot(None))
+            .distinct()
+            .limit(limit)
+            .all()
+        )
+        if item[0]
+    ]
+    if change_set_run_ids:
+        for run in db.query(CronJobRun).filter(
+            CronJobRun.id.in_(tuple(change_set_run_ids))
+        ).all():
+            summaries = build_cron_workspace_change_set_summaries(
+                db,
+                run_id=str(run.id),
+            )
+            encoded = json.dumps(summaries, ensure_ascii=False, separators=(",", ":"))
+            if (run.workspace_change_sets or "[]") != encoded:
+                run.workspace_change_sets = encoded
+                repaired += 1
+    return repaired
+
+
+def _load_queued_run_ids(limit: int = 200) -> list[str]:
+    with SessionLocal() as db:
+        return [
+            str(row[0])
+            for row in (
+                db.query(CronJobRun.id)
+                .filter(CronJobRun.status == "queued")
+                .order_by(CronJobRun.queued_at.asc(), CronJobRun.id.asc())
+                .limit(limit)
+                .all()
+            )
+        ]
+
+
+async def _spawn_queued_runs(worker_id: str) -> None:
+    run_ids = await asyncio.to_thread(_load_queued_run_ids)
+    for run_id in run_ids:
+        _spawn_queued_run(run_id, worker_id)
+
+
+async def _run_queued(run_id: str, worker_id: str) -> None:
+    claim = await asyncio.to_thread(_claim_queued_run, run_id, worker_id)
+    if claim is None:
+        return
+
+    claim_token = str(claim["claim_token"])
+    execution_task = asyncio.create_task(
+        run_cron_job(
+            str(claim["user_id"]),
+            str(claim["job_name"]),
+            run_id,
+            expected_job_id=(
+                int(claim["job_id"])
+                if claim.get("job_id") is not None
+                else None
+            ),
+            expected_rule_version=(
+                int(claim["rule_version"])
+                if claim.get("rule_version") is not None
+                else None
+            ),
+            scheduled_at=claim.get("scheduled_at"),
+            trigger_source=str(claim.get("trigger_source") or "scheduled"),
+            claim_token=claim_token,
+        )
+    )
+    stop = asyncio.Event()
+    heartbeat_task = asyncio.create_task(
+        _claim_heartbeat_loop(
+            run_id,
+            claim_token,
+            stop,
+            execution_task,
+        )
+    )
+    try:
+        await execution_task
+    finally:
+        stop.set()
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+
+def _is_durable_queued_run(run_id: str) -> bool:
+    with SessionLocal() as db:
+        return (
+            db.query(CronJobRun.id)
+            .filter(CronJobRun.id == run_id, CronJobRun.status == "queued")
+            .first()
+            is not None
+        )
 
 
 async def _run(
@@ -316,6 +852,10 @@ async def _run(
     """
     actual_run_id = run_id or str(uuid.uuid4())
     source = "manual" if run_id else "scheduled"
+
+    if run_id is not None and await asyncio.to_thread(_is_durable_queued_run, run_id):
+        await _run_queued(run_id, worker_id)
+        return
 
     if scheduled_job_id is not None:
         # 自动调度路径：在真正执行前做二次校验，收敛竞态窗口。

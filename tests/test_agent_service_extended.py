@@ -66,6 +66,64 @@ class TestAgentServiceCreateTools:
         assert "bash_kill" in tool_names
         assert "sub_agent" in tool_names
         assert "record_note" in tool_names
+        assert {
+            "workspace_list",
+            "workspace_stage",
+            "workspace_publish",
+            "workspace_create_directory",
+            "workspace_move",
+            "workspace_delete",
+        }.issubset(tool_names)
+        workspace_list = next(tool for tool in tools if tool.name == "workspace_list")
+        assert workspace_list._sandbox is service.sandbox
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("access", "expected"),
+        [
+            ("none", set()),
+            ("read", {"workspace_list", "workspace_stage"}),
+            (
+                "edit",
+                {
+                    "workspace_list",
+                    "workspace_stage",
+                    "workspace_publish",
+                    "workspace_create_directory",
+                },
+            ),
+            (
+                "manage",
+                {
+                    "workspace_list",
+                    "workspace_stage",
+                    "workspace_publish",
+                    "workspace_create_directory",
+                    "workspace_move",
+                    "workspace_delete",
+                },
+            ),
+        ],
+    )
+    async def test_workspace_access_controls_exposed_tools(self, service, access, expected):
+        with patch("src.api.services.tool_factory.settings") as mock_settings:
+            mock_settings.bocha_search_appcode = None
+            mock_settings.skills_dir = ""
+            mock_settings.sandbox_background_command_timeout_seconds = 21600
+            from src.api.services.tool_factory import create_agent_tools
+            from src.api.services.sandbox_service import get_sandbox_mount_path
+
+            tools, _ = await create_agent_tools(
+                sandbox=service.sandbox,
+                workspace_dir=service._workspace_dir,
+                mount=get_sandbox_mount_path(),
+                user_id=service.user_id,
+                db_session_factory=service._get_db_session_factory(),
+                workspace_access=access,
+            )
+
+        workspace_names = {tool.name for tool in tools if tool.name.startswith("workspace_")}
+        assert workspace_names == expected
 
     @pytest.mark.asyncio
     async def test_create_tools_passes_image_capability(self, service):
@@ -455,6 +513,28 @@ class TestAgentServiceChatAgui:
 
         assert prepared.run_id
         assert service.agent._pending_interrupt is None
+
+    @pytest.mark.asyncio
+    async def test_admitted_idempotency_key_skips_attachment_staging(self, service):
+        from src.api.services.agent_service import DuplicateRoundError
+
+        service.history_service.find_round_by_idempotency_key = MagicMock(
+            return_value=SimpleNamespace(id="round-existing", status="running")
+        )
+        service._materialize_workspace_attachments = AsyncMock()
+
+        with pytest.raises(DuplicateRoundError) as excinfo:
+            await service.prepare_chat_round(
+                user_content=[{"type": "text", "text": "retry"}],
+                idempotency_key="idem-retry",
+            )
+
+        assert excinfo.value.existing_round_id == "round-existing"
+        # Staging copies files and allocates uuid-suffixed directory snapshots;
+        # a retry must not reach it.
+        service._materialize_workspace_attachments.assert_not_awaited()
+        service.history_service.create_round.assert_not_called()
+
 
     @pytest.mark.asyncio
     async def test_chat_agui_basic(self, service):
@@ -1179,12 +1259,178 @@ class TestAgentServiceChatAgui:
             for block in sent_content
             if isinstance(block, dict) and isinstance(block.get("text"), str)
         ]
-        assert any("文件已就绪" in text for text in file_text_blocks)
+        assert all("文件已就绪" not in text for text in file_text_blocks)
         assert all("如需读取，请使用 read_file 工具" not in text for text in file_text_blocks)
         create_kwargs = service.history_service.create_round.call_args.kwargs
         assert create_kwargs["user_message"] == "read this"
         assert len(create_kwargs["user_attachments"]) == 2
         assert create_kwargs["user_attachments"][0]["path"] == "a.txt"
+
+    @pytest.mark.asyncio
+    async def test_workspace_attachment_is_frozen_before_round_creation(self, service):
+        staged_entry = SimpleNamespace(
+            entry_id="entry-1",
+            relative_path="reports/report.xlsx",
+            name="report.xlsx",
+            kind="file",
+            mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        staged_result = SimpleNamespace(
+            entry=staged_entry,
+            destination_relative_path=".workspace-snapshots/entry-1/version-8/report.xlsx",
+            source_revision=7,
+            sha256="a" * 64,
+            size_bytes=42,
+            version_id="version-8",
+            version_sequence=8,
+        )
+        workspace_service = MagicMock()
+        workspace_service.stage_entry = AsyncMock(return_value=staged_result)
+
+        with patch(
+            "src.api.services.workspace_service.WorkspaceService",
+            return_value=workspace_service,
+            create=True,
+        ):
+            async for _event in service.chat_agui([{
+                "type": "file",
+                "file": {
+                    "source": "workspace",
+                    "entry_id": "entry-1",
+                    "name": "forged-name.xlsx",
+                    "size": 999,
+                },
+            }]):
+                pass
+
+        stage_kwargs = workspace_service.stage_entry.await_args.kwargs
+        assert stage_kwargs["expected_revision"] is None
+        assert stage_kwargs["destination_root"] == "/home/user/sessions/session-123"
+        assert len(stage_kwargs["snapshot_id"]) == 32
+        sent_content = service.agent.add_user_message.call_args.args[0]
+        file_text = next(block["text"] for block in sent_content if block.get("type") == "text")
+        assert '"path":".workspace-snapshots/entry-1/version-8/report.xlsx"' in file_text
+        assert '"workspace_entry_id":"entry-1"' in file_text
+        assert '"workspace_version_sequence":8' in file_text
+        assert "逐字使用 metadata.path" not in file_text
+
+        attachment = service.history_service.create_round.call_args.kwargs["user_attachments"][0]
+        assert attachment == {
+            "path": ".workspace-snapshots/entry-1/version-8/report.xlsx",
+            "name": "report.xlsx",
+            "type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "size": 42,
+            "source": "workspace",
+            "entry_id": "entry-1",
+            "revision": "7",
+            "origin_path": "reports/report.xlsx",
+            "snapshot_path": ".workspace-snapshots/entry-1/version-8/report.xlsx",
+            "sha256": "a" * 64,
+            "version_id": "version-8",
+            "version_sequence": 8,
+        }
+
+    @pytest.mark.asyncio
+    async def test_workspace_directory_attachment_is_one_folder_snapshot(self, service):
+        staged_entry = SimpleNamespace(
+            entry_id="folder-1",
+            relative_path="research",
+            name="research",
+            kind="directory",
+            mime_type=None,
+        )
+        staged_result = SimpleNamespace(
+            entry=staged_entry,
+            destination_relative_path=".workspace-snapshots/folder-1/3-token/research",
+            source_revision=1,
+            tree_revision=3,
+            sha256="b" * 64,
+            size_bytes=128,
+            version_id=None,
+            version_sequence=None,
+        )
+        workspace_service = MagicMock()
+        workspace_service.stage_entry = AsyncMock(return_value=staged_result)
+
+        with patch(
+            "src.api.services.workspace_service.WorkspaceService",
+            return_value=workspace_service,
+            create=True,
+        ):
+            async for _event in service.chat_agui([{
+                "type": "file",
+                "file": {
+                    "source": "workspace",
+                    "entry_id": "folder-1",
+                    "kind": "directory",
+                    "name": "forged-name",
+                },
+            }]):
+                pass
+
+        sent_content = service.agent.add_user_message.call_args.args[0]
+        folder_text = next(block["text"] for block in sent_content if block.get("type") == "text")
+        assert folder_text.startswith("[附件文件夹] metadata=")
+        assert '"path":".workspace-snapshots/folder-1/3-token/research"' in folder_text
+        assert '"kind":"directory"' in folder_text
+
+        attachment = service.history_service.create_round.call_args.kwargs["user_attachments"][0]
+        assert attachment == {
+            "path": ".workspace-snapshots/folder-1/3-token/research",
+            "name": "research",
+            "type": "inode/directory",
+            "size": 128,
+            "source": "workspace",
+            "entry_id": "folder-1",
+            "revision": "1",
+            "origin_path": "research",
+            "snapshot_path": ".workspace-snapshots/folder-1/3-token/research",
+            "sha256": "b" * 64,
+            "kind": "directory",
+            "is_directory": True,
+            "tree_revision": 3,
+            "manifest_sha256": "b" * 64,
+        }
+
+    @pytest.mark.asyncio
+    async def test_workspace_attachment_partial_stage_failure_discards_capture(self, service):
+        from src.api.services.workspace_service import WorkspaceError
+
+        staged = SimpleNamespace(
+            entry=SimpleNamespace(
+                entry_id="entry-1",
+                relative_path="a.md",
+                name="a.md",
+                kind="file",
+                mime_type="text/markdown",
+            ),
+            destination_relative_path=".workspace-snapshots/entry-1/capture/a.md",
+            source_revision=1,
+            sha256="a" * 64,
+            size_bytes=1,
+            version_id="version-1",
+            version_sequence=1,
+        )
+        workspace_service = MagicMock()
+        workspace_service.stage_entry = AsyncMock(side_effect=[
+            staged,
+            WorkspaceError(404, "ENTRY_NOT_FOUND", "missing"),
+        ])
+        service._discard_workspace_attachment_capture = AsyncMock()
+
+        with patch(
+            "src.api.services.workspace_service.WorkspaceService",
+            return_value=workspace_service,
+            create=True,
+        ):
+            with pytest.raises(WorkspaceError, match="missing"):
+                await service._materialize_workspace_attachments([
+                    {"type": "file", "file": {"source": "workspace", "entry_id": "entry-1", "name": "a.md"}},
+                    {"type": "file", "file": {"source": "workspace", "entry_id": "entry-2", "name": "b.md"}},
+                ])
+
+        capture = service._discard_workspace_attachment_capture.await_args.args[0]
+        assert [item.entry_id for item in capture.items] == ["entry-1"]
 
     @pytest.mark.asyncio
     async def test_chat_agui_attachment_prompt_preserves_exact_chinese_etf_path(self, service):
@@ -1204,7 +1450,7 @@ class TestAgentServiceChatAgui:
 
         assert f'"name":"{filename}"' in file_text
         assert f'"path":"{filename}"' in file_text
-        assert "metadata.path" in file_text
+        assert file_text == f'[附件文件] metadata={{"name":"{filename}","path":"{filename}"}}'
         assert "xxxx .docx" not in file_text
 
         create_kwargs = service.history_service.create_round.call_args.kwargs
@@ -1377,6 +1623,7 @@ class TestAgentServiceInitializeAgent:
 
         runtime_provider = MockAgent.call_args.kwargs["runtime_prompt_provider"]
         assert "`pdf`" in runtime_provider()
+        assert "Load a skill's full content" not in runtime_provider()
 
     @pytest.mark.asyncio
     async def test_runtime_mcp_connections_are_compact_request_only_metadata(
@@ -1416,14 +1663,10 @@ class TestAgentServiceInitializeAgent:
         runtime_provider = agent_kwargs["runtime_prompt_provider"]
         assert runtime_provider() == (
             "## 数据连接\n"
-            "按请求语义自动匹配并优先调用 `mcp_tool_search`：\n"
             "- 同花顺股票 MCP：A 股实时行情、个股资料、财务和公告"
         )
         assert "同花顺股票 MCP" not in agent_kwargs["system_prompt"]
-        assert (
-            "按请求语义自动匹配并优先调用 `mcp_tool_search`"
-            in runtime_provider()
-        )
+        assert "mcp_tool_search" not in runtime_provider()
 
     @pytest.mark.asyncio
     async def test_initialize_agent_filters_multimodal_incompatible_fallbacks(self, service):

@@ -1,5 +1,5 @@
 import { act, createRef } from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -96,7 +96,7 @@ describe('VditorMarkdownEditor', () => {
     document.getElementById('vditorIconScript')?.remove();
   });
 
-  it('初始化单一所见即所得编辑器并暴露可访问文本框', async () => {
+  it('始终初始化所见即所得画布，焦点不会暴露 Markdown 标记', async () => {
     const onChange = vi.fn();
     const buildSessionFileUrl = vi.fn((path: string) => `/api/session-files/${path}`);
     const ref = createRef<VditorMarkdownEditorHandle>();
@@ -121,7 +121,7 @@ describe('VditorMarkdownEditor', () => {
     });
 
     act(() => instances[0].options.input('# 用户修改'));
-    expect(onChange).toHaveBeenCalledWith('# 用户修改');
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith('# 用户修改'));
 
     rerender(
       <VditorMarkdownEditor
@@ -139,6 +139,137 @@ describe('VditorMarkdownEditor', () => {
 
     unmount();
     expect(instances[0].destroy).toHaveBeenCalledOnce();
+  });
+
+  it('在段落末尾连续按普通 Enter 会连续产生空段落', async () => {
+    render(
+      <VditorMarkdownEditor
+        markdown="第一行"
+        onChange={() => {}}
+        filePath="report.md"
+        buildSessionFileUrl={(path) => path}
+        toolbarOpen={false}
+      />,
+    );
+    const editor = await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+    editor.innerHTML = '<p data-block="0">第一行</p>';
+    const paragraph = editor.querySelector('p')!;
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    range.collapse(false);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+
+    fireEvent.keyDown(editor, { key: 'Enter' });
+    expect(editor.querySelectorAll(':scope > p')).toHaveLength(2);
+    fireEvent.keyDown(editor, { key: 'Enter' });
+    expect(editor.querySelectorAll(':scope > p')).toHaveLength(3);
+    expect(Array.from(editor.querySelectorAll(':scope > p')).slice(1).every((paragraph) => (
+      paragraph.textContent === '\u00a0'
+      && paragraph.hasAttribute('data-opencapybox-empty-paragraph')
+    ))).toBe(true);
+  });
+
+  it('自定义 Enter 用可 round-trip 的 HTML 语义投影空段，保存后重开仍保留段落', async () => {
+    const onChange = vi.fn();
+    const ref = createRef<VditorMarkdownEditorHandle>();
+    const firstRender = render(
+      <VditorMarkdownEditor
+        ref={ref}
+        markdown="第一行"
+        onChange={onChange}
+        filePath="report.md"
+        buildSessionFileUrl={(path) => path}
+        toolbarOpen={false}
+      />,
+    );
+    const editor = await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+    editor.innerHTML = '<p data-block="0">第一行</p>';
+    const paragraph = editor.querySelector('p')!;
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    range.collapse(false);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    instances[0].value = '第一行\n\n';
+    onChange.mockClear();
+
+    fireEvent.keyDown(editor, { key: 'Enter' });
+
+    expect(onChange).toHaveBeenCalledWith('第一行\n\n&nbsp;');
+    expect(ref.current?.getMarkdown()).toBe('第一行\n\n&nbsp;');
+
+    firstRender.unmount();
+    render(
+      <VditorMarkdownEditor
+        markdown={'第一行\n\n&nbsp;'}
+        onChange={() => {}}
+        filePath="report.md"
+        buildSessionFileUrl={(path) => path}
+        toolbarOpen={false}
+      />,
+    );
+    await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+    expect(instances[1].options.value).toBe('第一行\n\n&nbsp;');
+  });
+
+  it('输入不叠加编辑器内部 debounce，同一 tick 内即投影', async () => {
+    const onChange = vi.fn();
+    render(
+      <VditorMarkdownEditor
+        markdown="初稿"
+        onChange={onChange}
+        filePath="report.md"
+        buildSessionFileUrl={(path) => path}
+        toolbarOpen={false}
+      />,
+    );
+    await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+
+    act(() => instances[0].options.input('初稿改'));
+
+    expect(onChange).toHaveBeenCalledWith('初稿改');
+  });
+
+  it('只折叠纯 HTML 机器注释，不隐藏普通 HTML 块或改写 Markdown', async () => {
+    const ref = createRef<VditorMarkdownEditorHandle>();
+    const source = '<!-- ANCHOR:DAILY:START -->\n\n正文';
+    render(
+      <VditorMarkdownEditor
+        ref={ref}
+        markdown={source}
+        onChange={() => {}}
+        filePath="report.md"
+        buildSessionFileUrl={(path) => path}
+        toolbarOpen={false}
+      />,
+    );
+    const editor = await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+    const commentBlock = document.createElement('div');
+    commentBlock.className = 'vditor-wysiwyg__block';
+    commentBlock.dataset.type = 'html-block';
+    commentBlock.innerHTML = '<pre><code></code></pre><pre class="vditor-wysiwyg__preview"></pre>';
+    commentBlock.querySelector('code')!.textContent = '<!-- ANCHOR:DAILY:START -->';
+    const htmlBlock = commentBlock.cloneNode(true) as HTMLElement;
+    htmlBlock.querySelector('code')!.textContent = '<section>可见内容</section>';
+    editor.append(commentBlock, htmlBlock);
+
+    await waitFor(() => expect(commentBlock).toHaveClass('file-preview-vditor-machine-comment'));
+    expect(commentBlock).toHaveAttribute('aria-hidden', 'true');
+    expect(htmlBlock).not.toHaveClass('file-preview-vditor-machine-comment');
+    expect(htmlBlock).not.toHaveAttribute('aria-hidden');
+    expect(ref.current?.getMarkdown()).toBe(source);
+  });
+
+  it('原生输入立即交付草稿，不等待 Vditor 延迟回调且不重复交付', async () => {
+    const onChange = vi.fn();
+    render(<VditorMarkdownEditor markdown="正文" onChange={onChange} filePath="report.md" buildSessionFileUrl={() => ''} toolbarOpen={false} />);
+    const editor = await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+    instances[0].value = 'AAA正文';
+    fireEvent.input(editor);
+    expect(onChange).toHaveBeenCalledWith('AAA正文');
+    act(() => instances[0].options.input('AAA正文'));
+    expect(onChange).toHaveBeenCalledTimes(1);
   });
 
   it('鉴权加载会话图片且保存时还原 Markdown 相对路径', async () => {
@@ -170,7 +301,7 @@ describe('VditorMarkdownEditor', () => {
 
     instances[0].value = '![趋势图](blob:session-image)';
     act(() => instances[0].options.input(instances[0].value));
-    expect(onChange).toHaveBeenLastCalledWith('![趋势图](./assets/chart.png)');
+    expect(onChange).not.toHaveBeenCalled(); // 图片 URL 转换没有改变正文，不应触发保存。
     expect(ref.current?.getMarkdown()).toBe('![趋势图](./assets/chart.png)');
 
     unmount();

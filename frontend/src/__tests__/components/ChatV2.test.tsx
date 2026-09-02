@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { StrictMode } from 'react';
+import { StrictMode, forwardRef, useImperativeHandle } from 'react';
 import { render, screen, fireEvent, waitFor, act } from '../utils/test-utils';
 import { ChatV2 } from '../../components/ChatV2';
 import { apiService } from '../../services/api';
@@ -19,6 +19,22 @@ const ABORT_RESPONSE = {
   outcome_warning: ABORT_WARNING,
 };
 
+const workspaceClient = vi.hoisted(() => ({
+  get: vi.fn(),
+  post: vi.fn(),
+  put: vi.fn(),
+  patch: vi.fn(),
+  delete: vi.fn(),
+}));
+const workspacePreviewControls = vi.hoisted(() => ({
+  dirty: false,
+  save: vi.fn(async (_options?: unknown) => ({ ok: true, stale: false })),
+}));
+const sessionFilesControls = vi.hoisted(() => ({
+  dirty: false,
+  save: vi.fn(async (_options?: unknown) => ({ ok: true, stale: false, failedPaths: [] as string[] })),
+}));
+
 // Mock apiService
 vi.mock('../../services/api', () => ({
   apiService: {
@@ -30,6 +46,7 @@ vi.mock('../../services/api', () => ({
     getRunningSessions: vi.fn(),
     createSession: vi.fn(),
     abortChat: vi.fn(),
+    getAxiosClient: vi.fn(() => workspaceClient),
     getUserId: vi.fn(() => 'demo-session'),
     subscribeToRound: vi.fn(() => ({ abort: vi.fn(), promise: Promise.resolve() })),
   },
@@ -175,7 +192,19 @@ vi.mock('../../components/Round', () => ({
 }));
 
 vi.mock('../../components/ArtifactsPanel', () => ({
-  ArtifactsPanel: ({ sessionId, isOpen, onClose, variant, isExpanded, onToggleExpanded }: any) => {
+  ArtifactsPanel: forwardRef(function MockArtifactsPanel({ sessionId, ownerEpoch = 0, isOpen, onClose, variant, isExpanded, onToggleExpanded }: any, ref) {
+    useImperativeHandle(ref, () => ({
+      ownerSessionId: sessionId,
+      ownerEpoch,
+      hasDirty: () => sessionFilesControls.dirty,
+      pendingFileDrafts: () => (
+        sessionFilesControls.dirty ? [{ source: 'session', path: 'dirty.md' }] : []
+      ),
+      saveDirty: async (owner: any, options: any) => ({
+        ...owner,
+        ...(await sessionFilesControls.save(options)),
+      }),
+    }), [ownerEpoch, sessionId]);
     if (!sessionId) return null;
     return (
       <div
@@ -188,7 +217,7 @@ vi.mock('../../components/ArtifactsPanel', () => ({
         <button onClick={onToggleExpanded}>Toggle Expand</button>
       </div>
     );
-  },
+  }),
 }));
 
 vi.mock('../../services/mcpApi', () => ({
@@ -219,12 +248,21 @@ vi.mock('../../services/mcpApi', () => ({
 }));
 
 vi.mock('../../components/FilePreview', () => ({
-  FilePreview: ({ file, onClose }: any) => (
-    <div data-testid="file-preview">
-      <span>Preview: {file.name}</span>
-      <button onClick={onClose}>Close Preview</button>
-    </div>
-  ),
+  FilePreview: forwardRef(function MockFilePreview({ file, onClose }: any, ref) {
+    useImperativeHandle(ref, () => ({
+      ownerSessionId: 'workspace:persistent',
+      ownerEpoch: 0,
+      path: file.path,
+      isDirty: () => workspacePreviewControls.dirty,
+      saveDirty: async (owner: any, options: any) => ({ ...owner, path: file.path, ...(await workspacePreviewControls.save(options)) }),
+    }), [file.path]);
+    return (
+      <div data-testid="file-preview">
+        <span>Preview: {file.name}</span>
+        <button onClick={onClose}>Close Preview</button>
+      </div>
+    );
+  }),
 }));
 
 vi.mock('../../components/QuestionCard', async () => {
@@ -307,6 +345,10 @@ describe('ChatV2 组件', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    workspacePreviewControls.dirty = false;
+    workspacePreviewControls.save.mockReset().mockResolvedValue({ ok: true, stale: false });
+    sessionFilesControls.dirty = false;
+    sessionFilesControls.save.mockReset().mockResolvedValue({ ok: true, stale: false, failedPaths: [] });
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       rounds: mockRounds,
       session_id: 'test-session',
@@ -321,6 +363,152 @@ describe('ChatV2 组件', () => {
     });
     vi.mocked(apiService.resumeStream).mockResolvedValue(undefined);
     vi.mocked(apiService.abortChat).mockResolvedValue(ABORT_RESPONSE);
+    workspaceClient.get.mockResolvedValue({
+      data: { items: [], next_cursor: null, workspace_revision: 1 },
+    });
+  });
+
+  it('模型目录未给出 default_model 时不读取不存在的 reasoning draft', () => {
+    expect(() => render(
+      <ChatV2
+        sessionId=""
+        {...defaultProps}
+        selectedModelId={undefined as unknown as string}
+        availableModels={[]}
+      />,
+    )).not.toThrow();
+
+    expect(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...')).toBeInTheDocument();
+  });
+
+  it('工作区文件多选去重并以 workspace identity 发送，不上传或编码 Data URL', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [], session_id: 'test-session', total: 0,
+    });
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    const workspaceEntry = {
+      entry_id: 'entry-report', parent_id: null, name: '日报.md', kind: 'file', path: '研究/日报.md',
+      size_bytes: 88, mime_type: 'text/markdown', sha256: 'hash', revision: 5,
+      current_version_id: 'version-5', status: 'active',
+      created_at: '2026-08-26T00:00:00Z', updated_at: '2026-08-26T00:00:00Z',
+    };
+    workspaceClient.get.mockResolvedValue({
+      data: { items: [workspaceEntry], next_cursor: null, workspace_revision: 2 },
+    });
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    const selectWorkspaceFile = async () => {
+      fireEvent.click(await screen.findByRole('button', { name: '添加内容' }));
+      const menuItems = screen.getAllByRole('menuitem');
+      expect(menuItems.map((item) => item.textContent?.trim())).toEqual([
+        '工作区文件', '上传文件', '专家 Skills', '数据连接',
+      ]);
+      await waitFor(() => expect(screen.getByRole('menuitem', { name: '工作区文件' })).toHaveFocus());
+      fireEvent.keyDown(screen.getByRole('menu', { name: '添加内容' }), { key: 'ArrowDown' });
+      expect(screen.getByRole('menuitem', { name: '上传文件' })).toHaveFocus();
+      fireEvent.click(screen.getByRole('menuitem', { name: '工作区文件' }));
+      fireEvent.click(await screen.findByRole('button', { name: '日报.md' }));
+      fireEvent.click(screen.getByRole('button', { name: '添加到对话' }));
+    };
+    await selectWorkspaceFile();
+    await selectWorkspaceFile();
+    expect(screen.getAllByRole('button', { name: '移除 日报.md' })).toHaveLength(1);
+
+    const textarea = screen.getByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '分析日报' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+    await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1));
+    expect(apiService.uploadFile).not.toHaveBeenCalled();
+    expect(vi.mocked(apiService.sendMessageStreamV2).mock.calls[0][1]).toContainEqual({
+      type: 'file',
+      file: {
+        source: 'workspace',
+        entry_id: 'entry-report',
+        name: '日报.md',
+        mime_type: 'text/markdown',
+        size: 88,
+      },
+    });
+  });
+
+  it('选择工作区文件夹时保留文件夹卡片并发送目录 snapshot 引用', async () => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [], session_id: 'test-session', total: 0,
+    });
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    const workspaceFolder = {
+      entry_id: 'folder-research', parent_id: null, name: '研究', kind: 'directory', path: '研究',
+      size_bytes: 0, mime_type: null, sha256: null, revision: 2, status: 'active',
+      created_at: '2026-08-26T00:00:00Z', updated_at: '2026-08-26T00:00:00Z',
+    };
+    workspaceClient.get.mockResolvedValue({
+      data: {
+        items: [workspaceFolder],
+        next_cursor: null,
+        workspace_revision: 2,
+      },
+    });
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '工作区文件' }));
+    fireEvent.click(await screen.findByRole('button', { name: '研究' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加到对话' }));
+    expect(await screen.findByRole('button', { name: '移除 研究' })).toBeInTheDocument();
+    expect(screen.getByText('文件夹')).toBeInTheDocument();
+
+    const textarea = screen.getByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '分析研究目录' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+    await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(apiService.sendMessageStreamV2).mock.calls[0][1]).toContainEqual({
+      type: 'file',
+      file: {
+        source: 'workspace',
+        entry_id: 'folder-research',
+        kind: 'directory',
+        name: '研究',
+        mime_type: 'inode/directory',
+        size: 0,
+      },
+    });
+  });
+
+  it('欢迎页选择工作区文件不提前建 Session，发送时随 draft 迁移', async () => {
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    workspaceClient.get.mockResolvedValue({
+      data: {
+        items: [{
+          entry_id: 'entry-xlsx', parent_id: null, name: '模型.xlsx', kind: 'file', path: '模型.xlsx',
+          size_bytes: 128, mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          sha256: 'hash', revision: 3, status: 'active', created_at: 'now', updated_at: 'now',
+        }],
+        next_cursor: null,
+        workspace_revision: 2,
+      },
+    });
+    const onCreateSession = vi.fn().mockResolvedValue('created-session');
+    const onSessionCreated = vi.fn();
+    render(<ChatV2 sessionId="" {...defaultProps} onCreateSession={onCreateSession} onSessionCreated={onSessionCreated} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '工作区文件' }));
+    fireEvent.click(await screen.findByRole('button', { name: '模型.xlsx' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加到对话' }));
+    expect(onCreateSession).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...'), { key: 'Enter', shiftKey: false });
+
+    await waitFor(() => expect(onCreateSession).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1));
+    expect(onSessionCreated).toHaveBeenCalledWith('created-session');
+    expect(apiService.uploadFile).not.toHaveBeenCalled();
+    expect(vi.mocked(apiService.sendMessageStreamV2).mock.calls[0][1]).toContainEqual(expect.objectContaining({
+      type: 'file',
+      file: expect.objectContaining({ source: 'workspace', entry_id: 'entry-xlsx' }),
+    }));
   });
 
   it('从历史 Round 保留服务端 Skill 展示快照', async () => {
@@ -712,7 +900,7 @@ describe('ChatV2 组件', () => {
 
     const filesButton = screen.getByRole('button', { name: '查看文件' });
     expect(filesButton).toHaveClass('h-6', 'w-6');
-    expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
     fireEvent.click(filesButton);
 
     await waitFor(() => {
@@ -722,55 +910,168 @@ describe('ChatV2 组件', () => {
       expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
       expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: '查看文件' })).toHaveAttribute('aria-expanded', 'true');
-      expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
     });
 
     fireEvent.click(filesButton);
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
   });
 
-  it('移动端文件覆盖层应该禁用聊天交互并管理焦点', async () => {
-    const originalMatchMedia = window.matchMedia;
-    Object.defineProperty(window, 'matchMedia', {
-      configurable: true,
-      value: vi.fn(() => ({
-        matches: true,
-        media: '(max-width: 1199px)',
-        onchange: null,
-        addEventListener: vi.fn(),
-        removeEventListener: vi.fn(),
-        addListener: vi.fn(),
-        removeListener: vi.fn(),
-        dispatchEvent: vi.fn(),
-      })),
-    });
+  it('工作区文件开合应该恢复打开前的聊天滚动位置', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      text: async () => 'workspace note',
+      headers: new Headers({ 'Content-Type': 'text/plain' }),
+    } as Response);
+    const workspaceTarget = {
+      entry_id: 'workspace-note', parent_id: null, name: 'note.txt', kind: 'file' as const,
+      path: 'note.txt', size_bytes: 14, mime_type: 'text/plain', sha256: 'hash', revision: 1,
+      status: 'active' as const, created_at: 'now', updated_at: 'now',
+    };
 
     try {
-      render(<ChatV2 sessionId="test-session" {...defaultProps} />);
-      const filesButton = screen.getByRole('button', { name: '查看文件' });
-      filesButton.focus();
-      fireEvent.click(filesButton);
+      const { container, rerender } = render(
+        <ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={null} />
+      );
+      const chatArea = container.querySelector('div[class*="overflow-y-auto"][class*="bg-claude-bg"]') as HTMLDivElement;
+      Object.defineProperty(chatArea, 'scrollTop', { configurable: true, writable: true, value: 240 });
 
-      await waitFor(() => {
-        expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'true');
-        expect(screen.getByTestId('chat-pane')).toHaveAttribute('inert');
-        expect(screen.getByRole('button', { name: 'Close Panel' })).toHaveFocus();
-        expect(screen.queryByRole('button', { name: '收起面板' })).not.toBeInTheDocument();
-        expect(screen.queryByRole('button', { name: '展开面板' })).not.toBeInTheDocument();
-      });
+      rerender(
+        <ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={workspaceTarget} />
+      );
+      await waitFor(() => expect(screen.getByTestId('workspace-files-panel')).toBeInTheDocument());
+      expect(chatArea.scrollTop).toBe(240);
 
-      fireEvent.click(screen.getByRole('button', { name: 'Close Panel' }));
-      await waitFor(() => {
-        expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'false');
-        expect(screen.getByTestId('chat-pane')).not.toHaveAttribute('inert');
-        expect(filesButton).toHaveFocus();
-      });
+      rerender(
+        <ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={null} />
+      );
+      await waitFor(() => expect(screen.queryByTestId('workspace-files-panel')).not.toBeInTheDocument());
+      expect(chatArea.scrollTop).toBe(240);
     } finally {
-      Object.defineProperty(window, 'matchMedia', {
-        configurable: true,
-        value: originalMatchMedia,
-      });
+      fetchSpy.mockRestore();
     }
+  });
+
+  it('工作区整面板远端保存失败也立即关闭，草稿由后台队列继续同步', async () => {
+    workspacePreviewControls.dirty = true;
+    workspacePreviewControls.save.mockResolvedValue({ ok: false, stale: false });
+    const workspaceTarget = {
+      entry_id: 'workspace-note', parent_id: null, name: 'note.txt', kind: 'file' as const,
+      path: 'note.txt', size_bytes: 14, mime_type: 'text/plain', sha256: 'hash', revision: 1,
+      status: 'active' as const, created_at: 'now', updated_at: 'now',
+    };
+    const onWorkspaceFilesClose = vi.fn();
+    const { rerender } = render(<ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={workspaceTarget} onWorkspaceFilesClose={onWorkspaceFilesClose} />);
+    await waitFor(() => expect(screen.getByTestId('workspace-files-panel')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: '收起工作区文件' }));
+    await waitFor(() => expect(workspacePreviewControls.save).toHaveBeenCalledTimes(1));
+    expect(onWorkspaceFilesClose).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    rerender(<ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={null} onWorkspaceFilesClose={onWorkspaceFilesClose} />);
+    await waitFor(() => expect(screen.queryByTestId('workspace-files-panel')).not.toBeInTheDocument());
+  });
+
+  it('发送时同步抓取 Workspace dirty 草稿，但远端失败不阻止 Agent 启动', async () => {
+    workspacePreviewControls.dirty = true;
+    workspacePreviewControls.save.mockResolvedValue({ ok: false, stale: false });
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [], session_id: 'test-session', total: 0,
+    });
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    const workspaceTarget = {
+      entry_id: 'workspace-send-guard', parent_id: null, name: 'guard.md', kind: 'file' as const,
+      path: 'guard.md', size_bytes: 12, mime_type: 'text/markdown', sha256: 'hash', revision: 1,
+      status: 'active' as const, created_at: 'now', updated_at: 'now',
+    };
+    render(<ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={workspaceTarget} />);
+    await waitFor(() => expect(screen.getByTestId('workspace-files-panel')).toBeInTheDocument());
+    const textarea = screen.getByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '先保存再发送' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+    await waitFor(() => expect(workspacePreviewControls.save).toHaveBeenCalledWith(undefined));
+    await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalled());
+    expect(textarea).toHaveValue('');
+    expect(screen.queryByText(/非附件文件尚未完成同步/)).not.toBeInTheDocument();
+    const latestSend = vi.mocked(startSendStream).mock.calls.slice(-1)[0]?.[0];
+    expect(latestSend?.pendingFileDrafts).toEqual([
+      { source: 'workspace', path: 'guard.md' },
+    ]);
+  });
+
+  it('发送已附加的 dirty Workspace 文件时等待该文件保存成功', async () => {
+    workspacePreviewControls.dirty = true;
+    let resolveSave!: (value: { ok: boolean; stale: boolean }) => void;
+    workspacePreviewControls.save.mockImplementation(() => new Promise((resolve) => {
+      resolveSave = (value) => {
+        workspacePreviewControls.dirty = false;
+        resolve(value);
+      };
+    }));
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [], session_id: 'test-session', total: 0,
+    });
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    const workspaceTarget = {
+      entry_id: 'workspace-attached', parent_id: null, name: 'attached.md', kind: 'file' as const,
+      path: 'attached.md', size_bytes: 12, mime_type: 'text/markdown', sha256: 'hash', revision: 1,
+      current_version_id: 'version-1', status: 'active' as const, created_at: 'now', updated_at: 'now',
+    };
+    workspaceClient.get.mockResolvedValue({
+      data: { items: [workspaceTarget], next_cursor: null, workspace_revision: 1 },
+    });
+    render(<ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={workspaceTarget} />);
+    await waitFor(() => expect(screen.getByTestId('workspace-files-panel')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '工作区文件' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'attached.md' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加到对话' }));
+
+    const textarea = screen.getByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '读取附件' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+
+    await waitFor(() => expect(workspacePreviewControls.save).toHaveBeenCalledTimes(1));
+    expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '发送消息' }).querySelector('.animate-spin')).not.toBeNull();
+
+    await act(async () => resolveSave({ ok: true, stale: false }));
+
+    await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(apiService.sendMessageStreamV2).mock.calls[0][1]).toContainEqual({
+      type: 'file',
+      file: {
+        source: 'workspace',
+        entry_id: 'workspace-attached',
+        name: 'attached.md',
+        mime_type: 'text/markdown',
+        size: 12,
+      },
+    });
+  });
+
+  it('窄宽也应该保留文件分栏、splitter 与聊天侧总开关', async () => {
+    const { container } = render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    const filesButton = screen.getByRole('button', { name: '查看文件' });
+
+    expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
+    fireEvent.click(filesButton);
+
+    await waitFor(() => {
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
+      expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'false');
+      expect(screen.getByTestId('chat-pane')).not.toHaveAttribute('inert');
+      expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    await waitFor(() => {
+      expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
+      expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
+    });
   });
 
   it('文件面板应该在 split 与 full 之间切换', async () => {
@@ -828,21 +1129,21 @@ describe('ChatV2 组件', () => {
       <ChatV2 sessionId="test-session" {...defaultProps} />
     );
 
-    expect(screen.getByRole('button', { name: '展开面板' })).toHaveAttribute('aria-expanded', 'false');
-    expect(screen.queryByRole('button', { name: '收起面板' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '收起面板' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: '展开面板' })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
     await waitFor(() => {
       expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
     });
-    expect(screen.getByRole('button', { name: '收起面板' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: '展开面板' })).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
     expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' }))
       .toHaveAttribute('aria-valuenow', '100');
-    expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
   });
 
   it('session 切换保留当前 split，关闭后再打开固定恢复 45/55', async () => {
@@ -856,9 +1157,9 @@ describe('ChatV2 组件', () => {
     expect(container.querySelector('.session-files-shell')).toHaveStyle({
       '--session-files-chat-ratio': '47%',
     });
-    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
-    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
     fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
+    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
     expect(container.querySelector('.session-files-shell')).toHaveStyle({
       '--session-files-chat-ratio': '45%',
@@ -900,11 +1201,11 @@ describe('ChatV2 组件', () => {
     fireEvent.keyDown(splitter, { key: 'End' });
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
     expect(screen.getByRole('button', { name: '查看文件' })).toHaveAttribute('aria-pressed', 'false');
-    expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
     expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' }))
       .toHaveAttribute('aria-valuenow', '100');
 
-    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
     expect(container.querySelector('.session-files-shell')).toHaveStyle({
       '--session-files-chat-ratio': '45%',
@@ -932,22 +1233,18 @@ describe('ChatV2 组件', () => {
       '--session-files-chat-ratio': '15%',
     });
     fireEvent.pointerMove(window, { clientX: 500, pointerId: 1 });
+    fireEvent.pointerUp(window, { pointerId: 1 });
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
     expect(container.querySelector('.session-files-shell')).toHaveStyle({
       '--session-files-chat-ratio': '40%',
     });
-    fireEvent.pointerUp(window, { pointerId: 1 });
 
     splitter = screen.getByRole('separator', { name: '调整聊天和文件面板宽度' });
     fireEvent.pointerDown(splitter, { button: 0, pointerId: 2 });
     fireEvent.pointerMove(window, { clientX: 1050, pointerId: 2 });
-    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
-    expect(container.querySelector('.session-files-shell')).toHaveStyle({
-      '--session-files-chat-ratio': '95%',
-    });
     fireEvent.pointerMove(window, { clientX: 1100, pointerId: 2 });
-    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
     fireEvent.pointerUp(window, { pointerId: 2 });
+    expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
     vi.unstubAllGlobals();
     window.localStorage.removeItem('opencapybox.sessionFiles.chatRatio');
   });
@@ -1926,6 +2223,43 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('resume 时同步抓取 Session dirty 草稿，但远端失败不阻止 continuation', async () => {
+    sessionFilesControls.dirty = true;
+    sessionFilesControls.save.mockResolvedValue({
+      ok: false,
+      stale: false,
+      failedPaths: ['report.md'],
+    });
+    const question = '继续执行吗？';
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      rounds: [{
+        round_id: 'round-resume-save-guard',
+        user_message: '编辑后继续',
+        final_response: '',
+        steps: [],
+        step_count: 1,
+        status: 'waiting_interaction',
+        created_at: new Date().toISOString(),
+        interrupt: {
+          id: 'resume-save-guard',
+          reason: 'input_required',
+          payload: {
+            kind: 'ask_user',
+            questions: [{ question, header: '确认', options: [] }],
+          },
+        },
+      }],
+      session_id: 'test-session',
+      total: 1,
+    });
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    fireEvent.click(await screen.findByText('Submit Question'));
+
+    await waitFor(() => expect(sessionFilesControls.save).toHaveBeenCalledWith(undefined));
+    await waitFor(() => expect(apiService.resumeStream).toHaveBeenCalled());
+    expect(screen.queryByText(/当前文件尚未成功保存到远端/)).not.toBeInTheDocument();
+  });
+
   it('普通用户发送审批格式文本时不应被当作控制轮次', async () => {
     const literalApprovalMessage: RoundData = {
       round_id: 'round-literal-approval',
@@ -2494,9 +2828,9 @@ describe('ChatV2 组件', () => {
       expect(header).toHaveClass('h-14', 'shrink-0', 'border-b', 'border-claude-border');
       expect(header.querySelectorAll('.w-\\[88px\\]')).toHaveLength(0);
       expect(await screen.findByRole('button', { name: '查看文件' })).toHaveClass('h-6', 'w-6');
-      expect(screen.getByRole('button', { name: '展开面板' })).toHaveClass('h-6', 'w-6');
+      expect(screen.getByRole('button', { name: '收起面板' })).toHaveClass('h-6', 'w-6');
       fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
-      expect(await screen.findByRole('button', { name: '收起面板' })).toHaveClass('h-6', 'w-6');
+      expect(await screen.findByRole('button', { name: '展开面板' })).toHaveClass('h-6', 'w-6');
       expect(header.querySelector('.ml-auto')).toBeInTheDocument();
     });
   });

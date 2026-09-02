@@ -16,6 +16,7 @@ from src.api.routes import admin_mcp as admin_mcp_routes
 from src.api.routes import mcp as mcp_routes
 from src.api.routes import permissions as permission_routes
 from src.api.routes import admin_permissions as admin_permission_routes
+from src.api.routes import workspace as workspace_routes
 from src.api.models.database import init_db
 from src.api.validation_errors import safe_request_validation_exception_handler
 import os
@@ -56,9 +57,10 @@ def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
     from sqlalchemy import and_, insert, or_
 
     from src.api.models.round import Round
-    from src.api.models.user_run_lock import UserRunLock
     from src.api.models.user_memory import CronJobRun
+    from src.api.models.user_run_lock import UserRunLock
     from src.api.services.agent_interaction_service import AgentInteractionService
+    from src.api.services.cron_worker import reconcile_expired_cron_runs
     from src.api.services.run_completion_service import RunCompletionService
     from src.api.services.tool_permission_service import (
         reconcile_expired_approval_leases,
@@ -151,6 +153,22 @@ def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
         for row in db.query(UserRunLock.session_id).all()
         if row[0]
     }
+    # CronJobRun.id 同时是内部 Cron Session.id。fresh claim 属于其他
+    # worker 时，启动清理不能在 lease 对账前把其关联 Round 判成孤儿。
+    protected_session_ids.update(
+        str(row[0])
+        for row in (
+            db.query(CronJobRun.id)
+            .filter(
+                CronJobRun.status == "running",
+                CronJobRun.claim_token.isnot(None),
+                CronJobRun.claim_lease_expires_at.isnot(None),
+                CronJobRun.claim_lease_expires_at > cleanup_at,
+            )
+            .all()
+        )
+        if row[0]
+    )
     stale_count = 0
 
     def _continuation_failure_response(interaction_kind: str) -> str:
@@ -282,18 +300,12 @@ def cleanup_stale_runtime_state(db) -> tuple[int, int, int, int]:
     # Another worker may still own an active execution lease. Only missing or
     # expired claims become terminal unknown; none are retried.
     reconcile_expired_approval_leases(db, now=cleanup_at, commit=False)
-    stale_cron_count = (
-        db.query(CronJobRun)
-        .filter(CronJobRun.status == "running")
-        .update(
-            {
-                "status": "failed",
-                "output": "[服务重启，定时任务执行被中断]",
-                "completed_at": cleanup_at,
-            },
-            synchronize_session=False,
-        )
+    cron_requeued_count, cron_unknown_count = reconcile_expired_cron_runs(
+        at=cleanup_at,
+        db=db,
+        commit=False,
     )
+    stale_cron_count = cron_requeued_count + cron_unknown_count
 
     db.commit()
     return (
@@ -318,6 +330,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Session-File-Revision", "X-Session-File-Modified", "X-Session-Edit-Base"],
 )
 
 
@@ -337,7 +350,17 @@ async def startup_event():
     if bootstrapped_users:
         print(f"✅ 已从 SIMPLE_AUTH_USERS 初始化 {bootstrapped_users} 个认证用户")
 
-    # 清理上次进程残留的运行状态（服务器重启后 Agent 已不再运行）
+    try:
+        from src.api.services.workspace_service import reconcile_workspace_mutations
+
+        with SessionLocal() as db:
+            reconciled_workspace_mutations = await reconcile_workspace_mutations(db)
+        if reconciled_workspace_mutations:
+            print(f"⚠️  已收敛 {reconciled_workspace_mutations} 条工作区 prepared mutation")
+    except Exception as e:
+        print(f"⚠️  工作区 mutation 恢复失败，将在首次写入时重试: {e}")
+
+    # 对账运行状态；新鲜 lease 可能属于其他 worker，绝不能 blanket fail。
     try:
         from src.api.models.database import SessionLocal
         from src.api.services.cron_worker import start_cron_worker
@@ -349,7 +372,7 @@ async def startup_event():
             if stale_lock_count:
                 print(f"⚠️  已清理 {stale_lock_count} 条残留的 user_run_locks")
             if stale_cron_count:
-                print(f"⚠️  已清理 {stale_cron_count} 条残留的 cron running 记录")
+                print(f"⚠️  已对账 {stale_cron_count} 条 lease 过期的 cron running 记录")
     except Exception as e:
         print(f"⚠️  清理残留运行状态失败: {e}")
 
@@ -382,10 +405,41 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  工具审批执行 lease reconciler 启动失败: {e}")
 
+    try:
+        from src.api.services.workspace_maintenance import start_workspace_maintenance
+
+        await start_workspace_maintenance(app)
+        print("✅ Workspace 内容对象维护任务已启动")
+    except Exception as e:
+        print(f"⚠️  Workspace 内容对象维护任务启动失败: {e}")
+
+    try:
+        from src.api.services.sandbox_cleanup_service import start_sandbox_cleanup_worker
+
+        await start_sandbox_cleanup_worker(app)
+        print("✅ Sandbox 持久清理任务已启动")
+    except Exception as e:
+        print(f"⚠️  Sandbox 持久清理任务启动失败: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭时停止 cron worker。"""
+    try:
+        from src.api.services.sandbox_cleanup_service import stop_sandbox_cleanup_worker
+
+        await stop_sandbox_cleanup_worker(app)
+    except Exception as e:
+        print(f"⚠️  Sandbox 持久清理任务关闭失败: {e}")
+
+    try:
+        from src.api.services.workspace_maintenance import stop_workspace_maintenance
+
+        await stop_workspace_maintenance(app)
+        print("✅ Workspace 内容对象维护任务已关闭")
+    except Exception as e:
+        print(f"⚠️  Workspace 内容对象维护任务关闭失败: {e}")
+
     try:
         from src.api.services.approval_reconciler import stop_approval_reconciler
 
@@ -409,6 +463,11 @@ app.include_router(
     sessions.router, prefix=f"{settings.api_prefix}/sessions", tags=["会话管理"]
 )
 app.include_router(chat.router, prefix=f"{settings.api_prefix}/chat", tags=["对话"])
+app.include_router(
+    workspace_routes.router,
+    prefix=f"{settings.api_prefix}/workspace",
+    tags=["工作区"],
+)
 app.include_router(models.router, prefix=f"{settings.api_prefix}/models", tags=["模型管理"])
 app.include_router(cron_routes.router, prefix=f"{settings.api_prefix}/cron", tags=["定时任务"])
 app.include_router(config_routes.router, prefix=f"{settings.api_prefix}/config", tags=["配置管理"])

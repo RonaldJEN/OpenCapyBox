@@ -48,10 +48,30 @@ class RoundExistsError extends Error {
  * HTTP 错误：携带状态码，用于 4xx 判断不重试
  */
 class HttpError extends Error {
-  constructor(public readonly status: number, message: string) {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly code?: string,
+    public readonly detail?: Record<string, unknown>,
+  ) {
     super(message);
     this.name = 'HttpError';
   }
+}
+
+function extractErrorDetail(errorText: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(errorText);
+    const detail = parsed?.detail;
+    return detail && typeof detail === 'object' ? detail as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractErrorCode(errorText: string): string | undefined {
+  const detail = extractErrorDetail(errorText);
+  return typeof detail?.code === 'string' ? detail.code : undefined;
 }
 
 /**
@@ -277,7 +297,12 @@ class APIService {
   async getSessions(q?: string): Promise<SessionListResponse> {
     const trimmedQuery = q?.trim();
     const params = trimmedQuery ? { q: trimmedQuery } : undefined;
-    const response = await this.client.get<SessionListResponse>('/sessions/list', { params });
+    const response = await this.client.get<SessionListResponse>('/sessions/list', {
+      params,
+      // 会话清单只用于导航，不能继承 Agent 请求的 60s 长超时；否则
+      // 从工作区切回会话会表现成无限 loading。
+      timeout: 8000,
+    });
     return response.data;
   }
 
@@ -1089,8 +1114,9 @@ class APIService {
   /** 原子保存当前 Session 内的 Markdown 文件。 */
   async updateSessionMarkdown(
     chatSessionId: string,
-    file: Pick<FileInfo, 'path' | 'size' | 'modified'>,
+    file: Pick<FileInfo, 'path' | 'size' | 'modified' | 'revision' | 'edit_base_token'>,
     content: string,
+    saveId?: string,
   ): Promise<FileInfo> {
     const response = await fetch(buildSandboxFileUrl(chatSessionId, file.path, false), {
       method: 'PUT',
@@ -1100,6 +1126,9 @@ class APIService {
       },
       body: JSON.stringify({
         content,
+        expected_revision: file.revision,
+        edit_base_token: file.edit_base_token,
+        save_id: saveId,
         expected_size: file.size,
         expected_modified: file.modified,
       }),
@@ -1107,7 +1136,12 @@ class APIService {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new HttpError(response.status, formatHttpErrorMessage(response.status, errorText));
+      throw new HttpError(
+        response.status,
+        formatHttpErrorMessage(response.status, errorText),
+        extractErrorCode(errorText),
+        extractErrorDetail(errorText),
+      );
     }
 
     return response.json() as Promise<FileInfo>;
@@ -1116,8 +1150,9 @@ class APIService {
   /** 原子保存当前 Session 内的 UTF-8 CSV/XLSX 文件。 */
   async updateSessionSpreadsheet(
     chatSessionId: string,
-    file: Pick<FileInfo, 'path' | 'size' | 'modified'>,
+    file: Pick<FileInfo, 'path' | 'size' | 'modified' | 'revision' | 'edit_base_token'>,
     content: ArrayBuffer,
+    saveId?: string,
   ): Promise<FileInfo> {
     const response = await fetch(buildSandboxFileUrl(chatSessionId, file.path, false), {
       method: 'PUT',
@@ -1127,6 +1162,9 @@ class APIService {
       },
       body: JSON.stringify({
         content_base64: arrayBufferToBase64(content),
+        expected_revision: file.revision,
+        edit_base_token: file.edit_base_token,
+        save_id: saveId,
         expected_size: file.size,
         expected_modified: file.modified,
       }),
@@ -1134,7 +1172,12 @@ class APIService {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new HttpError(response.status, formatHttpErrorMessage(response.status, errorText));
+      throw new HttpError(
+        response.status,
+        formatHttpErrorMessage(response.status, errorText),
+        extractErrorCode(errorText),
+        extractErrorDetail(errorText),
+      );
     }
 
     return response.json() as Promise<FileInfo>;

@@ -12,18 +12,21 @@
 - BINARY_FORMAT_SKILLS: 二進位格式提示
 """
 
+import asyncio
 import base64
 import hashlib
 import json
 import logging
 import posixpath
 import shlex
+import uuid
 from typing import Any, Awaitable, Callable
 
 
 from opensandbox import Sandbox
 
 from .base import Tool, ToolResult
+from .session_file_references import stat_session_file_reference
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,10 @@ AgentConfigSync = Callable[[str, str], Awaitable[None]]
 
 class _SandboxWriteNotDispatchedError(RuntimeError):
     """The sandbox exposes no write API, so no remote mutation was attempted."""
+
+
+class _SandboxWriteConflictError(RuntimeError):
+    """The file changed after the caller read its edit base."""
 
 
 def _normalize_workspace_dir(workspace_dir: str) -> str:
@@ -164,7 +171,67 @@ async def _sandbox_read_text(sandbox: Sandbox, path: str) -> str:
     raise FileNotFoundError(f"File not found or unreadable: {path}")
 
 
-async def _sandbox_write_text(sandbox: Sandbox, path: str, content: str) -> None:
+async def _sandbox_write_text(
+    sandbox: Sandbox,
+    path: str,
+    content: str,
+    *,
+    workspace_dir: str | None = None,
+    expected_sha256: str | None = None,
+    must_not_exist: bool = False,
+) -> None:
+    if workspace_dir and '/sessions/' in workspace_dir and path.startswith(workspace_dir.rstrip('/') + '/'):
+        # The Session editor uses the same per-path lock for its final CAS.
+        # Root config files and Cron execution roots keep their existing behavior.
+        edit_root = posixpath.join(workspace_dir, '.opencapybox-edit')
+        temp = posixpath.join(edit_root, '.' + uuid.uuid4().hex + '.tmp')
+        script = (
+            'import fcntl,hashlib,os,sys\n'
+            f'path={path!r}\ntemp={temp!r}\nroot={edit_root!r}\nexpected={expected_sha256!r}\nmust_not_exist={must_not_exist!r}\n'
+            "lock=os.open(root+'/locks/'+hashlib.sha256(path.encode()).hexdigest(),os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)\n"
+            'try:\n'
+            ' fcntl.flock(lock,fcntl.LOCK_EX)\n'
+            ' if must_not_exist:\n'
+            '  try: os.stat(path,follow_symlinks=False); sys.exit(4)\n'
+            '  except FileNotFoundError: pass\n'
+            ' if expected is not None:\n'
+            '  current_fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)\n'
+            '  try:\n'
+            "   digest=hashlib.sha256(b''.join(iter(lambda:os.read(current_fd,65536),b''))).hexdigest()\n"
+            '  finally:\n'
+            '   os.close(current_fd)\n'
+            '  if digest != expected: sys.exit(3)\n'
+            ' os.replace(temp,path)\n'
+            ' parent=os.open(os.path.dirname(path),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)\n'
+            ' try: os.fsync(parent)\n'
+            ' finally: os.close(parent)\n'
+            'finally:\n'
+            ' os.close(lock)\n'
+            ' if os.path.exists(temp): os.unlink(temp)\n'
+        )
+        async def commit():
+            try:
+                await sandbox.commands.run('mkdir -p -- ' + shlex.quote(edit_root + '/locks'))
+                await _sandbox_write_text(sandbox, temp, content)
+                result = await sandbox.commands.run('python3 -c ' + shlex.quote(script))
+                if _extract_exit_code(result) in {3, 4}:
+                    raise _SandboxWriteConflictError('Session file changed after edit read')
+                if _extract_exit_code(result) != 0:
+                    raise RuntimeError('Session file commit failed')
+            finally:
+                try:
+                    await sandbox.commands.run('rm -f -- ' + shlex.quote(temp))
+                except Exception:
+                    logger.warning('Session tool temp cleanup failed: %s', temp, exc_info=True)
+        task = asyncio.create_task(commit())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
+        return
     write_file = getattr(sandbox.files, "write_file", None)
     if callable(write_file):
         await write_file(path, content)
@@ -236,12 +303,48 @@ def _raw_offsets_for_normalized_indices(
     return offsets
 
 
+def _render_text_edit(
+    raw_content: str,
+    normalized_old_str: str,
+    normalized_new_str: str,
+    *,
+    replace_all: bool,
+) -> tuple[str, int]:
+    line_ending = _detect_edit_line_ending(raw_content)
+    content = _normalize_edit_line_endings(raw_content)
+    match_positions = _find_edit_matches(content, normalized_old_str)
+    match_count = len(match_positions)
+    if match_count == 0:
+        raise ValueError("TEXT_NOT_FOUND")
+    if match_count > 1 and not replace_all:
+        raise ValueError(f"MULTIPLE_MATCHES:{match_count}")
+    replacements = match_count if replace_all else 1
+    selected_positions = match_positions[:replacements]
+    normalized_boundaries = {
+        boundary
+        for position in selected_positions
+        for boundary in (position, position + len(normalized_old_str))
+    }
+    raw_offsets = _raw_offsets_for_normalized_indices(raw_content, normalized_boundaries)
+    rendered_new_str = normalized_new_str.replace("\n", line_ending)
+    parts: list[str] = []
+    raw_cursor = 0
+    for position in selected_positions:
+        raw_start = raw_offsets[position]
+        raw_end = raw_offsets[position + len(normalized_old_str)]
+        parts.append(raw_content[raw_cursor:raw_start])
+        parts.append(rendered_new_str)
+        raw_cursor = raw_end
+    parts.append(raw_content[raw_cursor:])
+    return "".join(parts), replacements
+
+
 async def _classify_text_write(
     sandbox: Sandbox,
     path: str,
     content: str,
-) -> str:
-    """Return CREATED, UPDATED, or NO CHANGE without transferring file content.
+) -> tuple[str, str | None]:
+    """Return the write classification and observed base SHA when it exists.
 
     The primary path hashes the existing file inside the sandbox.  The full-read
     fallback preserves compatibility with sandbox backends that cannot execute
@@ -277,14 +380,14 @@ async def _classify_text_write(
             payload = json.loads(_extract_stdout(result).strip())
             exists = payload.get("exists")
             if exists is False:
-                return "CREATED"
+                return "CREATED", None
             if exists is True:
                 size = payload.get("size")
                 digest = payload.get("sha256")
                 if isinstance(size, int) and size >= 0 and isinstance(digest, str):
                     if size == expected_size and digest == expected_digest:
-                        return "NO CHANGE"
-                    return "UPDATED"
+                        return "NO CHANGE", digest
+                    return "UPDATED", digest
             logger.debug(
                 "sandbox write probe returned invalid metadata for %s; "
                 "falling back to a full read",
@@ -297,11 +400,12 @@ async def _classify_text_write(
         existing = await _sandbox_read_text(sandbox, path)
     except Exception as exc:
         if _is_missing_file_error(exc):
-            return "CREATED"
+            return "CREATED", None
         raise RuntimeError(
             f"Unable to inspect existing file before write: {path} — {exc}"
         ) from exc
-    return "NO CHANGE" if existing == content else "UPDATED"
+    existing_digest = hashlib.sha256(existing.encode("utf-8")).hexdigest()
+    return ("NO CHANGE" if existing == content else "UPDATED"), existing_digest
 
 
 def _uncertain_write_result(path: str, exc: Exception) -> ToolResult:
@@ -471,8 +575,7 @@ class SandboxReadImageTool(Tool):
     def description(self) -> str:
         return (
             "Read one or more sandbox image files and attach them to the next model request as visual context. "
-            "Use this when you need to inspect generated or extracted PNG/JPEG/WebP files in the current workspace. "
-            "Only supports .png, .jpg, .jpeg, and .webp paths inside the current workspace."
+            "Supports .png, .jpg, .jpeg, and .webp files in the current execution Workspace."
         )
 
     @property
@@ -483,7 +586,7 @@ class SandboxReadImageTool(Tool):
                 "paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Image paths, absolute or relative to the current workspace.",
+                    "description": "Image paths, absolute or relative to the current execution Workspace shown in the system context",
                 },
                 "max_images": {
                     "type": "integer",
@@ -606,7 +709,11 @@ class SandboxReadTool(Tool):
     repeat_policy = "read_only"
     manages_model_result_size = True
 
-    def __init__(self, sandbox: Sandbox, workspace_dir: str = "/home/user"):
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        workspace_dir: str = "/home/user",
+    ):
         self._sandbox = sandbox
         self._workspace_dir = _normalize_workspace_dir(workspace_dir)
 
@@ -641,7 +748,7 @@ class SandboxReadTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute or relative path to the file (relative to sandbox workspace root)",
+                    "description": "Absolute path, or a path relative to the current execution Workspace shown in the system context",
                 },
                 "offset": {
                     "type": "integer",
@@ -692,7 +799,6 @@ class SandboxReadTool(Tool):
                     error=f"Cannot read binary file '{path}'. This is a {file_ext} file.\n\n"
                           f"💡 Quick Fix: Run this command directly:\n"
                           f"   {script_cmd} {safe_path}\n\n"
-                          f"Use the quoted path exactly as shown; do not rename, split, or add spaces.\n\n"
                           f"📚 For more options, use: get_skill('{skill_name}')",
                 )
 
@@ -825,7 +931,7 @@ class SandboxWriteTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute or relative path to the file (relative to sandbox workspace root)",
+                    "description": "Absolute path, or a path relative to the current execution Workspace shown in the system context",
                 },
                 "content": {
                     "type": "string",
@@ -846,7 +952,7 @@ class SandboxWriteTool(Tool):
                     error=f"{full_path} is managed by the platform template and cannot be edited.",
                 )
 
-            write_status = await _classify_text_write(
+            write_status, observed_sha256 = await _classify_text_write(
                 self._sandbox,
                 full_path,
                 content,
@@ -858,7 +964,18 @@ class SandboxWriteTool(Tool):
                     full_path,
                     content,
                 )
-                return ToolResult(success=True, content=f"NO CHANGE {full_path}")
+                reference = await stat_session_file_reference(
+                    self._sandbox,
+                    self._workspace_dir,
+                    full_path,
+                )
+                if reference:
+                    reference = {**reference, "operation": "NO_CHANGE"}
+                return ToolResult(
+                    success=True,
+                    content=f"NO CHANGE {full_path}",
+                    assistant_file_references=[reference] if reference else None,
+                )
 
             # 確保父目錄存在（透過 bash 命令）
             parent_dir = posixpath.dirname(full_path)
@@ -867,14 +984,40 @@ class SandboxWriteTool(Tool):
 
             # 寫入文件
             try:
-                await _sandbox_write_text(self._sandbox, full_path, content)
+                write_options: dict[str, Any] = {"workspace_dir": self._workspace_dir}
+                if (
+                    '/sessions/' in self._workspace_dir
+                    and full_path.startswith(self._workspace_dir.rstrip('/') + '/')
+                ):
+                    if observed_sha256 is not None:
+                        write_options["expected_sha256"] = observed_sha256
+                    else:
+                        write_options["must_not_exist"] = True
+                await _sandbox_write_text(self._sandbox, full_path, content, **write_options)
+            except _SandboxWriteConflictError:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error="File changed while applying full write; read the latest content and retry.",
+                )
             except _SandboxWriteNotDispatchedError as exc:
                 return ToolResult(success=False, content="", error=str(exc))
             except Exception as exc:
                 return _uncertain_write_result(full_path, exc)
             await _sync_agent_config_after_write(self._agent_config_sync, full_path, content)
+            reference = await stat_session_file_reference(
+                self._sandbox,
+                self._workspace_dir,
+                full_path,
+            )
+            if reference:
+                reference = {**reference, "operation": write_status}
 
-            return ToolResult(success=True, content=f"{write_status} {full_path}")
+            return ToolResult(
+                success=True,
+                content=f"{write_status} {full_path}",
+                assistant_file_references=[reference] if reference else None,
+            )
 
         except Exception as e:
             return ToolResult(success=False, content="", error=str(e))
@@ -918,7 +1061,7 @@ class SandboxEditTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute or relative path to the file (relative to sandbox workspace root)",
+                    "description": "Absolute path, or a path relative to the current execution Workspace shown in the system context",
                 },
                 "old_str": {
                     "type": "string",
@@ -975,67 +1118,74 @@ class SandboxEditTool(Tool):
                     error=f"{full_path} is managed by the platform template and cannot be edited.",
                 )
 
-            # 讀取當前內容
-            raw_content = await _sandbox_read_text(self._sandbox, full_path)
-            line_ending = _detect_edit_line_ending(raw_content)
-            content = _normalize_edit_line_endings(raw_content)
-
-            match_positions = _find_edit_matches(content, normalized_old_str)
-            match_count = len(match_positions)
-            if match_count == 0:
-                return ToolResult(
-                    success=False,
-                    content="",
-                    error=f"Text not found in file: {old_str}",
-                )
-            if match_count > 1 and not replace_all:
-                return ToolResult(
-                    success=False,
-                    content="",
-                    error=(
-                        f"Found {match_count} matches for old_str in {full_path}. "
-                        "Provide a more specific old_str or set replace_all=true."
-                    ),
-                )
-
-            replacements = match_count if replace_all else 1
-            selected_positions = match_positions[:replacements]
-            normalized_boundaries = {
-                boundary
-                for position in selected_positions
-                for boundary in (
-                    position,
-                    position + len(normalized_old_str),
-                )
-            }
-            raw_offsets = _raw_offsets_for_normalized_indices(
-                raw_content,
-                normalized_boundaries,
+            use_session_cas = (
+                '/sessions/' in self._workspace_dir
+                and full_path.startswith(self._workspace_dir.rstrip('/') + '/')
             )
-            rendered_new_str = normalized_new_str.replace("\n", line_ending)
-            parts: list[str] = []
-            raw_cursor = 0
-            for position in selected_positions:
-                raw_start = raw_offsets[position]
-                raw_end = raw_offsets[position + len(normalized_old_str)]
-                parts.append(raw_content[raw_cursor:raw_start])
-                parts.append(rendered_new_str)
-                raw_cursor = raw_end
-            parts.append(raw_content[raw_cursor:])
-            new_content = "".join(parts)
-
-            # 寫回
-            try:
-                await _sandbox_write_text(self._sandbox, full_path, new_content)
-            except _SandboxWriteNotDispatchedError as exc:
-                return ToolResult(success=False, content="", error=str(exc))
-            except Exception as exc:
-                return _uncertain_write_result(full_path, exc)
+            max_attempts = 2 if use_session_cas else 1
+            replacements = 0
+            new_content = ""
+            for attempt in range(max_attempts):
+                raw_content = await _sandbox_read_text(self._sandbox, full_path)
+                try:
+                    new_content, replacements = _render_text_edit(
+                        raw_content,
+                        normalized_old_str,
+                        normalized_new_str,
+                        replace_all=replace_all,
+                    )
+                except ValueError as exc:
+                    code = str(exc)
+                    if code == "TEXT_NOT_FOUND":
+                        return ToolResult(success=False, content="", error=f"Text not found in file: {old_str}")
+                    if code.startswith("MULTIPLE_MATCHES:"):
+                        match_count = int(code.split(":", 1)[1])
+                        return ToolResult(
+                            success=False,
+                            content="",
+                            error=(
+                                f"Found {match_count} matches for old_str in {full_path}. "
+                                "Provide a more specific old_str or set replace_all=true."
+                            ),
+                        )
+                    raise
+                try:
+                    write_options: dict[str, Any] = {"workspace_dir": self._workspace_dir}
+                    if use_session_cas:
+                        write_options["expected_sha256"] = hashlib.sha256(
+                            raw_content.encode("utf-8")
+                        ).hexdigest()
+                    await _sandbox_write_text(
+                        self._sandbox,
+                        full_path,
+                        new_content,
+                        **write_options,
+                    )
+                    break
+                except _SandboxWriteConflictError:
+                    if attempt + 1 >= max_attempts:
+                        return ToolResult(
+                            success=False,
+                            content="",
+                            error="File changed while applying edit; read the latest content and retry.",
+                        )
+                except _SandboxWriteNotDispatchedError as exc:
+                    return ToolResult(success=False, content="", error=str(exc))
+                except Exception as exc:
+                    return _uncertain_write_result(full_path, exc)
             await _sync_agent_config_after_write(self._agent_config_sync, full_path, new_content)
+            reference = await stat_session_file_reference(
+                self._sandbox,
+                self._workspace_dir,
+                full_path,
+            )
+            if reference:
+                reference = {**reference, "operation": "UPDATED"}
 
             return ToolResult(
                 success=True,
                 content=f"EDITED {full_path} | replacements={replacements}",
+                assistant_file_references=[reference] if reference else None,
             )
 
         except Exception as e:

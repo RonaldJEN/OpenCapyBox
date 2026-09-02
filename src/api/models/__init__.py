@@ -36,6 +36,17 @@ from .mcp import (
     McpConfigVersion,
 )
 from .tool_permission import ToolPermissionRule, ToolApprovalRequest, ToolPermissionAudit
+from .sandbox_cleanup import SandboxCleanupJob
+from .workspace import (
+    UserWorkspace,
+    WorkspaceChangeSet,
+    WorkspaceClaim,
+    WorkspaceContentObject,
+    WorkspaceContentReference,
+    WorkspaceEntry,
+    WorkspaceFileVersion,
+    WorkspaceMutation,
+)
 
 __all__ = [
     # 數據庫基礎
@@ -73,6 +84,15 @@ __all__ = [
     "ToolPermissionRule",
     "ToolApprovalRequest",
     "ToolPermissionAudit",
+    "SandboxCleanupJob",
+    "UserWorkspace",
+    "WorkspaceChangeSet",
+    "WorkspaceClaim",
+    "WorkspaceContentObject",
+    "WorkspaceContentReference",
+    "WorkspaceEntry",
+    "WorkspaceFileVersion",
+    "WorkspaceMutation",
     
     # AG-UI 命名（協議兼容）
     "Thread",  # = Session

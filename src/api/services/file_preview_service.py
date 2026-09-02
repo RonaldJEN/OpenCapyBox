@@ -1,13 +1,14 @@
 """Sandbox-scoped office document preview conversion.
 
 The source file and all conversion work stay inside the user's OpenSandbox.
-The backend never executes LibreOffice against an untrusted document on the
-API host.  Converted PDFs are cached in a hidden directory below the session
-root and therefore disappear with the session workspace.
+The backend never executes LibreOffice against an untrusted document
+on the API host. Converted artifacts stay below the session root and therefore
+disappear with the session workspace.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -27,6 +28,19 @@ MAX_OFFICE_PREVIEW_BYTES = 50 * 1024 * 1024
 MAX_RENDERED_PDF_BYTES = 100 * 1024 * 1024
 OFFICE_PREVIEW_TIMEOUT_SECONDS = 90
 OFFICE_PREVIEW_LOCK_STALE_SECONDS = 180
+OFFICE_PREVIEW_INCOMING_STALE_SECONDS = 300
+
+
+async def _complete_cleanup_before_cancellation(awaitable):
+    """Finish remote cleanup before propagating an HTTP/task cancellation."""
+    task = asyncio.create_task(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        finally:
+            raise
 
 
 class FilePreviewError(RuntimeError):
@@ -91,12 +105,50 @@ def _preview_cache_key(content_digest: str, extension: str) -> str:
     return digest.hexdigest()
 
 
-async def _snapshot_office_source(
+def office_preview_cache_keys(content_digest: str) -> tuple[str, ...]:
+    """Return every Office cache key that can be derived from one content SHA."""
+    normalized_digest = content_digest.lower()
+    if (
+        len(normalized_digest) != 64
+        or any(character not in "0123456789abcdef" for character in normalized_digest)
+    ):
+        raise ValueError("invalid Office preview content digest")
+    return tuple(
+        _preview_cache_key(normalized_digest, extension)
+        for extension in sorted(OFFICE_PDF_EXTENSIONS)
+    )
+
+
+def _trusted_preview_cache_key(
+    source_sha256: str | None,
+    source_size: int | None,
+    extension: str,
+) -> str | None:
+    """Resolve an immutable Workspace object's cache key without reading it."""
+    if source_sha256 is None and source_size is None:
+        return None
+    if source_sha256 is None or source_size is None:
+        raise FilePreviewUnavailableError("文件版本元数据不完整")
+    normalized_sha256 = source_sha256.lower()
+    if (
+        len(normalized_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in normalized_sha256)
+        or source_size < 0
+    ):
+        raise FilePreviewUnavailableError("文件版本元数据无效")
+    if source_size > MAX_OFFICE_PREVIEW_BYTES:
+        raise FilePreviewTooLargeError("文件超过 50 MiB，请下载后查看")
+    return _preview_cache_key(normalized_sha256, extension)
+
+
+async def _snapshot_bounded_source(
     sandbox,
     *,
     source_path: str,
     snapshot_path: str,
-    extension: str,
+    max_bytes: int,
+    too_large_message: str,
+    cleanup_stale_incoming_seconds: int | None = None,
 ) -> tuple[str, int]:
     """Copy/hash a bounded source in one sandbox process.
 
@@ -106,14 +158,29 @@ async def _snapshot_office_source(
     """
 
     script = f"""python3 - <<'PY'
-import hashlib, json, os
+import hashlib, json, os, re, shutil, time
 source = {json.dumps(source_path)}
 destination = {json.dumps(snapshot_path)}
-limit = {MAX_OFFICE_PREVIEW_BYTES}
+limit = {max_bytes}
+stale_incoming_seconds = {cleanup_stale_incoming_seconds!r}
 digest = hashlib.sha256()
 total = 0
 result = {{"ok": False, "reason": "unavailable"}}
 try:
+    if stale_incoming_seconds is not None:
+        incoming_dir = os.path.dirname(destination)
+        cache_root = os.path.dirname(incoming_dir)
+        pattern = re.compile(r'^\\.incoming-[0-9a-f]{{32}}$')
+        if os.path.isdir(cache_root) and not os.path.islink(cache_root):
+            now = time.time()
+            for entry in os.scandir(cache_root):
+                if (
+                    entry.path != incoming_dir
+                    and pattern.fullmatch(entry.name)
+                    and entry.is_dir(follow_symlinks=False)
+                    and now - entry.stat(follow_symlinks=False).st_mtime > stale_incoming_seconds
+                ):
+                    shutil.rmtree(entry.path)
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     with open(source, "rb") as reader, open(destination, "xb") as writer:
         while True:
@@ -149,7 +216,7 @@ PY"""
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise FilePreviewUnavailableError("无法读取待预览文件") from exc
     if payload.get("reason") == "too_large":
-        raise FilePreviewTooLargeError("文件超过 50 MiB，请下载后查看")
+        raise FilePreviewTooLargeError(too_large_message)
     if payload.get("reason") == "missing":
         raise FilePreviewSourceNotFoundError("文件不存在或无法读取")
     if payload.get("ok") is not True:
@@ -160,6 +227,24 @@ PY"""
         raise FilePreviewUnavailableError("无法读取待预览文件")
     if not isinstance(content_digest, str) or len(content_digest) != 64:
         raise FilePreviewUnavailableError("无法读取待预览文件")
+    return content_digest, size
+
+
+async def _snapshot_office_source(
+    sandbox,
+    *,
+    source_path: str,
+    snapshot_path: str,
+    extension: str,
+) -> tuple[str, int]:
+    content_digest, size = await _snapshot_bounded_source(
+        sandbox,
+        source_path=source_path,
+        snapshot_path=snapshot_path,
+        max_bytes=MAX_OFFICE_PREVIEW_BYTES,
+        too_large_message="文件超过 50 MiB，请下载后查看",
+        cleanup_stale_incoming_seconds=OFFICE_PREVIEW_INCOMING_STALE_SECONDS,
+    )
     return _preview_cache_key(content_digest, extension), size
 
 
@@ -224,12 +309,96 @@ async def _release_cache_lock(sandbox, lock_path: str) -> None:
         logger.debug("Failed to release preview cache lock", exc_info=True)
 
 
+async def _prune_office_preview_cache(
+    sandbox,
+    *,
+    cache_root: str,
+    max_bytes: int,
+    protected_cache_key: str,
+) -> None:
+    """Delete oldest complete cache directories without touching active work."""
+
+    if max_bytes <= 0:
+        return
+    script = f"""python3 - <<'PY'
+import json, os, re, shutil, stat
+root = {json.dumps(cache_root)}
+limit = {int(max_bytes)}
+protected = {json.dumps(protected_cache_key)}
+entries = []
+total = 0
+try:
+    names = os.listdir(root)
+except FileNotFoundError:
+    names = []
+for name in names:
+    if not re.fullmatch(r'[0-9a-f]{{64}}', name):
+        continue
+    directory = os.path.join(root, name)
+    try:
+        directory_stat = os.lstat(directory)
+        if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
+            continue
+        if os.path.isdir(os.path.join(directory, '.lock')):
+            continue
+        pdf_path = os.path.join(directory, 'source.pdf')
+        pdf_stat = os.lstat(pdf_path)
+        if not stat.S_ISREG(pdf_stat.st_mode) or stat.S_ISLNK(pdf_stat.st_mode):
+            continue
+    except OSError:
+        continue
+    size = int(pdf_stat.st_size)
+    total += size
+    entries.append((float(pdf_stat.st_mtime), name, directory, size))
+removed = 0
+for _mtime, name, directory, size in sorted(entries):
+    if total <= limit:
+        break
+    if name == protected:
+        continue
+    try:
+        shutil.rmtree(directory)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        continue
+    total -= size
+    removed += size
+print(json.dumps({{'removed_bytes': removed, 'remaining_bytes': total}}))
+PY"""
+    result = await _run_command(sandbox, script)
+    if _command_exit_code(result) != 0:
+        logger.warning("Office preview cache pruning failed root=%s", cache_root)
+
+
+async def _touch_and_prune_office_preview_cache(
+    sandbox,
+    *,
+    pdf_path: str,
+    cache_root: str,
+    cache_key: str,
+    cache_max_bytes: int | None,
+) -> None:
+    await _run_command(sandbox, f"touch -- {shlex.quote(pdf_path)}")
+    if cache_max_bytes is not None:
+        await _prune_office_preview_cache(
+            sandbox,
+            cache_root=cache_root,
+            max_bytes=cache_max_bytes,
+            protected_cache_key=cache_key,
+        )
+
+
 async def render_office_document_to_pdf(
     sandbox,
     *,
     source_filename: str,
     source_path: str,
     session_root: str,
+    cache_max_bytes: int | None = None,
+    cache_root: str | None = None,
+    source_sha256: str | None = None,
+    source_size: int | None = None,
 ) -> RenderedOfficePreview:
     """Convert a Word/PowerPoint file to a cached PDF inside OpenSandbox."""
 
@@ -238,26 +407,35 @@ async def render_office_document_to_pdf(
         raise FilePreviewUnsupportedError("此文件类型不支持转换为 PDF")
 
     request_key = uuid.uuid4().hex
+    effective_cache_root = cache_root or posixpath.join(session_root, ".opencapybox-preview")
     incoming_dir = posixpath.join(
-        session_root,
-        ".opencapybox-preview",
+        effective_cache_root,
         f".incoming-{request_key}",
     )
     snapshot_path = posixpath.join(incoming_dir, f"source{extension}")
     profile_path = posixpath.join("/tmp", f"opencapybox-lo-{request_key}")
     owns_lock = False
     lock_path = ""
+    cleanup_paths: list[str] = []
 
     try:
-        cache_key, _source_size = await _snapshot_office_source(
-            sandbox,
-            source_path=source_path,
-            snapshot_path=snapshot_path,
-            extension=extension,
+        trusted_cache_key = _trusted_preview_cache_key(
+            source_sha256,
+            source_size,
+            extension,
         )
+        if trusted_cache_key is None:
+            cleanup_paths.append(incoming_dir)
+            cache_key, _source_size = await _snapshot_office_source(
+                sandbox,
+                source_path=source_path,
+                snapshot_path=snapshot_path,
+                extension=extension,
+            )
+        else:
+            cache_key = trusted_cache_key
         cache_dir = posixpath.join(
-            session_root,
-            ".opencapybox-preview",
+            effective_cache_root,
             cache_key,
         )
         pdf_path = posixpath.join(cache_dir, "source.pdf")
@@ -268,6 +446,13 @@ async def render_office_document_to_pdf(
             if cached_size > MAX_RENDERED_PDF_BYTES:
                 await _run_command(sandbox, f"rm -f -- {shlex.quote(pdf_path)}")
                 raise FilePreviewTooLargeError("转换后的 PDF 超过 100 MiB，请下载后查看")
+            await _touch_and_prune_office_preview_cache(
+                sandbox,
+                pdf_path=pdf_path,
+                cache_root=effective_cache_root,
+                cache_key=cache_key,
+                cache_max_bytes=cache_max_bytes,
+            )
             return RenderedOfficePreview(
                 sandbox_path=pdf_path,
                 filename=f"{posixpath.splitext(source_filename)[0]}.pdf",
@@ -286,6 +471,13 @@ async def render_office_document_to_pdf(
             if cached_size:
                 if cached_size > MAX_RENDERED_PDF_BYTES:
                     raise FilePreviewTooLargeError("转换后的 PDF 超过 100 MiB，请下载后查看")
+                await _touch_and_prune_office_preview_cache(
+                    sandbox,
+                    pdf_path=pdf_path,
+                    cache_root=effective_cache_root,
+                    cache_key=cache_key,
+                    cache_max_bytes=cache_max_bytes,
+                )
                 return RenderedOfficePreview(
                     sandbox_path=pdf_path,
                     filename=f"{posixpath.splitext(source_filename)[0]}.pdf",
@@ -302,6 +494,13 @@ async def render_office_document_to_pdf(
             if cached_size > MAX_RENDERED_PDF_BYTES:
                 await _run_command(sandbox, f"rm -f -- {shlex.quote(pdf_path)}")
                 raise FilePreviewTooLargeError("转换后的 PDF 超过 100 MiB，请下载后查看")
+            await _touch_and_prune_office_preview_cache(
+                sandbox,
+                pdf_path=pdf_path,
+                cache_root=effective_cache_root,
+                cache_key=cache_key,
+                cache_max_bytes=cache_max_bytes,
+            )
             return RenderedOfficePreview(
                 sandbox_path=pdf_path,
                 filename=f"{posixpath.splitext(source_filename)[0]}.pdf",
@@ -309,7 +508,19 @@ async def render_office_document_to_pdf(
                 size=cached_size,
             )
 
+        if trusted_cache_key is not None:
+            cleanup_paths.append(incoming_dir)
+            observed_cache_key, observed_size = await _snapshot_office_source(
+                sandbox,
+                source_path=source_path,
+                snapshot_path=snapshot_path,
+                extension=extension,
+            )
+            if observed_cache_key != trusted_cache_key or observed_size != source_size:
+                raise FilePreviewConversionError("文件内容与版本元数据不一致")
+
         await _run_command(sandbox, f"rm -f -- {shlex.quote(pdf_path)}")
+        cleanup_paths.append(profile_path)
         work_result = await _run_command(sandbox, f"mkdir -p {shlex.quote(profile_path)}")
         if _command_exit_code(work_result) != 0:
             raise FilePreviewUnavailableError("无法创建预览工作目录")
@@ -373,6 +584,14 @@ async def render_office_document_to_pdf(
             await _run_command(sandbox, f"rm -f -- {shlex.quote(pdf_path)}")
             raise FilePreviewUnavailableError("转换后的 PDF 校验失败")
 
+        await _touch_and_prune_office_preview_cache(
+            sandbox,
+            pdf_path=pdf_path,
+            cache_root=effective_cache_root,
+            cache_key=cache_key,
+            cache_max_bytes=cache_max_bytes,
+        )
+
         return RenderedOfficePreview(
             sandbox_path=pdf_path,
             filename=f"{posixpath.splitext(source_filename)[0]}.pdf",
@@ -380,9 +599,16 @@ async def render_office_document_to_pdf(
             size=published_size,
         )
     finally:
-        await _cleanup_preview_working_files(sandbox, incoming_dir, profile_path)
-        if owns_lock and lock_path:
-            await _release_cache_lock(sandbox, lock_path)
+        try:
+            if cleanup_paths:
+                await _complete_cleanup_before_cancellation(
+                    _cleanup_preview_working_files(sandbox, *cleanup_paths)
+                )
+        finally:
+            if owns_lock and lock_path:
+                await _complete_cleanup_before_cancellation(
+                    _release_cache_lock(sandbox, lock_path)
+                )
 
 
 def _command_stdout_text(execution) -> str:

@@ -142,6 +142,29 @@ class TestManageCronToolAdd:
         mock_db.add.assert_not_called()
         mock_db.commit.assert_not_called()
 
+
+class TestManageCronToolUpdate:
+    @pytest.mark.asyncio
+    async def test_update_prompt(self, tool_and_db):
+        tool, _ = tool_and_db
+        with patch("src.api.services.cron_service.CronService") as svc_cls:
+            job = svc_cls.return_value.update_job.return_value
+            job.name = "daily"
+            job.cron_expr = "0 9 * * *"
+            job.definition_version = 2
+
+            result = await tool.execute(
+                action="update",
+                name="daily",
+                content="更新工作区日报",
+            )
+
+        assert result.success is True
+        kwargs = svc_cls.return_value.update_job.call_args.kwargs
+        assert kwargs["content"] == "更新工作区日报"
+        assert "定义版本：2" in result.content
+
+
 class TestManageCronToolRemove:
     """remove action 测试"""
 
@@ -344,8 +367,9 @@ class TestManageCronToolSchema:
         assert params["type"] == "object"
         assert "action" in params["properties"]
         assert params["properties"]["action"]["enum"] == [
-            "add", "remove", "list", "toggle", "history"
+            "add", "update", "remove", "list", "toggle", "history"
         ]
+        assert "workspace_access" not in params["properties"]
 
     def test_to_openai_schema(self):
         from src.agent.tools.cron_tool import ManageCronTool

@@ -5,9 +5,11 @@ import contextvars
 import inspect
 import json
 import logging
+import posixpath
+import shlex
 import uuid
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, AsyncIterator, Any
+from typing import List, Dict, Optional, AsyncIterator, Any, Callable
 
 from opensandbox import Sandbox
 from sqlalchemy import func
@@ -24,12 +26,14 @@ from src.agent.schema.run_context import (
     LLMRequestContext,
     RequestedReasoningContext,
     RequestedTurnPreferencesContext,
+    PendingFileDraftRef,
     ResolvedMcpConnectionRef,
     ResolvedReasoningContext,
     ResolvedSkillRef,
     ResolvedTurnPreferencesContext,
     current_run_context,
     parse_requested_reasoning_contexts,
+    parse_pending_file_draft_contexts,
     parse_requested_turn_preferences_contexts,
     requested_turn_preferences_to_context,
     resolve_reasoning_selection,
@@ -128,6 +132,19 @@ class PreparedAgentRun:
     tool_approval_resolution: str | None = None
 
 
+@dataclass(frozen=True)
+class _StagedWorkspaceAttachment:
+    entry_id: str
+    version_id: str | None
+    destination_relative_path: str
+
+
+@dataclass
+class _WorkspaceAttachmentCapture:
+    capture_id: str
+    items: list[_StagedWorkspaceAttachment] = field(default_factory=list)
+
+
 settings = get_settings()
 
 
@@ -167,10 +184,7 @@ def _render_mcp_connections_runtime_prompt(connections: object) -> str:
         return ""
 
     entries.sort(key=lambda item: (item[0].casefold(), item[1].casefold()))
-    lines = [
-        "## 数据连接",
-        "按请求语义自动匹配并优先调用 `mcp_tool_search`：",
-    ]
+    lines = ["## 数据连接"]
     lines.extend(
         f"- {name}：{description}" if description else f"- {name}"
         for name, description in entries
@@ -199,6 +213,11 @@ class AgentService:
         allow_human_interrupts: bool = True,
         restore_history: bool = True,
         persist_context_checkpoint: bool = True,
+        workspace_access: str = "manage",
+        workspace_actor: str = "chat",
+        workspace_fence: Callable[[DBSession], None] | None = None,
+        workspace_change_recorder: Callable[[DBSession, dict[str, Any]], None] | None = None,
+        workspace_context: dict[str, Any] | None = None,
     ):
         self.sandbox = sandbox
         self.history_service = history_service
@@ -210,6 +229,13 @@ class AgentService:
         self.allow_human_interrupts = allow_human_interrupts
         self.restore_history = restore_history
         self.persist_context_checkpoint = persist_context_checkpoint
+        if workspace_access not in {"none", "read", "edit", "manage"}:
+            raise ValueError("workspace_access 必须为 none/read/edit/manage")
+        self.workspace_access = workspace_access
+        self.workspace_actor = workspace_actor
+        self.workspace_fence = workspace_fence
+        self.workspace_change_recorder = workspace_change_recorder
+        self.workspace_context = dict(workspace_context or {})
         self.agent: Agent | None = None
         self._model_config = None
         self._last_saved_index = 0
@@ -335,6 +361,11 @@ class AgentService:
             supports_image=model_config.supports_image,
             max_images=model_config.max_images,
             build_metadata=tool_build_metadata,
+            workspace_access=self.workspace_access,
+            workspace_actor=self.workspace_actor,
+            workspace_fence=self.workspace_fence,
+            workspace_change_recorder=self.workspace_change_recorder,
+            workspace_context=self.workspace_context,
         )
         exact_mcp_fingerprint = tool_build_metadata.get("mcp_catalog_fingerprint")
         self.mcp_catalog_fingerprint = (
@@ -646,6 +677,12 @@ class AgentService:
                 allow_human_interrupts=False,
                 restore_history=False,
                 persist_context_checkpoint=False,
+                workspace_access={
+                    "research": "read",
+                    "write": "edit",
+                    "general": "manage",
+                }.get(profile.name, "none"),
+                workspace_actor="chat",
             )
             await child_service.initialize_agent()
             child_service.cancel_token = context.cancel_token
@@ -733,6 +770,23 @@ class AgentService:
             if child_status != SubagentRun.COMPLETED:
                 return ToolResult(success=False, error=child_error or "sub-agent failed")
 
+            child_file_references: list[dict[str, Any]] = []
+            child_history._rebuild_steps_from_events(
+                child_run_id,
+                assistant_file_references=child_file_references,
+            )
+            deduplicated_child_references: dict[str, dict[str, Any]] = {}
+            for reference in child_file_references:
+                identity = (
+                    f"workspace:{reference.get('entry_id')}"
+                    if reference.get("source") == "workspace"
+                    else (
+                        f"session:{reference.get('session_id')}:"
+                        f"{reference.get('path')}"
+                    )
+                )
+                deduplicated_child_references[identity] = reference
+
             return ToolResult(
                 success=True,
                 content=self._subagent_tool_result_content(
@@ -743,6 +797,9 @@ class AgentService:
                     model_id=model_id,
                     output=child_output,
                 ),
+                assistant_file_references=list(
+                    deduplicated_child_references.values()
+                ) or None,
             )
 
         except Exception as exc:
@@ -1502,7 +1559,8 @@ class AgentService:
             elif block_type == "file":
                 file_obj = block.get("file") or {}
                 name = file_obj.get("name") or file_obj.get("path") or "file"
-                attachment_parts.append(f"[附件文件:{name}]")
+                label = "附件文件夹" if file_obj.get("kind") == "directory" else "附件文件"
+                attachment_parts.append(f"[{label}:{name}]")
             elif block_type == "video_url":
                 attachment_parts.append("[附件视频]")
 
@@ -1525,14 +1583,33 @@ class AgentService:
                 file_obj = block.get("file") or {}
                 path = file_obj.get("path")
                 if path:
-                    attachments.append(
-                        {
-                            "path": path,
-                            "name": file_obj.get("name") or PathlibPath(path).name,
-                            "type": file_obj.get("mime_type") or "",
-                            "size": AgentService._parse_file_size(file_obj.get("size")),
-                        }
-                    )
+                    attachment = {
+                        "path": path,
+                        "name": file_obj.get("name") or PathlibPath(path).name,
+                        "type": file_obj.get("mime_type") or "",
+                        "size": AgentService._parse_file_size(file_obj.get("size")),
+                    }
+                    if file_obj.get("source") == "workspace":
+                        attachment.update({
+                            "source": "workspace",
+                            "entry_id": file_obj.get("entry_id"),
+                            "revision": file_obj.get("revision"),
+                            "origin_path": file_obj.get("origin_path"),
+                            "snapshot_path": file_obj.get("snapshot_path") or path,
+                            "sha256": file_obj.get("sha256"),
+                        })
+                        if file_obj.get("version_id"):
+                            attachment["version_id"] = file_obj.get("version_id")
+                        if file_obj.get("version_sequence") is not None:
+                            attachment["version_sequence"] = file_obj.get("version_sequence")
+                        if file_obj.get("kind") == "directory":
+                            attachment.update({
+                                "kind": "directory",
+                                "is_directory": True,
+                                "tree_revision": file_obj.get("tree_revision"),
+                                "manifest_sha256": file_obj.get("manifest_sha256"),
+                            })
+                    attachments.append(attachment)
             elif block_type == "image_url":
                 file_obj = block.get("file") or {}
                 path = file_obj.get("path")
@@ -1568,6 +1645,438 @@ class AgentService:
             else:
                 raise ValueError(f"不支持的 content block 类型: {type(block)}")
         return normalized
+
+    async def _materialize_workspace_attachments(
+        self,
+        blocks: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], _WorkspaceAttachmentCapture | None]:
+        """Freeze workspace references into the current execution directory."""
+        workspace_blocks = [
+            block
+            for block in blocks
+            if block.get("type") == "file"
+            and isinstance(block.get("file"), dict)
+            and (block.get("file") or {}).get("source") == "workspace"
+        ]
+        if not workspace_blocks:
+            return blocks, None
+
+        from src.api.services.workspace_service import WorkspaceError, WorkspaceService
+
+        db = self._get_db_session_factory()()
+        capture = _WorkspaceAttachmentCapture(uuid.uuid4().hex)
+        try:
+            service = WorkspaceService(db, sandbox=self.sandbox)
+            for block in workspace_blocks:
+                file_obj = dict(block.get("file") or {})
+                entry_id = file_obj.get("entry_id")
+                version_id = file_obj.get("version_id")
+                if not isinstance(entry_id, str) or not entry_id:
+                    raise ValueError("workspace 附件缺少 entry_id")
+
+                stage_kwargs: dict[str, Any] = {
+                    "expected_revision": None,
+                    "destination_root": self._workspace_dir,
+                    "snapshot_id": capture.capture_id,
+                }
+                if isinstance(version_id, str) and version_id:
+                    stage_kwargs["version_id"] = version_id
+                try:
+                    staged = await service.stage_entry(
+                        self.user_id,
+                        entry_id,
+                        **stage_kwargs,
+                    )
+                except WorkspaceError as exc:
+                    if version_id or exc.code != "REVISION_CONFLICT":
+                        raise
+                    staged = await service.stage_entry(
+                        self.user_id,
+                        entry_id,
+                        **stage_kwargs,
+                    )
+                entry = staged.entry
+                capture.items.append(_StagedWorkspaceAttachment(
+                    entry_id=str(entry.entry_id),
+                    version_id=(
+                        str(getattr(staged, "version_id", ""))
+                        if getattr(staged, "version_id", None) else None
+                    ),
+                    destination_relative_path=staged.destination_relative_path,
+                ))
+                file_obj.update({
+                    "source": "workspace",
+                    "entry_id": entry.entry_id,
+                    "revision": str(staged.source_revision),
+                    "kind": entry.kind,
+                    "origin_path": entry.relative_path,
+                    "path": staged.destination_relative_path,
+                    "snapshot_path": staged.destination_relative_path,
+                    "name": entry.name,
+                    "mime_type": entry.mime_type or (
+                        "inode/directory" if entry.kind == "directory" else None
+                    ),
+                    "size": int(staged.size_bytes),
+                    "sha256": staged.sha256,
+                })
+                if getattr(staged, "version_id", None):
+                    file_obj["version_id"] = staged.version_id
+                if getattr(staged, "version_sequence", None) is not None:
+                    file_obj["version_sequence"] = int(staged.version_sequence)
+                if entry.kind == "directory":
+                    file_obj["tree_revision"] = staged.tree_revision
+                    file_obj["manifest_sha256"] = staged.sha256
+                block["file"] = file_obj
+            return blocks, capture
+        except BaseException:
+            await self._discard_workspace_attachment_capture(capture)
+            raise
+        finally:
+            db.close()
+
+    async def _discard_workspace_attachment_capture(
+        self,
+        capture: _WorkspaceAttachmentCapture,
+    ) -> None:
+        if not capture.items:
+            return
+        from src.api.models.user_sandbox import UserSandbox
+        from src.api.services.sandbox_cleanup_service import enqueue_cleanup, run_cleanup_job
+        from src.api.services.workspace_service import WorkspaceService
+
+        cleanup_ids: list[str] = []
+        db = self._get_db_session_factory()()
+        try:
+            service = WorkspaceService(db, sandbox=self.sandbox)
+            sandbox_row = db.query(UserSandbox).filter(
+                UserSandbox.user_id == self.user_id,
+            ).one_or_none()
+            for item in capture.items:
+                parent_path = posixpath.dirname(item.destination_relative_path)
+                service.release_content_references(
+                    self.user_id,
+                    reference_kind="stage_snapshot",
+                    reference_key_prefix=f"{self._workspace_dir}:{parent_path}",
+                    commit=False,
+                )
+                if sandbox_row is not None and sandbox_row.sandbox_id:
+                    cleanup_ids.append(enqueue_cleanup(
+                        db,
+                        user_id=self.user_id,
+                        owner_kind="attachment_capture",
+                        owner_id=capture.capture_id,
+                        sandbox_id=str(sandbox_row.sandbox_id),
+                        profile_id=sandbox_row.active_profile_id,
+                        profile_version=sandbox_row.active_profile_version,
+                        mount_path=get_sandbox_service().get_mount_path(self.user_id),
+                        relative_path=(
+                            f"sessions/{self.session_id}/.workspace-snapshots/"
+                            f"{item.entry_id}/{capture.capture_id}"
+                        ),
+                    ))
+            db.commit()
+        finally:
+            db.close()
+        for cleanup_id in cleanup_ids:
+            await run_cleanup_job(cleanup_id)
+
+    def _commit_workspace_attachment_capture(
+        self,
+        capture: _WorkspaceAttachmentCapture | None,
+        *,
+        run_id: str,
+    ) -> None:
+        if capture is None:
+            return
+        from src.api.services.workspace_service import WorkspaceService
+
+        db = self._get_db_session_factory()()
+        try:
+            service = WorkspaceService(db, sandbox=self.sandbox)
+            for item in capture.items:
+                if item.version_id:
+                    service.protect_version_reference(
+                        self.user_id,
+                        item.version_id,
+                        reference_kind="round_attachment",
+                        reference_key=(
+                            f"{self.session_id}:{run_id}:"
+                            f"{item.entry_id}:{item.version_id}"
+                        ),
+                        commit=False,
+                        entry_id=item.entry_id,
+                    )
+                service.release_content_references(
+                    self.user_id,
+                    reference_kind="stage_snapshot",
+                    reference_key_prefix=(
+                        f"{self._workspace_dir}:"
+                        f"{posixpath.dirname(item.destination_relative_path)}"
+                    ),
+                    commit=False,
+                )
+            db.commit()
+        finally:
+            db.close()
+
+    @staticmethod
+    def _sandbox_command_stdout(execution: Any) -> str:
+        logs = getattr(execution, "logs", None)
+        lines = getattr(logs, "stdout", None) if logs is not None else None
+        if not lines:
+            return ""
+        if isinstance(lines, str):
+            return lines
+        return "\n".join(
+            str(getattr(line, "text", line))
+            for line in lines
+        )
+
+    async def _capture_session_assistant_file(
+        self,
+        reference: dict[str, Any],
+        *,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        """Freeze one mutable Session file before its structured event commits."""
+
+        relative_path = posixpath.normpath(str(reference.get("path") or "").replace("\\", "/"))
+        revision = str(reference.get("revision") or "")
+        if (
+            not relative_path
+            or relative_path in {".", ".."}
+            or posixpath.isabs(relative_path)
+            or relative_path.startswith("../")
+            or any(segment.startswith(".") for segment in relative_path.split("/"))
+        ):
+            return None
+        revision_parts = revision.split(":")
+        if len(revision_parts) != 3 or revision_parts[0] != "v1":
+            return None
+        try:
+            expected_size = int(revision_parts[1])
+            expected_mtime_ns = int(revision_parts[2])
+        except ValueError:
+            return None
+        if expected_size < 0 or expected_mtime_ns < 0:
+            return None
+
+        name = posixpath.basename(relative_path)
+        capture_token = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{self.session_id}:{run_id}:{relative_path}:{revision}",
+        ).hex
+        snapshot_path = f".assistant-artifacts/{run_id}/{capture_token}/{name}"
+        source_path = posixpath.join(self._workspace_dir, relative_path)
+        destination_path = posixpath.join(self._workspace_dir, snapshot_path)
+        script = (
+            "import hashlib,json,os,stat,sys,uuid\n"
+            f"source={source_path!r}\n"
+            f"destination={destination_path!r}\n"
+            f"expected_size={expected_size!r}\n"
+            f"expected_mtime_ns={expected_mtime_ns!r}\n"
+            "try:\n"
+            " source_stat=os.lstat(source)\n"
+            "except OSError:\n"
+            " sys.exit(2)\n"
+            "if stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISREG(source_stat.st_mode):\n"
+            " sys.exit(3)\n"
+            "if int(source_stat.st_size)!=expected_size or int(source_stat.st_mtime_ns)!=expected_mtime_ns:\n"
+            " sys.exit(4)\n"
+            "os.makedirs(os.path.dirname(destination),mode=0o700,exist_ok=True)\n"
+            "source_flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)\n"
+            "source_fd=os.open(source,source_flags)\n"
+            "digest=hashlib.sha256()\n"
+            "temp=destination+'.'+uuid.uuid4().hex+'.tmp'\n"
+            "try:\n"
+            " current=os.fstat(source_fd)\n"
+            " if int(current.st_size)!=expected_size or int(current.st_mtime_ns)!=expected_mtime_ns:\n"
+            "  sys.exit(4)\n"
+            " src=os.fdopen(source_fd,'rb',closefd=True)\n"
+            " source_fd=-1\n"
+            " with src,open(temp,'xb') as dst:\n"
+            "  while True:\n"
+            "   chunk=src.read(1024*1024)\n"
+            "   if not chunk:\n"
+            "    break\n"
+            "   digest.update(chunk)\n"
+            "   dst.write(chunk)\n"
+            "  dst.flush()\n"
+            "  os.fsync(dst.fileno())\n"
+            " if os.path.exists(destination):\n"
+            "  existing=hashlib.sha256()\n"
+            "  with open(destination,'rb') as handle:\n"
+            "   for chunk in iter(lambda:handle.read(1024*1024),b''):\n"
+            "    existing.update(chunk)\n"
+            "  if existing.hexdigest()!=digest.hexdigest():\n"
+            "   sys.exit(5)\n"
+            "  os.unlink(temp)\n"
+            " else:\n"
+            "  os.replace(temp,destination)\n"
+            " os.chmod(destination,0o400)\n"
+            " print(json.dumps({'sha256':digest.hexdigest(),'size':expected_size},separators=(',',':')))\n"
+            "finally:\n"
+            " if source_fd>=0:\n"
+            "  os.close(source_fd)\n"
+            " try:\n"
+            "  if os.path.exists(temp): os.unlink(temp)\n"
+            " except OSError:\n"
+            "  pass\n"
+        )
+        execution = await self.sandbox.commands.run(
+            "python3 -c " + shlex.quote(script)
+        )
+        if getattr(execution, "error", None):
+            return None
+        stdout = self._sandbox_command_stdout(execution).strip()
+        if not stdout:
+            return None
+        try:
+            captured = json.loads(stdout.splitlines()[-1])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(captured, dict) or captured.get("size") != expected_size:
+            return None
+        return {
+            "ref_id": f"session:{self.session_id}:{run_id}:{capture_token}",
+            "source": "session",
+            "session_id": self.session_id,
+            "name": name,
+            "path": relative_path,
+            "snapshot_path": snapshot_path,
+            "size": expected_size,
+            "modified": str(reference.get("modified") or ""),
+            "type": str(reference.get("type") or ""),
+            "revision": revision,
+            "sha256": str(captured.get("sha256") or ""),
+            "operation": str(reference.get("operation") or "UPDATED"),
+            "toolCallId": reference.get("toolCallId"),
+        }
+
+    def _protect_workspace_assistant_file(
+        self,
+        reference: dict[str, Any],
+        *,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        """Validate and pin one immutable Workspace version for Round history."""
+
+        entry_id = str(reference.get("entry_id") or "")
+        version_id = str(
+            reference.get("version_id")
+            or reference.get("current_version_id")
+            or ""
+        )
+        path = str(reference.get("workspace_path") or reference.get("path") or "")
+        name = str(reference.get("name") or posixpath.basename(path))
+        operation = str(reference.get("operation") or "").upper()
+        if (
+            not entry_id
+            or not version_id
+            or not path
+            or not name
+            or (
+                reference.get("kind") != "file"
+                and not (reference.get("source") == "workspace" and reference.get("kind") is None)
+            )
+            or str(reference.get("status") or "active") != "active"
+            or operation in {"NO_CHANGE", "DELETED"}
+        ):
+            return None
+        from src.api.services.workspace_service import WorkspaceService
+
+        WorkspaceService(self.history_service.db, sandbox=self.sandbox).protect_version_reference(
+            self.user_id,
+            version_id,
+            reference_kind="round_attachment",
+            reference_key=(
+                f"{self.session_id}:{run_id}:assistant:{entry_id}:{version_id}"
+            ),
+            commit=False,
+            entry_id=entry_id,
+        )
+        return {
+            "ref_id": f"workspace:{entry_id}:{version_id}",
+            "source": "workspace",
+            "entry_id": entry_id,
+            "name": name,
+            "path": path,
+            "workspace_path": path,
+            "size": int(reference.get("size") or reference.get("size_bytes") or 0),
+            "modified": str(reference.get("modified") or ""),
+            "type": str(
+                reference.get("type")
+                or (name.rsplit(".", 1)[-1].lower() if "." in name else "")
+            ),
+            "revision": str(reference.get("revision") or ""),
+            "version_id": version_id,
+            "operation": operation or "UPDATED",
+            "toolCallId": reference.get("toolCallId") or reference.get("tool_call_id"),
+        }
+
+    async def _materialize_assistant_file_reference(
+        self,
+        value: Any,
+        *,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        if value.get("source") == "session":
+            if str(value.get("operation") or "").upper() == "DELETED":
+                path = str(value.get("path") or "")
+                name = str(value.get("name") or posixpath.basename(path))
+                revision = str(value.get("revision") or "")
+                if not path or not name or not revision:
+                    return None
+                tombstone_id = uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{self.session_id}:{run_id}:deleted:{path}",
+                ).hex
+                return {
+                    "ref_id": f"session:{self.session_id}:{run_id}:deleted:{tombstone_id}",
+                    "source": "session",
+                    "session_id": self.session_id,
+                    "name": name,
+                    "path": path,
+                    "size": int(value.get("size") or 0),
+                    "modified": str(value.get("modified") or ""),
+                    "type": str(value.get("type") or ""),
+                    "revision": revision,
+                    "operation": "DELETED",
+                    "toolCallId": value.get("toolCallId"),
+                }
+            existing_snapshot = str(value.get("snapshot_path") or "")
+            if existing_snapshot:
+                if (
+                    value.get("session_id") != self.session_id
+                    or not existing_snapshot.startswith(".assistant-artifacts/")
+                    or not value.get("ref_id")
+                    or not value.get("revision")
+                ):
+                    return None
+                # Child-agent references already point at a platform-created,
+                # read-only capture in this same Session. Preserve that exact
+                # identity instead of re-reading the mutable source path.
+                return {
+                    "ref_id": str(value["ref_id"]),
+                    "source": "session",
+                    "session_id": self.session_id,
+                    "name": str(value.get("name") or ""),
+                    "path": str(value.get("path") or ""),
+                    "snapshot_path": existing_snapshot,
+                    "size": int(value.get("size") or 0),
+                    "modified": str(value.get("modified") or ""),
+                    "type": str(value.get("type") or ""),
+                    "revision": str(value["revision"]),
+                    "sha256": str(value.get("sha256") or ""),
+                    "operation": str(value.get("operation") or "UPDATED"),
+                    "toolCallId": value.get("toolCallId"),
+                }
+            return await self._capture_session_assistant_file(value, run_id=run_id)
+        if value.get("source") == "workspace":
+            return self._protect_workspace_assistant_file(value, run_id=run_id)
+        return None
 
     def _validate_multimodal_blocks(self, blocks: list[dict[str, Any]]) -> None:
         """依照模型能力校驗多模態輸入。"""
@@ -1648,19 +2157,31 @@ class AgentService:
                 if not file_path:
                     raise ValueError("file.path 不能为空")
                 file_name = file_obj.get("name") or file_path
+                metadata_payload = {
+                    "name": str(file_name),
+                    "path": str(file_path),
+                }
+                is_directory = file_obj.get("kind") == "directory"
+                if is_directory:
+                    metadata_payload["kind"] = "directory"
+                if file_obj.get("source") == "workspace":
+                    metadata_payload.update({
+                        "source": "workspace",
+                        "workspace_entry_id": str(file_obj.get("entry_id") or ""),
+                        "workspace_path": str(file_obj.get("origin_path") or ""),
+                        "workspace_revision": str(file_obj.get("revision") or ""),
+                        "workspace_version_id": str(file_obj.get("version_id") or ""),
+                        "workspace_version_sequence": file_obj.get("version_sequence"),
+                    })
                 metadata = json.dumps(
-                    {"name": str(file_name), "path": str(file_path)},
+                    metadata_payload,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
                 agent_blocks.append(
                     {
                         "type": "text",
-                        "text": (
-                            f"[附件文件] metadata={metadata}。"
-                            "文件已就绪；读取时必须逐字使用 metadata.path，"
-                            "不要根据文件名语义补空格或改写路径。"
-                        ),
+                        "text": f"[{'附件文件夹' if is_directory else '附件文件'}] metadata={metadata}",
                     }
                 )
             else:
@@ -1779,6 +2300,21 @@ class AgentService:
         if not self.agent:
             raise RuntimeError("Agent not initialized")
 
+        # Admit the key before any side effect: workspace staging below copies
+        # files and allocates uuid-suffixed directory snapshots that a retry
+        # would orphan, and a moved-on source revision would fail CAS instead
+        # of reporting the already-created Round.
+        if idempotency_key:
+            admitted = self.history_service.find_round_by_idempotency_key(
+                self.session_id, idempotency_key
+            )
+            if admitted is not None:
+                logger.warning(
+                    "幂等預檢：已存在 Round %s (status=%s)，跳過附件落盤與重複執行 (key=%s)",
+                    admitted.id, admitted.status, idempotency_key,
+                )
+                raise DuplicateRoundError(admitted.id)
+
         persisted_interrupt = self._load_persisted_interrupt(None)
         if persisted_interrupt is not None:
             raise InteractionConflictError(
@@ -1789,9 +2325,15 @@ class AgentService:
 
         requested_context = parse_requested_turn_preferences_contexts(contexts or [])
         requested_reasoning = parse_requested_reasoning_contexts(contexts or [])
+        pending_file_drafts = parse_pending_file_draft_contexts(contexts or [])
+        run_context_options = (
+            {"pending_file_drafts": pending_file_drafts}
+            if pending_file_drafts else {}
+        )
         run_context = await self._resolve_run_context(
             requested_context,
             requested_reasoning,
+            **run_context_options,
         )
 
         # 正規化 + 校驗 + 構建輸入內容
@@ -1800,47 +2342,49 @@ class AgentService:
             raise ValueError("消息 content 不能为空")
 
         self._validate_multimodal_blocks(normalized_blocks)
-        agent_content = self._build_agent_user_content(normalized_blocks)
-        user_message_for_history = self._blocks_to_plain_text(normalized_blocks)
-        user_attachments = self._extract_user_attachments(normalized_blocks)
-
-        self._refresh_runtime_messages_from_history()
-
-        # 創建運行 ID
-        run_id = str(uuid.uuid4())
-        
-        # 創建 Round（含幂等性保護：若 idempotency_key 衝突，返回已有 Round）
-        created_round = self.history_service.create_round(
-            session_id=self.session_id,
-            round_id=run_id,
-            user_message=user_message_for_history,
-            user_attachments=user_attachments,
-            preferred_skills=[
-                {
-                    "key": skill.key,
-                    "display_name": skill.display_name,
-                }
-                for skill in (
-                    run_context.preferences.skills
-                    if run_context.preferences is not None
-                    else ()
-                )
-            ],
-            preferred_mcp_connections=[
-                {
-                    "server_id": connection.server_id,
-                    "display_name": connection.display_name,
-                }
-                for connection in (
-                    run_context.preferences.mcp_connections
-                    if run_context.preferences is not None
-                    else ()
-                )
-            ],
-            thinking_mode=(run_context.reasoning.mode if run_context.reasoning else None),
-            reasoning_effort=(run_context.reasoning.effort if run_context.reasoning else None),
-            idempotency_key=idempotency_key,
+        normalized_blocks, attachment_capture = await self._materialize_workspace_attachments(
+            normalized_blocks
         )
+        try:
+            agent_content = self._build_agent_user_content(normalized_blocks)
+            user_message_for_history = self._blocks_to_plain_text(normalized_blocks)
+            user_attachments = self._extract_user_attachments(normalized_blocks)
+            self._refresh_runtime_messages_from_history()
+            run_id = str(uuid.uuid4())
+            created_round = self.history_service.create_round(
+                session_id=self.session_id,
+                round_id=run_id,
+                user_message=user_message_for_history,
+                user_attachments=user_attachments,
+                preferred_skills=[
+                    {"key": skill.key, "display_name": skill.display_name}
+                    for skill in (
+                        run_context.preferences.skills
+                        if run_context.preferences is not None else ()
+                    )
+                ],
+                preferred_mcp_connections=[
+                    {
+                        "server_id": connection.server_id,
+                        "display_name": connection.display_name,
+                    }
+                    for connection in (
+                        run_context.preferences.mcp_connections
+                        if run_context.preferences is not None else ()
+                    )
+                ],
+                thinking_mode=(
+                    run_context.reasoning.mode if run_context.reasoning else None
+                ),
+                reasoning_effort=(
+                    run_context.reasoning.effort if run_context.reasoning else None
+                ),
+                idempotency_key=idempotency_key,
+            )
+        except BaseException:
+            if attachment_capture is not None:
+                await self._discard_workspace_attachment_capture(attachment_capture)
+            raise
 
         # 幂等衝突：另一個 Worker 已搶先創建了相同 idempotency_key 的 Round
         if idempotency_key and created_round.id != run_id:
@@ -1848,7 +2392,14 @@ class AgentService:
                 "幂等衝突：已存在 Round %s (status=%s)，跳過重複執行 (key=%s)",
                 created_round.id, created_round.status, idempotency_key,
             )
+            if attachment_capture is not None:
+                await self._discard_workspace_attachment_capture(attachment_capture)
             raise DuplicateRoundError(created_round.id)
+
+        self._commit_workspace_attachment_capture(
+            attachment_capture,
+            run_id=run_id,
+        )
         
         # 添加到 agent
         user_message_id = f"{run_id}:user"
@@ -1931,6 +2482,7 @@ class AgentService:
         self,
         requested: RequestedTurnPreferencesContext | None,
         requested_reasoning: RequestedReasoningContext | None = None,
+        pending_file_drafts: tuple[PendingFileDraftRef, ...] = (),
     ) -> AgentRunContext:
         """Resolve user-provided keys against the effective registry for this run."""
         resolved_skills: list[ResolvedSkillRef] = []
@@ -2002,7 +2554,11 @@ class AgentService:
             else None
         )
         reasoning = self._resolve_reasoning_context(requested_reasoning)
-        return AgentRunContext(preferences=preferences, reasoning=reasoning)
+        return AgentRunContext(
+            preferences=preferences,
+            reasoning=reasoning,
+            pending_file_drafts=pending_file_drafts,
+        )
 
     def _resolve_reasoning_context(
         self,
@@ -2546,6 +3102,7 @@ class AgentService:
         *,
         interrupt_id: str,
         answers: dict[str, str],
+        contexts: list[Context] | None = None,
     ) -> PreparedAgentRun:
         """Persist an answer and prepare the original Round continuation."""
         if self._resume_lock.locked():
@@ -2588,12 +3145,20 @@ class AgentService:
                     parent_run_id=parent_run_id,
                 )
             )
-            run_context = await self._resolve_run_context(requested_context)
+            pending_file_drafts = parse_pending_file_draft_contexts(contexts or [])
+            run_context = await self._resolve_run_context(
+                requested_context,
+                **(
+                    {"pending_file_drafts": pending_file_drafts}
+                    if pending_file_drafts else {}
+                ),
+            )
             parent_reasoning = self._reasoning_context_from_round(parent_run_id)
             if parent_reasoning is not None:
                 run_context = AgentRunContext(
                     preferences=run_context.preferences,
                     reasoning=parent_reasoning,
+                    pending_file_drafts=run_context.pending_file_drafts,
                 )
             if interrupt_kind == "tool_approval":
                 return self._prepare_tool_approval_resume_locked(
@@ -3133,6 +3698,58 @@ class AgentService:
                             for item in (round_preferred_mcp_connections or [])
                         ],
                     })
+
+                if (
+                    event.type == EventType.CUSTOM
+                    and getattr(event, "name", "") == "assistant_file_referenced"
+                ):
+                    try:
+                        materialized_reference = (
+                            await self._materialize_assistant_file_reference(
+                                getattr(event, "value", None),
+                                run_id=run_id,
+                            )
+                        )
+                    except Exception:
+                        self.history_service.db.rollback()
+                        logger.warning(
+                            "助手文件引用冻结失败，已丢弃该展示引用: session=%s round=%s",
+                            self.session_id,
+                            run_id,
+                            exc_info=True,
+                        )
+                        continue
+                    if materialized_reference is None:
+                        logger.info(
+                            "助手文件引用在持久化前已失效，已跳过: session=%s round=%s",
+                            self.session_id,
+                            run_id,
+                        )
+                        continue
+                    event = event.model_copy(update={"value": materialized_reference})
+
+                if (
+                    event.type == EventType.CUSTOM
+                    and getattr(event, "name", "") == "workspace_resource_changed"
+                    and isinstance(getattr(event, "value", None), dict)
+                ):
+                    workspace_event_value = dict(event.value)
+                    try:
+                        workspace_reference = self._protect_workspace_assistant_file(
+                            workspace_event_value,
+                            run_id=run_id,
+                        )
+                    except Exception:
+                        self.history_service.db.rollback()
+                        workspace_reference = None
+                        logger.warning(
+                            "Workspace 助手文件版本保护失败，仅保留内部变更事件: round=%s",
+                            run_id,
+                            exc_info=True,
+                        )
+                    if workspace_reference is not None:
+                        workspace_event_value["assistant_file_reference"] = workspace_reference
+                        event = event.model_copy(update={"value": workspace_event_value})
 
                 event_to_store = event
                 event_to_yield = event

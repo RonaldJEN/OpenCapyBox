@@ -8,12 +8,13 @@
 """
 import json
 
-from sqlalchemy import Column, String, Integer, Text, Boolean, DateTime, JSON
+from sqlalchemy import Column, String, Integer, Text, Boolean, DateTime, ForeignKey, JSON
 
 from src.agent.schema.skill_key import MAX_SKILL_KEY_LENGTH
 
 from .database import Base
 from src.api.utils.timezone import now_naive
+from src.api.utils.sandbox_helpers import filter_workspace_publish_scratch
 from src.api.utils.embedding_vector import MEMORY_EMBEDDING_DIMENSIONS, PGVector, normalize_embedding_vector
 
 
@@ -57,6 +58,13 @@ class MemoryEmbedding(Base):
     file_path = Column(String(255), nullable=True)
     chunk_index = Column(Integer, nullable=True)
     chunk_text = Column(Text, nullable=False)
+    # New conversation indexes own a real Round. Legacy rows and memory-file
+    # indexes intentionally remain nullable and are not backfilled.
+    conversation_round_id = Column(
+        String(36),
+        ForeignKey("rounds.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     # float array，例如 [0.12, -0.34, ...]；短向量写入前补齐到 2560 维
     embedding = Column(JSON().with_variant(PGVector(MEMORY_EMBEDDING_DIMENSIONS), "postgresql"), nullable=True)
     created_at = Column(DateTime, default=now_naive)
@@ -72,18 +80,35 @@ class CronJobRun(Base):
 
     id = Column(String(36), primary_key=True)
     user_id = Column(String(100), nullable=False, index=True)
+    # 历史快照字段，不设 FK：删除任务后执行历史仍需保留。
+    job_id = Column(Integer, nullable=True, index=True)
+    fire_id = Column(String(36), nullable=True, unique=True, index=True)
     # 来自 CronJob 表的任务名
     job_name = Column(String(100), nullable=False)
     cron_expr = Column(String(50), nullable=False)
     rule_version = Column(Integer, nullable=True)
+    definition_version = Column(Integer, nullable=True)
+    definition_snapshot = Column(Text, nullable=True)
     # 本次调度原本计划触发的分钟；手动触发时为空。
     scheduled_at = Column(DateTime, nullable=True)
     # scheduled / manual
     trigger_source = Column(String(20), nullable=False, default="scheduled")
-    started_at = Column(DateTime, default=now_naive)
+    queued_at = Column(DateTime, default=now_naive, nullable=True)
+    started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
-    # running / success / failed
-    status = Column(String(20), default="running")
+    # queued / running / success / failed / conflict / unknown
+    status = Column(String(20), default="queued", nullable=False, index=True)
+    # queued / preparing / executing / publishing / terminal
+    phase = Column(String(20), default="queued", nullable=False)
+    claim_token = Column(String(36), nullable=True, index=True)
+    claim_worker_id = Column(String(64), nullable=True, index=True)
+    claim_lease_expires_at = Column(DateTime, nullable=True, index=True)
+    heartbeat_at = Column(DateTime, nullable=True)
+    # Claim/dispatch 冻结的 OpenSandbox 实例。执行、被动文件请求和重启恢复
+    # 只能连接这个 ID，不得用后来的用户绑定创建替代实例。
+    sandbox_id = Column(String(100), nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    error_code = Column(String(80), nullable=True)
     output = Column(Text, nullable=True)
     # 未读标记：新记录默认未读(False)，存量通过迁移 DEFAULT 1 回填为已读
     is_read = Column(Boolean, default=False)
@@ -91,29 +116,52 @@ class CronJobRun(Base):
     artifacts = Column(Text, nullable=True)
     # 本次运行的沙箱工作目录绝对路径
     run_workspace = Column(String(500), nullable=True)
+    # WorkspaceService 回写的结构化变更清单；不与 run artifacts 混用。
+    workspace_changes = Column(Text, nullable=True)
+    # Proposed/conflict change sets that still need publication or review.
+    workspace_change_sets = Column(Text, nullable=True)
 
     def to_dict(self) -> dict:
         """序列化为前端可用的 dict（单一事实源）。"""
-        artifacts = None
-        if self.artifacts:
+        def _decode_json(raw):
+            if not raw:
+                return None
             try:
-                artifacts = json.loads(self.artifacts)
+                return json.loads(raw)
             except (ValueError, TypeError):
-                pass
+                return None
+
+        artifacts = _decode_json(self.artifacts)
+        if isinstance(artifacts, list):
+            artifacts = filter_workspace_publish_scratch(artifacts)
+        workspace_changes = _decode_json(self.workspace_changes) or []
+        workspace_change_sets = _decode_json(self.workspace_change_sets) or []
+        phase = self.phase
+        if self.status in {"success", "failed", "conflict", "unknown"}:
+            phase = "terminal"
         return {
             "id": self.id,
+            "job_id": self.job_id,
+            "fire_id": self.fire_id,
             "job_name": self.job_name,
             "cron_expr": self.cron_expr,
             "rule_version": self.rule_version,
+            "definition_version": self.definition_version,
             "scheduled_at": self.scheduled_at.isoformat() if self.scheduled_at else None,
             "trigger_source": self.trigger_source,
+            "queued_at": self.queued_at.isoformat() if self.queued_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "status": self.status,
+            "phase": phase,
+            "attempt_count": int(self.attempt_count or 0),
+            "error_code": self.error_code,
             "output": self.output,
             "is_read": bool(self.is_read),
             "artifacts": artifacts,
             "run_workspace": self.run_workspace,
+            "workspace_changes": workspace_changes,
+            "workspace_change_sets": workspace_change_sets,
         }
 
 

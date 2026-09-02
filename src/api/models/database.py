@@ -57,6 +57,15 @@ def _import_models():
         ToolApprovalRequest,
         ToolPermissionAudit,
     )
+    from src.api.models.workspace import (  # noqa: F401
+        UserWorkspace,
+        WorkspaceChangeSet,
+        WorkspaceClaim,
+        WorkspaceEntry,
+        WorkspaceFileVersion,
+        WorkspaceMutation,
+    )
+    from src.api.models.sandbox_cleanup import SandboxCleanupJob as _  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -352,13 +361,54 @@ _PENDING_COLUMNS = [
     ("cron_job_runs", "artifacts", "TEXT"),
     ("cron_job_runs", "run_workspace", "VARCHAR(500)"),
     ("cron_job_runs", "rule_version", "INTEGER"),
+    ("cron_job_runs", "job_id", "INTEGER"),
+    ("cron_job_runs", "fire_id", "VARCHAR(36)"),
+    ("cron_job_runs", "definition_version", "INTEGER"),
+    ("cron_job_runs", "definition_snapshot", "TEXT"),
     ("cron_job_runs", "scheduled_at", "TIMESTAMP"),
     ("cron_job_runs", "trigger_source", "VARCHAR(20) NOT NULL DEFAULT 'scheduled'"),
+    ("cron_job_runs", "queued_at", "TIMESTAMP"),
+    ("cron_job_runs", "phase", "VARCHAR(20) NOT NULL DEFAULT 'queued'"),
+    ("cron_job_runs", "claim_token", "VARCHAR(36)"),
+    ("cron_job_runs", "claim_worker_id", "VARCHAR(64)"),
+    ("cron_job_runs", "claim_lease_expires_at", "TIMESTAMP"),
+    ("cron_job_runs", "heartbeat_at", "TIMESTAMP"),
+    ("cron_job_runs", "sandbox_id", "VARCHAR(100)"),
+    ("cron_job_runs", "attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("cron_job_runs", "error_code", "VARCHAR(80)"),
+    ("cron_job_runs", "workspace_changes", "TEXT"),
+    ("cron_job_runs", "workspace_change_sets", "TEXT"),
     # Cron 任务表单：结构化时间配置（前端编辑回显）+ 执行内容（Agent prompt）
     ("cron_jobs", "schedule", "TEXT"),
     ("cron_jobs", "content", "TEXT NOT NULL DEFAULT ''"),
     ("cron_jobs", "rule_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("cron_jobs", "definition_version", "INTEGER NOT NULL DEFAULT 1"),
     ("cron_fires", "rule_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("cron_fires", "definition_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("cron_fires", "run_id", "VARCHAR(36)"),
+    ("workspace_entries", "current_version_id", "VARCHAR(36)"),
+    ("workspace_entries", "head_blob_id", "VARCHAR(36)"),
+    ("workspace_entries", "tree_revision", "BIGINT NOT NULL DEFAULT 1"),
+    ("user_workspaces", "history_quota_bytes", "BIGINT NOT NULL DEFAULT 5368709120"),
+    ("user_workspaces", "history_used_bytes", "BIGINT NOT NULL DEFAULT 0"),
+    ("user_workspaces", "last_history_gc_at", "TIMESTAMP"),
+    ("workspace_file_versions", "blob_id", "VARCHAR(36)"),
+    ("workspace_file_versions", "checkpoint_kind", "VARCHAR(32)"),
+    ("workspace_file_versions", "retained_until", "TIMESTAMP"),
+    ("workspace_file_versions", "pruned_at", "TIMESTAMP"),
+    ("workspace_file_versions", "legacy_content_path", "VARCHAR(2000)"),
+    ("workspace_change_sets", "proposal_blob_id", "VARCHAR(36)"),
+    ("workspace_content_references", "retained_until", "TIMESTAMP"),
+    ("workspace_mutations", "lease_expires_at", "TIMESTAMP"),
+    ("workspace_mutations", "tool_call_id", "VARCHAR(64)"),
+    ("workspace_mutations", "claim_id", "VARCHAR(36)"),
+    ("workspace_mutations", "claim_generation", "BIGINT"),
+    ("workspace_mutations", "owner_token", "VARCHAR(64)"),
+    ("workspace_mutations", "change_set_id", "VARCHAR(36)"),
+    ("workspace_mutations", "before_version_id", "VARCHAR(36)"),
+    ("workspace_mutations", "after_version_id", "VARCHAR(36)"),
+    ("workspace_mutations", "heartbeat_at", "TIMESTAMP"),
+    ("memory_embeddings", "conversation_round_id", "VARCHAR(36)"),
     ("user_skill_inventory_snapshots", "issues_json", "TEXT NOT NULL DEFAULT '[]'"),
     # auth_users: JWT 凭据代次
     ("auth_users", "token_generation", "INTEGER NOT NULL DEFAULT 0"),
@@ -394,10 +444,18 @@ _PENDING_UNIQUE_CONSTRAINTS = [
     ("sandbox_profiles", "uq_sandbox_profiles_name", ["name"]),
     ("user_sandboxes", "uq_user_sandboxes_user_id", ["user_id"]),
     ("user_sandbox_configs", "uq_user_sandbox_configs_user_id", ["user_id"]),
+    ("cron_fires", "uq_cron_fires_run_id", ["run_id"]),
+    ("cron_job_runs", "uq_cron_job_runs_fire_id", ["fire_id"]),
 ]
 
 
 _DEPRECATED_COLUMNS = [
+    ("workspace_entries", "original_parent_id"),
+    ("workspace_entries", "original_name"),
+    ("workspace_entries", "original_relative_path"),
+    ("workspace_entries", "trashed_at"),
+    ("cron_jobs", "workspace_access"),
+    ("cron_job_runs", "workspace_access"),
     ("sandbox_profiles", "image"),
     ("sandbox_profiles", "cpu_limit"),
     ("sandbox_profiles", "memory_limit"),
@@ -486,6 +544,14 @@ def _migrate_add_columns(target_engine=None):
     """检查并添加缺失的列和约束（幂等，仅在不存在时执行）"""
     bind_engine = target_engine or engine
     inspector = inspect(bind_engine)
+    deprecated_columns_to_drop: list[tuple[str, str]] = []
+    for table_name, column_name in _DEPRECATED_COLUMNS:
+        if not inspector.has_table(table_name):
+            continue
+        existing_columns = {col["name"] for col in inspector.get_columns(table_name)}
+        if column_name in existing_columns:
+            deprecated_columns_to_drop.append((table_name, column_name))
+
     with bind_engine.begin() as conn:
         table_columns_cache: dict[str, set[str] | None] = {}
         added_columns: set[tuple[str, str]] = set()
@@ -515,14 +581,84 @@ def _migrate_add_columns(target_engine=None):
                 "CREATE INDEX IF NOT EXISTS idx_tool_approval_execution_lease "
                 "ON tool_approval_requests (status, execution_lease_expires_at)"
             ))
-        for table_name, column_name in _DEPRECATED_COLUMNS:
-            if not inspector.has_table(table_name):
-                continue
-            existing_columns = {col["name"] for col in inspector.get_columns(table_name)}
-            if column_name in existing_columns:
-                conn.execute(text(f"ALTER TABLE {table_name} DROP COLUMN {column_name}"))
-                logger.info("DB 迁移: %s 表删除废弃列 %s", table_name, column_name)
-
+        if table_columns_cache.get("cron_job_runs") is not None:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_cron_runs_claim_lease "
+                "ON cron_job_runs (status, claim_lease_expires_at)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_cron_runs_queue "
+                "ON cron_job_runs (status, queued_at)"
+            ))
+            conn.execute(text(
+                "UPDATE cron_job_runs SET queued_at = COALESCE(started_at, completed_at, CURRENT_TIMESTAMP) "
+                "WHERE queued_at IS NULL"
+            ))
+            conn.execute(text(
+                "UPDATE cron_job_runs SET phase = 'terminal' "
+                "WHERE status IN ('success', 'failed', 'conflict', 'unknown')"
+            ))
+        if table_columns_cache.get("workspace_mutations") is not None:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_mutations_state_lease "
+                "ON workspace_mutations (state, lease_expires_at)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_mutations_tool_call_id "
+                "ON workspace_mutations (tool_call_id)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_mutations_claim_id "
+                "ON workspace_mutations (claim_id)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_mutations_change_set_id "
+                "ON workspace_mutations (change_set_id)"
+            ))
+        if table_columns_cache.get("workspace_entries") is not None:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_entries_current_version "
+                "ON workspace_entries (current_version_id)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_entries_head_blob "
+                "ON workspace_entries (head_blob_id)"
+            ))
+        if table_columns_cache.get("workspace_file_versions") is not None:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_versions_blob "
+                "ON workspace_file_versions (blob_id)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_versions_checkpoint "
+                "ON workspace_file_versions (user_id, checkpoint_kind, created_at)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_versions_retained_until "
+                "ON workspace_file_versions (state, retained_until)"
+            ))
+        if table_columns_cache.get("workspace_content_references") is not None:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_workspace_content_references_retained_until "
+                "ON workspace_content_references (retained_until)"
+            ))
+        if table_columns_cache.get("memory_embeddings") is not None:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_conversation_round "
+                "ON memory_embeddings (conversation_round_id)"
+            ))
+            if bind_engine.dialect.name == "postgresql":
+                foreign_keys = inspector.get_foreign_keys("memory_embeddings")
+                if not any(
+                    fk.get("constrained_columns") == ["conversation_round_id"]
+                    for fk in foreign_keys
+                ):
+                    conn.execute(text(
+                        "ALTER TABLE memory_embeddings ADD CONSTRAINT "
+                        "fk_memory_embeddings_conversation_round "
+                        "FOREIGN KEY (conversation_round_id) REFERENCES rounds(id) "
+                        "ON DELETE CASCADE"
+                    ))
         sandbox_profile_columns = table_columns_cache.get("sandbox_profiles")
         if sandbox_profile_columns:
             _backfill_sandbox_profiles(conn, sandbox_profile_columns)
@@ -680,6 +816,19 @@ def _migrate_add_columns(target_engine=None):
                 "SET thinking_wire_format = 'none', enable_thinking = false "
                 "WHERE provider <> 'openai' AND thinking_wire_format = 'enable_thinking'"
             ))
+        if ("workspace_file_versions", "checkpoint_kind") in added_columns:
+            conn.execute(text(
+                "UPDATE workspace_file_versions SET checkpoint_kind = 'legacy' "
+                "WHERE checkpoint_kind IS NULL"
+            ))
+
+        # Keep destructive DDL last. In-memory SQLite tests may share one DBAPI
+        # connection between the migration transaction and Inspector calls;
+        # reflecting after a DROP can otherwise roll back that transactional DDL.
+        for table_name, column_name in deprecated_columns_to_drop:
+            conn.execute(text(f"ALTER TABLE {table_name} DROP COLUMN {column_name}"))
+            logger.info("DB 迁移: %s 表删除废弃列 %s", table_name, column_name)
+
 
 def _ensure_agui_events_run_sequence_unique(conn, inspector) -> None:
     """Ensure agui_events(run_id, sequence) is unique without rewriting history."""

@@ -37,7 +37,7 @@
 ### 本模块不负责
 
 - 会话 CRUD（由 Session 模块处理）
-- 文件操作（由 OpenSandbox 文件服务处理）
+- 工作区 mutation（由 WorkspaceService/WorkspaceMutationCoordinator 统一处理；OpenSandbox 只执行受控 I/O）
 - 模型管理（由 Model Registry 处理）
 - Cron 定时任务执行
 - 技能（Skills）的注册与管理
@@ -334,7 +334,23 @@ Content-Type: application/json
 | `text`      | `{type: "text", text: string}`                                                           | 纯文本消息                              |
 | `image_url` | `{type: "image_url", image_url: {url: string}}`                                          | 图片（base64 data URI 或 URL）          |
 | `video_url` | `{type: "video_url", video_url: {url: string}}`                                          | 视频                                    |
-| `file`      | `{type: "file", file: {path: string, name?: string, mime_type?: string, size?: number}}` | 文件附件，`path` 为会话工作区相对路径 |
+| `file`      | `{type: "file", file: SessionFile \| WorkspaceFile}` | Session 文件或用户持久工作区引用 |
+
+```ts
+type SessionFile = {
+  source?: "session"; path: string; name?: string; mime_type?: string; size?: number;
+};
+type WorkspaceFile = {
+  source: "workspace"; entry_id: string;
+  version_id?: string;
+  kind?: "file" | "directory"; name?: string; mime_type?: string; size?: number;
+};
+```
+
+- 客户端不得为 `source="workspace"` 提交 `path/revision/tree_revision/manifest_sha256`。普通选择只提交稳定 `entry_id`，服务端在 Round 受理时解析该用户当时的 current head；只有用户明确选择历史版本时才提交 `version_id`。客户端名称、类型和大小只是 optimistic 展示提示，不能作为正文或所有权事实。
+- Workspace 文件或文件夹引用在创建 Round 前复制到当前 Session 的隐藏 `.workspace-snapshots/<entry>/<snapshot>/`。文件省略 `version_id` 时冻结受理时 current head，显式 `version_id` 时冻结该不可变版本；文件夹冻结受理时最新 `tree_revision + descendant manifest` 并在复制后复核。Agent 只读取该冻结副本，原内容后续更新不改变本轮输入。
+- staging 成功后由服务端生成并持久化同一 capture 的 `entry revision/version_id/version_sequence/path/name/sha256/size`；禁止把历史正文 version 与另一个时点的 entry metadata 拼成同一附件。staging 失败发生在 Round 接受前，前端保留正文和附件草稿。
+- 每次发送使用独立 capture 路径；全部附件成功且 Round 创建后才提交永久 `round_attachment` 引用。任一附件或 Round admission 失败时解除临时引用，并用 durable cleanup job 删除本次已生成的 snapshots。
 
 **本轮 Skill / MCP 偏好契约与作用域**:
 
@@ -345,7 +361,7 @@ Content-Type: application/json
 - run 启动前，Skill 按该用户当前 registry 解析；MCP 只从当前 Agent 的 `McpCatalogSnapshot.connections` 解析。未知、已禁用、发现失败或没有可见工具的项被忽略，不导致整次发送失败。
 - direct Round 分别固化 `preferred_skills: [{key, display_name}]` 与 `preferred_mcp_connections: [{server_id, display_name}]`。两份展示快照均不可变，读取历史时不得用当前 registry/catalog 改写。
 - direct `RUN_STARTED` 同时携带 `preferredSkills` 与 `preferredMcpConnections`，显式空数组也是权威结果，用于替换或清除 optimistic 标签；same-Round resume 不发新的 `RUN_STARTED`。
-- provider 请求只注入一条短 system 解释策略与一个紧凑 `<ui_context>`，并只前置到精确匹配的原始 user message 请求副本；不得写回 `agent.messages`、`conversation_messages` 或标题/摘要/记忆请求。属性值是数据标签而非指令，正文始终优先。
+- Skill/MCP 的通用调用规则与选择后提示固定在平台 `AGENTS.md`；动态 Skill/MCP 清单只携带可用项元数据，不得夹带调用说明，也不得因本轮选择动态改写 system message。provider 请求只把紧凑 `<ui_context>` 前置到精确匹配的原始 user message 请求副本；不得写回 `agent.messages`、`conversation_messages` 或标题/摘要/记忆请求。属性值是数据标签而非指令，正文始终优先。
 - Skill 只有在 `get_skill` 成功后、连接只有在真实远程 MCP 工具调用成功后才能声称“已使用”；成功的 `mcp_tool_search` 只代表发现工具。UI 选择本身不构成使用审计。
 - 若产生 Interaction，服务端把唯一 `runtime_context` 与 `turn_preferences_origin_user_message_id` 写入热 pending state 和持久化 request payload，并先清除 producer 夹带的同名值。resume 按当时 registry/catalog 重新解析运行偏好，连续暂停始终锚定最初 user message。
 - same-Round continuation 不改写原 Round 的两份展示快照。`turn_preferences_origin_user_message_id` 是服务端专用元数据，不属于客户端 payload，发送和 resume 均不能提交或覆盖。
@@ -360,9 +376,19 @@ Content-Type: application/json
 
 **file block 注入语义**:
 
-- `file` block 在进入 Agent 上下文前会映射为文本提示：`[附件文件] metadata={"name":"<name>","path":"<path>"}。文件已就绪；读取时必须逐字使用 metadata.path，不要根据文件名语义补空格或改写路径。`
+- `file` block 在进入 Agent 上下文前只映射为当前 user message 的选择元数据：普通文件使用 `[附件文件] metadata={"name":"<name>","path":"<path>"}`，目录使用 `[附件文件夹] metadata={"name":"<name>","path":"<path>","kind":"directory"}`。如何读取附件的通用调用规则固定在平台 `AGENTS.md`，不得因附件选择动态改写 system message。
 - `metadata` 是由 `{name, path}` 经过 JSON 编码生成；Agent 读取附件时必须以 `metadata.path` 作为唯一事实源。
+- Workspace 引用的 `metadata.path` 是服务端生成的 Session snapshot；附加的 `source/workspace_entry_id/workspace_path/workspace_revision/workspace_version_id/workspace_version_sequence` 只用于来源说明和后续显式发布，不能把原 workdir 绝对路径交给模型。
+- Round 的 `user_attachments` 持久化 `source/entry_id/revision/version_id/version_sequence/origin_path/snapshot_path/sha256`，目录额外持久化 `kind=directory/is_directory=true/tree_revision/manifest_sha256`。这些是选择审计，不是已删除文件的恢复来源；源 Workspace entry 存在时预览固定 snapshot/version，entry 永久删除后 history 和当前客户端投影均按 entry_id 过滤，且淘汰相关 captured cache。“在工作区打开”只是次级动作。
 - 该提示是中性提示，不强制触发 `read_file` 调用；是否读取由当前任务意图决定。
+
+**工作区工具语义**:
+
+- `workspace_list`、`workspace_stage` 为读取能力；`workspace_publish`、`workspace_create_directory` 为编辑能力；`workspace_move`、`workspace_delete` 为管理能力。
+- `workspace_list` 支持可选 `cursor`，原样透传服务端分页游标；每页默认 50 项，工具声明上限 100 项。返回 `next_cursor` 非空且需要更多结果时，保持 `parent_id/query/limit` 不变并携带该游标继续请求；不自动拉取全部结果。
+- `workspace_stage` 把指定 file version、目录 tree revision 或当前 head 复制到 Session/Cron execution root；模型携带的观察 revision 已过期时，工具内部自动重取一次当前 head，不把正常的人类并发编辑暴露成循环重试。目录保留层级与空子目录。成功结果中的绝对 `snapshot_path` 供文件工具使用，相对 `publish_source_path` 供 `workspace_publish` 使用，并返回实际 `revision/base_version_id/tree_revision`；`read_file/write_file/edit_file` 的相对路径基准为当前 execution Workspace。
+- `workspace_publish` 仅接受当前 Session/Cron execution root 内的普通文件，先把冻结提案写入用户内 SHA 内容对象并建立 `change_set_proposal/base` 显式引用，再由统一发布入口校验 base/current version、claim、配额与 journal。已有文件先校验 DB head、不可变 head 对象与 active 物化文件：active 命中旧版本时从 head 修复，出现未入库新内容时先静默吸收为 `web` head；三方合并的 current 始终读取内部 head 对象，不读取用户命名的 active 路径。base 未变化时直接 apply；变化时对 Markdown/TXT、CSV、XLSX 自动三方合并，不同位置同时保留、同一位置保留当前正式文件（人的内容）。无法可靠合并时保持当前正式内容，提案仅留作内部审计，不向普通用户发出决策请求。
+- proposed/conflict/failed 只产生标准 `TOOL_CALL_RESULT` 并保存在服务端审计中，不发送 `CUSTOM workspace_change_proposed/workspace_change_conflict` 给普通客户端。并发 conflict 由 Workspace maintenance 继续收敛；不可恢复的 head/proposal 读取或校验错误进入 failed 终态并保留提案；调用取消或 worker 丢失继续依赖 prepared journal。只有成功正式 mutation 后才持久化 `CUSTOM workspace_resource_changed`，不得从工具文本或助手正文正则推断工作区产物。
 
 **图片约束**:
 
@@ -402,6 +428,7 @@ SSE 事件流格式遵循 AG-UI 协议（详见 [第 4.6 节](#46-ag-ui-事件�
 | 错误事件                | 触发条件                                                                                                                         |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | `AGENT_INIT_FAILED`   | Agent 初始化失败（沙箱连接、历史加载、技能初始化等）                                                                             |
+| `AGENT_INIT_TIMEOUT`  | Agent 初始化超过配置的总墙钟期限；取消初始化任务并释放运行锁                                                                      |
 | `ROUND_IN_PROGRESS`   | 幂等键冲突：相同`idempotency_key` 的 Round 已在执行中                                                                          |
 | `INTERACTION_PENDING` | 当前 session 已有同一 Round 的 pending Interaction；这是未创建新 Round 的控制面拒绝，客户端必须恢复权威 waiting 状态与未受理草稿 |
 | `INTERNAL_ERROR`      | 其他内部错误                                                                                                                     |
@@ -447,7 +474,7 @@ Content-Type: application/json
 #### 响应
 
 SSE 事件流，格式与 `message/stream` 相同。
-Agent 初始化和中断状态校验在 SSE generator 内执行；入口只做会话、token、用户并发 slot 等前置校验，避免请求级 DB Session 跨 Agent / sandbox 初始化长时间持有连接。
+Agent 初始化和中断状态校验在 SSE generator 内执行；入口只做会话、token、用户并发 slot 等前置校验并在返回流前结束请求级事务。generator 只接收预读标量，Agent 初始化与取消复核使用独立短生命周期 Session，禁止请求级 DB Session 跨 Agent / sandbox 初始化长时间持有连接。
 
 响应继续使用原 `runId == round_id`，不再发送第二个 `RUN_STARTED`。持久化的 `CUSTOM interaction_resolved` 是 continuation 已接管原 Round 的 wire 边界；HTTP 200 或客户端本地 `stream_accepted` 只表示传输已建立，不表示 Round 已恢复运行。
 
@@ -480,6 +507,7 @@ Agent 初始化和中断状态校验在 SSE generator 内执行；入口只做�
 | `RESUME_CONFLICT`              | 回答与持久化事实冲突                    | 并发恢复已获胜，或同一 interaction 收到不同答案           |
 | `INVALID_INTERACTION_RESPONSE` | 回答格式或枚举值不符合 Interaction kind | 例如工具审批缺少`answers.approval`，或值不在允许枚举中  |
 | `AGENT_INIT_FAILED`            | Agent 初始化失败                        | AgentPool 获取或初始化失败                                |
+| `AGENT_INIT_TIMEOUT`           | Agent 初始化超时                        | 初始化超过 `AGENT_INIT_TIMEOUT_SECONDS`，取消并释放运行锁 |
 | `USER_ABORT`                   | 恢复初始化期间被取消                    | 较新的 abort 已经收敛该会话                               |
 | `INTERNAL_ERROR`               | continuation 尚未启动的内部错误         | 服务端保留或恢复权威 waiting 状态                         |
 
@@ -618,6 +646,20 @@ SSE 事件流。
   ],
   "preferred_mcp_connections": [
     {"server_id": "server-uuid", "display_name": "东方财富数据"}
+  ],
+  "assistant_file_references": [
+    {
+      "ref_id": "workspace:entry-uuid:version-uuid",
+      "source": "workspace",
+      "entry_id": "entry-uuid",
+      "version_id": "version-uuid",
+      "path": "reports/result.xlsx",
+      "workspace_path": "reports/result.xlsx",
+      "name": "result.xlsx",
+      "revision": "2",
+      "size": 1024,
+      "type": "xlsx"
+    }
   ]
 }
 ```
@@ -628,6 +670,7 @@ SSE 事件流。
 - same-Round continuation 仍是原 direct Round，因此继续返回原先冻结的展示快照，不新增重复标签。
 - 这些数组不是使用审计；不能据此声称 Skill 已加载或 MCP 连接已被真实调用。
 - 各个独立 direct Round 的快照彼此隔离，不继承、不合并，也不根据当前启停状态、改名或删除情况重算。
+- 文件卡只使用 `assistant_file_references`：Session 引用来自已冻结 `.assistant-artifacts`，Workspace 引用来自成功 mutation 内受保护的 immutable version；同 Round 删除事件作为 tombstone。history 不再返回旧 `workspace_resources/workspace_change_sets` 兼容字段。
 
 当 Round 为 `waiting_interaction` 时，`history/v2` 必须从 pending `agent_interactions` 投影 `interrupt={id, reason, payload}`，并与已持久化的 `interaction_requested` 指向同一 interaction id。读取历史会先处理过期 continuation claim：仅 `continuation_started_at` 为空的 pre-start 项可停回 waiting；已持久化 `interaction_resolved` 的 started continuation 必须写 durable `RUN_ERROR` 并收敛 failed。工具审批若已跨过 dispatch 且结果未知，还必须先按 execution lease 收敛 `unknown`，绝不自动重放。
 
@@ -706,6 +749,7 @@ Web send/resume/abort 入口先由 `WebChatAdapter` / `WebResumeAdapter` /
 | 用户并发上限        | 1      | 是 (`AGENT_USER_CONCURRENCY_LIMIT`) | 同一用户可同时运行的不同 session 数 |
 | 心跳间隔            | 15s    | 是 (`SSE_HEARTBEAT_INTERVAL`)       | SSE 心跳与锁刷新间隔                |
 | 工具超时            | 300s   | 是 (`tool_timeout`)                 | 单个工具执行超时                    |
+| Agent 初始化超时    | 180s   | 是 (`AGENT_INIT_TIMEOUT_SECONDS`)   | Sandbox、Skills 与工具目录初始化总墙钟期限 |
 | 流式块超时          | 100s   | —                                    | LLM 流式响应相邻 chunk 的最大间隔   |
 
 #### Runtime 工具循环防护
@@ -771,6 +815,11 @@ AgentPool 缓存失效不得中断仍在运行的 AgentService：配置更新、
 前端生成 UUID → idempotency_key
     │
     ▼
+幂等预检：按 (session_id, idempotency_key) 查已有 Round
+    │
+    ├── 命中 → 直接 ROUND_IN_PROGRESS，不执行任何副作用
+    │
+    ▼
 INSERT INTO rounds (..., idempotency_key)
     │
     ├── 成功 → 正常执行
@@ -790,6 +839,8 @@ INSERT INTO rounds (..., idempotency_key)
 
 - `idempotency_key` 由前端生成（UUID v4）
 - 唯一约束作用域：`(session_id, idempotency_key)`
+- `prepare_chat_round` 必须在任何副作用之前完成幂等预检。Workspace 附件落盘会复制文件、并为目录快照分配 uuid 后缀目录，重试若先落盘会留下孤儿快照；源 revision 已推进时还会先抛 `REVISION_CONFLICT` 而不是返回既有 Round。
+- 预检只覆盖串行重试；相同 key 的真并发仍由唯一约束兜底，输方已落盘的目录快照暂不回收（待引入 admission 认领记录后关闭）。
 - 前端在网络重试时必须携带相同的 `idempotency_key`
 
 ### 4.3 并发控制
@@ -961,6 +1012,8 @@ pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后�
 |                     | `interaction_requested`         | 同一 Round 已持久化提问/审批并进入`waiting_interaction` |
 |                     | `interaction_resolved`          | 回答已由同一`runId` 的 continuation 接管                |
 |                     | `tool_approval_resume`          | 同一 Round 的审批结果即将回填原工具占位                   |
+|                     | `workspace_resource_changed`    | 受控工作区 mutation 已提交；raw audit 只做失效信号，成功文件可内嵌结构化助手引用 |
+|                     | `assistant_file_referenced`     | Session 助手产物已冻结为结构化生成时引用                  |
 |                     | 其他自定义事件                    | 按需扩展                                                  |
 
 #### Human-in-the-Loop CUSTOM wire schema
@@ -998,6 +1051,42 @@ pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后�
 `interactionId`、`runId`、`kind` 与 `toolCallId` 是关联字段；`payload` 为 kind-specific 结构。`toolResultContent` 是历史重建所需的冻结文本，不得包含解密后的敏感工具参数。两种事件都必须进入 `agui_events` 并参与 sequence 重放；`heartbeat` 和仅传输层的 `stream_accepted` 不是持久化事实。
 
 工具审批 continuation 在最终结果前还会持久化 `CUSTOM tool_approval_resume`，其 `value={toolCallId}` 指向原审批工具调用。历史重建据此让紧随其后的匹配 `TOOL_CALL_RESULT` 替换预派发占位，而不是追加第二份工具结果。该 marker 不创建新 Round，也不是 Interaction 的完成边界；只有匹配的最终 `TOOL_CALL_RESULT` 持久化后，工具审批 Interaction 才转为 `answered`。
+
+#### Workspace resource CUSTOM wire schema
+
+```json
+{
+  "type": "CUSTOM",
+  "name": "workspace_resource_changed",
+  "value": {
+    "entry_id": "entry-uuid",
+    "operation": "UPDATED",
+    "path": "reports/result.md",
+    "name": "result.md",
+    "kind": "file",
+    "revision": 2,
+    "mutation_id": "mutation-uuid",
+    "toolCallId": "tool-call-id",
+    "assistant_file_reference": {
+      "ref_id": "workspace:entry-uuid:version-uuid",
+      "source": "workspace",
+      "entry_id": "entry-uuid",
+      "version_id": "version-uuid",
+      "path": "reports/result.md",
+      "workspace_path": "reports/result.md",
+      "name": "result.md",
+      "revision": "2",
+      "size": 42,
+      "type": "md"
+    }
+  },
+  "sequence": 21
+}
+```
+
+该事件只能由成功的 WorkspaceService mutation 产生，必须与 `WorkspaceMutation` 的 entry、revision 和 actor context 对应。失败、后台重试或仅保留 current 的 change set 不得冒充资源更新。普通前端不渲染 raw mutation；只有经过服务端版本保护的 `assistant_file_reference` 才进入 Round 卡片。实时 reducer 与 `history/v2` 使用同一稳定 identity 去重，DELETED 移除同 Round 旧引用；事件不包含文件正文或宿主绝对路径。
+
+Session `assistant_file_referenced` 必须携带 `ref_id/source=session/session_id/path/revision/snapshot_path/name/size/type/toolCallId`。`snapshot_path` 由 API 服务在事件提交前 no-follow 冻结并设为只读；工具文本、助手正文和客户端都无权自行构造。Bash manifest 任一侧失败/截断时 fail closed，不产生引用。
 
 #### ID 生成规则
 
@@ -1139,7 +1228,7 @@ models:
 
 | 参数              | 值   | 说明                 |
 | ----------------- | ---- | -------------------- |
-| `max_retries`   | 3    | 每个模型最大重试次数 |
+| `max_retries`   | 1    | 每个模型最大重试次数；SDK 内层重试固定关闭 |
 | `initial_delay` | 0.5s | 初始重试延迟         |
 | `max_delay`     | 30s  | 最大重试延迟         |
 | `max_increment` | 1.0s | 每次退避最大增量     |
@@ -1170,7 +1259,7 @@ SSE 连接建立
     └── 任一失败 → 发射 AGENT_INIT_FAILED 事件 → 关闭连接
 ```
 
-> **设计决策**: SSE 连接先建立再初始化，避免浏览器/网关因等待过久而断开连接。心跳在初始化期间就已开始发送。
+> **设计决策**: SSE 连接先建立再初始化，避免浏览器/网关因等待过久而断开连接。心跳在初始化期间发送，但不得绕过 `AGENT_INIT_TIMEOUT_SECONDS` 无限保活。
 
 ### 4.11 Round 状态不变量
 
@@ -1272,3 +1361,5 @@ GET /subscribe?last_sequence={last_seq}
 | 对话分支/分叉  | 不支持从历史消息分叉出新的对话线路                              |
 | Agent 间通信   | Sub-Agent 共享沙箱但拥有独立历史，不支持 Agent 间直接消息传递   |
 | 客户端工具执行 | 所有工具均在服务端执行，不支持将工具调用下发到客户端            |
+
+工作区文件显式删除后，其 WorkspaceFileVersion 和 round_attachment 引用一起移除，历史投影不再展示该文件引用；不回退已删除条目的历史正文。删除事件携带 DELETED 与 affected_entry_ids。

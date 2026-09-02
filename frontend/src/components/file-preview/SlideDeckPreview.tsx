@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -14,9 +15,20 @@ import type {
 import './SlideDeckPreview.css';
 
 interface SlideDeckPreviewProps {
-  src: string;
+  source: Blob | string;
+  sourceKey: string;
+  requestId: number;
+  activeRequestId: number;
   title: string;
-  onError?: (error: Error) => void;
+  onReady?: (sourceKey: string) => void;
+  onError?: (error: Error, sourceKey: string) => void;
+}
+
+interface LoadedDeck {
+  sourceKey: string;
+  document: PDFDocumentProxy;
+  loadingTask: PDFDocumentLoadingTask;
+  aspectRatio: number;
 }
 
 interface SlideCanvasProps {
@@ -245,7 +257,21 @@ function SlideDeckLoading() {
   );
 }
 
-function SlideDeckFallback({ src, title }: Pick<SlideDeckPreviewProps, 'src' | 'title'>) {
+function SlideDeckFallback({ source, title }: Pick<SlideDeckPreviewProps, 'source' | 'title'>) {
+  const [src, setSrc] = useState(typeof source === 'string' ? source : '');
+
+  useEffect(() => {
+    if (typeof source === 'string') {
+      setSrc(source);
+      return undefined;
+    }
+    const objectUrl = URL.createObjectURL(source);
+    setSrc(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [source]);
+
+  if (!src) return <SlideDeckLoading />;
+
   return (
     <div className="slide-deck-preview slide-deck-preview--fallback">
       <div className="slide-deck-preview__fallback-notice" role="alert">
@@ -261,57 +287,128 @@ function SlideDeckFallback({ src, title }: Pick<SlideDeckPreviewProps, 'src' | '
   );
 }
 
-export function SlideDeckPreview({ src, title, onError }: SlideDeckPreviewProps) {
-  const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
-  const [aspectRatio, setAspectRatio] = useState(16 / 9);
+export function SlideDeckPreview({
+  source,
+  sourceKey,
+  requestId,
+  activeRequestId,
+  title,
+  onReady,
+  onError,
+}: SlideDeckPreviewProps) {
+  const [activeDeck, setActiveDeck] = useState<LoadedDeck | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
-  const [failed, setFailed] = useState(false);
+  const [failedSourceKey, setFailedSourceKey] = useState('');
   const thumbnailScrollRef = useRef<HTMLDivElement>(null);
   const pageScrollRef = useRef<HTMLDivElement>(null);
+  const activeDeckRef = useRef<LoadedDeck | null>(null);
+  const retiredTasksRef = useRef<PDFDocumentLoadingTask[]>([]);
+  const destroyedTasksRef = useRef(new WeakSet<object>());
+  const requestedSourceRef = useRef({ sourceKey, requestId: activeRequestId });
+  const onReadyRef = useRef(onReady);
   const onErrorRef = useRef(onError);
+  requestedSourceRef.current = { sourceKey, requestId: activeRequestId };
+
+  const destroyTask = useCallback((task: PDFDocumentLoadingTask | null) => {
+    if (!task || destroyedTasksRef.current.has(task)) return;
+    destroyedTasksRef.current.add(task);
+    void task.destroy();
+  }, []);
 
   useEffect(() => {
+    onReadyRef.current = onReady;
     onErrorRef.current = onError;
-  }, [onError]);
+  }, [onError, onReady]);
 
   useEffect(() => {
+    if (requestId !== activeRequestId) return undefined;
+
     let disposed = false;
     let loadingTask: PDFDocumentLoadingTask | null = null;
+    let promoted = false;
 
-    setDocument(null);
-    setAspectRatio(16 / 9);
-    setCurrentPage(1);
-    setFailed(false);
+    const isCurrentRequest = () => (
+      !disposed
+      && requestedSourceRef.current.sourceKey === sourceKey
+      && requestedSourceRef.current.requestId === requestId
+    );
 
-    void loadPdfJs()
-      .then((pdfJs) => {
-        if (disposed) return null;
-        loadingTask = pdfJs.getDocument({ url: src });
+    setFailedSourceKey('');
+
+    void Promise.all([
+      loadPdfJs(),
+      typeof source === 'string' ? Promise.resolve(source) : source.arrayBuffer(),
+    ])
+      .then(([pdfJs, payload]) => {
+        if (!isCurrentRequest()) return null;
+        loadingTask = pdfJs.getDocument(
+          typeof payload === 'string'
+            ? { url: payload }
+            : { data: new Uint8Array(payload) },
+        );
         return loadingTask.promise;
       })
       .then(async (nextDocument) => {
         if (!nextDocument) return;
-        if (disposed) return;
+        if (!isCurrentRequest()) {
+          destroyTask(loadingTask);
+          return;
+        }
 
         const firstPage = await nextDocument.getPage(1);
         const viewport = firstPage.getViewport({ scale: 1 });
-        if (disposed) return;
-        setAspectRatio(viewport.width / viewport.height);
-        setDocument(nextDocument);
+        if (!isCurrentRequest() || !loadingTask) {
+          destroyTask(loadingTask);
+          return;
+        }
+
+        const nextDeck: LoadedDeck = {
+          sourceKey,
+          document: nextDocument,
+          loadingTask,
+          aspectRatio: viewport.width / viewport.height,
+        };
+        const previousDeck = activeDeckRef.current;
+        promoted = true;
+        activeDeckRef.current = nextDeck;
+        if (previousDeck && previousDeck.loadingTask !== loadingTask) {
+          retiredTasksRef.current.push(previousDeck.loadingTask);
+        }
+        setCurrentPage(1);
+        setFailedSourceKey('');
+        setActiveDeck(nextDeck);
+        onReadyRef.current?.(sourceKey);
       })
       .catch((error: unknown) => {
-        if (disposed) return;
+        if (!isCurrentRequest()) {
+          destroyTask(loadingTask);
+          return;
+        }
         const nextError = getError(error);
         console.error('Failed to load slide deck preview:', nextError);
-        setFailed(true);
-        onErrorRef.current?.(nextError);
+        destroyTask(loadingTask);
+        if (!activeDeckRef.current) setFailedSourceKey(sourceKey);
+        onErrorRef.current?.(nextError, sourceKey);
       });
 
     return () => {
       disposed = true;
-      if (loadingTask) void loadingTask.destroy();
+      if (!promoted) destroyTask(loadingTask);
     };
-  }, [src]);
+  }, [activeRequestId, destroyTask, requestId, source, sourceKey]);
+
+  useEffect(() => {
+    const retiredTasks = retiredTasksRef.current.splice(0);
+    retiredTasks.forEach(destroyTask);
+  }, [activeDeck, destroyTask]);
+
+  useEffect(() => () => {
+    destroyTask(activeDeckRef.current?.loadingTask || null);
+    retiredTasksRef.current.splice(0).forEach(destroyTask);
+  }, [destroyTask]);
+
+  const document = activeDeck?.document || null;
+  const aspectRatio = activeDeck?.aspectRatio || 16 / 9;
 
   const pageNumbers = useMemo(
     () => Array.from({ length: document?.numPages || 0 }, (_, index) => index + 1),
@@ -400,7 +497,9 @@ export function SlideDeckPreview({ src, title, onError }: SlideDeckPreviewProps)
     });
   };
 
-  if (failed) return <SlideDeckFallback src={src} title={title} />;
+  if (!document && failedSourceKey === sourceKey && requestId === activeRequestId) {
+    return <SlideDeckFallback source={source} title={title} />;
+  }
   if (!document) return <SlideDeckLoading />;
 
   return (

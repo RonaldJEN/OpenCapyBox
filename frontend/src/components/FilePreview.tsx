@@ -41,6 +41,33 @@ import mammoth from 'mammoth';
 import DOMPurify from 'dompurify';
 import type { FileInfo } from '../types';
 import { apiService } from '../services/api';
+import { WorkspaceApiError, workspaceApi } from '../services/workspaceApi';
+import { readFilePreviewCache, writeFilePreviewCache } from '../services/filePreviewCache';
+import {
+  discardSessionDraft,
+  flushSessionDraft,
+  getSessionDraft,
+  queueSessionMarkdownDraft,
+  queueSessionSpreadsheetDraft,
+  resolveSessionDraftForRead,
+  subscribeSessionSaves,
+  getSessionSaveSnapshot,
+  hasPendingSessionDraft,
+  sessionDraftKey,
+  type SessionSaveSnapshot,
+  type SessionDraftRecord,
+} from '../services/sessionDraftOutbox';
+import {
+  checkpointWorkspaceFile,
+  flushWorkspaceDraft,
+  getWorkspaceDraft,
+  queueWorkspaceMarkdownDraft,
+  queueWorkspaceSpreadsheetDraft,
+  subscribeWorkspaceDraftLosses,
+  takeWorkspaceDraftLossNotice,
+  type WorkspaceDraftLossNotice,
+} from '../services/workspaceDraftOutbox';
+import { requestOpenWorkspace } from '../services/workspaceEvents';
 import { formatDownloadError } from '../utils/errorMessages';
 import { buildSandboxFileUrl, getFileExtLabel } from '../utils/fileUtils';
 import { extractMarkdownHeadings, MarkdownReportPreview } from './file-preview/MarkdownReportPreview';
@@ -54,6 +81,8 @@ import {
 import './file-preview/filePreview.css';
 import type { VditorMarkdownEditorHandle } from './file-preview/VditorMarkdownEditor';
 import type { SpreadsheetEditorHandle } from './file-preview/SpreadsheetEditor';
+import { DEFAULT_FEEDBACK_AUTO_DISMISS_MS } from './FeedbackMessage';
+import { WorkspaceDestinationPicker } from './workspace/WorkspaceDestinationPicker';
 
 interface FilePreviewProps {
   file: FileInfo | null;
@@ -63,12 +92,21 @@ interface FilePreviewProps {
   readOnly?: boolean;
   previewUrlBuilder?: (file: FileInfo) => string;
   onDownloadFile?: (file: FileInfo) => Promise<void>;
+  onSaveMarkdownFile?: (file: FileInfo, content: string) => Promise<FileInfo>;
+  onSaveSpreadsheetFile?: (file: FileInfo, content: ArrayBuffer) => Promise<FileInfo>;
+  canSaveToWorkspace?: boolean;
+  onOpenWorkspace?: () => void;
   onFileUpdated?: (file: FileInfo) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onSavingChange?: (saving: boolean) => void;
   onSaveFailure?: () => void;
   saveRequestNonce?: number;
+  refreshInPlace?: boolean;
+  externalConflict?: boolean;
+  reloadNonce?: number;
+  onFileVersionLoaded?: (file: FileInfo) => void;
   inline?: boolean;
+  contextNotice?: string;
 }
 
 export interface SessionFileOwnerIdentity {
@@ -82,15 +120,26 @@ export interface FilePreviewSaveResult extends SessionFileOwnerIdentity {
   stale: boolean;
 }
 
+export interface FilePreviewSaveOptions {
+  requireRemote?: boolean;
+}
+
 export interface FilePreviewHandle extends SessionFileOwnerIdentity {
   path: string;
   isDirty: (expectedOwner: SessionFileOwnerIdentity) => boolean;
-  saveDirty: (expectedOwner: SessionFileOwnerIdentity) => Promise<FilePreviewSaveResult>;
+  saveDirty: (
+    expectedOwner: SessionFileOwnerIdentity,
+    options?: FilePreviewSaveOptions,
+  ) => Promise<FilePreviewSaveResult>;
+  downloadDraft: (expectedOwner: SessionFileOwnerIdentity) => boolean;
 }
 
 type PreviewViewMode = 'rendered' | 'source';
+type PreviewLoadState = 'idle' | 'initial-loading' | 'ready' | 'refreshing' | 'error';
 
-export const MARKDOWN_AUTOSAVE_DELAY_MS = 900;
+export const MARKDOWN_AUTOSAVE_DELAY_MS = 300;
+export const SPREADSHEET_AUTOSAVE_DELAY_MS = 300;
+export const OFFICE_PREVIEW_SLOW_HINT_MS = 2500;
 
 const VditorMarkdownEditor = lazy(async () => {
   const module = await import('./file-preview/VditorMarkdownEditor');
@@ -113,30 +162,78 @@ interface ZipEntry {
   directory: boolean;
 }
 
-const PREVIEW_CACHE_LIMIT = 30;
+interface PresentationPreviewSource {
+  blob: Blob;
+  key: string;
+  requestId: number;
+}
+
 const MAX_ZIP_PREVIEW_BYTES = 10 * 1024 * 1024;
 const MAX_ZIP_ENTRIES = 2000;
-const previewCache = new Map<string, PreviewCacheEntry>();
-
-function readPreviewCache(key: string): PreviewCacheEntry | null {
-  const cached = previewCache.get(key) || null;
-  if (!cached) return null;
-  previewCache.delete(key);
-  previewCache.set(key, cached);
-  return cached;
-}
-
-function writePreviewCache(key: string, value: PreviewCacheEntry) {
-  previewCache.delete(key);
-  previewCache.set(key, value);
-  if (previewCache.size > PREVIEW_CACHE_LIMIT) {
-    const oldestKey = previewCache.keys().next().value;
-    if (oldestKey) previewCache.delete(oldestKey);
-  }
-}
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
+}
+
+function previewOwnerKey(sessionId: string, ownerEpoch: number, file: FileInfo): string {
+  const mode = file.content_mode || 'current';
+  if (mode === 'captured') {
+    return [
+      sessionId,
+      ownerEpoch,
+      mode,
+      file.source || 'session',
+      file.entry_id || '',
+      file.version_id || '',
+      file.snapshot_path || '',
+      file.assistant_ref_id || '',
+      file.path,
+    ].join('::');
+  }
+  return [
+    sessionId,
+    ownerEpoch,
+    mode,
+    file.source || 'session',
+    file.source === 'workspace' && file.entry_id ? file.entry_id : file.path,
+  ].join('::');
+}
+
+function previewContentKey(file: FileInfo): string {
+  if (file.source === 'workspace' && file.version_id) return `workspace-version:${file.version_id}`;
+  return [
+    file.version_id || '',
+    file.snapshot_path || '',
+    file.assistant_ref_id || '',
+    String(file.revision ?? ''),
+    file.modified,
+    file.size,
+  ].join('::');
+}
+
+async function fetchMergedWorkspaceVersion(file: FileInfo): Promise<Response> {
+  if (!file.entry_id || !file.version_id) throw new Error('合并回执缺少工作区版本');
+  const response = await fetch(workspaceApi.versionContentUrl(file.version_id, true), {
+    headers: apiService.getAuthHeaders(),
+  });
+  if (!response.ok) throw new Error(`读取合并版本失败（HTTP ${response.status}）`);
+  return response;
+}
+
+function conflictCurrentFile(error: unknown): Partial<FileInfo> | null {
+  const detail = (error as { detail?: unknown })?.detail;
+  if (!detail || typeof detail !== 'object') return null;
+  const current = (detail as { current?: unknown }).current;
+  return current && typeof current === 'object' && typeof (current as { path?: unknown }).path === 'string'
+    ? current as Partial<FileInfo>
+    : null;
+}
+
+function isExpectedWorkspaceSaveWait(error: unknown): boolean {
+  return error instanceof WorkspaceApiError && (
+    error.detail.code === 'MUTATION_IN_PROGRESS'
+    || error.detail.code === 'WORKSPACE_MUTATION_IN_PROGRESS'
+  );
 }
 
 export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(function FilePreview({
@@ -147,21 +244,30 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   readOnly = false,
   previewUrlBuilder,
   onDownloadFile,
+  onSaveMarkdownFile,
+  onSaveSpreadsheetFile,
+  canSaveToWorkspace = false,
+  onOpenWorkspace,
   onFileUpdated,
   onDirtyChange,
   onSavingChange,
   onSaveFailure,
   saveRequestNonce,
+  refreshInPlace = false,
+  externalConflict = false,
+  reloadNonce = 0,
+  onFileVersionLoaded,
   inline = false,
+  contextNotice,
 }: FilePreviewProps, ref) {
-  const [loading, setLoading] = useState(false);
+  const [previewLoadState, setPreviewLoadState] = useState<PreviewLoadState>('idle');
+  const [officePreviewSlow, setOfficePreviewSlow] = useState(false);
   const [error, setError] = useState('');
   const [previewNotice, setPreviewNotice] = useState('');
   const [textContent, setTextContent] = useState('');
   const [markdownDraft, setMarkdownDraft] = useState('');
   const [fileVersion, setFileVersion] = useState<FileInfo | null>(file);
   const [savingMarkdown, setSavingMarkdown] = useState(false);
-  const [markdownSaveMessage, setMarkdownSaveMessage] = useState('');
   const [markdownSaveError, setMarkdownSaveError] = useState('');
   const [markdownRevision, setMarkdownRevision] = useState(0);
   const [markdownToolbarOpen, setMarkdownToolbarOpen] = useState(false);
@@ -171,17 +277,33 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   const [spreadsheetDirty, setSpreadsheetDirty] = useState(false);
   const [spreadsheetRevision, setSpreadsheetRevision] = useState(0);
   const [savingSpreadsheet, setSavingSpreadsheet] = useState(false);
-  const [spreadsheetSaveMessage, setSpreadsheetSaveMessage] = useState('');
   const [spreadsheetSaveError, setSpreadsheetSaveError] = useState('');
   const [zipEntries, setZipEntries] = useState<ZipEntry[]>([]);
   const [zipQuery, setZipQuery] = useState('');
   const [binaryPreviewUrl, setBinaryPreviewUrl] = useState('');
   const [convertedPdfUrl, setConvertedPdfUrl] = useState('');
+  const [presentationSource, setPresentationSource] = useState<PresentationPreviewSource | null>(null);
+  const [presentationRequestId, setPresentationRequestId] = useState(0);
   const [htmlFrameLoading, setHtmlFrameLoading] = useState(false);
   const [viewMode, setViewMode] = useState<PreviewViewMode>('rendered');
   const [wrapLongLines, setWrapLongLines] = useState(false);
   const [imageScale, setImageScale] = useState(1);
   const [imageRotation, setImageRotation] = useState(0);
+  const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
+  const [localReloadNonce, setLocalReloadNonce] = useState(0);
+  const [workspaceImportPreparing, setWorkspaceImportPreparing] = useState(false);
+  const [retainedSessionDraft, setRetainedSessionDraft] = useState<SessionDraftRecord | null>(null);
+  const [workspaceNotice, setWorkspaceNotice] = useState<{
+    entryId: string;
+    path: string;
+    message: string;
+  } | null>(null);
+  const [workspaceDraftLossNotice, setWorkspaceDraftLossNotice] = useState<WorkspaceDraftLossNotice | null>(null);
+  const loading = previewLoadState === 'initial-loading' || previewLoadState === 'refreshing';
+  const backgroundRefreshing = previewLoadState === 'refreshing';
+  const hasCurrentPresentationSource = Boolean(
+    presentationSource && presentationSource.requestId === presentationRequestId,
+  );
   const requestIdRef = useRef(0);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const contentViewportRef = useRef<HTMLDivElement>(null);
@@ -189,21 +311,35 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   const markdownRevisionRef = useRef(0);
   const spreadsheetEditorRef = useRef<SpreadsheetEditorHandle>(null);
   const spreadsheetRevisionRef = useRef(0);
+  const draftOutboxGenerationRef = useRef(0);
+  const acceptedSessionSaveRef = useRef<SessionSaveSnapshot | null>(null);
+  const spreadsheetDraftKeyRef = useRef<string | null>(null);
+  const spreadsheetDraftCapturePromiseRef = useRef<Promise<void> | null>(null);
   const selfSavedModifiedRef = useRef('');
-  const loadedFileIdentityRef = useRef('');
+  const loadedPreviewOwnerKeyRef = useRef('');
+  const loadedContentKeyRef = useRef('');
+  const contentLoadedRef = useRef(false);
+  const contentGenerationRef = useRef(0);
   const handledSaveRequestNonceRef = useRef<number | undefined>(undefined);
   const markdownSavePromiseRef = useRef<Promise<boolean> | null>(null);
   const spreadsheetSavePromiseRef = useRef<Promise<boolean> | null>(null);
+  const markdownRemoteSavedRef = useRef(true);
+  const spreadsheetRemoteSavedRef = useRef(true);
+  const refreshingRequestIdRef = useRef<number | null>(null);
+  const externalConflictRef = useRef(externalConflict);
   const ownerIdentityRef = useRef<SessionFileOwnerIdentity>({ ownerSessionId: sessionId, ownerEpoch });
   const fileVersionRef = useRef(fileVersion);
   const markdownDraftRef = useRef(markdownDraft);
   const textContentRef = useRef(textContent);
   const spreadsheetDirtyRef = useRef(spreadsheetDirty);
+  const retainedSessionDraftRef = useRef(retainedSessionDraft);
   ownerIdentityRef.current = { ownerSessionId: sessionId, ownerEpoch };
   fileVersionRef.current = fileVersion;
   markdownDraftRef.current = markdownDraft;
   textContentRef.current = textContent;
   spreadsheetDirtyRef.current = spreadsheetDirty;
+  retainedSessionDraftRef.current = retainedSessionDraft;
+  externalConflictRef.current = externalConflict;
   const fileRef = useRef(file);
   fileRef.current = file;
   const previewUrlBuilderRef = useRef(previewUrlBuilder);
@@ -214,14 +350,26 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   onSavingChangeRef.current = onSavingChange;
   const onSaveFailureRef = useRef(onSaveFailure);
   onSaveFailureRef.current = onSaveFailure;
+  const onFileVersionLoadedRef = useRef(onFileVersionLoaded);
+  onFileVersionLoadedRef.current = onFileVersionLoaded;
+  const onDownloadFileRef = useRef(onDownloadFile);
+  onDownloadFileRef.current = onDownloadFile;
+  const onSaveMarkdownFileRef = useRef(onSaveMarkdownFile);
+  onSaveMarkdownFileRef.current = onSaveMarkdownFile;
+  const onSaveSpreadsheetFileRef = useRef(onSaveSpreadsheetFile);
+  onSaveSpreadsheetFileRef.current = onSaveSpreadsheetFile;
+  const onFileUpdatedRef = useRef(onFileUpdated);
+  onFileUpdatedRef.current = onFileUpdated;
 
   const descriptor = useMemo(
     () => file ? resolvePreviewDescriptor(file) : null,
     [file],
   );
-  const effectiveReadOnly = readOnly || Boolean(previewUrlBuilder);
+  const hasCustomSave = Boolean(onSaveMarkdownFile || onSaveSpreadsheetFile);
+  const hasWorkspaceSave = file?.source === 'workspace' && Boolean(file.entry_id);
+  const effectiveReadOnly = readOnly || Boolean(previewUrlBuilder && !hasCustomSave && !hasWorkspaceSave);
   const spreadsheetReadOnly = descriptor?.kind === 'spreadsheet' && (
-    effectiveReadOnly || descriptor.type === 'xls' || descriptor.type === 'et'
+    effectiveReadOnly || Boolean(retainedSessionDraft) || descriptor.type === 'xls' || descriptor.type === 'et'
   );
   const markdownHeadings = useMemo(
     () => descriptor?.kind === 'markdown' ? extractMarkdownHeadings(markdownDraft) : [],
@@ -230,13 +378,85 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
 
   const getPreviewApiUrl = () => {
     if (!file) return '';
-    if (previewUrlBuilder) return previewUrlBuilder(file);
-    return buildSandboxFileUrl(sessionId, file.path, true);
+    const currentPreviewUrlBuilder = previewUrlBuilderRef.current;
+    if (currentPreviewUrlBuilder) return currentPreviewUrlBuilder(file);
+    const url = buildSandboxFileUrl(sessionId, file.path, true);
+    return isSessionEditable ? `${url}&edit=true` : url;
+  };
+
+  const isSessionEditable = !effectiveReadOnly && !hasCustomSave && !previewUrlBuilder
+    && file?.source !== 'workspace' && file?.content_mode !== 'captured'
+    && (descriptor?.kind === 'markdown' || (descriptor?.kind === 'spreadsheet' && !spreadsheetReadOnly));
+
+  const sessionContentVersion = (response: Response): FileInfo | null => {
+    if (!file || !isSessionEditable) return file;
+    const token = response.headers?.get('X-Session-Edit-Base');
+    const revision = response.headers?.get('X-Session-File-Revision');
+    if (!token || !revision) return file;
+    return { ...file, source: 'session', session_id: sessionId, edit_base_token: token, revision,
+      size: Number(response.headers.get('Content-Length')),
+      modified: response.headers.get('X-Session-File-Modified') || file.modified };
   };
 
   const getPreviewCacheKey = (suffix = '') => {
     if (!file) return '';
-    return `${getPreviewApiUrl()}::${file.modified}::${file.size}${suffix}`;
+    return [
+      getPreviewApiUrl(),
+      file.content_mode || 'current',
+      file.source || 'session',
+      file.entry_id || '',
+      file.version_id || '',
+      file.snapshot_path || '',
+      file.assistant_ref_id || '',
+      String(file.revision ?? ''),
+      file.modified,
+      String(file.size),
+      `reload:${localReloadNonce}`,
+      suffix,
+    ].join('::');
+  };
+
+  const readCachedPreview = (key: string): PreviewCacheEntry | null => (
+    readFilePreviewCache<PreviewCacheEntry>(key)
+  );
+
+  const writeCachedPreview = (key: string, value: PreviewCacheEntry): void => {
+    const currentFile = fileRef.current;
+    writeFilePreviewCache(
+      key,
+      value,
+      currentFile?.source === 'workspace' ? currentFile.entry_id : undefined,
+    );
+  };
+
+  const getApplicableRetainedDraft = async (
+    kind: 'markdown' | 'spreadsheet', loadedFile = file, content?: string | ArrayBuffer,
+  ) => {
+    if (!file || effectiveReadOnly || file.content_mode === 'captured') return null;
+    if (file.source === 'workspace' && file.entry_id) {
+      const draft = await getWorkspaceDraft(file.entry_id);
+      return draft?.kind === kind ? draft : null;
+    }
+    if (
+      (kind === 'markdown' && onSaveMarkdownFileRef.current)
+      || (kind === 'spreadsheet' && onSaveSpreadsheetFileRef.current)
+    ) return null;
+    const draft = loadedFile && content !== undefined
+      ? await resolveSessionDraftForRead(sessionId, loadedFile, content)
+      : await getSessionDraft(sessionId, file.path);
+    if (!draft || draft.kind !== kind) {
+      retainedSessionDraftRef.current = null;
+      setRetainedSessionDraft(null);
+      return null;
+    }
+    if (draft.status === 'conflict' || draft.status === 'retained') {
+      retainedSessionDraftRef.current = draft;
+      setRetainedSessionDraft(draft);
+      return null;
+    }
+    retainedSessionDraftRef.current = null;
+    setRetainedSessionDraft(null);
+    return draft;
   };
 
   const buildMarkdownSessionFileUrl = useCallback((resolvedPath: string) => {
@@ -253,85 +473,244 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       : buildSandboxFileUrl(sessionId, resolvedPath, true);
   }, [sessionId]);
 
+  const commitLoadedVersion = (requestId: number, loadedFile = file) => {
+    if (requestId !== requestIdRef.current || !loadedFile) return;
+    contentLoadedRef.current = true;
+    markdownRemoteSavedRef.current = true;
+    spreadsheetRemoteSavedRef.current = true;
+    loadedContentKeyRef.current = previewContentKey(loadedFile);
+    fileVersionRef.current = loadedFile;
+    setFileVersion(loadedFile);
+    onFileVersionLoadedRef.current?.(loadedFile);
+    refreshingRequestIdRef.current = null;
+    setPreviewLoadState('ready');
+  };
+
+  const reportLoadError = (requestId: number, message: string) => {
+    if (refreshingRequestIdRef.current === requestId) {
+      setPreviewNotice(`${message}，旧版本仍可查看，请稍后重试。`);
+      setPreviewLoadState('ready');
+      return;
+    }
+    setError(message);
+    setPreviewLoadState('error');
+  };
+
+  const acceptSessionSave = useCallback((snapshot: SessionSaveSnapshot) => {
+    const active = fileRef.current;
+    if (!active || effectiveReadOnly || active.content_mode === 'captured' || active.source === 'workspace'
+      || snapshot.key !== sessionDraftKey(sessionId, active.path)
+      || hasPendingSessionDraft(sessionId, active.path)) return;
+    if (acceptedSessionSaveRef.current === snapshot) return;
+    acceptedSessionSaveRef.current = snapshot;
+    // All mounted views consume the same outbox acknowledgement. A response to
+    // an editor that was closed must also update its newly opened replacement.
+    requestIdRef.current += 1;
+    const updated = { ...snapshot.file, session_id: sessionId };
+    selfSavedModifiedRef.current = updated.modified;
+    fileVersionRef.current = updated;
+    setFileVersion(updated);
+    loadedContentKeyRef.current = previewContentKey(updated);
+    if (typeof snapshot.content === 'string') {
+      textContentRef.current = snapshot.content;
+      markdownDraftRef.current = snapshot.content;
+      setTextContent(snapshot.content);
+      setMarkdownDraft(snapshot.content);
+    } else {
+      if (updated.session_auto_merged || !contentLoadedRef.current) setSpreadsheetSource(snapshot.content);
+      spreadsheetDirtyRef.current = false;
+      setSpreadsheetDirty(false);
+      spreadsheetDraftKeyRef.current = null;
+      spreadsheetDraftCapturePromiseRef.current = null;
+    }
+    draftOutboxGenerationRef.current = snapshot.generation;
+    retainedSessionDraftRef.current = null;
+    setRetainedSessionDraft(null);
+    markdownRemoteSavedRef.current = true;
+    spreadsheetRemoteSavedRef.current = true;
+    contentLoadedRef.current = true;
+    setPreviewLoadState('ready');
+    setPreviewNotice('');
+    onFileUpdatedRef.current?.(updated);
+  }, [effectiveReadOnly, sessionId]);
+
+  useEffect(() => subscribeSessionSaves(acceptSessionSave), [acceptSessionSave]);
+
+  const acceptWorkspaceDraftLoss = useCallback((notice: WorkspaceDraftLossNotice) => {
+    const active = fileRef.current;
+    if (
+      !active
+      || active.source !== 'workspace'
+      || active.entry_id !== notice.entryId
+    ) return;
+    takeWorkspaceDraftLossNotice(notice.entryId);
+    loadedPreviewOwnerKeyRef.current = '';
+    loadedContentKeyRef.current = '';
+    contentLoadedRef.current = false;
+    markdownRemoteSavedRef.current = true;
+    spreadsheetRemoteSavedRef.current = true;
+    spreadsheetDraftKeyRef.current = null;
+    spreadsheetDraftCapturePromiseRef.current = null;
+    spreadsheetDirtyRef.current = false;
+    setSpreadsheetDirty(false);
+    setMarkdownSaveError('');
+    setSpreadsheetSaveError('');
+    setWorkspaceDraftLossNotice(notice);
+    setLocalReloadNonce((value) => value + 1);
+  }, []);
+
+  useEffect(
+    () => subscribeWorkspaceDraftLosses(acceptWorkspaceDraftLoss),
+    [acceptWorkspaceDraftLoss],
+  );
+
+  useEffect(() => {
+    setWorkspaceDraftLossNotice(null);
+    if (file?.source !== 'workspace' || !file.entry_id) return;
+    const notice = takeWorkspaceDraftLossNotice(file.entry_id);
+    if (notice) acceptWorkspaceDraftLoss(notice);
+  }, [acceptWorkspaceDraftLoss, file?.entry_id, file?.source]);
+
   useLayoutEffect(() => {
     if (!file) return undefined;
 
-    const fileIdentity = `${sessionId}::${file.path}`;
+    const nextOwnerKey = previewOwnerKey(sessionId, ownerEpoch, file);
+    const nextContentKey = previewContentKey(file);
+    const nextDescriptor = resolvePreviewDescriptor(file);
+    const sameOwner = loadedPreviewOwnerKeyRef.current === nextOwnerKey;
     if (
-      loadedFileIdentityRef.current === fileIdentity
+      sameOwner
       && selfSavedModifiedRef.current
       && selfSavedModifiedRef.current === file.modified
     ) {
       selfSavedModifiedRef.current = '';
+      loadedContentKeyRef.current = nextContentKey;
       setFileVersion(file);
       return undefined;
     }
-    loadedFileIdentityRef.current = fileIdentity;
+    const loadedVersion = fileVersionRef.current;
+    const metadataOnlyUpdate = Boolean(
+      refreshInPlace
+      && contentLoadedRef.current
+      && sameOwner
+      && loadedVersion?.entry_id
+      && loadedVersion.entry_id === file.entry_id
+      && (
+        loadedContentKeyRef.current === nextContentKey
+        || Boolean(loadedVersion.version_id && loadedVersion.version_id === file.version_id)
+      ),
+    );
+    if (metadataOnlyUpdate) {
+      // 持久工作区的重命名/移动会推进 entry revision，但内容版本不变。
+      // 只更新路径和版本元数据，保留已加载内容以及未保存草稿。
+      loadedPreviewOwnerKeyRef.current = nextOwnerKey;
+      loadedContentKeyRef.current = nextContentKey;
+      fileVersionRef.current = file;
+      setFileVersion(file);
+      onFileVersionLoadedRef.current?.(file);
+      return undefined;
+    }
+    const hasLocalChanges = (
+      nextDescriptor.kind === 'markdown'
+        ? (markdownEditorRef.current?.getMarkdown() ?? markdownDraftRef.current) !== textContentRef.current
+        : nextDescriptor.kind === 'spreadsheet' && spreadsheetDirtyRef.current
+    );
+    if (refreshInPlace && sameOwner && contentLoadedRef.current && hasLocalChanges) {
+      setPreviewNotice('文件已有新版本；当前草稿已保留，完成保存后会继续同步。');
+      return undefined;
+    }
+    loadedPreviewOwnerKeyRef.current = nextOwnerKey;
+    if (!sameOwner) {
+      loadedContentKeyRef.current = '';
+      retainedSessionDraftRef.current = null;
+      setRetainedSessionDraft(null);
+    }
+    contentGenerationRef.current += 1;
 
     requestIdRef.current += 1;
     const requestId = requestIdRef.current;
     const controller = new AbortController();
-    const nextDescriptor = resolvePreviewDescriptor(file);
+    const shouldRefreshInPlace = refreshInPlace && sameOwner && contentLoadedRef.current;
+    refreshingRequestIdRef.current = shouldRefreshInPlace ? requestId : null;
+    setPresentationRequestId(nextDescriptor.kind === 'presentation' ? requestId : 0);
 
     setError('');
     setPreviewNotice('');
-    setTextContent('');
-    setMarkdownDraft('');
-    setFileVersion(file);
+    if (!shouldRefreshInPlace) {
+      fileVersionRef.current = file;
+      setFileVersion(file);
+    }
     setSavingMarkdown(false);
-    setMarkdownSaveMessage('');
     setMarkdownSaveError('');
-    markdownRevisionRef.current = 0;
-    setMarkdownRevision(0);
-    setMarkdownToolbarOpen(false);
-    setMarkdownTocOpen(false);
-    setDocxHtml('');
-    setSpreadsheetSource(null);
-    setSpreadsheetDirty(false);
-    spreadsheetRevisionRef.current = 0;
-    setSpreadsheetRevision(0);
     setSavingSpreadsheet(false);
-    setSpreadsheetSaveMessage('');
     setSpreadsheetSaveError('');
-    setZipEntries([]);
-    setZipQuery('');
-    setBinaryPreviewUrl('');
-    setConvertedPdfUrl('');
-    setHtmlFrameLoading(false);
-    setViewMode('rendered');
-    setWrapLongLines(false);
-    setImageScale(1);
-    setImageRotation(0);
-
-    switch (nextDescriptor.kind) {
-      case 'text':
-      case 'markdown':
-      case 'html':
-      case 'code':
-        void loadTextContent(requestId, controller.signal);
-        break;
-      case 'document':
-      case 'presentation':
-        void loadOfficePreview(requestId, controller.signal, nextDescriptor);
-        break;
-      case 'spreadsheet':
-        void loadSpreadsheetContent(requestId, controller.signal);
-        break;
-      case 'archive':
-        void loadZipContent(requestId, controller.signal);
-        break;
-      case 'image':
-      case 'pdf':
-        void loadBinaryPreview(requestId, controller.signal);
-        break;
-      default:
-        break;
+    setOfficePreviewSlow(false);
+    setPreviewLoadState(shouldRefreshInPlace ? 'refreshing' : 'initial-loading');
+    if (!shouldRefreshInPlace) {
+      contentLoadedRef.current = false;
+      setTextContent('');
+      setMarkdownDraft('');
+      textContentRef.current = '';
+      markdownDraftRef.current = '';
+      markdownRevisionRef.current = 0;
+      setMarkdownRevision(0);
+      setMarkdownToolbarOpen(false);
+      setMarkdownTocOpen(false);
+      setDocxHtml('');
+      setSpreadsheetSource(null);
+      setSpreadsheetDirty(false);
+      spreadsheetDirtyRef.current = false;
+      spreadsheetRevisionRef.current = 0;
+      draftOutboxGenerationRef.current = 0;
+      spreadsheetDraftKeyRef.current = null;
+      spreadsheetDraftCapturePromiseRef.current = null;
+      setSpreadsheetRevision(0);
+      setZipEntries([]);
+      setZipQuery('');
+      setBinaryPreviewUrl('');
+      setConvertedPdfUrl('');
+      setPresentationSource(null);
+      setHtmlFrameLoading(false);
+      setViewMode('rendered');
+      setWrapLongLines(false);
+      setImageScale(1);
+      setImageRotation(0);
     }
 
+    const startLoader = () => {
+      switch (nextDescriptor.kind) {
+        case 'text':
+        case 'markdown':
+        case 'html':
+        case 'code':
+          void loadTextContent(requestId, controller.signal);
+          break;
+        case 'document':
+        case 'presentation':
+          void loadOfficePreview(requestId, controller.signal, nextDescriptor);
+          break;
+        case 'spreadsheet':
+          void loadSpreadsheetContent(requestId, controller.signal);
+          break;
+        case 'archive':
+          void loadZipContent(requestId, controller.signal);
+          break;
+        case 'image':
+        case 'pdf':
+          void loadBinaryPreview(requestId, controller.signal);
+          break;
+        default:
+          commitLoadedVersion(requestId);
+          break;
+      }
+    };
+    startLoader();
+
     return () => controller.abort();
-  // Loader 使用本次 render 的 file/session 快照；requestIdRef 额外丢弃不遵守 abort 的迟到响应。
+  // Loader 只由文件版本和 owner 身份驱动；URL builder 通过 ref 读取，父级流式重渲染不得重载预览。
+  // requestIdRef 额外丢弃不遵守 abort 的迟到响应。
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file?.modified, file?.name, file?.path, file?.size, file?.type, sessionId, previewUrlBuilder]);
+  }, [file?.assistant_ref_id, file?.content_mode, file?.entry_id, file?.modified, file?.name, file?.path, file?.revision, file?.size, file?.snapshot_path, file?.source, file?.type, file?.version_id, refreshInPlace, localReloadNonce, reloadNonce, ownerEpoch, sessionId]);
 
   const markdownDirty = descriptor?.kind === 'markdown' && markdownDraft !== textContent;
   const previewDirty = markdownDirty || spreadsheetDirty;
@@ -346,14 +725,29 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   }, [previewSaving]);
 
   useEffect(() => {
-    if (!previewDirty) return undefined;
-    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      event.returnValue = '';
-    };
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [previewDirty]);
+    const isInitialOfficeLoad = previewLoadState === 'initial-loading'
+      && (descriptor?.kind === 'document' || descriptor?.kind === 'presentation')
+      && (descriptor.kind !== 'presentation' || !hasCurrentPresentationSource)
+      && (descriptor.kind !== 'document' || !convertedPdfUrl);
+    if (!isInitialOfficeLoad) {
+      setOfficePreviewSlow(false);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setOfficePreviewSlow(true), OFFICE_PREVIEW_SLOW_HINT_MS);
+    return () => window.clearTimeout(timer);
+  }, [convertedPdfUrl, descriptor?.kind, hasCurrentPresentationSource, previewLoadState]);
+
+  useEffect(() => {
+    const viewport = contentViewportRef.current;
+    if (!viewport) return;
+    if (backgroundRefreshing && loading) {
+      viewport.setAttribute('inert', '');
+      viewport.setAttribute('aria-busy', 'true');
+    } else {
+      viewport.removeAttribute('inert');
+      viewport.removeAttribute('aria-busy');
+    }
+  }, [backgroundRefreshing, loading]);
 
   useEffect(() => {
     return () => {
@@ -391,40 +785,73 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   };
 
   const loadTextContent = async (requestId: number, signal: AbortSignal) => {
-    setLoading(true);
     setError('');
     try {
       const cacheKey = getPreviewCacheKey();
-      const cached = cacheKey ? readPreviewCache(cacheKey) : null;
+      const cached = cacheKey && !isSessionEditable ? readCachedPreview(cacheKey) : null;
       if (cached?.kind === 'text') {
         if (requestId === requestIdRef.current) {
+          const retainedDraft = file && resolvePreviewDescriptor(file).kind === 'markdown'
+            ? await getApplicableRetainedDraft('markdown')
+            : null;
+          if (requestId !== requestIdRef.current) return;
           setTextContent(cached.text);
-          setMarkdownDraft(cached.text);
+          textContentRef.current = cached.text;
+          const loadedMarkdown = retainedDraft?.kind === 'markdown'
+            ? retainedDraft.content as string
+            : cached.text;
+          setMarkdownDraft(loadedMarkdown);
+          markdownDraftRef.current = loadedMarkdown;
+          commitLoadedVersion(requestId);
+          if (retainedDraft?.kind === 'markdown') {
+            fileVersionRef.current = retainedDraft.file;
+            setFileVersion(retainedDraft.file);
+            draftOutboxGenerationRef.current = retainedDraft.generation;
+            markdownRevisionRef.current += 1;
+            setMarkdownRevision(markdownRevisionRef.current);
+          }
         }
         return;
       }
 
       const response = await fetchPreviewResponse(getPreviewApiUrl(), signal);
       const text = await response.text();
+      const loadedFile = sessionContentVersion(response);
       if (requestId !== requestIdRef.current) return;
       if (file && resolvePreviewDescriptor(file).kind === 'html') {
         setHtmlFrameLoading(true);
       }
+      const retainedDraft = file && resolvePreviewDescriptor(file).kind === 'markdown'
+        ? await getApplicableRetainedDraft('markdown', loadedFile, text)
+        : null;
+      if (requestId !== requestIdRef.current) return;
       setTextContent(text);
-      setMarkdownDraft(text);
-      if (cacheKey) writePreviewCache(cacheKey, { kind: 'text', text });
+      textContentRef.current = text;
+      const loadedMarkdown = retainedDraft?.kind === 'markdown'
+        ? retainedDraft.content as string
+        : text;
+      setMarkdownDraft(loadedMarkdown);
+      markdownDraftRef.current = loadedMarkdown;
+      commitLoadedVersion(requestId, loadedFile);
+      if (retainedDraft?.kind === 'markdown') {
+        fileVersionRef.current = retainedDraft.file;
+        setFileVersion(retainedDraft.file);
+        draftOutboxGenerationRef.current = retainedDraft.generation;
+        spreadsheetDraftKeyRef.current = retainedDraft.key;
+        markdownRevisionRef.current += 1;
+        setMarkdownRevision(markdownRevisionRef.current);
+      }
+      if (cacheKey) writeCachedPreview(cacheKey, { kind: 'text', text });
     } catch (err) {
       if (requestId !== requestIdRef.current || isAbortError(err)) return;
       console.error('Failed to load text content:', err);
-      setError('加载文件内容失败');
-    } finally {
-      if (requestId === requestIdRef.current) setLoading(false);
+      reportLoadError(requestId, '加载文件内容失败');
     }
   };
 
   const loadDocxFallback = async (requestId: number, signal: AbortSignal) => {
     const cacheKey = getPreviewCacheKey('::mammoth');
-    const cached = cacheKey ? readPreviewCache(cacheKey) : null;
+    const cached = cacheKey ? readCachedPreview(cacheKey) : null;
     if (cached?.kind === 'docx') {
       if (requestId === requestIdRef.current) setDocxHtml(cached.html);
       return;
@@ -440,7 +867,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       FORBID_ATTR: ['onerror', 'onload', 'onclick'],
     });
     setDocxHtml(sanitizedHtml);
-    if (cacheKey) writePreviewCache(cacheKey, { kind: 'docx', html: sanitizedHtml });
+    if (cacheKey) writeCachedPreview(cacheKey, { kind: 'docx', html: sanitizedHtml });
     if (result.messages.length > 0) console.warn('DOCX conversion warnings:', result.messages);
   };
 
@@ -449,11 +876,10 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     signal: AbortSignal,
     officeDescriptor: PreviewDescriptor,
   ) => {
-    setLoading(true);
     setError('');
     try {
       const pdfCacheKey = getPreviewCacheKey('::render=pdf');
-      const cached = pdfCacheKey ? readPreviewCache(pdfCacheKey) : null;
+      const cached = pdfCacheKey ? readCachedPreview(pdfCacheKey) : null;
       let pdfBlob: Blob;
       if (cached?.kind === 'binary') {
         pdfBlob = cached.blob;
@@ -464,11 +890,19 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
         if (contentType && !contentType.toLowerCase().includes('pdf')) {
           throw new Error(`Unexpected converted content type: ${contentType}`);
         }
-        if (pdfCacheKey) writePreviewCache(pdfCacheKey, { kind: 'binary', blob: pdfBlob });
+        if (pdfCacheKey) writeCachedPreview(pdfCacheKey, { kind: 'binary', blob: pdfBlob });
       }
       if (requestId !== requestIdRef.current) return;
-      setConvertedPdfUrl(URL.createObjectURL(pdfBlob));
-      setLoading(false);
+      if (officeDescriptor.kind === 'presentation') {
+        setPresentationSource({
+          blob: pdfBlob,
+          key: `${pdfCacheKey || 'presentation'}::${requestId}`,
+          requestId,
+        });
+      } else {
+        setConvertedPdfUrl(URL.createObjectURL(pdfBlob));
+        commitLoadedVersion(requestId);
+      }
       return;
     } catch (conversionError) {
       if (requestId !== requestIdRef.current || isAbortError(conversionError)) return;
@@ -480,6 +914,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
         await loadDocxFallback(requestId, signal);
         if (requestId === requestIdRef.current) {
           setPreviewNotice('分页预览暂不可用，当前显示安全转换后的简化版式。');
+          commitLoadedVersion(requestId);
         }
       } catch (fallbackError) {
         if (requestId !== requestIdRef.current || isAbortError(fallbackError)) return;
@@ -494,37 +929,87 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       );
     }
 
-    if (requestId === requestIdRef.current) setLoading(false);
+    if (requestId === requestIdRef.current) {
+      setPreviewLoadState(
+        refreshingRequestIdRef.current === requestId && contentLoadedRef.current
+          ? 'ready'
+          : 'error',
+      );
+    }
+  };
+
+  const handlePresentationReady = (sourceKey: string) => {
+    const source = presentationSource;
+    if (
+      !source
+      || source.key !== sourceKey
+      || source.requestId !== presentationRequestId
+      || source.requestId !== requestIdRef.current
+    ) return;
+    commitLoadedVersion(source.requestId);
+  };
+
+  const handlePresentationError = (sourceKey: string) => {
+    const source = presentationSource;
+    if (
+      !source
+      || source.key !== sourceKey
+      || source.requestId !== presentationRequestId
+      || source.requestId !== requestIdRef.current
+    ) return;
+    if (refreshingRequestIdRef.current === source.requestId && contentLoadedRef.current) {
+      reportLoadError(source.requestId, '更新幻灯片预览失败');
+      return;
+    }
+    setPreviewNotice('高级幻灯片浏览器加载失败，已切换为浏览器 PDF 预览。');
+    commitLoadedVersion(source.requestId);
   };
 
   const loadSpreadsheetContent = async (requestId: number, signal: AbortSignal) => {
-    setLoading(true);
     setError('');
     try {
       const response = await fetchPreviewResponse(getPreviewApiUrl(), signal);
       const arrayBuffer = await response.arrayBuffer();
+      const loadedFile = sessionContentVersion(response);
       if (requestId !== requestIdRef.current) return;
-      setSpreadsheetSource(arrayBuffer);
+      const retainedDraft = file
+        ? await getApplicableRetainedDraft('spreadsheet', loadedFile, arrayBuffer)
+        : null;
+      if (requestId !== requestIdRef.current) return;
+      const loadedSpreadsheet = retainedDraft?.kind === 'spreadsheet'
+        ? retainedDraft.content as ArrayBuffer
+        : arrayBuffer;
+      setSpreadsheetSource(loadedSpreadsheet);
+      commitLoadedVersion(requestId, loadedFile);
+      if (retainedDraft?.kind === 'spreadsheet') {
+        fileVersionRef.current = retainedDraft.file;
+        setFileVersion(retainedDraft.file);
+        draftOutboxGenerationRef.current = retainedDraft.generation;
+        spreadsheetRevisionRef.current += 1;
+        spreadsheetDirtyRef.current = true;
+        setSpreadsheetRevision(spreadsheetRevisionRef.current);
+        setSpreadsheetDirty(true);
+      }
     } catch (err) {
       if (requestId !== requestIdRef.current || isAbortError(err)) return;
       console.error('Failed to load spreadsheet content:', err);
-      setError('加载电子表格失败');
-    } finally {
-      if (requestId === requestIdRef.current) setLoading(false);
+      reportLoadError(requestId, '加载电子表格失败');
     }
   };
 
   const loadZipContent = async (requestId: number, signal: AbortSignal) => {
-    setLoading(true);
     setError('');
     try {
       if (file && file.size > MAX_ZIP_PREVIEW_BYTES) {
         throw new Error('ZIP 文件超过 10 MB，请下载后解压查看');
       }
       const cacheKey = getPreviewCacheKey();
-      const cached = cacheKey ? readPreviewCache(cacheKey) : null;
+      const cached = cacheKey ? readCachedPreview(cacheKey) : null;
       if (cached?.kind === 'zip') {
-        if (requestId === requestIdRef.current) setZipEntries(cached.entries);
+        if (requestId === requestIdRef.current) {
+          setZipEntries(cached.entries);
+          commitLoadedVersion(requestId);
+        }
         return;
       }
       const response = await fetchPreviewResponse(getPreviewApiUrl(), signal);
@@ -548,45 +1033,42 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
         .sort((a, b) => Number(b.directory) - Number(a.directory) || a.path.localeCompare(b.path));
       if (requestId !== requestIdRef.current) return;
       setZipEntries(entries);
-      if (cacheKey) writePreviewCache(cacheKey, { kind: 'zip', entries });
+      commitLoadedVersion(requestId);
+      if (cacheKey) writeCachedPreview(cacheKey, { kind: 'zip', entries });
     } catch (err) {
       if (requestId !== requestIdRef.current || isAbortError(err)) return;
       console.error('Failed to load ZIP directory:', err);
-      setError(err instanceof Error ? err.message : '加载 ZIP 目录失败');
-    } finally {
-      if (requestId === requestIdRef.current) setLoading(false);
+      reportLoadError(requestId, err instanceof Error ? err.message : '加载 ZIP 目录失败');
     }
   };
 
   const loadBinaryPreview = async (requestId: number, signal: AbortSignal) => {
-    setLoading(true);
     setError('');
     try {
       const cacheKey = getPreviewCacheKey();
-      const cached = cacheKey ? readPreviewCache(cacheKey) : null;
+      const cached = cacheKey ? readCachedPreview(cacheKey) : null;
       let blob: Blob;
       if (cached?.kind === 'binary') {
         blob = cached.blob;
       } else {
         const response = await fetchPreviewResponse(getPreviewApiUrl(), signal);
         blob = await response.blob();
-        if (cacheKey) writePreviewCache(cacheKey, { kind: 'binary', blob });
+        if (cacheKey) writeCachedPreview(cacheKey, { kind: 'binary', blob });
       }
       if (requestId !== requestIdRef.current) return;
       setBinaryPreviewUrl(URL.createObjectURL(blob));
+      commitLoadedVersion(requestId);
     } catch (err) {
       if (requestId !== requestIdRef.current || isAbortError(err)) return;
       console.error('Failed to load binary content:', err);
-      setError('加载文件预览失败');
-    } finally {
-      if (requestId === requestIdRef.current) setLoading(false);
+      reportLoadError(requestId, '加载文件预览失败');
     }
   };
 
   const handleDownload = async () => {
     if (!file) return;
     try {
-      if (onDownloadFile) await onDownloadFile(file);
+      if (onDownloadFileRef.current) await onDownloadFileRef.current(file);
       else await apiService.downloadFile(sessionId, file.path);
     } catch (err) {
       console.error('Failed to download file:', err);
@@ -604,22 +1086,100 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     }
   };
 
+  const surfaceRetainedSessionDraft = useCallback(async (
+    saveError: unknown,
+    activeFile: FileInfo,
+  ): Promise<boolean> => {
+    const retained = await getSessionDraft(sessionId, activeFile.path);
+    if (!retained || (retained.status !== 'conflict' && retained.status !== 'retained')) return false;
+    retainedSessionDraftRef.current = retained;
+    setRetainedSessionDraft(retained);
+
+    const current = conflictCurrentFile(saveError);
+    if (current) {
+      const authoritative = {
+        ...activeFile,
+        ...current,
+        session_id: activeFile.session_id || sessionId,
+      } as FileInfo;
+      fileVersionRef.current = authoritative;
+      setFileVersion(authoritative);
+      onFileUpdatedRef.current?.(authoritative);
+    }
+    // 使用新的 cache identity 重新读取权威字节；retained 草稿只留作下载或丢弃。
+    setLocalReloadNonce((value) => value + 1);
+    onSaveFailureRef.current?.();
+    return true;
+  }, [sessionId]);
+
+  const handleDownloadRetainedDraft = useCallback(() => {
+    const retained = retainedSessionDraftRef.current;
+    if (!retained) return;
+    const blob = new Blob(
+      [retained.content],
+      { type: retained.kind === 'markdown' ? 'text/markdown;charset=utf-8' : 'application/octet-stream' },
+    );
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = `${retained.file.name || fileRef.current?.name || 'session-file'}.draft`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+  }, []);
+
+  const handleDiscardRetainedDraft = useCallback(async () => {
+    const retained = retainedSessionDraftRef.current;
+    if (!retained) return;
+    try {
+      await discardSessionDraft(retained.sessionId, retained.path);
+      if (retainedSessionDraftRef.current?.key !== retained.key) return;
+      retainedSessionDraftRef.current = null;
+      setRetainedSessionDraft(null);
+      spreadsheetDraftKeyRef.current = null;
+      spreadsheetDraftCapturePromiseRef.current = null;
+      spreadsheetDirtyRef.current = false;
+      setSpreadsheetDirty(false);
+      setLocalReloadNonce((value) => value + 1);
+      onSaveFailureRef.current?.();
+    } catch (discardError) {
+      console.error('Failed to discard retained Session draft:', discardError);
+      setError('丢弃本地草稿失败，请稍后重试');
+    }
+  }, []);
+
   const handleSaveMarkdown = useCallback((): Promise<boolean> => {
+    // Capture before returning an existing save promise: the editor may have
+    // newer input than the request already in flight.
+    const captured = markdownEditorRef.current?.getMarkdown() ?? markdownDraftRef.current;
+    const captureFile = fileVersionRef.current;
+    if (!effectiveReadOnly && !retainedSessionDraftRef.current && captureFile
+      && captureFile.source !== 'workspace' && !onSaveMarkdownFileRef.current
+      && descriptor?.kind === 'markdown' && captured !== textContentRef.current) {
+      markdownDraftRef.current = captured;
+      setMarkdownDraft(captured);
+      const queued = queueSessionMarkdownDraft(sessionId, captureFile, captured);
+      draftOutboxGenerationRef.current = queued.generation;
+    }
     if (markdownSavePromiseRef.current) return markdownSavePromiseRef.current;
+    if (externalConflictRef.current || retainedSessionDraftRef.current) return Promise.resolve(false);
+    const activeFile = fileRef.current;
     if (
-      !file
+      !activeFile
       || descriptor?.kind !== 'markdown'
       || effectiveReadOnly
     ) return Promise.resolve(true);
 
     const savePromise = (async () => {
+      const contentGeneration = contentGenerationRef.current;
       setSavingMarkdown(true);
       setMarkdownSaveError('');
       try {
         while (true) {
           const currentMarkdown = markdownEditorRef.current?.getMarkdown() ?? markdownDraftRef.current;
           if (currentMarkdown === textContentRef.current) {
-            setMarkdownSaveMessage('已自动保存');
+            markdownRemoteSavedRef.current = true;
             setMarkdownSaveError('');
             return true;
           }
@@ -627,28 +1187,95 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
           const currentVersion = fileVersionRef.current;
           if (!currentVersion) return false;
           const revisionAtStart = markdownRevisionRef.current;
-          setMarkdownSaveMessage('正在保存…');
-          const updated = await apiService.updateSessionMarkdown(sessionId, currentVersion, currentMarkdown);
-          const updatedWithSession = { ...updated, session_id: file.session_id || sessionId };
+          const currentSaveMarkdown = onSaveMarkdownFileRef.current;
+          let updated: FileInfo;
+          if (currentVersion.source === 'workspace') {
+            const queued = queueWorkspaceMarkdownDraft(currentVersion, currentMarkdown);
+            draftOutboxGenerationRef.current = queued.generation;
+            updated = await flushWorkspaceDraft(queued.key);
+          } else if (currentSaveMarkdown) {
+            updated = await currentSaveMarkdown(currentVersion, currentMarkdown);
+          } else {
+            const queued = queueSessionMarkdownDraft(sessionId, currentVersion, currentMarkdown);
+            draftOutboxGenerationRef.current = queued.generation;
+            updated = await flushSessionDraft(queued.key);
+          }
+          if (contentGeneration !== contentGenerationRef.current) return true;
+          if (currentVersion.source !== 'workspace' && !currentSaveMarkdown) {
+            const snapshot = getSessionSaveSnapshot(sessionId, currentVersion.path);
+            if (hasPendingSessionDraft(sessionId, currentVersion.path)) continue;
+            if (snapshot) acceptSessionSave(snapshot);
+            return true;
+          }
+          markdownRemoteSavedRef.current = true;
+          let mergedMarkdown: string | undefined;
+          if (currentVersion.source === 'workspace' && updated.workspace_auto_merged) {
+            const mergeReadRevision = markdownRevisionRef.current;
+            mergedMarkdown = await (await fetchMergedWorkspaceVersion(updated)).text();
+            const pending = await getWorkspaceDraft(updated.entry_id!);
+            if (contentGeneration !== contentGenerationRef.current) return true;
+            // 读取期间仍允许输入；迟到正文不能覆盖新稿，也不能改变其基线。
+            if (mergeReadRevision !== markdownRevisionRef.current || pending) continue;
+          }
+          const updatedWithSession = currentVersion.source === 'workspace' || currentSaveMarkdown
+            ? updated
+            : { ...updated, session_id: activeFile.session_id || sessionId };
           selfSavedModifiedRef.current = updated.modified;
           fileVersionRef.current = updatedWithSession;
-          textContentRef.current = currentMarkdown;
           setFileVersion(updatedWithSession);
+          onFileUpdatedRef.current?.(updatedWithSession);
+
+          if (mergedMarkdown !== undefined) {
+            textContentRef.current = mergedMarkdown;
+            markdownDraftRef.current = mergedMarkdown;
+            setTextContent(mergedMarkdown);
+            setMarkdownDraft(mergedMarkdown);
+            loadedContentKeyRef.current = previewContentKey(updatedWithSession);
+            return true;
+          }
+
+          if (updated.outbox_generation !== undefined) {
+            if (updated.outbox_generation === draftOutboxGenerationRef.current) {
+              const latestMarkdown = markdownEditorRef.current?.getMarkdown() ?? markdownDraftRef.current;
+              textContentRef.current = latestMarkdown;
+              markdownDraftRef.current = latestMarkdown;
+              setTextContent(latestMarkdown);
+              setMarkdownDraft(latestMarkdown);
+              return true;
+            }
+            continue;
+          }
+
+          textContentRef.current = currentMarkdown;
           setTextContent(currentMarkdown);
-          onFileUpdated?.(updatedWithSession);
 
           if (revisionAtStart === markdownRevisionRef.current) {
             markdownDraftRef.current = currentMarkdown;
             setMarkdownDraft(currentMarkdown);
-            setMarkdownSaveMessage('已自动保存');
             return true;
           }
           // 用户在保存期间继续输入：立即用刚返回的新版本令牌串行保存最新草稿。
         }
       } catch (err) {
-        console.error('Failed to save Markdown file:', err);
+        if (contentGeneration !== contentGenerationRef.current) return true;
+        markdownRemoteSavedRef.current = false;
+        if (!isExpectedWorkspaceSaveWait(err)) {
+          console.error('Failed to save Markdown file:', err);
+        }
+        if (
+          activeFile.source !== 'workspace'
+          && !onSaveMarkdownFileRef.current
+          && await surfaceRetainedSessionDraft(err, activeFile)
+        ) {
+          setMarkdownSaveError('');
+          return false;
+        }
+        if (!onSaveMarkdownFileRef.current || activeFile.source === 'workspace') {
+          // Workspace 草稿由页面内 outbox 决定重试或丢弃；两者都不阻止用户操作。
+          setMarkdownSaveError('');
+          return true;
+        }
         setMarkdownSaveError(err instanceof Error ? err.message : 'Markdown 保存失败');
-        setMarkdownSaveMessage('');
         onSaveFailureRef.current?.();
         return false;
       } finally {
@@ -656,16 +1283,17 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       }
     })();
     markdownSavePromiseRef.current = savePromise;
-    void savePromise.finally(() => {
+    const clearSavePromise = () => {
       if (markdownSavePromiseRef.current === savePromise) markdownSavePromiseRef.current = null;
-    });
+    };
+    void savePromise.then(clearSavePromise, clearSavePromise);
     return savePromise;
   }, [
     descriptor?.kind,
-    file,
-    onFileUpdated,
     effectiveReadOnly,
     sessionId,
+    surfaceRetainedSessionDraft,
+    acceptSessionSave,
   ]);
 
   useEffect(() => {
@@ -675,6 +1303,9 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       || !markdownDirty
       || savingMarkdown
       || markdownSaveError
+      || retainedSessionDraft
+      || externalConflict
+      || backgroundRefreshing
     ) return undefined;
     const timer = window.setTimeout(() => {
       void handleSaveMarkdown();
@@ -686,28 +1317,58 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     markdownDirty,
     markdownRevision,
     markdownSaveError,
+    retainedSessionDraft,
     effectiveReadOnly,
     savingMarkdown,
+    externalConflict,
+    backgroundRefreshing,
   ]);
 
   const markSpreadsheetDirty = useCallback(() => {
     spreadsheetRevisionRef.current += 1;
+    const captureRevision = spreadsheetRevisionRef.current;
     spreadsheetDirtyRef.current = true;
+    spreadsheetRemoteSavedRef.current = false;
     setSpreadsheetRevision(spreadsheetRevisionRef.current);
     setSpreadsheetDirty(true);
     setSpreadsheetSaveError('');
-    setSpreadsheetSaveMessage('等待自动保存');
-  }, []);
+    const currentFile = fileVersionRef.current;
+    if (!currentFile) return;
+    const editor = spreadsheetEditorRef.current;
+    if (!editor) return;
+    const capture = editor.exportFileDeferred
+      ? editor.exportFileDeferred()
+      : Promise.resolve().then(() => editor.exportFile());
+    const captureTask = capture.then((content) => {
+      if (captureRevision !== spreadsheetRevisionRef.current) return;
+      if (currentFile.source === 'workspace') {
+        const queued = queueWorkspaceSpreadsheetDraft(currentFile, content);
+        draftOutboxGenerationRef.current = queued.generation;
+        spreadsheetDraftKeyRef.current = queued.key;
+      } else if (!onSaveSpreadsheetFileRef.current) {
+        const queued = queueSessionSpreadsheetDraft(sessionId, currentFile, content);
+        draftOutboxGenerationRef.current = queued.generation;
+        spreadsheetDraftKeyRef.current = queued.key;
+      }
+    });
+    spreadsheetDraftCapturePromiseRef.current = captureTask;
+    void captureTask.catch((error) => {
+      console.error('Failed to capture spreadsheet draft:', error);
+    });
+  }, [sessionId]);
 
   const handleSaveSpreadsheet = useCallback((): Promise<boolean> => {
     if (spreadsheetSavePromiseRef.current) return spreadsheetSavePromiseRef.current;
+    if (externalConflictRef.current || retainedSessionDraftRef.current) return Promise.resolve(false);
+    const activeFile = fileRef.current;
     if (
-      !file
+      !activeFile
       || descriptor?.kind !== 'spreadsheet'
       || spreadsheetReadOnly
     ) return Promise.resolve(true);
 
     const savePromise = (async () => {
+      const contentGeneration = contentGenerationRef.current;
       setSavingSpreadsheet(true);
       setSpreadsheetSaveError('');
       try {
@@ -715,28 +1376,102 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
           const currentVersion = fileVersionRef.current;
           if (!currentVersion) return false;
           const revisionAtStart = spreadsheetRevisionRef.current;
-          setSpreadsheetSaveMessage('正在保存…');
-          const content = spreadsheetEditorRef.current?.exportFile();
-          if (!content) throw new Error('电子表格编辑器尚未准备好');
-          const updated = await apiService.updateSessionSpreadsheet(sessionId, currentVersion, content);
-          const updatedWithSession = { ...updated, session_id: file.session_id || sessionId };
+          const currentSaveSpreadsheet = onSaveSpreadsheetFileRef.current;
+          let updated: FileInfo;
+          if (spreadsheetDraftCapturePromiseRef.current) {
+            await spreadsheetDraftCapturePromiseRef.current;
+          }
+          const capturedDraftKey = spreadsheetDraftKeyRef.current;
+          if (currentVersion.source === 'workspace' && capturedDraftKey) {
+            updated = await flushWorkspaceDraft(capturedDraftKey);
+          } else if (!currentSaveSpreadsheet && capturedDraftKey) {
+            updated = await flushSessionDraft(capturedDraftKey);
+          } else {
+            const content = spreadsheetEditorRef.current?.exportFile();
+            if (!content) throw new Error('电子表格编辑器尚未准备好');
+            if (currentVersion.source === 'workspace') {
+              const queued = queueWorkspaceSpreadsheetDraft(currentVersion, content);
+              draftOutboxGenerationRef.current = queued.generation;
+              spreadsheetDraftKeyRef.current = queued.key;
+              updated = await flushWorkspaceDraft(queued.key);
+            } else if (currentSaveSpreadsheet) {
+              updated = await currentSaveSpreadsheet(currentVersion, content);
+            } else {
+              const queued = queueSessionSpreadsheetDraft(sessionId, currentVersion, content);
+              draftOutboxGenerationRef.current = queued.generation;
+              spreadsheetDraftKeyRef.current = queued.key;
+              updated = await flushSessionDraft(queued.key);
+            }
+          }
+          if (contentGeneration !== contentGenerationRef.current) return true;
+          if (currentVersion.source !== 'workspace' && !currentSaveSpreadsheet) {
+            const snapshot = getSessionSaveSnapshot(sessionId, currentVersion.path);
+            if (hasPendingSessionDraft(sessionId, currentVersion.path)) continue;
+            if (snapshot) acceptSessionSave(snapshot);
+            return true;
+          }
+          spreadsheetRemoteSavedRef.current = true;
+          let mergedSpreadsheet: ArrayBuffer | undefined;
+          if (currentVersion.source === 'workspace' && updated.workspace_auto_merged) {
+            const mergeReadRevision = spreadsheetRevisionRef.current;
+            mergedSpreadsheet = await (await fetchMergedWorkspaceVersion(updated)).arrayBuffer();
+            const pending = await getWorkspaceDraft(updated.entry_id!);
+            if (contentGeneration !== contentGenerationRef.current) return true;
+            if (mergeReadRevision !== spreadsheetRevisionRef.current || pending) continue;
+          }
+          const updatedWithSession = currentVersion.source === 'workspace' || currentSaveSpreadsheet
+            ? updated
+            : { ...updated, session_id: activeFile.session_id || sessionId };
           selfSavedModifiedRef.current = updated.modified;
           fileVersionRef.current = updatedWithSession;
           setFileVersion(updatedWithSession);
-          onFileUpdated?.(updatedWithSession);
+          onFileUpdatedRef.current?.(updatedWithSession);
+          if (mergedSpreadsheet !== undefined) {
+            setSpreadsheetSource(mergedSpreadsheet);
+            spreadsheetDraftKeyRef.current = null;
+            spreadsheetDraftCapturePromiseRef.current = null;
+            spreadsheetDirtyRef.current = false;
+            setSpreadsheetDirty(false);
+            loadedContentKeyRef.current = previewContentKey(updatedWithSession);
+            return true;
+          }
+          if (updated.outbox_generation !== undefined) {
+            if (updated.outbox_generation === draftOutboxGenerationRef.current) {
+              spreadsheetDraftKeyRef.current = null;
+              spreadsheetDraftCapturePromiseRef.current = null;
+              spreadsheetDirtyRef.current = false;
+              setSpreadsheetDirty(false);
+              return true;
+            }
+            continue;
+          }
           if (revisionAtStart === spreadsheetRevisionRef.current) {
             spreadsheetDirtyRef.current = false;
             setSpreadsheetDirty(false);
-            setSpreadsheetSaveMessage('已自动保存');
             return true;
           }
         }
-        setSpreadsheetSaveMessage('已自动保存');
         return true;
       } catch (err) {
-        console.error('Failed to save spreadsheet file:', err);
+        if (contentGeneration !== contentGenerationRef.current) return true;
+        spreadsheetRemoteSavedRef.current = false;
+        if (!isExpectedWorkspaceSaveWait(err)) {
+          console.error('Failed to save spreadsheet file:', err);
+        }
+        if (
+          activeFile.source !== 'workspace'
+          && !onSaveSpreadsheetFileRef.current
+          && await surfaceRetainedSessionDraft(err, activeFile)
+        ) {
+          setSpreadsheetSaveError('');
+          return false;
+        }
+        if (!onSaveSpreadsheetFileRef.current || activeFile.source === 'workspace') {
+          // Workspace 草稿由页面内 outbox 决定重试或丢弃；两者都不阻止用户操作。
+          setSpreadsheetSaveError('');
+          return true;
+        }
         setSpreadsheetSaveError(err instanceof Error ? err.message : '电子表格保存失败');
-        setSpreadsheetSaveMessage('');
         onSaveFailureRef.current?.();
         return false;
       } finally {
@@ -744,11 +1479,12 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       }
     })();
     spreadsheetSavePromiseRef.current = savePromise;
-    void savePromise.finally(() => {
+    const clearSavePromise = () => {
       if (spreadsheetSavePromiseRef.current === savePromise) spreadsheetSavePromiseRef.current = null;
-    });
+    };
+    void savePromise.then(clearSavePromise, clearSavePromise);
     return savePromise;
-  }, [descriptor?.kind, file, onFileUpdated, sessionId, spreadsheetReadOnly]);
+  }, [descriptor?.kind, sessionId, spreadsheetReadOnly, surfaceRetainedSessionDraft, acceptSessionSave]);
 
   useEffect(() => {
     if (
@@ -757,10 +1493,13 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       || !spreadsheetDirty
       || savingSpreadsheet
       || spreadsheetSaveError
+      || retainedSessionDraft
+      || externalConflict
+      || backgroundRefreshing
     ) return undefined;
     const timer = window.setTimeout(() => {
       void handleSaveSpreadsheet();
-    }, 1200);
+    }, SPREADSHEET_AUTOSAVE_DELAY_MS);
     return () => window.clearTimeout(timer);
   }, [
     descriptor?.kind,
@@ -769,13 +1508,16 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     spreadsheetDirty,
     spreadsheetRevision,
     spreadsheetSaveError,
+    retainedSessionDraft,
     spreadsheetReadOnly,
+    externalConflict,
+    backgroundRefreshing,
   ]);
 
   useEffect(() => {
     if (saveRequestNonce === undefined || handledSaveRequestNonceRef.current === saveRequestNonce) return;
     handledSaveRequestNonceRef.current = saveRequestNonce;
-    if (effectiveReadOnly) return;
+    if (effectiveReadOnly || externalConflictRef.current || retainedSessionDraftRef.current) return;
     if (descriptor?.kind === 'markdown' && markdownDirty && !savingMarkdown) {
       void handleSaveMarkdown();
     } else if (descriptor?.kind === 'spreadsheet' && spreadsheetDirty && !savingSpreadsheet) {
@@ -793,6 +1535,10 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     spreadsheetDirty,
   ]);
 
+  const hasUnsavedMarkdown = useCallback(() => (
+    (markdownEditorRef.current?.getMarkdown() ?? markdownDraftRef.current) !== textContentRef.current
+  ), []);
+
   useImperativeHandle(ref, () => ({
     ownerSessionId: sessionId,
     ownerEpoch,
@@ -800,18 +1546,29 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     isDirty: (expectedOwner) => (
       expectedOwner.ownerSessionId === sessionId
       && expectedOwner.ownerEpoch === ownerEpoch
-      && !effectiveReadOnly
       && (
-        (descriptor?.kind === 'markdown' && markdownDraftRef.current !== textContentRef.current)
-        || (descriptor?.kind === 'spreadsheet' && spreadsheetDirtyRef.current)
+        Boolean(retainedSessionDraftRef.current)
+        || (
+          !effectiveReadOnly
+          && (
+            (descriptor?.kind === 'markdown' && hasUnsavedMarkdown())
+            || (descriptor?.kind === 'spreadsheet' && spreadsheetDirtyRef.current)
+          )
+        )
       )
     ),
-    saveDirty: async (expectedOwner) => {
+    saveDirty: async (expectedOwner, options) => {
       const path = file?.path || '';
       const expectedMatches = expectedOwner.ownerSessionId === sessionId
         && expectedOwner.ownerEpoch === ownerEpoch;
       if (!expectedMatches) {
         return { ...expectedOwner, path, ok: false, stale: true };
+      }
+      if (externalConflictRef.current) {
+        return { ...expectedOwner, path, ok: false, stale: true };
+      }
+      if (retainedSessionDraftRef.current) {
+        return { ...expectedOwner, path, ok: false, stale: false };
       }
       if (effectiveReadOnly) {
         return { ...expectedOwner, path, ok: true, stale: false };
@@ -819,11 +1576,21 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
 
       let ok = true;
       const currentMarkdownDirty = descriptor?.kind === 'markdown'
-        && markdownDraftRef.current !== textContentRef.current;
+        && hasUnsavedMarkdown();
       if (currentMarkdownDirty) {
         ok = await handleSaveMarkdown();
+        if (options?.requireRemote && !markdownRemoteSavedRef.current) ok = false;
       } else if (descriptor?.kind === 'spreadsheet' && spreadsheetDirtyRef.current) {
         ok = await handleSaveSpreadsheet();
+        if (options?.requireRemote && !spreadsheetRemoteSavedRef.current) ok = false;
+      }
+      const latestWorkspaceFile = fileVersionRef.current;
+      if (ok && latestWorkspaceFile?.source === 'workspace') {
+        try {
+          await checkpointWorkspaceFile(latestWorkspaceFile, 'web_close');
+        } catch {
+          // The durable head is already saved; the outbox retries checkpoint promotion.
+        }
       }
 
       const currentOwner = ownerIdentityRef.current;
@@ -831,15 +1598,102 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
         || currentOwner.ownerEpoch !== expectedOwner.ownerEpoch;
       return { ...expectedOwner, path, ok: ok && !stale, stale };
     },
+    downloadDraft: (expectedOwner) => {
+      const currentFile = fileRef.current;
+      if (
+        expectedOwner.ownerSessionId !== sessionId
+        || expectedOwner.ownerEpoch !== ownerEpoch
+        || !currentFile
+      ) return false;
+      if (retainedSessionDraftRef.current) {
+        handleDownloadRetainedDraft();
+        return true;
+      }
+      let blob: Blob | null = null;
+      if (descriptor?.kind === 'markdown') {
+        blob = new Blob(
+          [markdownEditorRef.current?.getMarkdown() ?? markdownDraftRef.current],
+          { type: 'text/markdown;charset=utf-8' },
+        );
+      } else if (descriptor?.kind === 'spreadsheet') {
+        const content = spreadsheetEditorRef.current?.exportFile();
+        if (content) blob = new Blob([content], { type: 'application/octet-stream' });
+      }
+      if (!blob) return false;
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = `${currentFile.name}.draft`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+      return true;
+    },
   }), [
     descriptor?.kind,
     effectiveReadOnly,
     file?.path,
     handleSaveMarkdown,
     handleSaveSpreadsheet,
+    handleDownloadRetainedDraft,
+    hasUnsavedMarkdown,
     ownerEpoch,
     sessionId,
   ]);
+
+  const openWorkspacePicker = async () => {
+    if (!file || workspaceImportPreparing) return;
+    setWorkspaceImportPreparing(true);
+    try {
+      let saved = true;
+      if (descriptor?.kind === 'markdown' && hasUnsavedMarkdown()) {
+        saved = await handleSaveMarkdown();
+      } else if (descriptor?.kind === 'spreadsheet' && spreadsheetDirtyRef.current) {
+        saved = await handleSaveSpreadsheet();
+      }
+      if (!saved) return;
+      let importVersion = fileVersionRef.current || file;
+      if (!importVersion.revision) {
+        const normalizedPath = importVersion.path.replace(/^\/+/, '');
+        const separator = normalizedPath.lastIndexOf('/');
+        const parentPath = separator >= 0 ? normalizedPath.slice(0, separator) : undefined;
+        try {
+          const listing = await apiService.getSessionFiles(sessionId, parentPath);
+          const refreshed = listing.files.find((candidate) => candidate.path.replace(/^\/+/, '') === normalizedPath);
+          if (!refreshed?.revision) {
+            setError('无法确认会话文件版本，请刷新文件列表后重试。');
+            return;
+          }
+          const changedSincePreview = (
+            (Boolean(importVersion.modified) && refreshed.modified !== importVersion.modified)
+            || (importVersion.size > 0 && refreshed.size !== importVersion.size)
+          );
+          if (changedSincePreview) {
+            onFileUpdatedRef.current?.({ ...refreshed, session_id: file.session_id || sessionId });
+            setError('会话文件已被更新，请刷新预览后再存入工作区。');
+            return;
+          }
+          importVersion = { ...importVersion, ...refreshed, session_id: file.session_id || sessionId };
+          fileVersionRef.current = importVersion;
+          setFileVersion(importVersion);
+        } catch (metadataError) {
+          console.error('Failed to refresh session file revision:', metadataError);
+          setError('无法刷新会话文件版本，请稍后重试。');
+          return;
+        }
+      }
+      setWorkspacePickerOpen(true);
+    } finally {
+      setWorkspaceImportPreparing(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!workspaceNotice) return undefined;
+    const timer = window.setTimeout(() => setWorkspaceNotice(null), DEFAULT_FEEDBACK_AUTO_DISMISS_MS);
+    return () => window.clearTimeout(timer);
+  }, [workspaceNotice]);
 
   const scrollToMarkdownHeading = (text: string) => {
     const candidates = contentViewportRef.current?.querySelectorAll<HTMLElement>('h1, h2, h3');
@@ -915,7 +1769,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       case 'pdf':
         return <PdfFrame src={binaryPreviewUrl} title={file.name} onError={() => setError('PDF 加载失败')} />;
       case 'markdown':
-        if (!effectiveReadOnly) {
+        if (!effectiveReadOnly && !retainedSessionDraft) {
           return (
             <Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-claude-muted">正在打开 Markdown 编辑器…</div>}>
               <VditorMarkdownEditor
@@ -926,11 +1780,19 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
                 toolbarOpen={markdownToolbarOpen}
                 onChange={(nextMarkdown) => {
                   markdownRevisionRef.current += 1;
+                  markdownRemoteSavedRef.current = false;
                   markdownDraftRef.current = nextMarkdown;
                   setMarkdownRevision(markdownRevisionRef.current);
                   setMarkdownDraft(nextMarkdown);
-                  setMarkdownSaveMessage(nextMarkdown === textContent ? '' : '等待自动保存');
                   setMarkdownSaveError('');
+                  const currentFile = fileVersionRef.current;
+                  if (currentFile?.source === 'workspace') {
+                    const queued = queueWorkspaceMarkdownDraft(currentFile, nextMarkdown);
+                    draftOutboxGenerationRef.current = queued.generation;
+                  } else if (currentFile && !onSaveMarkdownFileRef.current) {
+                    const queued = queueSessionMarkdownDraft(sessionId, currentFile, nextMarkdown);
+                    draftOutboxGenerationRef.current = queued.generation;
+                  }
                 }}
               />
             </Suspense>
@@ -1021,8 +1883,18 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
           </div>
         );
       case 'presentation':
-        return convertedPdfUrl
-          ? <SlideDeckPreview src={convertedPdfUrl} title={file.name} />
+        return presentationSource
+          ? (
+              <SlideDeckPreview
+                source={presentationSource.blob}
+                sourceKey={presentationSource.key}
+                requestId={presentationSource.requestId}
+                activeRequestId={presentationRequestId}
+                title={file.name}
+                onReady={handlePresentationReady}
+                onError={(_error, sourceKey) => handlePresentationError(sourceKey)}
+              />
+            )
           : renderOfficeFallback();
       default:
         return (
@@ -1057,13 +1929,16 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     : 'rounded-full bg-black p-2.5 text-white shadow-lg transition-[opacity,transform] hover:opacity-80 active:scale-90';
   const FileIcon = getPreviewIcon(descriptor);
   const supportsViewToggle = descriptor.kind === 'html';
-  const supportsMarkdownEdit = descriptor.kind === 'markdown' && !effectiveReadOnly;
+  const supportsMarkdownEdit = descriptor.kind === 'markdown' && !effectiveReadOnly && !retainedSessionDraft;
   const supportsWrapToggle = viewMode === 'source' || descriptor.kind === 'code' || descriptor.kind === 'text';
+  const presentationRendererStarting = descriptor.kind === 'presentation'
+    && hasCurrentPresentationSource
+    && previewLoadState === 'initial-loading';
 
   const previewCard = (
     <div className={cardClassName} onClick={inline ? undefined : (event) => event.stopPropagation()} data-testid={inline ? 'file-preview-inline' : undefined}>
       <div className={headerClassName}>
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
           {descriptor.kind === 'markdown' && markdownHeadings.length > 1 && (
             <button
               type="button"
@@ -1092,19 +1967,9 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {markdownSaveError && <span role="alert" title={markdownSaveError} className="file-preview-save-state file-preview-save-state--error">保存失败</span>}
-          {markdownSaveMessage && !markdownSaveError && (
-            <span role="status" className={`file-preview-save-state ${markdownSaveMessage === '已自动保存' ? 'file-preview-save-state--saved' : ''}`}>
-              {markdownSaveMessage}
-            </span>
-          )}
-          {markdownDirty && !markdownSaveError && !markdownSaveMessage && <span className="file-preview-save-state">等待自动保存</span>}
+          {backgroundRefreshing && loading && <span role="status" className="text-[11px] text-claude-muted">正在更新文件</span>}
           {descriptor.kind === 'spreadsheet' && spreadsheetSaveError && (
             <span role="alert" title={spreadsheetSaveError} className="max-w-[120px] truncate text-[11px] text-claude-error">保存失败</span>
-          )}
-          {descriptor.kind === 'spreadsheet' && spreadsheetSaveMessage && !spreadsheetSaveError && (
-            <span role="status" className={`text-[11px] ${spreadsheetSaveMessage === '已自动保存' ? 'text-claude-success' : 'text-claude-muted'}`}>
-              {spreadsheetSaveMessage}
-            </span>
           )}
           {descriptor.kind === 'spreadsheet' && spreadsheetSaveError && !spreadsheetReadOnly && (
             <button
@@ -1145,10 +2010,101 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
           {descriptor.kind === 'html' && viewMode === 'rendered' && (
             <button type="button" onClick={handleOpenHtml} className="rounded-md p-1.5 text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text" title="在新标签页中查看" aria-label="在新标签页中查看"><ExternalLink size={16} aria-hidden="true" /></button>
           )}
+          {onOpenWorkspace && (
+            <button
+              type="button"
+              onClick={onOpenWorkspace}
+              className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-claude-accent transition-colors hover:bg-claude-accent/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45"
+              aria-label="在工作区打开"
+              title="在工作区打开"
+            >
+              <Folder size={16} aria-hidden="true" />
+              <span className="hidden whitespace-nowrap md:inline">在工作区打开</span>
+            </button>
+          )}
+          {canSaveToWorkspace && (
+            <button
+              type="button"
+              onClick={() => void openWorkspacePicker()}
+              disabled={workspaceImportPreparing || previewSaving}
+              className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-claude-muted transition-colors hover:bg-claude-accent/10 hover:text-claude-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45 disabled:cursor-wait disabled:opacity-45"
+              title="存入工作区"
+              aria-label="将当前会话文件存入工作区"
+            >
+              {workspaceImportPreparing
+                ? <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent" aria-hidden="true" />
+                : <Folder size={16} aria-hidden="true" />}
+              <span className="hidden whitespace-nowrap md:inline">存入工作区</span>
+            </button>
+          )}
           <button type="button" onClick={handleDownload} className="rounded-md p-1.5 text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text" title="下载文件" aria-label="下载文件"><Download size={16} aria-hidden="true" /></button>
           {!inline && <button type="button" ref={closeButtonRef} onClick={onClose} className={closeButtonClassName} title="关闭" aria-label="关闭"><X size={17} aria-hidden="true" /></button>}
         </div>
       </div>
+
+      {contextNotice && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900" role="status">
+          <AlertCircle size={14} className="shrink-0" aria-hidden="true" />
+          <span className="min-w-0 flex-1">{contextNotice}</span>
+        </div>
+      )}
+
+      {retainedSessionDraft && (
+        <div
+          className="flex shrink-0 flex-wrap items-center gap-2 border-b border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950"
+          role="alert"
+          data-testid="retained-session-draft"
+        >
+          <AlertCircle size={14} className="shrink-0" aria-hidden="true" />
+          <span className="min-w-[220px] flex-1">{retainedSessionDraft.errorMessage || '本地草稿基于旧版本，已保留且不会覆盖当前文件。'}</span>
+          <button
+            type="button"
+            onClick={handleDownloadRetainedDraft}
+            className="h-8 shrink-0 rounded-md border border-amber-300 bg-white px-2.5 font-medium hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40"
+          >
+            下载草稿
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleDiscardRetainedDraft()}
+            className="h-8 shrink-0 rounded-md px-2.5 font-medium text-amber-950 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40"
+          >
+            丢弃草稿
+          </button>
+        </div>
+      )}
+
+      {workspaceDraftLossNotice && (
+        <div
+          className="flex shrink-0 items-center gap-2 border-b border-red-200 bg-red-50 px-3 py-2 text-xs text-red-900"
+          role="alert"
+          data-testid="workspace-draft-loss-notice"
+        >
+          <AlertCircle size={14} className="shrink-0" aria-hidden="true" />
+          <span className="min-w-0 flex-1">
+            {workspaceDraftLossNotice.message}
+            {workspaceDraftLossNotice.lastSavedAt
+              ? ` 最近保存：${formatModifiedTime(workspaceDraftLossNotice.lastSavedAt)}`
+              : ''}
+          </span>
+          <button
+            type="button"
+            onClick={() => setWorkspaceDraftLossNotice(null)}
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-red-700 hover:bg-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40"
+            aria-label="关闭未保存提示"
+          >
+            <X size={15} aria-hidden="true" />
+          </button>
+        </div>
+      )}
+
+      {previewNotice && refreshingRequestIdRef.current !== null && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900" role="status">
+          <AlertCircle size={14} className="shrink-0" aria-hidden="true" />
+          <span className="min-w-0 flex-1">{previewNotice}</span>
+          <button type="button" onClick={() => { setPreviewNotice(''); setLocalReloadNonce((value) => value + 1); }} className="h-8 shrink-0 rounded-md border border-amber-300 bg-white px-2.5 font-medium hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40">重试加载</button>
+        </div>
+      )}
 
       <div ref={contentViewportRef} className={`${contentClassName} relative`}>
         {descriptor.kind === 'markdown' && markdownTocOpen && markdownHeadings.length > 1 && (
@@ -1174,23 +2130,60 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
           </aside>
         )}
         {error ? (
-          <div className="flex items-center gap-3 rounded-2xl border border-red-100 bg-red-50 p-4"><AlertCircle className="h-5 w-5 text-claude-error" /><span className="font-medium text-claude-error">{error}</span></div>
-        ) : loading ? (
-          <div className="flex items-center justify-center py-24" data-testid="file-preview-loading">
-            <div className="flex space-x-2">{[0, 1, 2].map((index) => <div key={index} className="h-2 w-2 animate-dot-pulse rounded-full bg-claude-accent" style={{ animationDelay: `${index * 200}ms` }} />)}</div>
+          <div role="alert" className="flex items-center gap-3 rounded-2xl border border-red-100 bg-red-50 p-4"><AlertCircle className="h-5 w-5 text-claude-error" /><span className="font-medium text-claude-error">{error}</span></div>
+        ) : loading && !backgroundRefreshing && !presentationRendererStarting ? (
+          <div className="flex flex-col items-center justify-center gap-4 py-24 text-center" data-testid="file-preview-loading" role="status" aria-live="polite">
+            <div className="flex space-x-2" aria-hidden="true">{[0, 1, 2].map((index) => <div key={index} className="h-2 w-2 animate-dot-pulse rounded-full bg-claude-accent" style={{ animationDelay: `${index * 200}ms` }} />)}</div>
+            {(descriptor.kind === 'document' || descriptor.kind === 'presentation') && (
+              <div className="max-w-sm text-sm text-claude-secondary">
+                <p className="font-medium text-claude-text">正在生成 PDF 预览</p>
+                {officePreviewSlow && <p className="mt-1 text-xs leading-5 text-claude-muted">首次转换可能需要几十秒，你可以继续等待或下载原文件。</p>}
+              </div>
+            )}
           </div>
         ) : renderPreviewBody()}
       </div>
     </div>
   );
 
-  if (inline) return previewCard;
+  const workspaceOverlays = canSaveToWorkspace ? (
+    <>
+      <WorkspaceDestinationPicker
+        open={workspacePickerOpen}
+        sessionId={sessionId}
+        sourceFile={fileVersionRef.current || file}
+        onClose={() => setWorkspacePickerOpen(false)}
+        onImported={(result) => {
+          setWorkspacePickerOpen(false);
+          setWorkspaceNotice({
+            entryId: result.entry.entry_id,
+            path: result.entry.path,
+            message: result.status === 'NO_CHANGE'
+              ? '工作区已存在相同文件'
+              : `已存入 工作区/${result.entry.path}`,
+          });
+        }}
+      />
+      {workspaceNotice && (
+        <div className="fixed bottom-5 left-1/2 z-[190] flex max-w-[calc(100vw-32px)] -translate-x-1/2 items-center gap-3 rounded-xl border border-claude-border bg-white px-4 py-3 text-sm text-claude-text shadow-xl" role="status">
+          <span className="min-w-0 truncate">{workspaceNotice.message}</span>
+          <button type="button" onClick={() => { requestOpenWorkspace(workspaceNotice.entryId); setWorkspaceNotice(null); }} className="shrink-0 rounded-md px-2 py-1 font-semibold text-claude-accent hover:bg-claude-accent/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45">打开工作区</button>
+          <button type="button" onClick={() => setWorkspaceNotice(null)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover" aria-label="关闭提示"><X size={15} aria-hidden="true" /></button>
+        </div>
+      )}
+    </>
+  ) : null;
+
+  if (inline) return <>{previewCard}{workspaceOverlays}</>;
 
   return (
-    <div className="fixed inset-0 z-[100] flex animate-fade-in items-center justify-center p-6 sm:p-12" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/40 backdrop-blur-md" />
-      {previewCard}
-    </div>
+    <>
+      <div className="fixed inset-0 z-[100] flex animate-fade-in items-center justify-center p-6 sm:p-12" onClick={onClose}>
+        <div className="absolute inset-0 bg-black/40 backdrop-blur-md" />
+        {previewCard}
+      </div>
+      {workspaceOverlays}
+    </>
   );
 });
 

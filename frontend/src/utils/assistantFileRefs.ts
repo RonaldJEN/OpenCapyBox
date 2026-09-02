@@ -1,4 +1,4 @@
-import type { FileInfo } from '../types';
+import type { AssistantFileReference, FileInfo } from '../types';
 import { normalizeFileType } from './fileUtils';
 
 const FILE_HINT_LINE_RE = /^\s*(?:[-*]\s*)?(?:\*\*)?\s*(?:文件位置|文件路径|保存位置|已保存到|输出文件|生成文件|文件)\s*(?:[:：]\s*)?(?:\*\*)?\s*(?:[:：]\s*)?(.+?)\s*$/;
@@ -191,4 +191,87 @@ export function createAssistantFileInfoFromHref(
 ): FileInfo | null {
   if (!sessionId) return null;
   return createFileInfoFromCandidate(href, sessionId);
+}
+
+function matchStructuredReference(
+  candidate: FileInfo,
+  references: AssistantFileReference[],
+): AssistantFileReference | null {
+  const exact = references.filter((reference) => reference.path === candidate.path);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) return null;
+  const byName = references.filter((reference) => reference.name === candidate.name);
+  return byName.length === 1 ? byName[0] : null;
+}
+
+/**
+ * Select display intent from assistant prose while taking identity exclusively
+ * from durable structured references. Unknown or ambiguous mentions never
+ * become clickable files.
+ */
+export function selectAssistantFileReferences(
+  content: string,
+  references: AssistantFileReference[],
+): AssistantFileReference[] {
+  if (references.length === 0) return [];
+  const selectorSessionId = references.find((item) => item.source === 'session')?.session_id
+    || '__structured_reference__';
+  const mentions = extractAssistantFiles(content, selectorSessionId);
+  const selected: AssistantFileReference[] = [];
+  const seen = new Set<string>();
+  for (const mention of mentions) {
+    const reference = matchStructuredReference(mention, references);
+    if (reference && !seen.has(reference.ref_id)) {
+      seen.add(reference.ref_id);
+      selected.push(reference);
+    }
+  }
+  return selected;
+}
+
+export function resolveAssistantFileReferenceFromHref(
+  href: string,
+  references: AssistantFileReference[],
+): AssistantFileReference | null {
+  if (references.length === 0) return null;
+  const selectorSessionId = references.find((item) => item.source === 'session')?.session_id
+    || '__structured_reference__';
+  const candidate = createFileInfoFromCandidate(href, selectorSessionId);
+  return candidate ? matchStructuredReference(candidate, references) : null;
+}
+
+export function assistantFileReferenceToFileInfo(
+  reference: AssistantFileReference,
+): FileInfo {
+  if (reference.source === 'session') {
+    return {
+      source: 'session',
+      session_id: reference.session_id,
+      name: reference.name,
+      path: reference.path,
+      snapshot_path: reference.snapshot_path,
+      size: reference.size,
+      modified: reference.modified,
+      type: reference.type,
+      revision: reference.revision,
+      is_directory: false,
+      content_mode: 'current',
+      assistant_ref_id: reference.ref_id,
+    };
+  }
+  return {
+    source: 'workspace',
+    entry_id: reference.entry_id,
+    workspace_path: reference.workspace_path,
+    name: reference.name,
+    path: reference.workspace_path,
+    size: reference.size,
+    modified: reference.modified,
+    type: reference.type,
+    revision: reference.revision,
+    version_id: reference.version_id,
+    is_directory: false,
+    content_mode: 'current',
+    assistant_ref_id: reference.ref_id,
+  };
 }

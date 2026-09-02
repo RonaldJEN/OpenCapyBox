@@ -112,8 +112,19 @@ function createPdfDocument(pageCount = 7) {
   return { document, getPageMock, renderMock };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
 beforeEach(() => {
   intersectionObservers.length = 0;
+  getDocumentMock.mockReset();
   workerOptions.workerSrc = '';
   Object.defineProperty(window, 'IntersectionObserver', {
     configurable: true,
@@ -152,7 +163,7 @@ describe('SlideDeckPreview', () => {
     });
 
     const { container } = render(
-      <SlideDeckPreview src="blob:converted-presentation" title="季度汇报.pptx" />,
+      <SlideDeckPreview source="blob:converted-presentation" sourceKey="deck-1" requestId={1} activeRequestId={1} title="季度汇报.pptx" />,
     );
 
     await screen.findByLabelText('季度汇报.pptx 幻灯片预览');
@@ -199,7 +210,7 @@ describe('SlideDeckPreview', () => {
       destroy: vi.fn(() => Promise.resolve()),
     });
     const { container } = render(
-      <SlideDeckPreview src="blob:scroll-sync" title="产业链分析.pptx" />,
+      <SlideDeckPreview source="blob:scroll-sync" sourceKey="deck-scroll" requestId={1} activeRequestId={1} title="产业链分析.pptx" />,
     );
 
     await screen.findByLabelText('产业链分析.pptx 幻灯片预览');
@@ -216,6 +227,113 @@ describe('SlideDeckPreview', () => {
     expect(rendered).toEqual(['2', '3', '4', '5']);
   });
 
+  it('keeps the old deck visible until the replacement PDF and first page are ready', async () => {
+    const { document: oldDocument } = createPdfDocument(2);
+    const { document: newDocument } = createPdfDocument(5);
+    const replacement = deferred<PDFDocumentProxy>();
+    const destroyOld = vi.fn(() => Promise.resolve());
+    const destroyNew = vi.fn(() => Promise.resolve());
+    const onReady = vi.fn();
+    getDocumentMock
+      .mockReturnValueOnce({ promise: Promise.resolve(oldDocument), destroy: destroyOld })
+      .mockReturnValueOnce({ promise: replacement.promise, destroy: destroyNew });
+
+    const { rerender } = render(
+      <SlideDeckPreview source="blob:old" sourceKey="deck-old" requestId={1} activeRequestId={1} title="原子切换.pptx" onReady={onReady} />,
+    );
+    expect(await screen.findByText('2 页')).toBeInTheDocument();
+
+    rerender(
+      <SlideDeckPreview source="blob:new" sourceKey="deck-new" requestId={2} activeRequestId={2} title="原子切换.pptx" onReady={onReady} />,
+    );
+    await waitFor(() => expect(getDocumentMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('2 页')).toBeInTheDocument();
+    expect(screen.queryByText('正在准备幻灯片')).not.toBeInTheDocument();
+    expect(destroyOld).not.toHaveBeenCalled();
+
+    await act(async () => {
+      replacement.resolve(newDocument);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByText('5 页')).toBeInTheDocument();
+    await waitFor(() => expect(destroyOld).toHaveBeenCalledTimes(1));
+    expect(onReady).toHaveBeenLastCalledWith('deck-new');
+  });
+
+  it('keeps the active deck when a replacement fails', async () => {
+    const { document: oldDocument } = createPdfDocument(3);
+    const failure = new Error('replacement failed');
+    const replacement = deferred<PDFDocumentProxy>();
+    const destroyOld = vi.fn(() => Promise.resolve());
+    const destroyReplacement = vi.fn(() => Promise.resolve());
+    const onError = vi.fn();
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    getDocumentMock
+      .mockReturnValueOnce({ promise: Promise.resolve(oldDocument), destroy: destroyOld })
+      .mockReturnValueOnce({ promise: replacement.promise, destroy: destroyReplacement });
+
+    const { rerender } = render(
+      <SlideDeckPreview source="blob:old" sourceKey="deck-old" requestId={1} activeRequestId={1} title="刷新失败.pptx" />,
+    );
+    expect(await screen.findByText('3 页')).toBeInTheDocument();
+
+    rerender(
+      <SlideDeckPreview source="blob:bad" sourceKey="deck-bad" requestId={2} activeRequestId={2} title="刷新失败.pptx" onError={onError} />,
+    );
+
+    await waitFor(() => expect(getDocumentMock).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      replacement.reject(failure);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(onError).toHaveBeenCalledWith(failure, 'deck-bad'));
+    expect(screen.getByText('3 页')).toBeInTheDocument();
+    expect(screen.queryByTitle('刷新失败.pptx PDF 降级预览')).not.toBeInTheDocument();
+    expect(destroyOld).not.toHaveBeenCalled();
+    expect(destroyReplacement).toHaveBeenCalledTimes(1);
+    consoleError.mockRestore();
+  });
+
+  it('discards a superseded replacement even when its promise resolves late', async () => {
+    const { document: oldDocument } = createPdfDocument(2);
+    const { document: lateDocument } = createPdfDocument(9);
+    const { document: newestDocument } = createPdfDocument(4);
+    const late = deferred<PDFDocumentProxy>();
+    const destroyOld = vi.fn(() => Promise.resolve());
+    const destroyLate = vi.fn(() => Promise.resolve());
+    const destroyNewest = vi.fn(() => Promise.resolve());
+    getDocumentMock
+      .mockReturnValueOnce({ promise: Promise.resolve(oldDocument), destroy: destroyOld })
+      .mockReturnValueOnce({ promise: late.promise, destroy: destroyLate })
+      .mockReturnValueOnce({ promise: Promise.resolve(newestDocument), destroy: destroyNewest });
+
+    const { rerender } = render(
+      <SlideDeckPreview source="blob:old" sourceKey="deck-old" requestId={1} activeRequestId={1} title="竞态.pptx" />,
+    );
+    expect(await screen.findByText('2 页')).toBeInTheDocument();
+
+    rerender(
+      <SlideDeckPreview source="blob:late" sourceKey="deck-late" requestId={2} activeRequestId={2} title="竞态.pptx" />,
+    );
+    await waitFor(() => expect(getDocumentMock).toHaveBeenCalledTimes(2));
+    rerender(
+      <SlideDeckPreview source="blob:newest" sourceKey="deck-newest" requestId={3} activeRequestId={3} title="竞态.pptx" />,
+    );
+
+    expect(await screen.findByText('4 页')).toBeInTheDocument();
+    await act(async () => {
+      late.resolve(lateDocument);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('4 页')).toBeInTheDocument();
+    expect(screen.queryByText('9 页')).not.toBeInTheDocument();
+    expect(destroyLate).toHaveBeenCalledTimes(1);
+  });
+
   it('falls back to the browser PDF viewer when PDF.js cannot load the deck', async () => {
     const failure = new Error('broken pdf');
     const onError = vi.fn();
@@ -226,12 +344,12 @@ describe('SlideDeckPreview', () => {
     });
 
     render(
-      <SlideDeckPreview src="blob:broken-presentation" title="失败示例.pptx" onError={onError} />,
+      <SlideDeckPreview source="blob:broken-presentation" sourceKey="deck-broken" requestId={1} activeRequestId={1} title="失败示例.pptx" onError={onError} />,
     );
 
     expect(await screen.findByRole('alert')).toHaveTextContent('已切换为浏览器 PDF 预览');
     expect(screen.getByTitle('失败示例.pptx PDF 降级预览')).toHaveAttribute('src', 'blob:broken-presentation');
-    expect(onError).toHaveBeenCalledWith(failure);
+    expect(onError).toHaveBeenCalledWith(failure, 'deck-broken');
     consoleError.mockRestore();
   });
 
@@ -243,7 +361,7 @@ describe('SlideDeckPreview', () => {
       destroy: destroyLoadingTask,
     });
     const { unmount } = render(
-      <SlideDeckPreview src="blob:cleanup" title="清理测试.pptx" />,
+      <SlideDeckPreview source="blob:cleanup" sourceKey="deck-cleanup" requestId={1} activeRequestId={1} title="清理测试.pptx" />,
     );
 
     await screen.findByLabelText('清理测试.pptx 幻灯片预览');

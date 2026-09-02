@@ -26,12 +26,12 @@ function escapeHtml(value: string): string {
 function createSandboxedBlobPreview(content: Blob, title: string): BlobPreviewUrls {
   const contentUrl = URL.createObjectURL(content);
   const safeTitle = escapeHtml(title || 'HTML 文件预览');
+  // 包装页仅含固定结构和转义标题，不附加 CSP 限制预览脚本/资源；同源隔离由内层 sandbox 保持。
   const wrapper = `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src blob:; style-src 'unsafe-inline'">
   <title>${safeTitle}</title>
   <style>html,body,iframe{width:100%;height:100%;margin:0;border:0}body{overflow:hidden;background:#fff}</style>
 </head>
@@ -52,7 +52,7 @@ function disconnectOpener(openedWindow: Window): void {
   try {
     openedWindow.opener = null;
   } catch {
-    // 某些浏览器会在导航开始后立即限制 WindowProxy；包装页仍由 CSP + sandbox 隔离。
+    // 某些浏览器会在导航开始后立即限制 WindowProxy；预览内容仍由内层 sandbox 隔离。
   }
 }
 

@@ -14,9 +14,11 @@ from src.api.schemas.turn import (
 from src.agent.schema.run_context import (
     RequestedReasoningContext,
     RequestedTurnPreferencesContext,
+    PendingFileDraftRef,
     normalize_preferred_mcp_server_ids,
     normalize_preferred_skill_keys,
     requested_reasoning_to_context,
+    pending_file_drafts_to_context,
     requested_turn_preferences_to_context,
 )
 
@@ -54,6 +56,11 @@ class WebChatAdapter:
                     effort=(request.reasoning_effort or "").strip() or None,
                 )
             ))
+        if request.pending_file_drafts:
+            contexts.append(pending_file_drafts_to_context(tuple(
+                PendingFileDraftRef(source=item.source, path=item.path)
+                for item in request.pending_file_drafts
+            )))
         return NormalizedInboundTurn(
             channel=self.channel,
             user_id=user_id,
@@ -80,12 +87,19 @@ class WebResumeAdapter:
         user_id: str,
         request: ResumeRequest,
     ) -> NormalizedResumeTurn:
+        contexts = []
+        if request.pending_file_drafts:
+            contexts.append(pending_file_drafts_to_context(tuple(
+                PendingFileDraftRef(source=item.source, path=item.path)
+                for item in request.pending_file_drafts
+            )))
         return NormalizedResumeTurn(
             channel=self.channel,
             user_id=user_id,
             session_id=session_id,
             interrupt_id=request.interrupt_id,
             answers=request.answers,
+            context=contexts,
             reply_route=WebReplyRoute(session_id=session_id),
             metadata={"session_id": session_id},
         )

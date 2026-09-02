@@ -26,12 +26,23 @@ from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.round import Round
 from src.api.models.run_cancel_request import RunCancelRequest
 from src.api.models.session import Session
+from src.api.models.sandbox_cleanup import SandboxCleanupJob
 from src.api.models.subagent_run import SubagentRun
 from src.api.models.user_memory import CronJobRun, MemoryEmbedding, UserMemory, UserSkillConfig
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_sandbox import UserSandbox
 from src.api.models.user_sandbox_config import UserSandboxConfig
 from src.api.models.user_skill_inventory import UserSkillInventorySnapshot
+from src.api.models.workspace import (
+    UserWorkspace,
+    WorkspaceChangeSet,
+    WorkspaceClaim,
+    WorkspaceContentObject,
+    WorkspaceContentReference,
+    WorkspaceEntry,
+    WorkspaceFileVersion,
+    WorkspaceMutation,
+)
 from src.api.utils.timezone import now_naive
 
 
@@ -418,6 +429,17 @@ def _purge_user_owned_data(db: DBSession, *, user_id: str) -> None:
     db.query(MemoryEmbedding).filter(MemoryEmbedding.user_id == user_id).delete(synchronize_session=False)
     db.query(UserMemory).filter(UserMemory.user_id == user_id).delete(synchronize_session=False)
     db.query(UserSkillConfig).filter(UserSkillConfig.user_id == user_id).delete(synchronize_session=False)
+    db.query(WorkspaceContentReference).filter(WorkspaceContentReference.user_id == user_id).delete(synchronize_session=False)
+    db.query(WorkspaceChangeSet).filter(WorkspaceChangeSet.user_id == user_id).delete(synchronize_session=False)
+    db.query(WorkspaceClaim).filter(WorkspaceClaim.user_id == user_id).delete(synchronize_session=False)
+    db.query(WorkspaceFileVersion).filter(WorkspaceFileVersion.user_id == user_id).delete(synchronize_session=False)
+    db.query(WorkspaceContentObject).filter(WorkspaceContentObject.user_id == user_id).delete(synchronize_session=False)
+    db.query(WorkspaceMutation).filter(WorkspaceMutation.user_id == user_id).delete(synchronize_session=False)
+    db.query(WorkspaceEntry).filter(WorkspaceEntry.user_id == user_id).delete(synchronize_session=False)
+    db.query(UserWorkspace).filter(UserWorkspace.user_id == user_id).delete(synchronize_session=False)
+    db.query(SandboxCleanupJob).filter(
+        SandboxCleanupJob.user_id == user_id
+    ).delete(synchronize_session=False)
     # Keep the same lock order as inventory publication: binding first, then
     # snapshot. This avoids a delete/publish deadlock under concurrent teardown.
     db.query(UserSandbox).filter(UserSandbox.user_id == user_id).delete(synchronize_session=False)

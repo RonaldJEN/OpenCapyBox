@@ -42,6 +42,40 @@ class TestRequestDbReadTransactions:
         assert result is False
         mock_db.rollback.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_subscribe_releases_request_transaction_before_streaming(self):
+        from starlette.responses import StreamingResponse
+
+        from src.api.models.round import Round
+        from src.api.models.session import Session
+        from src.api.routes.chat import subscribe_to_round
+
+        mock_db = MagicMock()
+        mock_session = MagicMock()
+        mock_round = MagicMock()
+        mock_round.status = "running"
+
+        def query_side_effect(model):
+            chain = MagicMock()
+            if model is Session:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is Round:
+                chain.filter.return_value.first.return_value = mock_round
+            return chain
+
+        mock_db.query.side_effect = query_side_effect
+
+        response = await subscribe_to_round(
+            chat_session_id="session-1",
+            round_id="round-1",
+            last_sequence=0,
+            user_id="user-1",
+            db=mock_db,
+        )
+
+        assert isinstance(response, StreamingResponse)
+        mock_db.rollback.assert_called_once()
+
 
 class TestRoundSubscribersManagement:
     """轮次订阅者管理测试"""
@@ -1429,7 +1463,6 @@ class TestSubscribePersistedPolling:
                 response = await chat_routes.subscribe_to_round(
                     chat_session_id="session-1",
                     round_id="round-1",
-                    last_step=0,
                     last_sequence=0,
                     user_id="testuser",
                     db=request_db,

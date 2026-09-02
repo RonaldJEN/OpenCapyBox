@@ -1,17 +1,41 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type Ref } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+  type Ref,
+} from 'react';
 
 import { apiService } from '../services/api';
 import {
   AttachmentInfo,
   AskUserQuestion,
+  ChatFile,
   ChatContentBlock,
   FileInfo,
   ModelInfo,
   PreferredMcpConnectionSnapshot,
-  RoundData,
+  PendingFileDraftInfo,
   ToolApprovalPayload,
   TurnReasoningSelection,
 } from '../types';
+import type { WorkspaceEntry } from '../types/workspace';
+import {
+  getWorkspaceProjectionRevision,
+  isWorkspaceEntryDeleted,
+  requestOpenWorkspace,
+  subscribeWorkspaceProjection,
+} from '../services/workspaceEvents';
+import { workspaceApi } from '../services/workspaceApi';
+import {
+  flushWorkspaceDraft,
+  getWorkspaceDraft,
+  workspaceDraftKey,
+} from '../services/workspaceDraftOutbox';
 import {
   ChatRuntimeProvider,
   useChatRuntime,
@@ -19,10 +43,8 @@ import {
 } from '../runtime/ChatRuntimeProvider';
 import { readFileAsDataUrl } from '../utils/imageUtils';
 import { toFileInfo, isImageFile } from '../utils/fileUtils';
-import { extractAssistantFiles } from '../utils/assistantFileRefs';
 import {
   emptyTurnPreferenceDraft,
-  restoreFailedTurnPreferenceDraft,
   type TurnPreferenceDraft,
 } from '../utils/turnPreferenceDrafts';
 import {
@@ -32,7 +54,7 @@ import {
 } from '../utils/errorMessages';
 import { Round } from './Round';
 import { ArtifactsPanel, type ArtifactsPanelHandle } from './ArtifactsPanel';
-import { FilePreview, type SessionFileOwnerIdentity } from './FilePreview';
+import { type SessionFileOwnerIdentity } from './FilePreview';
 import { ModelSelector } from './ModelSelector';
 import { ChatInput } from './ChatInput';
 import { QuestionCard } from './QuestionCard';
@@ -42,6 +64,10 @@ import {
   SessionFilesButton,
 } from './session-files/SessionFilesControls';
 import { SessionFilesSplitter } from './session-files/SessionFilesSplitter';
+import {
+  WorkspaceFilesPanel,
+  type WorkspaceFilesPanelHandle,
+} from './workspace/WorkspaceFilesPanel';
 import './session-files/session-files.css';
 import {
   Loader2,
@@ -60,7 +86,6 @@ const WELCOME_SUGGESTIONS = [
 
 const NEW_SESSION_DRAFT_KEY = '__new_session__';
 const SESSION_FILES_RATIO_STORAGE_KEY = 'opencapybox.sessionFiles.chatRatio';
-const MOBILE_FILES_QUERY = '(max-width: 1199px)';
 const DEFAULT_SESSION_FILES_CHAT_RATIO = 45;
 
 type SessionFilesLayout = 'closed' | 'split' | 'full';
@@ -93,12 +118,6 @@ function readInitialChatRatio(): number {
     // Storage may be unavailable in privacy-restricted contexts.
   }
   return DEFAULT_SESSION_FILES_CHAT_RATIO;
-}
-
-function readIsMobileFilesViewport(): boolean {
-  return typeof window.matchMedia === 'function'
-    ? window.matchMedia(MOBILE_FILES_QUERY).matches
-    : false;
 }
 
 function defaultTurnReasoning(model?: ModelInfo): TurnReasoningSelection | null {
@@ -138,7 +157,7 @@ interface MessageDraft {
   draftId: string;
   revision: number;
   input: string;
-  attachedFiles: FileInfo[];
+  attachedFiles: ChatFile[];
 }
 
 interface ReasoningDraft {
@@ -183,6 +202,11 @@ interface ChatV2Props {
   onSessionCreated?: (sessionId: string) => void;
   onFilesFullChange?: (full: boolean) => void;
   sessionFilesHandleRef?: Ref<ArtifactsPanelHandle>;
+  workspaceFilesHandleRef?: Ref<WorkspaceFilesPanelHandle>;
+  workspaceFileTarget?: WorkspaceEntry | null;
+  workspaceTargetResolving?: boolean;
+  onWorkspaceFilesClose?: () => void;
+  onWorkspaceTabSelect?: (entry: WorkspaceEntry, options?: { replace?: boolean }) => void;
   onStartEdgeCollapseSidebar?: () => void;
   activeSlotSessionIds?: Set<string>;
   scrollTarget?: {
@@ -217,7 +241,12 @@ function ChatV2View(props: ChatV2Props) {
     onCreateSession,
     onSessionCreated,
     onFilesFullChange,
-    sessionFilesHandleRef,
+    sessionFilesHandleRef: externalSessionFilesHandleRef,
+    workspaceFilesHandleRef: externalWorkspaceFilesHandleRef,
+    workspaceFileTarget = null,
+    workspaceTargetResolving = false,
+    onWorkspaceFilesClose,
+    onWorkspaceTabSelect,
     onStartEdgeCollapseSidebar,
     activeSlotSessionIds,
     scrollTarget,
@@ -226,6 +255,11 @@ function ChatV2View(props: ChatV2Props) {
   const loadSessionHistory = runtime.loadSessionHistory;
   const projection = runtime.getSessionProjection(sessionId);
   const rounds = projection.rounds;
+  useSyncExternalStore(
+    subscribeWorkspaceProjection,
+    getWorkspaceProjectionRevision,
+    getWorkspaceProjectionRevision,
+  );
   const loading = projection.loading;
   const sending = projection.sending;
   const resuming = projection.resuming;
@@ -247,34 +281,47 @@ function ChatV2View(props: ChatV2Props) {
   }));
   const [localError, setLocalError] = useState('');
   const [creatingDraftId, setCreatingDraftId] = useState<string | null>(null);
+  const [syncingAttachmentDraftId, setSyncingAttachmentDraftId] = useState<string | null>(null);
   const [defaultChatRatio] = useState(readInitialChatRatio);
   const [sessionFilesStates, setSessionFilesStates] = useState<Record<string, SessionFilesViewState>>({});
-  const [isMobileFilesViewport, setIsMobileFilesViewport] = useState(readIsMobileFilesViewport);
+  const [workspaceFilesState, setWorkspaceFilesState] = useState<SessionFilesViewState>(() => createSessionFilesViewState(defaultChatRatio));
   const [filePanelTarget, setFilePanelTarget] = useState<(
     SessionFileOwnerIdentity & { file: FileInfo; nonce: number }
   ) | null>(null);
-  const [assistantFileMatches, setAssistantFileMatches] = useState<Record<string, FileInfo>>({});
-  const [previewFile, setPreviewFile] = useState<FileInfo | null>(null);
-  const [previewSessionId, setPreviewSessionId] = useState<string>('');
+  const [previewContextNotice, setPreviewContextNotice] = useState('');
   const [uploadingDraftIds, setUploadingDraftIds] = useState<Set<string>>(new Set());
   const [isDragging, setIsDragging] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [stopping, setStopping] = useState(false);
 
-  const assistantFileMatchesRef = useRef<Record<string, FileInfo>>({});
-  const assistantFileMissRoundCountsRef = useRef<Record<string, number>>({});
-  const pendingAssistantFileRoundCountsRef = useRef<Record<string, number>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const chatPaneRef = useRef<HTMLDivElement>(null);
   const sessionFilesShellRef = useRef<HTMLDivElement>(null);
   const sessionFilesPaneRef = useRef<HTMLElement>(null);
+  const sessionFilesHandleRef = useRef<ArtifactsPanelHandle | null>(null);
+  const setSessionFilesHandle = useCallback((handle: ArtifactsPanelHandle | null) => {
+    sessionFilesHandleRef.current = handle;
+    if (typeof externalSessionFilesHandleRef === 'function') externalSessionFilesHandleRef(handle);
+    else if (externalSessionFilesHandleRef) {
+      (externalSessionFilesHandleRef as { current: ArtifactsPanelHandle | null }).current = handle;
+    }
+  }, [externalSessionFilesHandleRef]);
+  const workspaceFilesHandleRef = useRef<WorkspaceFilesPanelHandle | null>(null);
+  const setWorkspaceFilesHandle = useCallback((handle: WorkspaceFilesPanelHandle | null) => {
+    workspaceFilesHandleRef.current = handle;
+    if (typeof externalWorkspaceFilesHandleRef === 'function') externalWorkspaceFilesHandleRef(handle);
+    else if (externalWorkspaceFilesHandleRef) {
+      (externalWorkspaceFilesHandleRef as { current: WorkspaceFilesPanelHandle | null }).current = handle;
+    }
+  }, [externalWorkspaceFilesHandleRef]);
   const chatScrollTopBeforeFilesRef = useRef<Record<string, number>>({});
   const focusBeforeFilesRef = useRef<Record<string, HTMLElement | null>>({});
   const previousFilesStateRef = useRef({ sessionId, isOpen: false });
-  const previousMobileOverlayRef = useRef(false);
   const filePanelTargetNonceRef = useRef(0);
+  const attachmentPreviewRequestIdRef = useRef(0);
+  const assistantFileOpenRequestIdRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const prevRoundsLengthRef = useRef<number>(0);
   const isInitialLoadRef = useRef<boolean>(true);
@@ -285,6 +332,7 @@ function ChatV2View(props: ChatV2Props) {
   const handledScrollTargetNonceRef = useRef<number | null>(null);
   const suppressAutoScrollRef = useRef<boolean>(false);
   const pendingSendSessionKeysRef = useRef<Set<string>>(new Set());
+  const resumeSaveBarrierPendingRef = useRef(false);
   const selectedModel = availableModels.find((m) => m.id === selectedModelId);
   const currentDraftKey = sessionId || NEW_SESSION_DRAFT_KEY;
   const currentMessageDraft = composerDrafts.messageDrafts[currentDraftKey] || {
@@ -296,7 +344,7 @@ function ChatV2View(props: ChatV2Props) {
   const currentPreferenceDraft = composerDrafts.preferenceDrafts[currentDraftKey]
     || emptyTurnPreferenceDraft();
   const currentReasoningDraft = composerDrafts.reasoningDrafts[currentDraftKey];
-  const turnReasoning = currentReasoningDraft?.modelId === selectedModelId
+  const turnReasoning = currentReasoningDraft && currentReasoningDraft.modelId === selectedModelId
     ? currentReasoningDraft.selection
     : defaultTurnReasoning(selectedModel);
   const input = currentMessageDraft.input;
@@ -309,12 +357,13 @@ function ChatV2View(props: ChatV2Props) {
   const sessionFilesState = sessionId
     ? sessionFilesStates[sessionId] ?? createSessionFilesViewState(defaultChatRatio)
     : createSessionFilesViewState(defaultChatRatio);
-  const filesLayout = sessionFilesState.layout;
-  const chatRatio = sessionFilesState.chatRatio;
+  const workspacePanelActive = Boolean(workspaceFileTarget);
+  const activeFilesState = workspacePanelActive ? workspaceFilesState : sessionFilesState;
+  const filesLayout = activeFilesState.layout;
+  const chatRatio = activeFilesState.chatRatio;
   const isFilesOpen = filesLayout !== 'closed';
   const isFilesExpanded = filesLayout === 'full';
-  const isMobileFilesOverlay = isMobileFilesViewport && isFilesOpen;
-  const chatInteractionHidden = isFilesExpanded || isMobileFilesOverlay;
+  const chatInteractionHidden = isFilesExpanded;
   const lastRoundStatus = rounds[rounds.length - 1]?.status || 'empty';
   const filesRefreshNonce = `${rounds.length}:${lastRoundStatus}:${Number(sending)}:${Number(resuming)}`;
   const activeSlotSessionIdsRef = useRef(activeSlotSessionIds);
@@ -339,14 +388,37 @@ function ChatV2View(props: ChatV2Props) {
   composerDraftsRef.current = composerDrafts;
   activeSlotSessionIdsRef.current = activeSlotSessionIds;
 
+  const commitComposerDrafts = (
+    updater: (current: ComposerDraftState) => ComposerDraftState,
+  ) => {
+    const previous = composerDraftsRef.current;
+    const next = updater(previous);
+    if (next === previous) return;
+    composerDraftsRef.current = next;
+    setComposerDrafts(next);
+  };
+
   useLayoutEffect(() => {
     committedFilesOwnerRef.current = sessionFilesOwner;
   }, [sessionFilesOwner]);
 
   useLayoutEffect(() => {
-    onFilesFullChange?.(isFilesExpanded);
+    if (!workspaceFileTarget || workspaceFilesState.layout !== 'closed') return;
+    chatScrollTopBeforeFilesRef.current[sessionId] = chatAreaRef.current?.scrollTop ?? 0;
+    focusBeforeFilesRef.current[sessionId] = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    setWorkspaceFilesState((current) => ({
+      ...current,
+      layout: 'split',
+      chatRatio: normalizeVisibleChatRatio(current.chatRatio),
+    }));
+  }, [sessionId, workspaceFileTarget, workspaceFilesState.layout]);
+
+  useLayoutEffect(() => {
+    onFilesFullChange?.(chatInteractionHidden);
     return () => onFilesFullChange?.(false);
-  }, [isFilesExpanded, onFilesFullChange]);
+  }, [chatInteractionHidden, onFilesFullChange]);
 
   const updateCurrentFilesState = (
     updater: (current: SessionFilesViewState) => SessionFilesViewState,
@@ -360,29 +432,78 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const setCurrentFilesLayout = (layout: SessionFilesLayout) => {
+    if (workspacePanelActive) {
+      setWorkspaceFilesState((current) => current.layout === layout ? current : { ...current, layout });
+      return;
+    }
     updateCurrentFilesState((current) => {
       if (current.layout === layout) return current;
       return { ...current, layout };
     });
   };
 
+  const saveWorkspaceFilesInBackground = () => {
+    const workspaceHandle = workspaceFilesHandleRef.current;
+    if (!workspaceHandle?.hasDirty()) return;
+    void workspaceHandle.saveDirty().catch((error) => {
+      console.error('Failed to sync workspace files in background:', error);
+    });
+  };
+
+  const captureDirtyEditorsBeforeAgentStart = useCallback((): PendingFileDraftInfo[] => {
+    const pending: PendingFileDraftInfo[] = [];
+    const sessionHandle = sessionFilesHandleRef.current;
+    if (sessionHandle && sessionId) {
+      const ownerMatches = sessionHandle.ownerSessionId === sessionFilesOwner.ownerSessionId
+        && sessionHandle.ownerEpoch === sessionFilesOwner.ownerEpoch;
+      if (ownerMatches && sessionHandle.hasDirty(sessionFilesOwner)) {
+        pending.push(...sessionHandle.pendingFileDrafts(sessionFilesOwner));
+        try {
+          void sessionHandle.saveDirty(sessionFilesOwner).catch((error) => {
+            console.error('Failed to sync Session drafts in background:', error);
+          });
+        } catch (error) {
+          console.error('Failed to capture Session drafts:', error);
+        }
+      }
+    }
+    const workspaceHandle = workspaceFilesHandleRef.current;
+    if (workspaceHandle?.hasDirty()) {
+      pending.push(...workspaceHandle.pendingFileDrafts());
+      try {
+        void workspaceHandle.saveDirty().catch((error) => {
+          console.error('Failed to sync Workspace drafts in background:', error);
+        });
+      } catch (error) {
+        console.error('Failed to capture Workspace drafts:', error);
+      }
+    }
+    return pending.filter((item, index, items) => (
+      items.findIndex((candidate) => candidate.source === item.source && candidate.path === item.path) === index
+    ));
+  }, [sessionFilesOwner, sessionId]);
+
   const openFilesPanel = () => {
     if (!sessionId) return;
-    if (!isFilesOpen) {
+    if (workspacePanelActive) {
+      saveWorkspaceFilesInBackground();
+      onWorkspaceFilesClose?.();
+    }
+    if (sessionFilesState.layout === 'closed') {
       chatScrollTopBeforeFilesRef.current[sessionId] = chatAreaRef.current?.scrollTop ?? 0;
       focusBeforeFilesRef.current[sessionId] = document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
     }
-    const visibleRatio = isFilesOpen
-      ? normalizeVisibleChatRatio(chatRatio)
+    const visibleRatio = sessionFilesState.layout !== 'closed'
+      ? normalizeVisibleChatRatio(sessionFilesState.chatRatio)
       : DEFAULT_SESSION_FILES_CHAT_RATIO;
     updateCurrentFilesState((current) => (
       current.layout === 'split' && current.chatRatio === visibleRatio
         ? current
         : { ...current, layout: 'split', chatRatio: visibleRatio }
     ));
-    if (visibleRatio !== chatRatio) {
+    if (visibleRatio !== sessionFilesState.chatRatio) {
       try {
         window.localStorage.setItem(SESSION_FILES_RATIO_STORAGE_KEY, String(visibleRatio));
       } catch {
@@ -391,7 +512,23 @@ function ChatV2View(props: ChatV2Props) {
     }
   };
 
+  const finalizeWorkspacePanelClose = () => {
+    setWorkspaceFilesState((current) => ({ ...current, layout: 'closed' }));
+    onWorkspaceFilesClose?.();
+  };
+
   const closeFilesPanel = () => {
+    if (workspacePanelActive) {
+      saveWorkspaceFilesInBackground();
+      finalizeWorkspacePanelClose();
+      return;
+    }
+    const sessionHandle = sessionFilesHandleRef.current;
+    if (sessionHandle?.hasDirty(sessionFilesOwner)) {
+      void sessionHandle.saveDirty(sessionFilesOwner).catch((error) => {
+        console.error('Failed to sync Session drafts on close:', error);
+      });
+    }
     setCurrentFilesLayout('closed');
     setFilePanelTarget(null);
   };
@@ -415,32 +552,11 @@ function ChatV2View(props: ChatV2Props) {
   }, [isFilesOpen, sessionId]);
 
   useLayoutEffect(() => {
-    const wasMobileOverlay = previousMobileOverlayRef.current;
-    if (!wasMobileOverlay && isMobileFilesOverlay) {
-      sessionFilesPaneRef.current
-        ?.querySelector<HTMLButtonElement>('button:not([disabled])')
-        ?.focus({ preventScroll: true });
-    }
-    previousMobileOverlayRef.current = isMobileFilesOverlay;
-  }, [isMobileFilesOverlay, sessionId]);
-
-  useLayoutEffect(() => {
     const pane = chatPaneRef.current;
     if (!pane) return;
     if (chatInteractionHidden) pane.setAttribute('inert', '');
     else pane.removeAttribute('inert');
   }, [chatInteractionHidden]);
-
-  useEffect(() => {
-    if (typeof window.matchMedia !== 'function') return undefined;
-    const mediaQuery = window.matchMedia(MOBILE_FILES_QUERY);
-    const handleChange = (event: MediaQueryListEvent) => {
-      setIsMobileFilesViewport(event.matches);
-    };
-    setIsMobileFilesViewport(mediaQuery.matches);
-    mediaQuery.addEventListener('change', handleChange);
-    return () => mediaQuery.removeEventListener('change', handleChange);
-  }, []);
 
   const handleFilesRatioChange = (ratio: number) => {
     if (ratio <= 0) {
@@ -451,11 +567,17 @@ function ChatV2View(props: ChatV2Props) {
       closeFilesPanel();
       return;
     }
-    updateCurrentFilesState((current) => (
-      current.chatRatio === ratio && current.layout === 'split'
+    if (workspacePanelActive) {
+      setWorkspaceFilesState((current) => current.chatRatio === ratio && current.layout === 'split'
         ? current
-        : { ...current, layout: 'split', chatRatio: ratio }
-    ));
+        : { ...current, layout: 'split', chatRatio: ratio });
+    } else {
+      updateCurrentFilesState((current) => (
+        current.chatRatio === ratio && current.layout === 'split'
+          ? current
+          : { ...current, layout: 'split', chatRatio: ratio }
+      ));
+    }
     try {
       window.localStorage.setItem(SESSION_FILES_RATIO_STORAGE_KEY, String(ratio));
     } catch {
@@ -465,7 +587,7 @@ function ChatV2View(props: ChatV2Props) {
 
   const toggleChatPane = () => {
     if (isFilesOpen) closeFilesPanel();
-    else openFilesPanel();
+    else void openFilesPanel();
   };
 
   useEffect(() => {
@@ -529,7 +651,7 @@ function ChatV2View(props: ChatV2Props) {
     expectedDraftId: string,
   ) => {
     if (sourceKey === targetSessionId) return;
-    setComposerDrafts((previous) => {
+    commitComposerDrafts((previous) => {
       const sourceMessage = previous.messageDrafts[sourceKey];
       if (!sourceMessage || sourceMessage.draftId !== expectedDraftId) return previous;
 
@@ -585,20 +707,13 @@ function ChatV2View(props: ChatV2Props) {
     }
   }, [projection.agentStateByRunKey, projection.visibleAgentStateRunKey]);
 
-  const resetAssistantFileMatches = () => {
-    assistantFileMatchesRef.current = {};
-    assistantFileMissRoundCountsRef.current = {};
-    pendingAssistantFileRoundCountsRef.current = {};
-    setAssistantFileMatches({});
-  };
-
-  const buildDisplayMessage = (text: string, files: FileInfo[]) => {
+  const buildDisplayMessage = (text: string, files: ChatFile[]) => {
     const trimmed = text.trim();
     if (trimmed) return trimmed;
     return files.length > 0 ? '' : '[空消息]';
   };
 
-  const buildContentBlocks = (text: string, files: FileInfo[]): ChatContentBlock[] => {
+  const buildContentBlocks = (text: string, files: ChatFile[]): ChatContentBlock[] => {
     const blocks: ChatContentBlock[] = [];
     const trimmed = text.trim();
     const toMimeType = (value?: string) => (value && value.includes('/') ? value : undefined);
@@ -610,7 +725,7 @@ function ChatV2View(props: ChatV2Props) {
       blocks.push({ type: 'text', text: trimmed });
     }
 
-    const imageFiles = files.filter((file) => isImageFile(file));
+    const imageFiles = files.filter((file) => file.source !== 'workspace' && isImageFile(file));
     if (imageFiles.length > 0 && !(selectedModel?.supports_image ?? false)) {
       throw new Error(`当前模型 ${selectedModel?.name || selectedModelId} 不支持图片输入`);
     }
@@ -619,6 +734,21 @@ function ChatV2View(props: ChatV2Props) {
     }
 
     for (const file of files) {
+      if (file.source === 'workspace') {
+        blocks.push({
+          type: 'file',
+          file: {
+            source: 'workspace',
+            entry_id: file.entry_id,
+            ...(file.version_id ? { version_id: file.version_id } : {}),
+            ...(file.is_directory ? { kind: 'directory' as const } : {}),
+            name: file.name,
+            mime_type: toMimeType(file.type),
+            size: file.size,
+          },
+        });
+        continue;
+      }
       const isImage = isImageFile(file);
       if (isImage && file.data_url && (selectedModel?.supports_image ?? false)) {
         blocks.push({
@@ -635,6 +765,7 @@ function ChatV2View(props: ChatV2Props) {
         blocks.push({
           type: 'file',
           file: {
+            source: 'session',
             path: file.path,
             name: file.name,
             mime_type: toMimeType(file.type),
@@ -653,10 +784,8 @@ function ChatV2View(props: ChatV2Props) {
   useEffect(() => {
     if (!sessionId) {
       setLocalError('');
-      setPreviewFile(null);
-      setPreviewSessionId('');
+      setPreviewContextNotice('');
       setFilePanelTarget(null);
-      resetAssistantFileMatches();
       setIsDragging(false);
       setDisableInitialMotion(false);
       setHighlightedRoundId(null);
@@ -672,7 +801,7 @@ function ChatV2View(props: ChatV2Props) {
     roundElementRefs.current = {};
     setHighlightedRoundId(null);
     setFilePanelTarget(null);
-    resetAssistantFileMatches();
+    setPreviewContextNotice('');
     setIsAtBottom(false);
     prevRoundsLengthRef.current = 0;
     setLocalError('');
@@ -710,83 +839,6 @@ function ChatV2View(props: ChatV2Props) {
       ),
     });
   }, [hasActiveSlot, hasLocalActiveTransport, loadSessionHistory, sessionId]);
-
-  useEffect(() => {
-    if (!sessionId || sending || resuming) return;
-
-    const pendingRoundCounts = pendingAssistantFileRoundCountsRef.current;
-    const verificationRoundCount = rounds.length;
-    const candidates = collectAssistantFileCandidates(rounds, sessionId).filter((file) => {
-      const cachedMatch = assistantFileMatchesRef.current[file.path];
-      if (cachedMatch) return false;
-
-      const pendingRoundCount = pendingRoundCounts[file.path];
-      if (pendingRoundCount !== undefined && pendingRoundCount >= verificationRoundCount) return false;
-
-      const lastMissRoundCount = assistantFileMissRoundCountsRef.current[file.path];
-      return lastMissRoundCount === undefined || lastMissRoundCount < verificationRoundCount;
-    });
-    if (candidates.length === 0) return;
-
-    const groupedByParent = new Map<string, FileInfo[]>();
-    for (const file of candidates) {
-      pendingRoundCounts[file.path] = verificationRoundCount;
-      const targetPath = normalizeAssistantTargetPath(file.path);
-      const parentPath = getAssistantTargetParentPath(targetPath);
-      const group = groupedByParent.get(parentPath) || [];
-      group.push(file);
-      groupedByParent.set(parentPath, group);
-    }
-
-    const targetSessionId = sessionId;
-    void Promise.all(Array.from(groupedByParent.entries()).map(async ([parentPath, files]) => {
-      let updates: Record<string, FileInfo | null>;
-      try {
-        const list = await apiService.getSessionFiles(targetSessionId, parentPath || undefined);
-        updates = buildAssistantFileMatchUpdates(files, list.files, targetSessionId);
-      } catch (err) {
-        console.warn('Failed to verify assistant file references:', err);
-        updates = {};
-      }
-
-      if (sessionIdRef.current !== targetSessionId) {
-        for (const file of files) {
-          if (pendingRoundCounts[file.path] === verificationRoundCount) delete pendingRoundCounts[file.path];
-        }
-        return;
-      }
-
-      const currentPaths = new Set(
-        files
-          .filter((file) => pendingRoundCounts[file.path] === verificationRoundCount)
-          .map((file) => file.path),
-      );
-      for (const file of files) {
-        if (pendingRoundCounts[file.path] === verificationRoundCount) delete pendingRoundCounts[file.path];
-      }
-
-      const currentUpdates = Object.fromEntries(
-        Object.entries(updates).filter(([path]) => currentPaths.has(path)),
-      );
-      if (Object.keys(currentUpdates).length === 0) return;
-
-      const nextMissRoundCounts = { ...assistantFileMissRoundCountsRef.current };
-      for (const [path, match] of Object.entries(currentUpdates)) {
-        if (match) delete nextMissRoundCounts[path];
-        else nextMissRoundCounts[path] = verificationRoundCount;
-      }
-      const matchedUpdates = Object.fromEntries(
-        Object.entries(currentUpdates).filter(([, match]) => !!match),
-      ) as Record<string, FileInfo>;
-      assistantFileMissRoundCountsRef.current = nextMissRoundCounts;
-      if (Object.keys(matchedUpdates).length === 0) return;
-      assistantFileMatchesRef.current = {
-        ...assistantFileMatchesRef.current,
-        ...matchedUpdates,
-      };
-      setAssistantFileMatches((prev) => ({ ...prev, ...matchedUpdates }));
-    }));
-  }, [rounds, sessionId, sending, resuming]);
 
   useLayoutEffect(() => {
     const container = chatAreaRef.current;
@@ -864,7 +916,7 @@ function ChatV2View(props: ChatV2Props) {
     const sourceDraftKey = currentDraftKey;
     uploadsInFlightRef.current.add(capturedDraftId);
     addUploadingDraftId(capturedDraftId);
-    const uploadedFiles: FileInfo[] = [];
+    const uploadedFiles: ChatFile[] = [];
     try {
       let targetSessionId = sessionId;
       if (!targetSessionId) {
@@ -892,9 +944,19 @@ function ChatV2View(props: ChatV2Props) {
 
       const uploadQueue = Array.from(files as ArrayLike<File>);
       for (const file of uploadQueue) {
-        const fileInfo = await apiService.uploadFile(targetSessionId, file);
-        fileInfo.session_id = targetSessionId;
-        if (file.type) fileInfo.type = file.type;
+        const uploaded = await apiService.uploadFile(targetSessionId, file);
+        const fileInfo: ChatFile = {
+          source: 'session',
+          name: uploaded.name,
+          path: uploaded.path,
+          revision: uploaded.revision,
+          size: uploaded.size,
+          modified: uploaded.modified,
+          session_id: targetSessionId,
+          type: file.type || uploaded.type,
+          is_directory: uploaded.is_directory,
+          data_url: uploaded.data_url,
+        };
         if (isImageFile(fileInfo)) fileInfo.data_url = await readFileAsDataUrl(file);
         uploadedFiles.push(fileInfo);
       }
@@ -952,10 +1014,10 @@ function ChatV2View(props: ChatV2Props) {
     }));
   };
 
-  const handlePreviewAttachment = async (file: AttachmentInfo | FileInfo) => {
+  const previewSessionAttachment = async (file: AttachmentInfo | FileInfo) => {
+    const requestId = ++attachmentPreviewRequestIdRef.current;
     const targetSessionId = file.session_id || sessionId;
     if (!targetSessionId) {
-      if (isImageFile(file) && file.data_url) setPreviewFile(toFileInfo(file, ''));
       return;
     }
     let normalizedFile = toFileInfo(file, targetSessionId);
@@ -975,15 +1037,153 @@ function ChatV2View(props: ChatV2Props) {
         console.warn('Failed to hydrate file metadata for preview:', err);
       }
     }
-    setPreviewSessionId(targetSessionId);
-    setPreviewFile(normalizedFile);
+    if (requestId !== attachmentPreviewRequestIdRef.current) return;
+    if (normalizedFile.is_directory) {
+      void handleOpenAssistantFile(normalizedFile);
+      return;
+    }
+    filePanelTargetNonceRef.current += 1;
+    setFilePanelTarget({
+      ...sessionFilesOwner,
+      file: {
+        ...normalizedFile,
+        session_id: targetSessionId,
+        content_mode: 'captured',
+      },
+      nonce: filePanelTargetNonceRef.current,
+    });
+    setPreviewContextNotice('');
+    openFilesPanel();
   };
 
-  const handleOpenAssistantFile = (file: FileInfo) => {
-    if (!sessionId) return;
+  const handlePreviewDraftAttachment = async (file: AttachmentInfo | FileInfo) => {
+    if (file.source === 'workspace' && file.entry_id) {
+      requestOpenWorkspace(
+        file.entry_id,
+      );
+      return;
+    }
+    await previewSessionAttachment(file);
+  };
+
+  const handlePreviewHistoryAttachment = async (file: AttachmentInfo | FileInfo) => {
+    if (file.source === 'workspace') {
+      if (isWorkspaceEntryDeleted(file.entry_id)) {
+        setLocalError('工作区文件已永久删除，历史中不再保留可读取副本。');
+        return;
+      }
+      const capturedPath = (file.snapshot_path || file.path).replace(/^\/+/, '');
+      if (!capturedPath.startsWith('.workspace-snapshots/')) {
+        setLocalError('工作区附件正在冻结，请稍后再打开。');
+        return;
+      }
+    }
     setLocalError('');
+    await previewSessionAttachment(file);
+  };
+
+  const handleOpenAssistantFile = async (file: FileInfo) => {
+    if (!sessionId) return;
+    const requestId = ++assistantFileOpenRequestIdRef.current;
+    const ownerSessionId = sessionId;
+    setLocalError('');
+    setPreviewContextNotice('');
     const normalizedFile = toFileInfo(file, sessionId);
-    const targetPath = normalizeAssistantTargetPath(normalizedFile.path);
+
+    const showCapturedFallback = (message: string) => {
+      if (
+        requestId !== assistantFileOpenRequestIdRef.current
+        || sessionIdRef.current !== ownerSessionId
+      ) return;
+      if (normalizedFile.source === 'workspace') {
+        setLocalError('工作区文件已删除或暂时无法读取；已删除的文件不保留历史副本。');
+        return;
+      }
+      const capturedSessionId = normalizedFile.session_id || ownerSessionId;
+      if (!normalizedFile.snapshot_path) {
+        setLocalError('当前会话文件已不存在，且没有可验证的生成时版本。');
+        return;
+      }
+      filePanelTargetNonceRef.current += 1;
+      setFilePanelTarget({
+        ...sessionFilesOwner,
+        file: {
+          ...normalizedFile,
+          path: normalizedFile.snapshot_path,
+          session_id: capturedSessionId,
+          content_mode: 'captured',
+        },
+        nonce: filePanelTargetNonceRef.current,
+      });
+      setPreviewContextNotice(message);
+      openFilesPanel();
+    };
+
+    if (normalizedFile.assistant_ref_id && normalizedFile.source === 'workspace') {
+      if (!normalizedFile.entry_id) {
+        showCapturedFallback('当前工作区文件身份无效，正在显示生成时版本。');
+        return;
+      }
+      try {
+        const currentEntry = await workspaceApi.getEntry(normalizedFile.entry_id);
+        if (
+          requestId !== assistantFileOpenRequestIdRef.current
+          || sessionIdRef.current !== ownerSessionId
+        ) return;
+        setPreviewContextNotice('');
+        requestOpenWorkspace(currentEntry.entry_id);
+      } catch (error) {
+        showCapturedFallback(
+          (error as { status?: unknown })?.status === 404
+            ? '工作区文件已删除，无法恢复。'
+            : '工作区文件暂时无法读取，请稍后重试。',
+        );
+      }
+      return;
+    }
+
+    if (normalizedFile.assistant_ref_id && normalizedFile.source !== 'workspace') {
+      const targetSessionId = normalizedFile.session_id || ownerSessionId;
+      const targetPath = normalizedFile.path.replace(/^\/+/, '');
+      const parentPath = targetPath.includes('/')
+        ? targetPath.slice(0, targetPath.lastIndexOf('/'))
+        : undefined;
+      try {
+        const listed = await apiService.getSessionFiles(targetSessionId, parentPath);
+        const currentFile = listed.files.find((item) => (
+          !item.is_directory && item.path.replace(/^\/+/, '') === targetPath
+        ));
+        if (
+          requestId !== assistantFileOpenRequestIdRef.current
+          || sessionIdRef.current !== ownerSessionId
+        ) return;
+        if (!currentFile) {
+          showCapturedFallback('当前会话文件已删除，正在显示生成时版本。');
+          return;
+        }
+        filePanelTargetNonceRef.current += 1;
+        setFilePanelTarget({
+          ...sessionFilesOwner,
+          file: {
+            ...currentFile,
+            source: 'session',
+            session_id: targetSessionId,
+            content_mode: 'current',
+            assistant_ref_id: normalizedFile.assistant_ref_id,
+            snapshot_path: normalizedFile.snapshot_path,
+          },
+          nonce: filePanelTargetNonceRef.current,
+        });
+        setPreviewContextNotice('');
+        openFilesPanel();
+      } catch {
+        showCapturedFallback('当前会话文件无法读取，正在显示生成时版本。');
+      }
+      return;
+    }
+
+    const targetPath = normalizedFile.path.replace(/^\/+/, '');
+    setPreviewContextNotice('');
     filePanelTargetNonceRef.current += 1;
     setFilePanelTarget({
       ...sessionFilesOwner,
@@ -1008,10 +1208,23 @@ function ChatV2View(props: ChatV2Props) {
 
   const handleSelectFile = (file: FileInfo, _newInput: string) => {
     updateMessageDraft(currentDraftKey, (draft) => {
-      if (draft.attachedFiles.some((item) => item.name === file.name)) return draft;
-      const normalizedFile = file.session_id
-        ? file
-        : { ...file, session_id: sessionId || undefined };
+      const normalizedFile: ChatFile = {
+        source: 'session',
+        name: file.name,
+        path: file.path,
+        revision: file.revision,
+        size: file.size,
+        modified: file.modified,
+        type: file.type,
+        is_directory: file.is_directory,
+        data_url: file.data_url,
+        session_id: file.session_id || sessionId || undefined,
+      };
+      if (draft.attachedFiles.some((item) => (
+        item.source !== 'workspace'
+        && item.path === normalizedFile.path
+        && item.session_id === normalizedFile.session_id
+      ))) return draft;
       return {
         ...draft,
         revision: draft.revision + 1,
@@ -1034,6 +1247,39 @@ function ChatV2View(props: ChatV2Props) {
             revision: current.revision + 1,
           },
         },
+      };
+    });
+  };
+
+  const handleWorkspaceFilesSelected = (entries: WorkspaceEntry[]) => {
+    updateMessageDraft(currentDraftKey, (draft) => {
+      const existingEntryIds = new Set(
+        draft.attachedFiles
+          .filter((file) => file.source === 'workspace')
+          .map((file) => file.entry_id),
+      );
+      const additions: ChatFile[] = entries
+        .filter((entry) => !existingEntryIds.has(entry.entry_id))
+        .map((entry) => ({
+          source: 'workspace',
+          entry_id: entry.entry_id,
+          revision: entry.revision,
+          tree_revision: entry.tree_revision,
+          workspace_path: entry.path,
+          path: entry.path,
+          name: entry.name,
+          size: entry.size_bytes,
+          modified: entry.updated_at,
+          type: entry.kind === 'directory'
+            ? 'inode/directory'
+            : entry.mime_type || entry.name.split('.').pop()?.toLowerCase() || 'file',
+          is_directory: entry.kind === 'directory',
+        }));
+      if (additions.length === 0) return draft;
+      return {
+        ...draft,
+        revision: draft.revision + 1,
+        attachedFiles: [...draft.attachedFiles, ...additions],
       };
     });
   };
@@ -1089,45 +1335,106 @@ function ChatV2View(props: ChatV2Props) {
     const clearedMessageRevision = messageSnapshot.revision + 1;
     const clearedPreferenceRevision = preferenceSnapshot.revision + 1;
     let restoreDraftKey = initialSessionKey;
+    let submissionRestored = false;
     const restoreSubmissionSnapshot = () => {
-      setComposerDrafts((previous) => {
+      if (submissionRestored) return;
+      submissionRestored = true;
+      commitComposerDrafts((previous) => {
         const current = previous.messageDrafts[restoreDraftKey];
-        if (!current || current.draftId !== messageSnapshot.draftId) return previous;
-        const nextMessageDrafts = { ...previous.messageDrafts };
         if (
-          current.revision === clearedMessageRevision
-        ) {
-          nextMessageDrafts[restoreDraftKey] = {
-            ...messageSnapshot,
-            revision: current.revision + 1,
-            attachedFiles: [...messageSnapshot.attachedFiles],
-          };
-        }
+          current
+          && current.draftId !== messageSnapshot.draftId
+          && !isPristineMessageDraft(current)
+        ) return previous;
+        const preferenceRevision = previous.preferenceDrafts[restoreDraftKey]?.revision
+          ?? clearedPreferenceRevision;
         return {
-          messageDrafts: nextMessageDrafts,
-          preferenceDrafts: restoreFailedTurnPreferenceDraft(
-            previous.preferenceDrafts,
-            restoreDraftKey,
-            preferenceSnapshot,
-            clearedPreferenceRevision,
-          ),
-          reasoningDrafts: previous.reasoningDrafts,
+          messageDrafts: {
+            ...previous.messageDrafts,
+            [restoreDraftKey]: {
+              ...messageSnapshot,
+              revision: Math.max(
+                current?.revision ?? clearedMessageRevision,
+                clearedMessageRevision,
+              ) + 1,
+              attachedFiles: [...messageSnapshot.attachedFiles],
+            },
+          },
+          preferenceDrafts: {
+            ...previous.preferenceDrafts,
+            [restoreDraftKey]: {
+              ...preferenceSnapshot,
+              skillKeys: [...preferenceSnapshot.skillKeys],
+              mcpConnections: preferenceSnapshot.mcpConnections.map(
+                (connection) => ({ ...connection }),
+              ),
+              revision: preferenceRevision + 1,
+            },
+          },
+          reasoningDrafts: reasoningSnapshot
+            ? {
+              ...previous.reasoningDrafts,
+              [restoreDraftKey]: {
+                modelId: selectedModelId,
+                selection: reasoningSnapshot,
+              },
+            }
+            : previous.reasoningDrafts,
         };
       });
     };
-    let contentBlocks: ChatContentBlock[] = [];
-    try {
-      contentBlocks = buildContentBlocks(draftInput, draftAttachments);
-    } catch (err: any) {
-      setLocalError(err?.message || '消息构建失败');
-      return;
-    }
     pendingSendSessionKeysRef.current.add(initialSessionKey);
     let targetSessionKey = initialSessionKey;
     try {
+      const attachedWorkspaceEntryIds = Array.from(new Set(
+        draftAttachments.flatMap((file) => (
+          file.source === 'workspace' && file.entry_id ? [file.entry_id] : []
+        )),
+      ));
+      if (attachedWorkspaceEntryIds.length > 0) {
+        setSyncingAttachmentDraftId(capturedDraftId);
+        const saveResult = await workspaceFilesHandleRef.current?.saveEntries(
+          attachedWorkspaceEntryIds,
+        );
+        if (saveResult && !saveResult.ok) {
+          setLocalError('附件尚未同步完成，请确认文件保存成功后重试');
+          return;
+        }
+        try {
+          await Promise.all(attachedWorkspaceEntryIds.map(async (entryId) => {
+            if (await getWorkspaceDraft(entryId)) {
+              await flushWorkspaceDraft(workspaceDraftKey(entryId));
+            }
+          }));
+        } catch {
+          setLocalError('附件尚未同步完成，请确认文件保存成功后重试');
+          return;
+        }
+      }
+
+      let contentBlocks: ChatContentBlock[] = [];
+      try {
+        contentBlocks = buildContentBlocks(draftInput, draftAttachments);
+      } catch (err: any) {
+        setLocalError(err?.message || '消息构建失败');
+        return;
+      }
+
+      const pendingFileDrafts = captureDirtyEditorsBeforeAgentStart();
+      const attachedWorkspacePaths = new Set(
+        draftAttachments.flatMap((file) => (
+          file.source === 'workspace' && file.workspace_path ? [file.workspace_path] : []
+        )),
+      );
+      if (pendingFileDrafts.some((item) => (
+        item.source === 'workspace' && attachedWorkspacePaths.has(item.path)
+      ))) {
+        setLocalError('附件在同步期间又发生了修改，请保存完成后重试');
+        return;
+      }
       const userMessage = buildDisplayMessage(draftInput, draftAttachments);
       const isStartingNewSession = !sessionId;
-      setComposerDrafts((previous) => {
+      commitComposerDrafts((previous) => {
         const current = previous.messageDrafts[initialSessionKey];
         if (!current || current.draftId !== messageSnapshot.draftId) return previous;
         return {
@@ -1194,10 +1501,12 @@ function ChatV2View(props: ChatV2Props) {
         preferredSkillKeys: preferenceSnapshot.skillKeys,
         preferredMcpConnections: preferenceSnapshot.mcpConnections,
         reasoning: reasoningSnapshot || undefined,
+        pendingFileDrafts,
         onRejectedBeforeAccept: restoreSubmissionSnapshot,
       });
       await sendPromise;
     } finally {
+      setSyncingAttachmentDraftId((current) => current === capturedDraftId ? null : current);
       pendingSendSessionKeysRef.current.delete(initialSessionKey);
       pendingSendSessionKeysRef.current.delete(targetSessionKey);
     }
@@ -1214,13 +1523,22 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleResumeSubmit = async (answers: Record<string, string>) => {
-    if (!sessionId || !pendingInterrupt?.id) return;
-    await runtime.resumeRun(sessionId, pendingInterrupt, answers);
+    if (!sessionId || !pendingInterrupt?.id || resumeSaveBarrierPendingRef.current) return;
+    resumeSaveBarrierPendingRef.current = true;
+    try {
+      const pendingFileDrafts = captureDirtyEditorsBeforeAgentStart();
+      await runtime.resumeRun(sessionId, pendingInterrupt, answers, pendingFileDrafts);
+    } finally {
+      resumeSaveBarrierPendingRef.current = false;
+    }
   };
 
-  const inputDisabled = sending || creatingCurrentDraft || resuming || waitingInteraction;
+  const syncingCurrentAttachments = syncingAttachmentDraftId === currentDraftId;
+  const inputDisabled = sending || creatingCurrentDraft || syncingCurrentAttachments || resuming || waitingInteraction;
   const sendingLabel = creatingCurrentDraft
     ? '创建中'
+    : syncingCurrentAttachments
+      ? '同步附件'
     : resuming
       ? 'Resuming'
       : sending
@@ -1263,11 +1581,11 @@ function ChatV2View(props: ChatV2Props) {
           <div className="ml-auto flex items-center gap-1">
             {sessionId && (
               <SessionFilesButton
-                open={isFilesOpen}
-                onToggle={openFilesPanel}
+                open={!workspacePanelActive && isFilesOpen}
+                onToggle={() => void openFilesPanel()}
               />
             )}
-            {sessionId && !isFilesExpanded && !isMobileFilesViewport && (
+            {(sessionId || workspacePanelActive) && !isFilesExpanded && (
               <ChatPaneButton
                 filesOpen={isFilesOpen}
                 onToggle={toggleChatPane}
@@ -1311,31 +1629,41 @@ function ChatV2View(props: ChatV2Props) {
             </div>
           ) : (
             <div data-testid="chat-message-column" className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6 md:px-8">
-              {rounds.map((round, index) => (
-                <div
-                  key={round.round_id}
-                  ref={(el) => {
-                    roundElementRefs.current[round.round_id] = el;
-                  }}
-                  data-round-id={round.round_id}
-                  className={`scroll-mt-20 rounded-2xl transition-colors duration-300 ${
-                    highlightedRoundId === round.round_id
-                      ? 'bg-claude-accent/10 ring-2 ring-claude-accent/30 px-3 py-3 -mx-3'
-                      : ''
-                  }`}
-                >
-                  <Round
-                    round={round}
-                    userAttachments={round.user_attachments || []}
-                    sessionId={sessionId}
-                    assistantFileMatches={assistantFileMatches}
-                    onPreviewAttachment={handlePreviewAttachment}
-                    onOpenFileInPanel={handleOpenAssistantFile}
-                    isStreaming={(sending || resuming) && index === rounds.length - 1}
-                    disableMotion={disableInitialMotion}
-                  />
-                </div>
-              ))}
+              {rounds.map((round, index) => {
+                const visibleUserAttachments = (round.user_attachments || []).filter((file) => (
+                  file.source !== 'workspace' || !isWorkspaceEntryDeleted(file.entry_id)
+                ));
+                const visibleAssistantFileReferences = (round.assistant_file_references || []).filter((file) => (
+                  file.source !== 'workspace' || !isWorkspaceEntryDeleted(file.entry_id)
+                ));
+                const visibleRound = visibleAssistantFileReferences.length === (round.assistant_file_references || []).length
+                  ? round
+                  : { ...round, assistant_file_references: visibleAssistantFileReferences };
+                return (
+                  <div
+                    key={round.round_id}
+                    ref={(el) => {
+                      roundElementRefs.current[round.round_id] = el;
+                    }}
+                    data-round-id={round.round_id}
+                    className={`scroll-mt-20 rounded-2xl transition-colors duration-300 ${
+                      highlightedRoundId === round.round_id
+                        ? 'bg-claude-accent/10 ring-2 ring-claude-accent/30 px-3 py-3 -mx-3'
+                        : ''
+                    }`}
+                  >
+                    <Round
+                      round={visibleRound}
+                      userAttachments={visibleUserAttachments}
+                      sessionId={sessionId}
+                      onPreviewAttachment={handlePreviewHistoryAttachment}
+                      onOpenFileInPanel={handleOpenAssistantFile}
+                      isStreaming={(sending || resuming) && index === rounds.length - 1}
+                      disableMotion={disableInitialMotion}
+                    />
+                  </div>
+                );
+              })}
               <div ref={messagesEndRef} />
             </div>
           )}
@@ -1427,8 +1755,9 @@ function ChatV2View(props: ChatV2Props) {
             attachedFiles={attachedFiles}
             onRemoveAttachment={handleRemoveAttachment}
             onFileUpload={handleFileUpload}
+            onWorkspaceFilesSelected={handleWorkspaceFilesSelected}
             onInputDropHandled={() => setIsDragging(false)}
-            onPreviewAttachment={sessionId ? handlePreviewAttachment : undefined}
+            onPreviewAttachment={handlePreviewDraftAttachment}
             uploading={uploadingCurrentDraft}
             onInputChangeRaw={handleInputChange}
             onFileSelected={handleSelectFile}
@@ -1471,7 +1800,7 @@ function ChatV2View(props: ChatV2Props) {
           />
       </div>
 
-      {sessionId && !isMobileFilesViewport && (
+      {(sessionId || workspacePanelActive) && (
         <SessionFilesSplitter
           containerRef={sessionFilesShellRef}
           chatRatio={filesLayout === 'full' ? 0 : filesLayout === 'closed' ? 100 : chatRatio}
@@ -1484,92 +1813,43 @@ function ChatV2View(props: ChatV2Props) {
         ref={sessionFilesPaneRef}
         className="session-files-pane min-h-0 bg-white"
         data-testid="session-files-pane"
-        aria-label="会话文件"
+        aria-label={workspacePanelActive ? '工作区文件' : '会话文件'}
         aria-hidden={!isFilesOpen}
       >
-        <ArtifactsPanel
-          ref={sessionFilesHandleRef}
-          sessionId={sessionId}
-          ownerEpoch={sessionFilesOwner.ownerEpoch}
-          isOpen={isFilesOpen}
-          onClose={closeFilesPanel}
-          targetFile={ownedFilePanelTarget?.file || null}
-          targetFileNonce={ownedFilePanelTarget?.nonce}
-          refreshNonce={filesRefreshNonce}
-          variant="workspace"
-          isExpanded={isFilesExpanded}
-          onToggleExpanded={() => {
-            setCurrentFilesLayout(isFilesExpanded ? 'split' : 'full');
-          }}
-        />
+        {workspacePanelActive ? (
+          <WorkspaceFilesPanel
+            ref={setWorkspaceFilesHandle}
+            target={workspaceFileTarget}
+            onActivateEntry={onWorkspaceTabSelect}
+            resolvingTarget={workspaceTargetResolving}
+            isOpen={isFilesOpen}
+            onClose={() => {
+              setPreviewContextNotice('');
+              closeFilesPanel();
+            }}
+            isExpanded={isFilesExpanded}
+            showExpandToggle
+            onToggleExpanded={() => setCurrentFilesLayout(isFilesExpanded ? 'split' : 'full')}
+          />
+        ) : (
+          <ArtifactsPanel
+            ref={setSessionFilesHandle}
+            sessionId={sessionId}
+            ownerEpoch={sessionFilesOwner.ownerEpoch}
+            isOpen={isFilesOpen}
+            onClose={closeFilesPanel}
+            targetFile={ownedFilePanelTarget?.file || null}
+            targetFileNonce={ownedFilePanelTarget?.nonce}
+            targetContextNotice={previewContextNotice}
+            refreshNonce={filesRefreshNonce}
+            variant="workspace"
+            isExpanded={isFilesExpanded}
+            onToggleExpanded={() => {
+              setCurrentFilesLayout(isFilesExpanded ? 'split' : 'full');
+            }}
+          />
+        )}
       </aside>
-
-      {previewFile && previewSessionId && (
-        <FilePreview
-          sessionId={previewSessionId}
-          file={previewFile}
-          readOnly
-          onClose={() => {
-            setPreviewFile(null);
-            setPreviewSessionId('');
-          }}
-        />
-      )}
     </div>
   );
-}
-
-function normalizeAssistantTargetPath(path: string): string {
-  return path.replace(/^\/+/, '');
-}
-
-function getAssistantTargetParentPath(path: string): string {
-  const normalizedPath = normalizeAssistantTargetPath(path);
-  return normalizedPath.includes('/')
-    ? normalizedPath.substring(0, normalizedPath.lastIndexOf('/'))
-    : '';
-}
-
-function collectAssistantFileCandidates(rounds: RoundData[], sessionId: string): FileInfo[] {
-  const byPath = new Map<string, FileInfo>();
-  for (const round of rounds) {
-    const assistantContent = getRoundAssistantContent(round);
-    if (!assistantContent) continue;
-    for (const file of extractAssistantFiles(assistantContent, sessionId)) {
-      if (!byPath.has(file.path)) byPath.set(file.path, file);
-    }
-  }
-  return Array.from(byPath.values());
-}
-
-function getRoundAssistantContent(round: RoundData): string {
-  if (round.final_response) return round.final_response;
-  return [...round.steps].reverse().find((step) => step.assistant_content)?.assistant_content || '';
-}
-
-function buildAssistantFileMatchUpdates(
-  candidates: FileInfo[],
-  listedFiles: FileInfo[],
-  sessionId: string,
-): Record<string, FileInfo | null> {
-  const listedByPath = new Map(
-    listedFiles
-      .filter((file) => !file.is_directory)
-      .map((file) => [normalizeAssistantTargetPath(file.path), file]),
-  );
-
-  return Object.fromEntries(candidates.map((candidate) => {
-    const targetPath = normalizeAssistantTargetPath(candidate.path);
-    const matched = listedByPath.get(targetPath);
-    return [
-      candidate.path,
-      matched
-        ? {
-            ...matched,
-            path: targetPath,
-            session_id: sessionId,
-          }
-        : null,
-    ];
-  }));
 }

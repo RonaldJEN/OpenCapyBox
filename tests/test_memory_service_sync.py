@@ -49,6 +49,8 @@ def test_agents_template_routes_connected_data_before_web_search():
     assert "`search` / `batch_search`" in content[web_fallback:]
 
 
+
+
 def test_agents_template_does_not_request_proactive_memory_writes():
     from src.api.services.memory_service import MemoryService
 

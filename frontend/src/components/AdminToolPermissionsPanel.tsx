@@ -231,7 +231,6 @@ export default function AdminToolPermissionsPanel({ refreshToken = 0 }: AdminToo
         <FeedbackMessage
           className="admin-toast"
           tone="success"
-          autoDismissMs={4000}
           icon={<CheckCircle2 size={14} />}
           onDismiss={() => setMessage('')}
         >

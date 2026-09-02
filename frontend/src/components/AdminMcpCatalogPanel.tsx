@@ -551,7 +551,6 @@ export default function AdminMcpCatalogPanel({
         <FeedbackMessage
           className="admin-toast"
           tone="success"
-          autoDismissMs={4000}
           icon={<CheckCircle2 size={14} />}
           onDismiss={() => setMessage('')}
         >

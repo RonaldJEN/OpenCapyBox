@@ -116,6 +116,20 @@ describe('APIService', () => {
 
       expect(client.get).toHaveBeenCalledWith('/sessions/list', {
         params: { q: '搜索词' },
+        timeout: 8000,
+      });
+    });
+
+    it('getSessions 使用导航级短超时，不能继承 Agent 请求的 60 秒超时', async () => {
+      const axiosModule = await import('axios');
+      const client = vi.mocked(axiosModule.default.create).mock.results[0].value as any;
+      client.get.mockResolvedValue({ data: { sessions: [] } });
+
+      await apiService.getSessions();
+
+      expect(client.get).toHaveBeenCalledWith('/sessions/list', {
+        params: undefined,
+        timeout: 8000,
       });
     });
 
@@ -776,6 +790,7 @@ describe('APIService', () => {
           path: 'reports/model.xlsx',
           size: 2048,
           modified: '2026-08-26T06:20:00+00:00',
+          revision: 'v1:2048:1787725200000000000',
         },
         new Uint8Array([0x50, 0x4b, 0x03, 0x04]).buffer,
       );
@@ -788,8 +803,59 @@ describe('APIService', () => {
       const request = fetchMock.mock.calls[0][1];
       expect(JSON.parse(request.body)).toEqual({
         content_base64: 'UEsDBA==',
+        expected_revision: 'v1:2048:1787725200000000000',
         expected_size: 2048,
         expected_modified: '2026-08-26T06:20:00+00:00',
+      });
+    });
+
+    it('updateSessionMarkdown 携带 opaque expected_revision', async () => {
+      const updated = {
+        name: 'report.md', path: 'report.md', size: 12, modified: 'later',
+        revision: 'v1:12:200', type: 'md', is_directory: false,
+      };
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(updated),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await apiService.updateSessionMarkdown('session-1', {
+        path: 'report.md', size: 8, modified: 'before', revision: 'v1:8:100',
+      }, '# new');
+
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+        content: '# new',
+        expected_revision: 'v1:8:100',
+        expected_size: 8,
+        expected_modified: 'before',
+      });
+    });
+
+    it('Session revision conflict 保留错误码与权威 current metadata', async () => {
+      const current = {
+        name: 'report.md', path: 'report.md', size: 15, modified: 'current',
+        revision: 'v1:15:300', type: 'md', is_directory: false,
+      };
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        text: vi.fn().mockResolvedValue(JSON.stringify({
+          detail: {
+            code: 'SESSION_FILE_REVISION_CONFLICT',
+            message: 'revision conflict',
+            current,
+            current_revision: current.revision,
+          },
+        })),
+      }));
+
+      await expect(apiService.updateSessionMarkdown('session-1', {
+        path: 'report.md', size: 8, modified: 'before', revision: 'v1:8:100',
+      }, '# stale')).rejects.toMatchObject({
+        status: 409,
+        code: 'SESSION_FILE_REVISION_CONFLICT',
+        detail: expect.objectContaining({ current }),
       });
     });
 

@@ -587,7 +587,152 @@ class _MarkerTool(MockTool):
         return ToolResult(success=True, content=self.marker)
 
 
+class _WorkspaceMutationTool(_MarkerTool):
+    async def execute(self, **kwargs) -> ToolResult:
+        self.execute_count += 1
+        self.last_args = kwargs
+        return ToolResult(
+            success=True,
+            content="UPDATED 工作区/报告.md",
+            resource_changes=[{
+                "entry_id": "entry-1",
+                "operation": "UPDATED",
+                "path": "报告.md",
+                "revision": "2:abc",
+            }],
+        )
+
+
+class _SessionArtifactTool(_MarkerTool):
+    async def execute(self, **kwargs) -> ToolResult:
+        self.execute_count += 1
+        self.last_args = kwargs
+        return ToolResult(
+            success=True,
+            content="CREATED /session/report.md",
+            assistant_file_references=[{
+                "source": "session",
+                "name": "report.md",
+                "path": "report.md",
+                "size": 42,
+                "modified": "2026-08-28T10:00:00Z",
+                "type": "md",
+                "revision": "v1:42:100",
+                "operation": "CREATED",
+            }],
+        )
+
+
 class TestCurrentTurnToolContinuity:
+    @pytest.mark.asyncio
+    async def test_session_artifact_emits_structured_reference_event(self, tmp_path):
+        tool = _SessionArtifactTool(name="write_file")
+
+        class ArtifactLLM:
+            def __init__(self):
+                self.calls = 0
+                self.last_request_snapshot = None
+
+            async def generate_stream(self, messages, tools, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMResponse(
+                        content="",
+                        finish_reason="tool_calls",
+                        tool_calls=[ToolCall(
+                            id="write-1",
+                            type="function",
+                            function=FunctionCall(
+                                name=tool.name,
+                                arguments={"param1": "report.md"},
+                            ),
+                        )],
+                    )
+                return LLMResponse(content="done", finish_reason="stop")
+
+        agent = Agent(
+            llm_client=ArtifactLLM(),
+            system_prompt="test",
+            tools=[tool],
+            workspace_dir=str(tmp_path / "ws"),
+            max_steps=5,
+        )
+        agent.messages.append(Message(role="user", content="生成报告"))
+
+        events = [event async for event in agent.run_agui("session-1", "round-1")]
+        references = [
+            event.value
+            for event in events
+            if event.type.value == "CUSTOM"
+            and getattr(event, "name", "") == "assistant_file_referenced"
+        ]
+
+        assert references == [{
+            "source": "session",
+            "name": "report.md",
+            "path": "report.md",
+            "size": 42,
+            "modified": "2026-08-28T10:00:00Z",
+            "type": "md",
+            "revision": "v1:42:100",
+            "operation": "CREATED",
+            "toolCallId": "write-1",
+            "round_id": "round-1",
+            "session_id": "session-1",
+        }]
+
+    @pytest.mark.asyncio
+    async def test_workspace_mutation_emits_structured_custom_event(self, tmp_path):
+        tool = _WorkspaceMutationTool(name="workspace_publish")
+
+        class WorkspaceLLM:
+            def __init__(self):
+                self.calls = 0
+                self.last_request_snapshot = None
+
+            async def generate_stream(self, messages, tools, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMResponse(
+                        content="",
+                        finish_reason="tool_calls",
+                        tool_calls=[ToolCall(
+                            id="publish-1",
+                            type="function",
+                            function=FunctionCall(
+                                name=tool.name,
+                                arguments={"param1": "报告.md"},
+                            ),
+                        )],
+                    )
+                return LLMResponse(content="done", finish_reason="stop")
+
+        agent = Agent(
+            llm_client=WorkspaceLLM(),
+            system_prompt="test",
+            tools=[tool],
+            workspace_dir=str(tmp_path / "ws"),
+            max_steps=5,
+        )
+        agent.messages.append(Message(role="user", content="保存报告"))
+
+        events = [event async for event in agent.run_agui("thread", "run")]
+        resources = [
+            event
+            for event in events
+            if event.type.value == "CUSTOM"
+            and getattr(event, "name", "") == "workspace_resource_changed"
+        ]
+
+        assert len(resources) == 1
+        assert resources[0].value == {
+            "entry_id": "entry-1",
+            "operation": "UPDATED",
+            "path": "报告.md",
+            "revision": "2:abc",
+            "toolCallId": "publish-1",
+        }
+
     @pytest.mark.asyncio
     async def test_successful_tool_result_is_visible_to_next_provider_request(self, tmp_path):
         tool = _MarkerTool(marker="WRITE_OK:/workspace/valuation.md")

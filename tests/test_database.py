@@ -224,6 +224,83 @@ class TestDatabaseMigration:
         finally:
             sqlite_engine.dispose()
 
+    def test_legacy_cron_schema_migrates_to_durable_queue_and_lease_columns(self):
+        from sqlalchemy import create_engine, inspect, text
+
+        from src.api.models import database as database_module
+
+        sqlite_engine = create_engine("sqlite://")
+        try:
+            with sqlite_engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE TABLE cron_jobs ("
+                    "id INTEGER PRIMARY KEY, user_id VARCHAR(100), name VARCHAR(100), "
+                    "cron_expr VARCHAR(50), description TEXT, enabled BOOLEAN, "
+                    "rule_version INTEGER, workspace_access VARCHAR(20) NOT NULL DEFAULT 'none', "
+                    "created_at DATETIME, updated_at DATETIME)"
+                ))
+                conn.execute(text(
+                    "CREATE TABLE cron_fires ("
+                    "id VARCHAR(36) PRIMARY KEY, job_id INTEGER, scheduled_at DATETIME, "
+                    "rule_version INTEGER, created_at DATETIME)"
+                ))
+                conn.execute(text(
+                    "CREATE TABLE cron_job_runs ("
+                    "id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(100), job_name VARCHAR(100), "
+                    "cron_expr VARCHAR(50), started_at DATETIME, completed_at DATETIME, "
+                    "status VARCHAR(20), output TEXT, "
+                    "workspace_access VARCHAR(20) NOT NULL DEFAULT 'none')"
+                ))
+                conn.execute(text(
+                    "INSERT INTO cron_job_runs "
+                    "(id,user_id,job_name,cron_expr,started_at,status) VALUES "
+                    "('legacy-success','u1','daily','0 9 * * *',CURRENT_TIMESTAMP,'success'),"
+                    "('legacy-running','u1','daily','0 9 * * *',CURRENT_TIMESTAMP,'running')"
+                ))
+
+            database_module._migrate_add_columns(sqlite_engine)
+            inspector = inspect(sqlite_engine)
+            run_columns = {col["name"] for col in inspector.get_columns("cron_job_runs")}
+            job_columns = {col["name"] for col in inspector.get_columns("cron_jobs")}
+            assert {
+                "job_id",
+                "fire_id",
+                "definition_version",
+                "definition_snapshot",
+                "queued_at",
+                "phase",
+                "claim_token",
+                "claim_worker_id",
+                "claim_lease_expires_at",
+                "heartbeat_at",
+                "sandbox_id",
+                "attempt_count",
+                "error_code",
+                "workspace_changes",
+            } <= run_columns
+            assert "workspace_access" not in run_columns
+            assert "workspace_access" not in job_columns
+            assert {"definition_version"} <= job_columns
+            assert {"definition_version", "run_id"} <= {
+                col["name"] for col in inspector.get_columns("cron_fires")
+            }
+            with sqlite_engine.connect() as conn:
+                rows = {
+                    row[0]: (row[1], row[2], row[3])
+                    for row in conn.execute(text(
+                        "SELECT id, status, phase, queued_at FROM cron_job_runs"
+                    ))
+            }
+            assert rows["legacy-success"][0] == "success"
+            assert rows["legacy-running"][0] == "running"
+            assert rows["legacy-running"][1] == "queued"
+            assert any(
+                index.get("unique") and index.get("column_names") == ["run_id"]
+                for index in inspector.get_indexes("cron_fires")
+            )
+        finally:
+            sqlite_engine.dispose()
+
     def test_fresh_agent_interaction_schema_has_started_boundary(self):
         from sqlalchemy import create_engine, inspect
 
@@ -494,6 +571,56 @@ class TestDatabaseMigration:
             ensure_default_sandbox_profile(db)
             db.close()
 
+    def test_existing_default_profile_releases_bootstrap_transaction_lock(self):
+        from src.api.services import sandbox_profile_service as service
+
+        db = MagicMock()
+        profile = MagicMock()
+        with patch.object(service, "_lock_default_profile_bootstrap"), patch.object(
+            service,
+            "_normalize_default_sandbox_profiles",
+            return_value=profile,
+        ):
+            resolved = service.ensure_default_sandbox_profile(db)
+
+        assert resolved is profile
+        db.commit.assert_called_once_with()
+        db.refresh.assert_called_once_with(profile)
+
+    def test_runtime_resolution_reads_existing_default_without_bootstrap_lock(self):
+        from types import SimpleNamespace
+
+        from src.api.services import sandbox_profile_service as service
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        profile = SimpleNamespace(
+            id="profile-default",
+            name="默认沙箱",
+            version=3,
+            domain="127.0.0.1:8080",
+            protocol="http",
+            api_key="test-key",
+            use_server_proxy=False,
+            enabled=True,
+        )
+        with patch.object(
+            service,
+            "get_existing_default_sandbox_profile",
+            return_value=profile,
+        ), patch.object(
+            service,
+            "ensure_default_sandbox_profile",
+            side_effect=AssertionError("request read path must not take bootstrap lock"),
+        ), patch(
+            "src.api.config.get_settings",
+            return_value=SimpleNamespace(sandbox_storage_mount_path="/home/user"),
+        ):
+            runtime = service.resolve_sandbox_runtime_config(db, "user-1")
+
+        assert runtime.profile_id == "profile-default"
+        assert runtime.profile_version == 3
+
     def test_sync_postgres_sequence_handles_uncalled_sequence_at_max_id(self):
         from src.api.models import database as database_module
 
@@ -590,7 +717,15 @@ class TestMemoryEmbeddingColumnType:
         column_type.scalar.return_value = "vector(2048)"
 
         conn = MagicMock()
-        conn.execute.side_effect = [extension_available, MagicMock(), column_type, MagicMock()]
+        conn.execute.side_effect = [
+            MagicMock(),  # add conversation_round_id
+            MagicMock(),  # create round index
+            MagicMock(),  # add round foreign key
+            extension_available,
+            MagicMock(),  # create pgvector extension
+            column_type,
+            MagicMock(),  # resize vector column
+        ]
 
         context = MagicMock()
         context.__enter__.return_value = conn
@@ -604,7 +739,10 @@ class TestMemoryEmbeddingColumnType:
             database_module._migrate_add_columns()
 
         executed_sql = [str(call.args[0]) for call in conn.execute.call_args_list]
-        alter_sql = next(sql for sql in executed_sql if "ALTER TABLE memory_embeddings" in sql)
+        alter_sql = next(
+            sql for sql in executed_sql
+            if "ALTER COLUMN embedding" in sql
+        )
         assert f"ALTER COLUMN embedding TYPE vector({MEMORY_EMBEDDING_DIMENSIONS})" in alter_sql
         assert "embedding::text" in alter_sql
 
@@ -620,3 +758,67 @@ class TestMemoryEmbeddingColumnType:
 
         with pytest.raises(RuntimeError, match="pgvector"):
             database_module._ensure_postgres_vector_extension(conn)
+
+
+class TestWorkspaceSchemaRegistration:
+
+
+    def test_workspace_claim_allows_history_but_only_one_active_scope(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.exc import IntegrityError
+        from sqlalchemy.orm import sessionmaker
+
+        from src.api.models.workspace import WorkspaceClaim
+        from src.api.utils.timezone import now_naive
+
+        engine = create_engine("sqlite://")
+        WorkspaceClaim.__table__.create(engine)
+        db = sessionmaker(bind=engine)()
+        try:
+            common = {
+                "user_id": "user-1",
+                "scope_kind": "file",
+                "scope_key": "file:entry-1",
+                "entry_id": "entry-1",
+                "mutation_id": None,
+                "operation": "write_content",
+                "lease_expires_at": now_naive(),
+                "heartbeat_at": now_naive(),
+            }
+            db.add_all([
+                WorkspaceClaim(
+                    claim_id="released-1",
+                    owner_token="owner-a",
+                    generation=1,
+                    state="released",
+                    **common,
+                ),
+                WorkspaceClaim(
+                    claim_id="released-2",
+                    owner_token="owner-b",
+                    generation=2,
+                    state="released",
+                    **common,
+                ),
+                WorkspaceClaim(
+                    claim_id="active-1",
+                    owner_token="owner-c",
+                    generation=3,
+                    state="active",
+                    **common,
+                ),
+            ])
+            db.commit()
+            db.add(WorkspaceClaim(
+                claim_id="active-2",
+                owner_token="owner-d",
+                generation=4,
+                state="active",
+                **common,
+            ))
+            with pytest.raises(IntegrityError):
+                db.commit()
+        finally:
+            db.rollback()
+            db.close()
+            engine.dispose()

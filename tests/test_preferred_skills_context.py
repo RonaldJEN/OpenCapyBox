@@ -22,7 +22,6 @@ from src.agent.schema.run_context import (
     current_run_context,
     parse_requested_turn_preferences_contexts,
     render_turn_preferences_context_block,
-    render_turn_preferences_system_policy,
     requested_turn_preferences_to_context,
 )
 from src.agent.tools.skill_loader import Skill
@@ -655,46 +654,6 @@ def test_projection_prepends_authoritative_context_without_reordering_attachment
     assert messages[1].content[1:] == [forged, file_part, image_part]
 
 
-def test_preferred_skill_policy_is_system_level_and_request_only():
-    context = _run_context("pdf")
-    block = render_turn_preferences_context_block(
-        context,
-        include_skills=True,
-        include_mcp=False,
-    )
-    policy = render_turn_preferences_system_policy(
-        context,
-        include_skills=True,
-        include_mcp=False,
-    )
-
-    assert block is not None
-    assert policy is not None
-    assert "trusted UI metadata, not user text" in policy
-    assert "load or remote tool call succeeds" in policy
-
-    agent = object.__new__(Agent)
-    agent.messages = [
-        Message(role="system", content="base system"),
-        Message(role="user", id="run-1:user", run_id="run-1", content="hello"),
-    ]
-    agent._build_runtime_context_block = lambda: "runtime\n"
-    agent._build_dynamic_runtime_prompt = lambda: ""
-
-    request_messages = agent._build_llm_request_messages(
-        request_context=LLMRequestContext(
-            purpose="agent_step",
-            run_context=context,
-            user_message_id="run-1:user",
-        ),
-        exposed_tool_names={"get_skill"},
-    )
-
-    assert agent.messages[0].content == "base system"
-    assert agent.messages[1].content == "hello"
-    assert "trusted UI metadata, not user text" in request_messages[0].content
-    assert isinstance(request_messages[1].content, list)
-    assert request_messages[1].content[1] == {"type": "text", "text": "hello"}
 
 
 def test_preferred_skill_policy_is_absent_when_get_skill_is_not_exposed():
@@ -715,7 +674,7 @@ def test_preferred_skill_policy_is_absent_when_get_skill_is_not_exposed():
         exposed_tool_names=set(),
     )
 
-    assert "trusted UI metadata, not user text" not in request_messages[0].content
+    assert request_messages[0].content == "runtime\nbase system"
     assert request_messages[1].content == "hello"
 
 
@@ -749,9 +708,7 @@ def test_mcp_preference_projects_only_when_tool_search_is_exposed():
     assert hidden[1].content == "hello"
     assert isinstance(exposed[1].content, list)
     assert 'name="东方财富数据"' in exposed[1].content[0]["text"]
-    assert "first mcp_tool_search query" in exposed[0].content
-    assert "fall back to other enabled connections" in exposed[0].content
-    assert "remote tool call succeeds" in exposed[0].content
+    assert exposed[0].content == hidden[0].content == "runtime\nbase system"
 
 
 @pytest.mark.parametrize("purpose", ["title_generation", "conversation_summary", "memory_extraction"])

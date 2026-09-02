@@ -63,7 +63,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 |------|------|--------|------|
 | `SANDBOX_DOMAIN` | 按需 | — | OpenSandbox 服务地址，如 `localhost:8080` |
 | `SANDBOX_API_KEY` | 是 | — | OpenSandbox API Key；生产环境必须配置 |
-| `SANDBOX_IMAGE` | 否 | `code-interpreter-agent:v1.1.0` | 沙箱容器镜像；启用 DOC/DOCX/PPT/PPTX 在线预览时必须包含 `python3`、GNU coreutils（`timeout/stat/head`）、LibreOffice/`soffice`、fontconfig 与中文字体 |
+| `SANDBOX_IMAGE` | 否 | `code-interpreter-agent:v1.1.0` | 沙箱容器镜像；Office 在线预览需要 `python3`、GNU coreutils（`timeout/stat/head`）、LibreOffice/`soffice`、fontconfig 与中文字体 |
 | `SANDBOX_PROTOCOL` | 否 | `http` | OpenSandbox 协议（http/https） |
 | `SANDBOX_USE_SERVER_PROXY` | 否 | `true` | 是否使用服务器代理模式 |
 | `SANDBOX_TIMEOUT_MINUTES` | 否 | `60` | 沙箱容器空闲超时（分钟），超时后容器被回收 |
@@ -72,10 +72,24 @@ CREATE EXTENSION IF NOT EXISTS vector;
 | `SANDBOX_PERSISTENT_STORAGE_ENABLED` | 否 | `true` | 是否启用持久化存储挂载 |
 | `SANDBOX_HOST_STORAGE_ROOT` | 否 | `/tmp/sandbox` | 宿主机持久化存储根路径 |
 | `SANDBOX_STORAGE_MOUNT_PATH` | 否 | `/home/user` | 容器内挂载路径 |
+| `WORKSPACE_QUOTA_BYTES` | 否 | `5368709120` | 单用户工作区总容量（active 文件，不含历史对象） |
+| `WORKSPACE_HISTORY_QUOTA_BYTES` | 否 | `5368709120` | 单用户内容寻址历史对象软配额；只按唯一 SHA 对象计量，超限触发回收但不阻断正式文件保存 |
+| `WORKSPACE_PREVIEW_CACHE_BYTES` | 否 | `536870912` | 单用户/Session Office PDF 派生缓存上限，超限按 LRU 回收完整缓存目录 |
+| `WORKSPACE_MAX_FILE_BYTES` | 否 | `536870912` | 工作区单文件上限，必须小于等于总配额 |
+| `WORKSPACE_MAX_ENTRIES` | 否 | `10000` | 单用户工作区条目上限 |
+| `WORKSPACE_MUTATION_LEASE_SECONDS` | 否 | `120` | prepared mutation lease；过期后启动/首次写入按文件状态与 hash 对账 |
+| `WORKSPACE_VERSION_RETENTION_COUNT` | 否 | `20` | 每个文件必须保留的最近检查点数量 |
+| `WORKSPACE_VERSION_RETENTION_DAYS` | 否 | `30` | 检查点按时间保留的天数 |
+| `WORKSPACE_DRAFT_BASE_RETENTION_DAYS` | 否 | `1` | 最近 autosave base 内容最长保留天数；过期后仍由 current/reference 保护 |
+| `WORKSPACE_DRAFT_REVISION_RETENTION_COUNT` | 否 | `5` | 每个文件额外保留的最近未 checkpoint revision 数量，避免 autosave 形成无界历史 |
+| `WORKSPACE_HISTORY_GC_INTERVAL_SECONDS` | 否 | `300` | 历史对象后台 reconciler/GC 周期 |
+| `WORKSPACE_HISTORY_GC_BATCH_SIZE` | 否 | `100` | 单轮最多处理的 version 候选数 |
 
 启动时系统会根据上述 OpenSandbox 连接环境变量创建一个默认 Sandbox Profile。之后管理员可在后台维护多个 Profile，并为用户显式分配；未分配用户继续使用默认 Profile。镜像、持久化存储根路径和容器挂载路径仍使用全局配置，不按 Profile 单独配置。
 
-Office 派生预览在**用户沙箱镜像**内执行，不使用 API 镜像中的 LibreOffice。若自定义 `SANDBOX_IMAGE` 不具备上述依赖，Markdown/HTML/图片等预览不受影响，Office 预览返回 503 并由前端降级；上线前必须用目标镜像实际转换一份中文 DOCX 与 PPTX。
+OpenSandbox execd 版本需包含上游修复 `e7f772fa`，以正确编码非 ASCII 下载文件名。
+
+Office 派生预览在**用户沙箱镜像**内执行，不使用 API 镜像中的 LibreOffice。若自定义 `SANDBOX_IMAGE` 不具备对应依赖，普通 Markdown/HTML/图片预览不受影响，Office 派生请求返回 503；上线前必须用目标镜像实际转换一份中文 DOCX 与 PPTX。
 
 ## Agent / SSE
 
@@ -84,6 +98,7 @@ Office 派生预览在**用户沙箱镜像**内执行，不使用 API 镜像中�
 | `AGENT_MAX_STEPS` | 否 | `100` | Agent 单次 run 最大步数 |
 | `AGENT_HISTORY_STRATEGY` | 否 | `checkpoint_v1` | 长程上下文策略；`checkpoint_v1` 使用累计替代 checkpoint，`legacy_120` 仅用于回滚 |
 | `AGENT_MAX_HISTORY_MESSAGES` | 否 | `120` | `legacy_120` 的历史消息注入上限（条数）；默认 `checkpoint_v1` 不使用该值裁剪 |
+| `AGENT_INIT_TIMEOUT_SECONDS` | 否 | `180` | Agent、Sandbox、Skills 与工具目录初始化的总墙钟期限；超时返回稳定错误并释放运行锁 |
 | `AGENT_TOOL_TIMEOUT` | 否 | `300` | 单次工具执行超时（秒），0 表示不限。详见下方超时体系说明 |
 | `AGENT_SUBAGENT_MAX_PARALLEL` | 否 | `3` | 同一父 Agent step 内最多并行执行的 `sub_agent` 数；`1` 表示串行 |
 | `AGENT_USER_CONCURRENCY_LIMIT` | 否 | `1` | 同一用户允许同时运行的不同会话数 |
@@ -91,6 +106,9 @@ Office 派生预览在**用户沙箱镜像**内执行，不使用 API 镜像中�
 | `TOOL_APPROVAL_EXECUTION_LEASE_SECONDS` | 否 | `120` | 审批已从 `approved` 派发为 `executing` 后的执行 lease；过期只收敛 unknown，不授权重试 |
 | `TOOL_APPROVAL_LEASE_HEARTBEAT_SECONDS` | 否 | `30` | executing 审批续租心跳间隔，必须小于执行 lease |
 | `TOOL_APPROVAL_RECONCILE_INTERVAL_SECONDS` | 否 | `30` | 过期 executing 审批对账周期 |
+| `CRON_CLAIM_LEASE_SECONDS` | 否 | `120` | Cron queued run 被 worker claim 后的执行 lease；过期后按 phase 对账 |
+| `CRON_CLAIM_HEARTBEAT_SECONDS` | 否 | `30` | Cron executing worker 续租间隔，应小于 claim lease |
+| `CRON_RECONCILE_INTERVAL_SECONDS` | 否 | `30` | 过期 Cron claim 对账及 durable queued run 恢复周期 |
 | `SSE_HEARTBEAT_INTERVAL` | 否 | `15` | SSE 心跳间隔（秒） |
 | `SSE_SUBSCRIBE_TIMEOUT` | 否 | `300` | runtime 心跳陈旧阈值（秒），用于 UserRunLock 回收与 worker_dead 判定；不是订阅最大时长 |
 | `AGUI_REPAIR_TERMINAL_SINCE_HOURS` | 否 | `24` | `scripts/repair_terminal_runs.py` 默认扫描窗口（小时） |
@@ -108,6 +126,7 @@ Office 派生预览在**用户沙箱镜像**内执行，不使用 API 镜像中�
 基础设施层
 ├── SANDBOX_TIMEOUT_MINUTES (60min)      沙箱容器空闲超时，超时后容器被回收
 ├── SANDBOX_READY_TIMEOUT_SECONDS (120s) 沙箱启动就绪等待
+├── AGENT_INIT_TIMEOUT_SECONDS (180s)    Agent/Sandbox/工具初始化总墙钟期限
 └── SANDBOX_BACKGROUND_COMMAND_TIMEOUT_SECONDS (21600s)
                                            后台 bash 命令服务端运行上限，0 表示不设置
 

@@ -314,7 +314,7 @@ describe('CronSchedule', () => {
         cron_expr: '0 9 * * *',
         started_at: '2026-04-22T09:00:00Z',
         completed_at: pollCount >= 61 ? '2026-04-22T09:03:30Z' : null,
-        status: pollCount >= 61 ? 'success' : 'running',
+        status: pollCount >= 61 ? 'success' : pollCount === 1 ? 'queued' : 'running',
         output: pollCount >= 61 ? 'ok' : null,
         is_read: false,
         artifacts: null,
@@ -346,7 +346,7 @@ describe('CronSchedule', () => {
       await Promise.resolve();
       expect(within(targetRow).getByRole('button', { name: '执行中…' })).toBeInTheDocument();
 
-      // 前 60 次轮询均为 running（对应超过 2 分钟）
+      // 首次 queued、随后 running；两者都必须保持轮询（对应超过 2 分钟）
       for (let i = 0; i < 60; i += 1) {
         await act(async () => {
           await vi.advanceTimersByTimeAsync(2000);
@@ -391,6 +391,23 @@ describe('CronSchedule', () => {
       expect(updateCronJob).toHaveBeenCalledWith('daily_report', { enabled: false });
       expect(within(targetRow).getByRole('switch', { name: '启用任务' })).toBeInTheDocument();
     });
+  });
+
+  it('日程操作错误不会自动消失，并可由用户关闭', async () => {
+    const { updateCronJob } = await import('../../services/configApi');
+    vi.mocked(updateCronJob).mockRejectedValueOnce(new Error('状态切换失败'));
+    render(<CronSchedule />);
+
+    fireEvent.click(await screen.findByText('列表'));
+    await screen.findByText(/3\s*个任务/);
+
+    const list = screen.getByTestId('schedule-list-cards');
+    const targetRow = list.querySelector('[data-task-name="daily_report"]') as HTMLElement;
+    fireEvent.click(within(targetRow).getByRole('switch', { name: '暂停任务' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('状态切换失败');
+    fireEvent.click(screen.getByRole('button', { name: '关闭提示' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('列表视图点击执行后不弹成功提示，使用行内执行中反馈', async () => {
@@ -560,6 +577,7 @@ describe('CronSchedule', () => {
 
     const contentField = screen.getByRole('textbox', { name: '任务内容' }) as HTMLTextAreaElement;
     expect(contentField.value).toBe('每天9点日报');
+    expect(screen.queryByLabelText('工作区权限')).not.toBeInTheDocument();
 
     fireEvent.change(contentField, {
       target: { value: '执行健康检查并输出结果' },
@@ -573,6 +591,10 @@ describe('CronSchedule', () => {
           description: '执行健康检查并输出结果',
           content: '执行健康检查并输出结果',
         }),
+      );
+      expect(updateCronJob).not.toHaveBeenCalledWith(
+        'daily_report',
+        expect.objectContaining({ workspace_access: expect.anything() }),
       );
     });
   });

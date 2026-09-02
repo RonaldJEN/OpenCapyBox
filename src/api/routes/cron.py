@@ -20,6 +20,7 @@ import logging
 import posixpath
 import shlex
 import uuid
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
@@ -38,9 +39,14 @@ from src.api.services.cron_service import (
     CronJobNotFoundError,
     CronJobValidationError,
     CronService,
+    build_cron_definition_snapshot,
 )
 from src.api.services.cron_worker import trigger_manual_run
-from src.api.utils.sandbox_helpers import extract_command_stdout
+from src.api.utils.sandbox_helpers import (
+    extract_command_stdout,
+    filter_workspace_publish_scratch,
+    is_workspace_publish_scratch_path,
+)
 from src.api.models.user_memory import CronJobRun
 from src.api.utils.timezone import now_naive
 
@@ -86,6 +92,12 @@ def _job_response(job: object) -> dict:
         schedule = json.loads(raw_schedule) if raw_schedule else None
     else:
         schedule = raw_schedule
+    raw_definition_version = getattr(job, "definition_version", 1)
+    definition_version = (
+        int(raw_definition_version)
+        if isinstance(raw_definition_version, (int, float))
+        else 1
+    )
     return {
         "id": getattr(job, "id", None),
         "name": getattr(job, "name"),
@@ -95,6 +107,7 @@ def _job_response(job: object) -> dict:
         "content": getattr(job, "content", "") or "",
         "enabled": bool(getattr(job, "enabled", False)),
         "rule_version": int(getattr(job, "rule_version", 1) or 1),
+        "definition_version": definition_version,
     }
 
 
@@ -258,8 +271,16 @@ async def mark_runs_read(
     if run_id is not None:
         query = query.filter(CronJobRun.id == run_id)
     marked = query.update({"is_read": True})
+    unread_count = (
+        db.query(CronJobRun)
+        .filter(
+            CronJobRun.user_id == user_id,
+            CronJobRun.is_read == False,  # noqa: E712
+        )
+        .count()
+    )
     db.commit()
-    return {"marked": marked}
+    return {"marked": marked, "unread_count": unread_count}
 
 
 @router.get("/runs/{run_id}")
@@ -277,32 +298,7 @@ async def get_run_status(
     if not run:
         raise HTTPException(status_code=404, detail="执行记录不存在")
 
-    artifacts = None
-    if run.artifacts:
-        try:
-            artifacts = json.loads(run.artifacts)
-        except (ValueError, TypeError):
-            artifacts = None
-
-    return {
-        "id": run.id,
-        "job_name": run.job_name,
-        "cron_expr": run.cron_expr,
-        "rule_version": getattr(run, "rule_version", None),
-        "scheduled_at": (
-            run.scheduled_at.isoformat()
-            if getattr(run, "scheduled_at", None)
-            else None
-        ),
-        "trigger_source": getattr(run, "trigger_source", "scheduled"),
-        "started_at": run.started_at.isoformat() if run.started_at else None,
-        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
-        "status": run.status,
-        "output": run.output,
-        "is_read": bool(getattr(run, 'is_read', True)),
-        "artifacts": artifacts,
-        "run_workspace": getattr(run, 'run_workspace', None),
-    }
+    return CronJobRun.to_dict(run)
 
 
 @router.get("/runs/{run_id}/files")
@@ -324,7 +320,7 @@ async def list_run_files(
     if run.artifacts:
         try:
             files = json.loads(run.artifacts)
-            return {"files": files}
+            return {"files": filter_workspace_publish_scratch(files)}
         except (ValueError, TypeError):
             pass
 
@@ -391,6 +387,8 @@ async def download_run_file(
     sandbox_path = posixpath.normpath(posixpath.join(run.run_workspace, file_path))
     if not sandbox_path.startswith(run.run_workspace + "/") and sandbox_path != run.run_workspace:
         raise HTTPException(status_code=403, detail="路径越界")
+    if is_workspace_publish_scratch_path(sandbox_path):
+        raise HTTPException(status_code=404, detail="文件不存在")
 
     # 获取沙箱
     from src.api.models.user_sandbox import UserSandbox
@@ -449,7 +447,11 @@ async def download_run_file(
     return Response(
         content=file_bytes,
         media_type=content_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename*=UTF-8''{quote(filename, safe='')}"
+            )
+        },
     )
 
 
@@ -481,18 +483,27 @@ async def trigger_job(
     # 会重新查到新版本，导致执行记录与实际触发绑定到不同规则。
     submitted_job_id = int(job.id)
     submitted_rule_version = int(job.rule_version or 1)
+    submitted_definition_version = int(job.definition_version or 1)
     submitted_cron_expr = job.cron_expr
-
+    definition_snapshot = build_cron_definition_snapshot(job)
     # 预创建执行记录，确保前端可立即开始轮询
     run_id = str(uuid.uuid4())
     run_record = CronJobRun(
         id=run_id,
         user_id=user_id,
+        job_id=submitted_job_id,
         job_name=job_name,
         cron_expr=submitted_cron_expr,
         rule_version=submitted_rule_version,
+        definition_version=submitted_definition_version,
+        definition_snapshot=json.dumps(
+            definition_snapshot,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
         trigger_source="manual",
-        status="running",
+        status="queued",
+        phase="queued",
         is_read=False,
     )
     db.add(run_record)
@@ -511,14 +522,19 @@ async def trigger_job(
         # 任何异常（HTTPException / RuntimeError / 其他）都必须把预创建的 running
         # 记录立刻收拢为 failed，否则会一直挂到 startup 1 小时清理 → 前端永久转圈。
         rec = db.query(CronJobRun).filter(CronJobRun.id == run_id).first()
-        if rec and rec.status == "running":
+        if rec and rec.status in {"queued", "running"}:
             if isinstance(exc, HTTPException):
                 reason = str(exc.detail) or "cron worker 未启动，无法手动触发任务"
             else:
                 reason = f"手动触发失败: {exc.__class__.__name__}: {exc}"
             rec.status = "failed"
+            rec.phase = "terminal"
             rec.output = reason
+            rec.error_code = "manual_dispatch_failed"
             rec.completed_at = now_naive()
+            rec.claim_token = None
+            rec.claim_worker_id = None
+            rec.claim_lease_expires_at = None
             db.commit()
         raise
 

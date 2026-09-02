@@ -1,6 +1,7 @@
 """cron_worker 单元测试。"""
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -15,16 +16,20 @@ from src.api.models.auth_user import AuthUser
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.database import Base
+from src.api.models.user_memory import CronJobRun
+from src.api.models.user_sandbox import UserSandbox
 
 
 @pytest.fixture(autouse=True)
 def clear_background_tasks():
     cron_worker._background_tasks.clear()
+    cron_worker._local_run_ids.clear()
     yield
     for task in list(cron_worker._background_tasks):
         if not task.done():
             task.cancel()
     cron_worker._background_tasks.clear()
+    cron_worker._local_run_ids.clear()
 
 
 @pytest.fixture
@@ -215,6 +220,326 @@ class TestInsertFire:
 
         assert cron_worker._try_insert_fire(job.id, minute) is True
         assert cron_worker._try_insert_fire(job.id, minute) is False
+
+    def test_fire_and_queued_run_are_created_atomically_with_frozen_definition(self, cron_db):
+        job = _insert_job(
+            cron_db,
+            user_id="u1",
+            name="workspace-job",
+            cron_expr="* * * * *",
+        )
+        with cron_db() as db:
+            persisted = db.get(CronJob, job.id)
+            persisted.content = "更新工作区日报"
+            persisted.definition_version = 3
+            db.commit()
+
+        minute = datetime.utcnow().replace(second=0, microsecond=0)
+        run_id = cron_worker._enqueue_scheduled_run(job.id, minute, 1, 3)
+
+        assert run_id is not None
+        with cron_db() as db:
+            fire = db.query(CronFire).one()
+            run = db.get(CronJobRun, run_id)
+            assert fire.run_id == run_id
+            assert run is not None
+            assert run.fire_id == fire.id
+            assert run.status == "queued"
+            assert run.phase == "queued"
+            snapshot = json.loads(run.definition_snapshot)
+            assert snapshot["content"] == "更新工作区日报"
+            assert "workspace_access" not in snapshot
+
+        assert cron_worker._enqueue_scheduled_run(job.id, minute, 1, 3) is None
+        with cron_db() as db:
+            assert db.query(CronFire).count() == 1
+            assert db.query(CronJobRun).count() == 1
+
+    def test_fire_rolls_back_when_queued_run_creation_fails(
+        self, cron_db, monkeypatch,
+    ):
+        job = _insert_job(
+            cron_db,
+            user_id="u1",
+            name="atomic-failure",
+            cron_expr="* * * * *",
+        )
+        real_model = cron_worker.CronJobRun
+
+        def fail_run_model(*args, **kwargs):
+            raise RuntimeError("simulated run construction failure")
+
+        monkeypatch.setattr(cron_worker, "CronJobRun", fail_run_model)
+        with pytest.raises(RuntimeError, match="construction failure"):
+            cron_worker._enqueue_scheduled_run(
+                job.id,
+                datetime.utcnow().replace(second=0, microsecond=0),
+            )
+        monkeypatch.setattr(cron_worker, "CronJobRun", real_model)
+        with cron_db() as db:
+            assert db.query(CronFire).count() == 0
+            assert db.query(CronJobRun).count() == 0
+
+    def test_definition_edit_before_enqueue_uses_latest_snapshot_without_dropping_fire(
+        self, cron_db,
+    ):
+        job = _insert_job(
+            cron_db,
+            user_id="u1",
+            name="definition-race",
+            cron_expr="* * * * *",
+        )
+        with cron_db() as db:
+            persisted = db.get(CronJob, job.id)
+            persisted.definition_version = 2
+            persisted.content = "new prompt"
+            db.commit()
+
+        run_id = cron_worker._enqueue_scheduled_run(
+            job.id,
+            datetime.utcnow().replace(second=0, microsecond=0),
+            rule_version=1,
+            definition_version=1,
+        )
+        assert run_id is not None
+        with cron_db() as db:
+            run = db.get(CronJobRun, run_id)
+            assert run.definition_version == 2
+            assert json.loads(run.definition_snapshot)["content"] == "new prompt"
+
+
+class TestDurableRunClaims:
+    def _queued_run(self, cron_db) -> str:
+        job = _insert_job(
+            cron_db,
+            user_id="u1",
+            name=f"job-{time.time_ns()}",
+            cron_expr="* * * * *",
+        )
+        run_id = cron_worker._enqueue_scheduled_run(
+            job.id,
+            datetime.utcnow().replace(second=0, microsecond=0),
+        )
+        assert run_id is not None
+        return run_id
+
+    def test_claim_is_fenced_and_renewable(self, cron_db):
+        run_id = self._queued_run(cron_db)
+        with cron_db() as db:
+            db.add(UserSandbox(
+                id="binding-u1",
+                user_id="u1",
+                sandbox_id="sbx-claim",
+                status="active",
+            ))
+            db.commit()
+        claim = cron_worker._claim_queued_run(run_id, "worker-a")
+        assert claim is not None
+        assert claim["sandbox_id"] == "sbx-claim"
+        assert cron_worker._claim_queued_run(run_id, "worker-b") is None
+        assert cron_worker._renew_run_claim(run_id, claim["claim_token"]) is True
+
+        with cron_db() as db:
+            run = db.get(CronJobRun, run_id)
+            assert run.status == "running"
+            assert run.phase == "preparing"
+            assert run.claim_worker_id == "worker-a"
+            assert run.sandbox_id == "sbx-claim"
+            assert run.attempt_count == 1
+            assert run.claim_lease_expires_at > run.heartbeat_at
+
+    def test_expired_claim_cannot_be_resurrected_by_late_heartbeat(self, cron_db):
+        run_id = self._queued_run(cron_db)
+        claim = cron_worker._claim_queued_run(run_id, "worker-a")
+        assert claim is not None
+        with cron_db() as db:
+            run = db.get(CronJobRun, run_id)
+            run.claim_lease_expires_at = datetime.utcnow() - timedelta(seconds=1)
+            db.commit()
+
+        assert cron_worker._renew_run_claim(run_id, claim["claim_token"]) is False
+
+    def test_workspace_lease_and_change_summary_share_the_claim_fence(self, cron_db):
+        from src.api.services.cron_service import (
+            append_cron_workspace_change,
+            assert_cron_workspace_lease,
+        )
+
+        run_id = self._queued_run(cron_db)
+        claim = cron_worker._claim_queued_run(run_id, "worker-a")
+        assert claim is not None
+        with cron_db() as db:
+            assert_cron_workspace_lease(
+                db,
+                user_id="u1",
+                run_id=run_id,
+                claim_token=claim["claim_token"],
+            )
+            with pytest.raises(PermissionError):
+                assert_cron_workspace_lease(
+                    db,
+                    user_id="u1",
+                    run_id=run_id,
+                    claim_token="wrong",
+                )
+
+        change = {
+            "mutation_id": "mutation-1",
+            "entry_id": "entry-1",
+            "operation": "updated",
+            "revision": 2,
+        }
+        with cron_db() as db:
+            assert append_cron_workspace_change(
+                db,
+                user_id="u1",
+                run_id=run_id,
+                claim_token=claim["claim_token"],
+                change=change,
+            ) is True
+        with cron_db() as db:
+            assert append_cron_workspace_change(
+                db,
+                user_id="u1",
+                run_id=run_id,
+                claim_token=claim["claim_token"],
+                change=change,
+            ) is True
+            run = db.get(CronJobRun, run_id)
+            assert json.loads(run.workspace_changes) == [change]
+
+    def test_reconciler_repairs_workspace_changes_from_mutation_journal(self, cron_db):
+        from src.api.models.workspace import WorkspaceEntry, WorkspaceMutation
+
+        run_id = self._queued_run(cron_db)
+        with cron_db() as db:
+            entry = WorkspaceEntry(
+                entry_id="entry-repair",
+                user_id="u1",
+                parent_key="",
+                name="日报.md",
+                kind="file",
+                relative_path="日报.md",
+                size_bytes=12,
+                mime_type="text/markdown",
+                sha256="a" * 64,
+                revision=2,
+                status="active",
+            )
+            mutation = WorkspaceMutation(
+                mutation_id="mutation-repair",
+                user_id="u1",
+                entry_id=entry.entry_id,
+                actor="cron",
+                operation="publish_file",
+                state="completed",
+                result_status="UPDATED",
+                idempotency_key="workspace-tool:repair",
+                cron_job_id="1",
+                cron_run_id=run_id,
+                before_revision=1,
+                after_revision=2,
+                after_sha256="a" * 64,
+            )
+            db.add_all([entry, mutation])
+            db.commit()
+
+            assert cron_worker._reconcile_workspace_change_summaries(db) == 1
+            db.commit()
+            summary = json.loads(db.get(CronJobRun, run_id).workspace_changes)
+            assert summary[0]["mutation_id"] == "mutation-repair"
+            assert summary[0]["path"] == "日报.md"
+            assert summary[0]["operation"] == "UPDATED"
+
+            # Hard deletion leaves no entry row; replay metadata comes from the journal.
+            db.delete(entry)
+            db.add(WorkspaceMutation(
+                mutation_id="mutation-delete", user_id="u1", entry_id="entry-repair",
+                actor="cron", operation="delete_entries", state="completed",
+                result_status="DELETED", idempotency_key="workspace-tool:delete",
+                cron_job_id="1", cron_run_id=run_id, after_revision=0,
+                details_json=json.dumps({"journal": {
+                    "delete_entry_ids": ["entry-repair"],
+                    "root_projections": [{
+                        "entry_id": "entry-repair", "relative_path": "日报.md",
+                        "name": "日报.md", "kind": "file", "revision": 2,
+                    }],
+                }}),
+            ))
+            db.commit()
+            assert cron_worker._reconcile_workspace_change_summaries(db) == 1
+            db.commit()
+            deleted = json.loads(db.get(CronJobRun, run_id).workspace_changes)[-1]
+            assert deleted["operation"] == "DELETED"
+            assert deleted["path"] == deleted["name"] == "日报.md"
+            assert deleted["revision"] == 3
+            assert deleted["affected_entry_ids"] == ["entry-repair"]
+
+    def test_reconcile_requeues_prestart_but_never_replays_started_work(self, cron_db):
+        now = datetime.utcnow()
+        preparing_id = self._queued_run(cron_db)
+        executing_id = self._queued_run(cron_db)
+        active_id = self._queued_run(cron_db)
+
+        for run_id in (preparing_id, executing_id, active_id):
+            claim = cron_worker._claim_queued_run(run_id, "worker-a")
+            assert claim is not None
+        with cron_db() as db:
+            preparing = db.get(CronJobRun, preparing_id)
+            executing = db.get(CronJobRun, executing_id)
+            active = db.get(CronJobRun, active_id)
+            preparing.claim_lease_expires_at = now - timedelta(seconds=1)
+            executing.phase = "executing"
+            executing.claim_lease_expires_at = now - timedelta(seconds=1)
+            active.phase = "executing"
+            active.claim_lease_expires_at = now + timedelta(minutes=5)
+            db.commit()
+
+        assert cron_worker.reconcile_expired_cron_runs(at=now) == (1, 1)
+        with cron_db() as db:
+            preparing = db.get(CronJobRun, preparing_id)
+            executing = db.get(CronJobRun, executing_id)
+            active = db.get(CronJobRun, active_id)
+            assert (preparing.status, preparing.phase, preparing.claim_token) == (
+                "queued", "queued", None,
+            )
+            assert executing.status == "unknown"
+            assert executing.error_code == "worker_lease_expired_after_start"
+            assert active.status == "running"
+            assert active.claim_token is not None
+
+    @pytest.mark.asyncio
+    async def test_run_queued_passes_the_exact_claim_to_runner(
+        self, cron_db, monkeypatch,
+    ):
+        run_id = self._queued_run(cron_db)
+        captured = {}
+
+        async def fake_runner(user_id, job_name, actual_run_id, **kwargs):
+            captured.update({
+                "user_id": user_id,
+                "job_name": job_name,
+                "run_id": actual_run_id,
+                **kwargs,
+            })
+            with cron_db() as db:
+                run = db.get(CronJobRun, actual_run_id)
+                assert run.claim_token == kwargs["claim_token"]
+                run.status = "success"
+                run.phase = "terminal"
+                run.claim_token = None
+                run.claim_worker_id = None
+                run.claim_lease_expires_at = None
+                db.commit()
+            return "ok"
+
+        monkeypatch.setattr(cron_worker, "run_cron_job", fake_runner)
+        await cron_worker._run_queued(run_id, "worker-a")
+
+        assert captured["run_id"] == run_id
+        assert captured["claim_token"]
+        assert captured["expected_job_id"] is not None
+        assert captured["trigger_source"] == "scheduled"
 
 
 class TestDispatchAndSpawn:

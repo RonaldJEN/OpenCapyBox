@@ -492,7 +492,6 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
         <FeedbackMessage
           className="admin-toast"
           tone="success"
-          autoDismissMs={4000}
           icon={<CheckCircle2 size={14} />}
           onDismiss={() => setMessage('')}
         >

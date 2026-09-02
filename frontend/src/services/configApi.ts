@@ -124,22 +124,56 @@ export interface CronTask {
   content: string;
   enabled: boolean;
   rule_version?: number;
+  definition_version?: number;
+}
+
+export interface CronWorkspaceChange {
+  affected_entry_ids?: string[];
+  entry_id: string;
+  operation: string;
+  path: string;
+  name?: string;
+  kind?: 'file' | 'directory';
+  revision?: number | string;
+  mutation_id?: string;
+}
+
+export interface CronWorkspaceChangeSet {
+  change_set_id: string;
+  entry_id?: string | null;
+  operation: string;
+  status: 'proposed' | 'conflict' | 'needs_review' | string;
+  base_version_id?: string | null;
+  proposed_version_id?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  target_name?: string | null;
+  target_path?: string | null;
 }
 
 export interface CronJobRun {
   id: string;
+  job_id?: number | null;
+  fire_id?: string | null;
   job_name: string;
   cron_expr: string;
   rule_version?: number | null;
+  definition_version?: number | null;
+  queued_at?: string | null;
+  phase?: string | null;
+  attempt_count?: number;
+  error_code?: string | null;
   scheduled_at?: string | null;
   trigger_source?: 'scheduled' | 'manual';
   started_at: string | null;
   completed_at: string | null;
-  status: string;
+  status: 'queued' | 'running' | 'success' | 'failed' | 'conflict' | 'unknown' | string;
   output: string | null;
   is_read: boolean;
   artifacts: ArtifactFile[] | null;
   run_workspace: string | null;
+  workspace_changes?: CronWorkspaceChange[] | null;
+  workspace_change_sets?: CronWorkspaceChangeSet[] | null;
 }
 
 export interface ArtifactFile {
@@ -231,8 +265,8 @@ export async function getUnreadCount(): Promise<{ count: number }> {
   return resp.data;
 }
 
-export async function markCronRunsRead(runId?: string): Promise<{ marked: number }> {
-  const resp = await client.post<{ marked: number }>(
+export async function markCronRunsRead(runId?: string): Promise<{ marked: number; unread_count: number }> {
+  const resp = await client.post<{ marked: number; unread_count: number }>(
     '/cron/runs/mark-read',
     undefined,
     runId ? { params: { run_id: runId } } : undefined,

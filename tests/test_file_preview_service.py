@@ -15,13 +15,73 @@ from src.api.services.file_preview_service import (
     FilePreviewUnavailableError,
     FilePreviewUnsupportedError,
     MAX_RENDERED_PDF_BYTES,
+    OFFICE_PREVIEW_INCOMING_STALE_SECONDS,
     RenderedOfficePreview,
+    _complete_cleanup_before_cancellation,
+    _prune_office_preview_cache,
     render_office_document_to_pdf,
 )
 from tests.helpers import make_fake_execution
 
 
 CONTENT_DIGEST = "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_trusted_workspace_cache_hit_does_not_read_source_again():
+    sandbox = MagicMock()
+    with (
+        patch(
+            "src.api.services.file_preview_service._validated_pdf_size",
+            new=AsyncMock(return_value=8192),
+        ),
+        patch(
+            "src.api.services.file_preview_service._snapshot_office_source",
+            new=AsyncMock(),
+        ) as snapshot,
+        patch(
+            "src.api.services.file_preview_service._touch_and_prune_office_preview_cache",
+            new=AsyncMock(),
+        ),
+        patch(
+            "src.api.services.file_preview_service._cleanup_preview_working_files",
+            new=AsyncMock(),
+        ) as cleanup,
+    ):
+        rendered = await render_office_document_to_pdf(
+            sandbox,
+            source_filename="report.pptx",
+            source_path="/home/user/workdir/.opencapybox/objects/aa/content",
+            session_root="/home/user/workdir",
+            cache_root="/home/user/workdir/.opencapybox/derived/office",
+            source_sha256=CONTENT_DIGEST,
+            source_size=4096,
+        )
+
+    snapshot.assert_not_awaited()
+    cleanup.assert_not_awaited()
+    assert rendered.size == 8192
+    assert rendered.sandbox_path.endswith("/source.pdf")
+
+
+@pytest.mark.asyncio
+async def test_preview_cache_pruner_only_targets_complete_hash_directories_and_protects_current():
+    command_run = AsyncMock(return_value=make_fake_execution(stdout_text='{"removed_bytes": 1}'))
+    sandbox = MagicMock()
+    sandbox.commands.run = command_run
+
+    await _prune_office_preview_cache(
+        sandbox,
+        cache_root="/home/user/workdir/.opencapybox/derived/office",
+        max_bytes=512,
+        protected_cache_key="a" * 64,
+    )
+
+    command = command_run.await_args.args[0]
+    assert "re.fullmatch(r'[0-9a-f]{64}', name)" in command
+    assert "os.path.isdir(os.path.join(directory, '.lock'))" in command
+    assert "if name == protected" in command
+    assert ".incoming-" not in command
 
 
 def _snapshot_execution(*, size: int = 12, reason: str | None = None):
@@ -90,6 +150,10 @@ async def test_office_preview_converts_in_unique_scratch_then_atomically_publish
     assert rendered.filename == "deck.pdf"
     assert rendered.size == 8192
     commands = [call.args[0] for call in sandbox.commands.run.await_args_list]
+    snapshot = next(command for command in commands if "python3 - <<'PY'" in command)
+    assert f"stale_incoming_seconds = {OFFICE_PREVIEW_INCOMING_STALE_SECONDS}" in snapshot
+    assert "re.compile(r'^\\.incoming-[0-9a-f]{32}$')" in snapshot
+    assert "shutil.rmtree(entry.path)" in snapshot
     conversion = next(command for command in commands if "--convert-to" in command)
     assert "timeout -k 5 90 soffice" in conversion
     assert ".incoming-" in conversion
@@ -187,6 +251,33 @@ async def test_office_preview_maps_shell_timeout():
 
 
 @pytest.mark.asyncio
+async def test_office_cleanup_finishes_before_propagating_request_cancellation():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+
+    async def cleanup_operation():
+        started.set()
+        try:
+            await release.wait()
+        finally:
+            completed.set()
+
+    request = asyncio.create_task(
+        _complete_cleanup_before_cancellation(cleanup_operation())
+    )
+    await started.wait()
+    request.cancel()
+    await asyncio.sleep(0)
+    assert not request.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert completed.is_set()
+
+
+@pytest.mark.asyncio
 async def test_office_preview_rejects_oversized_cached_pdf():
     sandbox = _sandbox_with_commands(
         _snapshot_execution(),
@@ -270,6 +361,44 @@ async def test_concurrent_same_content_requests_publish_once():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file_path", "expected_cache_control"),
+    [
+        ("report.md", "no-store"),
+        (
+            ".assistant-artifacts/round-1/ref/report.md",
+            "private, max-age=31536000, immutable",
+        ),
+    ],
+)
+async def test_download_file_defines_cache_policy_in_download_scope(
+    file_path, expected_cache_control
+):
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        id="s1", user_id="u1"
+    )
+    sandbox = MagicMock()
+
+    async def chunks():
+        yield b"# report"
+
+    sandbox.files.read_bytes_stream = AsyncMock(return_value=chunks())
+    sandbox_service = MagicMock()
+    sandbox_service.get_mount_path.return_value = "/home/user"
+    with (
+        patch("src.api.routes.sessions.get_sandbox_service", return_value=sandbox_service),
+        patch("src.api.routes.sessions._ensure_sandbox", new=AsyncMock(return_value=sandbox)),
+    ):
+        response = await sessions.download_file(
+            "s1", file_path, "u1", True, None, db
+        )
+
+    assert isinstance(response, StreamingResponse)
+    assert response.headers["cache-control"] == expected_cache_control
+
+
+@pytest.mark.asyncio
 async def test_download_file_pdf_render_returns_derived_pdf_without_reading_source():
     db = MagicMock()
     db.query.return_value.filter.return_value.first.return_value = MagicMock(id="s1", user_id="u1")
@@ -297,6 +426,7 @@ async def test_download_file_pdf_render_returns_derived_pdf_without_reading_sour
         source_filename="report.docx",
         source_path="/home/user/sessions/s1/report.docx",
         session_root="/home/user/sessions/s1",
+        cache_max_bytes=512 * 1024 * 1024,
     )
     assert sandbox.files.read_bytes.await_count == 1
 

@@ -14,6 +14,17 @@ class ToolResult(BaseModel):
     content: str = ""
     error: str | None = None
     content_blocks: list[dict[str, Any]] | None = None
+    # Durable UI resources produced by a tool call. These are not sent back to
+    # the model as tool text; Agent.run_agui projects them as CUSTOM events.
+    resource_changes: list[dict[str, Any]] | None = Field(default=None, exclude=True)
+    workspace_change_events: list[dict[str, Any]] | None = Field(default=None, exclude=True)
+    # Structured file identities observed or produced by this call.  The UI
+    # may correlate these with explicit file mentions in the final response;
+    # it must never infer a source namespace from a filename alone.
+    assistant_file_references: list[dict[str, Any]] | None = Field(
+        default=None,
+        exclude=True,
+    )
     # Internal execution-state signal.  In particular, a remote write may
     # have reached the MCP server even though no response was observed.
     outcome_uncertain: bool = Field(default=False, exclude=True)
@@ -107,6 +118,23 @@ class Tool:
     def tool_ref(self) -> ToolRef:
         """Stable reference used by runtime policy, audit and remote routing."""
         return ToolRef(provider="builtin", name=self.name)
+
+    def permission_ref_for(self, arguments: dict[str, Any] | None = None) -> ToolRef:
+        """Resolve the policy identity for one concrete invocation.
+
+        Most tools have one stable permission identity. Mixed-capability tools
+        may override this hook so a high-risk argument set cannot inherit a
+        grant issued for a harmless operation exposed under the same model
+        tool name.
+        """
+        return self.tool_ref
+
+    def permission_default_effect_for(
+        self,
+        arguments: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Return an invocation-specific default policy effect, if any."""
+        return None
 
     def validate_arguments(self, arguments: dict[str, Any]) -> str | None:
         """Run provider-specific validation before approval or execution."""

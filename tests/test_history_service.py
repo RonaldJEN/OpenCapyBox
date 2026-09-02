@@ -126,6 +126,24 @@ class TestHistoryServiceRound:
             {"server_id": "server-a", "display_name": "Original data"},
         ]
 
+    def test_find_round_by_idempotency_key_returns_detached_existing_round(
+        self, history_service, mock_db
+    ):
+        existing = Round(
+            id="round-existing",
+            session_id="session-123",
+            user_message="Original",
+            idempotency_key="idem-1",
+        )
+        mock_db.query.return_value.filter.return_value.first.return_value = existing
+
+        result = history_service.find_round_by_idempotency_key("session-123", "idem-1")
+
+        assert result is existing
+        mock_db.expunge.assert_called_once_with(existing)
+        mock_db.rollback.assert_called_once()
+
+
     def test_complete_round(self, history_service, mock_db):
         """測試完成 Round"""
         mock_round = MagicMock()
@@ -241,13 +259,32 @@ class TestHistoryServiceGetSessionRounds:
         mock_event_end.event_type = "STEP_FINISHED"
         mock_event_end.payload = json.dumps({"type": "STEP_FINISHED"})
         mock_event_end.created_at = datetime.now()
-        mock_event_end.sequence = 2
+        mock_event_end.sequence = 3
+
+        mock_workspace_resource = MagicMock()
+        mock_workspace_resource.event_type = "CUSTOM"
+        mock_workspace_resource.payload = json.dumps({
+            "type": "CUSTOM",
+            "name": "workspace_resource_changed",
+            "value": {
+                "entry_id": "entry-1",
+                "operation": "UPDATED",
+                "path": "reports/result.md",
+                "name": "result.md",
+                "kind": "file",
+                "revision": 2,
+                "mutation_id": "mutation-1",
+                "toolCallId": "tool-1",
+            },
+        })
+        mock_workspace_resource.created_at = datetime.now()
+        mock_workspace_resource.sequence = 2
         
         # 設置查詢返回：subagent child id 查詢、rounds 查詢 和 events 查詢
         mock_db.query.return_value.filter.return_value.all.return_value = []
         mock_db.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
             [mock_round],  # rounds 查詢
-            [mock_event, mock_event_end],  # events 查詢（用於重建 steps）
+            [mock_event, mock_workspace_resource, mock_event_end],  # events 查詢
         ]
         
         rounds = history_service.get_session_rounds("session-123")
@@ -255,7 +292,7 @@ class TestHistoryServiceGetSessionRounds:
         assert len(rounds) == 1
         assert rounds[0]["round_id"] == "round-1"
         assert rounds[0]["parent_run_id"] == "round-parent"
-        assert rounds[0]["last_event_sequence"] == 2
+        assert rounds[0]["last_event_sequence"] == 3
         assert rounds[0]["user_message"] == "Hello"
         assert rounds[0]["preferred_skills"] == [
             {"key": "pdf", "display_name": "PDF 文档"},
@@ -316,6 +353,60 @@ class TestHistoryServiceRebuildSteps:
         steps = history_service._rebuild_steps_from_events("run-123")
         
         assert steps == []
+
+    def test_rebuild_steps_projects_captured_assistant_file_reference(
+        self, history_service, mock_db
+    ):
+        event = MagicMock(
+            event_type="CUSTOM",
+            payload=json.dumps({
+                "type": "CUSTOM",
+                "name": "assistant_file_referenced",
+                "value": {
+                    "ref_id": "session:s1:r1:report",
+                    "source": "session",
+                    "session_id": "s1",
+                    "name": "report.md",
+                    "path": "report.md",
+                    "snapshot_path": ".assistant-artifacts/r1/report/report.md",
+                    "size": 42,
+                    "modified": "2026-08-28T10:00:00Z",
+                    "type": "md",
+                    "revision": "v1:42:100",
+                    "toolCallId": "tool-1",
+                },
+            }),
+            created_at=datetime.now(),
+            sequence=1,
+            id="e-file",
+        )
+        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [event]
+        references = []
+
+        steps = history_service._rebuild_steps_from_events(
+            "run-123",
+            assistant_file_references=references,
+        )
+
+        assert steps == []
+        assert references == [{
+            "ref_id": "session:s1:r1:report",
+            "source": "session",
+            "name": "report.md",
+            "path": "report.md",
+            "size": 42,
+            "modified": "2026-08-28T10:00:00Z",
+            "type": "md",
+            "revision": "v1:42:100",
+            "operation": None,
+            "tool_call_id": "tool-1",
+            "sha256": None,
+            "session_id": "s1",
+            "snapshot_path": ".assistant-artifacts/r1/report/report.md",
+            "entry_id": None,
+            "workspace_path": None,
+            "version_id": None,
+        }]
 
     def test_rebuild_steps_with_thinking(self, history_service, mock_db):
         """測試從事件重建包含 thinking 的 steps（聚合模式）"""

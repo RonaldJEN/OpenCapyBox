@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, it, expect, vi } from 'vitest';
-import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import App from '../../App';
 import { apiService } from '../../services/api';
+import { emitWorkspaceMutation, subscribeWorkspaceMutation } from '../../services/workspaceEvents';
 
 const NativeRequest = globalThis.Request;
 
@@ -14,6 +15,16 @@ class RouterTestRequest extends NativeRequest {
     // still exercising the real data-router PUSH/POP blocker state machine.
     super(input, init ? { ...init, signal: undefined } : init);
   }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
 }
 
 const mockControls = vi.hoisted(() => ({
@@ -30,6 +41,8 @@ const mockControls = vi.hoisted(() => ({
     stale: boolean;
     failedPaths: string[];
   }>),
+  workspaceGet: vi.fn(),
+  cronRunsGet: vi.fn(),
 }));
 
 vi.mock('../../services/api', () => ({
@@ -38,7 +51,7 @@ vi.mock('../../services/api', () => ({
     getUserId: vi.fn(() => 'demo-user'),
     isAdminUser: vi.fn(() => false),
     getAxiosClient: vi.fn(() => ({
-      get: vi.fn(),
+      get: mockControls.workspaceGet,
       post: vi.fn(),
       patch: vi.fn(),
       put: vi.fn(),
@@ -58,14 +71,16 @@ vi.mock('../../services/api', () => ({
 
 vi.mock('../../services/configApi', () => ({
   getUnreadCount: vi.fn().mockResolvedValue({ count: 0 }),
+  getCronRuns: (...args: unknown[]) => mockControls.cronRunsGet(...args),
 }));
 
 vi.mock('../../components/SessionList', () => ({
-  SessionList: ({ isCollapsed, onOpenConfig, onOpenCron, onOpenSkills, onOpenConnections, activePrimarySurface, onSessionSelect, onModelChange, onNewChat, executingSessionIds }: { isCollapsed?: boolean; onOpenConfig?: () => void; onOpenCron?: () => void; onOpenSkills?: () => void; onOpenConnections?: () => void; activePrimarySurface?: string; onSessionSelect?: (sessionId: string) => void; onModelChange?: (modelId: string) => void; onNewChat?: () => void; executingSessionIds?: Set<string> }) => (
+  SessionList: ({ isCollapsed, onOpenConfig, onOpenCron, onOpenSkills, onOpenConnections, activePrimarySurface, onSessionSelect, onModelChange, onNewChat, executingSessionIds, sidebarMode, onSidebarModeChange, onOpenWorkspaceEntry, mobileSheet, onCloseMobileSheet }: any) => (
     <div>
       <div data-testid="sidebar-state">{isCollapsed ? 'collapsed' : 'open'}</div>
       <div data-testid="executing-sessions">{Array.from(executingSessionIds ?? []).join(',')}</div>
       <div data-testid="active-primary-surface">{activePrimarySurface}</div>
+      <div data-testid={mobileSheet ? 'mobile-sidebar-mode' : 'sidebar-mode'}>{sidebarMode}</div>
       <button onClick={onOpenConfig}>open-config</button>
       <button onClick={onOpenCron}>open-cron</button>
       <button onClick={onOpenSkills}>open-skills</button>
@@ -78,6 +93,10 @@ vi.mock('../../components/SessionList', () => ({
       <button onClick={() => onSessionSelect?.('session-b')}>select-session-b</button>
       <button onClick={onNewChat}>new-chat</button>
       <button onClick={() => onModelChange?.('qwen-plus')}>select-qwen-model</button>
+      <button onClick={() => onSidebarModeChange?.('workspace')}>sidebar-workspace</button>
+      <button onClick={() => onSidebarModeChange?.('sessions')}>sidebar-sessions</button>
+      <button onClick={() => onOpenWorkspaceEntry?.({ entry_id: 'workspace-file', parent_id: null, name: 'report.md', kind: 'file', path: 'report.md', size_bytes: 10, mime_type: 'text/markdown', sha256: 'hash', revision: 1, status: 'active', created_at: 'now', updated_at: 'now' })}>open-workspace-file</button>
+      {mobileSheet && <button onClick={onCloseMobileSheet}>mock-close-mobile-sidebar</button>}
     </div>
   ),
 }));
@@ -91,6 +110,10 @@ vi.mock('../../components/ChatV2', () => ({
     onSessionCreated,
     onFilesFullChange,
     sessionFilesHandleRef,
+    workspaceFilesHandleRef,
+    workspaceFileTarget,
+    workspaceTargetResolving,
+    onWorkspaceFilesClose,
   }: {
     sessionId?: string;
     selectedModelId?: string;
@@ -99,6 +122,10 @@ vi.mock('../../components/ChatV2', () => ({
     onSessionCreated?: (sessionId: string) => void;
     onFilesFullChange?: (full: boolean) => void;
     sessionFilesHandleRef?: { current: any };
+    workspaceFilesHandleRef?: ((handle: any) => void) | { current: any };
+    workspaceFileTarget?: { entry_id?: string } | null;
+    workspaceTargetResolving?: boolean;
+    onWorkspaceFilesClose?: () => void;
   }) => {
     const [draft, setDraft] = useState('');
     const [waiting, setWaiting] = useState(false);
@@ -139,6 +166,21 @@ vi.mock('../../components/ChatV2', () => ({
     }, [currentFilesOwner, sessionFilesHandleRef]);
 
     useLayoutEffect(() => {
+      if (!workspaceFilesHandleRef || !workspaceFileTarget) return undefined;
+      const assignHandle = (handle: any) => {
+        if (typeof workspaceFilesHandleRef === 'function') workspaceFilesHandleRef(handle);
+        else workspaceFilesHandleRef.current = handle;
+      };
+      const handle = {
+        owner: { scope: 'workspace', id: 'persistent', epoch: 0 },
+        hasDirty: () => false,
+        saveDirty: async () => ({ ok: true, failedEntryIds: [] }),
+      };
+      assignHandle(handle);
+      return () => assignHandle(null);
+    }, [workspaceFileTarget, workspaceFilesHandleRef]);
+
+    useLayoutEffect(() => {
       onFilesFullChange?.(filesFull);
       return () => onFilesFullChange?.(false);
     }, [filesFull, onFilesFullChange]);
@@ -159,6 +201,8 @@ vi.mock('../../components/ChatV2', () => ({
         data-session-id={sessionId}
         data-selected-model-id={selectedModelId}
         data-active-slots={Array.from(activeSlotSessionIds ?? []).join(',')}
+        data-workspace-entry-id={workspaceTargetResolving ? '' : workspaceFileTarget?.entry_id || ''}
+        data-workspace-target-resolving={String(Boolean(workspaceTargetResolving))}
       >
         chat
         <label>
@@ -184,6 +228,9 @@ vi.mock('../../components/ChatV2', () => ({
             });
           }}
         >create-chat-session</button>
+        {workspaceFileTarget && (
+          <button type="button" onClick={onWorkspaceFilesClose}>close-workspace-file</button>
+        )}
       </div>
     );
   },
@@ -237,6 +284,8 @@ describe('App 配置抽屉交互', () => {
     mockControls.sessionFilesDirty = false;
     mockControls.sessionFilesSaveCalls = [];
     mockControls.sessionFilesSaveImpl = null;
+    mockControls.workspaceGet.mockReset();
+    mockControls.cronRunsGet.mockReset().mockResolvedValue({ runs: [], total: 0, offset: 0, limit: 20 });
   });
 
   afterEach(() => {
@@ -270,10 +319,12 @@ describe('App 配置抽屉交互', () => {
     render(<App />);
     expect(screen.getByRole('separator', { name: '调整左侧栏宽度', hidden: true }))
       .toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: '移动端主导航' })).toBeInTheDocument();
 
     fireEvent.click(screen.getByText('mock-files-full'));
 
     await waitFor(() => {
+      expect(screen.queryByRole('navigation', { name: '移动端主导航' })).not.toBeInTheDocument();
       expect(screen.queryByRole('separator', { name: '调整左侧栏宽度', hidden: true }))
         .not.toBeInTheDocument();
       expect(screen.getAllByRole('separator', { hidden: true })).toHaveLength(1);
@@ -412,6 +463,263 @@ describe('App 配置抽屉交互', () => {
     expect(screen.getByTestId('schedule-page')).toBeInTheDocument();
     expect(screen.getByTestId('schedule-primary-surface')).not.toHaveClass('hidden');
     expect(screen.getByTestId('chat-v2')).toBe(originalChat);
+
+    fireEvent.click(screen.getByText('sidebar-sessions'));
+    await waitFor(() => expect(window.location.pathname).toBe('/'));
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('sessions');
+    expect(screen.getByTestId('active-primary-surface')).toHaveTextContent('chat');
+    expect(screen.getByTestId('chat-v2')).toBe(originalChat);
+  });
+
+  it('工作区切换只投影左栏并在聊天右侧开文件，不创建一级 surface', async () => {
+    render(<App />);
+    const originalChat = screen.getByTestId('chat-v2');
+    fireEvent.click(screen.getByText('sidebar-workspace'));
+    await waitFor(() => expect(window.location.pathname).toBe('/workspace'));
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('workspace');
+    expect(screen.getByTestId('active-primary-surface')).toHaveTextContent('chat');
+    expect(screen.queryByTestId('workspace-primary-surface')).not.toBeInTheDocument();
+    expect(screen.getByTestId('chat-v2')).toBe(originalChat);
+
+    fireEvent.click(screen.getByText('open-workspace-file'));
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'workspace-file'));
+    expect(window.location.search).toContain('entry=workspace-file');
+
+    fireEvent.click(screen.getByText('sidebar-sessions'));
+    expect(window.location.pathname).toBe('/workspace');
+    expect(window.location.search).toContain('entry=workspace-file');
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('sessions');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'workspace-file');
+
+    fireEvent.click(screen.getByText('sidebar-workspace'));
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('workspace');
+    expect(window.location.pathname).toBe('/workspace');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'workspace-file');
+  });
+
+  it('从首页点击工作区会持久化路由，重新挂载后首帧仍恢复工作区', async () => {
+    window.history.replaceState({}, '', '/');
+    const firstMount = render(<App />);
+
+    fireEvent.click(screen.getByText('sidebar-workspace'));
+    await waitFor(() => expect(window.location.pathname).toBe('/workspace'));
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('workspace');
+
+    firstMount.unmount();
+    await act(async () => { await Promise.resolve(); });
+    render(<App />);
+
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('workspace');
+    expect(screen.getByTestId('chat-primary-surface')).not.toHaveClass('hidden');
+  });
+
+  it('工作区顶部新建对话会在 flush 后回到会话路由', async () => {
+    window.history.replaceState({}, '', '/workspace');
+    render(<App />);
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('workspace');
+
+    fireEvent.click(screen.getByText('new-chat'));
+
+    await waitFor(() => expect(window.location.pathname).toBe('/'));
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('sessions');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', '');
+  });
+
+  it('移动端工作区 Sheet 选择会话后关闭 Sheet 并回到会话路由', async () => {
+    window.history.replaceState({}, '', '/workspace');
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: '对话' }));
+    const sheet = screen.getByRole('dialog', { name: '会话与工作区' });
+
+    fireEvent.click(within(sheet).getByText('select-session-a'));
+
+    await waitFor(() => expect(window.location.pathname).toBe('/'));
+    expect(screen.queryByRole('dialog', { name: '会话与工作区' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('sessions');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a');
+  });
+
+  it('移动端对话入口打开全屏会话/工作区 Sheet，并可从中打开文件', async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: '对话' }));
+    const sheet = screen.getByRole('dialog', { name: '会话与工作区' });
+    expect(screen.getAllByTestId('mobile-sidebar-mode')).toHaveLength(1);
+    expect(screen.queryByTestId('sidebar-mode')).not.toBeInTheDocument();
+    fireEvent.click(within(sheet).getByText('sidebar-workspace'));
+    expect(within(sheet).getByTestId('mobile-sidebar-mode')).toHaveTextContent('workspace');
+    fireEvent.click(within(sheet).getByText('open-workspace-file'));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '会话与工作区' })).not.toBeInTheDocument());
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'workspace-file');
+  });
+
+  it('/workspace?entry 深链映射到 chat + workspace sidebar + 右侧文件', async () => {
+    window.history.replaceState({}, '', '/workspace?entry=deep-file');
+    mockControls.workspaceGet.mockResolvedValueOnce({ data: { entry_id: 'deep-file', parent_id: null, name: 'deep.md', kind: 'file', path: 'deep.md', size_bytes: 1, mime_type: 'text/markdown', sha256: 'hash', revision: 1, status: 'active', created_at: 'now', updated_at: 'now' } });
+    render(<App />);
+    // 工作区模式必须由首帧 location 同步投影，不能等待 effect 或用户再次点击。
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('workspace');
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'deep-file'));
+    expect(screen.getByTestId('chat-primary-surface')).not.toHaveClass('hidden');
+    expect(screen.queryByTestId('workspace-primary-surface')).not.toBeInTheDocument();
+  });
+
+  it('右侧 Workspace 文件打开后无需进入日程也立即轮询 Cron changes 并发出 invalidation', async () => {
+    mockControls.cronRunsGet.mockResolvedValue({
+      runs: [{
+        id: 'global-cron-run',
+        job_name: 'workspace-writer',
+        cron_expr: '* * * * *',
+        started_at: '2026-08-29T00:00:00Z',
+        completed_at: '2026-08-29T00:00:01Z',
+        status: 'success',
+        output: null,
+        is_read: false,
+        artifacts: null,
+        run_workspace: null,
+        workspace_changes: [{
+          entry_id: 'workspace-file',
+          operation: 'updated',
+          path: 'report.md',
+          revision: 2,
+        }],
+      }],
+      total: 1,
+      offset: 0,
+      limit: 20,
+    });
+    const invalidations: Array<{ entryId?: string; revision?: number }> = [];
+    const unsubscribe = subscribeWorkspaceMutation((detail) => {
+      if (detail.entryId === 'workspace-file') invalidations.push(detail);
+    });
+    render(<App />);
+    await act(async () => { await Promise.resolve(); });
+    expect(mockControls.cronRunsGet).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText('open-workspace-file'));
+
+    await waitFor(() => expect(mockControls.cronRunsGet).toHaveBeenCalledWith(undefined, 10, 0));
+    expect(invalidations).toEqual([
+      expect.objectContaining({ entryId: 'workspace-file', revision: 2, origin: 'server' }),
+    ]);
+    expect(screen.getByTestId('active-primary-surface')).toHaveTextContent('chat');
+    unsubscribe();
+  });
+
+  it('首次深链解析失败时事务回滚到 /workspace，URL 不再指向未打开文件', async () => {
+    window.history.replaceState({}, '', '/workspace?entry=missing-file&path=missing.md');
+    mockControls.workspaceGet.mockRejectedValueOnce(new Error('missing'));
+
+    render(<App />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法解析工作区深链');
+    await waitFor(() => expect(`${window.location.pathname}${window.location.search}`).toBe('/workspace'));
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', '');
+  });
+
+  it('浏览器导航从 A 到 B 的延迟解析窗口隐藏 A，成功后才原子展示 B', async () => {
+    const entryA = { entry_id: 'success-entry-a', parent_id: null, name: 'a.md', kind: 'file', path: 'a.md', size_bytes: 1, mime_type: 'text/markdown', sha256: 'hash-a', revision: 1, status: 'active', created_at: 'now', updated_at: 'now' };
+    const entryB = { ...entryA, entry_id: 'success-entry-b', name: 'b.md', path: 'b.md', sha256: 'hash-b' };
+    const entryBRequest = deferred<{ data: typeof entryB }>();
+    window.history.replaceState({}, '', '/workspace?entry=success-entry-a&path=a.md');
+    mockControls.workspaceGet
+      .mockResolvedValueOnce({ data: entryA })
+      .mockImplementationOnce(() => entryBRequest.promise);
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'success-entry-a'));
+
+    act(() => {
+      window.history.pushState({}, '', '/workspace?entry=success-entry-b&path=b.md');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', '');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-target-resolving', 'true');
+    await act(async () => { entryBRequest.resolve({ data: entryB }); });
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'success-entry-b'));
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-target-resolving', 'false');
+  });
+
+  it('从已提交文件 A 跳到失败深链 B 时 replace 回 A，面板与 URL 保持同一 entry', async () => {
+    const entryA = { entry_id: 'entry-a', parent_id: null, name: 'a.md', kind: 'file', path: 'a.md', size_bytes: 1, mime_type: 'text/markdown', sha256: 'hash-a', revision: 1, status: 'active', created_at: 'now', updated_at: 'now' };
+    const entryBRequest = deferred<{ data: never }>();
+    window.history.replaceState({}, '', '/workspace?entry=entry-a&path=a.md');
+    mockControls.workspaceGet
+      .mockResolvedValueOnce({ data: entryA })
+      .mockImplementationOnce(() => entryBRequest.promise);
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'entry-a'));
+
+    act(() => {
+      window.history.pushState({}, '', '/workspace?entry=entry-b&path=b.md');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+
+    expect(window.location.search).toContain('entry=entry-b');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', '');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-target-resolving', 'true');
+    entryBRequest.reject(new Error('entry-b missing'));
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法解析工作区深链');
+    await waitFor(() => expect(`${window.location.pathname}${window.location.search}`).toBe('/workspace?entry=entry-a'));
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'entry-a');
+  });
+
+  it('工作区文件打开失败提示可由用户立即关闭', async () => {
+    mockControls.workspaceGet.mockRejectedValueOnce(new Error('workspace unavailable'));
+    render(<App />);
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('workspace:navigate', {
+        detail: { entryId: 'missing-file' },
+      }));
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法打开工作区文件，请刷新工作区后重试。');
+    fireEvent.click(screen.getByRole('button', { name: '关闭提示' }));
+    expect(screen.queryByTestId('session-switch-save-error')).not.toBeInTheDocument();
+  });
+
+  it('关闭工作区文件时清除 entry 深链，不能被 route effect 立即重新打开', async () => {
+    window.history.replaceState({}, '', '/workspace?entry=deep-file&path=deep.md');
+    mockControls.workspaceGet.mockResolvedValueOnce({ data: { entry_id: 'deep-file', parent_id: null, name: 'deep.md', kind: 'file', path: 'deep.md', size_bytes: 1, mime_type: 'text/markdown', sha256: 'hash', revision: 1, status: 'active', created_at: 'now', updated_at: 'now' } });
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'deep-file'));
+
+    fireEvent.click(screen.getByText('close-workspace-file'));
+
+    await waitFor(() => expect(window.location.pathname).toBe('/workspace'));
+    expect(window.location.search).toBe('');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', '');
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', '');
+  });
+
+  it('批量删除命中当前文件时同步关闭标签并 replace 掉失效 entry 深链', async () => {
+    window.history.replaceState({}, '', '/workspace?entry=deep-file&path=deep.md');
+    mockControls.workspaceGet.mockResolvedValueOnce({ data: { entry_id: 'deep-file', parent_id: null, name: 'deep.md', kind: 'file', path: 'deep.md', size_bytes: 1, mime_type: 'text/markdown', sha256: 'hash', revision: 1, status: 'active', created_at: 'now', updated_at: 'now' } });
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'deep-file'));
+
+    act(() => emitWorkspaceMutation({
+      operation: 'delete',
+      affectedEntryIds: ['deep-file', 'nested-file'],
+      tombstone: true,
+      origin: 'local',
+    }));
+
+    await waitFor(() => expect(`${window.location.pathname}${window.location.search}`).toBe('/workspace'));
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', '');
+  });
+
+  it('硬刷新 /workspace 时首帧同步进入工作区，不依赖 entry 请求', () => {
+    window.history.replaceState({}, '', '/workspace');
+    mockControls.workspaceGet.mockImplementation(() => new Promise(() => {}));
+
+    render(<App />);
+
+    expect(screen.getByTestId('sidebar-mode')).toHaveTextContent('workspace');
+    expect(screen.getByTestId('active-primary-surface')).toHaveTextContent('chat');
+    expect(screen.getByTestId('chat-primary-surface')).not.toHaveClass('hidden');
+    expect(screen.getByTestId('chat-v2')).toBeInTheDocument();
   });
 
   it('切换一级入口时保留 ChatV2 草稿与 waiting 状态，且不重复挂载或 abort', async () => {
@@ -514,7 +822,7 @@ describe('App 配置抽屉交互', () => {
     await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-b'));
   });
 
-  it('dirty A 的保存 Promise resolve 前必须一直停留在 A', async () => {
+  it('dirty A 的保存 Promise 未完成也立即切换到 B', async () => {
     let resolveSave!: (result: {
       ownerSessionId: string;
       ownerEpoch: number;
@@ -536,7 +844,7 @@ describe('App 配置抽屉交互', () => {
     fireEvent.click(screen.getByText('select-session-b'));
 
     await waitFor(() => expect(mockControls.sessionFilesSaveCalls).toHaveLength(1));
-    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-b');
 
     await act(async () => {
       resolveSave({
@@ -548,10 +856,10 @@ describe('App 配置抽屉交互', () => {
       });
       await Promise.resolve();
     });
-    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-b'));
+    expect(screen.queryByTestId('session-switch-save-error')).not.toBeInTheDocument();
   });
 
-  it('dirty A 保存失败时留在 A 并保留当前草稿', async () => {
+  it('dirty A 后台保存失败也切换到 B，返回 A 时聊天草稿仍在', async () => {
     render(<App />);
     fireEvent.click(screen.getByText('select-session-a'));
     await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a'));
@@ -567,12 +875,64 @@ describe('App 配置抽屉交互', () => {
     });
     fireEvent.click(screen.getByText('select-session-b'));
 
-    expect(await screen.findByTestId('session-switch-save-error')).toHaveTextContent('文件保存失败');
-    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a');
-    expect(draft).toHaveValue('A 的未保存草稿');
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-b'));
+    expect(screen.queryByTestId('session-switch-save-error')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText('select-session-a'));
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'ChatV2 草稿' })).toHaveValue('A 的未保存草稿'));
   });
 
-  it('当前 Session 的文件 owner handle 暂时缺失时保守阻止切换', async () => {
+  it('dirty Session 下的 entry 深链立即打开，文件保存留在后台', async () => {
+    render(<App />);
+    fireEvent.click(screen.getByText('select-session-a'));
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a'));
+
+    mockControls.sessionFilesDirty = true;
+    mockControls.sessionFilesSaveImpl = async (owner) => ({
+      ...owner,
+      ok: false,
+      stale: false,
+      failedPaths: ['report.md'],
+    });
+    mockControls.workspaceGet.mockResolvedValue({ data: { entry_id: 'deep-file', parent_id: null, name: 'deep.md', kind: 'file', path: 'deep.md', size_bytes: 1, mime_type: 'text/markdown', sha256: 'hash', revision: 1, status: 'active', created_at: 'now', updated_at: 'now' } });
+
+    // 地址栏/前进后退进入深链，绕过了应用内的点击入口。
+    act(() => {
+      window.history.pushState({}, '', '/workspace?entry=deep-file');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'deep-file'));
+    expect(window.location.pathname).toBe('/workspace');
+    expect(mockControls.workspaceGet).toHaveBeenCalled();
+    expect(mockControls.sessionFilesSaveCalls).toHaveLength(1);
+    expect(screen.queryByTestId('session-switch-save-error')).not.toBeInTheDocument();
+  });
+
+  it('dirty Session 下的 entry 深链 flush 成功后才投影目标文件', async () => {
+    render(<App />);
+    fireEvent.click(screen.getByText('select-session-a'));
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a'));
+
+    mockControls.sessionFilesDirty = true;
+    mockControls.sessionFilesSaveImpl = async (owner) => ({
+      ...owner,
+      ok: true,
+      stale: false,
+      failedPaths: [],
+    });
+    mockControls.workspaceGet.mockResolvedValue({ data: { entry_id: 'deep-file', parent_id: null, name: 'deep.md', kind: 'file', path: 'deep.md', size_bytes: 1, mime_type: 'text/markdown', sha256: 'hash', revision: 1, status: 'active', created_at: 'now', updated_at: 'now' } });
+
+    act(() => {
+      window.history.pushState({}, '', '/workspace?entry=deep-file');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-workspace-entry-id', 'deep-file'));
+    expect(mockControls.sessionFilesSaveCalls).toHaveLength(1);
+    expect(window.location.pathname).toBe('/workspace');
+  });
+
+  it('当前 Session 的文件 owner handle 暂时缺失时也立即切换', async () => {
     render(<App />);
     fireEvent.click(screen.getByText('select-session-a'));
     await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a'));
@@ -580,8 +940,8 @@ describe('App 配置抽屉交互', () => {
     fireEvent.click(screen.getByText('drop-files-handle'));
     fireEvent.click(screen.getByText('select-session-b'));
 
-    expect(await screen.findByTestId('session-switch-save-error')).toHaveTextContent('文件编辑状态仍在同步');
-    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a');
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-b'));
+    expect(screen.queryByTestId('session-switch-save-error')).not.toBeInTheDocument();
   });
 
   it('dirty A 新建会话前同样先保存，成功后才回到欢迎页', async () => {

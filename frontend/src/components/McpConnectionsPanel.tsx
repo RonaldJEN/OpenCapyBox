@@ -1085,7 +1085,6 @@ export default function McpConnectionsPanel({
         <FeedbackMessage
           className={`mcp-user-alert ${messageTone}`}
           tone={messageTone}
-          autoDismissMs={messageTone === 'success' ? 4000 : undefined}
           icon={messageTone === 'success' ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
           onDismiss={() => setMessage('')}
         >

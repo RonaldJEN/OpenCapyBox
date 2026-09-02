@@ -382,6 +382,27 @@ class TestSessionsRouter:
     def test_delete_session_awaits_agent_pool_remove_async(self, sessions_client):
         with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
             self._add_session(db, "delete-me")
+            from src.api.models.round import Round
+            from src.api.models.user_memory import MemoryEmbedding
+            from src.api.models.user_sandbox import UserSandbox
+            db.add(Round(
+                id="delete-round",
+                session_id="delete-me",
+                thread_id="delete-me",
+                user_message="delete",
+                status="completed",
+            ))
+            db.add(MemoryEmbedding(
+                user_id="user-1",
+                file_path="conversation/delete-me/delete-round",
+                conversation_round_id="delete-round",
+                chunk_text="delete me",
+            ))
+            db.add(UserSandbox(
+                id="sandbox-row-delete",
+                user_id="user-1",
+                sandbox_id="sandbox-delete",
+            ))
             db.commit()
 
         mock_pool = MagicMock()
@@ -389,29 +410,30 @@ class TestSessionsRouter:
         mock_sandbox_service = MagicMock()
         mock_sandbox_service.get_cached.return_value = None
         mock_sandbox_service.get_mount_path.return_value = "/home/user"
-        recovered_sandbox = MagicMock()
-        recovered_sandbox.commands.run = AsyncMock(return_value=make_fake_execution())
+        cleanup_runner = AsyncMock(return_value=True)
 
         with (
             patch("src.api.routes.sessions.get_agent_pool", return_value=mock_pool),
             patch("src.api.routes.sessions.get_sandbox_service", return_value=mock_sandbox_service),
-            patch(
-                "src.api.routes.sessions._ensure_sandbox",
-                new=AsyncMock(return_value=recovered_sandbox),
-            ) as ensure_sandbox,
+            patch("src.api.routes.sessions.enqueue_cleanup", return_value="cleanup-1") as enqueue,
+            patch("src.api.routes.sessions.run_cleanup_job", cleanup_runner),
         ):
             response = sessions_client.delete("/sessions/delete-me")
 
         assert response.status_code == 200
         assert response.json() == {"message": "会话已删除"}
         mock_pool.remove_async.assert_awaited_once_with("delete-me")
-        ensure_sandbox.assert_awaited_once()
-        recovered_sandbox.commands.run.assert_awaited_once()
-        assert "rm -rf /home/user/sessions/delete-me" in recovered_sandbox.commands.run.await_args.args[0]
+        enqueue.assert_called_once()
+        assert enqueue.call_args.kwargs["relative_path"] == "sessions/delete-me"
+        cleanup_runner.assert_awaited_once_with("cleanup-1")
 
         with sessions_client.SessionLocal() as db:  # type: ignore[attr-defined]
             from src.api.models.session import Session as SessionModel
+            from src.api.models.user_memory import MemoryEmbedding
             assert db.query(SessionModel).filter(SessionModel.id == "delete-me").count() == 0
+            assert db.query(MemoryEmbedding).filter(
+                MemoryEmbedding.conversation_round_id == "delete-round"
+            ).count() == 0
 
     def test_get_running_sessions_returns_all_user_slots(self, sessions_client):
         from src.api.utils.timezone import now_naive
@@ -831,13 +853,6 @@ class TestSessionsRouter:
         assert "filename*=UTF-8''" in result
         # URL 編碼後的中文
         assert "%E5%A0%B1%E5%91%8A.pdf" in result
-
-    def test_contains_non_ascii(self):
-        """測試非 ASCII 檢測"""
-        from src.api.routes.sessions import _contains_non_ascii
-
-        assert _contains_non_ascii("報告.xlsx") is True
-        assert _contains_non_ascii("report.xlsx") is False
 
     @pytest.mark.asyncio
     async def test_upload_file_missing_file_returns_400(self):
@@ -1709,6 +1724,28 @@ class TestSanitizeFilename:
 class TestEnsureSandbox:
     """_ensure_sandbox / _upsert_user_sandbox 輔助函數測試"""
 
+    @staticmethod
+    def _binding_db(*, user_sandbox=None, active_lock=None, cron_rows=None):
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.models.user_sandbox import UserSandbox
+        from src.api.models.user_memory import CronJobRun
+
+        mock_db = MagicMock()
+
+        def query_side_effect(*models):
+            query = MagicMock()
+            model = models[0]
+            if model is UserSandbox:
+                query.filter.return_value.first.return_value = user_sandbox
+            elif model is UserRunLock.lock_id:
+                query.filter.return_value.first.return_value = active_lock
+            elif model is CronJobRun.sandbox_id:
+                query.filter.return_value.all.return_value = cron_rows or []
+            return query
+
+        mock_db.query.side_effect = query_side_effect
+        return mock_db
+
     @pytest.mark.asyncio
     async def test_ensure_sandbox_returns_cached(self):
         """快取命中時直接返回，不調用 get_or_resume"""
@@ -1719,8 +1756,7 @@ class TestEnsureSandbox:
         sandbox_service = MagicMock()
         sandbox_service.get_cached.return_value = mock_sandbox
 
-        mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_db = self._binding_db()
 
         result = await _ensure_sandbox(sandbox_service, "user-1", mock_db)
 
@@ -1744,8 +1780,7 @@ class TestEnsureSandbox:
 
         user_sandbox = MagicMock()
         user_sandbox.sandbox_id = "sbx-new"
-        mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.first.return_value = user_sandbox
+        mock_db = self._binding_db(user_sandbox=user_sandbox)
 
         result = await _ensure_sandbox(sandbox_service, "user-1", mock_db)
 
@@ -1765,9 +1800,7 @@ class TestEnsureSandbox:
         sandbox_service.get_or_resume = AsyncMock(return_value=mock_sandbox)
         sandbox_service.get_sandbox_id.return_value = "sbx-new"
 
-        mock_db = MagicMock()
-        # 模擬 UserSandbox 查詢返回 None（新用戶）
-        mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_db = self._binding_db()
 
         result = await _ensure_sandbox(sandbox_service, "user-1", mock_db)
 
@@ -1789,8 +1822,7 @@ class TestEnsureSandbox:
         sandbox_service.get_or_resume = AsyncMock(return_value=mock_sandbox)
         sandbox_service.get_sandbox_id.return_value = "sbx-fresh"
 
-        mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_db = self._binding_db()
 
         result = await _ensure_sandbox(
             sandbox_service, "user-1", mock_db, force_refresh=True,
@@ -1798,6 +1830,84 @@ class TestEnsureSandbox:
 
         sandbox_service.invalidate_cache.assert_called_once_with("user-1")
         assert result is mock_sandbox
+
+    @pytest.mark.asyncio
+    async def test_active_agent_file_panel_only_reconnects_exact_binding(self):
+        """Agent 运行期间被动文件面板不得创建沙箱或改写用户绑定。"""
+        from src.api.routes.sessions import _ensure_sandbox
+
+        persisted = MagicMock()
+        persisted.sandbox_id = "sbx-running"
+        active_lock = MagicMock()
+        active_lock.lock_id = "lock-running"
+        expected = AsyncMock()
+        expected.id = "sbx-running"
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = None
+        sandbox_service.get_existing = AsyncMock(return_value=expected)
+        sandbox_service.get_or_resume = AsyncMock()
+        mock_db = self._binding_db(
+            user_sandbox=persisted,
+            active_lock=active_lock,
+        )
+
+        result = await _ensure_sandbox(sandbox_service, "user-1", mock_db)
+
+        assert result is expected
+        sandbox_service.get_existing.assert_awaited_once_with(
+            "user-1",
+            "sbx-running",
+        )
+        sandbox_service.get_or_resume.assert_not_awaited()
+        mock_db.commit.assert_called_once()
+
+
+    @pytest.mark.asyncio
+    async def test_active_cron_file_request_reconnects_frozen_run_sandbox(self):
+        """Cron claim 新鲜时忽略可变用户绑定，只连接 run 冻结的 ID。"""
+        from src.api.routes.sessions import _ensure_sandbox
+
+        persisted = MagicMock(sandbox_id="sbx-later")
+        expected = AsyncMock()
+        expected.id = "sbx-cron"
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = None
+        sandbox_service.get_existing = AsyncMock(return_value=expected)
+        sandbox_service.get_or_resume = AsyncMock()
+        mock_db = self._binding_db(
+            user_sandbox=persisted,
+            cron_rows=[("sbx-cron",)],
+        )
+
+        result = await _ensure_sandbox(sandbox_service, "user-1", mock_db)
+
+        assert result is expected
+        sandbox_service.get_existing.assert_awaited_once_with("user-1", "sbx-cron")
+        sandbox_service.get_or_resume.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_active_owner_without_frozen_id_rejects_cached_sandbox(self):
+        """fresh owner 尚未冻结 ID 时，任意进程 cache 都不能被动放行。"""
+        from src.api.routes.sessions import _ensure_sandbox
+        from src.api.services.sandbox_service import SandboxTemporarilyUnavailable
+
+        cached = AsyncMock()
+        cached.id = "sbx-unverified-cache"
+        sandbox_service = MagicMock()
+        sandbox_service.get_cached.return_value = cached
+        sandbox_service.get_existing = AsyncMock()
+        sandbox_service.get_or_resume = AsyncMock()
+        mock_db = self._binding_db(
+            user_sandbox=None,
+            cron_rows=[(None,)],
+        )
+
+        with pytest.raises(SandboxTemporarilyUnavailable, match="尚未冻结"):
+            await _ensure_sandbox(sandbox_service, "user-1", mock_db)
+
+        sandbox_service.get_cached.assert_not_called()
+        sandbox_service.get_existing.assert_not_awaited()
+        sandbox_service.get_or_resume.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_upsert_user_sandbox_updates_existing(self):
@@ -1834,6 +1944,7 @@ class TestEnsureSandbox:
         fresh_sandbox.commands.run = AsyncMock(side_effect=[
             make_fake_execution(stdout_text=""),
             make_fake_execution(stdout_text="NOT_EXISTS"),
+            make_fake_execution(stdout_text='{"size": 5, "mtime": 1.5, "mtime_ns": 1500000000}'),
         ])
 
         sandbox_service = MagicMock()
@@ -1848,12 +1959,20 @@ class TestEnsureSandbox:
         mock_session.user_id = "user-1"
 
         # 按模型類型返回不同的查詢結果
-        def query_side_effect(model):
+        def query_side_effect(*models):
+            from src.api.models.user_run_lock import UserRunLock
+            from src.api.models.user_memory import CronJobRun
+
             q = MagicMock()
+            model = models[0]
             if model is Session:
                 q.filter.return_value.first.return_value = mock_session
             elif model is UserSandbox:
                 q.filter.return_value.first.return_value = None  # 新用戶，無記錄
+            elif model is UserRunLock.lock_id:
+                q.filter.return_value.first.return_value = None
+            elif model is CronJobRun.sandbox_id:
+                q.filter.return_value.all.return_value = []
             return q
 
         mock_db = MagicMock()
@@ -1879,6 +1998,7 @@ class TestEnsureSandbox:
         assert result.path == "test.txt"
         assert result.size == 5
         assert result.type == "txt"
+        assert result.revision == "v1:5:1500000000"
         assert datetime.fromisoformat(result.modified).tzinfo == timezone.utc
 
     @pytest.mark.asyncio
@@ -1893,6 +2013,7 @@ class TestEnsureSandbox:
         sandbox.commands.run = AsyncMock(side_effect=[
             make_fake_execution(stdout_text=""),
             make_fake_execution(stdout_text="NOT_EXISTS"),
+            make_fake_execution(stdout_text='{"size": 5, "mtime": 2.5, "mtime_ns": 2500000000}'),
         ])
 
         sandbox_service = MagicMock()
@@ -1903,12 +2024,20 @@ class TestEnsureSandbox:
         mock_session.id = "session-1"
         mock_session.user_id = "user-1"
 
-        def query_side_effect(model):
+        def query_side_effect(*models):
+            from src.api.models.user_run_lock import UserRunLock
+            from src.api.models.user_memory import CronJobRun
+
             q = MagicMock()
+            model = models[0]
             if model is Session:
                 q.filter.return_value.first.return_value = mock_session
             elif model is UserSandbox:
                 q.filter.return_value.first.return_value = None
+            elif model is UserRunLock.lock_id:
+                q.filter.return_value.first.return_value = None
+            elif model is CronJobRun.sandbox_id:
+                q.filter.return_value.all.return_value = []
             return q
 
         mock_db = MagicMock()
@@ -1931,6 +2060,7 @@ class TestEnsureSandbox:
         assert result.path == "報告_最終版.docx"
         assert result.type == "docx"
         assert result.size == 5
+        assert result.revision == "v1:5:2500000000"
         assert sandbox.files.write.await_count == 1
         assert sandbox.files.write.await_args.args[0] == "/home/user/sessions/session-1/報告_最終版.docx"
 
@@ -1947,6 +2077,7 @@ class TestEnsureSandbox:
             make_fake_execution(stdout_text=""),
             make_fake_execution(stdout_text="EXISTS"),
             make_fake_execution(stdout_text="NOT_EXISTS"),
+            make_fake_execution(stdout_text='{"size": 5, "mtime": 3.5, "mtime_ns": 3500000000}'),
         ])
 
         sandbox_service = MagicMock()
@@ -1957,12 +2088,20 @@ class TestEnsureSandbox:
         mock_session.id = "session-1"
         mock_session.user_id = "user-1"
 
-        def query_side_effect(model):
+        def query_side_effect(*models):
+            from src.api.models.user_run_lock import UserRunLock
+            from src.api.models.user_memory import CronJobRun
+
             q = MagicMock()
+            model = models[0]
             if model is Session:
                 q.filter.return_value.first.return_value = mock_session
             elif model is UserSandbox:
                 q.filter.return_value.first.return_value = None
+            elif model is UserRunLock.lock_id:
+                q.filter.return_value.first.return_value = None
+            elif model is CronJobRun.sandbox_id:
+                q.filter.return_value.all.return_value = []
             return q
 
         mock_db = MagicMock()
@@ -1984,6 +2123,7 @@ class TestEnsureSandbox:
         assert result.name == "report_1_1.txt"
         assert result.path == "report_1_1.txt"
         assert result.type == "txt"
+        assert result.revision == "v1:5:3500000000"
         assert sandbox.files.write.await_args.args[0] == "/home/user/sessions/session-1/report_1_1.txt"
 
     @pytest.mark.asyncio
@@ -2011,12 +2151,20 @@ class TestEnsureSandbox:
         mock_session.id = "session-1"
         mock_session.user_id = "user-1"
 
-        def query_side_effect(model):
+        def query_side_effect(*models):
+            from src.api.models.user_run_lock import UserRunLock
+            from src.api.models.user_memory import CronJobRun
+
             q = MagicMock()
+            model = models[0]
             if model is Session:
                 q.filter.return_value.first.return_value = mock_session
             elif model is UserSandbox:
                 q.filter.return_value.first.return_value = None
+            elif model is UserRunLock.lock_id:
+                q.filter.return_value.first.return_value = None
+            elif model is CronJobRun.sandbox_id:
+                q.filter.return_value.all.return_value = []
             return q
 
         mock_db = MagicMock()
@@ -2121,129 +2269,6 @@ class TestCommandStdoutText:
         exe.logs = None
         exe.stdout = None
         assert _command_stdout_text(exe) == ""
-
-
-class TestAsciiAliasRead:
-    """_read_bytes_via_ascii_alias 輔助函數測試"""
-
-    @pytest.mark.asyncio
-    async def test_read_bytes_via_ascii_alias_success(self):
-        from src.api.routes.sessions import _read_bytes_via_ascii_alias
-
-        execution = MagicMock()
-        execution.exit_code = 0
-
-        sandbox = MagicMock()
-        sandbox.commands.run = AsyncMock(return_value=execution)
-        sandbox.files.read_bytes = AsyncMock(return_value=b"abc")
-
-        result = await _read_bytes_via_ascii_alias(
-            sandbox,
-            "/home/user/報告.xlsx",
-        )
-
-        assert result == b"abc"
-        assert sandbox.files.read_bytes.call_count == 1
-        # cp + rm
-        assert sandbox.commands.run.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_read_bytes_via_ascii_alias_copy_failed(self):
-        from src.api.routes.sessions import _read_bytes_via_ascii_alias
-
-        cp_execution = MagicMock()
-        cp_execution.exit_code = 1
-
-        rm_execution = MagicMock()
-        rm_execution.exit_code = 0
-
-        sandbox = MagicMock()
-        sandbox.commands.run = AsyncMock(side_effect=[cp_execution, rm_execution])
-        sandbox.files.read_bytes = AsyncMock()
-
-        result = await _read_bytes_via_ascii_alias(
-            sandbox,
-            "/home/user/報告.xlsx",
-        )
-
-        assert result is None
-        sandbox.files.read_bytes.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_read_bytes_fallback_to_command_when_sdk_fails(self):
-        """read_bytes 失敗時回退到 base64 命令讀取"""
-        import base64 as b64_mod
-        from src.api.routes.sessions import _read_bytes_via_ascii_alias
-
-        cp_execution = MagicMock()
-        cp_execution.exit_code = 0
-
-        encoded = b64_mod.b64encode(b"pptx-content").decode()
-        b64_line = MagicMock()
-        b64_line.text = encoded
-        b64_execution = MagicMock()
-        b64_execution.exit_code = 0
-        b64_execution.logs.stdout = [b64_line]
-
-        rm_execution = MagicMock()
-        rm_execution.exit_code = 0
-
-        sandbox = MagicMock()
-        sandbox.commands.run = AsyncMock(
-            side_effect=[cp_execution, b64_execution, rm_execution]
-        )
-        sandbox.files.read_bytes = AsyncMock(
-            side_effect=Exception("SDK proxy 500")
-        )
-
-        result = await _read_bytes_via_ascii_alias(
-            sandbox,
-            "/home/user/報告.pptx",
-        )
-
-        assert result == b"pptx-content"
-
-
-class TestReadNonAsciiFileBytes:
-    """Unicode 路徑依預覽/下載情境選擇最低往返讀取策略。"""
-
-    @pytest.mark.asyncio
-    async def test_preview_prefers_single_command(self, monkeypatch):
-        from src.api.routes import sessions
-
-        command_read = AsyncMock(return_value=b"html-preview")
-        alias_read = AsyncMock(return_value=b"alias-preview")
-        monkeypatch.setattr(sessions, "_read_bytes_via_command", command_read)
-        monkeypatch.setattr(sessions, "_read_bytes_via_ascii_alias", alias_read)
-
-        result = await sessions._read_non_ascii_file_bytes(
-            MagicMock(),
-            "/home/user/随便写写.html",
-            preview=True,
-        )
-
-        assert result == b"html-preview"
-        command_read.assert_awaited_once()
-        alias_read.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_download_keeps_alias_transport_first(self, monkeypatch):
-        from src.api.routes import sessions
-
-        command_read = AsyncMock(return_value=b"command-download")
-        alias_read = AsyncMock(return_value=b"large-download")
-        monkeypatch.setattr(sessions, "_read_bytes_via_command", command_read)
-        monkeypatch.setattr(sessions, "_read_bytes_via_ascii_alias", alias_read)
-
-        result = await sessions._read_non_ascii_file_bytes(
-            MagicMock(),
-            "/home/user/报告.pptx",
-            preview=False,
-        )
-
-        assert result == b"large-download"
-        alias_read.assert_awaited_once()
-        command_read.assert_not_awaited()
 
 
 class TestReadBytesViaCommand:
@@ -2356,9 +2381,9 @@ class TestSandboxListDir:
 
         sandbox = MagicMock()
         json_payload = json.dumps([
-            {"name": "report.pdf", "path": "/home/user/sessions/s1/report.pdf", "size": 2048, "mtime": 1750000000.0, "is_dir": False},
-            {"name": "data", "path": "/home/user/sessions/s1/data", "size": 0, "mtime": 1750000100.0, "is_dir": True},
-            {"name": "output.csv", "path": "/home/user/sessions/s1/output.csv", "size": 512, "mtime": 1750000200.0, "is_dir": False},
+            {"name": "report.pdf", "path": "/home/user/sessions/s1/report.pdf", "size": 2048, "mtime": 1750000000.0, "mtime_ns": 1750000000000000000, "is_dir": False},
+            {"name": "data", "path": "/home/user/sessions/s1/data", "size": 0, "mtime": 1750000100.0, "mtime_ns": 1750000100000000000, "is_dir": True},
+            {"name": "output.csv", "path": "/home/user/sessions/s1/output.csv", "size": 512, "mtime": 1750000200.0, "mtime_ns": 1750000200000000000, "is_dir": False},
         ], ensure_ascii=False)
         sandbox.commands.run = AsyncMock(
             return_value=make_fake_execution(stdout_text=json_payload)
@@ -2380,6 +2405,7 @@ class TestSandboxListDir:
         assert items[2].name == "report.pdf"
         assert items[2].is_directory is False
         assert items[2].size == 2048
+        assert items[2].revision == "v1:2048:1750000000000000000"
         assert items[2].modified == datetime.fromtimestamp(1750000000.0, timezone.utc).isoformat()
 
     @pytest.mark.asyncio
@@ -2388,11 +2414,11 @@ class TestSandboxListDir:
         from src.api.routes.sessions import _sandbox_list_dir
 
         json_payload = json.dumps([
-            {"name": "app.py", "path": "/home/user/sessions/s1/app.py", "size": 10, "mtime": 1750000000.0, "is_dir": False},
-            {"name": "node_modules", "path": "/home/user/sessions/s1/node_modules", "size": 0, "mtime": 1750000001.0, "is_dir": True},
-            {"name": "__pycache__", "path": "/home/user/sessions/s1/__pycache__", "size": 0, "mtime": 1750000002.0, "is_dir": True},
-            {"name": ".agent_memory.json", "path": "/home/user/sessions/s1/.agent_memory.json", "size": 13, "mtime": 1750000003.0, "is_dir": False},
-            {"name": "result.xlsx", "path": "/home/user/sessions/s1/result.xlsx", "size": 99, "mtime": 1750000004.0, "is_dir": False},
+            {"name": "app.py", "path": "/home/user/sessions/s1/app.py", "size": 10, "mtime": 1750000000.0, "mtime_ns": 1750000000000000000, "is_dir": False},
+            {"name": "node_modules", "path": "/home/user/sessions/s1/node_modules", "size": 0, "mtime": 1750000001.0, "mtime_ns": 1750000001000000000, "is_dir": True},
+            {"name": "__pycache__", "path": "/home/user/sessions/s1/__pycache__", "size": 0, "mtime": 1750000002.0, "mtime_ns": 1750000002000000000, "is_dir": True},
+            {"name": ".agent_memory.json", "path": "/home/user/sessions/s1/.agent_memory.json", "size": 13, "mtime": 1750000003.0, "mtime_ns": 1750000003000000000, "is_dir": False},
+            {"name": "result.xlsx", "path": "/home/user/sessions/s1/result.xlsx", "size": 99, "mtime": 1750000004.0, "mtime_ns": 1750000004000000000, "is_dir": False},
         ], ensure_ascii=False)
         sandbox = MagicMock()
         sandbox.commands.run = AsyncMock(
@@ -2441,7 +2467,7 @@ class TestSandboxListDir:
         from src.api.routes.sessions import _sandbox_list_dir
 
         json_payload = json.dumps([
-            {"name": "chart.png", "path": "/home/user/sessions/s1/reports/chart.png", "size": 1024, "mtime": 1750000000.0, "is_dir": False},
+            {"name": "chart.png", "path": "/home/user/sessions/s1/reports/chart.png", "size": 1024, "mtime": 1750000000.0, "mtime_ns": 1750000000000000000, "is_dir": False},
         ], ensure_ascii=False)
         sandbox = MagicMock()
         sandbox.commands.run = AsyncMock(
@@ -2460,9 +2486,9 @@ class TestSandboxListDir:
         from src.api.routes.sessions import _sandbox_list_dir
 
         json_payload = json.dumps([
-            {"name": ".hidden", "path": "/home/user/sessions/s1/.hidden", "size": 0, "mtime": 1750000000.0, "is_dir": True},
-            {"name": ".env", "path": "/home/user/sessions/s1/.env", "size": 50, "mtime": 1750000001.0, "is_dir": False},
-            {"name": "visible.txt", "path": "/home/user/sessions/s1/visible.txt", "size": 100, "mtime": 1750000002.0, "is_dir": False},
+            {"name": ".hidden", "path": "/home/user/sessions/s1/.hidden", "size": 0, "mtime": 1750000000.0, "mtime_ns": 1750000000000000000, "is_dir": True},
+            {"name": ".env", "path": "/home/user/sessions/s1/.env", "size": 50, "mtime": 1750000001.0, "mtime_ns": 1750000001000000000, "is_dir": False},
+            {"name": "visible.txt", "path": "/home/user/sessions/s1/visible.txt", "size": 100, "mtime": 1750000002.0, "mtime_ns": 1750000002000000000, "is_dir": False},
         ], ensure_ascii=False)
         sandbox = MagicMock()
         sandbox.commands.run = AsyncMock(

@@ -66,6 +66,12 @@ class TestAnthropicClientInit:
             assert client.api_key == "test-key"
             assert client.api_base == "https://api.example.com"
             assert client.model == "test-model"
+            kwargs = mock_anthropic.call_args.kwargs
+            assert kwargs["max_retries"] == 0
+            assert kwargs["timeout"].connect == 10.0
+            assert kwargs["timeout"].read == 120.0
+            assert kwargs["timeout"].write == 60.0
+            assert kwargs["timeout"].pool == 10.0
 
     def test_client_with_retry_config(self):
         """測試帶重試配置的客戶端初始化"""

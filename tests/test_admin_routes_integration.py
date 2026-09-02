@@ -26,6 +26,7 @@ from src.api.models.subagent_run import SubagentRun
 from src.api.models.user_sandbox import UserSandbox
 from src.api.models.user_sandbox_config import UserSandboxConfig
 from src.api.models.user_run_lock import UserRunLock
+from src.api.models.workspace import UserWorkspace
 from src.api.routes import admin as admin_routes
 from src.api.utils.timezone import now_naive
 from tests.db_safety import create_all_for_test_engine, ensure_safe_test_database_url, load_dotenv_database_url
@@ -764,6 +765,7 @@ def test_user_sandbox_profile_patch_same_active_profile_is_noop(admin_integratio
     finally:
         db.close()
 
+
     with patch("src.api.routes.admin.get_agent_pool") as get_agent_pool_mock, \
          patch("src.api.routes.admin.SandboxSessionService") as sandbox_service_cls:
         response = client.patch(
@@ -786,6 +788,81 @@ def test_user_sandbox_profile_patch_same_active_profile_is_noop(admin_integratio
         assert user_sandbox.active_profile_version == 3
     finally:
         db.close()
+
+
+@pytest.mark.parametrize(
+    ("force_recreate", "profile_version", "active_version"),
+    [
+        (True, 3, 3),
+        (False, 4, 3),
+    ],
+)
+def test_nonempty_workspace_blocks_force_recreate_and_stale_profile_rebuild(
+    admin_integration_client,
+    force_recreate,
+    profile_version,
+    active_version,
+):
+    client, SessionLocal = admin_integration_client
+    user_id = f"workspace-rebuild-{force_recreate}-{profile_version}"
+    profile_id = f"workspace-profile-{force_recreate}-{profile_version}"
+    db = SessionLocal()
+    try:
+        db.add(AuthUser(
+            user_id=user_id,
+            username=user_id,
+            auth_type="simple",
+            enabled=True,
+        ))
+        db.add(SandboxProfile(
+            id=profile_id,
+            name=profile_id,
+            domain="10.0.0.5:8080",
+            api_key="secret-workspace",
+            enabled=True,
+            version=profile_version,
+        ))
+        db.add(UserSandboxConfig(
+            id=f"config-{user_id}",
+            user_id=user_id,
+            sandbox_profile_id=profile_id,
+            updated_by="admin",
+        ))
+        db.add(UserSandbox(
+            id=f"binding-{user_id}",
+            user_id=user_id,
+            sandbox_id=f"sbx-{user_id}",
+            active_profile_id=profile_id,
+            active_profile_version=active_version,
+            status="active",
+        ))
+        db.add(UserWorkspace(
+            user_id=user_id,
+            root_path="/home/user/workdir",
+            active_profile_id=profile_id,
+            active_profile_version=active_version,
+            quota_bytes=1024,
+            used_bytes=7,
+            entry_count=1,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    with patch("src.api.routes.admin.get_agent_pool") as get_agent_pool_mock, \
+         patch("src.api.routes.admin.SandboxSessionService") as sandbox_service_cls:
+        response = client.patch(
+            f"/admin/users/{user_id}/sandbox-profile",
+            json={
+                "sandbox_profile_id": profile_id,
+                "force_recreate": force_recreate,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "WORKSPACE_PROFILE_SWITCH_BLOCKED"
+    get_agent_pool_mock.assert_not_called()
+    sandbox_service_cls.assert_not_called()
 
 
 def test_users_payload_exposes_missing_explicit_sandbox_profile(admin_integration_client):

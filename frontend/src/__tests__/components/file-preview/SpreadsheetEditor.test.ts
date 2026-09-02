@@ -1,12 +1,15 @@
-import { CellValueType } from '@univerjs/core';
+import { CellValueType, CommandType } from '@univerjs/core';
+import { SetRangeValuesMutation } from '@univerjs/sheets';
 import { describe, expect, it, vi } from 'vitest';
 import * as XLSX from 'xlsx';
 import {
   applySpreadsheetAccessMode,
+  createSpreadsheetContentTracker,
   getSpreadsheetSheetsUiConfig,
   isSpreadsheetReadOnly,
   readSpreadsheetSource,
   sheetJsToUniverWorkbook,
+  shouldMarkSpreadsheetDirty,
   snapshotToArrayBuffer,
 } from '../../../components/file-preview/SpreadsheetEditor';
 
@@ -93,6 +96,35 @@ function addCalculationChain(source: ArrayBuffer): ArrayBuffer {
 }
 
 describe('SpreadsheetEditor 文件格式桥接', () => {
+  it('内容 tracker 忽略初始化重复灌入和公式缓存重算，只报告真实值/公式变化', () => {
+    const snapshot = sheetJsToUniverWorkbook(workbookWithTwoSheets(), '模型.xlsx');
+    const tracker = createSpreadsheetContentTracker(snapshot);
+
+    expect(tracker.apply({ subUnitId: 'sheet-1', cellValue: { 1: { 1: { v: 12 } } } })).toBe(false);
+    expect(tracker.apply({ subUnitId: 'sheet-1', cellValue: { 1: { 2: { v: 25 } } } })).toBe(false);
+    expect(tracker.apply({ subUnitId: 'sheet-1', cellValue: { 1: { 1: { v: 13 } } } })).toBe(true);
+    expect(tracker.apply({ subUnitId: 'sheet-1', cellValue: { 1: { 2: { f: 'B2*3', v: 39 } } } })).toBe(true);
+  });
+
+  it('远端 changeset 只更新 tracker 基线，不触发工作区自动写回', () => {
+    const snapshot = sheetJsToUniverWorkbook(workbookWithTwoSheets(), '模型.xlsx');
+    const tracker = createSpreadsheetContentTracker(snapshot);
+    const command = (value: number) => ({
+      id: SetRangeValuesMutation.id,
+      type: CommandType.MUTATION,
+      params: {
+        unitId: snapshot.id,
+        subUnitId: 'sheet-1',
+        cellValue: { 1: { 1: { v: value } } },
+      },
+    });
+
+    expect(shouldMarkSpreadsheetDirty(command(13), { fromChangeset: true }, tracker, snapshot.id, false)).toBe(false);
+    expect(shouldMarkSpreadsheetDirty(command(13), undefined, tracker, snapshot.id, false)).toBe(false);
+    expect(shouldMarkSpreadsheetDirty(command(14), undefined, tracker, snapshot.id, false)).toBe(true);
+    expect(shouldMarkSpreadsheetDirty(command(15), undefined, tracker, 'other-workbook', false)).toBe(false);
+  });
+
   it('viewer 关闭数字文本提醒，避免 ET 点击单元格时泄露缺失语言键', () => {
     expect(getSpreadsheetSheetsUiConfig(true)).toEqual({ disableForceStringAlert: true });
     expect(getSpreadsheetSheetsUiConfig(false)).toEqual({ disableForceStringAlert: false });
@@ -168,11 +200,13 @@ describe('SpreadsheetEditor 文件格式桥接', () => {
     expect(snapshot.sheets['sheet-1'].cellData?.[1]?.[1]).toEqual({
       v: 12,
       t: CellValueType.NUMBER,
+      s: { n: { pattern: '#,##0.00' } },
     });
     expect(snapshot.sheets['sheet-1'].cellData?.[2]?.[1]).toEqual(expect.objectContaining({
       f: '=SUM(B2:B2)',
       v: 12,
     }));
+    expect(snapshot.sheets['sheet-1'].cellData?.[1]?.[2]?.s).toEqual({ n: { pattern: '0.00' } });
   });
 
   it('在原 OOXML 上只补丁值/公式/清空，并保留链接、批注、数字格式和未编辑公式', () => {
@@ -180,6 +214,7 @@ describe('SpreadsheetEditor 文件格式桥接', () => {
     const original = readSpreadsheetSource(source, 'xlsx');
     const snapshot = sheetJsToUniverWorkbook(original, '模型.xlsx');
     snapshot.sheets['sheet-1'].cellData![1]![1] = {
+      ...snapshot.sheets['sheet-1'].cellData![1]![1],
       v: 99,
       t: CellValueType.NUMBER,
     };
@@ -208,6 +243,31 @@ describe('SpreadsheetEditor 文件格式桥接', () => {
     expect(zipEntryWithSuffix(output, '/xl/comments1.xml')).toEqual(zipEntryWithSuffix(source, '/xl/comments1.xml'));
   });
 
+  it('空白 XLSX 首次输入的 null 编辑器字段不会被误判为格式修改', () => {
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([]), 'Sheet1');
+    const source = XLSX.write(workbook, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
+    const original = readSpreadsheetSource(source, 'xlsx');
+    const snapshot = sheetJsToUniverWorkbook(original, '未命名.xlsx');
+    snapshot.sheets['sheet-1'].cellData = {
+      0: {
+        0: {
+          v: 'luna-diagnose-1',
+          t: CellValueType.STRING,
+          f: null,
+          si: null,
+          p: null,
+          ref: null,
+          custom: null,
+        },
+      },
+    };
+
+    const output = snapshotToArrayBuffer(snapshot, original, 'xlsx');
+
+    expect(readSpreadsheetSource(output, 'xlsx').Sheets.Sheet1.A1.v).toBe('luna-diagnose-1');
+  });
+
   it('拒绝改写数组/共享公式，并在普通值变化后移除陈旧 calcChain', () => {
     const arrayFormulaSource = replaceZipXml(serializeWorkbook('xlsx'), '/xl/worksheets/sheet1.xml', (xml) => (
       xml.replace('<f>SUM(B2:B2)</f>', '<f t="array" ref="B3:B3">SUM(B2:B2)</f>')
@@ -223,7 +283,11 @@ describe('SpreadsheetEditor 文件格式桥接', () => {
     const calcChainSource = addCalculationChain(serializeWorkbook('xlsx'));
     const calcChainWorkbook = readSpreadsheetSource(calcChainSource, 'xlsx');
     const calcChainSnapshot = sheetJsToUniverWorkbook(calcChainWorkbook, '计算链.xlsx');
-    calcChainSnapshot.sheets['sheet-1'].cellData![1]![1] = { v: 99, t: CellValueType.NUMBER };
+    calcChainSnapshot.sheets['sheet-1'].cellData![1]![1] = {
+      ...calcChainSnapshot.sheets['sheet-1'].cellData![1]![1],
+      v: 99,
+      t: CellValueType.NUMBER,
+    };
     const output = snapshotToArrayBuffer(calcChainSnapshot, calcChainWorkbook, 'xlsx');
     const archive = XLSX.CFB.read(new Uint8Array(output), { type: 'buffer' }) as { FullPaths: string[] };
 
@@ -233,7 +297,7 @@ describe('SpreadsheetEditor 文件格式桥接', () => {
     expect(readSpreadsheetSource(output, 'xlsx').Sheets['汇总'].B2.v).toBe(99);
   });
 
-  it('格式或工作表结构 mutation 不会伪装成已成功保存', () => {
+  it('忽略编辑器附带样式但拒绝工作表结构 mutation', () => {
     const source = serializeWorkbook('xlsx');
     const original = readSpreadsheetSource(source, 'xlsx');
     const styledSnapshot = sheetJsToUniverWorkbook(original, '模型.xlsx');
@@ -241,9 +305,8 @@ describe('SpreadsheetEditor 文件格式桥接', () => {
       ...styledSnapshot.sheets['sheet-1'].cellData![1]![1],
       s: 'unsupported-style',
     };
-    expect(() => snapshotToArrayBuffer(styledSnapshot, original, 'xlsx')).toThrow(
-      '格式修改未保存',
-    );
+    const styledOutput = snapshotToArrayBuffer(styledSnapshot, original, 'xlsx');
+    expect(readSpreadsheetSource(styledOutput, 'xlsx').Sheets['汇总'].B2.z).toBe('#,##0.00');
 
     const resizedSnapshot = sheetJsToUniverWorkbook(original, '模型.xlsx');
     resizedSnapshot.sheets['sheet-1'].rowData = { 1: { h: 48 } };

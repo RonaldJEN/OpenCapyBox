@@ -58,10 +58,10 @@ class InProcessAgentEngine:
         self,
         turn: NormalizedResumeTurn,
     ) -> PreparedAgentRun:
-        return await self.service.prepare_resume_round(
-            interrupt_id=turn.interrupt_id,
-            answers=turn.answers,
-        )
+        kwargs = {"interrupt_id": turn.interrupt_id, "answers": turn.answers}
+        if turn.context:
+            kwargs["contexts"] = turn.context
+        return await self.service.prepare_resume_round(**kwargs)
 
     def stream(
         self,

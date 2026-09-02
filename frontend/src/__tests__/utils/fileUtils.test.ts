@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { isImageFile, getFileIcon, inferFileType, getFileExtLabel, getFileBadgeClass, getFileIconClass, normalizeFileType } from '../../utils/fileUtils';
-import { FileImage, FileSpreadsheet, FileText } from 'lucide-react';
+import { File, FileArchive, FileCode, FileImage, FileSpreadsheet, FileText, Folder, Presentation } from 'lucide-react';
 
 describe('fileUtils.isImageFile', () => {
   it('MIME 為 image/* 時應判斷為圖片', () => {
@@ -27,6 +27,22 @@ describe('fileUtils.getFileIcon', () => {
   it('一般文字檔應回傳 FileText icon', () => {
     const icon = getFileIcon({ name: 'notes.md', type: 'md' });
     expect(icon).toBe(FileText);
+  });
+
+  it('按格式族区分文档、表格、演示、代码、图片、压缩包和未知文件', () => {
+    expect(getFileIcon({ name: 'proposal.docx' })).toBe(FileText);
+    expect(getFileIcon({ name: 'manual.pdf' })).toBe(FileText);
+    expect(getFileIcon({ name: 'budget.xlsx' })).toBe(FileSpreadsheet);
+    expect(getFileIcon({ name: 'slides.pptx' })).toBe(Presentation);
+    expect(getFileIcon({ name: 'config.json' })).toBe(FileCode);
+    expect(getFileIcon({ name: 'photo.png' })).toBe(FileImage);
+    expect(getFileIcon({ name: 'bundle.zip' })).toBe(FileArchive);
+    expect(getFileIcon({ name: 'README' })).toBe(File);
+  });
+
+  it('文件夹应使用 Folder icon，而不是按名称误判文件类型', () => {
+    expect(getFileIcon({ name: '图片.png', is_directory: true })).toBe(Folder);
+    expect(isImageFile({ name: '图片.png', is_directory: true })).toBe(false);
   });
 });
 
@@ -67,6 +83,7 @@ describe('fileUtils.readable labels and classes', () => {
     expect(getFileExtLabel({ name: 'slides.pptx' })).toBe('PPTX');
     expect(getFileExtLabel({ name: 'manual.pdf' })).toBe('PDF');
     expect(getFileExtLabel({ name: 'budget.et' })).toBe('ET');
+    expect(getFileExtLabel({ name: '研究', is_directory: true })).toBe('文件夹');
   });
 
   it('應為不同類型返回對應 token 類別', () => {

@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, act } from '../utils/test-utils';
+import { render, screen, fireEvent, waitFor, act, within } from '../utils/test-utils';
 import { SessionList } from '../../components/SessionList';
 import { apiService } from '../../services/api';
 import { SessionStatus } from '../../types';
+
+const workspaceClient = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn() }));
 
 // Mock apiService
 vi.mock('../../services/api', () => ({
@@ -13,6 +15,7 @@ vi.mock('../../services/api', () => ({
     getUserId: vi.fn(() => 'mock-session'),
     isAdminUser: vi.fn(() => false),
     getRunningSessions: vi.fn().mockResolvedValue({ running_sessions: [] }),
+    getAxiosClient: vi.fn(() => workspaceClient),
   },
 }));
 
@@ -52,21 +55,51 @@ describe('SessionList 組件', () => {
       sessions: mockSessions,
     });
     vi.mocked(apiService.getRunningSessions).mockResolvedValue({ running_sessions: [] });
+    workspaceClient.get.mockResolvedValue({ data: { items: [], next_cursor: null, workspace_revision: 1 } });
   });
 
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it('應該顯示載入狀態', () => {
+  it('会话加载使用紧凑骨架，不显示会无限旋转的 spinner', () => {
     vi.mocked(apiService.getSessions).mockImplementation(
       () => new Promise(() => {})
     );
 
     render(<SessionList onSessionSelect={vi.fn()} />);
 
-    // 檢查是否有載入動畫
-    expect(document.querySelector('.animate-spin')).toBeInTheDocument();
+    expect(screen.getByTestId('session-loading-state')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '会话' })).toBeInTheDocument();
+    expect(screen.getByRole('status', { name: '正在加载会话' })).toBeInTheDocument();
+    expect(screen.queryByText('正在加载会话…')).not.toBeInTheDocument();
+    expect(screen.getByTestId('session-loading-state').querySelector('.animate-spin')).toBeNull();
+  });
+
+  it('会话请求永久 pending 时不得阻塞工作区首屏投影', () => {
+    vi.mocked(apiService.getSessions).mockImplementation(() => new Promise(() => {}));
+    workspaceClient.get.mockImplementation(() => new Promise(() => {}));
+
+    render(<SessionList sidebarMode="workspace" onSessionSelect={vi.fn()} />);
+
+    expect(screen.getByRole('tab', { name: '工作区' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByTestId('workspace-sidebar-content')).toBeInTheDocument();
+    expect(screen.queryByTestId('session-loading-state')).not.toBeInTheDocument();
+  });
+
+  it('会话请求失败后结束 loading，并允许显式重试', async () => {
+    vi.mocked(apiService.getSessions)
+      .mockRejectedValueOnce(new Error('network unavailable'))
+      .mockResolvedValueOnce({ sessions: mockSessions });
+
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    expect(await screen.findByTestId('session-load-error')).toHaveTextContent('会话加载失败，请重试。');
+    expect(screen.queryByTestId('session-loading-state')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    expect(screen.getByTestId('session-loading-state')).toBeInTheDocument();
+    expect(await screen.findByText('測試會話 1')).toBeInTheDocument();
+    expect(apiService.getSessions).toHaveBeenCalledTimes(2);
   });
 
   it('應該顯示會話列表', async () => {
@@ -76,6 +109,28 @@ describe('SessionList 組件', () => {
       expect(screen.getByText('測試會話 1')).toBeInTheDocument();
       expect(screen.getByText('測試會話 2')).toBeInTheDocument();
     });
+  });
+
+  it('会话列表移除 HISTORY，并以固定紧凑行承载标题与次级信息', async () => {
+    render(<SessionList currentSessionId="session-1" onSessionSelect={vi.fn()} />);
+
+    await screen.findByText('測試會話 1');
+    expect(screen.queryByText('History', { exact: true })).not.toBeInTheDocument();
+    expect(screen.getByRole('tabpanel', { name: '会话' })).toHaveClass('flex', 'min-h-0', 'flex-1', 'pt-2');
+    expect(screen.getByTestId('session-list-scroll')).toHaveClass('min-h-0', 'flex-1', 'space-y-1', 'overflow-y-auto');
+    expect(screen.getByTestId('session-row-session-1')).toHaveClass('h-12', 'border-claude-border', 'bg-white/90');
+    expect(screen.getByTestId('session-row-session-2')).toHaveClass('h-12', 'border-transparent');
+  });
+
+  it('会话空态占满列表剩余区域并居中显示操作指引', async () => {
+    vi.mocked(apiService.getSessions).mockResolvedValue({ sessions: [] });
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    expect(await screen.findByText('暂无对话记录')).toBeInTheDocument();
+    expect(screen.getByTestId('session-empty-state')).toHaveClass(
+      'flex', 'min-h-0', 'flex-1', 'items-center', 'justify-center', 'text-center',
+    );
+    expect(screen.getByText('新建对话后，会话会保存在这里')).toBeInTheDocument();
   });
 
   it('折叠状态只由外层 AppSidebar 控制，不在列表内重复做宽度动画', async () => {
@@ -210,19 +265,11 @@ describe('SessionList 組件', () => {
     expect(mockNavigate).toHaveBeenCalledWith('/admin');
   });
 
-  it('應該顯示品牌名稱 OpenCapyBox', async () => {
+  it('應該顯示品牌名稱 bsbox', async () => {
     render(<SessionList onSessionSelect={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByText('OpenCapyBox')).toBeInTheDocument();
-    });
-  });
-
-  it('應該顯示 HISTORY 標籤', async () => {
-    render(<SessionList onSessionSelect={vi.fn()} />);
-
-    await waitFor(() => {
-      expect(screen.getByText('History')).toBeInTheDocument();
+      expect(screen.getByText('bsbox')).toBeInTheDocument();
     });
   });
 
@@ -231,10 +278,10 @@ describe('SessionList 組件', () => {
     render(<SessionList onSessionSelect={vi.fn()} onNewChat={mockOnNewChat} />);
 
     await waitFor(() => {
-      expect(screen.getByTitle('新建对话')).toBeInTheDocument();
+      expect(screen.getAllByTitle('新建对话')).toHaveLength(2);
     });
 
-    fireEvent.click(screen.getByTitle('新建对话'));
+    fireEvent.click(screen.getAllByTitle('新建对话')[0]);
     expect(mockOnNewChat).toHaveBeenCalledTimes(1);
   });
 
@@ -242,7 +289,7 @@ describe('SessionList 組件', () => {
     render(<SessionList onSessionSelect={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByText('OpenCapyBox')).toBeInTheDocument();
+      expect(screen.getByText('bsbox')).toBeInTheDocument();
     });
 
     expect(screen.queryByTitle('新建对话')).not.toBeInTheDocument();
@@ -321,7 +368,7 @@ describe('SessionList 組件', () => {
     render(<SessionList onSessionSelect={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByText('OpenCapyBox')).toBeInTheDocument();
+      expect(screen.getByText('bsbox')).toBeInTheDocument();
     });
 
     expect(apiService.getRunningSessions).not.toHaveBeenCalled();
@@ -378,12 +425,35 @@ describe('SessionList 組件', () => {
     fireEvent.click(screen.getByLabelText('清空搜索'));
 
     expect(screen.getByLabelText('搜索会话')).toHaveFocus();
+    expect(screen.getByText('測試會話 1')).toBeInTheDocument();
 
     await waitFor(() => {
       expect(vi.mocked(apiService.getSessions).mock.calls.length).toBeGreaterThan(callsBeforeClear);
     });
     const calls = vi.mocked(apiService.getSessions).mock.calls;
     expect(calls[calls.length - 1]).toEqual([]);
+  });
+
+  it('搜索请求尚未返回时仍可清空，并立即恢复完整列表缓存', async () => {
+    let resolveSearch!: (value: { sessions: typeof mockSessions }) => void;
+    vi.mocked(apiService.getSessions)
+      .mockResolvedValueOnce({ sessions: mockSessions })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSearch = resolve; }));
+    render(<SessionList onSessionSelect={vi.fn()} />);
+    expect(await screen.findByText('測試會話 1')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('搜索会话'), { target: { value: '仍在搜索' } });
+    expect(screen.getByRole('status', { name: '正在搜索会话' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '清空搜索' })).toBeInTheDocument();
+    await waitFor(() => expect(apiService.getSessions).toHaveBeenCalledWith('仍在搜索'));
+    fireEvent.click(screen.getByRole('button', { name: '清空搜索' }));
+
+    expect(screen.getByText('測試會話 1')).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: '正在搜索会话' })).not.toBeInTheDocument();
+    await act(async () => {
+      resolveSearch({ sessions: [] });
+      await Promise.resolve();
+    });
   });
 
   it('消息命中时应显示摘要', async () => {
@@ -697,7 +767,7 @@ describe('SessionList 組件', () => {
     fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '新建对话' })).toHaveFocus();
+      expect(screen.getAllByRole('button', { name: '新建对话' })[0]).toHaveFocus();
     });
   });
 
@@ -753,5 +823,114 @@ describe('SessionList 組件', () => {
       expect(screen.queryByText('測試會話 1')).not.toBeInTheDocument();
       expect(screen.getByText('測試會話 2')).toBeInTheDocument();
     });
+  });
+
+  it('会话/工作区使用 ARIA tabs，支持方向键切换并保持可见焦点', async () => {
+    const onModeChange = vi.fn();
+    const { rerender } = render(<SessionList onSessionSelect={vi.fn()} sidebarMode="sessions" onSidebarModeChange={onModeChange} />);
+    await screen.findByRole('tab', { name: '会话' });
+    const searchSlotClass = screen.getByTestId('sidebar-search-slot').className;
+    const tabsClass = screen.getByTestId('sidebar-mode-tabs').className;
+    expect(screen.getByTestId('sidebar-search-control')).toHaveClass('h-9');
+    const sessionsTab = screen.getByRole('tab', { name: '会话' });
+    expect(sessionsTab).toHaveAttribute('aria-selected', 'true');
+    fireEvent.keyDown(sessionsTab, { key: 'ArrowRight' });
+    expect(onModeChange).toHaveBeenCalledWith('workspace');
+    expect(screen.getByRole('tab', { name: '工作区' })).toHaveFocus();
+
+    rerender(<SessionList onSessionSelect={vi.fn()} sidebarMode="workspace" onSidebarModeChange={onModeChange} />);
+    expect(await screen.findByTestId('workspace-sidebar-content')).toBeInTheDocument();
+    expect(document.getElementById('sidebar-workspace-panel')).toHaveClass('-mx-3');
+    expect(screen.getByRole('tab', { name: '工作区' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByTestId('sidebar-search-slot')).toHaveClass(...searchSlotClass.split(' '));
+    expect(screen.getByTestId('sidebar-mode-tabs')).toHaveClass(...tabsClass.split(' '));
+    expect(screen.getByRole('textbox', { name: '搜索会话' })).toHaveClass('h-9');
+    expect(screen.getByRole('textbox', { name: '搜索会话' })).toHaveAttribute('placeholder', '搜索对话');
+    expect(screen.getByTestId('sidebar-mode-tabs')).not.toHaveClass('rounded-xl', 'bg-claude-hover/70');
+    expect(screen.getByTestId('workspace-panel-header')).toHaveClass('absolute', '-top-11');
+    expect(screen.getByRole('button', { name: '搜索工作区文件' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '工作区操作' })).toBeInTheDocument();
+  });
+
+  it('浏览会话列表后返回工作区时保留展开状态并刷新根目录与可见子目录', async () => {
+    const folder = {
+      entry_id: 'folder-1', parent_id: null, name: '研究', kind: 'directory', path: '研究',
+      size_bytes: 0, mime_type: null, sha256: null, revision: 1, status: 'active',
+      created_at: 'now', updated_at: 'now',
+    };
+    const child = {
+      entry_id: 'file-1', parent_id: 'folder-1', name: '报告.md', kind: 'file', path: '研究/报告.md',
+      size_bytes: 12, mime_type: 'text/markdown', sha256: 'hash', revision: 1, status: 'active',
+      created_at: 'now', updated_at: 'now',
+    };
+    const refreshedChild = {
+      ...child,
+      entry_id: 'file-2',
+      name: '最新报告.md',
+      path: '研究/最新报告.md',
+      revision: 2,
+    };
+    let childRequestCount = 0;
+    workspaceClient.get.mockImplementation(async (_url, config) => ({
+      data: {
+        items: config?.params?.parent_id === 'folder-1'
+          ? [childRequestCount++ === 0 ? child : refreshedChild]
+          : [folder],
+        next_cursor: null,
+        workspace_revision: 1,
+      },
+    }));
+
+    const { rerender } = render(
+      <SessionList onSessionSelect={vi.fn()} sidebarMode="workspace" />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: '展开 研究' }));
+    expect(await screen.findByRole('button', { name: '报告.md' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择 报告.md' }));
+
+    rerender(<SessionList onSessionSelect={vi.fn()} sidebarMode="sessions" />);
+    expect(document.getElementById('sidebar-workspace-panel')).not.toBeVisible();
+    rerender(<SessionList onSessionSelect={vi.fn()} sidebarMode="workspace" />);
+
+    expect(screen.getByRole('button', { name: '收起 研究' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '最新报告.md' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '报告.md' })).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('1 项状态已失效');
+    expect(screen.getByRole('button', { name: '删除' })).toBeDisabled();
+    await waitFor(() => {
+      expect(
+        workspaceClient.get.mock.calls.filter(([url]) => url === '/workspace/entries'),
+      ).toHaveLength(4);
+    });
+  });
+
+  it('会话模式在同一固定模式栏右侧提供紧凑的新建对话入口', async () => {
+    const onNewChat = vi.fn();
+    const { rerender } = render(
+      <SessionList onSessionSelect={vi.fn()} onNewChat={onNewChat} sidebarMode="sessions" />,
+    );
+    await screen.findByRole('tab', { name: '会话' });
+
+    const modeActions = screen.getByTestId('session-mode-actions');
+    expect(modeActions).toHaveClass('absolute', 'inset-y-0', 'right-1');
+    const modeNewChat = within(modeActions).getByRole('button', { name: '新建对话' });
+    expect(modeNewChat).toHaveClass('h-8', 'w-8');
+    expect(modeNewChat).toHaveAttribute('title', '新建对话');
+    fireEvent.click(modeNewChat);
+    expect(onNewChat).toHaveBeenCalledTimes(1);
+
+    const modeBarClass = screen.getByTestId('sidebar-mode-tabs').className;
+    rerender(<SessionList onSessionSelect={vi.fn()} onNewChat={onNewChat} sidebarMode="workspace" />);
+    expect(screen.queryByTestId('session-mode-actions')).not.toBeInTheDocument();
+    expect(screen.getByTestId('sidebar-mode-tabs')).toHaveClass(...modeBarClass.split(' '));
+    expect(await screen.findByTestId('workspace-panel-header')).toHaveClass('h-11', '-top-11');
+  });
+
+  it('移动端 Sheet 复用同一 tabs 与内容，并提供明确关闭按钮', async () => {
+    const onClose = vi.fn();
+    render(<SessionList mobileSheet sidebarMode="workspace" onSessionSelect={vi.fn()} onCloseMobileSheet={onClose} />);
+    expect(await screen.findByTestId('workspace-sidebar-content')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '关闭侧栏' }));
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

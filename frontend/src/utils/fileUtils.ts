@@ -8,6 +8,7 @@ import {
   File,
   FileArchive,
   FileCode,
+  Folder,
   FileImage,
   FileSpreadsheet,
   FileText,
@@ -84,7 +85,10 @@ export function detectFileCategory(file: { name: string; type?: string }): FileC
 /**
  * 判斷文件是否為圖片：同時兼容 MIME（image/*）與副檔名。
  */
-export function isImageFile(file: { name: string; type?: string }): boolean {
+type FileLike = { name: string; type?: string; is_directory?: boolean };
+
+export function isImageFile(file: FileLike): boolean {
+  if (file.is_directory) return false;
   if (file.type?.startsWith('image/')) {
     return true;
   }
@@ -95,7 +99,8 @@ export function isImageFile(file: { name: string; type?: string }): boolean {
 /**
  * 根據文件信息返回對應的 Lucide 圖標組件。
  */
-export function getFileIcon(file: { name: string; type?: string }): LucideIcon {
+export function getFileIcon(file: FileLike): LucideIcon {
+  if (file.is_directory) return Folder;
   const type = normalizeFileType(file.name, file.type);
   if (isImageFile(file)) return FileImage;
   if (SPREADSHEET_EXTS.has(type)) return FileSpreadsheet;
@@ -109,7 +114,8 @@ export function getFileIcon(file: { name: string; type?: string }): LucideIcon {
 /**
  * 返回右上角的擴展名標籤文字（大寫，最多 8 字符）。
  */
-export function getFileExtLabel(file: { name: string; type?: string }): string {
+export function getFileExtLabel(file: FileLike): string {
+  if (file.is_directory) return '文件夹';
   const ext = getExtFromName(file.name);
   if (ext) {
     if (ext === 'jpeg') return 'JPG';
@@ -158,7 +164,8 @@ export function getFileCategoryLabel(file: { name: string; type?: string }): str
   }
 }
 
-export function getFileBadgeClass(file: { name: string; type?: string }): string {
+export function getFileBadgeClass(file: FileLike): string {
+  if (file.is_directory) return 'bg-claude-accent/15 text-claude-accent';
   switch (detectFileCategory(file)) {
     case 'sheet':
       return 'bg-claude-success/15 text-claude-success';
@@ -179,7 +186,8 @@ export function getFileBadgeClass(file: { name: string; type?: string }): string
   }
 }
 
-export function getFileIconClass(file: { name: string; type?: string }): string {
+export function getFileIconClass(file: FileLike): string {
+  if (file.is_directory) return 'text-claude-accent';
   switch (detectFileCategory(file)) {
     case 'sheet':
       return 'text-claude-success';
@@ -209,14 +217,35 @@ export function toFileInfo(
   file: AttachmentInfo | FileInfo,
   fallbackSessionId?: string,
 ): FileInfo {
+  const fileInfo = file as FileInfo;
+  const attachment = file as AttachmentInfo;
+  const isFileInfo = typeof fileInfo.modified === 'string' || Boolean(fileInfo.content_mode);
+  const snapshotPath = attachment.snapshot_path || fileInfo.snapshot_path;
+  const resolvedPath = fileInfo.content_mode === 'captured'
+    ? snapshotPath || file.path
+    : isFileInfo
+      ? file.path
+      : snapshotPath || file.path;
   return {
     name: file.name,
-    path: file.path,
+    path: resolvedPath,
     size: file.size ?? 0,
     modified: (file as FileInfo).modified || '',
     type: normalizeFileType(file.name, file.type),
     data_url: file.data_url,
     session_id: file.session_id || fallbackSessionId,
+    source: file.source,
+    entry_id: file.entry_id,
+    revision: file.revision,
+    version_id: file.version_id,
+    version_sequence: file.version_sequence,
+    snapshot_path: snapshotPath,
+    tree_revision: file.tree_revision,
+    manifest_sha256: file.manifest_sha256,
+    workspace_path: (file as FileInfo).workspace_path || (file as AttachmentInfo).origin_path,
+    is_directory: file.is_directory || (file as AttachmentInfo).kind === 'directory',
+    content_mode: (file as FileInfo).content_mode,
+    assistant_ref_id: (file as FileInfo).assistant_ref_id,
   };
 }
 

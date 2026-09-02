@@ -149,15 +149,16 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 
 - Response 200: `{message: "会话已删除"}`
 - Error 404
-- 级联删除：Round (CASCADE) → AGUIEventLog、ConversationMessage、LLMCallRecord、AgentInteraction、ToolApprovalRequest 等从属事实，随后移除 AgentPoolService 缓存
-- 沙箱清理：尝试删除 workspace 目录，沙箱过期时仅删 DB 记录
+- 数据删除：移除 Session、Round 及其 events/messages/LLM calls/interactions/approvals；带 `conversation_round_id` 的新对话向量随 Round 删除。旧向量允许 ownership 为空，不回填且不阻断删除。
+- 物理删除：数据库事务同时写入精确 Sandbox cleanup job；Session 立即删除，no-follow worker 幂等删除 `sessions/{id}`。Sandbox 暂不可用时保留 job 重试，不再丢失清理意图。
 
 ### GET /api/sessions/{id}/files
 
 - Query: `path: str = ""`（相对子目录）
-- Response 200: `{files: [{name, path, size, modified, type, is_directory}], total}`
+- Response 200: `{files: [{name, path, size, modified, type, is_directory, revision}], total}`，其中文件 `revision` 固定为 `v1:<size>:<mtime_ns>` opaque identity。
 - `modified` 为带显式时区偏移的 ISO 8601 时间字符串，当前统一返回 UTC（如 `2026-05-08T02:30:00+00:00`）。
 - 只有成功枚举出的零项才返回 `200 + files=[]`；沙箱连接、目录命令或 JSON 解析失败会强制重连一次，仍失败返回 503，不得伪装成空目录。
+- 列表/预览/下载/上传都是被动 Sandbox consumer：请求先在 DB 中冻结本次访问的 owner 绑定并释放请求连接，再执行 Sandbox 网络 I/O。存在新鲜 Agent `UserRunLock` 或 Cron claim 时，只允许 `get_existing` 连接 owner 已冻结的 `sandbox_id`；绑定尚未冻结、互相冲突或实例不可恢复时返回 503，禁止 `get_or_resume` 创建替代实例或改写 `UserSandbox`。同一请求的重试必须复用首次冻结的绑定。
 - Error 404, 403（"路径越界"）, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 503（沙箱或目录读取不可用）
 - 目录枚举统一在用户沙箱内执行 Python `os.listdir/stat`，不依赖 proxy 模式下会丢 query 参数的 `files.search`
 
@@ -166,12 +167,15 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 - Query:
   - `preview: bool = False`
   - `render: "pdf" | null = null`；仅在 `preview=true` 时有效
+  - `edit: bool = False`；当前 Session 的 Markdown/CSV/XLSX 编辑读取必须传 `edit=true`。在同一次沙箱快照中读取正文、SHA-256 和文件 revision，响应正文来自该不可变副本，响应头为 `X-Session-File-Revision`、`X-Session-File-Modified`、`X-Session-Edit-Base`，禁止从目录 metadata 猜正文版本。
+  - `base_token: str | null`；配合 `edit=true` 读取指定编辑基线的固定正文，用于接纳合并回执。基线签名绑定用户、Session、相对路径、SHA、大小和 mtime；不允许编辑 captured/system 路径。
 - Response: 文件字节流，`Content-Disposition` = attachment（下载）或 inline（预览）
 - 可预览类型：text/\*、image/\*、PDF、JSON、XML
-- 非 ASCII 路径的内联预览优先使用一次沙箱命令读取，失败再走 ASCII 临时别名；下载仍优先别名 + SDK 字节传输，避免大文件进入 base64 stdout。
 - `render=pdf`：仅接受 DOC/DOCX/PPT/PPTX。在**用户 OpenSandbox 内**以单一进程完成源文件的 50 MiB 有界快照、SHA-256 与复制，API 主机不得读取或执行不可信 Office 内容；随后在沙箱内调用 LibreOffice。派生 PDF 缓存在 session 根目录下的隐藏 `.opencapybox-preview/{content_hash}/`，不得出现在文件列表中，并随 session 删除。
+- `.assistant-artifacts/{round}/...` 是服务端对助手产物创建的只读生成时快照，只能由结构化工具事实产生；隐藏目录不参与普通枚举，直接鉴权预览可使用 immutable cache header，并随 Session 删除。快照用于当前文件缺失时的只读兜底，读取快照不得创建或恢复当前文件。
 - 派生预览以文件内容 hash + 扩展名 + renderer 版本为缓存键；同内容重复预览直接复用 PDF。
 - 相同内容通过沙箱内原子目录锁收敛为一次转换；每请求使用唯一 scratch/LibreOffice profile，先验证临时 PDF 的 `%PDF-` magic 与大小，再原子发布，禁止命中 partial cache。
+- 请求取消或 shell/SDK 超时不得再次取消 `.incoming-*` 与 LibreOffice profile 的清理；清理和锁释放完成后才能传播取消。每次 Office 快照还必须在同一隐藏缓存根下删除严格匹配 `.incoming-<32位小写十六进制>` 且超过 300 秒的中断残留，不跟随 symlink、不触碰内容 hash 缓存目录或当前请求 scratch。
 - Office 源文件最大 50 MiB、派生 PDF 最大 100 MiB；shell `timeout -k` 与 OpenSandbox SDK timeout 双重限制转换时间。成功响应优先流式读取派生 PDF。
 - 失败只影响当前预览，不改变 Session/Round 状态。
 - Error 404（源文件不存在）, 400（"文件路径不合法" 或未开启 preview 却请求 render）, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 413（源或派生预览文件过大）, 415（不支持的派生格式）, 422（文档损坏/转换失败）, 503（沙箱或 renderer 不可用）, 504（转换超时）
@@ -179,10 +183,12 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 ### PUT /api/sessions/{id}/files/{path:path}
 
 - 支持 `.md/.markdown` 的 UTF-8 `content`，以及 `.csv/.xlsx` 的 `content_base64`；旧二进制 `.xls`、`.et` 与其余扩展名返回 415，只允许下载/只读预览。
-- Request 同时携带 `expected_size + expected_modified`。服务端在沙箱内复核当前 stat，再通过同目录临时文件与 `os.replace` 原子发布；版本不一致返回 409，禁止静默覆盖 Agent 或其他标签页的新版本。
-- 存在新鲜 `UserRunLock` 时返回 409，避免网页编辑器与 Agent 同时写 Session 文件。
+- 新编辑请求携带与正文成对取得的 `expected_revision`、`edit_base_token`，以及每代草稿稳定的 `save_id`。文件内容变化时复用 Workspace 三方合并算法：base 为打开时正文，current 为本次用户草稿，proposal 为远端当前正文；互不重叠的改动保留，重叠按既有算法用户草稿优先。最终在单文件锁内校验合并所依据的当前 SHA/size/mtime，再原子替换；并发变化有界重算，持续变化返回可重试 `SESSION_EDIT_RETRY`。受控 Session WriteTool 把调用开始时观察到的 SHA（新文件则为 must-not-exist）带入共享锁内 CAS；EditTool 同样携带读取正文的 SHA，变化时重读并重新计算，第二次仍变化则安全失败。任意 Bash/外部直接写文件不属于此协作锁协议。
+- 基线和幂等回执仅保存在 Session 隐藏 `.opencapybox-edit/{bases,receipts,locks}`，不创建 Workspace entry/version/reference/checkpoint。基线是独立复制的不可变字节，使用现有预览缓存预算和草稿基线保留天数清理，回执另限 4 MiB，Session 删除时一起删除；它们不是永久历史。重复 `save_id` 和相同请求返回原回执，不重复应用合并。基线不可用或文件结构不支持合并时显式保留草稿，不得只推进 revision 后覆盖。
+- 未携带 `edit_base_token` 的旧客户端仍使用 strict CAS；版本不一致返回 `409 {code:"SESSION_FILE_REVISION_CONFLICT", message, current, current_revision}`。旧草稿只有正文等于当前正文，或原 revision 与新读取基线一致时才能自动恢复；不能给未知来源旧草稿补一个新 revision 强写。
+- `UserRunLock` 不阻止 Session 在线写回，不得以用户级或 Session 级运行锁扩大为整区只写门槛。
 - Markdown 最大 5 MiB；电子表格解码后最大 20 MiB。CSV 必须是无 NUL 的有效 UTF-8；XLSX 必须是完整且有界的 OOXML ZIP，校验必要 XML、条目路径、重复/加密条目、CRC、总解压大小，以及 Content Types、根 `officeDocument`、workbook sheet 清单和 worksheet target 组成的完整关系图；Base64、文本编码、容器结构或关系图无效返回 422。
-- Response 200: 最新 `{name, path, size, modified, type, is_directory}`，其中 `modified` 是 UTC ISO 8601，用作下一次保存的版本令牌和前端“最近修改”时间。
+- Response 200: `{name, path, size, modified, type, is_directory, revision, edit_base_token, session_auto_merged}`。`session_auto_merged=true` 时客户端按回执 token 读取固定合并正文，将正文和基线一起接纳；读取失败仍保留草稿并使用相同 save_id 重试。`modified` 仅用于展示。
 
 ### GET /api/sessions/running-sessions
 
@@ -228,3 +234,5 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 - 不做会话归档
 - 不做文件版本管理
 - 不做大文件分片上传
+
+Workspace-origin 附件在工作区 entry 删除后不再从历史返回；按 entry_id 命名的平台 .workspace-snapshots 随工作区直接删除清理。独立 Session 产物不受影响。

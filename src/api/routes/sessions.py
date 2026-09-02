@@ -3,16 +3,14 @@ import asyncio
 import logging
 import base64 as b64_mod
 import binascii
-import io
 import inspect
 import json
 import mimetypes
 import os
 import posixpath
 import re as _re
-import zipfile
+from dataclasses import dataclass
 from typing import Literal
-from xml.etree import ElementTree
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import exists, func, or_
@@ -26,6 +24,7 @@ from src.api.models.llm_call_record import LLMCallRecord
 from src.api.schemas.session import CreateSessionResponse, SessionResponse, SessionListResponse, FileListResponse, FileInfo, UpdateSessionFileRequest, UpdateSessionTitleRequest
 from src.api.schemas.chat import HistoryResponseV2
 from src.api.services.sandbox_service import (
+    SandboxTemporarilyUnavailable,
     get_sandbox_service,
     resolve_sandbox_path,
     to_sandbox_relative_path,
@@ -33,6 +32,12 @@ from src.api.services.sandbox_service import (
 )
 from src.api.services.history_service import HistoryService
 from src.api.services.agent_service import AgentService
+from src.api.services.workspace_service import WorkspaceService
+from src.api.services.session_file_edit_service import SessionFileEditService
+from src.api.services.spreadsheet_edit_validation import (
+    validate_csv_edit_payload,
+    validate_xlsx_edit_payload,
+)
 from src.api.services.file_preview_service import (
     FilePreviewConversionError,
     FilePreviewSourceNotFoundError,
@@ -46,16 +51,18 @@ from src.api.services.running_rounds import main_running_round_join_condition
 from src.api.services.model_access_service import assert_user_can_access_model, resolve_default_model_for_user
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.user_sandbox import UserSandbox
+from src.api.models.user_memory import CronJobRun, MemoryEmbedding
 from src.api.models.channel_session_binding import ChannelSessionBinding
 from src.api.models.conversation_message import ConversationMessage
 from datetime import datetime, timedelta, timezone
 from src.api.utils.timezone import now_naive
 from src.api.config import get_settings
+from src.api.services.sandbox_cleanup_service import enqueue_cleanup, run_cleanup_job
 import shlex
 
 logger = logging.getLogger(__name__)
 import uuid
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote
 
 router = APIRouter()
 
@@ -64,211 +71,7 @@ _MAX_MARKDOWN_EDIT_BYTES = 5 * 1024 * 1024
 _MAX_SPREADSHEET_EDIT_BYTES = 20 * 1024 * 1024
 _EDITABLE_MARKDOWN_EXTENSIONS = {".md", ".markdown"}
 _EDITABLE_SPREADSHEET_EXTENSIONS = {".csv", ".xlsx"}
-_MAX_XLSX_ENTRY_COUNT = 10_000
-_MAX_XLSX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
-_MAX_XLSX_REQUIRED_XML_BYTES = 5 * 1024 * 1024
-_XLSX_REQUIRED_XML_PARTS = (
-    "[Content_Types].xml",
-    "_rels/.rels",
-    "xl/workbook.xml",
-    "xl/_rels/workbook.xml.rels",
-)
-_XLSX_WORKBOOK_CONTENT_TYPE = (
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
-)
-_XLSX_WORKSHEET_CONTENT_TYPE = (
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
-)
-
-
-def _validate_csv_edit_payload(content: bytes) -> None:
-    """Reject non UTF-8 CSV instead of silently replacing undecodable bytes."""
-
-    try:
-        decoded = content.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise ValueError("CSV 不是有效的 UTF-8 文本") from exc
-    if "\x00" in decoded:
-        raise ValueError("CSV 文本包含 NUL 字符")
-
-
-def _validate_xlsx_edit_payload(content: bytes) -> None:
-    """Validate the complete bounded OOXML ZIP before replacing the original."""
-
-    try:
-        with zipfile.ZipFile(io.BytesIO(content), "r") as archive:
-            entries = archive.infolist()
-            if not entries or len(entries) > _MAX_XLSX_ENTRY_COUNT:
-                raise ValueError("XLSX ZIP 条目数量无效")
-
-            names = [entry.filename.replace("\\", "/") for entry in entries]
-            if len(names) != len(set(names)):
-                raise ValueError("XLSX 包含重复 ZIP 条目")
-            for name in names:
-                path = name[:-1] if name.endswith("/") else name
-                if (
-                    not path
-                    or name.startswith("/")
-                    or any(part in {"", ".", ".."} for part in path.split("/"))
-                ):
-                    raise ValueError("XLSX ZIP 路径无效")
-            if any(entry.flag_bits & 0x1 for entry in entries):
-                raise ValueError("加密 XLSX 不支持在线编辑")
-            if sum(entry.file_size for entry in entries) > _MAX_XLSX_UNCOMPRESSED_BYTES:
-                raise ValueError("XLSX 解压后内容过大")
-
-            name_set = set(names)
-            if not set(_XLSX_REQUIRED_XML_PARTS).issubset(name_set):
-                raise ValueError("XLSX 缺少必要的 OOXML 结构")
-            if not any(
-                name.startswith("xl/worksheets/") and name.endswith(".xml")
-                for name in names
-            ):
-                raise ValueError("XLSX 缺少工作表")
-
-            parsed_parts: dict[str, ElementTree.Element] = {}
-            for part in _XLSX_REQUIRED_XML_PARTS:
-                info = archive.getinfo(part)
-                if info.file_size > _MAX_XLSX_REQUIRED_XML_BYTES:
-                    raise ValueError(f"XLSX 必要结构过大: {part}")
-                parsed_parts[part] = ElementTree.fromstring(archive.read(info))
-
-            def local_name(tag: str) -> str:
-                return tag.rsplit("}", 1)[-1]
-
-            def resolve_relationship_target(source_part: str, target: str) -> str:
-                parsed_target = urlsplit(target)
-                if (
-                    parsed_target.scheme
-                    or parsed_target.netloc
-                    or parsed_target.query
-                    or parsed_target.fragment
-                ):
-                    raise ValueError("XLSX 关系目标无效")
-                target_path = unquote(parsed_target.path).replace("\\", "/")
-                if target_path.startswith("/"):
-                    resolved = posixpath.normpath(target_path.lstrip("/"))
-                else:
-                    resolved = posixpath.normpath(
-                        posixpath.join(posixpath.dirname(source_part), target_path)
-                    )
-                if not resolved or resolved == ".." or resolved.startswith("../"):
-                    raise ValueError("XLSX 关系目标越界")
-                return resolved
-
-            content_types = parsed_parts["[Content_Types].xml"]
-            root_relationships = parsed_parts["_rels/.rels"]
-            workbook = parsed_parts["xl/workbook.xml"]
-            workbook_relationships = parsed_parts["xl/_rels/workbook.xml.rels"]
-            if local_name(content_types.tag) != "Types":
-                raise ValueError("XLSX Content Types 结构无效")
-            if local_name(root_relationships.tag) != "Relationships":
-                raise ValueError("XLSX 根关系结构无效")
-            if local_name(workbook.tag) != "workbook":
-                raise ValueError("XLSX workbook 结构无效")
-            if local_name(workbook_relationships.tag) != "Relationships":
-                raise ValueError("XLSX workbook 关系结构无效")
-
-            overrides = {
-                element.attrib.get("PartName", "").lstrip("/"): element.attrib.get("ContentType", "")
-                for element in content_types
-                if local_name(element.tag) == "Override"
-            }
-            if overrides.get("xl/workbook.xml") != _XLSX_WORKBOOK_CONTENT_TYPE:
-                raise ValueError("XLSX workbook Content Type 无效")
-
-            office_document_targets = []
-            for relationship in root_relationships:
-                if local_name(relationship.tag) != "Relationship":
-                    continue
-                relationship_type = relationship.attrib.get("Type", "")
-                if not relationship_type.endswith("/officeDocument"):
-                    continue
-                if relationship.attrib.get("TargetMode", "Internal") != "Internal":
-                    raise ValueError("XLSX workbook 不能使用外部关系")
-                office_document_targets.append(
-                    resolve_relationship_target("", relationship.attrib.get("Target", ""))
-                )
-            if office_document_targets != ["xl/workbook.xml"]:
-                raise ValueError("XLSX 根关系未唯一指向 workbook")
-
-            relationship_by_id: dict[str, ElementTree.Element] = {}
-            for relationship in workbook_relationships:
-                if local_name(relationship.tag) != "Relationship":
-                    continue
-                relationship_id = relationship.attrib.get("Id", "")
-                if not relationship_id or relationship_id in relationship_by_id:
-                    raise ValueError("XLSX workbook 关系 ID 无效")
-                relationship_by_id[relationship_id] = relationship
-
-            sheets = next(
-                (element for element in workbook if local_name(element.tag) == "sheets"),
-                None,
-            )
-            sheet_entries = [] if sheets is None else [
-                element for element in sheets if local_name(element.tag) == "sheet"
-            ]
-            if not sheet_entries:
-                raise ValueError("XLSX workbook 没有工作表")
-
-            sheet_ids: set[str] = set()
-            relationship_ids: set[str] = set()
-            worksheet_targets: set[str] = set()
-            for sheet in sheet_entries:
-                sheet_name = sheet.attrib.get("name", "").strip()
-                sheet_id = sheet.attrib.get("sheetId", "")
-                relationship_id = next(
-                    (
-                        value
-                        for attribute, value in sheet.attrib.items()
-                        if local_name(attribute) == "id"
-                    ),
-                    "",
-                )
-                if not sheet_name or not sheet_id.isdigit() or int(sheet_id) < 1:
-                    raise ValueError("XLSX 工作表声明无效")
-                if sheet_id in sheet_ids or relationship_id in relationship_ids:
-                    raise ValueError("XLSX 工作表声明重复")
-                sheet_ids.add(sheet_id)
-                relationship_ids.add(relationship_id)
-
-                relationship = relationship_by_id.get(relationship_id)
-                if relationship is None:
-                    raise ValueError("XLSX 工作表关系缺失")
-                if not relationship.attrib.get("Type", "").endswith("/worksheet"):
-                    raise ValueError("XLSX 工作表关系类型无效")
-                if relationship.attrib.get("TargetMode", "Internal") != "Internal":
-                    raise ValueError("XLSX 工作表不能使用外部关系")
-                worksheet_target = resolve_relationship_target(
-                    "xl/workbook.xml",
-                    relationship.attrib.get("Target", ""),
-                )
-                if worksheet_target in worksheet_targets or worksheet_target not in name_set:
-                    raise ValueError("XLSX 工作表目标无效")
-                if overrides.get(worksheet_target) != _XLSX_WORKSHEET_CONTENT_TYPE:
-                    raise ValueError("XLSX 工作表 Content Type 无效")
-                worksheet_info = archive.getinfo(worksheet_target)
-                if worksheet_info.file_size > _MAX_XLSX_REQUIRED_XML_BYTES:
-                    raise ValueError(f"XLSX 工作表结构过大: {worksheet_target}")
-                worksheet = ElementTree.fromstring(archive.read(worksheet_info))
-                if local_name(worksheet.tag) != "worksheet":
-                    raise ValueError("XLSX 工作表 XML 结构无效")
-                worksheet_targets.add(worksheet_target)
-
-            corrupt_entry = archive.testzip()
-            if corrupt_entry is not None:
-                raise ValueError(f"XLSX ZIP 条目损坏: {corrupt_entry}")
-    except (
-        zipfile.BadZipFile,
-        zipfile.LargeZipFile,
-        KeyError,
-        RuntimeError,
-        NotImplementedError,
-        ElementTree.ParseError,
-    ) as exc:
-        raise ValueError("XLSX 文件结构无效") from exc
-
-
+_SESSION_FILE_REVISION_RE = _re.compile(r"^v1:(0|[1-9][0-9]*):(0|[1-9][0-9]*)$")
 # 使用 AgentPoolService 管理 Agent 實例
 from src.api.services.agent_pool_service import get_agent_pool
 
@@ -368,13 +171,11 @@ async def _read_bytes_via_ascii_alias(sandbox, sandbox_path: str) -> bytes | Non
             logger.warning("ASCII 別名 cp 失敗: %s -> %s", sandbox_path, alias_path)
             return None
 
-        # 嘗試 SDK read_bytes
         try:
             return await sandbox.files.read_bytes(alias_path)
         except Exception as e:
             logger.warning("ASCII 別名 read_bytes 也失敗，改用命令讀取: %s — %s", alias_path, e)
 
-        # SDK 也不行時，用命令讀取
         return await _read_bytes_via_command(sandbox, alias_path)
     except Exception as e:
         logger.warning("ASCII 別名回退失敗: %s -> %s — %s", sandbox_path, alias_path, e)
@@ -566,6 +367,71 @@ def _get_user_sandbox_id(db: DBSession, user_id: str) -> str | None:
     return sandbox_id if isinstance(sandbox_id, str) and sandbox_id else None
 
 
+@dataclass(frozen=True)
+class _SandboxBindingState:
+    persisted_sandbox_id: str | None
+    active_sandbox_id: str | None
+    active_owner: bool
+
+
+def _get_sandbox_binding_state(db: DBSession, user_id: str) -> _SandboxBindingState:
+    """Freeze the passive request's Sandbox target and release its DB checkout."""
+    persisted_sandbox_id = _get_user_sandbox_id(db, user_id)
+    stale_cutoff = now_naive() - timedelta(
+        seconds=max(get_settings().sse_subscribe_timeout, 1)
+    )
+    active_agent = (
+        db.query(UserRunLock.lock_id)
+        .filter(
+            UserRunLock.user_id == user_id,
+            UserRunLock.updated_at >= stale_cutoff,
+        )
+        .first()
+        is not None
+    )
+    now = now_naive()
+    active_cron_rows = list((
+        db.query(CronJobRun.sandbox_id)
+        .filter(
+            CronJobRun.user_id == user_id,
+            CronJobRun.status == "running",
+            CronJobRun.claim_token.isnot(None),
+            CronJobRun.claim_lease_expires_at.isnot(None),
+            CronJobRun.claim_lease_expires_at > now,
+        )
+        .all()
+    ) or [])
+    active_cron_sandbox_ids = [row[0] for row in active_cron_rows]
+    # Session file listing/preview can wait on a remote Sandbox for seconds.
+    # Never pin one request-scoped DB checkout across that network boundary.
+    db.commit()
+
+    active_owner = active_agent or bool(active_cron_rows)
+    owner_ids: set[str] = set()
+    missing_owner_binding = False
+    if active_agent:
+        if persisted_sandbox_id:
+            owner_ids.add(persisted_sandbox_id)
+        else:
+            missing_owner_binding = True
+    for cron_sandbox_id in active_cron_sandbox_ids:
+        if isinstance(cron_sandbox_id, str) and cron_sandbox_id:
+            owner_ids.add(cron_sandbox_id)
+        else:
+            missing_owner_binding = True
+    if len(owner_ids) > 1:
+        raise SandboxTemporarilyUnavailable("运行中的 Sandbox 代际不一致")
+
+    active_sandbox_id = None
+    if active_owner and not missing_owner_binding and owner_ids:
+        active_sandbox_id = next(iter(owner_ids))
+    return _SandboxBindingState(
+        persisted_sandbox_id=persisted_sandbox_id,
+        active_sandbox_id=active_sandbox_id,
+        active_owner=active_owner,
+    )
+
+
 def _upsert_user_sandbox(db: DBSession, user_id: str, sandbox_service) -> None:
     """將當前沙箱 ID 持久化到 UserSandbox 表（get_or_resume 可能創建了新沙箱）。"""
     new_id = sandbox_service.get_sandbox_id(user_id)
@@ -605,7 +471,14 @@ def _upsert_user_sandbox(db: DBSession, user_id: str, sandbox_service) -> None:
         db.commit()
 
 
-async def _ensure_sandbox(sandbox_service, user_id: str, db: DBSession, *, force_refresh: bool = False):
+async def _ensure_sandbox(
+    sandbox_service,
+    user_id: str,
+    db: DBSession,
+    *,
+    force_refresh: bool = False,
+    binding_state: _SandboxBindingState | None = None,
+):
     """獲取可用沙箱，支持陳舊快取自動恢復。
 
     Args:
@@ -614,34 +487,87 @@ async def _ensure_sandbox(sandbox_service, user_id: str, db: DBSession, *, force
     Returns:
         可用的 Sandbox 實例
     """
+    binding = binding_state or _get_sandbox_binding_state(db, user_id)
+    persisted_sandbox_id = binding.persisted_sandbox_id
+    required_sandbox_id = (
+        binding.active_sandbox_id if binding.active_owner else persisted_sandbox_id
+    )
+    if binding.active_owner and not required_sandbox_id:
+        # 运行 owner 已成立但其代际身份尚未持久化时必须 fail closed；
+        # 进程内 cache 可能属于此前或并发创建的任意 Sandbox，不能作为替代。
+        raise SandboxTemporarilyUnavailable("运行期间 Sandbox 绑定尚未冻结")
+    if force_refresh and binding.active_owner:
+        # 被动文件请求只允许重新确认并连接运行 owner 已冻结的精确代际。
+        # get_existing 会自行淘汰确实失效的同代 cache，但绝不创建新代际或改写绑定。
+        return await sandbox_service.get_existing(user_id, required_sandbox_id)
     if force_refresh:
         sandbox_service.invalidate_cache(user_id)
-
-    persisted_sandbox_id = _get_user_sandbox_id(db, user_id)
     sandbox = sandbox_service.get_cached(user_id)
     if sandbox:
         cached_sandbox_id = getattr(sandbox, "id", None)
-        cached_current = not persisted_sandbox_id or cached_sandbox_id == persisted_sandbox_id
-        cached_is_current = getattr(sandbox_service, "cached_is_current", None)
-        if callable(cached_is_current):
-            current_result = cached_is_current(user_id, persisted_sandbox_id)
-            if isinstance(current_result, bool):
-                cached_current = current_result
+        cached_current = not required_sandbox_id or cached_sandbox_id == required_sandbox_id
+        if not binding.active_owner:
+            cached_is_current = getattr(sandbox_service, "cached_is_current", None)
+            if callable(cached_is_current):
+                current_result = cached_is_current(user_id, persisted_sandbox_id)
+                if isinstance(current_result, bool):
+                    cached_current = current_result
         if not cached_current:
             logger.warning(
-                "沙箱快取與 DB/profile 綁定不一致，移除快取 (user=%s, cached=%s, persisted=%s)",
+                "沙箱快取與请求冻结綁定不一致，移除快取 (user=%s, cached=%s, required=%s)",
                 user_id,
                 cached_sandbox_id,
-                persisted_sandbox_id,
+                required_sandbox_id,
             )
             sandbox_service.invalidate_cache(user_id)
         else:
             return sandbox
 
-    sandbox = await sandbox_service.get_or_resume(user_id, persisted_sandbox_id)
-    # 可能創建了新沙箱，持久化到 DB
-    _upsert_user_sandbox(db, user_id, sandbox_service)
+    if binding.active_owner:
+        # A file-panel request is a passive consumer. While a chat/Cron turn
+        # owns the user run fence it may reconnect the exact durable sandbox,
+        # but it must never create a replacement generation or change binding.
+        sandbox = await sandbox_service.get_existing(user_id, required_sandbox_id)
+    else:
+        sandbox = await sandbox_service.get_or_resume(user_id, persisted_sandbox_id)
+        # 可能創建了新沙箱，持久化到 DB
+        _upsert_user_sandbox(db, user_id, sandbox_service)
     return sandbox
+
+
+def _parse_session_file_revision(value: str) -> tuple[int, int]:
+    match = _SESSION_FILE_REVISION_RE.fullmatch(value.strip())
+    if not match:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "SESSION_FILE_REVISION_INVALID",
+                "message": "文件版本格式无效，请刷新后重试",
+            },
+        )
+    return int(match.group(1)), int(match.group(2))
+
+
+def _session_file_info_from_stat(
+    payload: dict,
+    *,
+    sandbox_path: str,
+    session_root: str,
+    requested_path: str,
+    extension: str,
+) -> FileInfo:
+    size = int(payload["size"])
+    mtime = float(payload["mtime"])
+    mtime_ns = int(payload["mtime_ns"])
+    return FileInfo(
+        name=posixpath.basename(sandbox_path),
+        path=to_sandbox_relative_path(sandbox_path, session_root) or requested_path,
+        size=size,
+        modified=datetime.fromtimestamp(mtime, timezone.utc).isoformat(),
+        type=extension.lstrip("."),
+        is_directory=False,
+        revision=f"v1:{size}:{mtime_ns}",
+    )
 
 
 async def _sandbox_list_dir(
@@ -664,7 +590,7 @@ for n in names:
         st = os.stat(p)
     except OSError:
         continue
-    out.append({{"name": n, "path": p, "size": int(st.st_size), "mtime": float(st.st_mtime), "is_dir": os.path.isdir(p)}})
+    out.append({{"name": n, "path": p, "size": int(st.st_size), "mtime": float(st.st_mtime), "mtime_ns": int(st.st_mtime_ns), "is_dir": os.path.isdir(p)}})
 print(json.dumps(out, ensure_ascii=False))
 PY"""
     result = await sandbox.commands.run(py_cmd)
@@ -699,6 +625,7 @@ PY"""
             continue
 
         mtime = row["mtime"]
+        mtime_ns = int(row["mtime_ns"])
         modified = datetime.fromtimestamp(float(mtime), timezone.utc).isoformat()
 
         if is_dir:
@@ -710,6 +637,7 @@ PY"""
                     modified=modified,
                     type="directory",
                     is_directory=True,
+                    revision=f"v1:0:{mtime_ns}",
                 )
             )
         else:
@@ -722,6 +650,7 @@ PY"""
                     modified=modified,
                     type=ext,
                     is_directory=False,
+                    revision=f"v1:{int(row.get('size', 0) or 0)}:{mtime_ns}",
                 )
             )
 
@@ -1033,33 +962,31 @@ async def delete_session(
     await agent_pool.remove_async(chat_session_id)
     logger.info("已清理 Agent 缓存: %s", chat_session_id)
 
-    # 沙箱屬於用戶，刪除 session 時不 kill 沙箱，只清理 session 子目錄
     user_id = session.user_id
     sandbox_service = get_sandbox_service()
-    # 不能只看当前 worker 的进程内缓存：重启或多 worker 时沙箱仍可能
-    # 持久存在。始终尝试按 DB 绑定恢复，以免 session 文件和隐藏预览缓存孤儿化。
-    try:
-        sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
-    except Exception as e:
-        logger.warning("無法連接沙箱清理 session 子目錄: %s", e)
-        sandbox = None
-
-    if sandbox:
-        import shlex as _shlex
-        session_dir = f"{sandbox_service.get_mount_path(user_id)}/sessions/{chat_session_id}"
-        try:
-            await sandbox.commands.run(
-                f"rm -rf {_shlex.quote(session_dir)} 2>/dev/null || true"
-            )
-            logger.info("已清理 session 子目錄: %s", session_dir)
-        except Exception as e:
-            logger.warning("清理 session 子目錄失敗: %s, 錯誤: %s", session_dir, e)
+    sandbox_row = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).one_or_none()
+    cleanup_id = None
+    if sandbox_row is not None and sandbox_row.sandbox_id:
+        cleanup_id = enqueue_cleanup(
+            db,
+            user_id=user_id,
+            owner_kind="session",
+            owner_id=chat_session_id,
+            sandbox_id=str(sandbox_row.sandbox_id),
+            profile_id=sandbox_row.active_profile_id,
+            profile_version=sandbox_row.active_profile_version,
+            mount_path=sandbox_service.get_mount_path(user_id),
+            relative_path=f"sessions/{chat_session_id}",
+        )
 
     # 刪除會話相關數據（Round -> AGUIEventLog -> ConversationMessage）
     round_ids = [r.id for r in db.query(Round.id).filter(Round.session_id == chat_session_id).all()]
     if round_ids:
         db.query(AGUIEventLog).filter(AGUIEventLog.run_id.in_(round_ids)).delete(synchronize_session=False)
         db.query(LLMCallRecord).filter(LLMCallRecord.round_id.in_(round_ids)).delete(synchronize_session=False)
+        db.query(MemoryEmbedding).filter(
+            MemoryEmbedding.conversation_round_id.in_(round_ids)
+        ).delete(synchronize_session=False)
     db.query(Round).filter(Round.session_id == chat_session_id).delete(synchronize_session=False)
     db.query(ConversationMessage).filter(ConversationMessage.session_id == chat_session_id).delete(synchronize_session=False)
     from src.api.models.tool_permission import ToolPermissionRule
@@ -1068,10 +995,24 @@ async def delete_session(
         ToolPermissionRule.scope_type == "session",
         ToolPermissionRule.scope_id == chat_session_id,
     ).delete(synchronize_session=False)
+    WorkspaceService(db).release_content_references(
+        user_id,
+        reference_kind="round_attachment",
+        reference_key_prefix=f"{chat_session_id}:",
+        commit=False,
+    )
 
     # 刪除会话
     db.delete(session)
     db.commit()
+
+    if cleanup_id:
+        cleanup_task = asyncio.create_task(run_cleanup_job(cleanup_id))
+        cleanup_task.add_done_callback(
+            lambda task: logger.error(
+                "Session 物理清理任务异常: %s", task.exception()
+            ) if not task.cancelled() and task.exception() else None
+        )
 
     return {"message": "会话已删除"}
 
@@ -1109,8 +1050,14 @@ async def get_session_files(
     if target_dir != session_root and not target_dir.startswith(session_root + "/"):
         raise HTTPException(status_code=403, detail="路径越界")
 
+    binding_state = _get_sandbox_binding_state(db, user_id)
     try:
-        sandbox = await _ensure_sandbox(sandbox_service, user_id, db)
+        sandbox = await _ensure_sandbox(
+            sandbox_service,
+            user_id,
+            db,
+            binding_state=binding_state,
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -1124,7 +1071,13 @@ async def get_session_files(
         # 沙箱可能已過期，清除快取重試一次
         logger.warning("從沙箱獲取文件列表失敗，嘗試重新連接: %s", e)
         try:
-            sandbox = await _ensure_sandbox(sandbox_service, user_id, db, force_refresh=True)
+            sandbox = await _ensure_sandbox(
+                sandbox_service,
+                user_id,
+                db,
+                force_refresh=True,
+                binding_state=binding_state,
+            )
             files = await _sandbox_list_dir(sandbox, target_dir, session_root)
             return FileListResponse(files=files, total=len(files))
         except HTTPException:
@@ -1144,9 +1097,9 @@ async def update_session_file(
 ):
     """原子覆盖当前 Session 内支持在线编辑的文件。
 
-    Markdown 使用 UTF-8 正文，CSV/XLS/XLSX 使用 Base64 二进制正文。保存前复核
-    编辑开始时的 size + mtime，避免覆盖 Agent 或其他标签页已经写入的新版本。
-    Agent 运行期间禁止保存。
+    Markdown 使用 UTF-8 正文，CSV/XLS/XLSX 使用 Base64 二进制正文。保存前在
+    同一个沙箱命令内精确复核 opaque revision 中的 size + mtime_ns，避免覆盖
+    Agent 或其他标签页已经写入的新版本。
     """
     session = (
         db.query(Session)
@@ -1155,6 +1108,13 @@ async def update_session_file(
     )
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
+    session_user_id = str(session.user_id)
+    # 后续可能进行 XLSX 校验和 Sandbox 网络 I/O；先释放请求 DB checkout。
+    db.commit()
+
+    expected_size, expected_mtime_ns = _parse_session_file_revision(
+        request.expected_revision
+    )
 
     extension = posixpath.splitext(file_path)[1].lower()
     if extension in _EDITABLE_MARKDOWN_EXTENSIONS:
@@ -1177,52 +1137,40 @@ async def update_session_file(
             raise HTTPException(status_code=413, detail="电子表格超过 20 MiB，无法在线编辑")
         try:
             if extension == ".csv":
-                _validate_csv_edit_payload(content_bytes)
+                await asyncio.to_thread(validate_csv_edit_payload, content_bytes)
             else:
-                await asyncio.to_thread(_validate_xlsx_edit_payload, content_bytes)
+                await asyncio.to_thread(validate_xlsx_edit_payload, content_bytes)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
     else:
         raise HTTPException(status_code=415, detail="当前文件类型不支持在线编辑")
 
-    try:
-        expected_modified = datetime.fromisoformat(
-            request.expected_modified.replace("Z", "+00:00")
-        )
-        if expected_modified.tzinfo is None:
-            expected_modified = expected_modified.replace(tzinfo=timezone.utc)
-        expected_mtime = expected_modified.timestamp()
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail="文件版本时间无效") from exc
-
-    settings = get_settings()
-    stale_cutoff = now_naive() - timedelta(
-        seconds=max(settings.sse_subscribe_timeout, 1)
-    )
-    active_lock = (
-        db.query(UserRunLock.lock_id)
-        .filter(
-            UserRunLock.user_id == user_id,
-            UserRunLock.session_id == chat_session_id,
-            UserRunLock.updated_at >= stale_cutoff,
-        )
-        .first()
-    )
-    if active_lock:
-        raise HTTPException(status_code=409, detail="Agent 正在使用此会话，结束后再保存文件")
-
     sandbox_service = get_sandbox_service()
-    session_root = f"{sandbox_service.get_mount_path(session.user_id)}/sessions/{chat_session_id}"
+    session_root = f"{sandbox_service.get_mount_path(session_user_id)}/sessions/{chat_session_id}"
     sandbox_path = resolve_sandbox_path(file_path, session_root)
     if not is_within_sandbox_root(sandbox_path, session_root):
         raise HTTPException(status_code=400, detail="文件路径不合法")
 
     try:
-        sandbox = await _ensure_sandbox(sandbox_service, session.user_id, db)
+        sandbox = await _ensure_sandbox(sandbox_service, session_user_id, db)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail="沙箱不可用") from exc
+
+    if request.edit_base_token:
+        editor = SessionFileEditService(
+            sandbox, root=session_root, user_id=session_user_id,
+            session_id=chat_session_id, path=to_sandbox_relative_path(sandbox_path, session_root),
+            max_bytes=_MAX_MARKDOWN_EDIT_BYTES if extension in _EDITABLE_MARKDOWN_EXTENSIONS else _MAX_SPREADSHEET_EDIT_BYTES,
+        )
+        base = editor.decode_token(request.edit_base_token)
+        if (base['size'], base['mtime_ns']) != (expected_size, expected_mtime_ns):
+            raise HTTPException(409, detail={'code': 'SESSION_EDIT_BASE_INVALID', 'message': '草稿正文与编辑基线不一致'})
+        return FileInfo(**await editor.save(
+            content_bytes, base_token=request.edit_base_token,
+            save_id=request.save_id or str(uuid.uuid4()),
+        ))
 
     edit_root = f"{session_root}/.opencapybox-edit"
     temp_path = f"{edit_root}/.{uuid.uuid4().hex}.tmp"
@@ -1235,44 +1183,62 @@ async def update_session_file(
             await sandbox.files.write_file(temp_path, content_bytes)
 
         update_command = f"""python3 - <<'PY'
-import json, os, stat, sys
+import fcntl, hashlib, json, os, stat, sys
 target = {sandbox_path!r}
 temp = {temp_path!r}
-expected_size = {request.expected_size!r}
-expected_mtime = {expected_mtime!r}
+lock_root = {edit_root!r} + '/locks'
+os.makedirs(lock_root, mode=0o700, exist_ok=True)
+lock_fd = os.open(lock_root + '/' + hashlib.sha256(target.encode()).hexdigest(), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+fcntl.flock(lock_fd, fcntl.LOCK_EX)
+expected_size = {expected_size!r}
+expected_mtime_ns = {expected_mtime_ns!r}
 try:
-    current = os.stat(target)
+    current = os.stat(target, follow_symlinks=False)
 except FileNotFoundError:
     sys.exit(2)
 if not stat.S_ISREG(current.st_mode):
     sys.exit(4)
-if current.st_size != expected_size or abs(current.st_mtime - expected_mtime) > 0.001:
-    print(json.dumps({{"status": "conflict", "size": current.st_size, "mtime": current.st_mtime}}))
+if current.st_size != expected_size or current.st_mtime_ns != expected_mtime_ns:
+    print(json.dumps({{"status": "conflict", "size": current.st_size, "mtime": current.st_mtime, "mtime_ns": current.st_mtime_ns}}))
     sys.exit(3)
 os.replace(temp, target)
-updated = os.stat(target)
-print(json.dumps({{"status": "saved", "size": updated.st_size, "mtime": updated.st_mtime}}))
+updated = os.stat(target, follow_symlinks=False)
+print(json.dumps({{"status": "saved", "size": updated.st_size, "mtime": updated.st_mtime, "mtime_ns": updated.st_mtime_ns}}))
 PY"""
         result = await sandbox.commands.run(update_command)
         exit_code = _extract_exit_code(result)
         if exit_code == 2:
             raise HTTPException(status_code=404, detail="文件不存在")
         if exit_code == 3:
-            raise HTTPException(status_code=409, detail="文件已被其他操作修改，请刷新后重试")
+            current_payload = json.loads(_command_stdout_text(result))
+            current_file = _session_file_info_from_stat(
+                current_payload,
+                sandbox_path=sandbox_path,
+                session_root=session_root,
+                requested_path=file_path,
+                extension=extension,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "SESSION_FILE_REVISION_CONFLICT",
+                    "message": "文件已被其他操作修改，请刷新后重试",
+                    "current": current_file.model_dump(),
+                    "current_revision": current_file.revision,
+                },
+            )
         if exit_code == 4:
             raise HTTPException(status_code=400, detail="目标不是可编辑文件")
         if exit_code != 0:
             raise RuntimeError("Session 文件原子保存失败")
 
         payload = json.loads(_command_stdout_text(result))
-        modified = datetime.fromtimestamp(float(payload["mtime"]), timezone.utc).isoformat()
-        return FileInfo(
-            name=posixpath.basename(sandbox_path),
-            path=to_sandbox_relative_path(sandbox_path, session_root) or file_path,
-            size=int(payload["size"]),
-            modified=modified,
-            type=extension.lstrip("."),
-            is_directory=False,
+        return _session_file_info_from_stat(
+            payload,
+            sandbox_path=sandbox_path,
+            session_root=session_root,
+            requested_path=file_path,
+            extension=extension,
         )
     except HTTPException:
         raise
@@ -1297,6 +1263,8 @@ async def download_file(
         description="可选派生渲染格式；当前支持 Word/PowerPoint 转 PDF",
     ),
     db: DBSession = Depends(get_db),
+    edit: bool = Query(False, description="从同一不可变内容取得编辑正文与基线"),
+    base_token: str | None = Query(None, max_length=256),
 ):
     """下载或预览沙箱中的文件（代理模式）
 
@@ -1338,10 +1306,34 @@ async def download_file(
     sandbox_path = resolve_sandbox_path(file_path, session_root)
     if not is_within_sandbox_root(sandbox_path, session_root):
         raise HTTPException(status_code=400, detail="文件路径不合法")
+    normalized_file_path = posixpath.normpath(file_path.replace("\\", "/")).lstrip("/")
+    is_captured_assistant_file = normalized_file_path.startswith(
+        ".assistant-artifacts/"
+    )
 
     # 確定文件名和 MIME 類型
     filename = posixpath.basename(sandbox_path)
     mime_type, _ = mimetypes.guess_type(filename)
+
+    if edit is True:
+        extension = posixpath.splitext(filename)[1].lower()
+        if render is not None or extension not in _EDITABLE_MARKDOWN_EXTENSIONS | _EDITABLE_SPREADSHEET_EXTENSIONS:
+            raise HTTPException(415, detail="当前文件不支持在线编辑")
+        editor = SessionFileEditService(
+            sandbox, root=session_root, user_id=user_id, session_id=chat_session_id,
+            path=to_sandbox_relative_path(sandbox_path, session_root),
+            max_bytes=_MAX_MARKDOWN_EDIT_BYTES if extension in _EDITABLE_MARKDOWN_EXTENSIONS else _MAX_SPREADSHEET_EDIT_BYTES,
+        )
+        info, snapshot_path = await editor.open(base_token if isinstance(base_token, str) else None)
+        stream = await sandbox.files.read_bytes_stream(snapshot_path, chunk_size=64 * 1024)
+        return StreamingResponse(stream, media_type=mime_type or 'application/octet-stream', headers={
+            'Cache-Control': 'no-store',
+            'Content-Disposition': encode_filename_header(filename, 'inline' if preview else 'attachment'),
+            'Content-Length': str(info['size']),
+            'X-Session-File-Revision': info['revision'],
+            'X-Session-File-Modified': info['modified'],
+            'X-Session-Edit-Base': info['edit_base_token'],
+        })
 
     if render == "pdf":
         try:
@@ -1350,6 +1342,7 @@ async def download_file(
                 source_filename=filename,
                 source_path=sandbox_path,
                 session_root=session_root,
+                cache_max_bytes=int(get_settings().workspace_preview_cache_bytes),
             )
         except FilePreviewUnsupportedError as exc:
             raise HTTPException(status_code=415, detail=str(exc)) from exc
@@ -1371,6 +1364,11 @@ async def download_file(
             ),
             "Content-Length": str(rendered.size),
             "X-OpenCapyBox-Preview-Cache": rendered.cache_key[:16],
+            "Cache-Control": (
+                "private, max-age=31536000, immutable"
+                if is_captured_assistant_file
+                else "no-store"
+            ),
         }
         rendered_stream_reader = getattr(sandbox.files, "read_bytes_stream", None)
         if callable(rendered_stream_reader):
@@ -1431,7 +1429,14 @@ async def download_file(
     disposition = "inline" if can_preview else "attachment"
     cd_header = encode_filename_header(filename, disposition)
 
-    headers = {"Content-Disposition": cd_header}
+    headers = {
+        "Content-Disposition": cd_header,
+        "Cache-Control": (
+            "private, max-age=31536000, immutable"
+            if is_captured_assistant_file
+            else "no-store"
+        ),
+    }
 
     # --- 嘗試讀取文件 ---
     file_bytes: bytes | None = None
@@ -1447,7 +1452,6 @@ async def download_file(
             preview=preview,
         )
     else:
-        # ASCII 路徑：正常嘗試 SDK API
         # 1) 流式讀取（SDK read_bytes_stream）
         read_bytes_stream = getattr(sandbox.files, "read_bytes_stream", None)
         if render is None and callable(read_bytes_stream):
@@ -1559,6 +1563,9 @@ async def upload_file(
     mount_path = sandbox_service.get_mount_path(user_id)
     session_root = f"{mount_path}/sessions/{chat_session_id}"
 
+    # UploadFile.read() 也会等待请求体 I/O；在此之前冻结 Sandbox owner 并
+    # 释放请求 DB checkout。后续重试必须复用同一冻结绑定。
+    binding_state = _get_sandbox_binding_state(db, user_id)
     # 提前讀取文件內容（重試時不可重複讀取 UploadFile）
     content = await file.read()
 
@@ -1570,7 +1577,11 @@ async def upload_file(
     for attempt in range(2):
         try:
             sandbox = await _ensure_sandbox(
-                sandbox_service, user_id, db, force_refresh=(attempt > 0),
+                sandbox_service,
+                user_id,
+                db,
+                force_refresh=(attempt > 0),
+                binding_state=binding_state,
             )
         except HTTPException:
             raise
@@ -1607,12 +1618,36 @@ async def upload_file(
             else:
                 await sandbox.files.write_file(sandbox_path, content)
 
+            stat_result = await sandbox.commands.run(
+                f"""python3 - <<'PY'
+import json, os, stat, sys
+path = {sandbox_path!r}
+try:
+    value = os.stat(path, follow_symlinks=False)
+except FileNotFoundError:
+    sys.exit(2)
+if not stat.S_ISREG(value.st_mode):
+    sys.exit(3)
+print(json.dumps({{"size": value.st_size, "mtime": value.st_mtime, "mtime_ns": value.st_mtime_ns}}))
+PY"""
+            )
+            if _extract_exit_code(stat_result) != 0:
+                raise RuntimeError("无法读取上传文件的稳定版本")
+            try:
+                persisted = json.loads(_command_stdout_text(stat_result))
+                persisted_size = int(persisted["size"])
+                persisted_mtime = float(persisted["mtime"])
+                persisted_mtime_ns = int(persisted["mtime_ns"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("上传文件版本响应无效") from exc
+
             file_info = FileInfo(
                 name=final_filename,
                 path=final_filename,  # 相對路徑
-                size=len(content),
-                modified=datetime.now(timezone.utc).isoformat(),
+                size=persisted_size,
+                modified=datetime.fromtimestamp(persisted_mtime, timezone.utc).isoformat(),
                 type=posixpath.splitext(final_filename)[1].lstrip(".").lower() or "file",
+                revision=f"v1:{persisted_size}:{persisted_mtime_ns}",
             )
 
             logger.info(f"文件上傳至沙箱成功: {final_filename} ({len(content)} bytes)")

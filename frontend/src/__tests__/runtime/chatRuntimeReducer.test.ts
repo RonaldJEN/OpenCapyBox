@@ -1201,4 +1201,137 @@ describe('chatRuntimeReducer', () => {
     expect(state.sessions['sess-a'].rounds[0].status).toBe('completed');
     expect(state.sessions['sess-a'].activeRunKeys).toEqual([]);
   });
+
+  it('does not project internal workspace audit events into the visible round', () => {
+    let state = startRun();
+    const event = {
+      type: 'CUSTOM',
+      name: 'workspace_resource_changed',
+      value: {
+        entry_id: 'entry-1',
+        operation: 'updated',
+        path: 'reports/daily.md',
+        name: 'daily.md',
+        kind: 'file',
+        revision: 4,
+        mutation_id: 'mutation-1',
+        toolCallId: 'tool-1',
+      },
+    };
+
+    state = stream(state, event);
+    state = stream(state, event);
+
+    expect(state.sessions['sess-a'].rounds[0].assistant_file_references).toBeUndefined();
+  });
+
+  it('directory deletion removes cards for every affected workspace file', () => {
+    let state = startRun();
+    state = stream(state, {
+      type: 'CUSTOM', name: 'assistant_file_referenced',
+      value: {
+        ref_id: 'workspace:child:version', source: 'workspace',
+        entry_id: 'child', version_id: 'version', revision: '1',
+        name: 'child.md', path: 'folder/child.md', size: 10, type: 'md',
+      },
+    });
+    expect(state.sessions['sess-a'].rounds[0].assistant_file_references).toHaveLength(1);
+    state = stream(state, {
+      type: 'CUSTOM', name: 'workspace_resource_changed',
+      value: { entry_id: 'folder', operation: 'DELETED', affected_entry_ids: ['folder', 'child'] },
+    });
+    expect(state.sessions['sess-a'].rounds[0].assistant_file_references).toEqual([]);
+  });
+
+  it('applies a global workspace tombstone to every round and rejects stale history', () => {
+    let state = chatRuntimeReducer(initialChatRuntimeState, {
+      type: 'HISTORY_LOADED',
+      sessionId: 'sess-a',
+      rounds: [round({
+        round_id: 'server-r1',
+        user_attachments: [
+          { source: 'workspace', entry_id: 'deleted', name: 'deleted.md', path: 'deleted.md', size: 10, type: 'md' },
+        ],
+        assistant_file_references: [
+          { ref_id: 'workspace:deleted:v1', source: 'workspace', entry_id: 'deleted', workspace_path: 'deleted.md', version_id: 'v1', revision: '1', name: 'deleted.md', path: 'deleted.md', size: 10, modified: '2026-09-01T08:00:00Z', type: 'md' },
+        ],
+      })],
+      loadedAt: 1,
+      source: 'history',
+    });
+    state = chatRuntimeReducer(state, {
+      type: 'HISTORY_LOADED',
+      sessionId: 'sess-b',
+      rounds: [round({
+        round_id: 'server-r2',
+        user_attachments: [
+          { source: 'workspace', entry_id: 'deleted', name: 'deleted.md', path: 'deleted.md', size: 10, type: 'md' },
+        ],
+      })],
+      loadedAt: 2,
+      source: 'history',
+    });
+
+    state = chatRuntimeReducer(state, {
+      type: 'WORKSPACE_ENTRIES_DELETED',
+      entryIds: ['deleted'],
+    });
+
+    expect(state.sessions['sess-a'].rounds[0].user_attachments).toEqual([]);
+    expect(state.sessions['sess-a'].rounds[0].assistant_file_references).toEqual([]);
+    expect(state.sessions['sess-b'].rounds[0].user_attachments).toEqual([]);
+
+    state = chatRuntimeReducer(state, {
+      type: 'HISTORY_LOADED',
+      sessionId: 'sess-a',
+      rounds: [round({
+        round_id: 'server-r1',
+        user_attachments: [
+          { source: 'workspace', entry_id: 'deleted', name: 'deleted.md', path: 'deleted.md', size: 10, type: 'md' },
+        ],
+      })],
+      loadedAt: 3,
+      source: 'history',
+    });
+    expect(state.sessions['sess-a'].rounds[0].user_attachments).toEqual([]);
+  });
+
+  it('projects only structured file identities and applies deletion tombstones', () => {
+    let state = startRun();
+    state = stream(state, {
+      type: 'CUSTOM',
+      name: 'assistant_file_referenced',
+      value: {
+        ref_id: 'session:sess-a:server-r1:report',
+        source: 'session',
+        session_id: 'sess-a',
+        name: 'report.md',
+        path: 'report.md',
+        snapshot_path: '.assistant-artifacts/server-r1/report/report.md',
+        size: 42,
+        modified: '2026-08-28T10:00:00Z',
+        type: 'md',
+        revision: 'v1:42:100',
+      },
+    });
+    expect(state.sessions['sess-a'].rounds[0].assistant_file_references).toHaveLength(1);
+
+    state = stream(state, {
+      type: 'CUSTOM',
+      name: 'assistant_file_referenced',
+      value: {
+        ref_id: 'session:sess-a:server-r1:deleted:report',
+        source: 'session',
+        session_id: 'sess-a',
+        name: 'report.md',
+        path: 'report.md',
+        size: 42,
+        modified: '2026-08-28T10:01:00Z',
+        type: 'md',
+        revision: 'v1:42:101',
+        operation: 'DELETED',
+      },
+    });
+    expect(state.sessions['sess-a'].rounds[0].assistant_file_references).toEqual([]);
+  });
 });

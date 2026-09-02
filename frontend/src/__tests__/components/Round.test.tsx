@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '../utils/test-utils';
 import { Round } from '../../components/Round';
-import { RoundData } from '../../types';
+import { RoundData, type AttachmentInfo } from '../../types';
 
 // Mock ReasoningPanel 组件
 vi.mock('../../components/ReasoningPanel', () => ({
@@ -494,49 +494,46 @@ describe('Round 组件', () => {
     expect(authImg.getAttribute('src')).toBe('data:image/png;base64,iVBOR');
   });
 
-  it('助手回复中的文件位置应该渲染为可点击文件卡片', () => {
-    const round = createMockRound({
-      final_response: [
-        '写好了，领导！',
-        '',
-        '**文件位置：** `/home/user/sessions/s1/quick_sort.py`',
-        '',
-        '包含两个版本：',
-      ].join('\n'),
-    });
-    const onOpenFileInPanel = vi.fn();
+  it('历史消息中的工作区目录保持文件夹卡片', () => {
+    const round = createMockRound();
+    const folder: AttachmentInfo = {
+      name: '研究',
+      path: '.workspace-snapshots/folder-1/3-token/研究',
+      size: 128,
+      type: 'inode/directory',
+      source: 'workspace',
+      entry_id: 'folder-1',
+      revision: '3',
+      origin_path: '研究',
+      kind: 'directory',
+      is_directory: true,
+    };
+    const onPreviewAttachment = vi.fn();
 
     render(
       <Round
         round={round}
         isStreaming={false}
+        userAttachments={[folder]}
         sessionId="s1"
-        onOpenFileInPanel={onOpenFileInPanel}
+        onPreviewAttachment={onPreviewAttachment}
       />,
     );
 
-    expect(screen.getByText('quick_sort.py')).toBeInTheDocument();
-    expect(screen.getByText('包含两个版本：')).toBeInTheDocument();
-    expect(screen.getByText('/home/user/sessions/s1/quick_sort.py')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '查看 quick_sort.py' }));
-
-    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'quick_sort.py',
-      path: 'quick_sort.py',
-      session_id: 's1',
-      type: 'py',
+    const folderCard = screen.getByTitle('预览 研究');
+    expect(folderCard).toHaveTextContent('文件夹');
+    expect(folderCard).toHaveTextContent('研究');
+    fireEvent.click(folderCard);
+    expect(onPreviewAttachment).toHaveBeenCalledWith(expect.objectContaining({
+      name: '研究',
+      is_directory: true,
+      entry_id: 'folder-1',
     }));
   });
 
-  it('传入 session 文件校验结果时只渲染匹配文件卡片', () => {
+  it('普通正文文件名没有结构化身份时不渲染卡片', () => {
     const round = createMockRound({
-      final_response: [
-        '生成结果如下：',
-        '',
-        '文件位置： `scripts/batch_find_similar.py`',
-        '文件位置： `references/db_schema.md`',
-      ].join('\n'),
+      final_response: '工作区里那份 `未命名.md` 已经更新。',
       steps: [],
     });
     const onOpenFileInPanel = vi.fn();
@@ -546,80 +543,30 @@ describe('Round 组件', () => {
         round={round}
         isStreaming={false}
         sessionId="s1"
-        assistantFileMatches={{
-          'scripts/batch_find_similar.py': null,
-          'references/db_schema.md': {
-            name: 'db_schema.md',
-            path: 'references/db_schema.md',
-            size: 42,
-            modified: '2026-06-12T10:00:00Z',
-            type: 'md',
-            is_directory: false,
-            session_id: 's1',
-          },
-        }}
         onOpenFileInPanel={onOpenFileInPanel}
       />,
     );
 
-    expect(screen.queryByRole('button', { name: '查看 batch_find_similar.py' })).not.toBeInTheDocument();
-    const fileCard = screen.getByRole('button', { name: '查看 db_schema.md' });
-    expect(fileCard).toHaveClass(
-      'min-h-[52px]',
-      'max-w-[520px]',
-      'sm:w-fit',
-      'sm:min-w-[280px]',
-    );
-    expect(fileCard.parentElement).toHaveClass('max-w-[520px]', 'gap-1.5', 'sm:items-start');
-    expect(fileCard.querySelector('.min-w-0')).toHaveClass(
-      'text-[15px]',
-      'font-medium',
-      'sm:max-w-[430px]',
-    );
-    expect(fileCard).toHaveTextContent('db_schema.md');
-    expect(fileCard).not.toHaveTextContent('Document');
-    expect(fileCard).not.toHaveTextContent('MD');
-    expect(fileCard).not.toHaveTextContent('42 B');
-    expect(fileCard.querySelector('[data-file-category="doc"]')).toHaveClass(
-      'bg-claude-file',
-      'text-white',
-    );
-    expect(fileCard.querySelectorAll('svg[aria-hidden="true"]')).toHaveLength(1);
-    fireEvent.click(fileCard);
-
-    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'db_schema.md',
-      path: 'references/db_schema.md',
-      size: 42,
-      session_id: 's1',
-    }));
-  });
-
-  it('传入空校验结果时不渲染未确认的文件卡片', () => {
-    const round = createMockRound({
-      final_response: '文件位置： `scripts/pending.py`',
-      steps: [],
-    });
-    const onOpenFileInPanel = vi.fn();
-
-    render(
-      <Round
-        round={round}
-        isStreaming={false}
-        sessionId="s1"
-        assistantFileMatches={{}}
-        onOpenFileInPanel={onOpenFileInPanel}
-      />,
-    );
-
-    expect(screen.queryByRole('button', { name: '查看 pending.py' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /打开 未命名\.md/ })).not.toBeInTheDocument();
     expect(onOpenFileInPanel).not.toHaveBeenCalled();
   });
 
-  it('助手回复句子里的 docx 文件名也应该渲染为文件卡片', () => {
+  it('结构化 Session 引用携带当前身份和冻结兜底', () => {
     const round = createMockRound({
-      final_response: '搞定！ `DeepSeek_V4_解读.docx` 已生成，22KB。',
+      final_response: '文件已生成。',
       steps: [],
+      assistant_file_references: [{
+        ref_id: 'session:s1:r1:report',
+        source: 'session',
+        session_id: 's1',
+        name: '报告.md',
+        path: 'reports/报告.md',
+        snapshot_path: '.assistant-artifacts/r1/report/报告.md',
+        size: 42,
+        modified: '2026-08-28T10:00:00Z',
+        type: 'md',
+        revision: 'v1:42:100',
+      }],
     });
     const onOpenFileInPanel = vi.fn();
 
@@ -632,26 +579,59 @@ describe('Round 组件', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: '查看 DeepSeek_V4_解读.docx' }));
+    const card = screen.getByRole('button', { name: '打开 报告.md' });
+    expect(card).toHaveTextContent('会话文件');
+    fireEvent.click(card);
 
     expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'DeepSeek_V4_解读.docx',
-      path: 'DeepSeek_V4_解读.docx',
+      name: '报告.md',
+      path: 'reports/报告.md',
+      snapshot_path: '.assistant-artifacts/r1/report/报告.md',
       session_id: 's1',
-      type: 'docx',
+      revision: 'v1:42:100',
+      content_mode: 'current',
     }));
   });
 
-  it('助手回复代码块中的文件提示不应该渲染为文件卡片', () => {
+  it('结构化 Workspace 引用携带稳定 entry 和版本兜底', () => {
     const round = createMockRound({
-      final_response: ['```text', '文件位置： quick_sort.py', '```'].join('\n'),
+      final_response: '工作区报告已更新。',
       steps: [],
+      assistant_file_references: [{
+        ref_id: 'workspace:entry-1:version-3',
+        source: 'workspace',
+        entry_id: 'entry-1',
+        version_id: 'version-3',
+        workspace_path: 'reports/daily.md',
+        name: 'daily.md',
+        path: 'reports/daily.md',
+        size: 80,
+        modified: '',
+        type: 'md',
+        revision: '3',
+      }],
     });
+    const onOpenFileInPanel = vi.fn();
 
-    render(<Round round={round} isStreaming={false} sessionId="s1" />);
+    render(
+      <Round
+        round={round}
+        isStreaming={false}
+        sessionId="s1"
+        onOpenFileInPanel={onOpenFileInPanel}
+      />,
+    );
 
-    expect(screen.queryByRole('button', { name: '查看 quick_sort.py' })).not.toBeInTheDocument();
-    expect(screen.getByText(/文件位置： quick_sort.py/)).toBeInTheDocument();
+    const card = screen.getByRole('button', { name: '打开 daily.md' });
+    expect(card).toHaveTextContent('工作区文件');
+    fireEvent.click(card);
+    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'workspace',
+      entry_id: 'entry-1',
+      version_id: 'version-3',
+      content_mode: 'current',
+    }));
+    expect(screen.queryByRole('button', { name: /在工作区打开/ })).not.toBeInTheDocument();
   });
 
   it('助手 Markdown 中的沙箱图片路径不会渲染成破图', () => {
@@ -678,39 +658,6 @@ describe('Round 组件', () => {
     expect(screen.queryByAltText('风景插画')).not.toBeInTheDocument();
   });
 
-  it('助手图片文件卡片应显示预览图', () => {
-    const round = createMockRound({
-      final_response: '图片文件在 `docx_images/image1.png`。',
-      steps: [],
-    });
-
-    render(
-      <Round
-        round={round}
-        isStreaming={false}
-        sessionId="s1"
-        assistantFileMatches={{
-          'docx_images/image1.png': {
-            name: 'image1.png',
-            path: 'docx_images/image1.png',
-            session_id: 's1',
-            size: 22323,
-            modified: '2026-06-25T10:00:00+00:00',
-            type: 'png',
-            is_directory: false,
-          },
-        }}
-      />,
-    );
-
-    const authImg = screen.getByTestId('auth-image');
-    expect(authImg).toHaveAttribute(
-      'src',
-      '/api/sessions/s1/files/docx_images/image1.png?preview=true',
-    );
-    expect(authImg).toHaveAttribute('alt', 'image1.png');
-  });
-
   it('助手 Markdown 中跨 session 的沙箱图片路径不会转换', () => {
     const round = createMockRound({
       final_response: '![chart](/home/user/sessions/other/reports/chart.png)',
@@ -723,10 +670,22 @@ describe('Round 组件', () => {
     expect(screen.queryByAltText('chart')).not.toBeInTheDocument();
   });
 
-  it('助手 Markdown 本地文件链接在当前 Files 面板打开', () => {
+  it('助手 Markdown 本地链接只有匹配结构化引用时才可点击', () => {
     const round = createMockRound({
       final_response: '[查看压缩包](exports/bundle.zip)',
       steps: [],
+      assistant_file_references: [{
+        ref_id: 'session:s1:r1:bundle',
+        source: 'session',
+        session_id: 's1',
+        name: 'bundle.zip',
+        path: 'exports/bundle.zip',
+        snapshot_path: '.assistant-artifacts/r1/bundle/bundle.zip',
+        size: 99,
+        modified: '2026-08-28T10:00:00Z',
+        type: 'zip',
+        revision: 'v1:99:200',
+      }],
     });
     const onOpenFileInPanel = vi.fn();
 
@@ -745,12 +704,13 @@ describe('Round 组件', () => {
     expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
       name: 'bundle.zip',
       path: 'exports/bundle.zip',
+      snapshot_path: '.assistant-artifacts/r1/bundle/bundle.zip',
       session_id: 's1',
       type: 'zip',
     }));
   });
 
-  it('助手 Markdown 中文及空格文件链接使用解码后的沙箱路径', () => {
+  it('没有结构化身份的本地 Markdown 链接不可点击', () => {
     const round = createMockRound({
       final_response: '[查看报告](<exports/报告 终版.pdf>)',
       steps: [],
@@ -766,12 +726,12 @@ describe('Round 组件', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('link', { name: '查看报告' }));
-    expect(onOpenFileInPanel).toHaveBeenCalledWith(expect.objectContaining({
-      name: '报告 终版.pdf',
-      path: 'exports/报告 终版.pdf',
-      session_id: 's1',
-      type: 'pdf',
-    }));
+    expect(screen.queryByRole('link', { name: '查看报告' })).not.toBeInTheDocument();
+    expect(screen.getByText('查看报告')).toHaveAttribute(
+      'title',
+      '没有可验证的文件版本，无法打开',
+    );
+    expect(onOpenFileInPanel).not.toHaveBeenCalled();
   });
+
 });
