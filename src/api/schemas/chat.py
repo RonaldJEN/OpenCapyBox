@@ -239,7 +239,7 @@ class RoundPreferredMcpConnection(BaseModel):
 
 
 class AssistantFileReference(BaseModel):
-    """One captured file identity produced or explicitly referenced by a Round."""
+    """One file identity explicitly presented by a Round."""
 
     ref_id: str
     source: Literal["session", "workspace"]
@@ -261,8 +261,8 @@ class AssistantFileReference(BaseModel):
     @model_validator(mode="after")
     def validate_source_identity(self):
         if self.source == "session":
-            if not self.session_id or not self.snapshot_path:
-                raise ValueError("Session assistant file reference requires session_id and snapshot_path")
+            if not self.session_id:
+                raise ValueError("Session assistant file reference requires session_id")
         elif not self.entry_id or not self.version_id:
             raise ValueError("Workspace assistant file reference requires entry_id and version_id")
         return self

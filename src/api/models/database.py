@@ -345,6 +345,7 @@ _PENDING_COLUMNS = [
     ("llm_call_records", "history_payload_sha256", "VARCHAR(64)"),
     ("llm_call_records", "history_breakdown_json", "TEXT"),
     ("llm_models", "auto_compact_token_limit", "INTEGER"),
+    ("llm_models", "openai_protocol", "VARCHAR(32)"),
     ("llm_models", "tool_output_truncation_bytes", "INTEGER NOT NULL DEFAULT 42667"),
     ("llm_models", "reasoning_effort", "VARCHAR(40)"),
     ("llm_models", "thinking_mode", "VARCHAR(24) NOT NULL DEFAULT 'provider_default'"),

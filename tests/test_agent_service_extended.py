@@ -59,8 +59,10 @@ class TestAgentServiceCreateTools:
         tool_names = [t.name for t in tools]
         assert "read_file" in tool_names
         assert "read_image_file" in tool_names
-        assert "write_file" in tool_names
-        assert "edit_file" in tool_names
+        assert "apply_patch" in tool_names
+        assert "present_files" in tool_names
+        assert "write_file" not in tool_names
+        assert "edit_file" not in tool_names
         assert "bash" in tool_names
         assert "bash_output" in tool_names
         assert "bash_kill" in tool_names

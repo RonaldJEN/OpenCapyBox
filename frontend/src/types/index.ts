@@ -498,7 +498,7 @@ export type AssistantFileReference = {
   | {
       source: 'session';
       session_id: string;
-      snapshot_path: string;
+      snapshot_path?: string;
       entry_id?: never;
       workspace_path?: never;
       version_id?: never;

@@ -387,8 +387,8 @@ type WorkspaceFile = {
 - “当前 Session 目录”专指本轮 Session/Cron 临时执行目录；“Workspace/工作区”专指跨会话持久文件区，模型可见提示和工具描述不得再把前者称作 Workspace。只有原始用户请求明确要求访问持久工作区时才允许调用 `workspace_*`；项目名、产品名、缺少资料、追求真实性和安全只读都不构成授权。Workspace 文件附件授权读取其 Session 冻结副本；文件夹附件授权只读访问所选 entry 的当前子树，写操作仍须由原始请求明确授权。子 Agent 只有在父任务明确委派持久 Workspace 访问时才能调用这些工具。
 - `workspace_list`、`workspace_stage` 为读取能力；`workspace_publish`、`workspace_create_directory` 为编辑能力；`workspace_move`、`workspace_delete` 为管理能力。
 - `workspace_list` 支持可选 `cursor`，原样透传服务端分页游标；每页默认 50 项，工具声明上限 100 项。返回 `next_cursor` 非空且需要更多结果时，保持 `parent_id/query/limit` 不变并携带该游标继续请求；不自动拉取全部结果。
-- `workspace_stage` 把指定 file version、目录 tree revision 或当前 head 复制到 Session/Cron execution root；模型携带的观察 revision 已过期时，工具内部自动重取一次当前 head，不把正常的人类并发编辑暴露成循环重试。目录保留层级与空子目录。成功结果中的绝对 `snapshot_path` 供文件工具使用，相对 `publish_source_path` 供 `workspace_publish` 使用，并返回实际 `revision/base_version_id/tree_revision`；`read_file/write_file/edit_file` 的相对路径基准为当前 execution Workspace。
-- `workspace_publish` 仅接受当前 Session/Cron execution root 内的普通文件，先把冻结提案写入用户内 SHA 内容对象并建立 `change_set_proposal/base` 显式引用，再由统一发布入口校验 base/current version、claim、配额与 journal。已有文件先校验 DB head、不可变 head 对象与 active 物化文件：active 命中旧版本时从 head 修复，出现未入库新内容时先静默吸收为 `web` head；三方合并的 current 始终读取内部 head 对象，不读取用户命名的 active 路径。base 未变化时直接 apply；变化时对 Markdown/TXT、CSV、XLSX 自动三方合并，不同位置同时保留、同一位置保留当前正式文件（人的内容）。无法可靠合并时保持当前正式内容，提案仅留作内部审计，不向普通用户发出决策请求。
+- `workspace_stage` 把指定 file version、目录 tree revision 或当前 head 复制到当前 Session/Cron 目录；模型携带的观察 revision 已过期时，工具内部自动重取一次当前 head，不把正常的人类并发编辑暴露成循环重试。目录保留层级与空子目录。成功结果中的绝对 `snapshot_path` 供文件工具使用，相对 `publish_source_path` 供 `workspace_publish` 使用，并返回实际 `revision/base_version_id/tree_revision`；`read_file/apply_patch` 的相对路径基准为当前 Session 目录。
+- `workspace_publish` 仅接受当前 Session/Cron 目录内的普通文件，先把冻结提案写入用户内 SHA 内容对象并建立 `change_set_proposal/base` 显式引用，再由统一发布入口校验 base/current version、claim、配额与 journal。已有文件先校验 DB head、不可变 head 对象与 active 物化文件：active 命中旧版本时从 head 修复，出现未入库新内容时先静默吸收为 `web` head；三方合并的 current 始终读取内部 head 对象，不读取用户命名的 active 路径。base 未变化时直接 apply；变化时对 Markdown/TXT、CSV、XLSX 自动三方合并，不同位置同时保留、同一位置保留当前正式文件（人的内容）。无法可靠合并时保持当前正式内容，提案仅留作内部审计，不向普通用户发出决策请求。
 - proposed/conflict/failed 只产生标准 `TOOL_CALL_RESULT` 并保存在服务端审计中，不发送 `CUSTOM workspace_change_proposed/workspace_change_conflict` 给普通客户端。并发 conflict 由 Workspace maintenance 继续收敛；不可恢复的 head/proposal 读取或校验错误进入 failed 终态并保留提案；调用取消或 worker 丢失继续依赖 prepared journal。只有成功正式 mutation 后才持久化 `CUSTOM workspace_resource_changed`，不得从工具文本或助手正文正则推断工作区产物。
 
 **图片约束**:
@@ -671,7 +671,7 @@ SSE 事件流。
 - same-Round continuation 仍是原 direct Round，因此继续返回原先冻结的展示快照，不新增重复标签。
 - 这些数组不是使用审计；不能据此声称 Skill 已加载或 MCP 连接已被真实调用。
 - 各个独立 direct Round 的快照彼此隔离，不继承、不合并，也不根据当前启停状态、改名或删除情况重算。
-- 文件卡只使用 `assistant_file_references`：Session 引用来自已冻结 `.assistant-artifacts`，Workspace 引用来自成功 mutation 内受保护的 immutable version；同 Round 删除事件作为 tombstone。history 不再返回旧 `workspace_resources/workspace_change_sets` 兼容字段。
+- 文件卡只使用 `assistant_file_references`：Session 引用只来自主 Agent 显式调用 `present_files` 后记录的当前路径，Workspace 引用来自成功 mutation 内受保护的 immutable version。Session 引用不复制正文，文件被覆盖后打开最新内容，被删除后提示不可用。history 不再返回旧 `workspace_resources/workspace_change_sets` 兼容字段。
 
 当 Round 为 `waiting_interaction` 时，`history/v2` 必须从 pending `agent_interactions` 投影 `interrupt={id, reason, payload}`，并与已持久化的 `interaction_requested` 指向同一 interaction id。读取历史会先处理过期 continuation claim：仅 `continuation_started_at` 为空的 pre-start 项可停回 waiting；已持久化 `interaction_resolved` 的 started continuation 必须写 durable `RUN_ERROR` 并收敛 failed。工具审批若已跨过 dispatch 且结果未知，还必须先按 execution lease 收敛 `unknown`，绝不自动重放。
 
@@ -761,7 +761,7 @@ Web send/resume/abort 入口先由 `WebChatAdapter` / `WebResumeAdapter` /
 - 只读工具允许“初读 + 复核”，第 3 次仍得到相同结果时阻止；相同成功的 mutating 工具下一次不得重复执行，`outcome_uncertain` 的副作用调用也不得自动重试。
 - 完整观察到 `A → B → A → B`，且 A/B 均为相同只读调用、两次结果各自未变化后，下一次再次调用 A 或 B 时识别为无进展循环；不得在尚未观察第二次 B 的结果前预测性阻止。成功 mutation 会清空旧的读/搜索观察。声明为 polling 的工具使用独立有界阈值，但相同 uncertain 结果最多实际尝试 2 次。
 - `bash` 命令文本不凭首个单词猜测读写属性；MCP annotation 只能把默认策略收紧，远端自称 `readOnlyHint=true` 不得放宽重试权限。带 `mode` 的记忆工具按具体调用区分 read 与 write/append。
-- 文件变更工具（`write_file` / `edit_file`）额外按规范化路径记账：某路径上出现过 `outcome_uncertain` 写入后，该路径上的任何后续文件变更都被阻止，即使参数不同。解除条件唯一——对同一规范化路径调用 `read_file` 并得到确定结果（成功，或明确的 `File not found:`）；用 `bash cat` 等其他方式旁路校验不解除阻断。工具超时产生的 uncertain 写入必须在 synthetic tool result 中明确告知模型该路径需要 `read_file` 校验。
+- 文件变更工具 `apply_patch` 额外按规范化路径记账：单目标 Patch 的写入结果不确定后，同一路径的后续文件变更被阻止，直到 `read_file` 得到确定结果；多文件 Patch 的相同调用不得自动重放。
 - 确定存在的缺失文件读取只解除它自己验证的那个路径的 uncertain 记账与对应恢复态，不得清空其他无关 pattern 的恢复态；只有成功调用才按既有规则收敛全局恢复态。
 - 首次命中时不执行候选工具，但仍写入配对的 synthetic tool result，明确要求换策略，并给模型一次恢复机会；若下一步仍调用同一被拒绝 pattern，则为同一 assistant 批次的其余调用补齐 skipped result，发出 `RUN_ERROR(tool_loop_detected)` 并将 Round 置为失败；真正不同且成功的策略会解除该 pattern 的恢复态。
 - Round 收尾不得额外调用模型提取或写入长期记忆；只允许同步本轮已由显式工具/文件操作产生的 dirty 配置文件，并按 [memory-spec.md](./memory-spec.md) 维护对话轮检索索引。
@@ -1014,7 +1014,7 @@ pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后�
 |                     | `interaction_resolved`          | 回答已由同一`runId` 的 continuation 接管                |
 |                     | `tool_approval_resume`          | 同一 Round 的审批结果即将回填原工具占位                   |
 |                     | `workspace_resource_changed`    | 受控工作区 mutation 已提交；raw audit 只做失效信号，成功文件可内嵌结构化助手引用 |
-|                     | `assistant_file_referenced`     | Session 助手产物已冻结为结构化生成时引用                  |
+|                     | `assistant_file_referenced`     | Agent 通过 `present_files` 明确展示当前 Session 文件      |
 |                     | 其他自定义事件                    | 按需扩展                                                  |
 
 #### Human-in-the-Loop CUSTOM wire schema
@@ -1087,7 +1087,7 @@ pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后�
 
 该事件只能由成功的 WorkspaceService mutation 产生，必须与 `WorkspaceMutation` 的 entry、revision 和 actor context 对应。失败、后台重试或仅保留 current 的 change set 不得冒充资源更新。普通前端不渲染 raw mutation；只有经过服务端版本保护的 `assistant_file_reference` 才进入 Round 卡片。实时 reducer 与 `history/v2` 使用同一稳定 identity 去重，DELETED 移除同 Round 旧引用；事件不包含文件正文或宿主绝对路径。
 
-Session `assistant_file_referenced` 必须携带 `ref_id/source=session/session_id/path/revision/snapshot_path/name/size/type/toolCallId`。`snapshot_path` 由 API 服务在事件提交前 no-follow 冻结并设为只读；工具文本、助手正文和客户端都无权自行构造。Bash manifest 任一侧失败/截断时 fail closed，不产生引用。
+Session `assistant_file_referenced` 只能由主 Agent 的 `present_files` 产生，必须携带 `ref_id/source=session/session_id/path/revision/name/size/type/toolCallId`。服务端验证目标是当前 Session 内真实存在的普通文件后持久化当前路径引用，不复制或冻结内容；重新打开时读取该路径的最新内容，文件已删除则提示不可用。`bash`、`bash_output`、`apply_patch` 和助手正文不得自动产生展示引用。
 
 #### ID 生成规则
 

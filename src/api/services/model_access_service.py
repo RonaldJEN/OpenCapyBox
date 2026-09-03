@@ -147,6 +147,7 @@ def seed_model_catalog_from_yaml_if_empty(db: DBSession, yaml_path: str | Path |
             api_base=config.api_base,
             api_key=config.api_key,
             model_name=config.model_name,
+            openai_protocol=config.openai_protocol,
             max_tokens=int(config.max_tokens),
             context_window=int(config.context_window),
             auto_compact_token_limit=config.auto_compact_token_limit,
@@ -193,6 +194,11 @@ def db_model_to_config(model: LLMModel) -> ModelConfig:
         api_base=model.api_base,
         api_key=model.api_key,
         model_name=model.model_name,
+        openai_protocol=(
+            model.openai_protocol
+            if model.provider == "openai" and model.openai_protocol
+            else "chat_completions" if model.provider == "openai" else None
+        ),
         max_tokens=int(model.max_tokens or 16384),
         context_window=int(model.context_window or 128000),
         auto_compact_token_limit=(
@@ -472,6 +478,7 @@ def admin_model_payload(db: DBSession, model: LLMModel) -> dict[str, Any]:
         "id": model.model_id,
         "name": model.display_name,
         "provider": model.provider,
+        "openai_protocol": config.openai_protocol,
         "api_base": model.api_base,
         "model_name": model.model_name,
         "max_tokens": model.max_tokens,

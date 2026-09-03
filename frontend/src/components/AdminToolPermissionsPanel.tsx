@@ -38,8 +38,7 @@ interface RuleForm {
 const BUILTIN_TOOLS = [
   'read_file',
   'read_image_file',
-  'write_file',
-  'edit_file',
+  'apply_patch',
   'bash',
   'bash_output',
   'bash_kill',

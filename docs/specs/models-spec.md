@@ -7,8 +7,8 @@
 - DB 连接或查询失败必须直接暴露，禁止静默切换到 YAML；只有成功确认模型表为空才允许 YAML 初始化路径。
 - `models.yaml` 负责首次 seed 模型目录，并继续承载 embedding 模型配置。
 - 模型列表与详情查询必须按当前用户的模型权限过滤。
-- 模型行为配置：`reasoning_format`、`reasoning_split`、三态 `thinking_mode`、`thinking_wire_format`、`reasoning_effort`、多模态能力、上下文窗口与输出上限。
-- 对外 `supports_thinking` 表示目录配置能够展示思考内容：`reasoning_format=none` 或默认显式关闭时为 false；Anthropic 模型在其余情况下为 true；OpenAI 兼容模型还必须满足 `reasoning_split=true`、默认显式开启，或 `supported_reasoning_efforts` 至少包含一个非 `off` 等级。`reasoning_split` 只是其中一种能力信号和部分网关的请求参数，DeepSeek 原生协议可通过显式思考开关声明能力而不依赖它。
+- 模型行为配置：`openai_protocol`、`reasoning_format`、独立思考内容能力标记 `reasoning_split`、三态 `thinking_mode`、`thinking_wire_format`、`reasoning_effort`、多模态能力、上下文窗口与输出上限。
+- 对外 `supports_thinking` 表示目录配置能够展示思考内容：`reasoning_format=none` 或默认显式关闭时为 false；Anthropic 模型在其余情况下为 true；OpenAI 兼容模型还必须满足 `reasoning_split=true`、默认显式开启，或 `supported_reasoning_efforts` 至少包含一个非 `off` 等级。`reasoning_split` 只表示网关能返回独立思考内容，不参与 Responses 请求编码。
 - 默认模型配置：普通对话、Cron、Subagent 分别有默认模型；Cron/Subagent 未显式配置时继承普通默认模型。
 - 模型权限包：默认权限包自动应用给所有普通用户，管理员可为用户额外绑定权限包。
 - 不负责：LLM 调用实现、Token 计费、模型部署。
@@ -24,6 +24,7 @@
 | `model_id` | str | 模型唯一标识 |
 | `display_name` | str | 模型显示名称 |
 | `provider` | str | SDK 协议（`anthropic` / `openai`） |
+| `openai_protocol` | str/null | OpenAI API 协议：`responses` 或 `chat_completions`；仅对 `provider=openai` 有效 |
 | `api_base` | str | API 基础 URL（管理端可见，普通 API 不返回） |
 | `api_key` | str | API Key 或 `${ENV_VAR}` 引用（不对外明文暴露） |
 | `model_name` | str | 发送给供应商 API 的实际模型名 |
@@ -32,7 +33,7 @@
 | `auto_compact_token_limit` | int/null | 可选自动压缩阈值，最终不得超过 `(context_window - max_tokens) * 80%` |
 | `tool_output_truncation_bytes` | int | 通用工具结果记录截断策略，必须大于 0，默认 42667 bytes；按 1.2 倍序列化余量得到 51200 UTF-8 bytes 正文预算；自行严格限流的内建工具成功结果可豁免 |
 | `reasoning_format` | str | 推理格式配置 |
-| `reasoning_split` | bool | 是否发送 `reasoning_split` |
+| `reasoning_split` | bool | 目录能力标记：网关是否返回独立的可展示思考内容；Responses 下不发送，Chat Completions 兼容路径发送同名扩展参数 |
 | `thinking_mode` | str | 内部传输字段：`provider_default` 省略开关；`enabled` / `disabled` 显式发送 true / false；管理端不单独暴露 |
 | `thinking_wire_format` | str | 思考开关请求协议：`none`、`enable_thinking` 布尔值或 `thinking_object`（`thinking.type`） |
 | `enable_thinking` | bool | 旧版相容字段；仅在 `thinking_mode=provider_default` 时，true 等同 enabled |
@@ -115,8 +116,9 @@
 
 - 所有模型行为由 DB 中的 `LLMModel` / `ModelConfig` 描述。
 - 代码中不得按模型名写特殊判断分支。
-- `LLMClient` 根据 `provider` 自动选择 AnthropicClient 或 OpenAIClient。
-- OpenAI 兼容请求按 DB 中的 `thinking_wire_format` 编码显式开关：`enable_thinking` 发送布尔值，`thinking_object` 发送 `thinking: {type: enabled|disabled}`，`none` 不发送开关；非空 `reasoning_effort` 始终作为顶层字段发送。`reasoning_split` 独立配置，不得用来猜测请求协议。
+- `LLMClient` 先根据 `provider` 选择 Anthropic 或 OpenAI，再按 `openai_protocol` 选择 `OpenAIResponsesClient` 或 `OpenAIClient`。存量 OpenAI 模型的 `NULL` 按 `chat_completions` 解释；不自动探测、不因请求失败切换协议。
+- Responses 下 `apply_patch` 投影为带 Lark grammar 的 freeform custom tool；Chat Completions 下投影为参数结构为 `{patch: string}` 的 function tool。两条路径在 Agent 内部统一为 `arguments.patch`。
+- OpenAI Responses 请求把非空 `reasoning_effort` 编码为 `reasoning.effort`；`thinking_wire_format` 仅在网关需要显式开关时写入扩展字段。`reasoning_split` 保留为模型目录能力信息，不再发送到 Responses 请求。
 - `thinking_mode` 是供应商传输细节。管理端只编辑“默认推理等级”：空值映射 `provider_default`，`off` 映射 `disabled`，`on` 映射 `enabled`，其他值映射 `enabled + reasoning_effort`。该等级是二元组的有损展示投影；编辑时若等级未变必须保留原始二元组，仅在新建或等级实际改变时执行反向映射。
 - `supports_thinking` 描述目录是否声明了可展示的思考能力。OpenAI 兼容模型的判定依据为：未显式关闭、`reasoning_format!=none`，并且 `reasoning_split=true`、`effective_thinking_mode=enabled` 或白名单含非 `off` 等级三者至少满足一项；仅有 `provider_default`、旧 reasoning format 且没有上述能力信号的存量 No Thinking 变体必须返回 false。`supports_reasoning_control` 则仅由 OpenAI 兼容模型非空的 `supported_reasoning_efforts` 声明，不能从 reasoning format 或 `supports_thinking` 猜测可选档位。
 - `supported_reasoning_efforts` 是服务端有序白名单，不按模型名推断，也不由前端自动添加 `off`。规范化时去除首尾空白、拒绝空项并按首次出现位置去重；管理端必须持久化 `ModelConfig` 的规范化结果，禁止数据库/API 保留重复项而运行时另行去重。默认等级非空且白名单非空时必须包含在白名单中；按轮选择必须精确命中该列表。白名单为空的存量模型只表示不提供按轮选择器，不得因此阻止管理端保存其他字段。
@@ -124,21 +126,22 @@
 - `thinking_wire_format=none` 表示该网关无法编码思考开关，但仍可接收顶层 `reasoning_effort`。因此 `none` 允许 `high` / `max` 这类分级值，但必须拒绝白名单中的 `off` / `on`，以及没有 `reasoning_effort` 的显式开关默认值——这些配置一旦落库就会静默丢弃用户的开关选择。
 - 上述开关默认值校验必须基于 `effective_thinking_mode` 而非原始 `thinking_mode`：`enable_thinking=true` + `thinking_mode=provider_default` + `wire=none` 同样会让 `supports_thinking` / 默认等级对外显示为开启，实际请求却不携带任何开关，属于必须拒绝的不一致配置。
 - 管理端限制白名单最多 20 项、单项最多 40 字符且不得为空；非 OpenAI provider 创建或更新时将 `thinking_wire_format` 归一化为 `none`，无需等待重启迁移。
-- 推理等级是网关级透传参数。同一 Run 的推理快照在 failover 到备用模型时原样传递，不按备用模型白名单过滤或自动降级；无法编码该快照的客户端必须跳过。`provider_default + null` 无需编码，可跨 provider；其他快照只尝试 OpenAI 兼容客户端，其中 `thinking_wire_format=none` 仅在存在具体 `reasoning_effort` 时兼容。
+- 推理等级是网关级透传参数。同一 Run 的推理快照在 failover 到备用模型时原样传递，不按备用模型白名单过滤或自动降级；无法编码该快照的客户端必须跳过。每个 fallback 使用自身的 `openai_protocol`，不得继承主模型协议。`provider_default + null` 无需编码，可跨 provider；其他快照只尝试 OpenAI 兼容客户端，其中 `thinking_wire_format=none` 仅在存在具体 `reasoning_effort` 时兼容。
 - 管理端模型创建/更新/删除、默认模型变更、权限包模型变更后，必须触发 `reload_model_registry()`；模型目录变更还必须失效进程内 Agent 缓存，运行中会话延迟到本轮结束后重建。
 
-### 升级说明：`enable_thinking` 与 `reasoning_split` 解耦
+### 升级说明：思考能力与请求传输解耦
 
-历史实现把 `enable_thinking` 嵌套在 `reasoning_split` 分支内，只有同时开启 `reasoning_split` 才会真正发送思考开关。该耦合是缺陷：DeepSeek 原生协议等网关不需要 `reasoning_split`，却因此永远拿不到显式开关。
+历史 Chat Completions 实现曾把 `reasoning_split` 同时当作网关请求参数和思考能力信号，并把 `enable_thinking` 嵌套在它的分支内。Responses 迁移后该语义废止：能力由目录描述，请求只由 `thinking_mode`、`thinking_wire_format` 与 `reasoning_effort` 编码。
 
 现在两者完全独立，**不回滚**这一行为：
 
-- `reasoning_split=false` + `enable_thinking=true` 的存量模型行，请求体从"不发送任何 extra_body"变为"发送该模型 `thinking_wire_format` 对应的开关"。
-- 迁移只新增列并按 provider 归一化 `thinking_wire_format`，不回填 OpenAI 行的 `enable_thinking` / `reasoning_split`；非 OpenAI 行同时清除这个从未生效的旧 OpenAI-only 开关，避免形成 `wire=none + effective enabled` 的不可编码状态。若某 OpenAI 存量模型原本依赖上述耦合来事实性关闭思考，升级后需要在管理端把默认推理等级显式设为 `off`。
+- `reasoning_split` 不进入 Responses 请求；Chat Completions 兼容路径继续把它作为旧网关扩展字段发送，同时参与 `supports_thinking` 的目录投影。
+- `thinking_mode` 与 `reasoning_effort` 的实际传输完全由 `thinking_wire_format` 和 Responses `reasoning.effort` 决定。
 
 ### 启动 seed
 
 - `models.yaml` 只在模型表为空时 seed；数据库已有模型后，启动和字段迁移均不得再从 YAML 回填或覆盖模型配置。
+- `models.yaml` 中 OpenAI 模型未声明 `openai_protocol` 时默认 seed 为 `chat_completions`；Anthropic 模型归一化为 `NULL`。
 - seed 必须复用与运行时 registry 完全相同的 `ModelConfig` 构造与校验（共享 `model_config_from_yaml_entry`），写入的是校验并归一化后的值。禁止把 `models.yaml` 原始字段直接落库：否则未加引号的 `[off, high]` 会以布尔 `false` 写入，再在读取时被转成字符串 `"False"`，形成不报错的错误推理等级。
 - 非法 `models.yaml` 必须让 seed 直接失败，不得部分写入。
 - 从 DB 读取 `supported_reasoning_efforts_json` 时不得用 `str(item)` 强转：非字符串项必须报错暴露损坏数据，而不是静默生成一个永远匹配不上的等级。`tags` 是自由标签，不适用该严格规则。

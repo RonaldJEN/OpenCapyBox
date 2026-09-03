@@ -364,14 +364,15 @@ class TestDatabaseMigration:
 
             with sqlite_engine.connect() as conn:
                 rows = {
-                    row[0]: (row[1], bool(row[2]))
+                    row[0]: (row[1], bool(row[2]), row[3])
                     for row in conn.execute(text(
-                        "SELECT model_id, thinking_wire_format, enable_thinking FROM llm_models"
+                        "SELECT model_id, thinking_wire_format, enable_thinking, openai_protocol "
+                        "FROM llm_models"
                     )).all()
                 }
             assert rows == {
-                "openai-model": ("enable_thinking", True),
-                "anthropic-model": ("none", False),
+                "openai-model": ("enable_thinking", True, None),
+                "anthropic-model": ("none", False, None),
             }
 
             with sqlite_engine.begin() as conn:

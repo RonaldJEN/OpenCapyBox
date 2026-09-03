@@ -575,7 +575,7 @@ class SandboxReadImageTool(Tool):
     def description(self) -> str:
         return (
             "Read one or more sandbox image files and attach them to the next model request as visual context. "
-            "Supports .png, .jpg, .jpeg, and .webp files in the current execution Workspace."
+            "Supports .png, .jpg, .jpeg, and .webp files in the current Session directory."
         )
 
     @property
@@ -586,7 +586,7 @@ class SandboxReadImageTool(Tool):
                 "paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Image paths, absolute or relative to the current execution Workspace shown in the system context",
+                    "description": "Image paths, absolute or relative to the current Session directory shown in the system context",
                 },
                 "max_images": {
                     "type": "integer",
@@ -748,7 +748,7 @@ class SandboxReadTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path, or a path relative to the current execution Workspace shown in the system context",
+                    "description": "Absolute path, or a path relative to the current Session directory shown in the system context",
                 },
                 "offset": {
                     "type": "integer",
@@ -931,7 +931,7 @@ class SandboxWriteTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path, or a path relative to the current execution Workspace shown in the system context",
+                    "description": "Absolute path, or a path relative to the current Session directory shown in the system context",
                 },
                 "content": {
                     "type": "string",
@@ -1061,7 +1061,7 @@ class SandboxEditTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path, or a path relative to the current execution Workspace shown in the system context",
+                    "description": "Absolute path, or a path relative to the current Session directory shown in the system context",
                 },
                 "old_str": {
                     "type": "string",

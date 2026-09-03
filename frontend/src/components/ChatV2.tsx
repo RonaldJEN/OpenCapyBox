@@ -1095,7 +1095,7 @@ function ChatV2View(props: ChatV2Props) {
     setPreviewContextNotice('');
     const normalizedFile = toFileInfo(file, sessionId);
 
-    const showCapturedFallback = (message: string) => {
+    const showCapturedFallback = (message: string, currentOnlyMessage?: string) => {
       if (
         requestId !== assistantFileOpenRequestIdRef.current
         || sessionIdRef.current !== ownerSessionId
@@ -1106,7 +1106,7 @@ function ChatV2View(props: ChatV2Props) {
       }
       const capturedSessionId = normalizedFile.session_id || ownerSessionId;
       if (!normalizedFile.snapshot_path) {
-        setLocalError('当前会话文件已不存在，且没有可验证的生成时版本。');
+        setLocalError(currentOnlyMessage || '当前会话文件已不存在。');
         return;
       }
       filePanelTargetNonceRef.current += 1;
@@ -1163,7 +1163,10 @@ function ChatV2View(props: ChatV2Props) {
           || sessionIdRef.current !== ownerSessionId
         ) return;
         if (!currentFile) {
-          showCapturedFallback('当前会话文件已删除，正在显示生成时版本。');
+          showCapturedFallback(
+            '当前会话文件已删除，正在显示生成时版本。',
+            '当前会话文件已不存在。',
+          );
           return;
         }
         filePanelTargetNonceRef.current += 1;
@@ -1182,7 +1185,10 @@ function ChatV2View(props: ChatV2Props) {
         setPreviewContextNotice('');
         openFilesPanel();
       } catch {
-        showCapturedFallback('当前会话文件无法读取，正在显示生成时版本。');
+        showCapturedFallback(
+          '当前会话文件无法读取，正在显示生成时版本。',
+          '当前会话文件暂时无法读取，请稍后重试。',
+        );
       }
       return;
     }

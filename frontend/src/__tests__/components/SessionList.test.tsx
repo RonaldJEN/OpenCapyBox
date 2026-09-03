@@ -265,11 +265,11 @@ describe('SessionList 組件', () => {
     expect(mockNavigate).toHaveBeenCalledWith('/admin');
   });
 
-  it('應該顯示品牌名稱 bsbox', async () => {
+  it('應該顯示品牌名稱 OpenCapyBox', async () => {
     render(<SessionList onSessionSelect={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByText('bsbox')).toBeInTheDocument();
+      expect(screen.getByText('OpenCapyBox')).toBeInTheDocument();
     });
   });
 
@@ -289,7 +289,7 @@ describe('SessionList 組件', () => {
     render(<SessionList onSessionSelect={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByText('bsbox')).toBeInTheDocument();
+      expect(screen.getByText('OpenCapyBox')).toBeInTheDocument();
     });
 
     expect(screen.queryByTitle('新建对话')).not.toBeInTheDocument();
@@ -368,7 +368,7 @@ describe('SessionList 組件', () => {
     render(<SessionList onSessionSelect={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByText('bsbox')).toBeInTheDocument();
+      expect(screen.getByText('OpenCapyBox')).toBeInTheDocument();
     });
 
     expect(apiService.getRunningSessions).not.toHaveBeenCalled();

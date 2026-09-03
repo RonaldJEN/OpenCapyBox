@@ -405,6 +405,7 @@ export interface AdminModelItem {
   id: string;
   name: string;
   provider: 'openai' | 'anthropic' | string;
+  openai_protocol: 'responses' | 'chat_completions' | null;
   api_base: string;
   model_name: string;
   max_tokens: number;
@@ -454,6 +455,7 @@ export interface AdminModelPayload {
   model_id?: string;
   display_name?: string;
   provider?: string;
+  openai_protocol?: 'responses' | 'chat_completions';
   api_base?: string;
   api_key?: string;
   model_name?: string;

@@ -298,7 +298,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
       <div className="flex items-center justify-between px-2">
         <div className="flex items-center space-x-3">
           <img src="/logo.jpg" alt="OpenCapyBox" className="w-8 h-8 rounded-lg object-cover transition-transform active:scale-95 cursor-pointer" />
-          <span className="font-sans font-semibold text-lg tracking-tight text-claude-text">bsbox</span>
+          <span className="font-sans font-semibold text-lg tracking-tight text-claude-text">OpenCapyBox</span>
         </div>
         <div className="flex items-center gap-1">
         {onNewChat && (

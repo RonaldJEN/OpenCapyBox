@@ -1859,26 +1859,13 @@ class AgentService:
         finally:
             db.close()
 
-    @staticmethod
-    def _sandbox_command_stdout(execution: Any) -> str:
-        logs = getattr(execution, "logs", None)
-        lines = getattr(logs, "stdout", None) if logs is not None else None
-        if not lines:
-            return ""
-        if isinstance(lines, str):
-            return lines
-        return "\n".join(
-            str(getattr(line, "text", line))
-            for line in lines
-        )
-
-    async def _capture_session_assistant_file(
+    def _present_current_session_file(
         self,
         reference: dict[str, Any],
         *,
         run_id: str,
     ) -> dict[str, Any] | None:
-        """Freeze one mutable Session file before its structured event commits."""
+        """Persist a validated live path selected by ``present_files``."""
 
         relative_path = posixpath.normpath(str(reference.get("path") or "").replace("\\", "/"))
         revision = str(reference.get("revision") or "")
@@ -1902,94 +1889,21 @@ class AgentService:
             return None
 
         name = posixpath.basename(relative_path)
-        capture_token = uuid.uuid5(
+        reference_token = uuid.uuid5(
             uuid.NAMESPACE_URL,
-            f"{self.session_id}:{run_id}:{relative_path}:{revision}",
+            f"{self.session_id}:{run_id}:present:{relative_path}",
         ).hex
-        snapshot_path = f".assistant-artifacts/{run_id}/{capture_token}/{name}"
-        source_path = posixpath.join(self._workspace_dir, relative_path)
-        destination_path = posixpath.join(self._workspace_dir, snapshot_path)
-        script = (
-            "import hashlib,json,os,stat,sys,uuid\n"
-            f"source={source_path!r}\n"
-            f"destination={destination_path!r}\n"
-            f"expected_size={expected_size!r}\n"
-            f"expected_mtime_ns={expected_mtime_ns!r}\n"
-            "try:\n"
-            " source_stat=os.lstat(source)\n"
-            "except OSError:\n"
-            " sys.exit(2)\n"
-            "if stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISREG(source_stat.st_mode):\n"
-            " sys.exit(3)\n"
-            "if int(source_stat.st_size)!=expected_size or int(source_stat.st_mtime_ns)!=expected_mtime_ns:\n"
-            " sys.exit(4)\n"
-            "os.makedirs(os.path.dirname(destination),mode=0o700,exist_ok=True)\n"
-            "source_flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)\n"
-            "source_fd=os.open(source,source_flags)\n"
-            "digest=hashlib.sha256()\n"
-            "temp=destination+'.'+uuid.uuid4().hex+'.tmp'\n"
-            "try:\n"
-            " current=os.fstat(source_fd)\n"
-            " if int(current.st_size)!=expected_size or int(current.st_mtime_ns)!=expected_mtime_ns:\n"
-            "  sys.exit(4)\n"
-            " src=os.fdopen(source_fd,'rb',closefd=True)\n"
-            " source_fd=-1\n"
-            " with src,open(temp,'xb') as dst:\n"
-            "  while True:\n"
-            "   chunk=src.read(1024*1024)\n"
-            "   if not chunk:\n"
-            "    break\n"
-            "   digest.update(chunk)\n"
-            "   dst.write(chunk)\n"
-            "  dst.flush()\n"
-            "  os.fsync(dst.fileno())\n"
-            " if os.path.exists(destination):\n"
-            "  existing=hashlib.sha256()\n"
-            "  with open(destination,'rb') as handle:\n"
-            "   for chunk in iter(lambda:handle.read(1024*1024),b''):\n"
-            "    existing.update(chunk)\n"
-            "  if existing.hexdigest()!=digest.hexdigest():\n"
-            "   sys.exit(5)\n"
-            "  os.unlink(temp)\n"
-            " else:\n"
-            "  os.replace(temp,destination)\n"
-            " os.chmod(destination,0o400)\n"
-            " print(json.dumps({'sha256':digest.hexdigest(),'size':expected_size},separators=(',',':')))\n"
-            "finally:\n"
-            " if source_fd>=0:\n"
-            "  os.close(source_fd)\n"
-            " try:\n"
-            "  if os.path.exists(temp): os.unlink(temp)\n"
-            " except OSError:\n"
-            "  pass\n"
-        )
-        execution = await self.sandbox.commands.run(
-            "python3 -c " + shlex.quote(script)
-        )
-        if getattr(execution, "error", None):
-            return None
-        stdout = self._sandbox_command_stdout(execution).strip()
-        if not stdout:
-            return None
-        try:
-            captured = json.loads(stdout.splitlines()[-1])
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(captured, dict) or captured.get("size") != expected_size:
-            return None
         return {
-            "ref_id": f"session:{self.session_id}:{run_id}:{capture_token}",
+            "ref_id": f"session:{self.session_id}:{run_id}:{reference_token}",
             "source": "session",
             "session_id": self.session_id,
             "name": name,
             "path": relative_path,
-            "snapshot_path": snapshot_path,
             "size": expected_size,
             "modified": str(reference.get("modified") or ""),
             "type": str(reference.get("type") or ""),
             "revision": revision,
-            "sha256": str(captured.get("sha256") or ""),
-            "operation": str(reference.get("operation") or "UPDATED"),
+            "operation": "PRESENTED",
             "toolCallId": reference.get("toolCallId"),
         }
 
@@ -2063,29 +1977,6 @@ class AgentService:
         if not isinstance(value, dict):
             return None
         if value.get("source") == "session":
-            if str(value.get("operation") or "").upper() == "DELETED":
-                path = str(value.get("path") or "")
-                name = str(value.get("name") or posixpath.basename(path))
-                revision = str(value.get("revision") or "")
-                if not path or not name or not revision:
-                    return None
-                tombstone_id = uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"{self.session_id}:{run_id}:deleted:{path}",
-                ).hex
-                return {
-                    "ref_id": f"session:{self.session_id}:{run_id}:deleted:{tombstone_id}",
-                    "source": "session",
-                    "session_id": self.session_id,
-                    "name": name,
-                    "path": path,
-                    "size": int(value.get("size") or 0),
-                    "modified": str(value.get("modified") or ""),
-                    "type": str(value.get("type") or ""),
-                    "revision": revision,
-                    "operation": "DELETED",
-                    "toolCallId": value.get("toolCallId"),
-                }
             existing_snapshot = str(value.get("snapshot_path") or "")
             if existing_snapshot:
                 if (
@@ -2113,7 +2004,9 @@ class AgentService:
                     "operation": str(value.get("operation") or "UPDATED"),
                     "toolCallId": value.get("toolCallId"),
                 }
-            return await self._capture_session_assistant_file(value, run_id=run_id)
+            if str(value.get("operation") or "").upper() != "PRESENTED":
+                return None
+            return self._present_current_session_file(value, run_id=run_id)
         if value.get("source") == "workspace":
             return self._protect_workspace_assistant_file(value, run_id=run_id)
         return None
@@ -3756,7 +3649,7 @@ class AgentService:
                     except Exception:
                         self.history_service.db.rollback()
                         logger.warning(
-                            "助手文件引用冻结失败，已丢弃该展示引用: session=%s round=%s",
+                            "助手文件引用校验失败，已丢弃该展示引用: session=%s round=%s",
                             self.session_id,
                             run_id,
                             exc_info=True,
@@ -3988,7 +3881,7 @@ class AgentService:
                     tool_name = getattr(event, "tool_call_name", "")
                     if tool_name in _memory_write_tools:
                         _dirty_memory = True
-                    elif tool_name in ("write_file", "edit_file"):
+                    elif tool_name in ("apply_patch", "write_file", "edit_file"):
                         tcid = getattr(event, "tool_call_id", "")
                         if tcid:
                             _file_op_tracking.add(tcid)

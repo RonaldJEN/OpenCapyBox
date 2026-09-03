@@ -119,6 +119,29 @@ class _ToolLoopObservation:
     path: str | None = None
 
 
+def _file_mutation_path(arguments: Any) -> str | None:
+    if not isinstance(arguments, dict):
+        return None
+    path = arguments.get("path") or arguments.get("file_path")
+    if isinstance(path, str):
+        return path
+    patch = arguments.get("patch")
+    if not isinstance(patch, str):
+        return None
+    paths = {
+        line.strip().split(":", 1)[1].strip()
+        for line in patch.splitlines()
+        if line.strip().startswith((
+            "*** Add File: ",
+            "*** Delete File: ",
+            "*** Update File: ",
+            "*** Move to: ",
+        ))
+        and ":" in line
+    }
+    return next(iter(paths)) if len(paths) == 1 else None
+
+
 class _ToolLoopGuard:
     """Run-local no-progress guard independent from compacted chat history."""
 
@@ -130,6 +153,7 @@ class _ToolLoopGuard:
         "recall_notes",
     })
     _MUTATING_TOOLS = frozenset({
+        "apply_patch",
         "write_file",
         "edit_file",
         "bash_kill",
@@ -138,7 +162,7 @@ class _ToolLoopGuard:
         "update_user",
     })
     _POLLING_TOOLS = frozenset({"bash_output"})
-    _FILE_MUTATING_TOOLS = frozenset({"write_file", "edit_file"})
+    _FILE_MUTATING_TOOLS = frozenset({"apply_patch", "write_file", "edit_file"})
     def __init__(self, *, workspace_dir: str | None = None) -> None:
         self._observations: list[_ToolLoopObservation] = []
         self._active_recoveries: dict[str, frozenset[str]] = {}
@@ -246,14 +270,11 @@ class _ToolLoopGuard:
         )
 
     def _canonical_path(self, arguments: Any) -> str | None:
-        if not isinstance(arguments, dict):
+        value = _file_mutation_path(arguments)
+        if value is None:
             return None
-        for key in ("path", "file_path"):
-            value = arguments.get(key)
-            if isinstance(value, str):
-                normalized = self._canonicalize(value, key=key)
-                return normalized if isinstance(normalized, str) else None
-        return None
+        normalized = self._canonicalize(value, key="path")
+        return normalized if isinstance(normalized, str) else None
 
     @staticmethod
     def _uncertain_file_recovery_key(canonical_path: str) -> str:
@@ -651,13 +672,13 @@ class Agent:
         context_info_parts.append(f"- ⚠️ **重要**: 现在是 **{year}年**，不是2024年或更早的年份！请始终使用此实时时间信息。")
         context_info_parts.append("- ⚠️ **时效原则**: 本块只存在于本次模型请求；历史消息里的时间只代表当时，不可当作当前时间。")
 
-        # 注入工作空间信息
+        # 注入当前 Session 目录信息；Workspace 专指用户持久工作区。
         if self._include_workspace_context:
             context_info_parts.append(
-                f"- **Workspace（当前会话工作目录）**: `{self._model_workspace_dir}`"
+                f"- **当前 Session 目录**: `{self._model_workspace_dir}`"
             )
             context_info_parts.append("- **用户根目录**: `/home/user`（记忆文件、Skills 等用户级资源在此）")
-            context_info_parts.append("- **⚠️ 为用户创建的文件（文档、代码等）必须保存在 Workspace 目录下**，用户才能看到和下载")
+            context_info_parts.append("- **⚠️ 本轮为用户创建的文件（文档、代码等）必须保存在当前 Session 目录下**，用户才能看到和下载")
 
         # 注入平台信息（固定為 sandbox 執行語義）
         context_info_parts.append("- **OS**: Linux (OpenSandbox)")
@@ -1810,6 +1831,9 @@ class Agent:
             if msg.tool_calls:
                 total_tokens += len(encoding.encode(str(msg.tool_calls)))
 
+            if msg.provider_items:
+                total_tokens += len(encoding.encode(str(msg.provider_items)))
+
             # Metadata overhead per message (approximately 4 tokens)
             total_tokens += 4
         return total_tokens
@@ -1837,6 +1861,9 @@ class Agent:
 
             if msg.tool_calls:
                 total_chars += len(str(msg.tool_calls))
+
+            if msg.provider_items:
+                total_chars += len(str(msg.provider_items))
 
         # Rough estimation: average 2.5 characters = 1 token
         return int(total_chars / 2.5)
@@ -2030,12 +2057,8 @@ class Agent:
             except asyncio.TimeoutError:
                 timeout_used = self.tool_timeout if tool.execute_timeout is None else tool.execute_timeout
                 verification_content = ""
-                if function_name in {"write_file", "edit_file"}:
-                    target = (
-                        arguments.get("path")
-                        if isinstance(arguments, dict)
-                        else None
-                    )
+                if function_name in {"apply_patch", "write_file", "edit_file"}:
+                    target = _file_mutation_path(arguments)
                     target_text = f" for {target!r}" if isinstance(target, str) else ""
                     verification_content = (
                         f"The write outcome{target_text} is uncertain and may have "
@@ -3626,6 +3649,7 @@ class Agent:
                     content=response.content,
                     thinking=response.thinking,
                     tool_calls=response.tool_calls,
+                    provider_items=response.provider_items,
                 )
                 self.messages.append(assistant_msg)
 

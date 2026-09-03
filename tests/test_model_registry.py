@@ -84,6 +84,7 @@ class TestModelConfig:
         cfg = self._make_config()
         assert cfg.id == "test-model"
         assert cfg.provider == "openai"
+        assert cfg.openai_protocol == "chat_completions"
 
     def test_reasoning_effort_is_normalized(self):
         cfg = self._make_config(reasoning_effort="  high  ")
@@ -235,7 +236,9 @@ class TestModelConfig:
         )
         model.tool_output_truncation_bytes = None
 
-        assert db_model_to_config(model).tool_output_truncation_bytes == 42667
+        config = db_model_to_config(model)
+        assert config.tool_output_truncation_bytes == 42667
+        assert config.openai_protocol == "chat_completions"
 
     def test_supports_thinking_true(self):
         """OpenAI 变体显式启用 reasoning split 时公开支持思考。"""
@@ -321,6 +324,7 @@ class TestModelConfig:
         public = cfg.to_public_dict()
         assert "api_key" not in public
         assert "api_base" not in public
+        assert "openai_protocol" not in public
         assert public["id"] == "test-model"
         assert public["name"] == "Test Model"
         assert public["supports_image"] is False

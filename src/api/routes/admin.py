@@ -66,6 +66,7 @@ from src.api.services.workspace_service import (
 )
 from src.api.model_registry import (
     ModelConfig,
+    VALID_OPENAI_PROTOCOLS,
     VALID_PROVIDERS,
     VALID_REASONING_FORMATS,
     VALID_THINKING_MODES,
@@ -207,6 +208,7 @@ class AdminModelPayload(BaseModel):
     api_base: str = Field(..., min_length=1)
     api_key: str = Field(..., min_length=1)
     model_name: str = Field(..., min_length=1, max_length=255)
+    openai_protocol: str = "chat_completions"
     max_tokens: int = Field(default=16384, gt=0)
     context_window: int = Field(default=128000, gt=0)
     auto_compact_token_limit: int | None = Field(default=None, gt=0)
@@ -225,7 +227,7 @@ class AdminModelPayload(BaseModel):
     enabled: bool = True
     tags: list[str] = Field(default_factory=list)
 
-    @field_validator("model_id", "display_name", "provider", "api_base", "api_key", "model_name", "reasoning_format", "thinking_mode", "thinking_wire_format", "reasoning_effort", mode="before")
+    @field_validator("model_id", "display_name", "provider", "api_base", "api_key", "model_name", "openai_protocol", "reasoning_format", "thinking_mode", "thinking_wire_format", "reasoning_effort", mode="before")
     @classmethod
     def _strip_model_strings(cls, value):
         return value.strip() if isinstance(value, str) else value
@@ -250,6 +252,13 @@ class AdminModelPayload(BaseModel):
     def _valid_provider(cls, value: str) -> str:
         if value not in VALID_PROVIDERS:
             raise ValueError(f"provider 必须是 {sorted(VALID_PROVIDERS)}")
+        return value
+
+    @field_validator("openai_protocol")
+    @classmethod
+    def _valid_openai_protocol(cls, value: str) -> str:
+        if value not in VALID_OPENAI_PROTOCOLS:
+            raise ValueError(f"openai_protocol 必须是 {sorted(VALID_OPENAI_PROTOCOLS)}")
         return value
 
     @field_validator("reasoning_format")
@@ -282,6 +291,7 @@ class AdminModelPatchPayload(BaseModel):
     api_base: str | None = Field(default=None, min_length=1)
     api_key: str | None = None
     model_name: str | None = Field(default=None, min_length=1, max_length=255)
+    openai_protocol: str | None = None
     max_tokens: int | None = Field(default=None, gt=0)
     context_window: int | None = Field(default=None, gt=0)
     auto_compact_token_limit: int | None = Field(default=None, gt=0)
@@ -300,7 +310,7 @@ class AdminModelPatchPayload(BaseModel):
     enabled: bool | None = None
     tags: list[str] | None = None
 
-    @field_validator("display_name", "provider", "api_base", "api_key", "model_name", "reasoning_format", "thinking_mode", "thinking_wire_format", "reasoning_effort", mode="before")
+    @field_validator("display_name", "provider", "api_base", "api_key", "model_name", "openai_protocol", "reasoning_format", "thinking_mode", "thinking_wire_format", "reasoning_effort", mode="before")
     @classmethod
     def _strip_optional_model_strings(cls, value):
         if isinstance(value, str):
@@ -328,6 +338,13 @@ class AdminModelPatchPayload(BaseModel):
     def _valid_optional_provider(cls, value: str | None) -> str | None:
         if value is not None and value not in VALID_PROVIDERS:
             raise ValueError(f"provider 必须是 {sorted(VALID_PROVIDERS)}")
+        return value
+
+    @field_validator("openai_protocol")
+    @classmethod
+    def _valid_optional_openai_protocol(cls, value: str | None) -> str | None:
+        if value is not None and value not in VALID_OPENAI_PROTOCOLS:
+            raise ValueError(f"openai_protocol 必须是 {sorted(VALID_OPENAI_PROTOCOLS)}")
         return value
 
     @field_validator("reasoning_format")
@@ -488,6 +505,7 @@ def _validate_model_config_values(data: dict[str, Any]) -> ModelConfig:
             api_base=data["api_base"],
             api_key=data["api_key"],
             model_name=data["model_name"],
+            openai_protocol=data.get("openai_protocol"),
             max_tokens=data["max_tokens"],
             context_window=data["context_window"],
             auto_compact_token_limit=data.get("auto_compact_token_limit"),
@@ -535,6 +553,7 @@ def _build_admin_models_payload(db: DBSession) -> dict[str, Any]:
 def _create_admin_model(db: DBSession, payload: AdminModelPayload) -> dict[str, Any]:
     payload_data = payload.model_dump()
     if payload.provider != "openai":
+        payload_data["openai_protocol"] = None
         payload_data["thinking_wire_format"] = "none"
     config = _validate_model_config_values(payload_data)
     model = LLMModel(
@@ -544,6 +563,7 @@ def _create_admin_model(db: DBSession, payload: AdminModelPayload) -> dict[str, 
         api_base=config.api_base,
         api_key=config.api_key,
         model_name=config.model_name,
+        openai_protocol=config.openai_protocol,
         max_tokens=config.max_tokens,
         context_window=config.context_window,
         auto_compact_token_limit=config.auto_compact_token_limit,
@@ -589,6 +609,7 @@ def _update_admin_model(db: DBSession, model_id: str, payload: AdminModelPatchPa
     for field_name, value in data.items():
         setattr(model, field_name, value)
     if model.provider != "openai":
+        model.openai_protocol = None
         model.thinking_wire_format = "none"
     config = _validate_model_config_values({
         "model_id": model.model_id,
@@ -597,6 +618,7 @@ def _update_admin_model(db: DBSession, model_id: str, payload: AdminModelPatchPa
         "api_base": model.api_base,
         "api_key": model.api_key,
         "model_name": model.model_name,
+        "openai_protocol": model.openai_protocol,
         "max_tokens": model.max_tokens,
         "context_window": model.context_window,
         "auto_compact_token_limit": model.auto_compact_token_limit,
@@ -625,6 +647,7 @@ def _update_admin_model(db: DBSession, model_id: str, payload: AdminModelPatchPa
     model.api_base = config.api_base
     model.api_key = config.api_key
     model.model_name = config.model_name
+    model.openai_protocol = config.openai_protocol
     model.max_tokens = config.max_tokens
     model.context_window = config.context_window
     model.auto_compact_token_limit = config.auto_compact_token_limit

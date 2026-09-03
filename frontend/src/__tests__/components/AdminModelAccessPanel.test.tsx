@@ -33,6 +33,7 @@ const modelsResponse = {
       id: 'delete-model',
       name: '可删除模型',
       provider: 'openai',
+      openai_protocol: 'chat_completions' as const,
       api_base: 'https://api.example.com/v1',
       model_name: 'delete-model',
       max_tokens: 1024,

@@ -24,11 +24,11 @@ dependencies = [
     "prompt-toolkit>=3.0.0",
     # LLM Clients
     "anthropic>=0.39.0",
-    "openai>=1.57.4",
+    "openai>=2.8.0",
     # Web Framework
     "fastapi>=0.104.0",
     "uvicorn>=0.24.0",
-    "sqlalchemy>=2.0.0",
+    "sqlalchemy==2.0.52",
     "psycopg2-binary>=2.9.0",
     "python-dotenv>=1.0.0",
     "python-multipart>=0.0.6",

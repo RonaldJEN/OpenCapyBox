@@ -14,7 +14,7 @@ export type ToolCategory = 'edit' | 'create' | 'read' | 'bash' | 'search' | 'ski
 /** 统一的工具分类函数 — 所有分类逻辑的唯一来源 */
 export function getToolCategory(name: string): ToolCategory {
   const lower = name.toLowerCase();
-  if (lower === 'edit_file' || lower === 'edittool') return 'edit';
+  if (lower === 'apply_patch' || lower === 'edit_file' || lower === 'edittool') return 'edit';
   if (lower === 'write_file' || lower === 'writetool') return 'create';
   if (lower === 'read_file' || lower === 'readtool') return 'read';
   if (lower === 'bash' || lower === 'bashtool' || lower === 'shell' || lower === 'bash_output' || lower === 'bashoutputtool' || lower === 'bash_kill' || lower === 'bashkilltool') return 'bash';
@@ -85,6 +85,14 @@ export function getToolDescription(name: string, input: Record<string, unknown>)
   const category = getToolCategory(name);
   const lowerName = name.toLowerCase();
 
+  if (lowerName === 'present_files') {
+    const paths = Array.isArray(input.paths)
+      ? input.paths.filter((path): path is string => typeof path === 'string')
+      : [];
+    if (paths.length === 1) return `Present ${shortenPath(paths[0])}`;
+    return paths.length > 1 ? `Present ${paths.length} files` : 'Present files';
+  }
+
   switch (category) {
     case 'read': {
       const path = getStringField(input, 'path', 'file_path');
@@ -95,6 +103,11 @@ export function getToolDescription(name: string, input: Record<string, unknown>)
       return path ? `Create ${shortenPath(path)}` : 'Create file';
     }
     case 'edit': {
+      if (lowerName === 'apply_patch') {
+        const paths = extractPatchPaths(input);
+        if (paths.length === 1) return `Update ${shortenPath(paths[0])}`;
+        if (paths.length > 1) return `Update ${paths.length} files`;
+      }
       const path = getStringField(input, 'path', 'file_path');
       return path ? `Update ${shortenPath(path)}` : 'Edit file';
     }
@@ -135,10 +148,27 @@ export function getToolDescription(name: string, input: Record<string, unknown>)
  * 从工具调用中提取文件路径（如有）
  */
 export function extractFilePath(name: string, input: Record<string, unknown>): string | undefined {
+  if (name.toLowerCase() === 'present_files') {
+    const paths = Array.isArray(input.paths)
+      ? input.paths.filter((path): path is string => typeof path === 'string')
+      : [];
+    return paths.length === 1 ? paths[0] : paths.length > 1 ? `${paths.length} files` : undefined;
+  }
   if (isFileToolCategory(getToolCategory(name))) {
+    if (name.toLowerCase() === 'apply_patch') {
+      const paths = extractPatchPaths(input);
+      return paths.length === 1 ? paths[0] : paths.length > 1 ? `${paths.length} files` : undefined;
+    }
     return getStringField(input, 'path', 'file_path') || undefined;
   }
   return undefined;
+}
+
+function extractPatchPaths(input: Record<string, unknown>): string[] {
+  if (typeof input.patch !== 'string') return [];
+  return [...input.patch.matchAll(/^\*\*\* (?:Add File|Delete File|Update File|Move to):\s*(.+)$/gm)]
+    .map((match) => match[1].trim())
+    .filter((path, index, paths) => path.length > 0 && paths.indexOf(path) === index);
 }
 
 /**
@@ -176,17 +206,27 @@ export function getGroupSummary(items: ToolGroupItem[]): string {
 
   const parts: string[] = [];
 
-  // 按优先级排序：edit > create > read > bash > search > subagent > other
-  const priorityOrder = ['edit', 'create', 'read', 'bash', 'search', 'subagent', 'skill', 'other'];
+  // 按优先级排序：新写入/交付动作优先，再兼容历史工具分类。
+  const priorityOrder = ['update', 'edit', 'present', 'create', 'read', 'bash', 'search', 'subagent', 'skill', 'other'];
 
   for (const cat of priorityOrder) {
     const count = counts[cat];
     if (!count) continue;
 
     switch (cat) {
+      case 'update': {
+        const files = fileNames[cat]?.size || count;
+        parts.push(files === 1 ? `Updated ${[...(fileNames[cat] || [])][0] || 'a file'}` : `Updated ${files} files`);
+        break;
+      }
       case 'edit': {
         const files = fileNames[cat]?.size || count;
         parts.push(files === 1 ? `Edited ${[...(fileNames[cat] || [])][0] || 'a file'}` : `Edited ${files} files`);
+        break;
+      }
+      case 'present': {
+        const files = fileNames[cat]?.size || count;
+        parts.push(files === 1 ? `Presented ${[...(fileNames[cat] || [])][0] || 'a file'}` : `Presented ${files} files`);
         break;
       }
       case 'create': {
@@ -220,8 +260,11 @@ export function getGroupSummary(items: ToolGroupItem[]): string {
   return parts.join(', ') || 'Processing';
 }
 
-/** 分组摘要专用分类：将 note 归入 other 以保持摘要简洁 */
+/** 分组摘要专用分类：区分新工具语义，并将 note 归入 other。 */
 function categorizeToolAction(name: string): string {
+  const lowerName = name.toLowerCase();
+  if (lowerName === 'apply_patch') return 'update';
+  if (lowerName === 'present_files') return 'present';
   const cat = getToolCategory(name);
   // note 类归入 other 以保持分组摘要行为不变
   return cat === 'note' ? 'other' : cat;
@@ -257,7 +300,9 @@ export function transformToDisplayBlocks(
     // 计算主要工具类别（出现次数最多的类别，平局按优先级）
     const catCounts: Record<string, number> = {};
     for (const item of pendingToolItems) {
-      const cat = categorizeToolAction(item.toolName);
+      const cat = item.toolName.toLowerCase() === 'present_files'
+        ? 'create'
+        : getToolCategory(item.toolName);
       catCounts[cat] = (catCounts[cat] || 0) + 1;
     }
     const catPriority = ['edit', 'bash', 'create', 'read', 'search', 'subagent', 'skill', 'other'];

@@ -64,6 +64,7 @@ def _resolve_env(value: str) -> str:
 # ============================================================
 
 VALID_PROVIDERS = {"anthropic", "openai"}
+VALID_OPENAI_PROTOCOLS = {"responses", "chat_completions"}
 VALID_THINKING_MODES = {"provider_default", "enabled", "disabled"}
 VALID_THINKING_WIRE_FORMATS = {"none", "enable_thinking", "thinking_object"}
 VALID_REASONING_FORMATS = {
@@ -117,12 +118,13 @@ class ModelConfig:
         id: Registry 唯一標識（如 "deepseek-chat"）
         display_name: 前端展示名稱
         provider: SDK 協議（"anthropic" | "openai"）
+        openai_protocol: OpenAI Provider 使用的 API 協議
         api_base: 完整 API 地址（含後綴，直接傳給 SDK）
         api_key: API 密鑰值或 ${ENV_VAR} 引用
         model_name: 發送給 API 的實際模型名稱
         max_tokens: 最大輸出 token 數
         reasoning_format: 思考過程解析格式
-        reasoning_split: 是否發送 extra_body.reasoning_split = true（僅 OpenAI）
+        reasoning_split: 目录能力标记；表示网关可返回独立的可展示思考内容
         thinking_mode: 思考開關三態（provider_default/enabled/disabled，僅 OpenAI）
         thinking_wire_format: 思考开关的请求协议（不发送/enable_thinking/thinking.type）
         enable_thinking: 舊版相容開關；thinking_mode=provider_default 時 true 代表 enabled
@@ -137,12 +139,13 @@ class ModelConfig:
     api_base: str
     api_key: str  # 原始值，可能是 ${ENV_VAR}
     model_name: str
+    openai_protocol: str | None = None
     max_tokens: int = 16384          # 單次輸出上限（output tokens）
     context_window: int = 128000     # 模型總上下文窗口大小（input + output tokens）
     auto_compact_token_limit: int | None = None
     tool_output_truncation_bytes: int = 42667
     reasoning_format: str = "none"
-    reasoning_split: bool = False
+    reasoning_split: bool = False  # Catalog capability only; never sent to Responses.
     enable_thinking: bool = False
     thinking_mode: str = "provider_default"
     thinking_wire_format: str = "none"
@@ -162,6 +165,15 @@ class ModelConfig:
                 f"模型 '{self.id}' 的 provider '{self.provider}' 無效，"
                 f"可選: {VALID_PROVIDERS}"
             )
+        if self.provider == "openai":
+            self.openai_protocol = self.openai_protocol or "chat_completions"
+            if self.openai_protocol not in VALID_OPENAI_PROTOCOLS:
+                raise ValueError(
+                    f"模型 '{self.id}' 的 openai_protocol '{self.openai_protocol}' 無效，"
+                    f"可選: {VALID_OPENAI_PROTOCOLS}"
+                )
+        else:
+            self.openai_protocol = None
         if self.reasoning_format not in VALID_REASONING_FORMATS:
             raise ValueError(
                 f"模型 '{self.id}' 的 reasoning_format '{self.reasoning_format}' 無效，"
@@ -400,6 +412,7 @@ def model_config_from_yaml_entry(model_id: str, cfg: dict) -> ModelConfig:
         api_base=cfg["api_base"],
         api_key=cfg.get("api_key", "${LLM_API_KEY}"),
         model_name=cfg.get("model_name", str(model_id)),
+        openai_protocol=cfg.get("openai_protocol"),
         max_tokens=cfg.get("max_tokens", 16384),
         context_window=cfg.get("context_window", 128000),
         auto_compact_token_limit=cfg.get("auto_compact_token_limit"),

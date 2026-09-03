@@ -172,7 +172,7 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 - Response: 文件字节流，`Content-Disposition` = attachment（下载）或 inline（预览）
 - 可预览类型：text/\*、image/\*、PDF、JSON、XML
 - `render=pdf`：仅接受 DOC/DOCX/PPT/PPTX。在**用户 OpenSandbox 内**以单一进程完成源文件的 50 MiB 有界快照、SHA-256 与复制，API 主机不得读取或执行不可信 Office 内容；随后在沙箱内调用 LibreOffice。派生 PDF 缓存在 session 根目录下的隐藏 `.opencapybox-preview/{content_hash}/`，不得出现在文件列表中，并随 session 删除。
-- `.assistant-artifacts/{round}/...` 是服务端对助手产物创建的只读生成时快照，只能由结构化工具事实产生；隐藏目录不参与普通枚举，直接鉴权预览可使用 immutable cache header，并随 Session 删除。快照用于当前文件缺失时的只读兜底，读取快照不得创建或恢复当前文件。
+- `.assistant-artifacts/{round}/...` 仅承载 `present_files` 迁移前已经持久化的旧 Session 助手引用，不再为新引用创建。history 可原样返回旧引用的 `snapshot_path`；当前文件缺失时，旧卡片仍可只读回退到生成时快照，且不得据此创建或恢复当前文件。新 `present_files` 引用只记录当前 Session 路径，不复制正文；文件被覆盖后打开最新内容，被删除后提示不可用。隐藏目录不参与普通枚举，既有快照可使用 immutable cache header，并随 Session 删除。
 - 派生预览以文件内容 hash + 扩展名 + renderer 版本为缓存键；同内容重复预览直接复用 PDF。
 - 相同内容通过沙箱内原子目录锁收敛为一次转换；每请求使用唯一 scratch/LibreOffice profile，先验证临时 PDF 的 `%PDF-` magic 与大小，再原子发布，禁止命中 partial cache。
 - 请求取消或 shell/SDK 超时不得再次取消 `.incoming-*` 与 LibreOffice profile 的清理；清理和锁释放完成后才能传播取消。每次 Office 快照还必须在同一隐藏缓存根下删除严格匹配 `.incoming-<32位小写十六进制>` 且超过 300 秒的中断残留，不跟随 symlink、不触碰内容 hash 缓存目录或当前请求 scratch。
@@ -183,7 +183,7 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 ### PUT /api/sessions/{id}/files/{path:path}
 
 - 支持 `.md/.markdown` 的 UTF-8 `content`，以及 `.csv/.xlsx` 的 `content_base64`；旧二进制 `.xls`、`.et` 与其余扩展名返回 415，只允许下载/只读预览。
-- 新编辑请求携带与正文成对取得的 `expected_revision`、`edit_base_token`，以及每代草稿稳定的 `save_id`。文件内容变化时复用 Workspace 三方合并算法：base 为打开时正文，current 为本次用户草稿，proposal 为远端当前正文；互不重叠的改动保留，重叠按既有算法用户草稿优先。最终在单文件锁内校验合并所依据的当前 SHA/size/mtime，再原子替换；并发变化有界重算，持续变化返回可重试 `SESSION_EDIT_RETRY`。受控 Session WriteTool 把调用开始时观察到的 SHA（新文件则为 must-not-exist）带入共享锁内 CAS；EditTool 同样携带读取正文的 SHA，变化时重读并重新计算，第二次仍变化则安全失败。任意 Bash/外部直接写文件不属于此协作锁协议。
+- 新编辑请求携带与正文成对取得的 `expected_revision`、`edit_base_token`，以及每代草稿稳定的 `save_id`。文件内容变化时复用 Workspace 三方合并算法：base 为打开时正文，current 为本次用户草稿，proposal 为远端当前正文；互不重叠的改动保留，重叠按既有算法用户草稿优先。最终在单文件锁内校验合并所依据的当前 SHA/size/mtime，再原子替换；并发变化有界重算，持续变化返回可重试 `SESSION_EDIT_RETRY`。受控 Session `apply_patch` 对已有源文件携带读取时观察到的 SHA，对 Add 与 Move 目标使用 must-not-exist，并在共享锁内完成 CAS；上下文失配或并发变化必须安全失败。任意 Bash/外部直接写文件不属于此协作锁协议。
 - 基线和幂等回执仅保存在 Session 隐藏 `.opencapybox-edit/{bases,receipts,locks}`，不创建 Workspace entry/version/reference/checkpoint。基线是独立复制的不可变字节，使用现有预览缓存预算和草稿基线保留天数清理，回执另限 4 MiB，Session 删除时一起删除；它们不是永久历史。重复 `save_id` 和相同请求返回原回执，不重复应用合并。基线不可用或文件结构不支持合并时显式保留草稿，不得只推进 revision 后覆盖。
 - 未携带 `edit_base_token` 的旧客户端仍使用 strict CAS；版本不一致返回 `409 {code:"SESSION_FILE_REVISION_CONFLICT", message, current, current_revision}`。旧草稿只有正文等于当前正文，或原 revision 与新读取基线一致时才能自动恢复；不能给未知来源旧草稿补一个新 revision 强写。
 - `UserRunLock` 不阻止 Session 在线写回，不得以用户级或 Session 级运行锁扩大为整区只写门槛。

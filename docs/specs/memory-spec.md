@@ -173,7 +173,7 @@
 ### Dirty Flag 检测与兜底
 
 - **工具名匹配**：`update_long_term_memory`、`update_user`
-- **文件操作嗅探**：`write_file` / `edit_file` 目标为记忆文件
+- **文件操作嗅探**：`apply_patch` 补丁目标包含记忆文件
 - **即时同步**：受控工具成功写入根目录 USER / MEMORY / SOUL 后，立即调用 DB 同步；USER / MEMORY 内容变化时同步重建 embedding
 - **AGENTS 保护**：根目录 AGENTS.md 由平台模板管理，受控文件工具拒绝写入，后台同步也不回写 DB
 - **兜底同步**：每 round 结束后若 dirty -> 从 sandbox 读回 DB-backed 文件；仅内容实际变化时更新版本并重建 USER / MEMORY embedding

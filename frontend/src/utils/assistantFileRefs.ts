@@ -1,9 +1,7 @@
 import type { AssistantFileReference, FileInfo } from '../types';
 import { normalizeFileType } from './fileUtils';
 
-const FILE_HINT_LINE_RE = /^\s*(?:[-*]\s*)?(?:\*\*)?\s*(?:文件位置|文件路径|保存位置|已保存到|输出文件|生成文件|文件)\s*(?:[:：]\s*)?(?:\*\*)?\s*(?:[:：]\s*)?(.+?)\s*$/;
 const INLINE_CODE_RE = /`([^`]+)`/;
-const INLINE_FILE_REF_RE = /`([^`\n]+)`/g;
 const SESSION_PATH_PREFIX = '/home/user/sessions/';
 const URL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const FILE_PREVIEW_EXTS = new Set([
@@ -14,79 +12,6 @@ const FILE_PREVIEW_EXTS = new Set([
   'jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp', 'pdf',
   'zip',
 ]);
-
-/**
- * 从助手回复文本中解析出被提及的文件，按 path 去重后返回（保留首次出现顺序）。
- * 正文本身不再被拆分，文件卡片统一在消息底部展示。
- */
-export function extractAssistantFiles(content: string, sessionId?: string): FileInfo[] {
-  if (!sessionId) {
-    return [];
-  }
-
-  const files: FileInfo[] = [];
-  const seenPaths = new Set<string>();
-  let inFence = false;
-
-  const pushFile = (file: FileInfo) => {
-    if (seenPaths.has(file.path)) {
-      return;
-    }
-    seenPaths.add(file.path);
-    files.push(file);
-  };
-
-  for (const line of content.split('\n')) {
-    if (line.trimStart().startsWith('```')) {
-      inFence = !inFence;
-      continue;
-    }
-
-    if (inFence) {
-      continue;
-    }
-
-    const hintFile = parseFileHintLine(line, sessionId);
-    if (hintFile) {
-      pushFile(hintFile);
-      continue;
-    }
-
-    for (const inlineFile of parseInlineFileRefs(line, sessionId)) {
-      pushFile(inlineFile.file);
-    }
-  }
-
-  return files;
-}
-
-function parseFileHintLine(line: string, sessionId: string): FileInfo | null {
-  const match = line.match(FILE_HINT_LINE_RE);
-  if (!match) {
-    return null;
-  }
-
-  return createFileInfoFromCandidate(match[1], sessionId);
-}
-
-function parseInlineFileRefs(line: string, sessionId: string) {
-  const refs: Array<{ start: number; end: number; file: FileInfo }> = [];
-  let match: RegExpExecArray | null;
-  INLINE_FILE_REF_RE.lastIndex = 0;
-
-  while ((match = INLINE_FILE_REF_RE.exec(line)) !== null) {
-    if (!isInlinePathCandidate(match[1])) {
-      continue;
-    }
-
-    const file = createFileInfoFromCandidate(match[1], sessionId);
-    if (file) {
-      refs.push({ start: match.index, end: match.index + match[0].length, file });
-    }
-  }
-
-  return refs;
-}
 
 function createFileInfoFromCandidate(raw: string, sessionId: string): FileInfo | null {
   const candidate = extractPathCandidate(raw);
@@ -180,10 +105,6 @@ function normalizeAssistantFilePath(candidate: string, sessionId: string): strin
   return segments.join('/');
 }
 
-function isInlinePathCandidate(raw: string): boolean {
-  return !/\s/.test(extractPathCandidate(raw));
-}
-
 /** 将 Markdown href 解析为当前会话内可预览文件；外链和越界路径返回 null。 */
 export function createAssistantFileInfoFromHref(
   href: string,
@@ -202,31 +123,6 @@ function matchStructuredReference(
   if (exact.length > 1) return null;
   const byName = references.filter((reference) => reference.name === candidate.name);
   return byName.length === 1 ? byName[0] : null;
-}
-
-/**
- * Select display intent from assistant prose while taking identity exclusively
- * from durable structured references. Unknown or ambiguous mentions never
- * become clickable files.
- */
-export function selectAssistantFileReferences(
-  content: string,
-  references: AssistantFileReference[],
-): AssistantFileReference[] {
-  if (references.length === 0) return [];
-  const selectorSessionId = references.find((item) => item.source === 'session')?.session_id
-    || '__structured_reference__';
-  const mentions = extractAssistantFiles(content, selectorSessionId);
-  const selected: AssistantFileReference[] = [];
-  const seen = new Set<string>();
-  for (const mention of mentions) {
-    const reference = matchStructuredReference(mention, references);
-    if (reference && !seen.has(reference.ref_id)) {
-      seen.add(reference.ref_id);
-      selected.push(reference);
-    }
-  }
-  return selected;
 }
 
 export function resolveAssistantFileReferenceFromHref(

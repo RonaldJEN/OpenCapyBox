@@ -43,6 +43,7 @@ type ModelForm = {
   model_id: string;
   display_name: string;
   provider: string;
+  openai_protocol: 'responses' | 'chat_completions';
   api_base: string;
   api_key: string;
   model_name: string;
@@ -68,6 +69,7 @@ const emptyModelForm: ModelForm = {
   model_id: '',
   display_name: '',
   provider: 'openai',
+  openai_protocol: 'chat_completions',
   api_base: '',
   api_key: '',
   model_name: '',
@@ -97,6 +99,7 @@ function modelToForm(model: AdminModelItem): ModelForm {
     model_id: model.id,
     display_name: model.name,
     provider: model.provider,
+    openai_protocol: model.openai_protocol || 'chat_completions',
     api_base: model.api_base,
     api_key: '',
     model_name: model.model_name,
@@ -423,6 +426,7 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
       model_id: modelForm.model_id.trim(),
       display_name: modelForm.display_name.trim(),
       provider: modelForm.provider,
+      openai_protocol: modelForm.openai_protocol,
       api_base: modelForm.api_base.trim(),
       api_key: modelForm.api_key.trim(),
       model_name: modelForm.model_name.trim(),
@@ -869,7 +873,8 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
             </div>
             <label className="admin-model-field">Model ID<input value={modelForm.model_id} disabled={!!editingModelId} onChange={(event) => setModelForm((prev) => ({ ...prev, model_id: event.target.value }))} /></label>
             <label className="admin-model-field">显示名称<input value={modelForm.display_name} onChange={(event) => setModelForm((prev) => ({ ...prev, display_name: event.target.value }))} /></label>
-            <label className="admin-model-field">Provider<select value={modelForm.provider} onChange={(event) => setModelForm((prev) => ({ ...prev, provider: event.target.value, thinking_wire_format: event.target.value === 'openai' ? (prev.thinking_wire_format === 'none' ? 'enable_thinking' : prev.thinking_wire_format) : 'none', default_reasoning_level: event.target.value === 'openai' ? (prev.default_reasoning_level || 'on') : '', supported_reasoning_efforts: event.target.value === 'openai' ? (prev.supported_reasoning_efforts || 'off, on') : '' }))}><option value="openai">openai</option><option value="anthropic">anthropic</option></select></label>
+            <label className="admin-model-field">Provider<select value={modelForm.provider} onChange={(event) => setModelForm((prev) => ({ ...prev, provider: event.target.value, openai_protocol: event.target.value === 'openai' ? prev.openai_protocol : 'chat_completions', thinking_wire_format: event.target.value === 'openai' ? (prev.thinking_wire_format === 'none' ? 'enable_thinking' : prev.thinking_wire_format) : 'none', default_reasoning_level: event.target.value === 'openai' ? (prev.default_reasoning_level || 'on') : '', supported_reasoning_efforts: event.target.value === 'openai' ? (prev.supported_reasoning_efforts || 'off, on') : '' }))}><option value="openai">openai</option><option value="anthropic">anthropic</option></select></label>
+            <label className="admin-model-field">OpenAI API 协议<select value={modelForm.openai_protocol} disabled={modelForm.provider !== 'openai'} onChange={(event) => setModelForm((prev) => ({ ...prev, openai_protocol: event.target.value as ModelForm['openai_protocol'] }))}><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option></select></label>
             <label className="admin-model-field">API Base<input value={modelForm.api_base} onChange={(event) => setModelForm((prev) => ({ ...prev, api_base: event.target.value }))} /></label>
             <label className="admin-model-field">API Key<input value={modelForm.api_key} placeholder={editingModelId ? '留空则保持不变' : ''} onChange={(event) => setModelForm((prev) => ({ ...prev, api_key: event.target.value }))} /></label>
             <label className="admin-model-field">Model Name<input value={modelForm.model_name} onChange={(event) => setModelForm((prev) => ({ ...prev, model_name: event.target.value }))} /></label>
@@ -888,7 +893,7 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
             <label className="admin-model-field">Tags<input value={modelForm.tags} placeholder="thinking, coding" onChange={(event) => setModelForm((prev) => ({ ...prev, tags: event.target.value }))} /></label>
             <div className="admin-model-flags">
               <label><input type="checkbox" checked={modelForm.enabled} onChange={(event) => setModelForm((prev) => ({ ...prev, enabled: event.target.checked }))} /> <CheckCircle2 size={13} />启用</label>
-              <label><input type="checkbox" checked={modelForm.reasoning_split} onChange={(event) => setModelForm((prev) => ({ ...prev, reasoning_split: event.target.checked }))} /> reasoning_split</label>
+              <label title="Responses 下仅标记独立思考内容能力；Chat Completions 兼容路径会发送 reasoning_split"><input type="checkbox" checked={modelForm.reasoning_split} onChange={(event) => setModelForm((prev) => ({ ...prev, reasoning_split: event.target.checked }))} /> 独立思考内容</label>
               <label><input type="checkbox" checked={modelForm.supports_image} onChange={(event) => setModelForm((prev) => ({ ...prev, supports_image: event.target.checked }))} /> 图片</label>
               <label><input type="checkbox" checked={modelForm.supports_video} onChange={(event) => setModelForm((prev) => ({ ...prev, supports_video: event.target.checked }))} /> 视频</label>
             </div>

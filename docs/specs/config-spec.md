@@ -38,8 +38,8 @@ Human-in-the-Loop 不提供协议切换配置：`ask_user` 与工具审批始终
 | 工具类 | 名称 | 用途 |
 |---|---|---|
 | SandboxReadTool | read_file | 按完整行分页读取沙箱文件（默认/最多 2000 行、约 50 KiB、单行 2000 字符）|
-| SandboxWriteTool | write_file | 写/创建沙箱文件 |
-| SandboxEditTool | edit_file | 字符串替换编辑 |
+| SandboxApplyPatchTool | apply_patch | Codex freeform 补丁，创建/更新/移动/删除沙箱文本文件 |
+| SandboxPresentFilesTool | present_files | 显式展示当前 Session 中已经完成的交付文件（仅 Chat 主 Agent）|
 | SandboxBashTool | bash | 执行命令（前台/后台）|
 | SandboxBashOutputTool | bash_output | 获取后台进程输出 |
 | SandboxBashKillTool | bash_kill | 终止后台进程 |
@@ -160,7 +160,7 @@ Human-in-the-Loop 不提供协议切换配置：`ask_user` 与工具审批始终
 
 | profile | 定位 | 额外禁用工具（在公共禁用之外） |
 | --- | --- | --- |
-| `research` | 读 + 联网 + 抓取（bash），靠提示约束不主动改 workspace | `SandboxWriteTool`、`SandboxEditTool`、记忆写工具（`UpdateLongTermMemoryTool`/`UpdateUserProfileTool`） |
+| `research` | 研究与证据任务，可按委派内容读取或修改 workspace | 记忆写工具（`UpdateLongTermMemoryTool`/`UpdateUserProfileTool`） |
 | `write` | 办公长任务产物工：创建/更新/修改/批注 workspace 文件 | 记忆写工具 |
 | `general` | 兜底（默认） | 无 |
 

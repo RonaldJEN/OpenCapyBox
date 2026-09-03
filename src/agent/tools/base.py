@@ -18,9 +18,9 @@ class ToolResult(BaseModel):
     # the model as tool text; Agent.run_agui projects them as CUSTOM events.
     resource_changes: list[dict[str, Any]] | None = Field(default=None, exclude=True)
     workspace_change_events: list[dict[str, Any]] | None = Field(default=None, exclude=True)
-    # Structured file identities observed or produced by this call.  The UI
-    # may correlate these with explicit file mentions in the final response;
-    # it must never infer a source namespace from a filename alone.
+    # Structured file identities explicitly selected for user presentation.
+    # The UI must never infer presentation intent or a source namespace from
+    # assistant prose or a filename alone.
     assistant_file_references: list[dict[str, Any]] | None = Field(
         default=None,
         exclude=True,
@@ -170,4 +170,13 @@ class Tool:
                 "description": self.description,
                 "parameters": self.parameters,
             },
+        }
+
+    def to_responses_schema(self) -> dict[str, Any]:
+        """Convert tool to the flat Responses API function-tool schema."""
+        return {
+            "type": "function",
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
         }

@@ -377,7 +377,8 @@ async def test_agent_service_sub_agent_creates_child_round_and_graph_edge():
         research_exclude = set(resolve_profile("review").tool_exclude)
         assert research_exclude in child_tool_excludes
         assert {"AskUserQuestionTool", "SubAgentTool"}.issubset(research_exclude)
-        assert {"SandboxWriteTool", "SandboxEditTool", "ManageCronTool"}.issubset(research_exclude)
+        assert "ManageCronTool" in research_exclude
+        assert "SandboxApplyPatchTool" not in research_exclude
         # 子 agent 使用 profile 精简 system prompt，而非父记忆
         assert child_prompt_overrides == [resolve_profile("review").system_prompt]
         assert child_history_policies == [(False, False)]

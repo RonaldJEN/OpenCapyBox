@@ -38,6 +38,7 @@ def test_alias_resolution_is_case_insensitive():
 def test_all_profiles_forbid_ask_and_sub():
     for profile in PROFILES.values():
         assert "AskUserQuestionTool" in profile.tool_exclude
+        assert "SandboxPresentFilesTool" in profile.tool_exclude
         assert "SubAgentTool" in profile.tool_exclude
 
 
@@ -46,9 +47,9 @@ def test_all_profiles_forbid_cron():
         assert "ManageCronTool" in profile.tool_exclude
 
 
-def test_research_forbids_workspace_writes_and_memory_writes():
+def test_research_allows_patch_but_forbids_memory_writes():
     exclude = resolve_profile("research").tool_exclude
-    assert {"SandboxWriteTool", "SandboxEditTool"}.issubset(exclude)
+    assert "SandboxApplyPatchTool" not in exclude
     assert {
         "UpdateLongTermMemoryTool",
         "UpdateUserProfileTool",
@@ -63,8 +64,7 @@ def test_research_allows_read_and_bash():
 
 def test_write_allows_workspace_writes_but_forbids_memory_writes():
     exclude = resolve_profile("write").tool_exclude
-    assert "SandboxWriteTool" not in exclude
-    assert "SandboxEditTool" not in exclude
+    assert "SandboxApplyPatchTool" not in exclude
     assert {
         "UpdateLongTermMemoryTool",
         "UpdateUserProfileTool",
@@ -73,7 +73,7 @@ def test_write_allows_workspace_writes_but_forbids_memory_writes():
 
 def test_general_allows_writes_and_memory_but_forbids_cron():
     exclude = resolve_profile("general").tool_exclude
-    assert "SandboxWriteTool" not in exclude
+    assert "SandboxApplyPatchTool" not in exclude
     assert "UpdateLongTermMemoryTool" not in exclude
     assert "ManageCronTool" in exclude
 

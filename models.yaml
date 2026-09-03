@@ -18,7 +18,8 @@
 #   - anthropic_thinking  Anthropic 協議原生 thinking content blocks
 #
 # reasoning_split / thinking_mode / reasoning_effort 僅對 provider=openai 生效：
-#   - reasoning_split:  發送 extra_body.reasoning_split = true
+#   - openai_protocol:  responses / chat_completions；缺省使用 chat_completions
+#   - reasoning_split:  Responses 下僅標記能力；Chat Completions 發送 extra_body.reasoning_split = true
 #   - thinking_mode:    provider_default（省略）/ enabled（true）/ disabled（false）
 #   - thinking_wire_format: none / enable_thinking 布尔值 / thinking_object（thinking.type）
 #   - enable_thinking:  舊版相容欄位；true 等同 thinking_mode=enabled

@@ -37,8 +37,8 @@ _TOOL_DESCRIPTION_PREVIEW_CHARS = 500
 _BUILTIN_TOOLS: tuple[tuple[str, str], ...] = (
     ("read_file", "读取工作区文件"),
     ("read_image_file", "读取工作区图片"),
-    ("write_file", "写入工作区文件"),
-    ("edit_file", "编辑工作区文件"),
+    ("apply_patch", "补丁修改工作区文件"),
+    ("present_files", "展示会话交付文件"),
     ("bash", "执行 Shell 命令"),
     ("bash_output", "读取后台命令输出"),
     ("bash_kill", "停止后台命令"),

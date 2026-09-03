@@ -41,3 +41,33 @@ def tools_to_openai_schema(tools: Iterable[Any]) -> list[dict[str, Any]]:
         else:
             raise TypeError(f"Unsupported tool type: {type(tool)}")
     return result
+
+
+def tools_to_responses_schema(tools: Iterable[Any]) -> list[dict[str, Any]]:
+    """Project tools exactly as the Responses API sends them."""
+
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        if isinstance(tool, dict):
+            if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+                function = tool["function"]
+                result.append({
+                    "type": "function",
+                    "name": function["name"],
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters", {"type": "object"}),
+                })
+            elif "input_schema" in tool:
+                result.append({
+                    "type": "function",
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool["input_schema"],
+                })
+            else:
+                result.append(tool)
+        elif hasattr(tool, "to_responses_schema"):
+            result.append(tool.to_responses_schema())
+        else:
+            raise TypeError(f"Unsupported tool type: {type(tool)}")
+    return result

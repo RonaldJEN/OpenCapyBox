@@ -300,7 +300,7 @@ function AssistantFileCard({
   const file = assistantFileReferenceToFileInfo(reference);
   const previewSessionId = file.session_id;
   const imagePreviewPath = reference.source === 'session'
-    ? reference.snapshot_path
+    ? reference.snapshot_path || reference.path
     : file.path;
   const showImagePreview = isImageFile(file) && (file.data_url || (previewSessionId && imagePreviewPath));
 

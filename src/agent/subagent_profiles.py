@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 _ALWAYS_EXCLUDED: frozenset[str] = frozenset(
     {
         "AskUserQuestionTool",
+        "SandboxPresentFilesTool",
         "SubAgentTool",
     }
 )
@@ -37,20 +38,31 @@ class SubAgentProfile:
     tool_exclude: frozenset[str] = field(default_factory=frozenset)
 
 
+_STORAGE_BOUNDARY_PROMPT = """
+
+Storage boundary:
+- The current Session directory is the temporary execution directory for this task.
+- Workspace means only the user's cross-session persistent Workspace.
+- Never call workspace_* unless the parent task explicitly instructs you to access the
+  persistent Workspace. A project/product name, missing information, or a desire for
+  factual context is not authorization. Otherwise use only the current Session directory
+  and the material already supplied by the parent.
+"""
+
+
 _RESEARCH_PROMPT = """You are a research sub-agent inside OpenCapyBox.
 
 Your job is to investigate a delegated topic and return a concise, well-sourced
 synthesis to the parent agent.
 
 Capabilities:
-- Read existing workspace files for context.
+- Read existing files in the current Session directory for context.
 - Search the web and fetch/crawl pages.
 - Run shell commands (curl, scripts) to gather data.
+- Use persistent Workspace tools only when the delegated task explicitly
+  authorizes that access.
 
 Constraints:
-- Focus on reading and gathering. Do NOT modify, create, or delete workspace
-  files as part of your task. Use the shell only to collect information, not to
-  produce deliverables.
 - Do not ask the user questions. If information is missing, state the assumption
   and proceed.
 - Report concrete findings with traceable evidence. Keep the final answer
@@ -77,11 +89,11 @@ Reporting contract:
 
 _WRITE_PROMPT = """You are a deliverable sub-agent inside OpenCapyBox.
 
-Your job is to produce office/long-form artifacts in the workspace: create,
+Your job is to produce office/long-form artifacts in the current Session directory: create,
 update, edit, and annotate files that fulfil the delegated task.
 
 Capabilities:
-- Read, write, and edit workspace files.
+- Read, write, and edit files in the current Session directory.
 - Run shell commands to build or transform artifacts.
 - Read existing memory/profile for context (read-only).
 
@@ -96,7 +108,7 @@ Constraints:
 _GENERAL_PROMPT = """You are a general-purpose sub-agent inside OpenCapyBox.
 
 Complete the delegated task using your available tools. Read for context, write
-or edit workspace files when the task requires it, and run shell commands as
+or edit files in the current Session directory when the task requires it, and run shell commands as
 needed.
 
 Constraints:
@@ -109,20 +121,18 @@ Constraints:
 PROFILES: dict[str, SubAgentProfile] = {
     "research": SubAgentProfile(
         name="research",
-        system_prompt=_RESEARCH_PROMPT,
+        system_prompt=_RESEARCH_PROMPT + _STORAGE_BOUNDARY_PROMPT,
         tool_exclude=frozenset(
             _ALWAYS_EXCLUDED
             | _MEMORY_WRITE_TOOLS
             | {
-                "SandboxWriteTool",
-                "SandboxEditTool",
                 "ManageCronTool",
             }
         ),
     ),
     "write": SubAgentProfile(
         name="write",
-        system_prompt=_WRITE_PROMPT,
+        system_prompt=_WRITE_PROMPT + _STORAGE_BOUNDARY_PROMPT,
         tool_exclude=frozenset(
             _ALWAYS_EXCLUDED
             | _MEMORY_WRITE_TOOLS
@@ -133,7 +143,7 @@ PROFILES: dict[str, SubAgentProfile] = {
     ),
     "general": SubAgentProfile(
         name="general",
-        system_prompt=_GENERAL_PROMPT,
+        system_prompt=_GENERAL_PROMPT + _STORAGE_BOUNDARY_PROMPT,
         tool_exclude=frozenset(
             _ALWAYS_EXCLUDED
             | {

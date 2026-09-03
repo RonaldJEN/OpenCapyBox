@@ -293,10 +293,12 @@ def test_create_non_openai_model_normalizes_thinking_wire_format(
         "model_name": "anthropic-wire-normalized",
         "max_tokens": 1024,
         "context_window": 16384,
+        "openai_protocol": "responses",
         "thinking_wire_format": "enable_thinking",
     })
 
     assert response.status_code == 200
+    assert response.json()["openai_protocol"] is None
     assert response.json()["thinking_wire_format"] == "none"
 
     db = SessionLocal()
@@ -304,6 +306,7 @@ def test_create_non_openai_model_normalizes_thinking_wire_format(
         model = db.query(LLMModel).filter(
             LLMModel.model_id == "anthropic-wire-normalized"
         ).one()
+        assert model.openai_protocol is None
         assert model.thinking_wire_format == "none"
     finally:
         db.close()
@@ -323,10 +326,12 @@ def test_admin_model_writes_persist_normalized_reasoning_levels(
         "model_name": "normalized-reasoning-levels",
         "max_tokens": 1024,
         "context_window": 16384,
+        "openai_protocol": "responses",
         "supported_reasoning_efforts": [" high ", "max", "high"],
     })
 
     assert create_response.status_code == 200
+    assert create_response.json()["openai_protocol"] == "responses"
     assert create_response.json()["supported_reasoning_efforts"] == ["high", "max"]
 
     db = SessionLocal()
@@ -334,6 +339,7 @@ def test_admin_model_writes_persist_normalized_reasoning_levels(
         created = db.query(LLMModel).filter(
             LLMModel.model_id == "normalized-reasoning-levels"
         ).one()
+        assert created.openai_protocol == "responses"
         assert json.loads(created.supported_reasoning_efforts_json) == ["high", "max"]
     finally:
         db.close()

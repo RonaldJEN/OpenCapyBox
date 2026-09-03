@@ -14,6 +14,7 @@ class LLMModel(Base):
     model_id = Column(String(100), primary_key=True)
     display_name = Column(String(255), nullable=False)
     provider = Column(String(20), nullable=False)
+    openai_protocol = Column(String(32), nullable=True)
     api_base = Column(Text, nullable=False)
     api_key = Column(Text, nullable=False)
     model_name = Column(String(255), nullable=False)

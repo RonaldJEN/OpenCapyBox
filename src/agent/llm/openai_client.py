@@ -124,6 +124,7 @@ class OpenAIClient(LLMClientBase):
 
         self.last_request_snapshot = {
             "provider": "openai",
+            "openai_protocol": "chat_completions",
             **params,
         }
 
@@ -634,6 +635,7 @@ class OpenAIClient(LLMClientBase):
 
         self.last_request_snapshot = {
             "provider": "openai",
+            "openai_protocol": "chat_completions",
             **params,
         }
 

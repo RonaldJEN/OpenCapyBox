@@ -618,7 +618,7 @@ class _SessionArtifactTool(_MarkerTool):
                 "modified": "2026-08-28T10:00:00Z",
                 "type": "md",
                 "revision": "v1:42:100",
-                "operation": "CREATED",
+                "operation": "PRESENTED",
             }],
         )
 
@@ -626,7 +626,7 @@ class _SessionArtifactTool(_MarkerTool):
 class TestCurrentTurnToolContinuity:
     @pytest.mark.asyncio
     async def test_session_artifact_emits_structured_reference_event(self, tmp_path):
-        tool = _SessionArtifactTool(name="write_file")
+        tool = _SessionArtifactTool(name="present_files")
 
         class ArtifactLLM:
             def __init__(self):
@@ -675,7 +675,7 @@ class TestCurrentTurnToolContinuity:
             "modified": "2026-08-28T10:00:00Z",
             "type": "md",
             "revision": "v1:42:100",
-            "operation": "CREATED",
+            "operation": "PRESENTED",
             "toolCallId": "write-1",
             "round_id": "round-1",
             "session_id": "session-1",

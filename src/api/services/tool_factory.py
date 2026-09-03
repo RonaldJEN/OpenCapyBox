@@ -1,7 +1,7 @@
 """共享工具工厂 — 统一创建 Agent 工具列表
 
-聊天 Agent 和 Cron Agent 共享同一套工具集，
-区别仅在于 Cron Agent 排除 AskUserQuestionTool（无人交互场景）。
+聊天 Agent 和 Cron Agent 共享主体工具集；Cron Agent 排除 AskUserQuestionTool
+和仅用于聊天交付展示的 SandboxPresentFilesTool。
 """
 
 import logging
@@ -15,9 +15,9 @@ from opensandbox import Sandbox
 from src.agent.tools.sandbox_file_tools import (
     SandboxReadTool,
     SandboxReadImageTool,
-    SandboxWriteTool,
-    SandboxEditTool,
 )
+from src.agent.tools.apply_patch_tool import SandboxApplyPatchTool
+from src.agent.tools.present_files_tool import SandboxPresentFilesTool
 from src.agent.tools.sandbox_bash_tool import (
     SandboxBashTool,
     SandboxBashOutputTool,
@@ -200,17 +200,15 @@ async def create_agent_tools(
             supports_image=supports_image,
             max_images=max_images,
         )),
-        ("SandboxWriteTool", lambda: SandboxWriteTool(
+        ("SandboxApplyPatchTool", lambda: SandboxApplyPatchTool(
             sandbox=sandbox,
             workspace_dir=workspace_dir,
             agent_config_sync=agent_config_sync,
             read_only_paths=read_only_paths,
         )),
-        ("SandboxEditTool", lambda: SandboxEditTool(
+        ("SandboxPresentFilesTool", lambda: SandboxPresentFilesTool(
             sandbox=sandbox,
             workspace_dir=workspace_dir,
-            agent_config_sync=agent_config_sync,
-            read_only_paths=read_only_paths,
         )),
         # 沙箱 Bash 工具（共享 tracker）
         ("SandboxBashTool", lambda: SandboxBashTool(
@@ -247,6 +245,9 @@ async def create_agent_tools(
         # 子 Agent 委托工具（服务层 runner 创建 child Round）
         ("SubAgentTool", lambda: SubAgentTool(runner=subagent_runner)),
     ]
+
+    if workspace_actor != "chat":
+        exclude.add("SandboxPresentFilesTool")
 
     workspace_tool_kwargs = {
         "db_session_factory": db_session_factory,

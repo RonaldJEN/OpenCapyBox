@@ -576,6 +576,7 @@ class TestAPIRequest:
         snapshot = openai_client_with_reasoning.last_request_snapshot
         assert snapshot is not None
         assert snapshot["provider"] == "openai"
+        assert snapshot["openai_protocol"] == "chat_completions"
         assert snapshot["messages"] == api_messages
         assert snapshot["model"] == openai_client_with_reasoning.model
         assert snapshot["max_tokens"] == openai_client_with_reasoning.max_tokens

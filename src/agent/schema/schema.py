@@ -38,6 +38,8 @@ class Message(BaseModel):
     tool_call_id: str | None = None
     name: str | None = None  # For tool role
     is_synthetic: bool = False  # True = 系統注入的合成消息（truncation retry / empty nudge / step reminder）
+    # Provider-native reasoning items needed by stateless Responses follow-ups.
+    provider_items: list[dict[str, Any]] | None = None
 
 
 class TokenUsage(BaseModel):
@@ -56,3 +58,4 @@ class LLMResponse(BaseModel):
     tool_calls: list[ToolCall] | None = None
     finish_reason: str
     usage: TokenUsage | None = None
+    provider_items: list[dict[str, Any]] | None = None

@@ -182,7 +182,10 @@ class WorkspaceListTool(_WorkspaceToolBase):
     @property
     def description(self) -> str:
         return (
-            "List or search files in the user's persistent workspace. Returns stable entry_id, "
+            "List or search files in the user's persistent Workspace. Use only when the original "
+            "user request or delegated task explicitly authorizes persistent Workspace access; "
+            "a project name, missing information, or a desire for factual context is not authorization. "
+            "Returns stable entry_id, "
             "relative path, type, size, and revision for later workspace calls. "
             "If next_cursor is non-null and more results are needed, pass it as cursor "
             "with the same parent_id, query, and limit to fetch the next page."
@@ -236,7 +239,8 @@ class WorkspaceStageTool(_WorkspaceToolBase):
     @property
     def description(self) -> str:
         return (
-            "Copy a workspace file or directory into the current execution Workspace. "
+            "Copy an explicitly authorized persistent Workspace file or directory into the current "
+            "Session directory. Do not use this tool merely to fill missing context. "
             "Omit revision to stage the current head; a stale observed revision automatically restages "
             "the latest head once so concurrent human edits do not block the Agent. Returns snapshot_path "
             "for file/bash tools and publish_source_path for workspace_publish."
@@ -253,7 +257,7 @@ class WorkspaceStageTool(_WorkspaceToolBase):
                 "tree_revision": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
                 "destination_path": {
                     "type": "string",
-                    "description": "Optional path relative to the current execution Workspace",
+                    "description": "Optional path relative to the current Session directory",
                 },
             },
             "required": ["entry_id"],
@@ -330,8 +334,9 @@ class WorkspacePublishTool(_WorkspaceToolBase):
     @property
     def description(self) -> str:
         return (
-            "Publish a regular file from the current execution Workspace into the persistent "
-            "workspace. Existing files require conflict_policy=overwrite plus the last observed "
+            "Publish a regular file from the current Session directory into the persistent "
+            "Workspace. Use only when the user explicitly requests a persistent Workspace write. "
+            "Existing files require conflict_policy=overwrite plus the last observed "
             "destination revision/base version. The service preserves human edits and merges in "
             "the background; never delete or recreate a target to resolve a publish conflict."
         )
@@ -341,7 +346,7 @@ class WorkspacePublishTool(_WorkspaceToolBase):
         return {
             "type": "object",
             "properties": {
-                "source_path": {"type": "string", "description": "Path relative to the current execution Workspace"},
+                "source_path": {"type": "string", "description": "Path relative to the current Session directory"},
                 "destination_parent_id": {"type": "string", "description": "Target directory entry_id; omit for root"},
                 "destination_name": {"type": "string"},
                 "conflict_policy": {"type": "string", "enum": ["fail", "overwrite"], "default": "fail"},
@@ -399,7 +404,10 @@ class WorkspaceCreateDirectoryTool(_WorkspaceToolBase):
 
     @property
     def description(self) -> str:
-        return "Create one persistent workspace directory under a stable parent entry_id."
+        return (
+            "Create one persistent Workspace directory under a stable parent entry_id. "
+            "Use only when the user explicitly requests a persistent Workspace write."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -437,7 +445,10 @@ class WorkspaceMoveTool(_WorkspaceToolBase):
 
     @property
     def description(self) -> str:
-        return "Rename and/or move a workspace entry with optimistic revision checking."
+        return (
+            "Rename and/or move a persistent Workspace entry with optimistic revision checking. "
+            "Use only when the user explicitly requests that persistent Workspace change."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -450,7 +461,7 @@ class WorkspaceMoveTool(_WorkspaceToolBase):
                 "move_to_root": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Set true to move the entry to the persistent workspace root",
+                    "description": "Set true to move the entry to the persistent Workspace root",
                 },
                 "name": {"type": "string", "description": "Omit to keep current name"},
             },
@@ -502,7 +513,7 @@ class WorkspaceDeleteTool(_WorkspaceToolBase):
     @property
     def description(self) -> str:
         return (
-            "Permanently delete a workspace file or directory, including its history, only when "
+            "Permanently delete a persistent Workspace file or directory, including its history, only when "
             "the user explicitly asks. There is no recycle bin or restore. Never delete a target "
             "to work around a failed publish; its stable entry_id must be preserved."
         )

@@ -34,6 +34,12 @@ describe('getToolDescription', () => {
     expect(getToolDescription('edit_file', { path: 'main.py' })).toBe('Update main.py');
     expect(getToolDescription('EditTool', { file_path: 'src/utils/helper.ts' })).toBe('Update utils/helper.ts');
     expect(getToolDescription('edit_file', {})).toBe('Edit file');
+    expect(getToolDescription('apply_patch', {
+      patch: '*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old\n+new\n*** End Patch',
+    })).toBe('Update src/a.ts');
+    expect(getToolDescription('apply_patch', {
+      patch: '*** Begin Patch\n*** Update File: a.ts\n@@\n-a\n+A\n*** Add File: b.ts\n+b\n*** End Patch',
+    })).toBe('Update 2 files');
   });
 
   it('应为 bash 工具生成描述', () => {
@@ -75,6 +81,11 @@ describe('getToolDescription', () => {
     expect(getToolDescription('bash_output', {})).toBe('Read command output');
     expect(getToolDescription('bash_kill', {})).toBe('Stop process');
   });
+
+  it('应显示明确交付的文件数量', () => {
+    expect(getToolDescription('present_files', { paths: ['final/report.md'] })).toBe('Present final/report.md');
+    expect(getToolDescription('present_files', { paths: ['a.pdf', 'b.xlsx'] })).toBe('Present 2 files');
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -86,6 +97,11 @@ describe('extractFilePath', () => {
     expect(extractFilePath('read_file', { path: 'a.txt' })).toBe('a.txt');
     expect(extractFilePath('edit_file', { file_path: 'b.ts' })).toBe('b.ts');
     expect(extractFilePath('WriteTool', { path: 'c.py' })).toBe('c.py');
+    expect(extractFilePath('apply_patch', {
+      patch: '*** Begin Patch\n*** Update File: a.ts\n@@\n-a\n+A\n*** End Patch',
+    })).toBe('a.ts');
+    expect(extractFilePath('present_files', { paths: ['final/report.md'] })).toBe('final/report.md');
+    expect(extractFilePath('present_files', { paths: ['a.pdf', 'b.xlsx'] })).toBe('2 files');
   });
 
   it('对非文件工具应返回 undefined', () => {
@@ -124,6 +140,7 @@ describe('extractDiffStats', () => {
 describe('getToolCategory', () => {
   it('应正确分类各种工具', () => {
     expect(getToolCategory('edit_file')).toBe('edit');
+    expect(getToolCategory('apply_patch')).toBe('edit');
     expect(getToolCategory('EditTool')).toBe('edit');
     expect(getToolCategory('write_file')).toBe('create');
     expect(getToolCategory('WriteTool')).toBe('create');
@@ -176,6 +193,12 @@ describe('getGroupSummary', () => {
     ];
     // 去重后只有 1 个文件
     expect(getGroupSummary(items)).toBe('Edited app.py');
+  });
+
+  it('新文件工具应使用准确的更新与交付摘要', () => {
+    expect(getGroupSummary([makeItem('apply_patch', 'src/app.py')])).toBe('Updated src/app.py');
+    expect(getGroupSummary([makeItem('present_files', 'final/report.md')])).toBe('Presented final/report.md');
+    expect(getGroupSummary([makeItem('present_files', '2 files')])).toBe('Presented 2 files');
   });
 
   it('混合操作应合并描述', () => {
@@ -306,6 +329,20 @@ describe('transformToDisplayBlocks', () => {
     expect(tg.status).toBe('completed');
     expect(tg.hasDone).toBe(true);
     expect(tg.dominantCategory).toBe('read');
+  });
+
+  it('显式交付文件应显示 Presented 摘要而不是 Used a tool', () => {
+    const blocks = transformToDisplayBlocks([
+      makeStep({
+        tool_calls: [{ name: 'present_files', input: { paths: ['final/report.md'] } }],
+        tool_results: [{ success: true, content: 'Presented files:\nfinal/report.md' }],
+      }),
+    ]);
+    const group = blocks[0] as ToolGroupBlock;
+
+    expect(group.summary).toBe('Presented final/report.md');
+    expect(group.items[0].description).toBe('Present final/report.md');
+    expect(group.dominantCategory).toBe('create');
   });
 
   it('并行工具结果乱序时应按 tool_call_id 关联', () => {

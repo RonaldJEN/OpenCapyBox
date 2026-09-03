@@ -102,17 +102,17 @@ TurnPreferenceDraft {
 
 结构化引用固定分为：
 
-- Session：`source/session_id/path/revision/snapshot_path/ref_id`。工具成功写入后用 no-follow stat 生成 opaque revision，并在 `.assistant-artifacts/{round}/...` 冻结生成时字节；Bash 只在完整、未截断的前后 manifest 都成功时投影变更，删除产生 tombstone。
+- Session：`source/session_id/path/revision/ref_id`。只有 Chat 主 Agent 显式调用 `present_files` 才用 no-follow stat 读取当前 metadata 并产生卡片；`bash`、`bash_output`、`apply_patch` 和助手正文都不能自动产生展示引用，也不复制生成时字节。
 - Workspace：`source/entry_id/path/revision/version_id/ref_id`。只接受成功正式 mutation；`workspace_change_proposed/conflict`、`NO_CHANGE`、delete 和内部审计记录不产生卡片。源 entry 存在时保护 version；显式删除 entry 后同时删除其版本与引用，不再提供历史兜底。
-- 同一 Round 内 Session 按 `session_id + path`、Workspace 按 `entry_id` last-write-wins；删除 tombstone 移除此前候选。子 Agent 的结构化引用必须回传父 Round；规范化 Workspace 引用不含原 mutation 的 `kind` 字段，父任务按 `user_id + entry_id + version_id` 校验并保护版本，不能因此丢弃引用或用同名 Session 副本替代。两种来源不按文件名合并。
+- 同一 Round 内 Session 按 `session_id + path`、Workspace 按 `entry_id` last-write-wins。子 Agent 不具备 `present_files`，只把产物路径报告给主 Agent，由主 Agent 决定最终交付；规范化 Workspace 引用不含原 mutation 的 `kind` 字段，父任务按 `user_id + entry_id + version_id` 校验并保护版本，不能因此丢弃引用或用同名 Session 副本替代。两种来源不按文件名合并。
 
 点击与布局遵循一个入口、一套预览：
 
 - 文件卡片位于助手 markdown 后方，使用最大宽度 520px、最小高度 52px 的紧凑附件行；整行是唯一点击目标，不提供“当前版本 / 生成时版本”双按钮。
 - 点击 Workspace 卡先按原稳定 `entry_id` 读取当前 active 实体；存在则在右侧 `WorkspaceFilesPanel` 打开最新内容。不得按同名路径串到另一个 entry，也不得自动恢复或重建。
 - 点击 Session 卡先按原 `session_id + path` 重新读取父目录 authoritative metadata，再在右侧 `ArtifactsPanel` 打开当前内容；历史 event 的旧 size/mtime/revision 不得直接命中预览缓存。
-- Workspace 实体已删除时显示错误并停止，不请求历史 version 或按同名路径替换；Session 自身产物的既有快照行为不属于工作区删除。
-- 快照只读；恢复到工作区属于独立、用户明确触发的写操作。卡片点击和预览本身永远不得创建、恢复、移动或重命名文件。
+- Workspace 实体已删除时显示错误并停止，不请求历史 version 或按同名路径替换；Session 文件已删除时显示不可用，不回退历史副本。
+- 恢复到工作区属于独立、用户明确触发的写操作。卡片点击和预览本身永远不得创建、恢复、移动或重命名文件。
 - FilePreview 将 owner identity 与 content identity 分离：同一 current Workspace `entry_id` 的新 version 属于同一 owner，可在 clean/ready 后台刷新；`version_id/snapshot_path/revision/ref_id/preview URL` 只决定内容与缓存。captured 与 current 必须属于不同 owner，captured/read-only 模式禁止读取 outbox 草稿或沿用 current 正文。
 
 ## 3. 核心不变量（Critical Invariants）
@@ -342,8 +342,8 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 | 工具 | 模板 | 截断策略 |
 |---|---|---|
 | `read_file` | `Read {path}` | Keep-Head |
-| `write_file` | `Write {path}` | Keep-Head，内容 Keep-Tail |
-| `edit_file` | `Edited {path}` | Keep-Head |
+| `apply_patch` | `Update {path}` / `Update N files` | 从 Patch 头提取路径，历史旧工具继续兼容 |
+| `present_files` | `Present {path}` / `Present N files` | 只展示显式交付路径 |
 | `bash` | `Run \`{cmd}\`` | Keep-Head |
 | `search_*` | `Search "{query}"` | Keep-Head |
 | `sub_agent` | `委派子任务 {description 或 prompt 首行}` | Keep-Head |
@@ -352,7 +352,8 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 ### 7.3 分组摘要
 
 `getGroupSummary(group: ToolGroupBlock)`：
-- 完成态：`Edited 2 files, read a file`
+- 完成态按真实工具语义聚合：`apply_patch` 使用 `Updated {path}` / `Updated N files`，`present_files` 使用 `Presented {path}` / `Presented N files`；历史 `edit_file` 继续使用 `Edited`，不得把 `present_files` 降级显示为 `Used a tool`
+- 其他示例：`Edited 2 files, Read a file`
 - 运行态：`Reading src/app.py...`（Typewriter Preview）
 
 ### 7.4 活动入口与抽屉

@@ -22,6 +22,10 @@ read_when:
 
 ## 工具路由
 
+文件工具涉及两个存储层，术语不得混用：当前 Session 目录是本轮 Session/Cron 的临时执行目录；Workspace（工作区）只指跨会话保存的用户持久文件区。
+
+Workspace 默认封闭。只有原始用户请求明确要求查找、读取或修改“工作区 / 我的工作区 / Workspace”里的内容时，才能调用 `workspace_*`。
+
 工具可以组合使用，下表表示优先入口，不是互斥流程：
 
 | 场景 | 优先工具 |
@@ -29,9 +33,10 @@ read_when:
 | 已连接数据源可能覆盖的实时或结构化数据 | `mcp_tool_search`（按连接名或能力词发现） |
 | 有匹配技能 | `get_skill(skill_name)` |
 | 独立、可并行或会产生大量中间结果的子任务 | `sub_agent` |
-| 用户持久 Workspace 的查找与读取 | `workspace_list` / `workspace_stage` |
-| 用户持久 Workspace 的发布、创建目录、移动与删除 | `workspace_publish` / `workspace_create_directory` / `workspace_move` / `workspace_delete` |
-| 当前执行 Workspace 内的少量明确文件 | `read_file` / `write_file` / `edit_file` |
+| 已获明确授权的 Workspace 查找与读取 | `workspace_list` / `workspace_stage` |
+| 已获明确授权的 Workspace 发布、创建目录、移动与删除 | `workspace_publish` / `workspace_create_directory` / `workspace_move` / `workspace_delete` |
+| 当前 Session 目录内的文本文件 | `read_file` / `apply_patch` |
+| 向用户展示本轮最终交付文件 | `present_files` |
 | Git、测试、构建、依赖、格式化器与进程 | `bash`；后台任务配合 `bash_output` / `bash_kill` |
 | 本轮短期笔记 | `record_note` / `recall_notes` |
 | 数据连接无匹配 / 调用失败，或需要公开网络信息 | `search` / `batch_search` |
@@ -50,7 +55,6 @@ read_when:
 - `[附件文件] metadata=<JSON>` 表示本轮附件。需要读取时逐字使用 `metadata.path`，不要按文件名补空格或改写路径；是否读取由任务决定。
 - `[附件文件夹] metadata=<JSON>` 表示本轮实时目录引用。不要把 `workspace://...` 交给 Session 文件工具；用 `workspace_list(parent_id=workspace_entry_id)` 枚举当前子项，需要正文时只对实际需要的文件调用 `workspace_stage`。
 - Workspace 文件附件的 `metadata.path` 是当前 Session 的冻结副本；文件夹附件的 `metadata.path` 是稳定 entry 引用。`workspace_path` 只说明受理时来源位置，移动后可能变化。
-- 冻结附件是本轮输入，不代表用户授权覆盖持久 Workspace。只有用户明确要求写回时，才使用 `workspace_publish`；只修改 Session 副本不能声称持久 Workspace 已更新。
 
 ### 分页与截断
 
@@ -58,14 +62,16 @@ read_when:
 
 ## 文件与 Bash
 
-- 覆盖或编辑现有文本文件前先 `read_file`；小范围修改优先 `edit_file`，只有确需整体替换时才用 `write_file`。
+- 修改现有文本文件前先 `read_file`；使用 `apply_patch` 的一个 Update File 和多个 `@@` hunk 组织同一文件的相关修改。
 - 日常文本读取和编辑优先文件工具。不要用 shell 重定向、`sed`、`awk`、heredoc 或 `tee` 临时改写普通文本文件。
 - Bash 可用于 Git 历史与差异、测试、构建、格式化器、代码生成、批量转换、二进制产物脚本和进程管理。
 - 二进制或 Office 文件使用匹配的 Skill、工具或脚本，不要强行当 UTF-8 文本处理。
 - 后台或长任务用 `bash_output` 获取增量输出，用 `bash_kill` 终止；不要在前台无期限等待。
 - 依赖缺失时先确认根因；开发依赖可按任务需要安装，生产依赖变更必须先问用户。
 
-普通产物必须写入实时上下文给出的当前执行 Workspace，让用户能够看到和下载。不要自行拼接 Session ID，也不要创建字面量 `{session_id}` 目录。`/home/user/` 根目录只用于平台约定的共享资源和用户级配置。
+普通产物必须写入实时上下文给出的当前 Session 目录，让用户能够看到和下载。不要自行拼接 Session ID，也不要创建字面量 `{session_id}` 目录。`/home/user/` 根目录只用于平台约定的共享资源和用户级配置。
+
+只有准备向用户交付的最终文件才调用一次 `present_files`；不要展示过程文件、缓存、校验输出或源文件。
 
 ## sub_agent — 隔离复杂子任务
 

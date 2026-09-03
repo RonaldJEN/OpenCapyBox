@@ -73,36 +73,30 @@ class TestLLMClient:
             
             assert client.api_base == "https://api.example.com"
 
-    def test_minimax_model_reasoning_split(self):
-        """測試 MiniMax 模型啟用 reasoning_split"""
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockClient:
-            client = LLMClient(
+    def test_responses_client_does_not_receive_reasoning_split_transport(self):
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockClient:
+            LLMClient(
                 api_key="test-key",
                 provider=LLMProvider.OPENAI,
                 api_base="https://api.example.com",
-                model="MiniMax-M2"
+                model="MiniMax-M2",
+                openai_protocol="responses",
             )
-            
-            # 確認 OpenAIClient 被調用時 enable_reasoning_split=True
-            MockClient.assert_called_once()
-            call_kwargs = MockClient.call_args[1]
-            assert call_kwargs["enable_reasoning_split"] is True
 
-    def test_gpt_model_no_reasoning_split(self):
-        """測試 GPT 模型不啟用 reasoning_split"""
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockClient:
-            client = LLMClient(
-                api_key="test-key",
-                provider=LLMProvider.OPENAI,
-                api_base="https://api.example.com",
-                model="gpt-4-turbo"
-            )
-            
-            call_kwargs = MockClient.call_args[1]
-            assert call_kwargs["enable_reasoning_split"] is False
+            MockClient.assert_called_once()
+            assert "enable_reasoning_split" not in MockClient.call_args.kwargs
+
+    def test_model_config_reasoning_split_is_catalog_only(self):
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockClient:
+            config = _make_model_config("reasoning-model")
+            config.reasoning_split = True
+
+            LLMClient.from_model_config(config)
+
+            assert "enable_reasoning_split" not in MockClient.call_args.kwargs
 
     def test_reasoning_effort_reaches_openai_client(self):
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as mock_client:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as mock_client:
             config = _make_model_config("reasoning-model")
             config.reasoning_effort = "high"
 
@@ -111,7 +105,7 @@ class TestLLMClient:
             assert mock_client.call_args.kwargs["reasoning_effort"] == "high"
 
     def test_thinking_mode_reaches_openai_client(self):
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as mock_client:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as mock_client:
             config = _make_model_config("no-think-model")
             config.thinking_mode = "disabled"
 
@@ -154,6 +148,7 @@ def _make_model_config(model_id: str, provider: str = "openai"):
     cfg.id = model_id
     cfg.display_name = model_id
     cfg.provider = provider
+    cfg.openai_protocol = "responses" if provider == "openai" else None
     cfg.api_base = "https://api.example.com/v1"
     cfg.api_key = "test-key"
     cfg.model_name = model_id
@@ -181,7 +176,7 @@ class TestLLMClientFailover:
             "messages": [{"role": "user", "content": "hi"}],
         }
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI:
             mock_client = AsyncMock()
             mock_client.generate_stream = AsyncMock(return_value=expected)
             mock_client.retry_callback = None
@@ -214,7 +209,10 @@ class TestLLMClientFailover:
             "messages": [{"role": "user", "content": "fallback"}],
         }
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with (
+            patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockResponses,
+            patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockChat,
+        ):
             primary_client = AsyncMock()
             primary_client.generate_stream = AsyncMock(side_effect=primary_err)
             primary_client.retry_callback = None
@@ -225,10 +223,12 @@ class TestLLMClientFailover:
             fb_client.retry_callback = None
             fb_client.last_request_snapshot = fallback_snapshot
 
-            MockOAI.side_effect = [primary_client, fb_client]
+            MockResponses.return_value = primary_client
+            MockChat.return_value = fb_client
 
             primary = _make_model_config("model-a")
             fb = _make_model_config("model-b")
+            fb.openai_protocol = "chat_completions"
 
             client = LLMClient.from_model_config(primary, fallback_configs=[fb])
             result = await client.generate_stream(messages=[])
@@ -237,6 +237,8 @@ class TestLLMClientFailover:
             # failover 是 one-shot 的，不會永久切換 client
             assert client.model == "model-a"
             assert client.last_request_snapshot == fallback_snapshot
+            MockResponses.assert_called_once()
+            MockChat.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_failover_preparation_can_rebuild_request_kwargs(self):
@@ -244,7 +246,7 @@ class TestLLMClientFailover:
         expected = LLMResponse(content="fallback", finish_reason="stop")
         rewritten = [Message(role="user", content="compacted replacement")]
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI:
             primary_client = AsyncMock()
             primary_client.generate_stream = AsyncMock(side_effect=primary_err)
             primary_client.retry_callback = None
@@ -278,7 +280,7 @@ class TestLLMClientFailover:
         """所有模型都失敗時拋出 RetryExhaustedError"""
         err = RetryExhaustedError(TimeoutError("stalled"), 2)
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI:
             failing_client = AsyncMock()
             failing_client.generate_stream = AsyncMock(side_effect=err)
             failing_client.retry_callback = None
@@ -298,7 +300,7 @@ class TestLLMClientFailover:
         """無 fallback 配置時，主模型失敗直接拋出"""
         err = RetryExhaustedError(TimeoutError("stalled"), 2)
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI:
             mock_client = AsyncMock()
             mock_client.generate_stream = AsyncMock(side_effect=err)
             mock_client.retry_callback = None
@@ -316,7 +318,7 @@ class TestLLMClientFailover:
         primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
         expected = LLMResponse(content="third model", thinking=None, tool_calls=[], finish_reason="stop")
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI:
             primary_client = AsyncMock()
             primary_client.generate_stream = AsyncMock(side_effect=primary_err)
             primary_client.retry_callback = None
@@ -348,7 +350,7 @@ class TestLLMClientFailover:
         primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
         expected = LLMResponse(content="fallback ok", thinking=None, tool_calls=[], finish_reason="stop")
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI:
             primary_client = AsyncMock()
             primary_client.generate = AsyncMock(side_effect=primary_err)
             primary_client.retry_callback = None
@@ -380,7 +382,7 @@ class TestLLMClientFailover:
         expected = LLMResponse(content="fallback ok", finish_reason="stop")
         snapshot = ResolvedReasoningContext(mode="enabled", effort="max")
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI:
             primary_client = AsyncMock()
             primary_client.generate = AsyncMock(side_effect=primary_err)
             primary_client.retry_callback = None
@@ -422,7 +424,7 @@ class TestLLMClientFailover:
         compatible_result = LLMResponse(content="compatible", finish_reason="stop")
 
         with (
-            patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI,
+            patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI,
             patch("src.agent.llm.llm_wrapper.AnthropicClient") as MockAnthropic,
         ):
             primary_client = AsyncMock()
@@ -467,7 +469,7 @@ class TestLLMClientFailover:
         primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
         expected = LLMResponse(content="compatible", finish_reason="stop")
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI:
             primary_client = AsyncMock()
             primary_client.generate = AsyncMock(side_effect=primary_err)
             primary_client.retry_callback = None
@@ -505,7 +507,7 @@ class TestLLMClientFailover:
         primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
         expected = LLMResponse(content="fallback", finish_reason="stop")
 
-        with patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI:
+        with patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI:
             primary_client = AsyncMock()
             primary_client.generate = AsyncMock(side_effect=primary_err)
             primary_client.retry_callback = None
@@ -543,7 +545,7 @@ class TestLLMClientFailover:
         expected = LLMResponse(content="anthropic", finish_reason="stop")
 
         with (
-            patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI,
+            patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI,
             patch("src.agent.llm.llm_wrapper.AnthropicClient") as MockAnthropic,
         ):
             primary_client = AsyncMock()
@@ -584,7 +586,7 @@ class TestLLMClientFailover:
         primary_err = RetryExhaustedError(TimeoutError("stalled"), 2)
 
         with (
-            patch("src.agent.llm.llm_wrapper.OpenAIClient") as MockOAI,
+            patch("src.agent.llm.llm_wrapper.OpenAIResponsesClient") as MockOAI,
             patch("src.agent.llm.llm_wrapper.AnthropicClient") as MockAnthropic,
         ):
             primary_client = AsyncMock()

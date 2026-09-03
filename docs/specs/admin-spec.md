@@ -148,14 +148,14 @@
 ### GET /api/admin/models
 
 - 响应：`{models, settings}`。
-- `models` 字段：`id`、`name`、`provider`、`api_base`、`model_name`、`max_tokens`、`context_window`、`auto_compact_token_limit`、`tool_output_truncation_bytes`、`reasoning_format`、`reasoning_split`、`enable_thinking`、`thinking_mode`、`thinking_wire_format`、`reasoning_effort`、`default_reasoning_level`、`supported_reasoning_efforts`、`supports_thinking`、`supports_image`、`max_images`、`supports_video`、`max_videos`、`enabled`、`tags`、`api_key_set`、`group_names`、`session_count`、`created_at`、`updated_at`。
+- `models` 字段：`id`、`name`、`provider`、`openai_protocol`、`api_base`、`model_name`、`max_tokens`、`context_window`、`auto_compact_token_limit`、`tool_output_truncation_bytes`、`reasoning_format`、`reasoning_split`、`enable_thinking`、`thinking_mode`、`thinking_wire_format`、`reasoning_effort`、`default_reasoning_level`、`supported_reasoning_efforts`、`supports_thinking`、`supports_image`、`max_images`、`supports_video`、`max_videos`、`enabled`、`tags`、`api_key_set`、`group_names`、`session_count`、`created_at`、`updated_at`。
 - `settings` 字段：`default_model_id`、`cron_default_model_id`、`subagent_default_model_id`。
 
 ### POST /api/admin/models
 
-- Body：完整模型配置（`model_id`、`display_name`、`provider`、`api_base`、`api_key`、`model_name`、token 窗口、reasoning、多模态能力、`enabled`、`tags`）。
+- Body：完整模型配置（`model_id`、`display_name`、`provider`、`openai_protocol`、`api_base`、`api_key`、`model_name`、token 窗口、reasoning、多模态能力、`enabled`、`tags`）。
 - 语义：创建 DB 模型目录项，使用 `ModelConfig` 校验配置；成功后 reload model registry。
-- 约束：`supported_reasoning_efforts` 最多 20 项，每项去除首尾空白后必须非空且不超过 40 字符；重复等级按首次出现位置去重，数据库、管理 API 与运行时目录必须使用同一份规范化结果；非 OpenAI provider 的 `thinking_wire_format` 在落库前强制归一化为 `none`。
+- 约束：`openai_protocol` 仅接受 `responses` / `chat_completions`，新建 OpenAI 模型缺省为后者，非 OpenAI provider 落库为 `NULL`；`supported_reasoning_efforts` 最多 20 项，每项去除首尾空白后必须非空且不超过 40 字符；重复等级按首次出现位置去重，数据库、管理 API 与运行时目录必须使用同一份规范化结果；非 OpenAI provider 的 `thinking_wire_format` 在落库前强制归一化为 `none`。
 - 失败：字段类型、数量、长度或空项等请求结构错误返回 422；通过结构校验但违反 `ModelConfig` 跨字段/协议不变量返回 400；重复 `model_id` 返回 409。
 
 ### PATCH /api/admin/models/settings
@@ -168,7 +168,7 @@
 
 - Body：模型配置增量字段；`api_key=null` 或缺省表示保留旧密钥。
 - 语义：更新模型目录项并 reload model registry。
-- 约束：推理等级列表遵循与创建相同的规范化和长度规则；provider 变为非 OpenAI 时 `thinking_wire_format` 立即归一化为 `none`；停用模型会从所有模型权限包中移除；请求结构错误返回 422，`ModelConfig` 跨字段/协议校验失败返回 400，模型不存在返回 404。
+- 约束：推理等级列表遵循与创建相同的规范化和长度规则；provider 变为非 OpenAI 时 `openai_protocol` 归一化为 `NULL`、`thinking_wire_format` 归一化为 `none`；provider 变为 OpenAI 且未指定协议时使用 `chat_completions`；停用模型会从所有模型权限包中移除；请求结构错误返回 422，`ModelConfig` 跨字段/协议校验失败返回 400，模型不存在返回 404。
 
 ### DELETE /api/admin/models/{model_id}
 

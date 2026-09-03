@@ -19,6 +19,7 @@ from ..schema.run_context import current_run_context
 from .anthropic_client import AnthropicClient
 from .base import LLMClientBase
 from .openai_client import OpenAIClient
+from .openai_responses_client import OpenAIResponsesClient
 
 if TYPE_CHECKING:
     from src.api.model_registry import ModelConfig
@@ -50,11 +51,12 @@ class LLMClient:
         # === 新增：ModelConfig 驅動的參數（向後兼容：全部有默認值） ===
         max_tokens: int = 16384,
         reasoning_format: str = "none",
-        enable_reasoning_split: bool | None = None,
+        enable_reasoning_split: bool = False,
         enable_thinking: bool = False,
         thinking_mode: str = "provider_default",
         thinking_wire_format: str = "enable_thinking",
         reasoning_effort: str | None = None,
+        openai_protocol: str = "chat_completions",
         _api_base_is_full: bool = False,
     ):
         """Initialize LLM client with specified provider.
@@ -69,17 +71,19 @@ class LLMClient:
             retry_config: Optional retry configuration
             max_tokens: Maximum output tokens
             reasoning_format: "none"|"reasoning_content"|"reasoning_details"|"anthropic_thinking"
-            enable_reasoning_split: Send extra_body.reasoning_split (None=auto-detect for legacy)
+            enable_reasoning_split: Send Chat Completions extra_body.reasoning_split
             enable_thinking: Send extra_body.enable_thinking
             thinking_mode: provider_default/enabled/disabled
             thinking_wire_format: Request encoding for the thinking switch
             reasoning_effort: Send the OpenAI-compatible reasoning_effort value
+            openai_protocol: "responses" or "chat_completions"
             _api_base_is_full: Internal flag — True when called from from_model_config()
         """
         self.provider = provider
         self.api_key = api_key
         self.model = model
         self.retry_config = retry_config or RetryConfig()
+        self.openai_protocol = openai_protocol if provider == LLMProvider.OPENAI else None
 
         # Determine full API base URL
         if _api_base_is_full:
@@ -110,19 +114,18 @@ class LLMClient:
                 max_tokens=max_tokens,
             )
         elif provider == LLMProvider.OPENAI:
-            # 向後兼容：如果未顯式傳 enable_reasoning_split，自動偵測
-            if enable_reasoning_split is None:
-                enable_reasoning_split = any(
-                    model.lower().startswith(p)
-                    for p in ("minimax", "glm", "qwen", "deepseek")
-                )
-
-            self._client = OpenAIClient(
+            if openai_protocol not in {"responses", "chat_completions"}:
+                raise ValueError(f"Unsupported openai_protocol: {openai_protocol}")
+            client_class = (
+                OpenAIResponsesClient
+                if openai_protocol == "responses"
+                else OpenAIClient
+            )
+            client_kwargs = dict(
                 api_key=api_key,
                 api_base=full_api_base,
                 model=model,
                 retry_config=retry_config,
-                enable_reasoning_split=enable_reasoning_split,
                 max_tokens=max_tokens,
                 reasoning_format=reasoning_format,
                 enable_thinking=enable_thinking,
@@ -130,10 +133,13 @@ class LLMClient:
                 thinking_wire_format=thinking_wire_format,
                 reasoning_effort=reasoning_effort,
             )
+            if openai_protocol == "chat_completions":
+                client_kwargs["enable_reasoning_split"] = enable_reasoning_split
+            self._client = client_class(**client_kwargs)
             logger.info(
-                "OpenAI client: reasoning_split=%s, reasoning_format=%s, "
+                "OpenAI client: protocol=%s, reasoning_format=%s, "
                 "thinking_mode=%s, thinking_wire_format=%s, max_tokens=%d (model: %s)",
-                enable_reasoning_split, reasoning_format, thinking_mode,
+                openai_protocol, reasoning_format, thinking_mode,
                 thinking_wire_format, max_tokens, model,
             )
         else:
@@ -190,6 +196,7 @@ class LLMClient:
             thinking_mode=config.thinking_mode,
             thinking_wire_format=config.thinking_wire_format,
             reasoning_effort=config.reasoning_effort,
+            openai_protocol=config.openai_protocol or "chat_completions",
             _api_base_is_full=True,
         )
         instance._fallback_configs = list(fallback_configs or [])
