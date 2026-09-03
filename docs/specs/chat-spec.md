@@ -347,10 +347,10 @@ type WorkspaceFile = {
 };
 ```
 
-- 客户端不得为 `source="workspace"` 提交 `path/revision/tree_revision/manifest_sha256`。普通选择只提交稳定 `entry_id`，服务端在 Round 受理时解析该用户当时的 current head；只有用户明确选择历史版本时才提交 `version_id`。客户端名称、类型和大小只是 optimistic 展示提示，不能作为正文或所有权事实。
-- Workspace 文件或文件夹引用在创建 Round 前复制到当前 Session 的隐藏 `.workspace-snapshots/<entry>/<snapshot>/`。文件省略 `version_id` 时冻结受理时 current head，显式 `version_id` 时冻结该不可变版本；文件夹冻结受理时最新 `tree_revision + descendant manifest` 并在复制后复核。Agent 只读取该冻结副本，原内容后续更新不改变本轮输入。
-- staging 成功后由服务端生成并持久化同一 capture 的 `entry revision/version_id/version_sequence/path/name/sha256/size`；禁止把历史正文 version 与另一个时点的 entry metadata 拼成同一附件。staging 失败发生在 Round 接受前，前端保留正文和附件草稿。
-- 每次发送使用独立 capture 路径；全部附件成功且 Round 创建后才提交永久 `round_attachment` 引用。任一附件或 Round admission 失败时解除临时引用，并用 durable cleanup job 删除本次已生成的 snapshots。
+- 客户端不得为 `source="workspace"` 提交 `path/revision/tree_revision/manifest_sha256`。普通选择只提交稳定 `entry_id`，服务端在 Round 受理时解析该用户当时的 current entry；只有用户明确选择文件历史版本时才提交 `version_id`，文件夹不得提交。客户端名称、类型和大小只是 optimistic 展示提示，不能作为正文或所有权事实。
+- Workspace **文件**在创建 Round 前复制到当前 Session 的隐藏 `.workspace-snapshots/<entry>/<snapshot>/`。省略 `version_id` 时冻结受理时 current head，显式 `version_id` 时冻结该不可变版本；staging 成功后持久化同一 capture 的 `entry revision/version_id/version_sequence/path/name/sha256/size`。禁止把历史正文 version 与另一个时点的 entry metadata 拼成同一附件。
+- Workspace **文件夹**不复制后代文件，也不生成 manifest；服务端只校验稳定 `entry_id` 仍指向 active directory，并生成 `workspace://entry/<entry_id>` 实时引用。Agent 每次通过 `workspace_list(parent_id=<entry_id>)` 读取当时的当前目录，需要文件正文时再对目标文件调用 `workspace_stage`。附件中的 `revision/tree_revision` 仅是受理时审计值，不提供前后内容一致性；移动后稳定 `entry_id` 继续有效，永久删除后不可用。目录不接受 `version_id`。
+- 服务端在处理每个 Workspace 附件前发送非持久化 `CUSTOM attachment_preparing {index,total,name,kind}`，长步骤之间继续发送 heartbeat。该事件只表示受理前准备进度，不等价于 `RUN_STARTED` 或 `stream_accepted`。任一附件或 Round admission 失败时解除已生成的文件临时引用，并用 durable cleanup job 删除本次文件 snapshots；纯文件夹发送不产生 snapshot 清理工作。
 
 **本轮 Skill / MCP 偏好契约与作用域**:
 
@@ -378,12 +378,13 @@ type WorkspaceFile = {
 
 - `file` block 在进入 Agent 上下文前只映射为当前 user message 的选择元数据：普通文件使用 `[附件文件] metadata={"name":"<name>","path":"<path>"}`，目录使用 `[附件文件夹] metadata={"name":"<name>","path":"<path>","kind":"directory"}`。如何读取附件的通用调用规则固定在平台 `AGENTS.md`，不得因附件选择动态改写 system message。
 - `metadata` 是由 `{name, path}` 经过 JSON 编码生成；Agent 读取附件时必须以 `metadata.path` 作为唯一事实源。
-- Workspace 引用的 `metadata.path` 是服务端生成的 Session snapshot；附加的 `source/workspace_entry_id/workspace_path/workspace_revision/workspace_version_id/workspace_version_sequence` 只用于来源说明和后续显式发布，不能把原 workdir 绝对路径交给模型。
-- Round 的 `user_attachments` 持久化 `source/entry_id/revision/version_id/version_sequence/origin_path/snapshot_path/sha256`，目录额外持久化 `kind=directory/is_directory=true/tree_revision/manifest_sha256`。这些是选择审计，不是已删除文件的恢复来源；源 Workspace entry 存在时预览固定 snapshot/version，entry 永久删除后 history 和当前客户端投影均按 entry_id 过滤，且淘汰相关 captured cache。“在工作区打开”只是次级动作。
+- Workspace 文件的 `metadata.path` 是服务端生成的 Session snapshot；Workspace 文件夹的 `metadata.path` 是 `workspace://entry/<entry_id>` 实时引用，必须用 `workspace_list(parent_id=workspace_entry_id)` 展开，不能交给 Session 文件工具枚举。附加的 `source/workspace_entry_id/workspace_path/workspace_revision/workspace_version_id/workspace_version_sequence/workspace_reference_mode` 用于说明读取方式和来源，不能把原 workdir 绝对路径交给模型。
+- Round 的文件附件持久化 `source/entry_id/revision/version_id/version_sequence/origin_path/snapshot_path/sha256`；目录持久化 `kind=directory/is_directory=true/reference_mode=live/tree_revision`，不含 `snapshot_path/manifest_sha256`。这些是选择审计，不是已删除文件的恢复来源；文件预览固定 snapshot/version，目录卡片按稳定 entry_id 打开当前目录，entry 永久删除后 history 和当前客户端投影均过滤该项。“在工作区打开”只是次级动作。
 - 该提示是中性提示，不强制触发 `read_file` 调用；是否读取由当前任务意图决定。
 
 **工作区工具语义**:
 
+- “当前 Session 目录”专指本轮 Session/Cron 临时执行目录；“Workspace/工作区”专指跨会话持久文件区，模型可见提示和工具描述不得再把前者称作 Workspace。只有原始用户请求明确要求访问持久工作区时才允许调用 `workspace_*`；项目名、产品名、缺少资料、追求真实性和安全只读都不构成授权。Workspace 文件附件授权读取其 Session 冻结副本；文件夹附件授权只读访问所选 entry 的当前子树，写操作仍须由原始请求明确授权。子 Agent 只有在父任务明确委派持久 Workspace 访问时才能调用这些工具。
 - `workspace_list`、`workspace_stage` 为读取能力；`workspace_publish`、`workspace_create_directory` 为编辑能力；`workspace_move`、`workspace_delete` 为管理能力。
 - `workspace_list` 支持可选 `cursor`，原样透传服务端分页游标；每页默认 50 项，工具声明上限 100 项。返回 `next_cursor` 非空且需要更多结果时，保持 `parent_id/query/limit` 不变并携带该游标继续请求；不自动拉取全部结果。
 - `workspace_stage` 把指定 file version、目录 tree revision 或当前 head 复制到 Session/Cron execution root；模型携带的观察 revision 已过期时，工具内部自动重取一次当前 head，不把正常的人类并发编辑暴露成循环重试。目录保留层级与空子目录。成功结果中的绝对 `snapshot_path` 供文件工具使用，相对 `publish_source_path` 供 `workspace_publish` 使用，并返回实际 `revision/base_version_id/tree_revision`；`read_file/write_file/edit_file` 的相对路径基准为当前 execution Workspace。
@@ -839,8 +840,8 @@ INSERT INTO rounds (..., idempotency_key)
 
 - `idempotency_key` 由前端生成（UUID v4）
 - 唯一约束作用域：`(session_id, idempotency_key)`
-- `prepare_chat_round` 必须在任何副作用之前完成幂等预检。Workspace 附件落盘会复制文件、并为目录快照分配 uuid 后缀目录，重试若先落盘会留下孤儿快照；源 revision 已推进时还会先抛 `REVISION_CONFLICT` 而不是返回既有 Round。
-- 预检只覆盖串行重试；相同 key 的真并发仍由唯一约束兜底，输方已落盘的目录快照暂不回收（待引入 admission 认领记录后关闭）。
+- `prepare_chat_round` 必须在任何副作用之前完成幂等预检。Workspace 文件附件落盘会复制文件并分配 uuid 后缀目录，重试若先落盘会留下孤儿快照；源 revision 已推进时还会先抛 `REVISION_CONFLICT` 而不是返回既有 Round。文件夹实时引用只查 DB，不复制正文。
+- 预检只覆盖串行重试；相同 key 的真并发仍由唯一约束兜底，输方已落盘的文件 snapshot 由 admission 失败清理链路回收。
 - 前端在网络重试时必须携带相同的 `idempotency_key`
 
 ### 4.3 并发控制

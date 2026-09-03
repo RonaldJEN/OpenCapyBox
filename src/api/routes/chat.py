@@ -854,13 +854,54 @@ async def send_message_stream(
                             print(f"⚠️  等待標題生成失敗: {e}")
                 return _extra()
 
+            attachment_progress_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+            async def on_attachment_progress(value: dict[str, Any]) -> None:
+                attachment_progress_queue.put_nowait(value)
+                # Give the SSE consumer a scheduling point between adjacent
+                # directory references so 1/N, 2/N, ... are emitted in order.
+                await asyncio.sleep(0)
+
+            submit_task = asyncio.create_task(_turn_orchestrator.submit_turn(
+                turn,
+                agent_service=agent_service,
+                lock_id=lock_id,
+                run_started_at=run_guard_started_at,
+                attachment_progress=on_attachment_progress,
+            ))
+            progress_task = asyncio.create_task(attachment_progress_queue.get())
+            heartbeat_task = asyncio.create_task(
+                asyncio.sleep(settings.sse_heartbeat_interval)
+            )
             try:
-                execution = await _turn_orchestrator.submit_turn(
-                    turn,
-                    agent_service=agent_service,
-                    lock_id=lock_id,
-                    run_started_at=run_guard_started_at,
-                )
+                while not submit_task.done():
+                    done, _ = await asyncio.wait(
+                        {submit_task, progress_task, heartbeat_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if progress_task in done:
+                        yield event_encoder.encode(CustomEvent(
+                            name="attachment_preparing",
+                            value=progress_task.result(),
+                        ))
+                        progress_task = asyncio.create_task(
+                            attachment_progress_queue.get()
+                        )
+                    if heartbeat_task in done:
+                        yield event_encoder.encode(CustomEvent(
+                            name="heartbeat",
+                            value={"timestamp": int(datetime.now().timestamp() * 1000)},
+                        ))
+                        heartbeat_task = asyncio.create_task(
+                            asyncio.sleep(settings.sse_heartbeat_interval)
+                        )
+
+                while not attachment_progress_queue.empty():
+                    yield event_encoder.encode(CustomEvent(
+                        name="attachment_preparing",
+                        value=attachment_progress_queue.get_nowait(),
+                    ))
+                execution = await submit_task
             except DuplicateRoundError as e:
                 yield event_encoder.encode(RunErrorEvent(message=e.existing_round_id, code="ROUND_IN_PROGRESS"))
                 return
@@ -880,6 +921,19 @@ async def send_message_stream(
                 logger.error("submit turn failed before orchestrated SSE started", exc_info=True)
                 yield event_encoder.encode(RunErrorEvent(message="Agent 執行失敗", code="INTERNAL_ERROR"))
                 return
+            finally:
+                progress_task.cancel()
+                heartbeat_task.cancel()
+                if not submit_task.done():
+                    submit_task.cancel()
+                for task in (progress_task, heartbeat_task, submit_task):
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        if task is not submit_task:
+                            logger.debug("附件准备保活任务收尾失败", exc_info=True)
 
             title_run_id = execution.handle.run_id
             title_run_ready.set()

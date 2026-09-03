@@ -672,6 +672,26 @@ export function WorkspaceSidebarContent({
     if (!children.has(entry.entry_id)) await loadDirectory(entry.entry_id);
   };
 
+  useEffect(() => {
+    if (!activeEntryId) return undefined;
+    let current = true;
+    void workspaceApi.getEntry(activeEntryId).then(async (entry) => {
+        if (!current) return;
+        if (entry.kind !== 'directory' || entry.status !== 'active') return;
+        const directoryIds = [entry.entry_id];
+        if (entry.parent_id) directoryIds.push(entry.parent_id);
+        setExpanded((current) => new Set([...current, ...directoryIds]));
+        if (entry.parent_id) await loadDirectory(entry.parent_id);
+        await loadDirectory(entry.entry_id);
+      }).catch((loadError) => {
+        if (!current) return;
+        if (!(loadError instanceof WorkspaceApiError && loadError.status === 404)) {
+          setError('无法打开工作区文件夹，请刷新后重试。');
+        }
+      });
+    return () => { current = false; };
+  }, [activeEntryId, loadDirectory]);
+
   const startCreateDirectory = (parent: WorkspaceEntry | null) => {
     if (parent && !canCreateSubdirectory(parent)) {
       setError('文件夹最多支持两层');

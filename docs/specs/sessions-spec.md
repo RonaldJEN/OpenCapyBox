@@ -235,4 +235,4 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 - 不做文件版本管理
 - 不做大文件分片上传
 
-Workspace-origin 附件在工作区 entry 删除后不再从历史返回；按 entry_id 命名的平台 .workspace-snapshots 随工作区直接删除清理。独立 Session 产物不受影响。
+Workspace-origin 附件在工作区 entry 删除后不再从历史返回；文件附件按 entry_id 命名的平台 `.workspace-snapshots` 随工作区直接删除清理。文件夹附件只保存实时 entry 引用，不在 Session 中复制目录。独立 Session 产物不受影响。

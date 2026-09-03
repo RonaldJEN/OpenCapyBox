@@ -128,6 +128,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     workspaceRouteActive ? 'workspace' : 'sessions'
   ));
   const [workspaceFileTarget, setWorkspaceFileTarget] = useState<WorkspaceEntry | null>(null);
+  const [workspaceDirectoryTargetId, setWorkspaceDirectoryTargetId] = useState<string | null>(null);
   const [workspaceFilesMounted, setWorkspaceFilesMounted] = useState(false);
   // 首帧仍由路由初始化 sidebarMode；进入页面后左右标签只切换浏览列表，
   // 不能因为查看会话列表就关闭右侧工作区或丢掉 entry 深链。
@@ -602,6 +603,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     if (!options?.preserveSidebarMode) setSidebarMode('workspace');
     // 同一文件标签可能已在右侧本地关闭，但 App 仍持有上一次 target。
     // 每次用户点击都投影成新的目标事件，不能被 React 的同引用去重吞掉。
+    setWorkspaceDirectoryTargetId(null);
     setWorkspaceFileTarget(entry.kind === 'file' ? { ...entry } : null);
     const params = new URLSearchParams({ entry: entry.entry_id });
     navigate(`/workspace?${params.toString()}`, { replace: options?.replace });
@@ -626,6 +628,12 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
       const requestEpoch = ++workspaceOpenRequestEpochRef.current;
       void workspaceApi.getEntry(detail.entryId).then((entry) => {
         if (requestEpoch !== workspaceOpenRequestEpochRef.current) return;
+        if (entry.kind === 'directory') {
+          setWorkspaceFileTarget(null);
+          setWorkspaceDirectoryTargetId(entry.entry_id);
+          requestPrimarySurface('chat');
+          return;
+        }
         requestWorkspaceEntry(entry);
       }).catch((error) => {
         console.error('Failed to open workspace entry:', error);
@@ -852,7 +860,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
             onOpenConnections={() => { setMobileSidebarOpen(false); requestPrimarySurface('connections'); }}
             sidebarMode={effectiveSidebarMode}
             onSidebarModeChange={handleSidebarModeChange}
-            activeWorkspaceEntryId={workspaceFileTarget?.entry_id}
+            activeWorkspaceEntryId={workspaceFileTarget?.entry_id || workspaceDirectoryTargetId}
             onOpenWorkspaceEntry={(entry) => {
               setMobileSidebarOpen(false);
               requestWorkspaceEntry(entry);

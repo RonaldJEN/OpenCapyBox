@@ -246,7 +246,7 @@ pre_accept_pending
 #### 选择器交互
 
 - 输入框底部使用唯一 `+` 根菜单，固定顺序为“工作区文件 → 上传文件 → 专家 Skills → 数据连接”；模型/推理等级仍常驻底栏。四个入口互斥，桌面端向上展开，移动端使用底部浮层；`Escape` 关闭并把焦点还给 `+`，点击外部关闭。
-- 工作区选择器展示文件和文件夹并支持搜索、lazy 目录与多选；文件夹必须作为一个独立选择项保留稳定 `entry_id/kind`，不得在前端展开成多个后代文件。Composer 与历史消息均渲染单个文件夹卡片；选择时不创建 Session、不上传、不读取 Data URL。普通草稿只以 `entry_id` 去重，发送时 file block 提交 `source/entry_id/kind/name/mime_type/size`，不提交选择时的 revision/current_version/tree_revision；服务端在 Round 受理时解析最新 durable head 或完整目录 manifest。只有明确的历史版本选择才额外提交 `version_id`。
+- 工作区选择器展示文件和文件夹并支持搜索、lazy 目录与多选；文件夹必须作为一个独立选择项保留稳定 `entry_id/kind`，不得在前端展开或复制后代文件。Composer 与历史消息均渲染单个文件夹卡片；选择时不创建 Session、不上传、不读取 Data URL。普通草稿只以 `entry_id` 去重，发送时 file block 提交 `source/entry_id/kind/name/mime_type/size`，不提交选择时的 revision/current_version/tree_revision；服务端在 Round 受理时对文件解析并冻结 latest durable head，对文件夹只校验 entry 并返回实时引用。只有文件的明确历史版本选择才额外提交 `version_id`。
 - `workspace_resource_changed` 仍是正式 mutation 的内部事实与工作区失效信号，但 `Round` 不直接渲染 raw audit。服务端只在成功文件 mutation 上附加受保护的 `assistant_file_reference`，live reducer 与 history 以同一稳定身份投影卡片；deleted tombstone 移除同 Round 旧引用。proposed/conflict/change-set、系统路径和 `NO_CHANGE` 永不进入普通聊天 UI。
 - clean 工作区标签收到更高 version 时，先后台读取新内容，再原子替换正文与版本；dirty 标签保留当前页面内存草稿和原 base version并继续远端保存，服务端自动三方合并，不显示“有新版本”、加载新版本、另存或放弃动作。网络歧义、5xx 和 mutation 尚在处理时由 outbox 使用原 key 重试；确定性终态失败丢弃 Workspace 草稿、恢复服务端 current head，并只在当前文件内显示可关闭错误。只有 authoritative 404 或显式删除 tombstone 时关闭文件。
 - `ChatInput` 仅在用户显式进入 Skill 子菜单时加载普通 `GET /api/config/skills`，每次重新打开都从服务端 DB 快照刷新清单，列表只展示 `enabled === true` 的项目；不得在页面初始化时预取或使用 `refresh=true` 触发远程恢复。已有成功清单时采用 stale-while-refresh：立即展示旧清单并以轻量状态提示请求，不得重新用整面 loading 遮住列表。
@@ -274,7 +274,8 @@ pre_accept_pending
 - 新会话仍以 `__new_session__` 作为客户端映射 key，但附件上传必须先取得真实 server session ID。上传等异步回调绑定发起时的 `draftId + serverSessionId`，不得根据回调执行时的当前活跃会话决定写入位置。
 - 从 `__new_session__` 迁移到真实 session 时，MessageDraft 与 TurnPreferenceDraft 必须在同一转换路径协调迁移；目标已有较新草稿或 draftId 已变化时，迟到响应不得覆盖或重新创建旧草稿。
 - 发送时冻结正文、附件与 TurnPreferenceDraft。若本轮附加的 Workspace 文件正 dirty，必须在发送请求前只等待这些 entry 的 outbox 保存；成功后再让服务端解析 current head，失败或保存回执为 stale 时不创建 Round并保留 composer 草稿。未作为本轮附件的 dirty 文件仍同步抓取到应用级 outbox并在后台保存，不阻断 Agent；这些非附件路径只进入 Agent 的 `pending_file_drafts`，前端不显示全局同步提示。不得传草稿正文。
-- optimistic Round 中尚未取得服务端 `.workspace-snapshots/` 路径的 Workspace 附件不得进入 Session 文件预览；点击时显示“工作区附件正在冻结，请稍后再打开”，不得把原 Workspace path 拼到 `/api/sessions/{id}/files/`。authoritative Round 返回 snapshot 后才按既有 captured/read-only 链路打开。
+- optimistic Round 中尚未取得服务端结果的 Workspace 文件不得进入 Session 文件预览；点击时显示“工作区附件正在准备，请稍后再打开”，不得把原 Workspace path 拼到 `/api/sessions/{id}/files/`。authoritative Round 返回 snapshot 后才按 captured/read-only 链路打开。文件夹卡片始终按稳定 entry_id 打开当前 Workspace 目录，不经过 Session 文件预览，也不承诺与发送时内容一致。
+- 受理前的 `CUSTOM attachment_preparing {index,total,name,kind}` 与 heartbeat 只用于持续产生 SSE 数据、避免客户端把准备阶段误判为断网；前端不得把逐项计数投影给用户。两者都不得把 run 从 `starting` 推进到 `streaming`，也不得触发 `stream_accepted`。
 - 欢迎页创建 Session、迁移草稿与清空 composer 必须通过同步 submission snapshot 收敛；stream accepted 前拒绝时原子恢复正文、附件和本轮偏好，不依赖 React state 提交时序。
 - HTTP/SSE 响应头不代表 Round 已受理；只有 `RUN_STARTED` 或按幂等键查到 durable Round 才发布 `stream_accepted`。此前收到的无序 `RUN_ERROR` 必须恢复 submission snapshot。
 - 提交发送时乐观清空目标 session 的两类偏好。服务端确认 SSE 已接受后保持清空；执行已接受后的流式失败、中断或取消不得恢复旧选择。

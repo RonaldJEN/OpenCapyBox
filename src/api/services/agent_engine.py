@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from typing import Protocol
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any, Protocol
 
 from src.agent.schema.agui_events import AGUIEvent
 from src.api.schemas.turn import NormalizedInboundTurn, NormalizedResumeTurn
@@ -18,7 +18,12 @@ class AgentEngine(Protocol):
 
     def set_liveness_token(self, liveness_token: asyncio.Event) -> None: ...
 
-    async def start_turn(self, turn: NormalizedInboundTurn) -> PreparedAgentRun: ...
+    async def start_turn(
+        self,
+        turn: NormalizedInboundTurn,
+        *,
+        attachment_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> PreparedAgentRun: ...
 
     async def answer_interaction(
         self,
@@ -45,13 +50,20 @@ class InProcessAgentEngine:
     def set_liveness_token(self, liveness_token: asyncio.Event) -> None:
         self.service.liveness_token = liveness_token
 
-    async def start_turn(self, turn: NormalizedInboundTurn) -> PreparedAgentRun:
+    async def start_turn(
+        self,
+        turn: NormalizedInboundTurn,
+        *,
+        attachment_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> PreparedAgentRun:
         kwargs = {
             "user_content": turn.content,
             "idempotency_key": turn.idempotency_key,
         }
         if turn.context:
             kwargs["contexts"] = turn.context
+        if attachment_progress is not None:
+            kwargs["attachment_progress"] = attachment_progress
         return await self.service.prepare_chat_round(**kwargs)
 
     async def answer_interaction(

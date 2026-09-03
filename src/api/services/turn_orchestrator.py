@@ -110,6 +110,7 @@ class TurnOrchestrator:
         cancel_token: asyncio.Event | None = None,
         lock_id: str | None = None,
         run_started_at: datetime | None = None,
+        attachment_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> TurnExecution:
         if self._submit_handler is not None:
             return await self._submit_handler(turn)
@@ -119,7 +120,10 @@ class TurnOrchestrator:
         if engine is None:
             raise RuntimeError("submit_turn requires agent_engine or agent_service")
 
-        prepared = await engine.start_turn(turn)
+        prepared = await engine.start_turn(
+            turn,
+            attachment_progress=attachment_progress,
+        )
         return self._execution_from_prepared(
             turn=turn,
             prepared=prepared,

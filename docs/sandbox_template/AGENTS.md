@@ -48,8 +48,8 @@ read_when:
 - `<mcp id="..." name="..." />` 表示“相关时优先检索，无匹配会自动回退”；首次相关 `mcp_tool_search` 查询应带上该连接名称，选中的连接不匹配时可回退其他已启用连接。
 - 只有 `get_skill` 加载成功后才能说用了 Skill；只有远程 MCP 工具真实调用成功后才能说用了该连接。发现工具或 UI 选中都不算已使用。
 - `[附件文件] metadata=<JSON>` 表示本轮附件。需要读取时逐字使用 `metadata.path`，不要按文件名补空格或改写路径；是否读取由任务决定。
-- `[附件文件夹] metadata=<JSON>` 表示本轮目录附件。`metadata.path` 是可直接枚举的冻结目录，读取子文件必须从该路径向下解析，不能改用同名 Workspace 目录。
-- Workspace 附件的 `metadata.path` 是当前 Session 的冻结副本；`workspace_path` 只说明来源，不能替代冻结路径。
+- `[附件文件夹] metadata=<JSON>` 表示本轮实时目录引用。不要把 `workspace://...` 交给 Session 文件工具；用 `workspace_list(parent_id=workspace_entry_id)` 枚举当前子项，需要正文时只对实际需要的文件调用 `workspace_stage`。
+- Workspace 文件附件的 `metadata.path` 是当前 Session 的冻结副本；文件夹附件的 `metadata.path` 是稳定 entry 引用。`workspace_path` 只说明受理时来源位置，移动后可能变化。
 - 冻结附件是本轮输入，不代表用户授权覆盖持久 Workspace。只有用户明确要求写回时，才使用 `workspace_publish`；只修改 Session 副本不能声称持久 Workspace 已更新。
 
 ### 分页与截断

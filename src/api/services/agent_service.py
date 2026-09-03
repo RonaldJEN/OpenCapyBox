@@ -9,7 +9,7 @@ import posixpath
 import shlex
 import uuid
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, AsyncIterator, Any, Callable
+from typing import List, Dict, Optional, AsyncIterator, Any, Awaitable, Callable
 
 from opensandbox import Sandbox
 from sqlalchemy import func
@@ -63,6 +63,8 @@ from src.agent.tools.base import ToolResult, ToolRuntimeContext
 from pathlib import Path as PathlibPath
 
 logger = logging.getLogger(__name__)
+
+AttachmentProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 TURN_PREFERENCES_ORIGIN_USER_MESSAGE_ID_KEY = (
     "turn_preferences_origin_user_message_id"
@@ -1595,20 +1597,23 @@ class AgentService:
                             "entry_id": file_obj.get("entry_id"),
                             "revision": file_obj.get("revision"),
                             "origin_path": file_obj.get("origin_path"),
-                            "snapshot_path": file_obj.get("snapshot_path") or path,
-                            "sha256": file_obj.get("sha256"),
                         })
-                        if file_obj.get("version_id"):
-                            attachment["version_id"] = file_obj.get("version_id")
-                        if file_obj.get("version_sequence") is not None:
-                            attachment["version_sequence"] = file_obj.get("version_sequence")
                         if file_obj.get("kind") == "directory":
                             attachment.update({
                                 "kind": "directory",
                                 "is_directory": True,
+                                "reference_mode": "live",
                                 "tree_revision": file_obj.get("tree_revision"),
-                                "manifest_sha256": file_obj.get("manifest_sha256"),
                             })
+                        else:
+                            attachment.update({
+                                "snapshot_path": file_obj.get("snapshot_path") or path,
+                                "sha256": file_obj.get("sha256"),
+                            })
+                            if file_obj.get("version_id"):
+                                attachment["version_id"] = file_obj.get("version_id")
+                            if file_obj.get("version_sequence") is not None:
+                                attachment["version_sequence"] = file_obj.get("version_sequence")
                     attachments.append(attachment)
             elif block_type == "image_url":
                 file_obj = block.get("file") or {}
@@ -1649,8 +1654,10 @@ class AgentService:
     async def _materialize_workspace_attachments(
         self,
         blocks: list[dict[str, Any]],
+        *,
+        on_progress: AttachmentProgressCallback | None = None,
     ) -> tuple[list[dict[str, Any]], _WorkspaceAttachmentCapture | None]:
-        """Freeze workspace references into the current execution directory."""
+        """Resolve folders as live references and freeze individual files."""
         workspace_blocks = [
             block
             for block in blocks
@@ -1667,12 +1674,48 @@ class AgentService:
         capture = _WorkspaceAttachmentCapture(uuid.uuid4().hex)
         try:
             service = WorkspaceService(db, sandbox=self.sandbox)
-            for block in workspace_blocks:
+            for index, block in enumerate(workspace_blocks, start=1):
                 file_obj = dict(block.get("file") or {})
                 entry_id = file_obj.get("entry_id")
                 version_id = file_obj.get("version_id")
                 if not isinstance(entry_id, str) or not entry_id:
                     raise ValueError("workspace 附件缺少 entry_id")
+
+                entry = await service.get_entry(self.user_id, entry_id)
+                if on_progress is not None:
+                    await on_progress({
+                        "index": index,
+                        "total": len(workspace_blocks),
+                        "name": entry.name,
+                        "kind": entry.kind,
+                    })
+
+                if entry.kind == "directory":
+                    if isinstance(version_id, str) and version_id:
+                        raise WorkspaceError(
+                            400,
+                            "DIRECTORY_VERSION_UNSUPPORTED",
+                            "工作区文件夹附件不支持固定版本",
+                        )
+                    file_obj.update({
+                        "source": "workspace",
+                        "entry_id": entry.entry_id,
+                        "revision": str(entry.revision),
+                        "tree_revision": int(entry.tree_revision),
+                        "kind": "directory",
+                        "origin_path": entry.relative_path,
+                        "path": f"workspace://entry/{entry.entry_id}",
+                        "name": entry.name,
+                        "mime_type": entry.mime_type or "inode/directory",
+                        "size": int(entry.size_bytes or 0),
+                    })
+                    file_obj.pop("snapshot_path", None)
+                    file_obj.pop("sha256", None)
+                    file_obj.pop("manifest_sha256", None)
+                    file_obj.pop("version_id", None)
+                    file_obj.pop("version_sequence", None)
+                    block["file"] = file_obj
+                    continue
 
                 stage_kwargs: dict[str, Any] = {
                     "expected_revision": None,
@@ -1723,11 +1766,8 @@ class AgentService:
                     file_obj["version_id"] = staged.version_id
                 if getattr(staged, "version_sequence", None) is not None:
                     file_obj["version_sequence"] = int(staged.version_sequence)
-                if entry.kind == "directory":
-                    file_obj["tree_revision"] = staged.tree_revision
-                    file_obj["manifest_sha256"] = staged.sha256
                 block["file"] = file_obj
-            return blocks, capture
+            return blocks, capture if capture.items else None
         except BaseException:
             await self._discard_workspace_attachment_capture(capture)
             raise
@@ -2172,6 +2212,9 @@ class AgentService:
                         "workspace_revision": str(file_obj.get("revision") or ""),
                         "workspace_version_id": str(file_obj.get("version_id") or ""),
                         "workspace_version_sequence": file_obj.get("version_sequence"),
+                        "workspace_reference_mode": (
+                            "live" if is_directory else "snapshot"
+                        ),
                     })
                 metadata = json.dumps(
                     metadata_payload,
@@ -2295,15 +2338,14 @@ class AgentService:
         user_content: list[Any],
         idempotency_key: str | None = None,
         contexts: list[Context] | None = None,
+        attachment_progress: AttachmentProgressCallback | None = None,
     ) -> PreparedAgentRun:
         """Create the user round and update Agent memory before execution."""
         if not self.agent:
             raise RuntimeError("Agent not initialized")
 
-        # Admit the key before any side effect: workspace staging below copies
-        # files and allocates uuid-suffixed directory snapshots that a retry
-        # would orphan, and a moved-on source revision would fail CAS instead
-        # of reporting the already-created Round.
+        # Admit the key before any side effect: individual Workspace files are
+        # copied into uuid-suffixed snapshots that a retry could orphan.
         if idempotency_key:
             admitted = self.history_service.find_round_by_idempotency_key(
                 self.session_id, idempotency_key
@@ -2343,7 +2385,8 @@ class AgentService:
 
         self._validate_multimodal_blocks(normalized_blocks)
         normalized_blocks, attachment_capture = await self._materialize_workspace_attachments(
-            normalized_blocks
+            normalized_blocks,
+            on_progress=attachment_progress,
         )
         try:
             agent_content = self._build_agent_user_content(normalized_blocks)

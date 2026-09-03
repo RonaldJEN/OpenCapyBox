@@ -1285,6 +1285,7 @@ class TestAgentServiceChatAgui:
             version_sequence=8,
         )
         workspace_service = MagicMock()
+        workspace_service.get_entry = AsyncMock(return_value=staged_entry)
         workspace_service.stage_entry = AsyncMock(return_value=staged_result)
 
         with patch(
@@ -1331,26 +1332,20 @@ class TestAgentServiceChatAgui:
         }
 
     @pytest.mark.asyncio
-    async def test_workspace_directory_attachment_is_one_folder_snapshot(self, service):
-        staged_entry = SimpleNamespace(
+    async def test_workspace_directory_attachment_is_live_reference(self, service):
+        directory_entry = SimpleNamespace(
             entry_id="folder-1",
             relative_path="research",
             name="research",
             kind="directory",
             mime_type=None,
-        )
-        staged_result = SimpleNamespace(
-            entry=staged_entry,
-            destination_relative_path=".workspace-snapshots/folder-1/3-token/research",
-            source_revision=1,
+            revision=1,
             tree_revision=3,
-            sha256="b" * 64,
             size_bytes=128,
-            version_id=None,
-            version_sequence=None,
         )
         workspace_service = MagicMock()
-        workspace_service.stage_entry = AsyncMock(return_value=staged_result)
+        workspace_service.get_entry = AsyncMock(return_value=directory_entry)
+        workspace_service.stage_entry = AsyncMock()
 
         with patch(
             "src.api.services.workspace_service.WorkspaceService",
@@ -1368,15 +1363,17 @@ class TestAgentServiceChatAgui:
             }]):
                 pass
 
+        workspace_service.stage_entry.assert_not_awaited()
         sent_content = service.agent.add_user_message.call_args.args[0]
         folder_text = next(block["text"] for block in sent_content if block.get("type") == "text")
         assert folder_text.startswith("[附件文件夹] metadata=")
-        assert '"path":".workspace-snapshots/folder-1/3-token/research"' in folder_text
+        assert '"path":"workspace://entry/folder-1"' in folder_text
         assert '"kind":"directory"' in folder_text
+        assert '"workspace_reference_mode":"live"' in folder_text
 
         attachment = service.history_service.create_round.call_args.kwargs["user_attachments"][0]
         assert attachment == {
-            "path": ".workspace-snapshots/folder-1/3-token/research",
+            "path": "workspace://entry/folder-1",
             "name": "research",
             "type": "inode/directory",
             "size": 128,
@@ -1384,12 +1381,10 @@ class TestAgentServiceChatAgui:
             "entry_id": "folder-1",
             "revision": "1",
             "origin_path": "research",
-            "snapshot_path": ".workspace-snapshots/folder-1/3-token/research",
-            "sha256": "b" * 64,
             "kind": "directory",
             "is_directory": True,
+            "reference_mode": "live",
             "tree_revision": 3,
-            "manifest_sha256": "b" * 64,
         }
 
     @pytest.mark.asyncio
@@ -1412,6 +1407,16 @@ class TestAgentServiceChatAgui:
             version_sequence=1,
         )
         workspace_service = MagicMock()
+        workspace_service.get_entry = AsyncMock(side_effect=[
+            staged.entry,
+            SimpleNamespace(
+                entry_id="entry-2",
+                relative_path="b.md",
+                name="b.md",
+                kind="file",
+                mime_type="text/markdown",
+            ),
+        ])
         workspace_service.stage_entry = AsyncMock(side_effect=[
             staged,
             WorkspaceError(404, "ENTRY_NOT_FOUND", "missing"),

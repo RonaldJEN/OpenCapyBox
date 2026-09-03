@@ -1072,9 +1072,14 @@ function ChatV2View(props: ChatV2Props) {
         setLocalError('工作区文件已永久删除，历史中不再保留可读取副本。');
         return;
       }
+      if (file.is_directory && file.entry_id) {
+        setLocalError('');
+        requestOpenWorkspace(file.entry_id);
+        return;
+      }
       const capturedPath = (file.snapshot_path || file.path).replace(/^\/+/, '');
       if (!capturedPath.startsWith('.workspace-snapshots/')) {
-        setLocalError('工作区附件正在冻结，请稍后再打开。');
+        setLocalError('工作区附件正在准备，请稍后再打开。');
         return;
       }
     }
