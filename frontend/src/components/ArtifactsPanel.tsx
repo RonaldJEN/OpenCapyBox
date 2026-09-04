@@ -21,6 +21,7 @@ import {
   FolderTree,
   Loader2,
   RotateCcw,
+  Search,
   X,
 } from 'lucide-react';
 
@@ -79,6 +80,7 @@ interface SessionPanelState {
   openTabs: FileInfo[];
   activePath: string | null;
   listScrollTops: Record<string, number>;
+  searchQueries: Record<string, string>;
   lastTriggerPath: string;
   lastExternalTargetKey: string | null;
 }
@@ -91,6 +93,7 @@ function createSessionPanelState(): SessionPanelState {
     openTabs: [],
     activePath: null,
     listScrollTops: {},
+    searchQueries: {},
     lastTriggerPath: '',
     lastExternalTargetKey: null,
   };
@@ -185,6 +188,13 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
   const activeFile = activePath
     ? openTabs.find((file) => normalizePathForCompare(file.path) === activePath) ?? null
     : null;
+  const searchQuery = sessionState.searchQueries[currentPath] ?? '';
+  const normalizedSearchQuery = searchQuery.trim().toLowerCase();
+  const visibleItems = useMemo(() => (
+    normalizedSearchQuery
+      ? items.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery))
+      : items
+  ), [items, normalizedSearchQuery]);
 
   const updateOwnedSessionState = useCallback((
     ownerSessionId: string,
@@ -202,6 +212,16 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
   ) => {
     updateOwnedSessionState(sessionId, updater);
   }, [sessionId, updateOwnedSessionState]);
+
+  const setSearchQuery = useCallback((query: string) => {
+    updateSessionState((current) => {
+      if ((current.searchQueries[current.currentPath] ?? '') === query) return current;
+      const searchQueries = { ...current.searchQueries };
+      if (query) searchQueries[current.currentPath] = query;
+      else delete searchQueries[current.currentPath];
+      return { ...current, searchQueries };
+    });
+  }, [updateSessionState]);
 
   useEffect(() => {
     if (isOpen) setIsMounted(true);
@@ -725,10 +745,45 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
         className={`${activeFile ? 'hidden' : 'flex'} min-h-0 flex-1 flex-col`}
         aria-hidden={Boolean(activeFile)}
       >
+          <div className="shrink-0 px-3 pt-3">
+            <div className="flex h-9 items-center gap-2 rounded-lg border border-claude-border bg-claude-surface/45 px-2.5 transition-colors focus-within:border-claude-accent/55 focus-within:bg-white focus-within:ring-2 focus-within:ring-claude-accent/15">
+              <Search size={14} className="shrink-0 text-claude-muted" aria-hidden="true" />
+              <input
+                type="text"
+                role="searchbox"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape' && searchQuery) {
+                    event.preventDefault();
+                    setSearchQuery('');
+                  }
+                }}
+                disabled={loading || Boolean(loadError)}
+                aria-label="搜索当前目录"
+                aria-controls="artifacts-file-list"
+                placeholder="搜索当前目录"
+                autoComplete="off"
+                className="min-w-0 flex-1 bg-transparent text-[13px] text-claude-text outline-none placeholder:text-claude-muted/75 disabled:cursor-not-allowed"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45"
+                  aria-label="清空搜索"
+                  title="清空搜索"
+                >
+                  <X size={12} aria-hidden="true" />
+                </button>
+              )}
+            </div>
+          </div>
           <div
             ref={listScrollRef}
+            id="artifacts-file-list"
             data-testid="artifacts-file-list"
-            className="flex-1 space-y-1 overflow-y-auto p-3"
+            className="flex-1 space-y-1 overflow-y-auto p-3 pt-2"
           >
             {loading ? (
               <div className="flex items-center justify-center py-12" aria-label="正在加载文件">
@@ -752,8 +807,14 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
                 <FolderOpen size={38} className="mb-3 text-claude-border" />
                 <p className="text-[13px] text-claude-muted">空目录</p>
               </div>
+            ) : visibleItems.length === 0 ? (
+              <div className="flex h-full min-h-[300px] flex-col items-center justify-center text-center">
+                <Search size={38} className="mb-3 text-claude-border" aria-hidden="true" />
+                <p className="text-[13px] text-claude-muted">未找到匹配项</p>
+                <p className="mt-1 text-[11px] text-claude-muted/80">试试其他关键词</p>
+              </div>
             ) : (
-              items.map((item) => {
+              visibleItems.map((item) => {
                 const itemPath = normalizePathForCompare(item.path);
                 const isOpenTab = !item.is_directory && openTabs.some(
                   (tab) => normalizePathForCompare(tab.path) === itemPath,
@@ -818,7 +879,9 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
           </div>
 
           <div className="flex items-center justify-between border-t border-claude-border px-4 py-2.5 text-[10px] text-claude-muted">
-            <span>{items.length} 项</span>
+            <span aria-live="polite">
+              {normalizedSearchQuery ? `${visibleItems.length} / ${items.length} 项` : `${items.length} 项`}
+            </span>
             <span className="ml-2 truncate font-mono" title={displayPath}>{displayPath}</span>
           </div>
       </div>

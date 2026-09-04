@@ -25,6 +25,8 @@ import { FileAttachment } from './FileAttachment';
 import { CodeBlock } from './CodeBlock';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { differenceInCalendarDays, format, isSameDay } from 'date-fns';
+import { zhCN } from 'date-fns/locale/zh-CN';
 import { parseMessageContent } from '../utils/messageParser';
 import {
   assistantFileReferenceToFileInfo,
@@ -223,6 +225,34 @@ function AssistantMarkdown({
     >
       {content}
     </ReactMarkdown>
+  );
+}
+
+function MessageTimestamp({ value, label }: { value: string; label: string }) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+
+  const now = new Date();
+  const time = format(date, 'HH:mm');
+  const calendarDaysAgo = differenceInCalendarDays(now, date);
+  const displayTime = isSameDay(date, now)
+    ? `今天 ${time}`
+    : calendarDaysAgo > 0 && calendarDaysAgo < 7
+      ? `${format(date, 'EEEE', { locale: zhCN })} ${time}`
+      : format(
+        date,
+        date.getFullYear() === now.getFullYear() ? 'M月d日 HH:mm' : 'yyyy年M月d日 HH:mm',
+        { locale: zhCN },
+      );
+
+  return (
+    <time
+      dateTime={date.toISOString()}
+      aria-label={`${label}：${displayTime}`}
+      className="inline-flex text-xs leading-7 text-claude-muted"
+    >
+      {displayTime}
+    </time>
   );
 }
 
@@ -466,6 +496,9 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
               ))}
             </div>
           )}
+          <div className="mt-2">
+            <MessageTimestamp value={round.created_at} label="消息发送时间" />
+          </div>
         </div>
       </div>
 
@@ -512,9 +545,6 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
                   ))}
                 </div>
               )}
-              {canCopyAssistantContent && (
-                <AssistantActions content={round.final_response ?? ''} />
-              )}
             </div>
           )}
 
@@ -533,6 +563,9 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
             <div className="text-xs text-claude-muted font-medium mt-2">
               已取消
             </div>
+          )}
+          {canCopyAssistantContent && (
+            <AssistantActions content={round.final_response ?? ''} />
           )}
         </div>
       </div>

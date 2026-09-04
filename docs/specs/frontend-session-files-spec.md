@@ -48,11 +48,12 @@ interface SessionFilesState {
   openTabs: SessionFileTab[];
   activePath: string | null;
   listScrollTop: number;
+  searchQueries: Record<string, string>; // currentPath -> query
   previewScrollTops: Record<string, number>;
 }
 ```
 
-- 状态必须按 `sessionId` 隔离；A/B session 不得共享路径、标签或活动文件。
+- 状态必须按 `sessionId` 隔离；A/B session 不得共享路径、标签、活动文件或目录搜索词。
 - 每个 session 在保持 `split` 时独立保留 splitter 比例；关闭文件区再通过聊天顶栏打开时恢复标签、路径和预览，但比例固定重置为聊天 45% / 文件 55%，不得继承上次的极窄比例。
 - 切回已访问 session 时恢复其文件状态。
 - 经过“新建会话”（`sessionId=""`）再返回旧 session 时也必须恢复；状态 owner 必须始终挂载。
@@ -103,6 +104,7 @@ Session 文件工作台是主布局的一部分，不适用普通右侧 Overlay 
 - 目录请求使用单调递增 request id；迟到响应不得覆盖新路径。
 - 支持后退、前进、上一级和根目录。
 - 目录在前、文件在后，排序沿用后端结果。
+- 目录视图顶部提供当前目录搜索：只在 `GET /api/sessions/{id}/files` 返回的完整条目中按 `name` 做客户端子串筛选，比较前 trim 搜索词并忽略英文大小写，不发起额外请求。搜索词按 `sessionId + currentPath` 隔离并在目录导航、文件预览和 Session 切换后恢复；空词显示全部条目，无匹配项时不得显示“空目录”。`Escape` 或清空按钮清除当前目录搜索，底部计数在筛选时显示“匹配数 / 总数”。
 - 点击目录进入目录；点击文件打开或激活相同路径标签。
 - 同一路径最多一个标签。
 - 关闭活动标签后选择相邻标签；最后一个标签关闭后显示目录列表。

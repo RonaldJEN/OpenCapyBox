@@ -109,6 +109,41 @@ describe('Round 组件', () => {
     expect(screen.getByText('这是我的分析结果...')).toBeInTheDocument();
   });
 
+  it('只在用户消息下直接显示 GPT 风格的日历时间', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date(2026, 8, 4, 18, 0));
+      const { rerender } = render(
+        <Round
+          round={createMockRound({
+            created_at: new Date(2026, 8, 4, 11, 14).toISOString(),
+            steps: [],
+          })}
+          isStreaming={false}
+        />,
+      );
+
+      let userTime = screen.getByLabelText(/消息发送时间/);
+      expect(userTime).toHaveTextContent('今天 11:14');
+      expect(userTime).not.toHaveAttribute('title');
+
+      rerender(
+        <Round
+          round={createMockRound({
+            created_at: new Date(2026, 8, 2, 16, 42).toISOString(),
+            steps: [],
+          })}
+          isStreaming={false}
+        />,
+      );
+      userTime = screen.getByLabelText(/消息发送时间/);
+      expect(userTime).toHaveTextContent('星期三 16:42');
+      expect(screen.queryByLabelText(/助手回复时间/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('点击复制回复应复制助手回复内容', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', {

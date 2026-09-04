@@ -760,6 +760,32 @@ describe('ArtifactsPanel 组件', () => {
     expect(await screen.findByText('Inline Preview: report.pdf')).toBeInTheDocument();
   });
 
+  it('可以按文件名筛选当前目录，并支持清空搜索', async () => {
+    render(
+      <ArtifactsPanel
+        sessionId="test-session"
+        isOpen
+        onClose={vi.fn()}
+      />,
+    );
+
+    const searchInput = await screen.findByRole('searchbox', { name: '搜索当前目录' });
+    await screen.findByText('report.pdf');
+
+    fireEvent.change(searchInput, { target: { value: 'REPORT' } });
+    expect(screen.getByText('report.pdf')).toBeInTheDocument();
+    expect(screen.queryByText('data.xlsx')).not.toBeInTheDocument();
+    expect(screen.getByText('1 / 3 项')).toBeInTheDocument();
+
+    fireEvent.change(searchInput, { target: { value: 'missing' } });
+    expect(screen.getByText('未找到匹配项')).toBeInTheDocument();
+    expect(screen.queryByText('空目录')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '清空搜索' }));
+    expect(screen.getByText('data.xlsx')).toBeInTheDocument();
+    expect(searchInput).toHaveValue('');
+  });
+
   it('空文件列表应该显示空目录提示', async () => {
     vi.mocked(apiService.getSessionFiles).mockResolvedValue({
       files: [],

@@ -77,6 +77,8 @@ TurnPreferenceDraft {
 }
 ```
 
+`Round` 只在用户消息下直接展示 `created_at`，不依赖悬停：当天显示“今天 HH:mm”，最近 6 个日历日显示“星期X HH:mm”，同年更早显示“M月d日 HH:mm”，跨年显示“yyyy年M月d日 HH:mm”。助手区域不展示 `completed_at` 或其他完成时间；`completed_at` 仅保留为运行状态与历史审计数据。
+
 ### 2.1 左栏工作区与右侧文件 owner
 
 - 右侧标签点击与左树打开复用 App 的 entry 导航入口，同步当前文件与 `entry/path` URL；关闭当前标签时以 replace 更新为相邻标签，关闭非当前标签不改变 URL，关闭最后一个标签清除 entry 深链。普通切标签保留编辑器实例和草稿，不额外请求 metadata。
