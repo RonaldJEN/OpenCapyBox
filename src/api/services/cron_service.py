@@ -24,9 +24,9 @@ from src.api.models.auth_user import AuthUser
 from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.user_memory import CronJobRun
-from src.api.models.user_sandbox import UserSandbox
 from src.api.models.workspace import WorkspaceChangeSet
 from src.api.services.cron_engine import CronEngine, CronExpressionError
+from src.api.services.sandbox_service import SandboxLifecycleError
 from src.api.services.cron_schedule import schedule_to_cron, ScheduleError
 from src.api.utils.timezone import now_naive
 from src.api.utils.sandbox_helpers import is_workspace_publish_scratch_path
@@ -463,18 +463,14 @@ class CronService:
 
 
 async def _get_renewed_cron_sandbox(sandbox_service, user_id: str, sandbox_id: str | None):
-    """Renew the frozen Sandbox, never replacing an existing run generation."""
+    """Acquire before binding; once bound, only renew that exact generation."""
     if not sandbox_id:
-        return await sandbox_service.get_or_resume_and_renew(user_id, None)
+        return await sandbox_service.acquire_user_sandbox(user_id)
 
-    sandbox = await sandbox_service.get_existing(user_id, sandbox_id)
+    sandbox = await sandbox_service.get_existing(user_id, sandbox_id, renew=True)
     connected_id = getattr(sandbox, "id", None)
     if connected_id != sandbox_id:
         raise RuntimeError("Cron 连接到非冻结 Sandbox")
-    if not await sandbox_service.renew(user_id):
-        raise RuntimeError("Cron 冻结 Sandbox 续租失败")
-    if sandbox_service.get_sandbox_id(user_id) != sandbox_id:
-        raise RuntimeError("Cron Sandbox 在续租期间发生代际切换")
     return sandbox
 
 
@@ -541,7 +537,7 @@ def _set_run_sandbox_id(
                 CronJobRun.claim_lease_expires_at > now_naive(),
             )
         record = query.with_for_update().first()
-        if record is None:
+        if record is None or record.phase != "preparing":
             return False
         current = record.sandbox_id if isinstance(record.sandbox_id, str) else None
         if current and current != sandbox_id:
@@ -819,28 +815,12 @@ async def run_cron_job(
 
         sandbox_service = get_sandbox_service()
 
-        sandbox_id = frozen_sandbox_id
-        if not sandbox_id:
-            with SessionLocal() as db:
-                user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
-                candidate_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
-                sandbox_id = (
-                    candidate_sandbox_id
-                    if isinstance(candidate_sandbox_id, str) and candidate_sandbox_id
-                    else None
-                )
-
         sandbox = await _get_renewed_cron_sandbox(
             sandbox_service,
             user_id,
-            sandbox_id,
+            frozen_sandbox_id,
         )
-        connected_sandbox_id = getattr(sandbox, "id", None)
-        latest_sandbox_id = (
-            connected_sandbox_id
-            if isinstance(connected_sandbox_id, str) and connected_sandbox_id
-            else sandbox_service.get_sandbox_id(user_id)
-        )
+        latest_sandbox_id = getattr(sandbox, "id", None)
         if not isinstance(latest_sandbox_id, str) or not latest_sandbox_id:
             raise RuntimeError("Cron 无法确认冻结 Sandbox ID")
         if not _set_run_sandbox_id(
@@ -849,32 +829,6 @@ async def run_cron_job(
             claim_token=claim_token,
         ):
             raise RuntimeError("Cron Sandbox 绑定被 claim fence 拒绝")
-
-        # 只有本轮开始时尚无 durable Sandbox 时才建立用户绑定；已有冻结 ID
-        # 的运行不得把后来变化的 UserSandbox 指回旧代际。
-        if frozen_sandbox_id is None:
-            with SessionLocal() as db:
-                user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
-                runtime_config = sandbox_service.get_cached_runtime_config(user_id)
-                if user_sandbox:
-                    user_sandbox.sandbox_id = latest_sandbox_id
-                    user_sandbox.status = "active"
-                    if runtime_config:
-                        user_sandbox.active_profile_id = runtime_config.profile_id
-                        user_sandbox.active_profile_version = runtime_config.profile_version
-                else:
-                    import uuid
-
-                    user_sandbox = UserSandbox(
-                        id=str(uuid.uuid4()),
-                        user_id=user_id,
-                        sandbox_id=latest_sandbox_id,
-                        active_profile_id=runtime_config.profile_id if runtime_config else None,
-                        active_profile_version=runtime_config.profile_version if runtime_config else None,
-                        status="active",
-                    )
-                    db.add(user_sandbox)
-                db.commit()
 
         try:
             from src.api.model_registry import get_model_registry
@@ -1130,12 +1084,24 @@ async def run_cron_job(
         return output
 
     except Exception as e:
-        logger.error("Cron 任务失败 (user=%s, job=%s): %s", user_id, job_name, e, exc_info=True)
+        failure = f"Error: {e}"
+        error_code = "execution_error"
+        if isinstance(e, SandboxLifecycleError):
+            error_code = e.code
+            failure = str(e)
+            diagnostics = json.dumps({
+                "code": e.code,
+                "message": str(e), "sandbox_id": e.sandbox_id,
+                "remote_state": e.remote_state, "stage": e.stage,
+            }, ensure_ascii=False)
+            logger.error("Cron Sandbox 失败 (run=%s): %s", run_id, diagnostics, exc_info=True)
+        else:
+            logger.error("Cron 任务失败 (user=%s, job=%s): %s", user_id, job_name, e, exc_info=True)
         _mark_run_failed(
             run_id,
-            f"Error: {e}",
+            failure,
             run_workspace,
-            error_code="execution_error",
+            error_code=error_code,
             claim_token=claim_token,
         )
 

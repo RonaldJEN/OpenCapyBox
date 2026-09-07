@@ -24,7 +24,6 @@ from src.api.models.cron_fire import CronFire
 from src.api.models.cron_job import CronJob
 from src.api.models.database import SessionLocal
 from src.api.models.user_memory import CronJobRun
-from src.api.models.user_sandbox import UserSandbox
 from src.api.services.cron_engine import CronEngine
 from src.api.services.cron_service import (
     build_cron_definition_snapshot,
@@ -457,17 +456,8 @@ def _claim_queued_run(run_id: str, worker_id: str) -> dict | None:
         )
         if record is None or record.status != "queued":
             return None
-        sandbox_row = (
-            db.query(UserSandbox.sandbox_id)
-            .filter(UserSandbox.user_id == record.user_id)
-            .first()
-        )
-        frozen_sandbox_id = sandbox_row[0] if sandbox_row else None
-        record.sandbox_id = (
-            frozen_sandbox_id
-            if isinstance(frozen_sandbox_id, str) and frozen_sandbox_id
-            else None
-        )
+        # A first claim has no execution Sandbox yet. Reclaimed preparing runs
+        # retain an already frozen ID; the mutable user binding is not a run ID.
         claim_token = str(uuid.uuid4())
         record.status = "running"
         record.phase = "preparing"
@@ -602,7 +592,6 @@ def reconcile_expired_cron_runs(
                 record.status = "queued"
                 record.phase = "queued"
                 record.started_at = None
-                record.sandbox_id = None
                 record.output = "[执行 worker 在 Agent 启动前失联，任务已重新排队]"
                 record.error_code = None
                 requeued += 1

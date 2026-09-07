@@ -159,10 +159,42 @@ describe('ChatV2 structured assistant file wiring', () => {
 
     fireEvent.click(await screen.findByTestId('open-user-attachment'));
 
-    expect(await screen.findByText('工作区附件正在冻结，请稍后再打开。')).toBeInTheDocument();
+    expect(await screen.findByText('工作区附件正在准备，请稍后再打开。')).toBeInTheDocument();
     expect(lastArtifactsPanelProps).toMatchObject({ isOpen: false });
     expect(lastArtifactsPanelProps.targetFile).toBeFalsy();
     expect(apiService.getSessionFiles).not.toHaveBeenCalled();
+  });
+
+  it.each([[0, 1], [1, 0], [0, 1, 0, 1]])('切换附件顺序 %j 后关闭保留最新阅读位置', async (...order) => {
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      session_id: 'test-session', total: 2,
+      rounds: ['v39.zip', 'v54.zip'].map((name, index) => ({
+        round_id: `round-${index}`, user_message: name, final_response: 'done',
+        user_attachments: [{ source: 'session', session_id: 'test-session', name, path: name, size: 100, type: 'zip' }],
+        steps: [], step_count: 0, status: 'completed', created_at: '2026-09-07T09:00:00Z',
+      })),
+    });
+    const { container } = render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    await waitFor(() => expect(screen.getAllByTestId('open-user-attachment')).toHaveLength(2));
+    const chatArea = container.querySelector('div[class*="overflow-y-auto"][class*="bg-claude-bg"]') as HTMLDivElement;
+    Object.defineProperties(chatArea, {
+      scrollTop: { configurable: true, writable: true, value: 200 },
+      scrollHeight: { configurable: true, value: 5000 },
+      clientWidth: { configurable: true, value: 600 },
+      clientHeight: { configurable: true, value: 600 },
+    });
+    for (const index of order) {
+      chatArea.scrollTop = index === 0 ? 200 : 3200;
+      fireEvent.scroll(chatArea);
+      fireEvent.click(screen.getAllByTestId('open-user-attachment')[index]);
+      await waitFor(() => expect(lastArtifactsPanelProps.targetFile?.name).toBe(index === 0 ? 'v39.zip' : 'v54.zip'));
+    }
+    // Reading may continue after the latest attachment was opened.
+    chatArea.scrollTop = 1800;
+    fireEvent.scroll(chatArea);
+    act(() => lastArtifactsPanelProps.onClose());
+    expect(lastArtifactsPanelProps.isOpen).toBe(false);
+    expect(chatArea.scrollTop).toBe(1800);
   });
 
   it('authoritative Workspace snapshot 仍以只读 Session 快照打开', async () => {

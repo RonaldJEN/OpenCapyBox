@@ -5,7 +5,7 @@ import json
 import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import create_engine
@@ -309,6 +309,70 @@ class TestInsertFire:
 
 
 class TestDurableRunClaims:
+    @pytest.mark.asyncio
+    async def test_lost_claim_after_acquisition_preserves_user_binding_and_skips_agent(self, cron_db, monkeypatch):
+        from src.api.models import database
+        from src.api.services import sandbox_service, agent_service
+        from src.api.services.cron_service import run_cron_job
+        from tests.helpers import make_mock_sandbox
+
+        monkeypatch.setattr(database, "SessionLocal", cron_db)
+        run_id = self._queued_run(cron_db)
+        claim = cron_worker._claim_queued_run(run_id, "worker-a")
+        recovered = make_mock_sandbox(sandbox_id="sbx-recovered")
+
+        async def acquire(user_id):
+            with cron_db() as db:
+                db.add(UserSandbox(id="binding", user_id=user_id, sandbox_id=recovered.id))
+                record = db.get(CronJobRun, run_id)
+                record.claim_token = "new-owner"
+                db.commit()
+            return recovered
+
+        service = MagicMock(acquire_user_sandbox=AsyncMock(side_effect=acquire))
+        monkeypatch.setattr(sandbox_service, "get_sandbox_service", lambda: service)
+        agent = MagicMock()
+        monkeypatch.setattr(agent_service, "AgentService", agent)
+        await run_cron_job("u1", claim["job_name"], run_id, claim_token=claim["claim_token"])
+        with cron_db() as db:
+            assert db.query(UserSandbox).one().sandbox_id == recovered.id
+            record = db.get(CronJobRun, run_id)
+            assert record.sandbox_id is None
+            assert record.claim_token == "new-owner"
+            assert record.status == "running"
+        recovered.commands.run.assert_not_awaited()
+        recovered.kill.assert_not_awaited()
+        agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_frozen_terminal_sandbox_reports_exact_cause_without_replacement(self, cron_db, monkeypatch, caplog):
+        from src.api.models import database
+        from src.api.services import sandbox_service
+        from src.api.services.cron_service import run_cron_job
+
+        monkeypatch.setattr(database, "SessionLocal", cron_db)
+        run_id = self._queued_run(cron_db)
+        claim = cron_worker._claim_queued_run(run_id, "worker-a")
+        with cron_db() as db:
+            db.get(CronJobRun, run_id).sandbox_id = "sbx-frozen"
+            db.commit()
+        error = sandbox_service.SandboxLifecycleError(
+            "既有沙箱不可用", code="sandbox_not_found", sandbox_id="sbx-frozen", remote_state="not_found",
+        )
+        service = MagicMock(get_existing=AsyncMock(side_effect=error), acquire_user_sandbox=AsyncMock())
+        monkeypatch.setattr(sandbox_service, "get_sandbox_service", lambda: service)
+        await run_cron_job("u1", claim["job_name"], run_id, claim_token=claim["claim_token"])
+        with cron_db() as db:
+            record = db.get(CronJobRun, run_id)
+            assert record.error_code == "sandbox_not_found"
+            assert record.output == "既有沙箱不可用"
+            assert "sbx-frozen" not in record.to_dict()["output"]
+            assert record.run_workspace is None
+            assert record.sandbox_id == "sbx-frozen"
+        service.acquire_user_sandbox.assert_not_awaited()
+        assert '"sandbox_id": "sbx-frozen"' in caplog.text
+        assert '"remote_state": "not_found"' in caplog.text
+
     def _queued_run(self, cron_db) -> str:
         job = _insert_job(
             cron_db,
@@ -335,7 +399,7 @@ class TestDurableRunClaims:
             db.commit()
         claim = cron_worker._claim_queued_run(run_id, "worker-a")
         assert claim is not None
-        assert claim["sandbox_id"] == "sbx-claim"
+        assert claim["sandbox_id"] is None
         assert cron_worker._claim_queued_run(run_id, "worker-b") is None
         assert cron_worker._renew_run_claim(run_id, claim["claim_token"]) is True
 
@@ -344,7 +408,7 @@ class TestDurableRunClaims:
             assert run.status == "running"
             assert run.phase == "preparing"
             assert run.claim_worker_id == "worker-a"
-            assert run.sandbox_id == "sbx-claim"
+            assert run.sandbox_id is None
             assert run.attempt_count == 1
             assert run.claim_lease_expires_at > run.heartbeat_at
 
@@ -489,6 +553,7 @@ class TestDurableRunClaims:
             executing = db.get(CronJobRun, executing_id)
             active = db.get(CronJobRun, active_id)
             preparing.claim_lease_expires_at = now - timedelta(seconds=1)
+            preparing.sandbox_id = "sbx-frozen"
             executing.phase = "executing"
             executing.claim_lease_expires_at = now - timedelta(seconds=1)
             active.phase = "executing"
@@ -507,6 +572,9 @@ class TestDurableRunClaims:
             assert executing.error_code == "worker_lease_expired_after_start"
             assert active.status == "running"
             assert active.claim_token is not None
+
+        reclaimed = cron_worker._claim_queued_run(preparing_id, "worker-b")
+        assert reclaimed["sandbox_id"] == "sbx-frozen"
 
     @pytest.mark.asyncio
     async def test_run_queued_passes_the_exact_claim_to_runner(

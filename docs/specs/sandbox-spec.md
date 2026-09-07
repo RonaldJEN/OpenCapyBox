@@ -68,7 +68,8 @@
 
 - `create(user_id) -> Sandbox`
 - `get_or_resume(user_id, sandbox_id) -> Sandbox` — 状态感知恢复：缓存命中优先；仅在 Profile 明确不匹配、控制面确认旧沙箱终止/失败/不存在，或没有持久化 ID 时创建新沙箱；暂时性故障不得触发重建
-- `get_existing(user_id, sandbox_id) -> Sandbox` — 仅复用 ID/Profile 均匹配的缓存或连接/恢复该指定沙箱；不可用或指纹不匹配时抛出 `RuntimeError`，不得返回其他缓存代际，也绝不 fallback create
+- `get_existing(user_id, sandbox_id, renew=False) -> Sandbox` — 仅复用 ID/Profile 均匹配的缓存或连接/恢复该指定沙箱；可在同一生命周期锁内续租该具体实例；不可用或指纹不匹配时抛出 `SandboxLifecycleError`（继承 RuntimeError），不得返回其他缓存代际，也绝不 fallback create
+- `acquire_user_sandbox(user_id) -> Sandbox` — 普通对话创建 Agent 与未冻结 ID 的 Cron 共用。在用户生命周期锁内读取最新持久绑定、复用现有恢复/CAS/首次持久化逻辑，最后续租并返回同一个实例；临时查询、连接或续租失败不触发替代创建。调用方只使用返回对象的 ID，不二次读取可变缓存。
 - `recover_persisted_sandbox(user_id, sandbox_id) -> Sandbox` — 恢复持久化沙箱；允许在确认旧代际已丢失或 Profile 明确不匹配时通过 CAS 重建，状态未知或暂时性连接故障时不创建替代实例
 - `get_or_resume_with_persisted_id(user_id, sandbox_id) -> tuple[Sandbox, str|None]`
 - `pause(user_id) -> bool`
@@ -147,8 +148,9 @@ Profile 配置更新仅保留当前行的 `updated_at` 和 `version`，MVP 不�
   - CAS 败者只销毁自己的候选容器、保留共享持久卷，然后按数据库中的胜出 ID 连接既有代际；
   - CAS 查询或提交失败时销毁候选容器并返回暂时不可用，不得把未绑定候选暴露给调用方。
 - 该 CAS 关闭多 worker 同时发现旧沙箱终止时的重复绑定窗口；候选清理失败由 OpenSandbox TTL 兜底并记录 warning。
-- `get_or_resume_with_persisted_id` 在没有传入持久化 ID 的首次创建路径中，于同一 user lifecycle lock 内完整 upsert `user_sandbox`；若跨 worker 竞争发现数据库已有其他胜出 ID，则销毁本地候选并改用胜出代际。
-- 调用方若使用裸 `get_or_resume`，首次创建或 cron 无记录场景仍需显式插入/回写当前 `sandbox_id` 与 active Profile 指纹。
+- `get_or_resume_with_persisted_id` 在没有传入持久化 ID 的首次创建路径中，于同一 user lifecycle lock 内完整 upsert `user_sandbox`；已有空绑定行在短事务中加行锁，不跨网络等待。若跨 worker 竞争发现数据库已有其他胜出 ID，则销毁本地候选并改用胜出代际。
+- Cron 用户绑定写入由公共 Sandbox 服务唯一负责，执行器不再自行 upsert。多进程 CAS 保证一个候选成为有效绑定；失败候选仅销毁容器，保留用户共享持久目录。已经绑定成功的实例不因某个 Cron 的 claim 失效而销毁。
+- 生命周期错误通过 `SandboxLifecycleError` 携带 code/sandbox_id/remote_state/stage；明确终态使用 sandbox_terminated/sandbox_failed/sandbox_not_found，其他阶段使用 sandbox_state_query_failed/sandbox_connect_failed/sandbox_resume_failed/sandbox_renew_failed/sandbox_profile_mismatch 等。数据库 active/paused 不是控制面的实时健康证明，不新增另一套周期性状态同步。
 
 ### AgentPool sandbox 代际一致性
 

@@ -577,6 +577,61 @@ class TestGetOrResume:
 
 
 class TestSandboxBindingCas:
+    @pytest.mark.asyncio
+    async def test_new_runs_share_terminal_binding_recovery_and_renew_exact_instance(self, service):
+        binding = "sbx-dead"
+        recovered = make_mock_sandbox(sandbox_id="sbx-recovered")
+
+        def bind(user_id, previous_id, candidate_id, **kwargs):
+            nonlocal binding
+            assert previous_id == binding
+            binding = candidate_id
+            return True, candidate_id
+
+        with (
+            patch.object(service, "_read_persisted_sandbox_id", side_effect=lambda _: binding),
+            patch.object(service, "_query_sandbox_state", new=AsyncMock(return_value="not_found")),
+            patch.object(service, "_compare_and_swap_sandbox_binding", side_effect=bind) as cas,
+            patch.object(service, "_create_candidate", new=AsyncMock(return_value=recovered)) as create,
+        ):
+            results = await asyncio.gather(*(service.acquire_user_sandbox("user-1") for _ in range(3)))
+
+        assert all(result is recovered for result in results)
+        assert binding == "sbx-recovered"
+        create.assert_awaited_once()
+        cas.assert_called_once()
+        assert recovered.renew.await_count == 3
+        recovered.commands.run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_acquisition_query_failure_does_not_replace_binding(self, service):
+        from src.api.services.sandbox_service import SandboxTemporarilyUnavailable
+
+        with (
+            patch.object(service, "_read_persisted_sandbox_id", return_value="sbx-old"),
+            patch.object(service, "_query_sandbox_state", new=AsyncMock(side_effect=SandboxTemporarilyUnavailable("network"))),
+            patch.object(service, "_create_candidate", new=AsyncMock()) as create,
+            patch.object(service, "_compare_and_swap_sandbox_binding") as cas,
+        ):
+            with pytest.raises(SandboxTemporarilyUnavailable):
+                await service.acquire_user_sandbox("user-1")
+        create.assert_not_awaited()
+        cas.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rebuild_db_failure_cleans_candidate_without_touching_files(self, service):
+        candidate = make_mock_sandbox(sandbox_id="sbx-candidate")
+        with (
+            patch.object(service, "_query_sandbox_state", new=AsyncMock(return_value="not_found")),
+            patch.object(service, "_create_candidate", new=AsyncMock(return_value=candidate)),
+            patch.object(service, "_compare_and_swap_sandbox_binding", side_effect=RuntimeError("db down")),
+        ):
+            with pytest.raises(RuntimeError, match="db down"):
+                await service.recover_persisted_sandbox("user-1", "sbx-old")
+        candidate.kill.assert_awaited_once()
+        candidate.commands.run.assert_not_awaited()
+        assert service.get_cached("user-1") is None
+
     @staticmethod
     def _session_factory():
         from sqlalchemy import create_engine

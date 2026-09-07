@@ -82,11 +82,12 @@ function AssistantMarkdown({
   fileReferences: AssistantFileReference[];
   onOpenFile?: (file: FileInfo) => void;
 }) {
+  const readingId = (node: any) => `answer:${node.tagName}:${node.position?.start?.offset}`;
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
-        code: ({ className, children, ...props }: any) => {
+        code: ({ node, className, children, ...props }: any) => {
           const match = /language-(\w+)/.exec(className || '');
           const language = match ? match[1] : '';
           const isInline = !match && !children?.toString().includes('\n');
@@ -106,6 +107,7 @@ function AssistantMarkdown({
             <CodeBlock
               language={language}
               value={String(children).replace(/\n$/, '')}
+              readingBlockId={readingId(node)}
             />
           );
         },
@@ -119,13 +121,14 @@ function AssistantMarkdown({
             </pre>
           );
         },
-        img: ({ src: imgSrc, alt: imgAlt, ...imgRest }: any) => {
+        img: ({ node, src: imgSrc, alt: imgAlt, ...imgRest }: any) => {
           if (typeof imgSrc !== 'string') {
             return null;
           }
           if (imgSrc.startsWith('/api/')) {
             return (
               <AuthenticatedImage
+                data-reading-block={readingId(node)}
                 src={imgSrc}
                 alt={imgAlt || ''}
                 className="max-w-full rounded-lg my-2"
@@ -134,7 +137,7 @@ function AssistantMarkdown({
             );
           }
           if (/^(https?:|data:image\/|blob:)/i.test(imgSrc)) {
-            return <img src={imgSrc} alt={imgAlt || ''} className="max-w-full rounded-lg my-2" {...imgRest} />;
+            return <img data-reading-block={readingId(node)} src={imgSrc} alt={imgAlt || ''} className="max-w-full rounded-lg my-2" {...imgRest} />;
           }
           return null;
         },
@@ -195,18 +198,24 @@ function AssistantMarkdown({
         ol: ({ children, ...props }: any) => (
           <ol className="space-y-1 my-2" {...props}>{children}</ol>
         ),
-        li: ({ children, ...props }: any) => (
-          <li className="text-claude-text" {...props}>{children}</li>
+        p: ({ node, children, ...props }: any) => (
+          <p data-reading-block={readingId(node)} {...props}>{children}</p>
         ),
-        h1: ({ children, ...props }: any) => (
-          <h1 className="text-[1.5em] font-semibold text-claude-text tracking-tight mt-6 mb-3" {...props}>{children}</h1>
+        li: ({ node, children, ...props }: any) => (
+          <li data-reading-block={readingId(node)} className="text-claude-text" {...props}>{children}</li>
         ),
-        h2: ({ children, ...props }: any) => (
-          <h2 className="text-[1.25em] font-semibold text-claude-text tracking-tight mt-5 mb-2" {...props}>{children}</h2>
+        h1: ({ node, children, ...props }: any) => (
+          <h1 data-reading-block={readingId(node)} className="text-[1.5em] font-semibold text-claude-text tracking-tight mt-6 mb-3" {...props}>{children}</h1>
         ),
-        h3: ({ children, ...props }: any) => (
-          <h3 className="text-[1.1em] font-semibold text-claude-text tracking-tight mt-4 mb-2" {...props}>{children}</h3>
+        h2: ({ node, children, ...props }: any) => (
+          <h2 data-reading-block={readingId(node)} className="text-[1.25em] font-semibold text-claude-text tracking-tight mt-5 mb-2" {...props}>{children}</h2>
         ),
+        h3: ({ node, children, ...props }: any) => (
+          <h3 data-reading-block={readingId(node)} className="text-[1.1em] font-semibold text-claude-text tracking-tight mt-4 mb-2" {...props}>{children}</h3>
+        ),
+        h4: ({ node, children, ...props }: any) => <h4 data-reading-block={readingId(node)} {...props}>{children}</h4>,
+        h5: ({ node, children, ...props }: any) => <h5 data-reading-block={readingId(node)} {...props}>{children}</h5>,
+        h6: ({ node, children, ...props }: any) => <h6 data-reading-block={readingId(node)} {...props}>{children}</h6>,
         table: ({ children, ...props }: any) => (
           <div className="overflow-x-auto my-4 rounded-xl border border-claude-border">
             <table className="min-w-full" {...props}>{children}</table>
@@ -215,11 +224,11 @@ function AssistantMarkdown({
         thead: ({ children, ...props }: any) => (
           <thead className="bg-claude-surface" {...props}>{children}</thead>
         ),
-        th: ({ children, ...props }: any) => (
-          <th className="px-4 py-2 text-left text-[12px] font-semibold text-claude-secondary uppercase tracking-wider" {...props}>{children}</th>
+        th: ({ node, children, ...props }: any) => (
+          <th data-reading-block={readingId(node)} className="px-4 py-2 text-left text-[12px] font-semibold text-claude-secondary uppercase tracking-wider" {...props}>{children}</th>
         ),
-        td: ({ children, ...props }: any) => (
-          <td className="px-4 py-2 text-[14px] text-claude-text border-t border-claude-border/50" {...props}>{children}</td>
+        td: ({ node, children, ...props }: any) => (
+          <td data-reading-block={readingId(node)} className="px-4 py-2 text-[14px] text-claude-text border-t border-claude-border/50" {...props}>{children}</td>
         ),
       }}
     >
@@ -337,6 +346,7 @@ function AssistantFileCard({
   return (
     <div className="not-prose w-full max-w-[520px] sm:w-fit sm:min-w-[280px]">
       <button
+        data-reading-block={`assistant-file:${reference.ref_id}`}
         type="button"
         onClick={() => onOpen?.(file)}
         className="group flex min-h-[52px] w-full items-center gap-2.5 rounded-[10px] border border-transparent bg-claude-surface px-2.5 py-2 text-left transition-[background-color,border-color,transform] hover:border-claude-border hover:bg-claude-hover active:scale-[0.995] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/35"
@@ -440,7 +450,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
               })}
             </div>
           )}
-          <div className="text-[15px] text-claude-text leading-relaxed whitespace-pre-wrap break-words">
+          <div data-reading-block="user" className="text-[15px] text-claude-text leading-relaxed whitespace-pre-wrap break-words">
             {cleanContent}
           </div>
           {/* 附件展示 */}
@@ -449,6 +459,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
               {userAttachments.map((file, idx) => (
                 <button
                   key={`${file.path}-${idx}`}
+                  data-reading-block={`user-file:${file.path}`}
                   type="button"
                   onClick={() => onPreviewAttachment?.(toFileInfo(file, sessionId))}
                   className="group relative w-24 h-20 rounded-xl overflow-hidden border border-claude-border bg-white hover:border-claude-border-strong transition-colors"

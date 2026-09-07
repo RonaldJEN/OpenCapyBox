@@ -104,7 +104,7 @@ class CronJobRun(Base):
     claim_worker_id = Column(String(64), nullable=True, index=True)
     claim_lease_expires_at = Column(DateTime, nullable=True, index=True)
     heartbeat_at = Column(DateTime, nullable=True)
-    # Claim/dispatch 冻结的 OpenSandbox 实例。执行、被动文件请求和重启恢复
+    # preparing 恢复并续租成功后冻结的 OpenSandbox 实例。执行、被动文件请求和重启恢复
     # 只能连接这个 ID，不得用后来的用户绑定创建替代实例。
     sandbox_id = Column(String(100), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0)

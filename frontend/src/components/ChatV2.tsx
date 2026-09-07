@@ -53,6 +53,7 @@ import {
   messageTooLongText,
 } from '../utils/errorMessages';
 import { Round } from './Round';
+import { useChatReadingPosition } from './useChatReadingPosition';
 import { ArtifactsPanel, type ArtifactsPanelHandle } from './ArtifactsPanel';
 import { type SessionFileOwnerIdentity } from './FilePreview';
 import { ModelSelector } from './ModelSelector';
@@ -291,11 +292,9 @@ function ChatV2View(props: ChatV2Props) {
   const [previewContextNotice, setPreviewContextNotice] = useState('');
   const [uploadingDraftIds, setUploadingDraftIds] = useState<Set<string>>(new Set());
   const [isDragging, setIsDragging] = useState(false);
-  const [isAtBottom, setIsAtBottom] = useState(true);
-  const [showScrollButton, setShowScrollButton] = useState(false);
   const [stopping, setStopping] = useState(false);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContentRef = useRef<HTMLDivElement>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const chatPaneRef = useRef<HTMLDivElement>(null);
   const sessionFilesShellRef = useRef<HTMLDivElement>(null);
@@ -316,21 +315,16 @@ function ChatV2View(props: ChatV2Props) {
       (externalWorkspaceFilesHandleRef as { current: WorkspaceFilesPanelHandle | null }).current = handle;
     }
   }, [externalWorkspaceFilesHandleRef]);
-  const chatScrollTopBeforeFilesRef = useRef<Record<string, number>>({});
   const focusBeforeFilesRef = useRef<Record<string, HTMLElement | null>>({});
   const previousFilesStateRef = useRef({ sessionId, isOpen: false });
   const filePanelTargetNonceRef = useRef(0);
   const attachmentPreviewRequestIdRef = useRef(0);
   const assistantFileOpenRequestIdRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const prevRoundsLengthRef = useRef<number>(0);
-  const isInitialLoadRef = useRef<boolean>(true);
   const sessionIdRef = useRef(sessionId);
   const composerDraftsRef = useRef(composerDrafts);
   const uploadsInFlightRef = useRef(new Set<string>());
-  const roundElementRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const handledScrollTargetNonceRef = useRef<number | null>(null);
-  const suppressAutoScrollRef = useRef<boolean>(false);
   const pendingSendSessionKeysRef = useRef<Set<string>>(new Set());
   const resumeSaveBarrierPendingRef = useRef(false);
   const selectedModel = availableModels.find((m) => m.id === selectedModelId);
@@ -364,6 +358,13 @@ function ChatV2View(props: ChatV2Props) {
   const isFilesOpen = filesLayout !== 'closed';
   const isFilesExpanded = filesLayout === 'full';
   const chatInteractionHidden = isFilesExpanded;
+  const reading = useChatReadingPosition({
+    sessionId, containerRef: chatAreaRef, contentRef: messagesContentRef,
+    hidden: chatInteractionHidden, loading, hasContent: rounds.length > 0,
+    layoutKey: `${workspacePanelActive ? 'workspace' : 'session'}:${filesLayout}:${chatRatio}`,
+    contentVersion: rounds, scrollTarget,
+  });
+  const { showScrollButton, scrollToBottom } = reading;
   const lastRoundStatus = rounds[rounds.length - 1]?.status || 'empty';
   const filesRefreshNonce = `${rounds.length}:${lastRoundStatus}:${Number(sending)}:${Number(resuming)}`;
   const activeSlotSessionIdsRef = useRef(activeSlotSessionIds);
@@ -404,7 +405,6 @@ function ChatV2View(props: ChatV2Props) {
 
   useLayoutEffect(() => {
     if (!workspaceFileTarget || workspaceFilesState.layout !== 'closed') return;
-    chatScrollTopBeforeFilesRef.current[sessionId] = chatAreaRef.current?.scrollTop ?? 0;
     focusBeforeFilesRef.current[sessionId] = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
@@ -432,6 +432,7 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const setCurrentFilesLayout = (layout: SessionFilesLayout) => {
+    if (layout !== filesLayout) reading.beforeLayoutChange();
     if (workspacePanelActive) {
       setWorkspaceFilesState((current) => current.layout === layout ? current : { ...current, layout });
       return;
@@ -485,12 +486,12 @@ function ChatV2View(props: ChatV2Props) {
 
   const openFilesPanel = () => {
     if (!sessionId) return;
+    reading.beforeLayoutChange();
     if (workspacePanelActive) {
       saveWorkspaceFilesInBackground();
       onWorkspaceFilesClose?.();
     }
     if (sessionFilesState.layout === 'closed') {
-      chatScrollTopBeforeFilesRef.current[sessionId] = chatAreaRef.current?.scrollTop ?? 0;
       focusBeforeFilesRef.current[sessionId] = document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
@@ -519,6 +520,7 @@ function ChatV2View(props: ChatV2Props) {
 
   const closeFilesPanel = () => {
     if (workspacePanelActive) {
+      reading.beforeLayoutChange();
       saveWorkspaceFilesInBackground();
       finalizeWorkspacePanelClose();
       return;
@@ -541,7 +543,6 @@ function ChatV2View(props: ChatV2Props) {
       && !isFilesOpen
       && chatAreaRef.current
     ) {
-      chatAreaRef.current.scrollTop = chatScrollTopBeforeFilesRef.current[sessionId] ?? 0;
       const previousFocus = focusBeforeFilesRef.current[sessionId];
       const returnFocus = previousFocus?.isConnected
         ? previousFocus
@@ -559,6 +560,7 @@ function ChatV2View(props: ChatV2Props) {
   }, [chatInteractionHidden]);
 
   const handleFilesRatioChange = (ratio: number) => {
+    reading.beforeLayoutChange();
     if (ratio <= 0) {
       setCurrentFilesLayout('full');
       return;
@@ -789,21 +791,13 @@ function ChatV2View(props: ChatV2Props) {
       setIsDragging(false);
       setDisableInitialMotion(false);
       setHighlightedRoundId(null);
-      roundElementRefs.current = {};
-      isInitialLoadRef.current = true;
-      suppressAutoScrollRef.current = false;
       return;
     }
 
     setDisableInitialMotion(true);
-    isInitialLoadRef.current = true;
-    suppressAutoScrollRef.current = true;
-    roundElementRefs.current = {};
     setHighlightedRoundId(null);
     setFilePanelTarget(null);
     setPreviewContextNotice('');
-    setIsAtBottom(false);
-    prevRoundsLengthRef.current = 0;
     setLocalError('');
     setStopping(false);
     void loadSessionHistory(sessionId, {
@@ -840,30 +834,10 @@ function ChatV2View(props: ChatV2Props) {
     });
   }, [hasActiveSlot, hasLocalActiveTransport, loadSessionHistory, sessionId]);
 
-  useLayoutEffect(() => {
-    const container = chatAreaRef.current;
-    if (!isInitialLoadRef.current || !container || loading) return;
-    isInitialLoadRef.current = false;
-
-    const hasExplicitScrollTarget = scrollTarget?.sessionId === sessionId && Boolean(scrollTarget.roundId);
-    if (!hasExplicitScrollTarget) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
-    }
-
-    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-    const atBottom = !hasExplicitScrollTarget || distanceFromBottom < 100;
-    setIsAtBottom(atBottom);
-    setShowScrollButton(!atBottom);
-    suppressAutoScrollRef.current = false;
-    prevRoundsLengthRef.current = rounds.reduce((sum, round) => sum + 1 + round.steps.length, 0);
-  }, [loading, rounds, sessionId, scrollTarget?.roundId, scrollTarget?.sessionId]);
-
   useEffect(() => {
     if (!scrollTarget || scrollTarget.sessionId !== sessionId || loading) return;
     if (handledScrollTargetNonceRef.current === scrollTarget.nonce) return;
-    const target = roundElementRefs.current[scrollTarget.roundId];
-    if (!target) return;
-    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (!rounds.some((round) => round.round_id === scrollTarget.roundId)) return;
     handledScrollTargetNonceRef.current = scrollTarget.nonce;
     setHighlightedRoundId(scrollTarget.roundId);
     const timer = setTimeout(() => {
@@ -871,35 +845,6 @@ function ChatV2View(props: ChatV2Props) {
     }, 1800);
     return () => clearTimeout(timer);
   }, [scrollTarget, sessionId, loading, rounds]);
-
-  useEffect(() => {
-    if (suppressAutoScrollRef.current) return;
-    const currentLength = rounds.reduce((sum, round) => sum + 1 + round.steps.length, 0);
-    const hasNewContent = currentLength > prevRoundsLengthRef.current;
-    if (isAtBottom) {
-      messagesEndRef.current?.scrollIntoView({ behavior: hasNewContent ? 'smooth' : 'auto' });
-    }
-    prevRoundsLengthRef.current = currentLength;
-  }, [rounds, isAtBottom]);
-
-  useEffect(() => {
-    const container = chatAreaRef.current;
-    if (!container) return;
-    const handleScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = container;
-      const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-      const atBottom = distanceFromBottom < 100;
-      setIsAtBottom(atBottom);
-      setShowScrollButton(!atBottom);
-    };
-    container.addEventListener('scroll', handleScroll);
-    return () => container.removeEventListener('scroll', handleScroll);
-  }, [sessionId]);
-
-  const scrollToBottom = (force: boolean = false) => {
-    if (force) setIsAtBottom(true);
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
 
   const handleFileUpload = async (files: FileList | File[] | null) => {
     const capturedDraftId = currentMessageDraft.draftId;
@@ -1605,7 +1550,7 @@ function ChatV2View(props: ChatV2Props) {
           </div>
         </header>
 
-        <div ref={chatAreaRef} className="relative flex-1 overflow-y-auto bg-claude-bg">
+        <div ref={chatAreaRef} className="relative flex-1 overflow-y-auto bg-claude-bg" style={{ overflowAnchor: 'none' }}>
           {loading && rounds.length === 0 ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
@@ -1639,7 +1584,7 @@ function ChatV2View(props: ChatV2Props) {
               </div>
             </div>
           ) : (
-            <div data-testid="chat-message-column" className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6 md:px-8">
+            <div ref={messagesContentRef} data-testid="chat-message-column" className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6 md:px-8">
               {rounds.map((round, index) => {
                 const visibleUserAttachments = (round.user_attachments || []).filter((file) => (
                   file.source !== 'workspace' || !isWorkspaceEntryDeleted(file.entry_id)
@@ -1653,9 +1598,6 @@ function ChatV2View(props: ChatV2Props) {
                 return (
                   <div
                     key={round.round_id}
-                    ref={(el) => {
-                      roundElementRefs.current[round.round_id] = el;
-                    }}
                     data-round-id={round.round_id}
                     className={`scroll-mt-20 rounded-2xl transition-colors duration-300 ${
                       highlightedRoundId === round.round_id
@@ -1675,14 +1617,13 @@ function ChatV2View(props: ChatV2Props) {
                   </div>
                 );
               })}
-              <div ref={messagesEndRef} />
             </div>
           )}
 
           {showScrollButton && (
             <button
               type="button"
-              onClick={() => scrollToBottom(true)}
+              onClick={scrollToBottom}
               className={`fixed bottom-28 right-8 z-10 flex items-center gap-2 bg-white text-claude-text shadow-lg border border-claude-border transition-[transform,box-shadow] hover:scale-105 active:scale-95 ${
                 hasLiveReplyBelow ? 'live-reply-pill rounded-full px-3.5 py-2.5 ring-2 ring-claude-accent/25 shadow-xl' : 'rounded-full p-2.5'
               }`}
@@ -1816,6 +1757,9 @@ function ChatV2View(props: ChatV2Props) {
           containerRef={sessionFilesShellRef}
           chatRatio={filesLayout === 'full' ? 0 : filesLayout === 'closed' ? 100 : chatRatio}
           onRatioChange={handleFilesRatioChange}
+          onResizeStart={reading.beginResize}
+          onResizeFrame={reading.restore}
+          onResizeEnd={reading.endResize}
           onStartEdgeCollapse={onStartEdgeCollapseSidebar}
         />
       )}

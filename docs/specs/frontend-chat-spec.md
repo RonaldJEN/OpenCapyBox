@@ -304,11 +304,13 @@ pre_accept_pending
 
 | 场景 | 时机 | 实现 |
 |---|---|---|
-| 普通进入会话 | 历史渲染完成后、浏览器绘制前 | `useLayoutEffect` 同步 `messagesEndRef.scrollIntoView({ behavior: 'auto' })`，直接定位最新消息 |
-| 搜索命中进入 | `scrollTarget` 指向当前 session/round | 目标 round `scrollIntoView({ behavior: 'smooth', block: 'center' })` 并短暂高亮；不得先滚到底部 |
-| 流式新内容 | rounds/steps 数量变化 | 仅 `isAtBottom` 时 `scrollIntoView({ behavior: hasNewContent ? 'smooth' : 'auto' })` |
-| 用户滚动 | `scroll` 事件 | 更新 `isAtBottom` 与 `showScrollButton`（容差 100px），不记忆跨会话 `scrollTop` |
+| 普通进入会话 | 历史渲染完成后、浏览器绘制前 | 阅读位置管理器在 useLayoutEffect 内直接定位最新消息 |
+| 搜索命中进入 | `scrollTarget` 指向当前 session/round | 管理器平滑定位目标 round 中部并短暂高亮；不得先滚到底部 |
+| 流式新内容 | 正文渲染或几何尺寸变化 | 跟随底部时直接保持末尾；阅读模式保持同一可见字符，不反复启动平滑动画追赶 token |
+| 用户滚动 | 用户造成的 `scroll` 事件 | 以统一 2px 容差识别是否回到底部，否则捕获文字阅读锚点；程序恢复/平滑定位中间帧不改写用户意图 |
 | 底部按钮 | 用户离开底部 | 点击后平滑滚到底；若有回复正在生成，按钮显示 live reply 指示 |
+
+`useChatReadingPosition` 是聊天容器唯一滚动写入者，统一管理首次进入、显式定位、流式跟随、文件布局恢复及 ResizeObserver 通知。容器关闭浏览器原生 overflow anchoring，避免双重补偿；用户 wheel/pointer/键盘输入可中止程序平滑定位。位置恢复不使用 timeout 或多帧猜测布局稳定。full 的隐藏阅读书签按 Session 隔离，具体语义见 Session 文件 spec。平滑定位尊重 prefers-reduced-motion。
 
 **禁止**：
 - 普通进入会话时恢复上次浏览位置。用户点击历史会话的默认预期是看到最新状态；浏览器刷新后也必须保持同一语义。

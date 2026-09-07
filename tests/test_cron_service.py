@@ -740,7 +740,7 @@ class TestCronSandboxBinding:
         service.get_existing = AsyncMock(return_value=sandbox)
         service.renew = AsyncMock(return_value=True)
         service.get_sandbox_id.return_value = "sbx-frozen"
-        service.get_or_resume_and_renew = AsyncMock()
+        service.acquire_user_sandbox = AsyncMock()
 
         result = await _get_renewed_cron_sandbox(
             service,
@@ -749,14 +749,15 @@ class TestCronSandboxBinding:
         )
 
         assert result is sandbox
-        service.get_existing.assert_awaited_once_with("user-1", "sbx-frozen")
-        service.renew.assert_awaited_once_with("user-1")
-        service.get_or_resume_and_renew.assert_not_awaited()
+        service.get_existing.assert_awaited_once_with("user-1", "sbx-frozen", renew=True)
+        service.renew.assert_not_awaited()
+        service.get_sandbox_id.assert_not_called()
+        service.acquire_user_sandbox.assert_not_awaited()
 
     def test_dispatch_fence_rejects_sandbox_generation_swap(self):
         from src.api.services.cron_service import _set_run_sandbox_id
 
-        record = MagicMock(sandbox_id="sbx-frozen")
+        record = MagicMock(sandbox_id="sbx-frozen", phase="preparing")
         db = MagicMock()
         db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = record
         with patch("src.api.models.database.SessionLocal") as session_local:

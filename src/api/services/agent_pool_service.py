@@ -738,7 +738,8 @@ class AgentPoolService:
 
         # 創建/恢復用戶級沙箱，並在同一 user lifecycle lock 內持久化本次 sandbox.id。
         sandbox_service = get_sandbox_service()
-        sandbox, new_sandbox_id = await sandbox_service.get_or_resume_with_persisted_id(user_id, sandbox_id)
+        sandbox = await sandbox_service.acquire_user_sandbox(user_id)
+        new_sandbox_id = getattr(sandbox, "id", None)
 
         # 后续 Agent metadata / cache 绑定只使用本次返回对象的 sandbox.id，
         # 不再从 mutable sandbox_service cache 二次读取，避免并发初始化错绑。

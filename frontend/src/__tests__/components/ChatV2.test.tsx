@@ -344,7 +344,14 @@ describe('ChatV2 组件', () => {
   const defaultProps = makeChatV2DefaultProps();
 
   beforeEach(() => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(600);
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false })));
+    Element.prototype.scrollTo = vi.fn(function (this: Element, options?: ScrollToOptions | number) {
+      if (typeof options === 'object') this.scrollTop = options.top ?? this.scrollTop;
+      this.dispatchEvent(new Event('scroll'));
+    });
     workspacePreviewControls.dirty = false;
     workspacePreviewControls.save.mockReset().mockResolvedValue({ ok: true, stale: false });
     sessionFilesControls.dirty = false;
@@ -640,7 +647,15 @@ describe('ChatV2 组件', () => {
   });
 
   it('带 scrollTarget 时加载历史后应定位到对应 round', async () => {
-    render(
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(2000);
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(600);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const chat = this.closest('[data-testid="chat-pane"]')?.querySelector('.overflow-y-auto');
+      return this.hasAttribute('data-round-id')
+        ? new DOMRect(0, 700 - (chat?.scrollTop ?? 0), 500, 200)
+        : new DOMRect(0, 0, 500, 600);
+    });
+    const { container } = render(
       <ChatV2
         sessionId="test-session"
         {...defaultProps}
@@ -653,15 +668,14 @@ describe('ChatV2 组件', () => {
     });
 
     await waitFor(() => {
-      expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({
-        behavior: 'smooth',
-        block: 'center',
-      });
+      expect(container.querySelector('[data-testid="chat-pane"] > .overflow-y-auto')?.scrollTop).toBe(500);
     });
   });
 
   it('普通进入会话时应直接定位到底部', async () => {
-    render(
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(2000);
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(600);
+    const { container } = render(
       <ChatV2
         sessionId="test-session"
         {...defaultProps}
@@ -673,7 +687,7 @@ describe('ChatV2 组件', () => {
     });
 
     await waitFor(() => {
-      expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: 'auto' });
+      expect(container.querySelector('[data-testid="chat-pane"] > .overflow-y-auto')?.scrollTop).toBe(1400);
     });
   });
 
@@ -821,19 +835,23 @@ describe('ChatV2 组件', () => {
   });
 
   it('停在底部时流式文本更新应持续滚到底部', async () => {
+    let totalHeight = 2000;
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(() => totalHeight);
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(600);
     vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
       callbacks.onStreamAccepted?.();
       callbacks.onRunStarted?.('test-session', 'stream-round-1');
       callbacks.onTextMessageStart?.('msg-1', 'assistant');
       callbacks.onTextMessageContent?.('msg-1', '第一段');
       await Promise.resolve();
+      totalHeight = 2400;
       callbacks.onTextMessageContent?.('msg-1', '第一段第二段');
       await Promise.resolve();
       callbacks.onTextMessageEnd?.('msg-1');
       callbacks.onRunFinished?.('test-session', 'stream-round-1', { finalResponse: '第一段第二段' }, 'success');
     });
 
-    render(
+    const { container } = render(
       <ChatV2
         sessionId="test-session"
         {...defaultProps}
@@ -845,7 +863,7 @@ describe('ChatV2 组件', () => {
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
 
     await waitFor(() => {
-      expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: 'auto' });
+      expect(container.querySelector('[data-testid="chat-pane"] > .overflow-y-auto')?.scrollTop).toBe(1800);
     });
   });
 
@@ -872,13 +890,21 @@ describe('ChatV2 组件', () => {
     });
 
     const chatArea = container.querySelector('.overflow-y-auto.relative.bg-claude-bg') as HTMLDivElement;
-    Object.defineProperty(chatArea, 'scrollTop', { configurable: true, value: 200 });
+    Object.defineProperty(chatArea, 'scrollTop', { configurable: true, writable: true, value: 200 });
     Object.defineProperty(chatArea, 'scrollHeight', { configurable: true, value: 1200 });
     Object.defineProperty(chatArea, 'clientHeight', { configurable: true, value: 500 });
+    fireEvent.wheel(chatArea);
     fireEvent.scroll(chatArea);
 
     expect(await screen.findByText('新回复正在生成')).toBeInTheDocument();
     expect(screen.getByLabelText('新回复正在生成，回到底部')).toBeInTheDocument();
+    // A reply grows while the explicit smooth scroll is still heading to the OLD bottom.
+    Element.prototype.scrollTo = vi.fn((_options?: ScrollToOptions | number, _y?: number) => {});
+    fireEvent.click(screen.getByLabelText('新回复正在生成，回到底部'));
+    Object.defineProperty(chatArea, 'scrollHeight', { configurable: true, value: 1500 });
+    chatArea.scrollTop = 700;
+    fireEvent.scroll(chatArea);
+    expect(chatArea.scrollTop).toBe(1000);
   });
 
   it('查看文件应该进入分栏且保留聊天输入框', async () => {
@@ -917,7 +943,7 @@ describe('ChatV2 组件', () => {
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
   });
 
-  it('工作区文件开合应该恢复打开前的聊天滚动位置', async () => {
+  it('工作区文件关闭后保留打开期间手动滚动到的位置', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
       ok: true,
       text: async () => 'workspace note',
@@ -934,7 +960,12 @@ describe('ChatV2 组件', () => {
         <ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={null} />
       );
       const chatArea = container.querySelector('div[class*="overflow-y-auto"][class*="bg-claude-bg"]') as HTMLDivElement;
+      await screen.findByText('Round: round-1');
       Object.defineProperty(chatArea, 'scrollTop', { configurable: true, writable: true, value: 240 });
+      Object.defineProperty(chatArea, 'scrollHeight', { configurable: true, value: 3000 });
+      Object.defineProperty(chatArea, 'clientHeight', { configurable: true, value: 600 });
+      fireEvent.wheel(chatArea);
+      fireEvent.scroll(chatArea);
 
       rerender(
         <ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={workspaceTarget} />
@@ -942,14 +973,47 @@ describe('ChatV2 组件', () => {
       await waitFor(() => expect(screen.getByTestId('workspace-files-panel')).toBeInTheDocument());
       expect(chatArea.scrollTop).toBe(240);
 
+      chatArea.scrollTop = 720;
+      fireEvent.scroll(chatArea);
+
       rerender(
         <ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={null} />
       );
       await waitFor(() => expect(screen.queryByTestId('workspace-files-panel')).not.toBeInTheDocument());
-      expect(chatArea.scrollTop).toBe(240);
+      expect(chatArea.scrollTop).toBe(720);
     } finally {
       fetchSpy.mockRestore();
     }
+  });
+
+  it.each([false, true])('关闭文件保留最新阅读锚点，经过 full=%s', async (expand) => {
+    const { container } = render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    const round = await screen.findByText('Round: round-1');
+    const roundElement = round.closest('[data-round-id]') as HTMLElement;
+    const chatArea = container.querySelector('div[class*="overflow-y-auto"][class*="bg-claude-bg"]') as HTMLDivElement;
+    const shell = container.querySelector('.session-files-shell') as HTMLElement;
+    Object.defineProperties(chatArea, {
+      scrollTop: { configurable: true, writable: true, value: 240 },
+      scrollHeight: { configurable: true, value: 3000 },
+      clientHeight: { configurable: true, value: 600 },
+    });
+    vi.spyOn(chatArea, 'getBoundingClientRect').mockImplementation(() => new DOMRect(0, 50, 500, 600));
+    vi.spyOn(roundElement, 'getBoundingClientRect').mockImplementation(() => {
+      const contentTop = shell.dataset.layout === 'split' ? 850 : 500;
+      const top = 50 + contentTop - chatArea.scrollTop;
+      return new DOMRect(0, top, 500, 800);
+    });
+    fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
+    chatArea.scrollTop = 900;
+    fireEvent.scroll(chatArea);
+    if (expand) {
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle Expand' }));
+      chatArea.scrollTop = 0; // display:none must not replace the visible snapshot.
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Close Panel' }));
+    expect(shell).toHaveAttribute('data-layout', 'closed');
+    expect(chatArea.scrollTop).toBe(550);
+    expect(roundElement.getBoundingClientRect().top).toBe(0);
   });
 
   it('工作区整面板远端保存失败也立即关闭，草稿由后台队列继续同步', async () => {

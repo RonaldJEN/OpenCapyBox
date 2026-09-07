@@ -84,7 +84,7 @@ UniqueConstraint: (job_id, scheduled_at) — 跨 worker 去重的核心机制
 | phase | String(20) | queued/preparing/executing/publishing/terminal |
 | claim_token / claim_worker_id | String | nullable。执行所有权 fence |
 | claim_lease_expires_at / heartbeat_at | DateTime | nullable。可续租执行 lease |
-| sandbox_id | String(100) | nullable。claim/Agent dispatch 冻结的 OpenSandbox 实例 ID；内部执行身份，不对普通客户端暴露 |
+| sandbox_id | String(100) | nullable。preparing 阶段恢复并续租成功后、运行目录创建前冻结的 OpenSandbox 实例 ID；内部执行身份，不对普通客户端暴露 |
 | attempt_count | Integer | default=0。pre-start 重排也使用同一 run id |
 | error_code | String(80) | nullable。机器可读错误分类 |
 | output | Text | nullable |
@@ -222,13 +222,15 @@ All require Bearer auth.
 
 ### 执行流程
 
-1. Worker 对 queued run 行加锁，写 running/preparing、随机 claim_token、worker_id、lease 与 attempt_count，并把已有 `UserSandbox.sandbox_id` 冻结到 run
-2. 若 run 已有 `sandbox_id`，只能 `get_existing` 连接并续租该实例；实例不可恢复时本轮失败，禁止 `get_or_resume` 创建替代代际。首次尚无绑定时允许创建一次，但必须在 Agent dispatch 前受 claim fence 写回 `CronJobRun.sandbox_id`
+1. Worker 对 queued run 行加锁，写 running/preparing、随机 claim_token、worker_id、lease 与 attempt_count；首次 claim 不复制用户 Sandbox 绑定，重领任务保留原本已有的执行 ID。
+2. run 尚无 `sandbox_id` 时，与普通对话共用 `acquire_user_sandbox`：在用户生命周期锁内读取最新持久绑定，连接/恢复，确认永久失效后使用现有 CAS 重建，并续租返回的具体实例。用户绑定只由 Sandbox 服务持久化。然后在 claim 匹配、租约有效且 phase=preparing 时首次冻结 `CronJobRun.sandbox_id`，成功后才创建运行目录或初始化 Agent。若 run 已有 ID，只能 `get_existing(..., renew=True)` 连接并续租原实例；不可恢复则本轮失败，不替换代际。冻结可重复写入相同 ID，禁止换成不同 ID。
 3. Workspace = `{mount}/cron/runs/{run_id}`；普通产物仍写入此 scratch
 4. AgentService 始终暴露完整持久工作区工具，由任务 prompt 决定是否使用及操作目标；每次工作区工具调用都注入 `assert_cron_workspace_lease` fence
 5. phase 进入 executing，`Agent.run_agui` 执行；heartbeat 周期续租 claim
 6. phase 进入 publishing；扫描 scratch artifacts。Workspace 工具先在 run scratch 冻结 change set，再由统一发布入口校验 base/current version并自动三方合并；最终正式版本记入 `workspace_changes`，change set 只作内部审计/恢复
 7. 仅 claim_token 仍匹配的 worker 可写 terminal、清理 claim 并提交 output/artifacts/workspace_changes
+
+Sandbox 恢复期间 claim 已丢失时停止启动本轮，不撤销已成功提交的用户绑定、不销毁其他运行可复用的胜出实例。初始化的 Sandbox 异常保留结构化 `error_code`；公开 output 只记录用户可读的 message，内部日志按 run_id 关联并记录 code/message/sandbox_id/remote_state/stage，不把内部执行身份放进公开输出。区分终态、查询/连接/恢复/续租失败和 Profile 不匹配，不按错误文案决定重建。存量已经冻结的运行保持原执行 ID，不回填或重放历史失败任务。
 
 ### 记忆与配置文件边界
 
@@ -290,7 +292,7 @@ All require Bearer auth.
   - 多 worker：同一用户的不同作业也可以并行执行。
   - 同一作业（同 job_id 同分钟）在任何部署模式下都不会被并行触发（由 `cron_fires` 兜底）。
 - 影响范围与缓解：
-  - 用户沙箱：每条 claimed run 使用 durable `sandbox_id` 作为代际身份；后来的用户绑定或进程内 cache 不得替换正在执行的实例。Session 列表/预览/上传等被动请求发现 fresh Cron claim 时也只能连接该 run 的 frozen ID。
+  - 用户沙箱：每条 run 在恢复完成后冻结 durable `sandbox_id` 作为代际身份；后来的用户绑定或进程内 cache 不得替换正在执行的实例。Session 列表/预览/上传等被动请求发现 fresh Cron claim 时只能连接该 run 的 frozen ID；ID 尚未就绪时返回暂时不可用，禁止被动请求另建代际。
   - `cron_job_runs` 写入：每条记录有独立 `run_id`，不会互相覆盖。
   - 手动触发：`POST /jobs/{name}/run` 与同分钟自动调度可能并行执行同一作业；调用方需自行接受这种语义。
 - 如需重新引入严格全局串行：未来可在 `_run` 入口增加 DB 级 user lock（如 `INSERT INTO user_run_locks` 抢占），不在本期实现范围。
@@ -309,7 +311,7 @@ All require Bearer auth.
 
 - startup 与独立 reconciler 都只处理 lease 过期的 running run；新鲜 lease 属于其他存活 worker，不得修改。
 - `CronJobRun.id` 同时是内部 Cron Session.id；startup 在扫描孤儿 Round 前必须把 `status=running + claim_token 非空 + claim_lease_expires_at > now` 的 run id 加入 `protected_session_ids`，不能先误杀关联 Round 再对账 Cron lease。
-- `phase=preparing` 且存在旧 claim_token：尚未越过 Agent dispatch，可清 claim、恢复 queued，并使用同一 run_id 重新 claim。
+- `phase=preparing` 且存在旧 claim_token：尚未越过 Agent dispatch，可清 claim、恢复 queued，并使用同一 run_id 重新 claim。已有 `sandbox_id` 必须保留，重新领取时只能复用该实例；没有执行 ID 的任务才能重新解析用户绑定。
 - `phase=executing/publishing`，或没有 durable claim 的旧 running 行：可能已经产生副作用，必须收敛 `status=unknown`、`error_code=worker_lease_expired_after_start`，绝不自动重放。
 - startup 不再 blanket fail 所有 running Cron；rolling worker 启动不能误杀另一 worker 的新鲜执行。
 

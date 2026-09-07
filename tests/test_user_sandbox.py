@@ -564,8 +564,8 @@ class TestAgentPoolServiceUserSessions:
         fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-new")
 
         mock_sandbox_service = MagicMock()
-        mock_sandbox_service.get_or_resume_with_persisted_id = AsyncMock(
-            return_value=(fresh_sandbox, "sbx-new")
+        mock_sandbox_service.acquire_user_sandbox = AsyncMock(
+            return_value=fresh_sandbox
         )
 
         mock_db = MagicMock()
@@ -590,7 +590,7 @@ class TestAgentPoolServiceUserSessions:
         assert "session-old" not in pool._cache
         assert pool._cache["session-new"] is agent_instance
         assert pool._agent_sandbox_ids["session-new"] == "sbx-new"
-        mock_sandbox_service.get_or_resume_with_persisted_id.assert_awaited_once_with("user-1", "sbx-old")
+        mock_sandbox_service.acquire_user_sandbox.assert_awaited_once_with("user-1")
         sync_memory.assert_awaited_once_with(user_id="user-1", sandbox=fresh_sandbox)
         mock_db.query.assert_not_called()
         mock_db.commit.assert_not_called()
@@ -604,8 +604,8 @@ class TestAgentPoolServiceUserSessions:
         fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-returned")
 
         mock_sandbox_service = MagicMock()
-        mock_sandbox_service.get_or_resume_with_persisted_id = AsyncMock(
-            return_value=(fresh_sandbox, "sbx-returned")
+        mock_sandbox_service.acquire_user_sandbox = AsyncMock(
+            return_value=fresh_sandbox
         )
         mock_sandbox_service.get_sandbox_id.return_value = "sbx-wrong-cache"
 
@@ -638,8 +638,8 @@ class TestAgentPoolServiceUserSessions:
         fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-new")
 
         mock_sandbox_service = MagicMock()
-        mock_sandbox_service.get_or_resume_with_persisted_id = AsyncMock(
-            return_value=(fresh_sandbox, "sbx-new")
+        mock_sandbox_service.acquire_user_sandbox = AsyncMock(
+            return_value=fresh_sandbox
         )
 
         agent_instance = MagicMock()
@@ -680,8 +680,8 @@ class TestAgentPoolServiceUserSessions:
         fresh_sandbox = make_mock_sandbox(sandbox_id="sbx-new")
 
         mock_sandbox_service = MagicMock()
-        mock_sandbox_service.get_or_resume_with_persisted_id = AsyncMock(
-            return_value=(fresh_sandbox, "sbx-new")
+        mock_sandbox_service.acquire_user_sandbox = AsyncMock(
+            return_value=fresh_sandbox
         )
 
         agent_instance = MagicMock()

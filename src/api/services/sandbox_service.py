@@ -64,7 +64,22 @@ class SkillDiscoveryResult(list[dict[str, str]]):
         self.issues = normalize_skill_scan_issues(issues or [])
 
 
-class SandboxTemporarilyUnavailable(RuntimeError):
+class SandboxLifecycleError(RuntimeError):
+    """Safe lifecycle diagnostics shared by interactive and background callers."""
+
+    def __init__(
+        self, message: str, *, code: str = "sandbox_unavailable",
+        sandbox_id: str | None = None, remote_state: str | None = None,
+        stage: str = "resolve",
+    ):
+        super().__init__(message)
+        self.code = code
+        self.sandbox_id = sandbox_id
+        self.remote_state = remote_state
+        self.stage = stage
+
+
+class SandboxTemporarilyUnavailable(SandboxLifecycleError):
     """The persisted sandbox cannot be used safely at the moment."""
 
 
@@ -456,7 +471,9 @@ class SandboxSessionService:
                 return sandbox_id if isinstance(sandbox_id, str) and sandbox_id else None
         except Exception as exc:
             logger.warning("读取最新 sandbox 绑定失败 (user=%s)", user_id, exc_info=True)
-            raise SandboxTemporarilyUnavailable("沙箱绑定暂时无法确认") from exc
+            raise SandboxTemporarilyUnavailable(
+                "沙箱绑定暂时无法确认", code="sandbox_binding_read_failed", stage="bind",
+            ) from exc
 
     # ------------------------------------------------------------------
     # 核心生命週期方法
@@ -512,7 +529,7 @@ class SandboxSessionService:
 
         except Exception as e:
             logger.error("沙箱創建失敗 (user=%s): %s", user_id, e, exc_info=True)
-            raise RuntimeError(f"沙箱創建失敗: {e}") from e
+            raise SandboxLifecycleError("沙箱創建失敗", code="sandbox_create_failed", stage="create") from e
 
     async def _query_sandbox_state(
         self,
@@ -545,7 +562,15 @@ class SandboxSessionService:
             except Exception:
                 pass
             logger.warning("查詢沙箱狀態失敗 (sandbox_id=%s): %s", sandbox_id, e)
-            raise SandboxTemporarilyUnavailable("沙箱状态暂时无法确认") from e
+            status_code = getattr(e, "status_code", None)
+            code = (
+                "sandbox_auth_failed" if status_code in (401, 403)
+                else "sandbox_rate_limited" if status_code == 429
+                else "sandbox_state_query_failed"
+            )
+            raise SandboxTemporarilyUnavailable(
+                "沙箱状态暂时无法确认", code=code, sandbox_id=sandbox_id, stage="query",
+            ) from e
 
     async def get_or_resume(
         self, user_id: str, sandbox_id: str | None = None
@@ -554,40 +579,34 @@ class SandboxSessionService:
         async with self._get_lifecycle_lock(user_id):
             return await self._get_or_resume_unlocked(user_id, sandbox_id)
 
-    async def get_or_resume_and_renew(
-        self, user_id: str, sandbox_id: str | None = None
-    ) -> Sandbox:
-        """獲取並續租同一沙箱，失敗恢復全程持有用戶生命週期鎖。"""
-        async with self._get_lifecycle_lock(user_id):
-            sandbox = await self._get_or_resume_unlocked(user_id, sandbox_id)
-            if await self._renew_instance(user_id, sandbox):
-                return sandbox
-
-            logger.warning(
-                "沙箱續租失敗，清理快取後重新獲取 "
-                "(user=%s, sandbox_id=%s)",
-                user_id,
-                self._sandbox_id_from_instance(sandbox) or sandbox_id,
-            )
-            retry_sandbox_id = self._sandbox_id_from_instance(sandbox) or sandbox_id
-            if self._cache.get(user_id) is sandbox:
-                self.invalidate_cache(user_id)
-
-            sandbox = await self._get_or_resume_unlocked(user_id, retry_sandbox_id)
-            if not await self._renew_instance(user_id, sandbox):
-                raise RuntimeError("沙箱續租失敗，無法安全開始任務")
-            return sandbox
-
     async def get_existing(
-        self, user_id: str, sandbox_id: str
+        self, user_id: str, sandbox_id: str, *, renew: bool = False,
     ) -> Sandbox:
         """Connect or resume an existing sandbox without creating a replacement."""
         async with self._get_lifecycle_lock(user_id):
-            return await self._get_or_resume_unlocked(
+            sandbox = await self._get_or_resume_unlocked(
                 user_id,
                 sandbox_id,
                 create_if_missing=False,
             )
+            if renew:
+                await self._require_instance_renewal(user_id, sandbox)
+            return sandbox
+
+    async def _require_instance_renewal(self, user_id: str, sandbox: Sandbox) -> None:
+        if not await self._renew_instance(user_id, sandbox):
+            raise SandboxTemporarilyUnavailable(
+                "沙箱续租暂时失败", code="sandbox_renew_failed",
+                sandbox_id=self._sandbox_id_from_instance(sandbox), stage="renew",
+            )
+
+    async def acquire_user_sandbox(self, user_id: str) -> Sandbox:
+        """Resolve the latest user binding and renew that exact instance for a new run."""
+        async with self._get_lifecycle_lock(user_id):
+            sandbox_id = self._read_persisted_sandbox_id(user_id)
+            sandbox, _ = await self._get_or_resume_with_persisted_id_unlocked(user_id, sandbox_id)
+            await self._require_instance_renewal(user_id, sandbox)
+            return sandbox
 
     async def recover_persisted_sandbox(
         self, user_id: str, sandbox_id: str
@@ -611,39 +630,40 @@ class SandboxSessionService:
         避免拿到 sandbox 後再讀 mutable cache 造成錯綁。
         """
         async with self._get_lifecycle_lock(user_id):
-            sandbox = await self._get_or_resume_unlocked(user_id, sandbox_id)
-            current_sandbox_id = self._sandbox_id_from_instance(sandbox)
-            runtime_config = self.get_cached_runtime_config(user_id) or self._resolve_runtime_config(user_id)
-            if current_sandbox_id and not sandbox_id:
-                try:
-                    bound_sandbox_id = self._upsert_user_sandbox_id(
-                        user_id,
-                        current_sandbox_id,
-                        runtime_config=runtime_config,
-                    )
-                except Exception:
-                    if self._cache.get(user_id) is sandbox:
-                        self.invalidate_cache(user_id)
-                    await self._destroy_container_preserve_storage(sandbox)
-                    raise
+            return await self._get_or_resume_with_persisted_id_unlocked(user_id, sandbox_id)
 
-                if bound_sandbox_id != current_sandbox_id:
-                    if self._cache.get(user_id) is sandbox:
-                        self.invalidate_cache(user_id)
-                    await self._destroy_container_preserve_storage(sandbox)
-                    sandbox = await self._get_or_resume_unlocked(
-                        user_id,
-                        bound_sandbox_id,
-                        create_if_missing=False,
-                    )
-                    current_sandbox_id = self._sandbox_id_from_instance(sandbox)
-                    runtime_config = (
-                        self.get_cached_runtime_config(user_id)
-                        or self._resolve_runtime_config(user_id)
-                    )
-            if current_sandbox_id:
-                self._store_cache(user_id, sandbox, runtime_config)
-            return sandbox, current_sandbox_id
+    async def _get_or_resume_with_persisted_id_unlocked(
+        self, user_id: str, sandbox_id: str | None,
+    ) -> tuple[Sandbox, str | None]:
+        sandbox = await self._get_or_resume_unlocked(user_id, sandbox_id)
+        current_sandbox_id = self._sandbox_id_from_instance(sandbox)
+        runtime_config = self.get_cached_runtime_config(user_id) or self._resolve_runtime_config(user_id)
+        if current_sandbox_id and not sandbox_id:
+            try:
+                bound_sandbox_id = self._upsert_user_sandbox_id(
+                    user_id, current_sandbox_id, runtime_config=runtime_config,
+                )
+            except Exception as exc:
+                if self._cache.get(user_id) is sandbox:
+                    self.invalidate_cache(user_id)
+                await self._destroy_container_preserve_storage(sandbox)
+                raise SandboxTemporarilyUnavailable(
+                    "沙箱绑定更新暂时失败", code="sandbox_binding_update_failed",
+                    sandbox_id=current_sandbox_id, stage="bind",
+                ) from exc
+
+            if bound_sandbox_id != current_sandbox_id:
+                if self._cache.get(user_id) is sandbox:
+                    self.invalidate_cache(user_id)
+                await self._destroy_container_preserve_storage(sandbox)
+                sandbox = await self._get_or_resume_unlocked(
+                    user_id, bound_sandbox_id, create_if_missing=False,
+                )
+                current_sandbox_id = self._sandbox_id_from_instance(sandbox)
+                runtime_config = self.get_cached_runtime_config(user_id) or self._resolve_runtime_config(user_id)
+        if current_sandbox_id:
+            self._store_cache(user_id, sandbox, runtime_config)
+        return sandbox, current_sandbox_id
 
     async def _get_or_resume_unlocked(
         self,
@@ -682,7 +702,7 @@ class SandboxSessionService:
             )
             if not matching_live_cache and profile_compatibility == ProfileCompatibility.STALE_BINDING:
                 if not create_if_missing:
-                    raise RuntimeError("既有沙箱绑定已更新")
+                    raise SandboxLifecycleError("既有沙箱绑定已更新", code="sandbox_binding_changed", sandbox_id=sandbox_id)
                 winner_id = self._read_persisted_sandbox_id(user_id)
                 if not winner_id or winner_id == sandbox_id:
                     raise SandboxTemporarilyUnavailable("沙箱绑定正在变化")
@@ -699,10 +719,13 @@ class SandboxSessionService:
                     create_if_missing=False,
                 )
             if not matching_live_cache and profile_compatibility == ProfileCompatibility.UNKNOWN:
-                raise SandboxTemporarilyUnavailable("既有沙箱 Profile 暂时无法确认")
+                raise SandboxTemporarilyUnavailable(
+                    "既有沙箱 Profile 暂时无法确认", code="sandbox_profile_unknown",
+                    sandbox_id=sandbox_id, stage="profile",
+                )
             if not matching_live_cache and profile_compatibility == ProfileCompatibility.MISMATCH:
                 if not create_if_missing:
-                    raise RuntimeError("既有沙箱 profile 指纹不匹配")
+                    raise SandboxLifecycleError("既有沙箱 profile 指纹不匹配", code="sandbox_profile_mismatch", sandbox_id=sandbox_id, stage="profile")
                 logger.warning(
                     "持久化 sandbox profile 指纹已过期，重建 sandbox "
                     "(user=%s, sandbox_id=%s, current_profile=%s/%s)",
@@ -776,7 +799,7 @@ class SandboxSessionService:
                         "沙箱連接失敗 (user=%s, sandbox_id=%s): %s",
                         user_id, sandbox_id, e,
                     )
-                    raise SandboxTemporarilyUnavailable("沙箱连接暂时失败") from e
+                    raise SandboxTemporarilyUnavailable("沙箱连接暂时失败", code="sandbox_connect_failed", sandbox_id=sandbox_id, remote_state=sandbox_state, stage="connect") from e
 
             if sandbox_state == "paused":
                 try:
@@ -794,11 +817,11 @@ class SandboxSessionService:
                         "沙箱恢復失敗 (user=%s, sandbox_id=%s): %s",
                         user_id, sandbox_id, e,
                     )
-                    raise SandboxTemporarilyUnavailable("沙箱恢复暂时失败") from e
+                    raise SandboxTemporarilyUnavailable("沙箱恢复暂时失败", code="sandbox_resume_failed", sandbox_id=sandbox_id, remote_state=sandbox_state, stage="resume") from e
 
             if sandbox_state in _TERMINAL_SANDBOX_STATES:
                 if not create_if_missing:
-                    raise RuntimeError("既有沙箱不可用")
+                    raise SandboxLifecycleError("既有沙箱不可用", code=f"sandbox_{sandbox_state}", sandbox_id=sandbox_id, remote_state=sandbox_state)
                 return await self._rebuild_sandbox_unlocked(
                     user_id,
                     sandbox_id,
@@ -808,14 +831,14 @@ class SandboxSessionService:
 
             if sandbox_state in _TRANSITIONAL_SANDBOX_STATES:
                 raise SandboxTemporarilyUnavailable(
-                    f"沙箱正在执行过渡操作: {sandbox_state}"
+                    f"沙箱正在执行过渡操作: {sandbox_state}", code="sandbox_transitioning", sandbox_id=sandbox_id, remote_state=sandbox_state,
                 )
             raise SandboxTemporarilyUnavailable(
-                f"无法安全处理沙箱状态: {sandbox_state or 'unknown'}"
+                f"无法安全处理沙箱状态: {sandbox_state or 'unknown'}", code="sandbox_state_unknown", sandbox_id=sandbox_id, remote_state=sandbox_state,
             )
 
         if not create_if_missing:
-            raise RuntimeError("既有沙箱不可用")
+            raise SandboxLifecycleError("既有沙箱不可用", code="sandbox_binding_missing")
         return await self.create(user_id)
 
     async def _rebuild_sandbox_unlocked(
@@ -827,7 +850,12 @@ class SandboxSessionService:
         reason: str,
     ) -> Sandbox:
         """Create a candidate and bind it with an old-id compare-and-swap."""
-        candidate = await self._create_candidate(user_id, runtime_config)
+        try:
+            candidate = await self._create_candidate(user_id, runtime_config)
+        except SandboxLifecycleError as exc:
+            exc.sandbox_id = previous_id
+            exc.remote_state = reason.removeprefix("state_") if reason.startswith("state_") else None
+            raise
         candidate_id = self._sandbox_id_from_instance(candidate)
         if not candidate_id:
             await self._destroy_container_preserve_storage(candidate)
@@ -934,7 +962,10 @@ class SandboxSessionService:
                     new_sandbox_id,
                     exc_info=True,
                 )
-                raise SandboxTemporarilyUnavailable("沙箱绑定更新暂时失败") from exc
+                raise SandboxTemporarilyUnavailable(
+                    "沙箱绑定更新暂时失败", code="sandbox_binding_update_failed",
+                    sandbox_id=previous_id, stage="bind",
+                ) from exc
 
     @staticmethod
     def _upsert_user_sandbox_id(
@@ -957,7 +988,7 @@ class SandboxSessionService:
 
         with SessionLocal() as db:
             try:
-                user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+                user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).with_for_update().first()
                 if user_sandbox:
                     if user_sandbox.sandbox_id and user_sandbox.sandbox_id != sandbox_id:
                         db.rollback()
@@ -995,7 +1026,7 @@ class SandboxSessionService:
                     db.commit()
                 except IntegrityError:
                     db.rollback()
-                    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
+                    user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).with_for_update().first()
                     if not user_sandbox:
                         raise
                     if user_sandbox.sandbox_id and user_sandbox.sandbox_id != sandbox_id:

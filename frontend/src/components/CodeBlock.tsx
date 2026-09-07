@@ -7,9 +7,10 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 interface CodeBlockProps {
   language: string;
   value: string;
+  readingBlockId?: string;
 }
 
-export function CodeBlock({ language, value }: CodeBlockProps) {
+export function CodeBlock({ language, value, readingBlockId }: CodeBlockProps) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = () => {
@@ -36,7 +37,7 @@ export function CodeBlock({ language, value }: CodeBlockProps) {
       </div>
 
       {/* Code Container */}
-      <div className="text-sm font-mono overflow-auto select-text cursor-text">
+      <div data-reading-block={readingBlockId} className="text-sm font-mono overflow-auto select-text cursor-text">
         <SyntaxHighlighter
           language={language || 'text'}
           style={vscDarkPlus}

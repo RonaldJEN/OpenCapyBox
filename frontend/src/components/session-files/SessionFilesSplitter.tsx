@@ -5,6 +5,9 @@ interface SessionFilesSplitterProps {
   chatRatio: number;
   onRatioChange: (ratio: number) => void;
   onStartEdgeCollapse?: () => void;
+  onResizeStart?: () => void;
+  onResizeFrame?: () => void;
+  onResizeEnd?: () => void;
 }
 
 const MIN_CHAT_RATIO = 0;
@@ -20,6 +23,9 @@ export function SessionFilesSplitter({
   chatRatio,
   onRatioChange,
   onStartEdgeCollapse,
+  onResizeStart,
+  onResizeFrame,
+  onResizeEnd,
 }: SessionFilesSplitterProps) {
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -27,6 +33,7 @@ export function SessionFilesSplitter({
     const bounds = container?.getBoundingClientRect();
     if (!container || !bounds?.width) return;
     event.preventDefault();
+    onResizeStart?.();
     const separator = event.currentTarget;
     separator.setPointerCapture?.(event.pointerId);
     const startsAtLeftEdge = chatRatio <= MIN_CHAT_RATIO;
@@ -45,6 +52,7 @@ export function SessionFilesSplitter({
       renderedRatio = pendingRatio;
       pendingRatio = null;
       container.style.setProperty(CHAT_RATIO_CSS_PROPERTY, `${renderedRatio}%`);
+      onResizeFrame?.();
     };
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
@@ -91,6 +99,7 @@ export function SessionFilesSplitter({
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', finish);
       window.removeEventListener('pointercancel', finish);
+      onResizeEnd?.();
     };
 
     window.addEventListener('pointermove', handlePointerMove);
