@@ -24,6 +24,31 @@
   - `summary`: 用户总数、管理员数、session/round 概览、cron 概览、LLM 调用与 token、平均完成延迟
   - `trends`: 最近 N 天的 `rounds/tokens` 趋势
 
+### GET /api/admin/usage-report
+
+- 管理台新增「使用报表」，独立加载；只允许管理员访问。读取审计动作 `usage_report.read`（L1）。
+- Query：`start_date/end_date`（北京时间自然日，必须同时提供或同时省略）、`as_of`（可选、带时区的查询截止时间）、`view=accounts|models|details`、`sort_by`（当前维度的列字段白名单）、`direction=asc|desc`、`page>=1`、`page_size=1..100`（默认20）、`account_filter/model_filter`（最长100字符，仅明细生效，按名称或标识不区分大小写的子串匹配）。
+- 缺省最近7个自然日，含今天；快捷选项另含最近30天。自定义范围最多366天（含起止日），不允许未来日期。自然日边界采用 `[开始日00:00, 截止日次日00:00)`，转换到现有数据库配置本地时区后查询，不将现有 naive 本地时间误当UTC。
+- 查询时聚合已落库数据；不引入 T+1 任务或日汇总表。响应 `period={start_date,end_date,as_of,timezone}`、`note`、`summary`、`view/sort_by/direction/account_filter/model_filter/page/page_size/total/rows`。页面显示成功结果的日期和查询截止时间（北京时间）。
+- 统计事实源为 `llm_call_records`，关联 `sessions.user_id` 归属账号、`sessions.model_id -> llm_models.display_name` 归属模型；模型配置缺失时保留模型标识，无标识时显示「未配置模型」。主Agent、子Agent、压缩、Cron的已落库调用均纳入，不按 `call_kind` 过滤。
+- 调用次数为记录数，不等同于用户提问次数或上游重试请求数；错误调用沿用 `response_error IS NOT NULL`。有至少1条调用即活跃，包括全部失败；期间去重，不累加每日活跃人数。
+- `summary.open_accounts` 为当前启用账号数；`active_accounts` 为其中期间有调用的账号数；`unused_accounts=open_accounts-active_accounts`。历史授权不回溯。账号列表含所有当前启用账号，以及期间有调用的停用/已不存在账号；后者保留标识并标注状态。总调用与Token包含后者，不能因停用而丢失用量。
+- `models.active_accounts` 为该模型期间内所有有调用的去重账号（含停用账号），页面明确提示与顶部当前启用账号人数的范围区别。
+- 指标 `calls/error_calls/input_tokens/output_tokens/total_tokens/missing_usage_calls`：三个Token字段分别求和，不自行用输入+输出替代总Token；失败但含usage也计入。任一Token字段为空即计入不完整条数；页面和Excel注明已记录用量及不完整条数。
+- `accounts` 另含 `user_id/account/enabled/model_count/share/usage_status`；`models` 另含 `model_id/model/active_accounts/share`；`details` 另含 `user_id/account/enabled/model_id/model/first_call_at/last_call_at`。首次/末次时间仅取期间内调用，输出带北京时间偏移的ISO时间。
+- 完全无调用时：当前启用账号仍显示，账号及明细以零值/「无使用记录」保留，模型列表为空；总Token分母为0时 `share=null`，页面显示「—」。占比分母始终为完整期间总Token，不随明细筛选改变。
+- 默认总Token降序，排序并列以账号标识/模型标识稳定排序；分页越界收敛到末页。数据库仅读取账号×模型聚合结果和账号名册，后端对聚合结果派生三个维度并排序分页，不加载调用原文。
+- 翻页、排序、切换维度和导出复用上次成功结果的 `as_of`，排除截止后新调用；手动查询/刷新更新截止点。此截止点不是不可变快照：账号状态、会话模型配置变化及会话硬删除仍可改变历史结果，不承诺独立计量账本能力。
+- 请求竞态：新查询取消旧请求，迟到结果不能覆盖新结果；失败保留旧结果及其日期/筛选标签。自定义输入未提交时不改变结果标题，导出始终使用下方成功查询的日期。
+
+### GET /api/admin/usage-report/export
+
+- 必填 `start_date/end_date`，可选 `as_of`；复用查询服务与统计口径，不接受分页或明细局部筛选。按钮明确「导出完整报表」。
+- 后端生成 `.xlsx`，三个Sheet固定为「汇总」（期间总览+账号列表）、「模型汇总」、「账号×模型明细」；含期间、截止时间、口径、不完整usage条数。数值保持数字类型，占比使用百分比格式，首次/末次时间使用北京时间Excel日期类型。账号、模型等文本固定为字符串，避免公式执行。
+- 文件名 `OpenCapyBox使用数据报表_yyyyMMdd_yyyyMMdd.xlsx`，通过 UTF-8 `Content-Disposition` 返回，`Cache-Control: no-store`。
+- 导出动作 `usage_report.export`（L2），复用管理员后端鉴权与审计，元数据只记录导出行数，不记录账号列表或搜索词。审计失败遵循既有503契约。
+- 前端60秒超时，导出期间按钮禁用，失败提示并恢复。页面与导出均无成本金额、趋势图或自定义维度。
+
 ### GET /api/admin/rounds-tree
 
 - Query: `limit`、`offset`、`status`、`user_id`、`search`。`status` 允许 `all` 及完整 Round 状态：`running`、`waiting_interaction`、`completed`、`failed`、`cancelled`、`max_steps_reached`。
@@ -256,6 +281,7 @@
 稳定动作编码按模块分组：
 
 - 概览与系统：`overview.read`、`system.read`。
+- 使用报表：`usage_report.read`、`usage_report.export`。
 - Session/Step：`session.list`、`session.search`、`session.view`、`step.view`、`step.review.update`。
 - 用户：`user.list`、`user.login_history.view`、`user.create`、`user.enabled.update`、`user.admin.update`、`user.token_limits.update`、`user.model_groups.update`、`user.password.reset`、`user.delete`、`user.export`。
 - 沙箱：`sandbox.list`、`sandbox.create`、`sandbox.update`、`sandbox.default.set`、`sandbox.enabled.update`、`user.sandbox.update`。
@@ -266,8 +292,8 @@
 审计等级固定按动作编码派生，不写入业务正文或新增可变等级字段：
 
 - L0 常规读取：`overview.read`、`system.read`、`sandbox.list`、`model.list`、`model_group.list`、`mcp.list`、`tool_permission.list`。成功或失败均不写入操作审计表。
-- L1 敏感查阅：`session.list`、`session.search`、`session.view`、`user.list`、`user.login_history.view`、`audit_log.list`、`mcp.personal_network_policy.list`。
-- L2 管理操作：除 L0、L1、L3 外的创建、更新、删除、重置、导出和外联测试动作，包括 `step.review.update` 与 `mcp.test`。
+- L1 敏感查阅：`session.list`、`session.search`、`session.view`、`user.list`、`user.login_history.view`、`audit_log.list`、`mcp.personal_network_policy.list`、`usage_report.read`。
+- L2 管理操作：除 L0、L1、L3 外的创建、更新、删除、重置、导出和外联测试动作，包括 `step.review.update`、`mcp.test` 与 `usage_report.export`。
 - L3 高危：仅 `step.view`，表示后端向管理员披露了用户会话步骤原文。
 
 查询接口的兼容风险字段由上述等级派生：`high` 仅匹配 L3 的 `step.view`，`normal` 匹配其他已存操作日志。`/rounds-tree` 的普通列表与带非空 `search` 的查询分别在业务执行前确定为 L1 `session.list` 与 `session.search`。

@@ -51,6 +51,7 @@ L0_ACTIONS = frozenset(
 )
 L1_ACTIONS = frozenset(
     {
+        "usage_report.read",
         "audit_log.list",
         "session.list",
         "session.search",
@@ -62,6 +63,7 @@ L1_ACTIONS = frozenset(
 )
 L2_ACTIONS = frozenset(
     {
+        "usage_report.export",
         "step.review.update",
         "user.create",
         "user.enabled.update",

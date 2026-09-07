@@ -1296,6 +1296,30 @@ describe('chatRuntimeReducer', () => {
     expect(state.sessions['sess-a'].rounds[0].user_attachments).toEqual([]);
   });
 
+  it('projects live PRESENTED Session files without a legacy snapshot', () => {
+    const reference = {
+      ref_id: 'session:sess-a:temp-r1:report',
+      source: 'session' as const,
+      session_id: 'sess-a',
+      name: '发言稿.docx',
+      path: '发言稿.docx',
+      size: 11740,
+      modified: '2026-09-07T00:00:00Z',
+      type: 'docx',
+      revision: 'v1:11740:100',
+      operation: 'PRESENTED',
+    };
+    const state = stream(startRun(), {
+      type: 'CUSTOM',
+      name: 'assistant_file_referenced',
+      value: reference,
+    });
+
+    expect(state.sessions['sess-a'].rounds[0].assistant_file_references).toEqual([
+      expect.objectContaining(reference),
+    ]);
+  });
+
   it('projects only structured file identities and applies deletion tombstones', () => {
     let state = startRun();
     state = stream(state, {

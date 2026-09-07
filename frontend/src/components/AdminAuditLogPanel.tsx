@@ -49,6 +49,8 @@ const ACTION_LABELS: Record<string, string> = {
   'step.view': '查看会话步骤原文',
   'step.review.update': '更新步骤审阅',
   'user.list': '查看用户列表',
+  'usage_report.read': '查看使用报表',
+  'usage_report.export': '导出使用报表',
   'user.login_history.view': '查看用户登录历史',
   'user.create': '创建用户',
   'user.enabled.update': '更新用户启用状态',
@@ -99,6 +101,7 @@ const TARGET_TYPE_LABELS: Record<string, string> = {
   mcp: 'MCP',
   tool_permission: '工具权限',
   audit_log: '操作日志',
+  usage_report: '使用报表',
 };
 
 type AdminAuditDisplayCategory =
@@ -121,6 +124,8 @@ const ACTION_CATEGORIES: Record<string, AdminAuditDisplayCategory> = {
   'session.search': 'session-access',
   'session.view': 'session-access',
   'user.list': 'user-access',
+  'usage_report.read': 'user-access',
+  'usage_report.export': 'export',
   'user.login_history.view': 'user-access',
   'audit_log.list': 'audit-access',
   'step.view': 'high',

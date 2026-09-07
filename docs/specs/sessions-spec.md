@@ -173,6 +173,7 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 - 可预览类型：text/\*、image/\*、PDF、JSON、XML
 - `render=pdf`：仅接受 DOC/DOCX/PPT/PPTX。在**用户 OpenSandbox 内**以单一进程完成源文件的 50 MiB 有界快照、SHA-256 与复制，API 主机不得读取或执行不可信 Office 内容；随后在沙箱内调用 LibreOffice。派生 PDF 缓存在 session 根目录下的隐藏 `.opencapybox-preview/{content_hash}/`，不得出现在文件列表中，并随 session 删除。
 - `.assistant-artifacts/{round}/...` 仅承载 `present_files` 迁移前已经持久化的旧 Session 助手引用，不再为新引用创建。history 可原样返回旧引用的 `snapshot_path`；当前文件缺失时，旧卡片仍可只读回退到生成时快照，且不得据此创建或恢复当前文件。新 `present_files` 引用只记录当前 Session 路径，不复制正文；文件被覆盖后打开最新内容，被删除后提示不可用。隐藏目录不参与普通枚举，既有快照可使用 immutable cache header，并随 Session 删除。
+- 实时 `assistant_file_referenced` 与 history 加载均须接受不含 `snapshot_path` 的合法 Session `PRESENTED` 引用；实时接收后即进入 Round 的 `assistant_file_references`，无需刷新。`snapshot_path` 仅作为旧快照引用的可选字段保留。
 - 派生预览以文件内容 hash + 扩展名 + renderer 版本为缓存键；同内容重复预览直接复用 PDF。
 - 相同内容通过沙箱内原子目录锁收敛为一次转换；每请求使用唯一 scratch/LibreOffice profile，先验证临时 PDF 的 `%PDF-` magic 与大小，再原子发布，禁止命中 partial cache。
 - 请求取消或 shell/SDK 超时不得再次取消 `.incoming-*` 与 LibreOffice profile 的清理；清理和锁释放完成后才能传播取消。每次 Office 快照还必须在同一隐藏缓存根下删除严格匹配 `.incoming-<32位小写十六进制>` 且超过 300 秒的中断残留，不跟随 symlink、不触碰内容 hash 缓存目录或当前请求 scratch。

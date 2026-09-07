@@ -24,7 +24,7 @@ from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.round import Round
 from src.api.models.session import Session
 from src.api.routes import admin_operation_logs
-from src.api.routes import admin, admin_mcp, admin_permissions
+from src.api.routes import admin, admin_mcp, admin_permissions, admin_usage
 from src.api.services.admin_operation_audit import (
     AdminAuditRoute,
     HIGH_RISK_ACTIONS,
@@ -903,6 +903,7 @@ def test_mcp_personal_network_policy_read_is_audited_as_l1(audit_db):
 def test_every_admin_route_declares_audit_action_and_admin_dependency():
     routers = (
         admin.router,
+        admin_usage.router,
         admin_mcp.router,
         admin_permissions.router,
         admin_operation_logs.router,
@@ -924,6 +925,8 @@ def test_every_admin_route_declares_audit_action_and_admin_dependency():
             assert get_current_admin_user in dependency_calls, route.path
     assert checked > 0
     expected_actions = {
+        "usage_report.read",
+        "usage_report.export",
         "overview.read",
         "system.read",
         "session.list",
@@ -980,6 +983,7 @@ def test_every_admin_route_declares_audit_action_and_admin_dependency():
     )
     assert HIGH_RISK_ACTIONS == L3_ACTIONS == {"step.view"}
     assert L1_ACTIONS == {
+        "usage_report.read",
         "audit_log.list",
         "session.list",
         "session.search",

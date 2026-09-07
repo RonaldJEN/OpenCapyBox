@@ -42,6 +42,13 @@ def _validate_target(owner_kind: str, relative_path: str) -> str:
         and parts[2] == ".workspace-snapshots"
         and _UUID.fullmatch(parts[3])
         and re.fullmatch(r"[0-9a-f]{32}", parts[4])
+    ) or (
+        owner_kind == "workspace_stage_incoming"
+        and re.fullmatch(r"\.incoming-[0-9a-f]{32}", parts[-1])
+        and (
+            (len(parts) >= 3 and parts[0] == "sessions" and _UUID.fullmatch(parts[1]))
+            or (len(parts) >= 4 and parts[:2] == ["cron", "runs"] and _UUID.fullmatch(parts[2]))
+        )
     )
     if not valid:
         raise ValueError("Sandbox cleanup target is outside a platform-owned scope")

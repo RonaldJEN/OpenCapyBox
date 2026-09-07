@@ -9226,6 +9226,22 @@ class WorkspaceService:
                         incoming_path,
                         exc_info=True,
                     )
+                    from src.api.services.sandbox_cleanup_service import enqueue_cleanup
+
+                    try:
+                        with self._independent_db_session_factory()() as cleanup_db:
+                            enqueue_cleanup(
+                                cleanup_db,
+                                user_id=user_id,
+                                owner_kind="workspace_stage_incoming",
+                                owner_id=incoming_name,
+                                sandbox_id=str(store.sandbox.id),
+                                mount_path=mount_path,
+                                relative_path=posixpath.join(root_relative, incoming_path),
+                            )
+                            cleanup_db.commit()
+                    except Exception:
+                        logger.exception("文件夹 stage incoming 清理重试入队失败 path=%s", incoming_path)
             self._release_unattached_claims(leases)
         manifest_sha256 = hashlib.sha256(
             json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

@@ -32,6 +32,7 @@ dependencies = [
     "psycopg2-binary>=2.9.0",
     "python-dotenv>=1.0.0",
     "python-multipart>=0.0.6",
+    "openpyxl>=3.1.5,<4.0.0",
     # Sandbox
     "opensandbox>=0.1.0",
     # Scheduler (Linux/Vixie 5-field Cron semantics)

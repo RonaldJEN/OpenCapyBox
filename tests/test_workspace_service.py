@@ -2005,15 +2005,30 @@ async def test_stage_directory_preserves_one_directory_snapshot_with_empty_and_n
 
 
 @pytest.mark.asyncio
-async def test_stage_directory_failure_cleans_incoming_without_final_name(workspace_db):
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("run_root", [
+    "sessions/11111111-1111-1111-1111-111111111111",
+    "cron/runs/22222222-2222-2222-2222-222222222222",
+])
+async def test_stage_directory_failure_cleans_incoming_without_final_name(workspace_db, cleanup_fails, run_root):
+    from src.api.models.sandbox_cleanup import SandboxCleanupJob
+    from src.api.services.sandbox_cleanup_service import _validate_target
+
     class FailingStageStore(FakeStore):
         async def copy_to_external_atomic(self, **kwargs):
             if kwargs["source_relative_path"].endswith("facts.csv"):
                 raise WorkspaceError(503, "IO_ERROR", "copy failed")
             return await super().copy_to_external_atomic(**kwargs)
 
+        async def cleanup_external_incoming_directory(self, **kwargs):
+            if cleanup_fails:
+                raise WorkspaceError(503, "IO_ERROR", "cleanup unavailable")
+            return await super().cleanup_external_incoming_directory(**kwargs)
+
     db, workspace = workspace_db
+    SandboxCleanupJob.__table__.create(db.get_bind())
     store = FailingStageStore()
+    store.sandbox.id = "original-stage-sandbox"
     service = ServiceUnderTest(db, workspace, store)
     folder = await service.create_directory("user-1", None, "research")
     await service.upload_file(
@@ -2028,12 +2043,27 @@ async def test_stage_directory_failure_cleans_incoming_without_final_name(worksp
             "user-1",
             folder.entry.entry_id,
             expected_revision=folder.entry.revision,
-            destination_root="/home/user/sessions/session-1",
+            destination_root=f"/home/user/{run_root}",
         )
 
     assert failed.value.code == "IO_ERROR"
+    assert failed.value.message == "copy failed"
     assert store.external == {}
-    assert store.external_directories == set()
+    jobs = db.query(SandboxCleanupJob).all()
+    if cleanup_fails:
+        assert len(jobs) == len(store.external_directories) == 1
+        root, incoming = next(iter(store.external_directories))
+        job = jobs[0]
+        assert job.state == "queued" and job.owner_kind == "workspace_stage_incoming"
+        assert job.sandbox_id == "original-stage-sandbox"
+        assert job.mount_path == "/home/user"
+        assert f"{job.mount_path}/{job.relative_path}" == f"{root}/{incoming}"
+        assert job.owner_id == incoming.rsplit("/", 1)[-1]
+        with pytest.raises(ValueError):
+            _validate_target(job.owner_kind, job.relative_path.rsplit("/", 1)[0] + "/research")
+    else:
+        assert jobs == [] and store.external_directories == set()
+    assert db.query(WorkspaceClaim).filter_by(state="active").count() == 0
 
 
 def test_non_empty_workspace_blocks_profile_switch(workspace_db):

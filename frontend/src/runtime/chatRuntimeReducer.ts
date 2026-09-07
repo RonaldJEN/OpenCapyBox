@@ -217,12 +217,13 @@ function normalizeAssistantFileReference(value: unknown): AssistantFileReference
   };
   if (source === 'session') {
     if (typeof item.session_id !== 'string' || !item.session_id) return null;
-    if (typeof item.snapshot_path !== 'string' || !item.snapshot_path) return null;
     return {
       ...common,
       source,
       session_id: item.session_id,
-      snapshot_path: item.snapshot_path,
+      snapshot_path: typeof item.snapshot_path === 'string' && item.snapshot_path
+        ? item.snapshot_path
+        : undefined,
     };
   }
   if (typeof item.entry_id !== 'string' || !item.entry_id) return null;

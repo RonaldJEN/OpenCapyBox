@@ -76,8 +76,9 @@ import './AdminConsole.css';
 const LazyAdminMcpCatalogPanel = lazy(() => import('./AdminMcpCatalogPanel'));
 const LazyAdminToolPermissionsPanel = lazy(() => import('./AdminToolPermissionsPanel'));
 const LazyAdminAuditLogPanel = lazy(() => import('./AdminAuditLogPanel'));
+const LazyAdminUsageReportPanel = lazy(() => import('./AdminUsageReportPanel'));
 
-type AdminTab = 'overview' | 'rounds' | 'users' | 'sandboxes' | 'models' | 'mcp' | 'permissions' | 'audit' | 'system';
+type AdminTab = 'overview' | 'usage' | 'rounds' | 'users' | 'sandboxes' | 'models' | 'mcp' | 'permissions' | 'audit' | 'system';
 type UserCreateMode = 'simple' | 'ldap';
 type UserStatusFilter = 'all' | 'enabled' | 'disabled';
 type UserRoleFilter = 'all' | 'admin' | 'user';
@@ -108,6 +109,7 @@ interface UserCreateFormValues {
 
 const NAV_ITEMS: Array<{ id: AdminTab; label: string; icon: ComponentType<{ size?: string | number }> }> = [
   { id: 'overview', label: '概览', icon: LayoutDashboard },
+  { id: 'usage', label: '使用报表', icon: BarChart3 },
   { id: 'rounds', label: 'Session监控', icon: BarChart3 },
   { id: 'users', label: '用户管理', icon: Users },
   { id: 'sandboxes', label: '沙箱管理', icon: Server },
@@ -455,6 +457,7 @@ function downloadBlob(filename: string, blob: Blob) {
 }
 
 export default function AdminConsole() {
+  const [usageRefreshToken, setUsageRefreshToken] = useState(0);
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
   const [loading, setLoading] = useState(false);
@@ -900,8 +903,9 @@ export default function AdminConsole() {
   const refreshActiveTab = useCallback(async () => {
     // The audit panel owns its filters and cursor. Let it load on mount, and
     // refresh it through a token so the global spinner does not unmount it.
-    if (activeTab === 'audit') {
+    if (activeTab === 'audit' || activeTab === 'usage') {
       setError('');
+      setLoading(false);
       return;
     }
     setLoading(true);
@@ -955,6 +959,10 @@ export default function AdminConsole() {
   }, [activeTab, overviewDays, roundPage, roundPageSize, debouncedRoundSearch, roundStatus]);
 
   const handleRefreshClick = useCallback(() => {
+    if (activeTab === 'usage') {
+      setUsageRefreshToken((prev) => prev + 1);
+      return;
+    }
     if (activeTab === 'audit') {
       setAuditRefreshToken((prev) => prev + 1);
       return;
@@ -1042,6 +1050,11 @@ export default function AdminConsole() {
         </div>
 
         <div className="admin-content">
+          {activeTab === 'usage' ? (
+            <Suspense fallback={<div className="admin-loading">正在加载使用报表...</div>}>
+              <LazyAdminUsageReportPanel refreshToken={usageRefreshToken} />
+            </Suspense>
+          ) : null}
           {error ? (
             <FeedbackMessage
               className="admin-error"

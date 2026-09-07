@@ -11,6 +11,7 @@ from src.api.routes import auth, sessions, chat, models
 from src.api.routes import cron as cron_routes
 from src.api.routes import config as config_routes
 from src.api.routes import admin as admin_routes
+from src.api.routes import admin_usage as admin_usage_routes
 from src.api.routes import admin_operation_logs as admin_operation_log_routes
 from src.api.routes import admin_mcp as admin_mcp_routes
 from src.api.routes import mcp as mcp_routes
@@ -472,6 +473,7 @@ app.include_router(models.router, prefix=f"{settings.api_prefix}/models", tags=[
 app.include_router(cron_routes.router, prefix=f"{settings.api_prefix}/cron", tags=["定时任务"])
 app.include_router(config_routes.router, prefix=f"{settings.api_prefix}/config", tags=["配置管理"])
 app.include_router(admin_routes.router, prefix=f"{settings.api_prefix}/admin", tags=["管理后台"])
+app.include_router(admin_usage_routes.router, prefix=f"{settings.api_prefix}/admin", tags=["管理后台使用报表"])
 app.include_router(
     admin_operation_log_routes.router,
     prefix=f"{settings.api_prefix}/admin",

@@ -2,6 +2,51 @@ import { apiService } from './api';
 
 const client = apiService.getAxiosClient();
 
+export type UsageReportView = 'accounts' | 'models' | 'details';
+export interface UsageReportParams {
+  start_date?: string;
+  end_date?: string;
+  as_of?: string;
+  view?: UsageReportView;
+  sort_by?: string;
+  direction?: 'asc' | 'desc';
+  account_filter?: string;
+  model_filter?: string;
+  page?: number;
+  page_size?: number;
+}
+export interface UsageReportPeriod {
+  start_date: string;
+  end_date: string;
+  as_of: string;
+  timezone: string;
+}
+export interface UsageReportData {
+  period: UsageReportPeriod;
+  note: string;
+  summary: Record<string, number>;
+  view: UsageReportView;
+  sort_by: string;
+  direction: 'asc' | 'desc';
+  account_filter: string;
+  model_filter: string;
+  page: number;
+  page_size: number;
+  total: number;
+  rows: Array<Record<string, string | number | boolean | null>>;
+}
+export async function getAdminUsageReport(params: UsageReportParams, signal?: AbortSignal): Promise<UsageReportData> {
+  const response = await client.get('/admin/usage-report', { params, signal, timeout: 60000 });
+  return response.data;
+}
+export async function exportAdminUsageReport(period: UsageReportPeriod): Promise<Blob> {
+  const { start_date, end_date, as_of } = period;
+  const response = await client.get('/admin/usage-report/export', {
+    params: { start_date, end_date, as_of }, responseType: 'blob', timeout: 60000,
+  });
+  return response.data;
+}
+
 export interface AdminOverview {
   window_days: number;
   summary: {
