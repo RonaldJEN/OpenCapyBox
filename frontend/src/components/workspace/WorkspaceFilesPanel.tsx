@@ -228,6 +228,14 @@ export const WorkspaceFilesPanel = forwardRef<WorkspaceFilesPanelHandle, {
     finalizeCloseTab(entryId);
   };
 
+  const requestCloseAllFiles = () => {
+    void saveMatchingDirty(() => true);
+    openFilesRef.current = [];
+    setOpenFiles([]);
+    setActiveId(null);
+    onClose();
+  };
+
   if (!isOpen) return null;
   const activeFile = openFiles.find((entry) => entry.entry_id === activeId) || null;
   return (
@@ -249,7 +257,7 @@ export const WorkspaceFilesPanel = forwardRef<WorkspaceFilesPanelHandle, {
           })}
         </div>
         {showExpandToggle && <SessionFilesExpandButton expanded={isExpanded} onToggle={onToggleExpanded} />}
-        <button type="button" onClick={onClose} className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45" aria-label="收起工作区文件" title="收起工作区文件"><X size={15} /></button>
+        <button type="button" onClick={requestCloseAllFiles} className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45" aria-label="关闭所有文件" title="关闭所有文件"><X size={15} /></button>
       </div>
       <div className="min-h-0 flex-1">
         {activeFile ? openFiles.map((entry) => {

@@ -34,6 +34,7 @@ from src.api.services.history_service import HistoryService
 from src.api.services.agent_service import AgentService
 from src.api.services.workspace_service import WorkspaceService
 from src.api.services.session_file_edit_service import SessionFileEditService
+from src.api.services.session_directory_download import create_directory_zip_response, normalize_archive_path
 from src.api.services.spreadsheet_edit_validation import (
     validate_csv_edit_payload,
     validate_xlsx_edit_payload,
@@ -457,7 +458,6 @@ def _upsert_user_sandbox(db: DBSession, user_id: str, sandbox_service) -> None:
                 user_sandbox.active_profile_id = runtime_config.profile_id
                 user_sandbox.active_profile_version = runtime_config.profile_version
             user_sandbox.status = "active"
-            db.commit()
     else:
         user_sandbox = UserSandbox(
             id=str(uuid.uuid4()),
@@ -468,7 +468,8 @@ def _upsert_user_sandbox(db: DBSession, user_id: str, sandbox_service) -> None:
             status="active",
         )
         db.add(user_sandbox)
-        db.commit()
+    # 查询也会开启事务；绑定未变化时同样释放连接，避免后续 Sandbox I/O 占用连接池。
+    db.commit()
 
 
 async def _ensure_sandbox(
@@ -1085,6 +1086,33 @@ async def get_session_files(
         except Exception as retry_error:
             logger.warning("重連後仍無法獲取文件列表: %s", retry_error)
             raise HTTPException(status_code=503, detail="无法读取会话文件") from retry_error
+
+
+@router.get("/{chat_session_id}/files-archive")
+async def download_session_directory(
+    chat_session_id: str,
+    path: str = Query("", description="待打包目录的 Session 相对路径，空表示根目录"),
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    session = db.query(Session).filter(Session.id == chat_session_id, Session.user_id == user_id).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+    relative = normalize_archive_path(path)
+    service = get_sandbox_service()
+    root = f"{service.get_mount_path(user_id)}/sessions/{chat_session_id}"
+    filename = (posixpath.basename(relative) or "会话文件") + ".zip"
+    try:
+        # Freeze the owning Sandbox and release the DB connection before packing.
+        sandbox = await _ensure_sandbox(service, user_id, db)
+        return await create_directory_zip_response(
+            sandbox, root=root, path=relative, disposition=encode_filename_header(filename),
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.warning("Session directory download failed: %s", error)
+        raise HTTPException(503, "文件夹打包失败，请稍后重试") from error
 
 
 @router.put("/{chat_session_id}/files/{file_path:path}", response_model=FileInfo)

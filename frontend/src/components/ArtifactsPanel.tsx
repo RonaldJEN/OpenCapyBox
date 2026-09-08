@@ -151,6 +151,9 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
   const [items, setItems] = useState<FileInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
+  const [directoryDownloads, setDirectoryDownloads] = useState<Record<string, { path: string; pending: boolean; error?: string }>>({});
+  const directoryDownload = directoryDownloads[sessionId];
+  const directoryDownloadInFlightRef = useRef(new Set<string>());
   const [sessionStates, setSessionStates] = useState<Record<string, SessionPanelState>>({});
   const [dirtyPaths, setDirtyPaths] = useState<Record<string, boolean>>({});
   const directoryRequestSeqRef = useRef(0);
@@ -561,13 +564,25 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
     });
   };
 
-  const requestPanelClose = () => {
+  const requestPanelClose = (closeAllTabs = false) => {
     const prefix = ownerKey(ownerIdentity);
     for (const [key, handle] of previewHandlesRef.current.entries()) {
       if (!key.startsWith(prefix) || !handle.isDirty(ownerIdentity)) continue;
       void handle.saveDirty(ownerIdentity).catch((error) => {
         console.error('Failed to sync Session draft in background:', error);
       });
+    }
+    if (closeAllTabs) {
+      pendingFocusPathRef.current = null;
+      updateSessionState((current) => ({
+        ...current,
+        openTabs: [],
+        activePath: null,
+        lastTriggerPath: '',
+      }));
+      setDirtyPaths((current) => Object.fromEntries(
+        Object.entries(current).filter(([key]) => !key.startsWith(prefix)),
+      ));
     }
     onClose();
   };
@@ -600,6 +615,26 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
     }
   };
 
+  const handleDirectoryDownload = async (path: string) => {
+    if (directoryDownloadInFlightRef.current.has(sessionId)) return;
+    directoryDownloadInFlightRef.current.add(sessionId);
+    setDirectoryDownloads((current) => ({ ...current, [sessionId]: { path, pending: true } }));
+    try {
+      await apiService.downloadDirectory(sessionId, path);
+      clearDirectoryDownload();
+    } catch (error) {
+      setDirectoryDownloads((current) => ({ ...current, [sessionId]: { path, pending: false, error: error instanceof Error ? error.message : '文件夹下载失败，请重试' } }));
+    } finally {
+      directoryDownloadInFlightRef.current.delete(sessionId);
+    }
+  };
+
+  const clearDirectoryDownload = () => setDirectoryDownloads((current) => {
+    const next = { ...current };
+    delete next[sessionId];
+    return next;
+  });
+  const currentDownload = directoryDownload;
   const shortSessionId = sessionId.length > 12
     ? `${sessionId.substring(0, 8)}...`
     : sessionId;
@@ -729,18 +764,20 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
           {variant === 'workspace' && onToggleExpanded && (
             <SessionFilesExpandButton expanded={isExpanded} onToggle={onToggleExpanded} />
           )}
+          {!activeFile && <button type="button" onClick={() => void handleDirectoryDownload(currentPath)} disabled={directoryDownload?.pending || loading || Boolean(loadError)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45 disabled:opacity-40" title="下载当前文件夹（ZIP）" aria-label="下载当前文件夹（ZIP）"><Download size={15} aria-hidden="true" /></button>}
           <button
             type="button"
-            onClick={requestPanelClose}
+            onClick={() => requestPanelClose(true)}
             className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45"
-            aria-label="收起文件"
-            title="收起文件"
+            aria-label="关闭所有文件"
+            title="关闭所有文件"
           >
             <X size={15} aria-hidden="true" />
           </button>
         </div>
       </div>
 
+      {currentDownload && <div className="flex items-center gap-2 border-b border-claude-border px-3 py-2 text-xs text-claude-secondary" role={currentDownload.pending ? 'status' : 'alert'}>{currentDownload.pending && <Loader2 size={13} className="shrink-0 animate-spin" aria-hidden="true" />}<span className="min-w-0 flex-1 break-words">{currentDownload.pending ? `正在打包并下载：${currentDownload.path.split('/').pop() || '会话文件'}` : currentDownload.error}</span>{!currentDownload.pending && <><button type="button" className="shrink-0 rounded px-2 py-1 hover:bg-claude-hover" onClick={() => void handleDirectoryDownload(currentDownload.path)}>重试</button><button type="button" aria-label="关闭下载错误" className="shrink-0 rounded p-1 hover:bg-claude-hover" onClick={clearDirectoryDownload}><X size={13} /></button></>}</div>}
       <div
         className={`${activeFile ? 'hidden' : 'flex'} min-h-0 flex-1 flex-col`}
         aria-hidden={Boolean(activeFile)}
@@ -859,19 +896,23 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
                       </div>
                     </div>
 
-                    {!item.is_directory && (
-                      <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                    <div className="flex shrink-0 items-center opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
                         <button
                           type="button"
-                          onClick={(event) => void handleDownload(item, event)}
+                          onClick={(event) => {
+                            if (item.is_directory) {
+                              event.stopPropagation();
+                              void handleDirectoryDownload(item.path);
+                            } else void handleDownload(item, event);
+                          }}
+                          disabled={item.is_directory && directoryDownload?.pending}
                           className="rounded-lg p-1.5 text-claude-muted transition-colors hover:bg-claude-surface hover:text-claude-text"
-                          title={`下载 ${item.name}`}
-                          aria-label={`下载 ${item.name}`}
+                          title={`下载 ${item.name}${item.is_directory ? '（ZIP）' : ''}`}
+                          aria-label={`下载 ${item.name}${item.is_directory ? '（ZIP）' : ''}`}
                         >
                           <Download size={13} aria-hidden="true" />
                         </button>
                       </div>
-                    )}
                   </div>
                 );
               })
@@ -954,7 +995,7 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
     <>
       <div
         className={`fixed inset-0 z-20 bg-black/10 transition-opacity duration-200 ${isOpen ? 'opacity-100' : 'opacity-0'}`}
-        onClick={requestPanelClose}
+        onClick={() => requestPanelClose()}
         onTransitionEnd={() => {
           if (!isOpen) setIsMounted(false);
         }}

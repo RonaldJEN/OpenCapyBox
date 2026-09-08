@@ -1028,7 +1028,7 @@ describe('ChatV2 组件', () => {
     const { rerender } = render(<ChatV2 sessionId="test-session" {...defaultProps} workspaceFileTarget={workspaceTarget} onWorkspaceFilesClose={onWorkspaceFilesClose} />);
     await waitFor(() => expect(screen.getByTestId('workspace-files-panel')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: '收起工作区文件' }));
+    fireEvent.click(screen.getByRole('button', { name: '关闭所有文件' }));
     await waitFor(() => expect(workspacePreviewControls.save).toHaveBeenCalledTimes(1));
     expect(onWorkspaceFilesClose).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();

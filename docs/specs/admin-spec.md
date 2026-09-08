@@ -2,6 +2,7 @@
 
 ## 1. 模块职责边界
 
+- 当前 Session 监控暂时停用：前端菜单与列表加载代码、后端四个监控接口的路由注册均已注释，原实现保留。`GET /api/admin/rounds-tree`、`GET /api/admin/sessions/{session_id}/rounds`、`GET /api/admin/llm-call-records/{llm_record_id}`、`PUT /api/admin/llm-call-records/{llm_record_id}/review` 不再注册，直接请求返回 404；下文对应契约作为恢复参考保留。概览、使用报表、用户管理与系统监控不受影响。
 - 为管理员提供跨用户的全局运维视图。
 - 提供概览、Session 监控、用户管理、沙箱管理、模型目录/权限、操作日志、系统监控等聚合与管理接口。
 - 不负责业务执行（不创建会话、不驱动对话执行）；配置与账号类写操作仅改变管理事实源。

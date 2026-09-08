@@ -333,14 +333,17 @@ describe('AdminConsole 组件', () => {
     });
   });
 
-  it('导航中应显示 Session监控 文案', async () => {
+  it('Session监控停用后应隐藏入口且不请求监控数据', async () => {
     render(<AdminConsole />);
 
     await waitFor(() => {
       expect(getAdminOverview).toHaveBeenCalled();
     });
 
-    expect(screen.getByRole('button', { name: /Session监控/ })).toBeInTheDocument();
+    // expect(screen.getByRole('button', { name: /Session监控/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Session监控/ })).not.toBeInTheDocument();
+    expect(getAdminRoundsTree).not.toHaveBeenCalled();
+    expect(getAdminSessionRounds).not.toHaveBeenCalled();
   });
 
   it('官方 MCP 导航应懒加载独立目录面板', async () => {
@@ -442,7 +445,8 @@ describe('AdminConsole 组件', () => {
     expect(mockNavigate).toHaveBeenCalledWith('/');
   });
 
-  it('Session监控分页应按 offset/limit 请求下一页', async () => {
+  // Session 监控暂时停用，保留恢复后的交互测试。
+  it.skip('Session监控分页应按 offset/limit 请求下一页', async () => {
     vi.mocked(getAdminRoundsTree)
       .mockResolvedValueOnce({
         total_sessions: 45,
@@ -488,7 +492,8 @@ describe('AdminConsole 组件', () => {
     });
   });
 
-  it('Session监控应提供完整 Round 状态筛选并支持 waiting_interaction', async () => {
+  // Session 监控暂时停用，保留恢复后的交互测试。
+  it.skip('Session监控应提供完整 Round 状态筛选并支持 waiting_interaction', async () => {
     render(<AdminConsole />);
 
     await waitFor(() => {
@@ -519,7 +524,8 @@ describe('AdminConsole 组件', () => {
     });
   });
 
-  it('展开 Session 时才懒加载 Round 明细', async () => {
+  // Session 监控暂时停用，保留恢复后的交互测试。
+  it.skip('展开 Session 时才懒加载 Round 明细', async () => {
     vi.mocked(getAdminRoundsTree).mockResolvedValue({
       total_sessions: 1,
       offset: 0,
@@ -595,7 +601,8 @@ describe('AdminConsole 组件', () => {
     expect(await screen.findByText('懒加载问题')).toBeInTheDocument();
   });
 
-  it('step详情可展开并可将审阅状态改为有问题', async () => {
+  // Session 监控暂时停用，保留恢复后的交互测试。
+  it.skip('step详情可展开并可将审阅状态改为有问题', async () => {
     vi.mocked(getAdminRoundsTree).mockResolvedValue({
       total_sessions: 1,
       offset: 0,
@@ -720,7 +727,8 @@ describe('AdminConsole 组件', () => {
     });
   });
 
-  it('Session监控应区分主Agent和子Agent Round', async () => {
+  // Session 监控暂时停用，保留恢复后的交互测试。
+  it.skip('Session监控应区分主Agent和子Agent Round', async () => {
     vi.mocked(getAdminRoundsTree).mockResolvedValue({
       total_sessions: 1,
       offset: 0,
@@ -1202,7 +1210,8 @@ describe('AdminConsole 组件', () => {
     expect(screen.getByRole('button', { name: '删除 admin' })).toBeDisabled();
   });
 
-  it('step详情字段为对象时不应白屏', async () => {
+  // Session 监控暂时停用，保留恢复后的交互测试。
+  it.skip('step详情字段为对象时不应白屏', async () => {
     vi.mocked(getAdminRoundsTree).mockResolvedValue({
       total_sessions: 1,
       offset: 0,
@@ -1307,7 +1316,8 @@ describe('AdminConsole 组件', () => {
     });
   });
 
-  it('审阅写回接口返回404时应仅提示失败并保持下拉可用', async () => {
+  // Session 监控暂时停用，保留恢复后的交互测试。
+  it.skip('审阅写回接口返回404时应仅提示失败并保持下拉可用', async () => {
     vi.mocked(getAdminRoundsTree).mockResolvedValue({
       total_sessions: 1,
       offset: 0,

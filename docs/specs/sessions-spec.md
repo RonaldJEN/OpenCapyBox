@@ -159,8 +159,17 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 - `modified` 为带显式时区偏移的 ISO 8601 时间字符串，当前统一返回 UTC（如 `2026-05-08T02:30:00+00:00`）。
 - 只有成功枚举出的零项才返回 `200 + files=[]`；沙箱连接、目录命令或 JSON 解析失败会强制重连一次，仍失败返回 503，不得伪装成空目录。
 - 列表/预览/下载/上传都是被动 Sandbox consumer：请求先在 DB 中冻结本次访问的 owner 绑定并释放请求连接，再执行 Sandbox 网络 I/O。存在新鲜 Agent `UserRunLock` 或 Cron claim 时，只允许 `get_existing` 连接 owner 已冻结的 `sandbox_id`；绑定尚未冻结、互相冲突或实例不可恢复时返回 503，禁止 `get_or_resume` 创建替代实例或改写 `UserSandbox`。同一请求的重试必须复用首次冻结的绑定。
+- 无活动 owner 的冷缓存重连在核对/持久化 `UserSandbox` 后必须结束短事务，包括 Sandbox ID 与 Profile 均未变化的分支；`_ensure_sandbox` 返回后不得继续占用请求 DB 连接等待目录读取、预览或 ZIP 打包/下载。
 - Error 404, 403（"路径越界"）, 409（沙箱 Profile 配置冲突，如绑定后端不存在/禁用）, 503（沙箱或目录读取不可用）
 - 目录枚举统一在用户沙箱内执行 Python `os.listdir/stat`，不依赖 proxy 模式下会丢 query 参数的 `files.search`
+
+### GET /api/sessions/{id}/files-archive
+
+- Query: `path: str = ""`，仅接受当前 Session 的相对目录，空值表示根目录；先校验会话归属，冻结 Sandbox 绑定并释放 DB 连接，再执行打包。
+- ZIP 在该 Sandbox 的独立 `/tmp/ocb-directory-zip-<uuid>/archive.zip` 中生成，接口按 64 KiB 块流式返回，API 进程不聚合整个 ZIP。中文下载名称使用现有 RFC 5987 编码；包内以选中目录名（根目录用“会话文件”）为顶层，保留子目录、中文文件名、空目录和普通隐藏文件。
+- 排除明确的内部/依赖目录：`.opencapybox`、`.opencapybox-edit`、`.opencapybox-preview`、`.workspace-snapshots`、`.workspace-change-sets`、`.assistant-artifacts`、`.git`、`.venv`、`__pycache__`、`node_modules`、`skills`，以及 `.agent_memory.json`；不按点号前缀一律排除文件。直接请求内部目录或 `..`/绝对路径返回 403。
+- 源路径逐层使用 dirfd + `O_NOFOLLOW` 打开，遍历不跟随符号链接，跳过链接与非普通文件/目录；不得读取选中目录外的链接目标。检测到读取中的文件/目录变化时整包失败，请用户重试，不提供已知不完整的 ZIP；不承诺并发写入下整个目录的原子快照。
+- 打包限时 120 秒，超时返回 504；普通不存在返回 404，路径含链接或不可访问条目返回 403，内容变化返回 409，Sandbox 不可用返回 503。打包失败、请求取消、传输结束或中断都清理本次临时 ZIP；取消时先等待正在进行的打包命令退出再清理，禁止留下迟到输出。下载响应显式持有并关闭 Sandbox 的底层 HTTP 响应，包含尚未发送响应体就失败的情况；不能仅关闭字节迭代器，也不能关闭共享 SDK 客户端。清理失败记录 warning，不触碰源目录，不创建文件条目或后台任务。
 
 ### GET /api/sessions/{id}/files/{path:path}
 

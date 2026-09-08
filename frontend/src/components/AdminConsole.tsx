@@ -37,7 +37,7 @@ import {
   exportAdminUsers,
   getAdminLLMCallRecordDetail,
   getAdminOverview,
-  getAdminRoundsTree,
+  // getAdminRoundsTree, // Session 监控暂时停用，保留实现以便恢复。
   getAdminSandboxProfiles,
   getAdminSessionRounds,
   getAdminSystem,
@@ -110,7 +110,7 @@ interface UserCreateFormValues {
 const NAV_ITEMS: Array<{ id: AdminTab; label: string; icon: ComponentType<{ size?: string | number }> }> = [
   { id: 'overview', label: '概览', icon: LayoutDashboard },
   { id: 'usage', label: '使用报表', icon: BarChart3 },
-  { id: 'rounds', label: 'Session监控', icon: BarChart3 },
+  // { id: 'rounds', label: 'Session监控', icon: BarChart3 }, // 暂时停用，保留代码。
   { id: 'users', label: '用户管理', icon: Users },
   { id: 'sandboxes', label: '沙箱管理', icon: Server },
   { id: 'models', label: '模型权限', icon: KeyRound },
@@ -914,14 +914,15 @@ export default function AdminConsole() {
       if (activeTab === 'overview') {
         setOverview(await getAdminOverview(overviewDays));
       }
-      if (activeTab === 'rounds') {
-        setRounds(await getAdminRoundsTree({
-          limit: roundPageSize,
-          offset: (roundPage - 1) * roundPageSize,
-          status: roundStatus,
-          search: debouncedRoundSearch || undefined,
-        }));
-      }
+      // Session 监控暂时停用；菜单与后台接口注册同步注释。
+      // if (activeTab === 'rounds') {
+      //   setRounds(await getAdminRoundsTree({
+      //     limit: roundPageSize,
+      //     offset: (roundPage - 1) * roundPageSize,
+      //     status: roundStatus,
+      //     search: debouncedRoundSearch || undefined,
+      //   }));
+      // }
       if (activeTab === 'users') {
         const [usersData, profilesData] = await Promise.all([
           getAdminUsers(),

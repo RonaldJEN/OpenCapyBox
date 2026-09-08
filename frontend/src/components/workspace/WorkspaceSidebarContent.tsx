@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ChevronDown,
@@ -149,6 +149,10 @@ export function WorkspaceSidebarContent({
   const [error, setError] = useState('');
   const uploadRef = useRef<HTMLInputElement>(null);
   const uploadParentRef = useRef<WorkspaceEntry | null>(null);
+  const uploadInFlightRef = useRef(false);
+  const fileDragDepthRef = useRef(0);
+  const [fileDropTarget, setFileDropTarget] = useState<{ id: string | null; path: string } | null>(null);
+  const [uploadStatus, setUploadStatus] = useState('');
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const menuPopupRef = useRef<HTMLDivElement>(null);
   const searchButtonRef = useRef<HTMLButtonElement>(null);
@@ -793,29 +797,67 @@ export function WorkspaceSidebarContent({
     }
   };
 
-  const uploadFiles = async (files: FileList | null) => {
-    if (!files?.length) return;
-    const parent = uploadParentRef.current;
-    const parentId = parent?.entry_id || null;
+  const uploadFiles = async (files: FileList | File[] | null, parentId: string | null) => {
+    if (!files?.length || busy || uploadInFlightRef.current) return;
+    const uploadBatch = Array.from(files);
+    let uploadFailure = '';
+    uploadInFlightRef.current = true;
     setBusy(true);
+    setError('');
     try {
-      for (const file of Array.from(files)) {
+      for (const file of uploadBatch) {
+        setUploadStatus(`正在上传 ${file.name}`);
         const result = await workspaceApi.uploadFile(parentId, file);
         rememberAuthoritativeEntry(result.entry);
         emitWorkspaceMutation({ operation: 'upload', entry: result.entry, parentId: result.entry.parent_id });
       }
-      if (parent) {
-        setExpanded((current) => new Set(current).add(parent.entry_id));
-        void loadDirectory(parent.entry_id);
-      }
       setError('');
     } catch (uploadError) {
-      setError(errorText(uploadError));
+      uploadFailure = errorText(uploadError);
     } finally {
+      if (parentId) {
+        setExpanded((current) => new Set(current).add(parentId));
+        await loadDirectory(parentId);
+      }
+      if (uploadFailure) setError(uploadFailure);
+      uploadInFlightRef.current = false;
+      setUploadStatus('');
       setBusy(false);
       uploadParentRef.current = null;
       if (uploadRef.current) uploadRef.current.value = '';
     }
+  };
+
+  const handleFileDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = busy || uploadInFlightRef.current ? 'none' : 'copy';
+    const row = event.target instanceof Element
+      ? event.target.closest<HTMLElement>('[data-workspace-upload-parent]')
+      : null;
+    setFileDropTarget({
+      id: row?.dataset.workspaceUploadParent || null,
+      path: row?.dataset.workspaceUploadPath || '工作区根目录',
+    });
+  };
+
+  const handleFileDrop = (event: DragEvent<HTMLDivElement>) => {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    fileDragDepthRef.current = 0;
+    setFileDropTarget(null);
+    if (busy || uploadInFlightRef.current) return;
+    // Read the native drag payload synchronously while the drop event is active.
+    if (Array.from(event.dataTransfer.items).some((item) => item.webkitGetAsEntry?.()?.isDirectory)) {
+      setError('暂不支持直接拖入文件夹，请选择其中的文件上传。');
+      return;
+    }
+    const row = event.target instanceof Element
+      ? event.target.closest<HTMLElement>('[data-workspace-upload-parent]')
+      : null;
+    void uploadFiles(Array.from(event.dataTransfer.files), row?.dataset.workspaceUploadParent || null);
   };
 
   const openUploadPicker = (parent: WorkspaceEntry | null) => {
@@ -1097,13 +1139,15 @@ export function WorkspaceSidebarContent({
         <div
           data-testid={`workspace-drag-row-${entry.entry_id}`}
           data-workspace-drop-target={directory ? entry.entry_id : entry.parent_id || undefined}
-          className={`group/entry mx-1 flex min-h-10 items-center rounded-lg pl-1 transition-[background-color,box-shadow,opacity] ${
+          data-workspace-upload-parent={directory ? entry.entry_id : entry.parent_id || ''}
+          data-workspace-upload-path={directory ? entry.path : entry.path.split('/').slice(0, -1).join('/')}
+          className={`group/entry flex min-h-10 items-center rounded-lg transition-[background-color,box-shadow,opacity] ${
             draggingEntry?.entry_id === entry.entry_id ? 'opacity-45' : ''
           } ${
-            dropTargetId === entry.entry_id ? 'bg-claude-accent/10 ring-1 ring-inset ring-claude-accent/35' : ''
+            dropTargetId === entry.entry_id || fileDropTarget?.id === entry.entry_id ? 'bg-claude-accent/10 ring-1 ring-inset ring-claude-accent/35' : ''
           } ${selected ? 'bg-claude-accent/10 text-claude-text ring-1 ring-inset ring-claude-accent/25' : activeEntryId === entry.entry_id ? 'bg-white text-claude-text shadow-sm' : 'text-claude-secondary hover:bg-claude-hover'}`}
         >
-          {directory ? <button type="button" onClick={() => void toggleDirectory(entry)} className="inline-flex h-9 w-5 shrink-0 items-center justify-center rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40" aria-label={`${opened ? '收起' : '展开'} ${entry.name}`}>{loadingParents.has(entry.entry_id) ? <Loader2 size={13} className="animate-spin" /> : opened ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</button> : <span className="h-9 w-5 shrink-0" aria-hidden="true" />}
+          {directory ? <button type="button" onClick={() => void toggleDirectory(entry)} className="inline-flex h-9 w-4 shrink-0 items-center justify-center rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40" aria-label={`${opened ? '收起' : '展开'} ${entry.name}`}>{loadingParents.has(entry.entry_id) ? <Loader2 size={13} className="animate-spin" /> : opened ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</button> : <span className="h-9 w-4 shrink-0" aria-hidden="true" />}
           <div className="relative mr-1 flex h-9 w-6 shrink-0 items-center justify-center">
             <Icon size={15} className={`shrink-0 ${getFileIconClass(fileInfo)} ${selectedEntryIds.size > 0 ? 'opacity-0' : 'opacity-0 md:opacity-100 md:group-hover/entry:opacity-0 md:group-focus-within/entry:opacity-0'}`} aria-hidden="true" />
             <label className={`absolute inset-0 flex cursor-pointer items-center justify-center ${selectedEntryIds.size > 0 ? 'opacity-100' : 'opacity-100 md:opacity-0 md:group-hover/entry:opacity-100 md:group-focus-within/entry:opacity-100'}`}>
@@ -1111,7 +1155,7 @@ export function WorkspaceSidebarContent({
             </label>
           </div>
           <div role="button" tabIndex={0} title={entry.name} aria-selected={selected} aria-current={activeEntryId === entry.entry_id ? 'page' : undefined} aria-grabbed={draggingEntry?.entry_id === entry.entry_id} onPointerDown={(event) => startPointerDrag(event, entry)} data-workspace-pointer-drag-source data-workspace-sidebar-tree-entry onKeyDown={handleKeyDown} onClick={(event) => { if (suppressClickEntryIdRef.current === entry.entry_id) { suppressClickEntryIdRef.current = null; return; } if (event.shiftKey || event.ctrlKey || event.metaKey) { toggleEntrySelection(entry, event.shiftKey); return; } directory ? void toggleDirectory(entry) : onOpenEntry(entry); }} className={`flex min-w-0 flex-1 touch-none select-none items-center gap-2 self-stretch text-left text-[13px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-claude-accent/40 ${busy ? '' : 'cursor-grab active:cursor-grabbing'}`}><span className="min-w-0 flex-1 truncate">{entry.name}</span>{pending && <Loader2 size={13} className="mr-1 shrink-0 animate-spin text-claude-accent" aria-label="正在删除" />}</div>
-          <button type="button" draggable={false} onClick={(event) => openRowMenu(entry, event.currentTarget)} className="mr-3 inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted opacity-65 hover:bg-white hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40" aria-label={`${entry.name} 操作`} aria-expanded={rowMenuEntry?.entry_id === entry.entry_id}><MoreHorizontal size={14} /></button>
+          <button type="button" draggable={false} onClick={(event) => openRowMenu(entry, event.currentTarget)} className="inline-flex h-8 w-7 shrink-0 items-center justify-center rounded-md text-claude-muted opacity-65 hover:bg-white hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40" aria-label={`${entry.name} 操作`} aria-expanded={rowMenuEntry?.entry_id === entry.entry_id}><MoreHorizontal size={14} /></button>
         </div>
         {opened && <ul role="group" data-workspace-drop-target={entry.entry_id} className={`ml-2 rounded-lg transition-colors ${dropTargetId === entry.entry_id ? 'bg-claude-accent/[0.035]' : ''}`}>{(children.get(entry.entry_id) || []).map((child) => renderEntry(child))}</ul>}
       </li>
@@ -1133,7 +1177,7 @@ export function WorkspaceSidebarContent({
       }
     };
     return (
-      <div key={entry.entry_id} aria-busy={pending || undefined} className={`group mx-1 flex min-h-10 items-center rounded-lg px-1 ${selected ? 'bg-claude-accent/10 ring-1 ring-inset ring-claude-accent/25' : 'hover:bg-claude-hover'}`}>
+      <div key={entry.entry_id} aria-busy={pending || undefined} data-workspace-upload-parent={entry.kind === 'directory' ? entry.entry_id : entry.parent_id || ''} data-workspace-upload-path={entry.kind === 'directory' ? entry.path : entry.path.split('/').slice(0, -1).join('/')} className={`group mx-1 flex min-h-10 items-center rounded-lg px-1 ${selected || fileDropTarget?.id === entry.entry_id ? 'bg-claude-accent/10 ring-1 ring-inset ring-claude-accent/25' : 'hover:bg-claude-hover'}`}>
         <label className={`flex h-9 w-7 shrink-0 cursor-pointer items-center justify-center transition-opacity ${selectedEntryIds.size > 0 || selected ? 'opacity-100' : 'opacity-100 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100'}`}><input type="checkbox" checked={selected} readOnly disabled={pending} onKeyDown={(event) => { handleSelectionShortcut(event, entry, pending); }} onClick={(event) => { event.stopPropagation(); toggleEntrySelection(entry, event.shiftKey); }} className="h-4 w-4 cursor-pointer rounded border-claude-border accent-claude-accent disabled:cursor-wait" aria-label={`选择 ${entry.name}`} /></label>
         <button type="button" role="option" aria-selected={selected} title={entry.path} data-workspace-sidebar-search-entry onKeyDown={handleKeyDown} onClick={(event) => { if (event.shiftKey || event.ctrlKey || event.metaKey) { toggleEntrySelection(entry, event.shiftKey); return; } entry.kind === 'file' ? onOpenEntry(entry) : void toggleDirectory(entry); }} className="flex min-h-10 min-w-0 flex-1 items-center gap-2 rounded-lg px-1 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-claude-accent/40"><span className="min-w-0 flex-1 truncate">{entry.path}</span>{pending && <Loader2 size={13} className="shrink-0 animate-spin text-claude-accent" aria-label="正在删除" />}</button>
       </div>
@@ -1238,12 +1282,28 @@ export function WorkspaceSidebarContent({
           document.body,
         );
       })()}
-      <input ref={uploadRef} type="file" multiple className="hidden" onChange={(event) => void uploadFiles(event.target.files)} />
+      <input ref={uploadRef} type="file" multiple className="hidden" onChange={(event) => void uploadFiles(event.target.files, uploadParentRef.current?.entry_id || null)} />
+      {uploadStatus && <div role="status" className="mx-2 mb-2 flex items-center gap-2 text-xs text-claude-secondary"><Loader2 size={13} className="shrink-0 animate-spin" aria-hidden="true" /><span className="min-w-0 truncate" title={uploadStatus}>{uploadStatus}</span></div>}
       {error && <div className="mx-1 mb-2 flex items-center gap-2 rounded-lg bg-red-50 px-2.5 py-2 text-[11px] text-claude-error" role="alert"><span className="min-w-0 flex-1 whitespace-normal">{error}</span><button type="button" onClick={() => void loadDirectory(null)} disabled={loadingParents.has(ROOT) || searching} className="shrink-0 rounded-md px-1.5 py-1 font-medium hover:bg-white/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-error/30 disabled:opacity-45" aria-label="重试加载工作区">重试</button><button type="button" onClick={() => setError('')} className="shrink-0 rounded p-1 hover:bg-white/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-error/30" aria-label="关闭错误"><X size={12} /></button></div>}
       <div
         data-testid="workspace-content-body"
-        className={`flex min-h-0 min-w-0 w-full flex-1 flex-col px-1 pb-2 ${dropTargetId === ROOT ? 'bg-claude-accent/[0.04]' : ''}`}
+        onDragEnter={(event) => {
+          if (!event.dataTransfer.types.includes('Files')) return;
+          fileDragDepthRef.current += 1;
+          handleFileDragOver(event);
+        }}
+        onDragOver={handleFileDragOver}
+        onDragLeave={(event) => {
+          if (!event.dataTransfer.types.includes('Files')) return;
+          event.preventDefault();
+          event.stopPropagation();
+          fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+          if (fileDragDepthRef.current === 0) setFileDropTarget(null);
+        }}
+        onDrop={handleFileDrop}
+        className={`relative flex min-h-0 min-w-0 w-full flex-1 flex-col px-1 pb-2 ${dropTargetId === ROOT || fileDropTarget ? 'bg-claude-accent/[0.04]' : ''}`}
       >
+        {fileDropTarget && <div role="status" className="pointer-events-none absolute inset-x-2 bottom-2 z-20 rounded-lg border border-dashed border-claude-accent bg-claude-bg px-3 py-2 text-center text-xs text-claude-accent shadow-sm">{busy ? '正在处理，请稍后再上传' : `松开上传到：${fileDropTarget.path}`}</div>}
         {draggingEntry && canDropInto(draggingEntry, null) && (
           <div
             data-testid="workspace-root-drop-zone"
@@ -1261,7 +1321,7 @@ export function WorkspaceSidebarContent({
           <div data-testid="workspace-empty-state" className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 text-center text-xs text-claude-muted">
             <Folder size={30} className="mb-3 text-claude-border" aria-hidden="true" />
             <span className="font-medium text-claude-secondary">{query ? '没有匹配文件' : '工作区为空'}</span>
-            {!query && <span className="mt-1.5 block max-w-[180px] whitespace-normal leading-5">可新建文件，或从会话文件面板存入内容</span>}
+            {!query && <span className="mt-1.5 block max-w-[180px] whitespace-normal leading-5">可拖入文件上传、新建文件，或从会话文件面板存入内容</span>}
           </div>
         ) : (
           <div className="min-h-0 min-w-0 w-full flex-1 overflow-x-hidden overflow-y-auto">

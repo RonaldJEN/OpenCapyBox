@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -28,6 +30,16 @@ def _make_client(*, admin_enabled: bool, db=None) -> TestClient:
 
 
 class TestAdminRouter:
+    def test_session_monitor_endpoints_are_disabled(self):
+        client = _make_client(admin_enabled=True)
+        for method, path in (
+            ("GET", "/admin/rounds-tree"),
+            ("GET", "/admin/sessions/session-1/rounds"),
+            ("GET", "/admin/llm-call-records/1"),
+            ("PUT", "/admin/llm-call-records/1/review"),
+        ):
+            assert client.request(method, path).status_code == 404
+
     def test_admin_requires_permission(self):
         client = _make_client(admin_enabled=False)
         resp = client.get("/admin/overview")
@@ -115,6 +127,7 @@ class TestAdminRouter:
         assert mocked.call_count == 1
         assert mocked.call_args.args[1] == 14
 
+    @pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
     def test_rounds_tree_delegates_to_builder(self):
         client = _make_client(admin_enabled=True)
         payload = {"total_sessions": 1, "offset": 0, "limit": 10, "sessions": []}
@@ -138,6 +151,7 @@ class TestAdminRouter:
         assert mocked.call_args.kwargs["user_id"] == "demo"
         assert mocked.call_args.kwargs["search"] == "hello"
 
+    @pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
     def test_session_rounds_delegates_to_builder(self):
         client = _make_client(admin_enabled=True)
         payload = {"session_id": "session-1", "rounds": []}
@@ -168,6 +182,7 @@ class TestAdminRouter:
         assert mocked.call_args.args[1] == "glm-test"
         assert mocked.call_args.kwargs["replacement_model_id"] == "glm-new"
 
+    @pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
     def test_update_llm_review_delegates_to_helper(self):
         client = _make_client(admin_enabled=True)
         payload = {"llm_record_id": 12, "manual_review_status": "有问题"}
@@ -184,6 +199,7 @@ class TestAdminRouter:
         assert mocked.call_args.kwargs["llm_record_id"] == 12
         assert mocked.call_args.kwargs["manual_review_status"] == "有问题"
 
+    @pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
     def test_update_llm_review_rejects_invalid_status(self):
         client = _make_client(admin_enabled=True)
 
@@ -195,6 +211,7 @@ class TestAdminRouter:
         assert resp.status_code == 400
         assert "manual_review_status" in resp.json()["detail"]
 
+    @pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
     def test_get_llm_call_record_detail_delegates_to_builder(self):
         client = _make_client(admin_enabled=True)
         payload = {

@@ -2172,7 +2172,8 @@ async def get_admin_overview(
     """管理端概览。"""
     return _build_overview_payload(db, days)
 
-@router.get("/rounds-tree")
+# Session 监控暂时停用：注释四个接口的路由注册，保留处理函数与数据查询实现。
+# @router.get("/rounds-tree")
 @admin_audit_action(
     "session.list",
     target_type="session_collection",
@@ -2219,7 +2220,7 @@ async def get_admin_rounds_tree(
     return result
 
 
-@router.get("/sessions/{session_id}/rounds")
+# @router.get("/sessions/{session_id}/rounds")
 @admin_audit_action(
     "session.view",
     target_type="session",
@@ -2258,7 +2259,7 @@ async def get_admin_session_rounds(
     return result
 
 
-@router.put("/llm-call-records/{llm_record_id}/review")
+# @router.put("/llm-call-records/{llm_record_id}/review")
 @admin_audit_action(
     "step.review.update",
     target_type="step",
@@ -2304,7 +2305,7 @@ async def update_admin_llm_call_review(
     return result
 
 
-@router.get("/llm-call-records/{llm_record_id}")
+# @router.get("/llm-call-records/{llm_record_id}")
 @admin_audit_action(
     "step.view",
     target_type="step",

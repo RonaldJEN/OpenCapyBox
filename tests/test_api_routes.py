@@ -1789,6 +1789,41 @@ class TestEnsureSandbox:
         sandbox_service.get_or_resume.assert_awaited_once_with("user-1", "sbx-new")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("cached", [False, True])
+    async def test_ensure_unchanged_binding_releases_transaction(self, cached):
+        """冷缓存同代重连和热缓存返回后均不得持有真实 SQLAlchemy 事务。"""
+        from types import SimpleNamespace
+        from src.api.models.user_sandbox import UserSandbox
+        from src.api.routes.sessions import _ensure_sandbox, _SandboxBindingState
+
+        engine = create_engine("sqlite://")
+        UserSandbox.__table__.create(engine)
+        try:
+            with sessionmaker(bind=engine)() as db:
+                db.add(UserSandbox(
+                    id="binding-1", user_id="user-1", sandbox_id="sbx-same",
+                    active_profile_id="profile-1", active_profile_version=1,
+                ))
+                db.commit()
+                sandbox = SimpleNamespace(id="sbx-same")
+                service = SimpleNamespace(
+                    get_cached=lambda _: sandbox if cached else None,
+                    get_or_resume=AsyncMock(return_value=sandbox),
+                    get_sandbox_id=lambda _: sandbox.id,
+                    get_cached_runtime_config=lambda _: SimpleNamespace(
+                        profile_id="profile-1", profile_version=1,
+                    ),
+                )
+                # 模拟请求已冻结绑定并释放连接，再跨越 Sandbox 获取边界。
+                binding = _SandboxBindingState("sbx-same", None, False)
+                result = await _ensure_sandbox(service, "user-1", db, binding_state=binding)
+                assert result is sandbox
+                assert not db.in_transaction()
+                assert service.get_or_resume.await_count == (0 if cached else 1)
+        finally:
+            engine.dispose()
+
+    @pytest.mark.asyncio
     async def test_ensure_sandbox_falls_back_to_get_or_resume(self):
         """快取未命中時走 get_or_resume 並更新 DB"""
         from src.api.routes.sessions import _ensure_sandbox

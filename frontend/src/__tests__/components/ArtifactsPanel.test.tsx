@@ -76,6 +76,7 @@ vi.mock('../../services/api', () => ({
   apiService: {
     getSessionFiles: vi.fn(),
     downloadFile: vi.fn(),
+    downloadDirectory: vi.fn(),
   },
 }));
 
@@ -115,6 +116,47 @@ describe('ArtifactsPanel 组件', () => {
       files: mockFiles,
       total: mockFiles.length,
     });
+  });
+
+  it('目录行和当前目录下载 ZIP，下载不导航且失败可重试', async () => {
+    const directory = { ...mockFiles[0], name: '报告', path: '报告', is_directory: true };
+    vi.mocked(apiService.getSessionFiles).mockResolvedValue({ files: [directory], total: 1 });
+    let finish!: () => void;
+    vi.mocked(apiService.downloadDirectory).mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    render(<ArtifactsPanel sessionId="test-session" isOpen onClose={vi.fn()} variant="workspace" />);
+    const download = await screen.findByRole('button', { name: '下载 报告（ZIP）' });
+    fireEvent.click(download);
+    expect(apiService.downloadDirectory).toHaveBeenCalledWith('test-session', '报告');
+    expect(apiService.getSessionFiles).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('status')).toHaveTextContent('正在打包并下载：报告');
+    expect(download).toBeDisabled();
+    await act(async () => finish());
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+
+    vi.mocked(apiService.downloadDirectory).mockRejectedValueOnce(new Error('文件夹打包失败'));
+    fireEvent.click(screen.getByRole('button', { name: '下载当前文件夹（ZIP）' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('文件夹打包失败');
+    expect(apiService.downloadDirectory).toHaveBeenLastCalledWith('test-session', '');
+    vi.mocked(apiService.downloadDirectory).mockResolvedValueOnce();
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(apiService.downloadDirectory).toHaveBeenCalledTimes(3);
+  });
+
+  it('切换会话后可独立下载，旧会话完成不清除当前打包状态', async () => {
+    const finishes: Record<string, () => void> = {};
+    vi.mocked(apiService.downloadDirectory).mockImplementation((id) => new Promise<void>((resolve) => { finishes[id] = resolve; }));
+    const props = { isOpen: true, onClose: vi.fn(), variant: 'workspace' as const };
+    const { rerender } = render(<ArtifactsPanel {...props} sessionId="a" />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '下载当前文件夹（ZIP）' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: '下载当前文件夹（ZIP）' }));
+    rerender(<ArtifactsPanel {...props} sessionId="b" />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '下载当前文件夹（ZIP）' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: '下载当前文件夹（ZIP）' }));
+    await act(async () => finishes.a());
+    expect(screen.getByRole('status')).toHaveTextContent('正在打包并下载');
+    await act(async () => finishes.b());
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
   it('面板关闭时不应该加载文件', () => {
@@ -238,20 +280,30 @@ describe('ArtifactsPanel 组件', () => {
     );
   });
 
-  it('点击关闭按钮应该调用 onClose', () => {
+  it('临时收起保留页签，X 清空全部且重新点同一文件只打开该文件', async () => {
     const mockOnClose = vi.fn();
+    const props = { sessionId: 'test-session', onClose: mockOnClose, variant: 'workspace' as const };
+    const { rerender } = render(<ArtifactsPanel {...props} isOpen targetFile={mockFiles[0]} targetFileNonce={1} />);
+    rerender(<ArtifactsPanel {...props} isOpen targetFile={mockFiles[1]} targetFileNonce={2} />);
+    expect(screen.getAllByRole('tab')).toHaveLength(2);
+    rerender(<ArtifactsPanel {...props} isOpen={false} targetFile={null} />);
+    rerender(<ArtifactsPanel {...props} isOpen targetFile={null} />);
+    expect(screen.getAllByRole('tab')).toHaveLength(2);
 
-    render(
-      <ArtifactsPanel
-        sessionId="test-session"
-        isOpen
-        onClose={mockOnClose}
-      />,
-    );
+    fireEvent.click(screen.getByRole('button', { name: '关闭所有文件' }));
+    expect(mockOnClose).toHaveBeenCalledTimes(1);
+    expect(screen.queryAllByRole('tab')).toHaveLength(0);
+    rerender(<ArtifactsPanel {...props} isOpen={false} />);
+    rerender(<ArtifactsPanel {...props} isOpen />);
+    expect(screen.queryAllByRole('tab')).toHaveLength(0);
+    expect(await screen.findByText('report.pdf')).toBeVisible();
 
-    fireEvent.click(screen.getByRole('button', { name: '收起文件' }));
-
-    expect(mockOnClose).toHaveBeenCalled();
+    rerender(<ArtifactsPanel {...props} isOpen targetFile={mockFiles[1]} targetFileNonce={3} />);
+    expect(screen.getAllByRole('tab')).toHaveLength(1);
+    expect(screen.getByRole('tab', { name: 'data.xlsx' })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.click(screen.getByRole('button', { name: '关闭所有文件' }));
+    // A stale external target must not restore the tab that was just closed.
+    expect(screen.queryAllByRole('tab')).toHaveLength(0);
   });
 
   it('点击文件应该在面板内直接预览', async () => {

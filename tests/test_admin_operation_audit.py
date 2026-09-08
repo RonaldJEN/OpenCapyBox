@@ -383,6 +383,7 @@ def test_terminal_row_cannot_be_finalized_twice(audit_db):
         assert row.status_code == 200
 
 
+@pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
 def test_real_session_and_step_routes_capture_only_safe_audit_context(audit_db):
     secret_prompt = "prompt-secret-must-not-be-audited"
     secret_answer = "answer-secret-must-not-be-audited"
@@ -473,6 +474,7 @@ def test_real_session_and_step_routes_capture_only_safe_audit_context(audit_db):
     assert "private-arguments" not in serialized_logs
 
 
+@pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
 def test_real_session_search_logs_filter_shape_not_search_text(audit_db):
     search_text = "search-secret-must-not-be-audited"
     with audit_db() as db:
@@ -973,7 +975,9 @@ def test_every_admin_route_declares_audit_action_and_admin_dependency():
         "audit_log.list",
         "audit_log.export",
     }
-    assert actions == expected_actions
+    # Session 监控路由暂时停用；审计动作字典保留，以支持历史日志。
+    disabled_actions = {"session.list", "session.view", "step.view", "step.review.update"}
+    assert actions == expected_actions - disabled_actions
     levels = (L0_ACTIONS, L1_ACTIONS, L2_ACTIONS, L3_ACTIONS)
     assert set().union(*levels) == expected_actions | {"session.search"}
     assert all(

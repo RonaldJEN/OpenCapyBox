@@ -73,8 +73,9 @@ describe('WorkspaceSidebarContent', () => {
     expect(tree).toHaveClass('min-w-0', 'w-full');
     expect(tree.querySelectorAll('[role="treeitem"]')[0]).toHaveTextContent('资料');
     const fileRow = screen.getByTestId('workspace-drag-row-file-1');
-    expect(fileRow).toHaveClass('mx-1', 'pl-1');
-    expect(fileRow.firstElementChild).toHaveClass('w-5');
+    expect(fileRow).not.toHaveClass('mx-1', 'pl-1');
+    expect(fileRow.firstElementChild).toHaveClass('w-4');
+    expect(within(fileRow).getByRole('button', { name: 'report.md 操作' })).toHaveClass('w-7', 'shrink-0');
     expect(within(fileRow).getByRole('checkbox', { name: '选择 report.md' })).toBeInTheDocument();
     const fileButton = screen.getByRole('button', { name: 'report.md' });
     expect(fileRow.children[2]).toBe(fileButton);
@@ -104,8 +105,8 @@ describe('WorkspaceSidebarContent', () => {
 
     const rootFolderRow = await screen.findByTestId('workspace-drag-row-dir-1');
     const rootFileRow = screen.getByTestId('workspace-drag-row-file-1');
-    expect(rootFolderRow).toHaveClass('mx-1', 'pl-1');
-    expect(rootFileRow).toHaveClass('mx-1', 'pl-1');
+    expect(rootFolderRow).not.toHaveClass('mx-1', 'pl-1');
+    expect(rootFileRow).not.toHaveClass('mx-1', 'pl-1');
 
     fireEvent.click(screen.getByRole('button', { name: '展开 资料' }));
     const nestedFileRow = await screen.findByTestId('workspace-drag-row-nested-file');
@@ -113,8 +114,8 @@ describe('WorkspaceSidebarContent', () => {
     expect(nestedGroup).toHaveClass('ml-2');
     expect(nestedGroup).not.toHaveClass('border-l', 'pl-1');
     expect(nestedGroup).toContainElement(nestedFileRow);
-    expect(nestedFileRow).toHaveClass('mx-1', 'pl-1');
-    expect(nestedFileRow.firstElementChild).toHaveClass('w-5');
+    expect(nestedFileRow).not.toHaveClass('mx-1', 'pl-1');
+    expect(nestedFileRow.firstElementChild).toHaveClass('w-4');
   });
 
   it('根目录到第三级的长名称均可悬停查看全名，且只收缩文本不收缩格式图标', async () => {
@@ -209,7 +210,7 @@ describe('WorkspaceSidebarContent', () => {
     expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ entry_id: 'new-file' }));
 
     const rowMenuButton = screen.getByRole('button', { name: 'report.md 操作' });
-    expect(rowMenuButton).toHaveClass('mr-3');
+    expect(rowMenuButton).not.toHaveClass('mr-3');
     vi.spyOn(rowMenuButton, 'getBoundingClientRect').mockReturnValue({
       x: 200, y: 180, left: 200, right: 232, top: 180, bottom: 212,
       width: 32, height: 32, toJSON: () => ({}),
@@ -982,6 +983,70 @@ describe('WorkspaceSidebarContent', () => {
     }));
   });
 
+  it.each([
+    ['workspace-content-body', null, '工作区根目录'],
+    ['workspace-drag-row-dir-1', 'dir-1', '资料'],
+    ['workspace-drag-row-file-1', null, '工作区根目录'],
+  ])('外部多文件拖入 %s 使用落点目录且不冒泡', async (targetId, parentId, path) => {
+    const outerDrop = vi.fn();
+    client.get.mockImplementation(async (_url: string, config?: { params?: Record<string, unknown> }) => ({
+      data: { items: config?.params?.parent_id ? [] : [file, folder], next_cursor: null, workspace_revision: 1 },
+    }));
+    client.post.mockImplementation(async (_url: string, body: FormData) => ({ data: {
+      status: 'CREATED', mutation_id: 'upload',
+      entry: { ...file, entry_id: (body.get('file') as File).name, parent_id: parentId },
+    } }));
+    render(<div onDrop={outerDrop}><WorkspaceSidebarContent onOpenEntry={vi.fn()} /></div>);
+    await screen.findByRole('button', { name: '资料' });
+    const target = screen.getByTestId(targetId);
+    const files = [new File(['a'], 'a.txt'), new File(['b'], 'b.txt')];
+    const dataTransfer = { types: ['Files'], files, items: [], dropEffect: 'none' };
+    fireEvent.dragEnter(target, { dataTransfer });
+    expect(screen.getByRole('status')).toHaveTextContent(`松开上传到：${path}`);
+    expect(dataTransfer.dropEffect).toBe('copy');
+    fireEvent.drop(target, { dataTransfer });
+    await waitFor(() => expect(client.post).toHaveBeenCalledTimes(2));
+    for (const [, body] of client.post.mock.calls) expect((body as FormData).get('parent_id')).toBe(parentId);
+    expect(outerDrop).not.toHaveBeenCalled();
+    expect(client.patch).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+  });
+
+  it('上传期间拒绝重复拖入，目录刷新后仍保留上传错误', async () => {
+    const pending = deferred<void>();
+    client.post.mockImplementationOnce(async () => { await pending.promise; throw new Error('上传失败'); });
+    client.get.mockImplementation(async (_url: string, config?: { params?: Record<string, unknown> }) => ({
+      data: { items: config?.params?.parent_id ? [] : [file, folder], next_cursor: null, workspace_revision: 1 },
+    }));
+    render(<WorkspaceSidebarContent onOpenEntry={vi.fn()} />);
+    const target = await screen.findByTestId('workspace-drag-row-dir-1');
+    const dataTransfer = { types: ['Files'], files: [new File(['a'], 'a.txt')], items: [], dropEffect: 'copy' };
+    fireEvent.drop(target, { dataTransfer });
+    fireEvent.dragOver(target, { dataTransfer });
+    expect(dataTransfer.dropEffect).toBe('none');
+    fireEvent.drop(target, { dataTransfer });
+    expect(client.post).toHaveBeenCalledTimes(1);
+    // A rejected request exercises the shared picker/drop error path.
+    await act(async () => pending.resolve());
+    expect(await screen.findByRole('alert')).toHaveTextContent('上传失败');
+    expect(screen.queryByText('正在上传 a.txt')).not.toBeInTheDocument();
+  });
+
+  it('忽略文本拖拽，离开清除落点，本机文件夹不作为普通文件上传', async () => {
+    render(<WorkspaceSidebarContent onOpenEntry={vi.fn()} />);
+    await screen.findByRole('button', { name: '资料' });
+    const target = screen.getByTestId('workspace-content-body');
+    fireEvent.dragEnter(target, { dataTransfer: { types: ['text/plain'] } });
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    const dataTransfer = { types: ['Files'], files: [], items: [{ webkitGetAsEntry: () => ({ isDirectory: true }) }] };
+    fireEvent.dragEnter(target, { dataTransfer });
+    fireEvent.dragLeave(target, { dataTransfer });
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    fireEvent.drop(target, { dataTransfer });
+    expect(screen.getByRole('alert')).toHaveTextContent('暂不支持直接拖入文件夹');
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
   it('根目录通过 cursor 自动加载后续页', async () => {
     client.get.mockReset();
     client.get
@@ -1000,7 +1065,7 @@ describe('WorkspaceSidebarContent', () => {
     expect(await screen.findByText('工作区为空')).toBeInTheDocument();
     expect(screen.getByTestId('workspace-content-body')).toHaveClass('flex', 'min-h-0', 'flex-1', 'flex-col');
     expect(screen.getByTestId('workspace-empty-state')).toHaveClass('flex', 'min-h-0', 'flex-1', 'items-center', 'justify-center', 'text-center');
-    expect(screen.getByText('可新建文件，或从会话文件面板存入内容')).toBeInTheDocument();
+    expect(screen.getByText('可拖入文件上传、新建文件，或从会话文件面板存入内容')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '搜索工作区文件' }));
     const searchPopover = screen.getByRole('textbox', { name: '搜索工作区' }).closest('div');

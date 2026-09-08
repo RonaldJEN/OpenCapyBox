@@ -1780,7 +1780,9 @@ function ChatV2View(props: ChatV2Props) {
             isOpen={isFilesOpen}
             onClose={() => {
               setPreviewContextNotice('');
-              closeFilesPanel();
+              // The panel captures all closing drafts before invoking this callback.
+              reading.beforeLayoutChange();
+              finalizeWorkspacePanelClose();
             }}
             isExpanded={isFilesExpanded}
             showExpandToggle

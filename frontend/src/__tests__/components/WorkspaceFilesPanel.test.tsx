@@ -73,6 +73,27 @@ describe('WorkspaceFilesPanel', () => {
   });
 
 
+  it('X 同步抓取全部草稿并立即清空页签，迟到保存不恢复已关闭文件', async () => {
+    const pending = deferred<{ ok: boolean; stale: boolean }>();
+    const onClose = vi.fn();
+    const props = { isExpanded: false, onToggleExpanded: vi.fn(), onClose };
+    const { rerender } = render(<WorkspaceFilesPanel {...props} target={first} isOpen />);
+    rerender(<WorkspaceFilesPanel {...props} target={second} isOpen />);
+    controls.dirty = true;
+    controls.save.mockReturnValue(pending.promise);
+    fireEvent.click(screen.getByRole('button', { name: '关闭所有文件' }));
+    expect(controls.save.mock.calls.map(([path]) => path)).toEqual(['one.md', 'two.xlsx']);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(screen.queryAllByRole('tab')).toHaveLength(0);
+    rerender(<WorkspaceFilesPanel {...props} target={null} isOpen={false} />);
+    rerender(<WorkspaceFilesPanel {...props} target={null} isOpen />);
+    expect(screen.queryAllByRole('tab')).toHaveLength(0);
+    rerender(<WorkspaceFilesPanel {...props} target={{ ...second }} isOpen />);
+    await act(async () => pending.resolve({ ok: true, stale: false }));
+    expect(screen.getAllByRole('tab')).toHaveLength(1);
+    expect(screen.getByRole('tab', { name: 'two.xlsx' })).toHaveAttribute('aria-selected', 'true');
+  });
+
   it('关闭多标签中的当前文件后，同一文件的新 target 事件可以重新打开', async () => {
     const onActivateEntry = vi.fn();
     const { rerender } = render(<WorkspaceFilesPanel target={first} isOpen isExpanded={false} onToggleExpanded={vi.fn()} onClose={vi.fn()} />);

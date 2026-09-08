@@ -1188,6 +1188,16 @@ class APIService {
    */
   async downloadFile(chatSessionId: string, filePath: string): Promise<void> {
     const url = buildSandboxFileUrl(chatSessionId, filePath, false);
+    await this.downloadBlob(url, filePath.split('/').pop() || 'download');
+  }
+
+  async downloadDirectory(chatSessionId: string, directoryPath: string): Promise<void> {
+    const path = directoryPath.replace(/\/+$/, '');
+    const url = `/api/sessions/${encodeURIComponent(chatSessionId)}/files-archive?path=${encodeURIComponent(path)}`;
+    await this.downloadBlob(url, `${path.split('/').pop() || '会话文件'}.zip`);
+  }
+
+  private async downloadBlob(url: string, filename: string): Promise<void> {
     const response = await fetch(url, {
       method: 'GET',
       headers: {
@@ -1206,7 +1216,7 @@ class APIService {
     try {
       const link = document.createElement('a');
       link.href = objectUrl;
-      link.download = filePath.split('/').pop() || 'download';
+      link.download = filename;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);

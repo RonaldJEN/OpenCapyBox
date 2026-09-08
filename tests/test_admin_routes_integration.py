@@ -947,6 +947,7 @@ def test_admin_read_paths_do_not_bootstrap_default_sandbox_profile(admin_integra
     assert user["sandbox_profile_source"] == "default"
 
 
+@pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
 def test_rounds_tree_real_sql_supports_limit_offset_status_search(admin_integration_client):
     client, SessionLocal = admin_integration_client
 
@@ -1027,6 +1028,7 @@ def test_rounds_tree_real_sql_supports_limit_offset_status_search(admin_integrat
     assert searched_data["sessions"][0]["session_id"] == "s-mid"
 
 
+@pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
 def test_rounds_tree_session_status_priority_includes_waiting(admin_integration_client):
     client, SessionLocal = admin_integration_client
 
@@ -1098,6 +1100,7 @@ def test_rounds_tree_session_status_priority_includes_waiting(admin_integration_
     }
 
 
+@pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
 def test_rounds_tree_step_list_is_lightweight_and_detail_is_full(admin_integration_client):
     client, SessionLocal = admin_integration_client
 
@@ -1145,6 +1148,7 @@ def test_rounds_tree_step_list_is_lightweight_and_detail_is_full(admin_integrati
     assert detail_data["response_content"] == heavy_response
 
 
+@pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
 def test_session_round_steps_are_ordered_by_creation_time(admin_integration_client):
     client, SessionLocal = admin_integration_client
 
@@ -1217,6 +1221,7 @@ def test_session_round_steps_are_ordered_by_creation_time(admin_integration_clie
     ]
 
 
+@pytest.mark.skip(reason="Session 监控暂时停用，保留恢复后的接口测试")
 def test_rounds_tree_marks_subagent_child_rounds(admin_integration_client):
     client, SessionLocal = admin_integration_client
 

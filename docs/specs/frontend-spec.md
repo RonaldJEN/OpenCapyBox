@@ -127,7 +127,9 @@
 - 用户写操作成功提示必须是短暂 toast，不占用表格上方常驻空间。
 - `ldap` 用户密码入口必须显示为 LDAP 认证，不提供本地密码重置控件。
 
-### 4.7 管理后台 Session 监控
+### 4.7 管理后台 Session 监控（暂时停用，保留恢复参考）
+
+当前菜单与列表加载代码、后端四个监控接口的路由注册均已注释，管理员不能访问 Session 监控。具体停用范围见 [admin-spec.md](admin-spec.md)；以下条款仅作为恢复参考，不属于当前启用功能的实现与验收要求。
 
 - `AdminConsole` 的 Session 监控页必须通过 `services/adminApi.ts` 调用 `/admin/rounds-tree` 获取 session 级分页聚合，再在展开单个 session 时调用 `/admin/sessions/{session_id}/rounds` 懒加载 round + 轻量 step 数据。
 - `/admin/rounds-tree` 首屏只返回 session 级字段，`rounds_loaded=false` 且 `rounds=[]`；前端不得假设首屏已包含 round 树。
