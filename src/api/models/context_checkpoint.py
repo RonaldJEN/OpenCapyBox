@@ -34,6 +34,9 @@ class ContextCheckpoint(Base):
         nullable=True,
         index=True,
     )
+    # Provider-native replay items in the replacement belong to this model.
+    # Existing checkpoints predate the field and remain NULL.
+    source_model_id = Column(String(100), nullable=True)
     source_message_sequence = Column(Integer, nullable=False, default=0)
     source_event_sequence = Column(Integer, nullable=False, default=0)
     trigger_phase = Column(String(30), nullable=False, default="pre_turn")

@@ -70,12 +70,12 @@ describe('send validation error formatting', () => {
         type: 'string_too_long',
         loc: ['body', 'content', 0, 'text'],
         msg: 'Request validation failed',
-        ctx: { max_length: 10000 },
+        ctx: { max_length: 30000 },
       }],
     }));
 
     expect(message).toContain('消息太长');
-    expect(message).toContain('10000');
+    expect(message).toContain('30000');
   });
 });
 

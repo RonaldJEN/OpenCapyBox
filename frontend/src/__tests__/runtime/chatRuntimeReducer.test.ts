@@ -75,12 +75,16 @@ describe('chatRuntimeReducer', () => {
       threadId: 'sess-a',
       runId: 'server-r1',
       preferredSkills: [{ key: 'pdf', display_name: 'PDF 文档' }],
+      modelId: 'model-b',
+      modelDisplayName: '模型 B',
       preferredMcpConnections: [
         { server_id: 'server-a', display_name: '东方财富数据' },
       ],
     });
 
     expect(state.sessions['sess-a'].rounds[0].round_id).toBe('server-r1');
+    expect(state.sessions['sess-a'].rounds[0].model_display_name).toBe('模型 B');
+    expect(state.sessions['sess-a'].modelId).toBe('model-b');
     expect(state.runs['run-a'].serverRunId).toBe('server-r1');
     expect(state.runs['run-a'].status).toBe('streaming');
     expect(state.serverRunIdToClientRunKey['server-r1']).toBe('run-a');

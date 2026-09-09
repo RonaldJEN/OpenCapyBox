@@ -11,8 +11,9 @@ export const makeChatV2DefaultProps = () => ({
   onTitleUpdated: vi.fn(),
   onExecutionStart: vi.fn(),
   onExecutionEnd: vi.fn(),
-  selectedModelId: '',
-  onModelChange: vi.fn(),
-  availableModels: [] as any[],
+  catalogDefaultModelId: 'test-model',
+  availableModels: [{ id: 'test-model', name: 'Test Model', provider: 'openai',
+    supports_thinking: false, supports_image: false, max_images: 0,
+    supports_video: false, max_videos: 0, max_tokens: 8192, enabled: true, tags: [] }] as any[],
   onCreateSession: vi.fn(),
 });

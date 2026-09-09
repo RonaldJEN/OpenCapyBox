@@ -70,8 +70,9 @@ class WebChatAdapter:
             context=contexts,
             attachments=_extract_attachments(request),
             reply_route=WebReplyRoute(session_id=session_id),
+            model_id=request.model_id,
             idempotency_key=request.idempotency_key,
-            metadata={"session_id": session_id},
+            metadata={"session_id": session_id, "model_id": request.model_id},
         )
 
 

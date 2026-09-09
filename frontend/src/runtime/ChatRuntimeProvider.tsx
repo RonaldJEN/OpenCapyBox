@@ -603,6 +603,7 @@ export function ChatRuntimeProvider({
       dispatch({
         type: 'HISTORY_LOADED',
         sessionId,
+        modelId: response.model_id,
         rounds: response.rounds.map((round) => ({
           ...round,
           user_attachments: (round.user_attachments || []).map((attachment) => ({
@@ -679,6 +680,9 @@ export function ChatRuntimeProvider({
 
   const sendMessage = useCallback(async ({
     sessionId,
+    submission,
+    modelId,
+    modelDisplayName,
     displayMessage,
     content,
     attachments = [],
@@ -690,10 +694,12 @@ export function ChatRuntimeProvider({
     onRejectedBeforeAccept,
   }: SendMessageInput) => {
     const clientRunKey = randomId('run');
-    const tempRoundId = `temp-${Date.now()}`;
+    const tempRoundId = submission?.id || `temp-${Date.now()}`;
     const idempotencyKey = randomId('idem');
     const round: RoundData = {
       round_id: tempRoundId,
+      model_id: modelId,
+      model_display_name: modelDisplayName,
       idempotency_key: idempotencyKey,
       user_message: displayMessage,
       user_attachments: [...attachments],
@@ -710,7 +716,7 @@ export function ChatRuntimeProvider({
       steps: [],
       step_count: 0,
       status: 'running',
-      created_at: new Date().toISOString(),
+      created_at: submission?.createdAt || new Date().toISOString(),
     };
 
     runOwnershipRef.current.idempotencyKeyToClientRunKey[idempotencyKey] = clientRunKey;
@@ -744,12 +750,13 @@ export function ChatRuntimeProvider({
         connectionId,
         source: 'direct',
         content,
+        modelId,
         idempotencyKey,
         preferredSkillKeys,
         preferredMcpServerIds: preferredMcpConnections.map(
           (connection) => connection.server_id,
         ),
-      reasoning,
+        reasoning,
         pendingFileDrafts,
         onRejectedBeforeAccept: () => {
           if (isCurrentTransport(clientRunKey, transportEpoch, connectionId)) {

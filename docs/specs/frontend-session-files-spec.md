@@ -86,7 +86,7 @@ interface SessionFilesState {
 
 ## 4. 布局
 
-- 聊天顶栏与文件工作台第一行工具栏统一为 56px（`h-14`），使用同一 `border-claude-border` 底边；分栏时两条水平分隔线必须在同一视觉基线上，文件标签栏从该基线下方开始。
+- 文件工作台使用固定两行布局：导航行 55px，第二行 48px，底边框 1px，总高 104px。第二行在目录视图显示搜索框，在文件预览显示已打开文件标签，两者共用同一行且不叠加；进入文件、返回目录或关闭最后一个标签时，内容区分隔线高度不变。搜索框在所有面板宽度下始终独占第二行；拖动分栏不改变行布局、不重挂载搜索框或丢失输入焦点。
 - `closed`：聊天占满主内容区；桌面仍在最右边缘保留 splitter，向左拖动即可恢复 `split`。
 - `split`：聊天与文件工作台并排，中间为键盘可操作的 splitter；先按容器几何将比例 clamp 到 `0..100`。两个方向都不得设置提前吸附阈值：从 `full` 向右拖出任意正比例时立即显示聊天，从 `closed` 向左拖出任意比例时立即显示文件；仅在比例真正到达 0/100 时进入端点状态。
 - splitter 连续拖动时按 `requestAnimationFrame` 合并指针事件，并直接更新容器 CSS 比例；除首次离开 `full/closed` 端点需要恢复 `split` 外，React 布局状态与持久化比例只在手势结束时提交，禁止每个 `pointermove` 重渲染整棵聊天/预览树或同步写存储。
@@ -106,6 +106,9 @@ Session 文件工作台是主布局的一部分，不适用普通右侧 Overlay 
 
 - 目录请求使用单调递增 request id；迟到响应不得覆盖新路径。
 - 支持后退、前进、上一级和根目录。
+- 文件预览中点击“后退”先返回打开文件前的当前目录列表，不移动目录历史游标、不关闭文件标签，并保留该目录的搜索词、滚动与触发项焦点；根目录内预览文件时也必须允许后退。回到列表后再次后退才回退目录历史；“上一级”仍直接进入父目录，“前进”仍按目录历史导航。
+- 顶栏位置使用无输入框底色的可点击面包屑“会话文件 › 子目录”，不重复展示 Session ID；根节点和祖先目录均可导航。完整 `~/sessions/{sessionId}/...` 仅在底部状态栏显示，宽度不足时视觉截断，悬停和选中复制保留完整路径。
+- 搜索框位于导航下方并占满可用宽度，提示和无障碍名称为“搜索此文件夹”，使用白底、清晰边框和放大镜；宽栏与窄栏保持一致。文件预览时隐藏搜索，但保留目录搜索状态与已打开文件标签。
 - 目录在前、文件在后，排序沿用后端结果。
 - 目录视图顶部提供当前目录搜索：只在 `GET /api/sessions/{id}/files` 返回的完整条目中按 `name` 做客户端子串筛选，比较前 trim 搜索词并忽略英文大小写，不发起额外请求。搜索词按 `sessionId + currentPath` 隔离并在目录导航、文件预览和 Session 切换后恢复；空词显示全部条目，无匹配项时不得显示“空目录”。`Escape` 或清空按钮清除当前目录搜索，底部计数在筛选时显示“匹配数 / 总数”。
 - 点击目录进入目录；点击文件打开或激活相同路径标签。
@@ -123,13 +126,16 @@ Session 文件工作台是主布局的一部分，不适用普通右侧 Overlay 
 
 所有预览器通过统一分发层选择，加载操作支持 `AbortSignal`。缓存身份优先使用 `content_mode/source/entry_id/version_id/snapshot_path/opaque revision/ref_id/preview URL`；`modified + size` 只用于无结构化版本的兼容来源。
 
-聊天卡、历史附件和 composer 附件统一进入既有右侧文件工作台，不再创建全屏遮罩预览壳。Session 来源复用 `ArtifactsPanel` 的标签栏；Workspace 内容复用 `WorkspaceFilesPanel`。统一 Workspace 投影保存 deleted entry 集合；tombstone 到达时必须进入 Chat runtime reducer，清理所有已加载 Session/Round 的 Workspace 附件和助手引用，并拒绝迟到 history 重新投影。文件工作台同步关闭对应 captured/current 标签、清除 `.workspace-snapshots/<entry>/` 陈旧目录项并回到 Session 根目录、淘汰 entry/version 预览缓存；刷新后由 history 权威投影做同一过滤。Workspace 来源或 `.workspace-snapshots/<entry>/` 平台副本不得显示“存入工作区”。其余有效快照必须显式只读，只提供预览与下载；当前 Session 的 Markdown、CSV、XLSX 编辑仍只由文件工作台拥有。
+已发送的聊天文件卡、历史附件和引用现有 Session/Workspace 文件的 composer 附件进入既有右侧文件工作台；Session 来源复用 `ArtifactsPanel` 的标签栏，Workspace 内容复用 `WorkspaceFilesPanel`。持有本地 `File` 的未发送草稿附件及发送准备态附件使用 `DraftAttachmentPreview` 弹层，不要求先创建 Session；图片、文本和 PDF 的本地预览及其他格式下载见 frontend-chat-spec §8。
+
+统一 Workspace 投影保存 deleted entry 集合；tombstone 到达时必须进入 Chat runtime reducer，清理所有已加载 Session/Round 的 Workspace 附件和助手引用，并拒绝迟到 history 重新投影。文件工作台同步关闭对应 captured/current 标签、清除 `.workspace-snapshots/<entry>/` 陈旧目录项并回到 Session 根目录、淘汰 entry/version 预览缓存；刷新后由 history 权威投影做同一过滤。Workspace 来源或 `.workspace-snapshots/<entry>/` 平台副本不得显示“存入工作区”。其余有效快照必须显式只读，只提供预览与下载；当前 Session 的 Markdown、CSV、XLSX 编辑仍只由文件工作台拥有。
 
 | 类型 | 预览语义 |
 |---|---|
 | Markdown | GFM、默认关闭的可折叠 outline、平面报告排版、表格滚动；当前 Session 直接进入所见即所得编辑，外部只读来源保持渲染预览；相对图片和文件链接通过 session 鉴权 URL 解析，拒绝越界 |
 | HTML | `srcDoc` iframe `sandbox="allow-scripts"`、源码、下载、安全 Blob 新标签 |
-| TXT/代码/JSON | 语法高亮、行号/换行、复制 |
+| TXT/LOG | 纯文本只读阅读，固定自动换行、系统字体、15px / 1.7 行高；保留原始空白和换行，连续字符可在任意位置软换行。正文直接铺在白色内容区，24–32px 内边距，不嵌套卡片或横向滚动容器。不提供换行/字体选项或专用工具栏，不改写原文 |
+| 代码/JSON | 语法高亮、行号/换行、复制，继续使用代码预览器 |
 | 图片/SVG | 适应窗口、缩放、旋转；SVG 不注入主 DOM |
 | PDF | 浏览器/PDF viewer 内联预览与下载 |
 | DOC/DOCX | 首选 `render=pdf`；DOCX 转换失败可用 DOMPurify 清洗后的 Mammoth HTML，DOC 失败则下载 |

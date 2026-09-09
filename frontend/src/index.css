@@ -37,6 +37,26 @@ body {
   }
 }
 
+/* 搜索和文件标签共用固定第二行，切换视图时内容区分隔线保持不动。 */
+.session-files-toolbar-grid {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: 55px 48px;
+  align-items: center;
+  column-gap: 8px;
+  min-height: 55px;
+}
+
+.session-files-toolbar-actions {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.session-files-toolbar-secondary {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
 /* ──────────────────────────────────────────
    Scrollbar — subtle visible (Claude-style)
    ────────────────────────────────────────── */

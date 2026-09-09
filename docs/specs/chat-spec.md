@@ -43,6 +43,10 @@
 - 技能（Skills）的注册与管理
 - 用户权限配置与限额配置（由 Auth/Admin 模块处理）
 
+### 跨模型历史媒体投影
+
+Agent 的持久化历史保留原始多模态块。每次向供应商构建请求时，才按**当前轮模型**的图片和视频能力生成独立副本：不支持的历史媒体块不会发送，而是替换为“当前模型未接收该图片/视频”的文本标记；同一消息中的文本、文件引用以及 assistant/tool 的调用配对保持。该投影不压缩、不截断、不回写 Agent 内存历史或数据库；切回支持对应媒体的模型后，原始媒体块再次可投影。
+
 ---
 
 ## 2. 数据模型
@@ -319,6 +323,7 @@ Content-Type: application/json
 
 {
   "content": ContentBlock[],
+  "model_id": "model-id",              // 可选：仅本次 direct Round
   "idempotency_key": "uuid-string",    // 可选
   "preferred_skill_keys": ["pdf", "data_analysis"], // 可选，本轮优先 Skill
   "preferred_mcp_server_ids": ["server-uuid"], // 可选，本轮优先数据连接
@@ -328,6 +333,8 @@ Content-Type: application/json
 ```
 
 **ContentBlock 类型**:
+
+单个 `text` 块允许 1–30,000 个 Unicode 码点，恰好 30,000 个可提交，超过时在建立 SSE 和创建 Round 前返回 422。该上限是应用层正文校验，不等同于模型的 token 上下文容量；文件附件正文不计入此文本块长度。
 
 | 类型          | 结构                                                                                       | 说明                                    |
 | ------------- | ------------------------------------------------------------------------------------------ | --------------------------------------- |
@@ -360,7 +367,7 @@ type WorkspaceFile = {
 - Web Adapter 把二者合并为唯一的 `bsbox.turn_preferences.v1`：`{"mode":"preferred","skill_keys":[...],"mcp_server_ids":[...]}`。附件沿用独立 `ContentBlock` 输入链路并按下方 file block 语义转换，不得重复写入该偏好上下文。
 - run 启动前，Skill 按该用户当前 registry 解析；MCP 只从当前 Agent 的 `McpCatalogSnapshot.connections` 解析。未知、已禁用、发现失败或没有可见工具的项被忽略，不导致整次发送失败。
 - direct Round 分别固化 `preferred_skills: [{key, display_name}]` 与 `preferred_mcp_connections: [{server_id, display_name}]`。两份展示快照均不可变，读取历史时不得用当前 registry/catalog 改写。
-- direct `RUN_STARTED` 同时携带 `preferredSkills` 与 `preferredMcpConnections`，显式空数组也是权威结果，用于替换或清除 optimistic 标签；same-Round resume 不发新的 `RUN_STARTED`。
+- direct `RUN_STARTED` 同时携带 `preferredSkills`、`preferredMcpConnections`、`modelId` 与 `modelDisplayName`，显式空数组也是权威结果，用于替换或清除 optimistic 标签；same-Round resume 不发新的 `RUN_STARTED`。
 - Skill/MCP 的通用调用规则与选择后提示固定在平台 `AGENTS.md`；动态 Skill/MCP 清单只携带可用项元数据，不得夹带调用说明，也不得因本轮选择动态改写 system message。provider 请求只把紧凑 `<ui_context>` 前置到精确匹配的原始 user message 请求副本；不得写回 `agent.messages`、`conversation_messages` 或标题/摘要/记忆请求。属性值是数据标签而非指令，正文始终优先。
 - Skill 只有在 `get_skill` 成功后、连接只有在真实远程 MCP 工具调用成功后才能声称“已使用”；成功的 `mcp_tool_search` 只代表发现工具。UI 选择本身不构成使用审计。
 - 若产生 Interaction，服务端把唯一 `runtime_context` 与 `turn_preferences_origin_user_message_id` 写入热 pending state 和持久化 request payload，并先清除 producer 夹带的同名值。resume 按当时 registry/catalog 重新解析运行偏好，连续暂停始终锚定最初 user message。
@@ -369,7 +376,7 @@ type WorkspaceFile = {
 **本轮推理选择契约**:
 
 - `thinking_mode` 与 `reasoning_effort` 是发送瞬间的不可变快照，只覆盖当前逻辑执行链；两者均省略时必须把当前模型目录默认值物化到快照与 direct Round，不得用 `NULL / NULL` 延迟解析。`disabled` 必须清除并拒绝同时携带的强度。
-- 后端先按 session 的精确 `model_id` 校验：仅 OpenAI 兼容且显式声明非空 `supported_reasoning_efforts` 的模型可切换；`disabled` 校验目录中的 `off`，无强度的 `enabled` 校验 `on`，具体强度精确命中同一有序目录，失效或伪造值在建立 SSE 前返回 400。`reasoning_effort` 中的 `off` / `on` 必须拒绝，它们只能通过 `thinking_mode` 表达。
+- 后端先按本次 `model_id`（省略时为 Session 最近已受理 direct Round 的模型）校验：仅 OpenAI 兼容且显式声明非空 `supported_reasoning_efforts` 的模型可切换；`disabled` 校验目录中的 `off`，无强度的 `enabled` 校验 `on`，具体强度精确命中同一有序目录，失效或伪造值在建立 SSE 前返回 400。`reasoning_effort` 中的 `off` / `on` 必须拒绝，它们只能通过 `thinking_mode` 表达。
 - 归一化后写入独立版本化上下文 `bsbox.reasoning.v1`，不得混入 `turn_preferences` 上下文；OpenAI 同步、流式、工具 follow-up、retry 和 failover 在同一 run 中都从 `ContextVar` 读取同一冻结快照。failover 不按备用模型白名单过滤或降级，但只能尝试能够编码该快照的客户端：`provider_default + null` 可跨 provider；显式开关或具体强度不能交给 Anthropic 客户端；OpenAI `thinking_wire_format=none` 只能承载具体 `reasoning_effort`，不能承载纯 On/Off。协议不兼容的备用模型必须跳过，继续尝试后续模型；若没有任何备用模型兼容，保留并抛出主模型的原始失败。
 - direct Round 将最终 `thinking_mode` / `reasoning_effort` 持久化用于审计和历史恢复。same-Round continuation 沿用该快照；`resume` API 不接受新的推理选择。
 - `enabled` / `disabled` 由模型 DB 的 `thinking_wire_format` 编码：DashScope 类网关使用 `enable_thinking=true|false`，DeepSeek 原生协议使用 `thinking: {type: enabled|disabled}`；`disabled` 同时移除强度，非空强度作为顶层 `reasoning_effort` 发送。选择 Off 不能退化成字段缺省。
@@ -664,6 +671,8 @@ SSE 事件流。
   ]
 }
 ```
+
+响应顶层 `model_id` 是 Session 最近已受理 direct Round 的模型；每个 Round 的 `model_id` / `model_display_name` 是不可变快照。旧 Round 为 `null`，不得用顶层值伪回填。
 
 `preferred_skills` 与 `preferred_mcp_connections` 分别是 Skill、MCP 连接的不可变展示快照，并遵循以下投影规则：
 

@@ -59,6 +59,7 @@ class NormalizedInboundTurn(StrictModel):
     context: list[Context] = Field(default_factory=list)
     attachments: list[Attachment] = Field(default_factory=list)
     reply_route: ReplyRoute
+    model_id: str | None = Field(default=None, max_length=100)
     metadata: dict[str, Any] = Field(default_factory=dict)
     idempotency_key: str | None = None
 

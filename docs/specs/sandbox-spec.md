@@ -86,6 +86,12 @@
 
 ## 4. 行为语义与不变量
 
+### Composer 草稿附件目录
+
+- 草稿附件物理目录是当前用户 Sandbox mount 下严格受控的 `.composer-drafts/{draft_id}/{attachment_id}/`，不是 Workspace，也不是隐藏 Session。ledger 冻结 `user_id`、Sandbox ID、mount、文件名、大小和 SHA-256 后才允许 I/O；网络 I/O 不持有数据库事务。
+- claim 的专属 Session 目标固定为 `sessions/{session_id}/attachments/{attachment_id}/`，使该文件可由普通 Session 文件列表展示。删除和 24 小时到期通过既有 `SandboxCleanupJob` 排入异步清理，仅处理严格匹配的草稿根或未被 Round 引用的专属目标，不扫描同级目录、不跟随 symlink；cleanup lease/generation 防止迟到回调复活或误删新文件。
+- 既有清理边界：worker 使用任务冻结的 Sandbox ID 调用 `get_existing`，不自动迁移到重绑后的当前 Sandbox。旧绑定不可用时任务保留错误并重试，持久卷上的文件可能尚未回收；24 小时是到期进入清理的条件，不是物理删除完成时限。Composer 沿用这项历史基础设施限制，本次未实现跨沙箱绑定的清理迁移。
+
 ### 单例模式
 
 - SandboxSessionService 通过 `__new__` 实现类级单例

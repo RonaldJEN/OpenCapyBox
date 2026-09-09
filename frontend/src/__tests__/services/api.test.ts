@@ -36,6 +36,24 @@ describe('APIService', () => {
   });
 
   describe('Session 管理', () => {
+    it('21 个附件按 20+1 准备，部分失败后重试复用同一身份和全部结果', async () => {
+      const client = apiService.getAxiosClient();
+      const ids = Array.from({ length: 21 }, (_, index) => `attachment-${index}`);
+      const first = ids.slice(0, 20).map((attachment_id) => ({ attachment_id, path: `attachments/${attachment_id}/file.md` }));
+      const last = { attachment_id: ids[20], path: `attachments/${ids[20]}/file.md` };
+      const error = new Error('second batch unavailable');
+      client.post.mockResolvedValueOnce({ data: { files: first } }).mockRejectedValueOnce(error);
+      await expect(apiService.claimDraftAttachments('session-a', 'draft-a', ids)).rejects.toBe(error);
+      expect(client.post.mock.calls.map((call: any[]) => call[1].attachment_ids.length)).toEqual([20, 1]);
+      client.post.mockClear();
+      client.post.mockResolvedValueOnce({ data: { files: first } }).mockResolvedValueOnce({ data: { files: [last] } });
+      await expect(apiService.claimDraftAttachments('session-a', 'draft-a', ids)).resolves.toEqual([...first, last]);
+      expect(client.post.mock.calls.map((call: any[]) => call[1])).toEqual([
+        { draft_id: 'draft-a', attachment_ids: ids.slice(0, 20) },
+        { draft_id: 'draft-a', attachment_ids: ids.slice(20) },
+      ]);
+    });
+
     it('setUserId 應該保存到 localStorage', () => {
       apiService.setUserId('test-session-123');
       
@@ -710,8 +728,8 @@ describe('APIService', () => {
             {
               type: 'string_too_long',
               loc: ['body', 'content', 0, 'text'],
-              msg: 'String should have at most 10000 characters',
-              ctx: { max_length: 10000 },
+              msg: 'String should have at most 30000 characters',
+              ctx: { max_length: 30000 },
             },
           ],
         })),
@@ -730,7 +748,7 @@ describe('APIService', () => {
 
       expect(callbacks.onStreamAccepted).not.toHaveBeenCalled();
       expect(callbacks.onRunError).toHaveBeenCalledWith(
-        '消息太长，当前最多支持 10000 字。请拆成多条发送，或保存为文件后上传。',
+        '消息太长，当前最多支持 30000 字。请拆成多条发送，或保存为文件后上传。',
         'HTTP_CLIENT_ERROR',
       );
     });

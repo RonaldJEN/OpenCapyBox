@@ -391,6 +391,26 @@ class TestAgentPoolServiceUserSessions:
         pool._create_agent_instance.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_model_change_rebuilds_without_cleaning_shared_sandbox_tools(self):
+        from src.api.services.agent_pool_service import AgentPoolService
+
+        pool = AgentPoolService(ttl=3600)
+        old = _inject_pool_session(pool, 'model-session', 'user-1', sandbox_id='same-sandbox')
+        old.model_id = 'model-a'
+        new = MagicMock(model_id='model-b')
+        pool._create_agent_instance = AsyncMock(return_value=new)
+        pool.remove_async = AsyncMock()
+        sandbox_service = MagicMock()
+        sandbox_service.get_sandbox_id.return_value = 'same-sandbox'
+        with patch('src.api.services.agent_pool_service.get_sandbox_service', return_value=sandbox_service):
+            result = await pool.get_or_create(user_id='user-1', session_id='user-1',
+                chat_session_id='model-session', db=MagicMock(), model_id='model-b', sandbox_id='same-sandbox')
+        assert result is new
+        assert pool._create_agent_instance.call_args.kwargs['model_id'] == 'model-b'
+        pool.remove_async.assert_not_called()
+        old.close.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_get_or_create_rebuilds_when_db_sandbox_id_differs_from_service_cache(self):
         """DB 中的跨 worker 新 sandbox_id 应触发旧 Agent 重建。"""
         from src.api.services.agent_pool_service import AgentPoolService

@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.config import get_settings
-from src.api.routes import auth, sessions, chat, models
+from src.api.routes import auth, sessions, chat, models, composer_drafts
 from src.api.routes import cron as cron_routes
 from src.api.routes import config as config_routes
 from src.api.routes import admin as admin_routes
@@ -464,6 +464,7 @@ app.include_router(
     sessions.router, prefix=f"{settings.api_prefix}/sessions", tags=["会话管理"]
 )
 app.include_router(chat.router, prefix=f"{settings.api_prefix}/chat", tags=["对话"])
+app.include_router(composer_drafts.router, prefix=f"{settings.api_prefix}", tags=["草稿附件"])
 app.include_router(
     workspace_routes.router,
     prefix=f"{settings.api_prefix}/workspace",

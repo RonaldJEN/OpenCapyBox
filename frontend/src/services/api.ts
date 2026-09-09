@@ -7,6 +7,7 @@ import type {
   HistoryResponseV2,
   FileListResponse,
   FileInfo,
+  DraftUploadResult,
   RunningSessionsResponse,
   ChatContentBlock,
   StreamCallbacks,
@@ -1109,6 +1110,48 @@ class APIService {
       }
     );
     return response.data;
+  }
+
+  async uploadDraftAttachment(
+    draftId: string,
+    attachmentId: string,
+    file: File,
+    signal: AbortSignal,
+    onProgress: (percent: number | undefined) => void,
+  ): Promise<DraftUploadResult> {
+    const body = new FormData();
+    body.append('file', file);
+    body.append('attachment_id', attachmentId);
+    const response = await this.client.post<DraftUploadResult>(
+      `/composer-drafts/${draftId}/attachments`, body,
+      {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        signal,
+        onUploadProgress: (event) => onProgress(event.total
+          ? Math.min(100, Math.round(event.loaded / event.total * 100))
+          : undefined),
+      },
+    );
+    return response.data;
+  }
+
+  async removeDraftAttachment(draftId: string, attachmentId: string): Promise<void> {
+    await this.client.delete(`/composer-drafts/${draftId}/attachments/${attachmentId}`);
+  }
+
+  async claimDraftAttachments(sessionId: string, draftId: string, attachmentIds: string[]) {
+    // The API's 20-item bound is a preparation batch size, not a composer
+    // attachment limit. Only return after every batch is ready. Retrying uses
+    // the same identities, so a previously completed batch is not copied again.
+    const files: (FileInfo & { attachment_id: string })[] = [];
+    for (let offset = 0; offset < attachmentIds.length; offset += 20) {
+      const response = await this.client.post<{ files: (FileInfo & { attachment_id: string })[] }>(
+        `/sessions/${sessionId}/draft-attachments/claim`,
+        { draft_id: draftId, attachment_ids: attachmentIds.slice(offset, offset + 20) },
+      );
+      files.push(...response.data.files);
+    }
+    return files;
   }
 
   /** 原子保存当前 Session 内的 Markdown 文件。 */

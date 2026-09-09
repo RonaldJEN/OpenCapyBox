@@ -14,7 +14,7 @@ class TextContentBlock(BaseModel):
     """文本内容块"""
 
     type: Literal["text"]
-    text: str = Field(..., min_length=1, max_length=10000, description="文本内容")
+    text: str = Field(..., min_length=1, max_length=30000, description="文本内容")
 
 
 class ImageUrl(BaseModel):
@@ -81,6 +81,12 @@ class FileObject(BaseModel):
     name: Optional[str] = Field(default=None, description="文件名")
     mime_type: Optional[str] = Field(default=None, description="MIME 类型")
     size: Optional[int] = Field(default=None, description="文件大小（字节）")
+    composer_draft_attachment_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=36,
+        description="已认领的 Composer 临时附件 ID（仅 session 文件）",
+    )
 
     @model_validator(mode="after")
     def _validate_source_identity(self):
@@ -99,6 +105,8 @@ class FileObject(BaseModel):
 
         if not self.entry_id:
             raise ValueError("workspace 文件必须提供 entry_id")
+        if self.composer_draft_attachment_id is not None:
+            raise ValueError("workspace 文件不能提供 composer_draft_attachment_id")
         if self.revision is not None:
             raise ValueError("workspace 文件 revision 只能由服务端生成")
         if self.tree_revision is not None or self.manifest_sha256 is not None:
@@ -160,6 +168,12 @@ class SendMessageRequest(BaseModel):
     """发送消息请求（V2：仅支持 content blocks）"""
 
     content: List[ContentBlock] = Field(..., min_length=1, description="用户消息内容块")
+    model_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="本轮模型；为空时沿用会话最近已受理轮次的模型",
+    )
     idempotency_key: Optional[str] = Field(default=None, max_length=64, description="幂等键（防止多 Worker 重复处理同一请求）")
     preferred_skill_keys: List[SkillKey] = Field(
         default_factory=list,
@@ -290,6 +304,8 @@ class RoundData(BaseModel):
     parent_run_id: Optional[str] = None
     idempotency_key: Optional[str] = None
     last_event_sequence: int = 0
+    model_id: Optional[str] = None
+    model_display_name: Optional[str] = None
     user_message: str
     user_attachments: List[Dict[str, Any]] = Field(default_factory=list)
     assistant_file_references: List[AssistantFileReference] = Field(default_factory=list)
@@ -339,5 +355,6 @@ class HistoryResponse(BaseModel):
 class HistoryResponseV2(BaseModel):
     """历史记录响应 V2（基于 Round）"""
     session_id: str
+    model_id: Optional[str] = None
     rounds: List[RoundData]
     total: int

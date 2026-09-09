@@ -1,4 +1,4 @@
-export const MAX_TEXT_BLOCK_CHARS = 10000;
+export const MAX_TEXT_BLOCK_CHARS = 30000;
 export const UPLOAD_TARGET_UNCERTAIN_MESSAGE = '文件上传失败：无法确认目标文件是否已存在。为避免覆盖已有文件，本次上传已取消，请稍后重试。';
 
 interface ApiErrorLike {

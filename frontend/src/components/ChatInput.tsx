@@ -22,7 +22,11 @@ import {
   Square,
   X,
 } from 'lucide-react';
-import { FileInfo, type PreferredMcpConnectionSnapshot } from '../types';
+import {
+  type ComposerAttachment,
+  FileInfo,
+  type PreferredMcpConnectionSnapshot,
+} from '../types';
 import type { WorkspaceEntry } from '../types/workspace';
 import { getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, isImageFile } from '../utils/fileUtils';
 import {
@@ -36,8 +40,10 @@ import {
   MAX_SELECTED_SKILLS,
 } from '../utils/turnPreferenceDrafts';
 import { WorkspaceFilePicker } from './workspace/WorkspaceFilePicker';
+import { DraftAttachmentPreview } from './DraftAttachmentPreview';
 
 const MAX_TEXTAREA_HEIGHT = 200;
+const PASTED_TEXT_ATTACHMENT_THRESHOLD = 1000;
 type AddMenuPanel = null | 'root' | 'workspace' | 'skills' | 'mcp';
 
 const skillKey = (skill: SkillInfo) => skill.key || skill.name;
@@ -69,13 +75,16 @@ interface ChatInputProps {
   textareaRef?: MutableRefObject<HTMLTextAreaElement | null>;
 
   // ---- 文件上传 ----
-  attachedFiles?: FileInfo[];
+  attachedFiles?: ComposerAttachment[];
   onRemoveAttachment?: (index: number) => void;
   onFileUpload?: (files: FileList | File[] | null) => void;
   onWorkspaceFilesSelected?: (entries: WorkspaceEntry[]) => void;
   onInputDropHandled?: () => void;
-  onPreviewAttachment?: (file: FileInfo) => void;
+  onPreviewAttachment?: (file: ComposerAttachment) => void;
   uploading?: boolean;
+  onRetryAttachment?: (index: number) => void;
+  onRestorePastedText?: (index: number) => void;
+  onPasteText?: (text: string) => void;
 
   // ---- 本轮 Skill 偏好 ----
   selectedSkillKeys?: string[];
@@ -115,7 +124,9 @@ export function ChatInput({
   onWorkspaceFilesSelected,
   onInputDropHandled,
   onPreviewAttachment,
-  uploading = false,
+  onRetryAttachment,
+  onRestorePastedText,
+  onPasteText,
   selectedSkillKeys = [],
   onSelectedSkillKeysChange,
   selectedMcpConnections = [],
@@ -129,7 +140,7 @@ export function ChatInput({
     if (externalTextareaRef) externalTextareaRef.current = node;
   }, [externalTextareaRef]);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [previewImage, setPreviewImage] = useState<{ src: string; name: string } | null>(null);
+  const [previewFile, setPreviewFile] = useState<ComposerAttachment | null>(null);
   const [isInputDragging, setIsInputDragging] = useState(false);
   const [addMenuPanel, setAddMenuPanel] = useState<AddMenuPanel>(null);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -357,6 +368,7 @@ export function ChatInput({
   }, [value]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       if (sendDisabled) return;
@@ -373,8 +385,6 @@ export function ChatInput({
   };
 
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    if (!onFileUpload) return;
-
     const items = Array.from(e.clipboardData.items || []);
     const files = items
       .filter((item) => item.kind === 'file')
@@ -383,7 +393,14 @@ export function ChatInput({
 
     if (files.length > 0) {
       e.preventDefault();
-      onFileUpload(files);
+      onFileUpload?.(files);
+      return;
+    }
+
+    const text = e.clipboardData.getData('text/plain');
+    if (Array.from(text).length > PASTED_TEXT_ATTACHMENT_THRESHOLD && onPasteText) {
+      e.preventDefault();
+      onPasteText(text);
     }
   };
 
@@ -431,8 +448,24 @@ export function ChatInput({
         {/* 附件列表 */}
         {attachedFiles.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2">
-            {attachedFiles.map((file, index) => (
-              <div key={index} className="relative">
+            {attachedFiles.map((file, index) => {
+              const attachmentKey = file.clientId
+                ?? file.draftId
+                ?? `legacy:${file.path}:${file.name}:${file.modified}:${file.size}`;
+              const status = file.uploadStatus ?? 'ready';
+              const hasProgress = typeof file.uploadProgress === 'number';
+              const progress = Math.max(0, Math.min(100, file.uploadProgress ?? 0));
+              const statusLabel = status === 'waiting'
+                ? '等待上传'
+                : status === 'uploading'
+                  ? (hasProgress ? `上传中 ${progress}%` : '上传中')
+                  : status === 'saving'
+                    ? '正在保存'
+                    : status === 'error'
+                      ? '上传失败'
+                      : '已就绪';
+              return (
+              <div key={attachmentKey} className="relative w-28">
                 <button
                   type="button"
                   onClick={() => {
@@ -440,19 +473,17 @@ export function ChatInput({
                       onPreviewAttachment(file);
                       return;
                     }
-                    if (isImageFile(file) && file.data_url) {
-                      setPreviewImage({ src: file.data_url, name: file.name });
-                    }
+                    setPreviewFile(file);
                   }}
-                  className="group relative w-24 h-20 rounded-xl overflow-hidden border border-claude-border bg-white hover:border-claude-border-strong transition-colors"
+                  className="group relative h-20 w-28 overflow-hidden rounded-xl border border-claude-border bg-white transition-colors hover:border-claude-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
                   title={`预览 ${file.name}`}
                 >
                   <div className={`absolute top-1.5 right-1.5 text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-wide z-10 ${getFileBadgeClass(file)}`}>
                     {getFileExtLabel(file)}
                   </div>
-                  {isImageFile(file) && file.data_url ? (
+                  {isImageFile(file) && (file.previewUrl || file.data_url) ? (
                     <img
-                      src={file.data_url}
+                      src={file.previewUrl ?? file.data_url}
                       alt={file.name}
                       className="w-full h-full object-cover transition-transform group-hover:scale-105"
                     />
@@ -469,6 +500,48 @@ export function ChatInput({
                   </div>
                 </button>
 
+                <div
+                  className="mt-1 min-h-4 truncate text-[10px] text-claude-muted"
+                  aria-live="polite"
+                  title={status === 'error' ? file.uploadError : undefined}
+                >
+                  {file.pastedText !== undefined ? `${Array.from(file.pastedText).length} 字 · ${statusLabel}` : statusLabel}
+                </div>
+                {status === 'uploading' && hasProgress && (
+                  <div
+                    role="progressbar"
+                    aria-label={`${file.name} 上传进度`}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={progress}
+                    className="h-1 overflow-hidden rounded-full bg-claude-border"
+                  >
+                    <div className="h-full rounded-full bg-claude-accent transition-[width] duration-200" style={{ width: `${progress}%` }} />
+                  </div>
+                )}
+                {(status === 'error' || file.pastedText !== undefined) && (
+                  <div className="mt-1 flex items-center gap-1">
+                    {status === 'error' && onRetryAttachment && (
+                      <button
+                        type="button"
+                        onClick={() => onRetryAttachment(index)}
+                        className="rounded px-1 text-[10px] text-claude-secondary hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
+                      >
+                        重试
+                      </button>
+                    )}
+                    {file.pastedText !== undefined && onRestorePastedText && (
+                      <button
+                        type="button"
+                        onClick={() => onRestorePastedText(index)}
+                        className="rounded px-1 text-[10px] text-claude-secondary hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
+                      >
+                        恢复文本
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {onRemoveAttachment && (
                   <button
                     type="button"
@@ -483,7 +556,8 @@ export function ChatInput({
                   </button>
                 )}
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -633,16 +707,13 @@ export function ChatInput({
                               <button
                                 type="button"
                                 role="menuitem"
-                                disabled={uploading}
                                 onClick={() => {
                                   setAddMenuPanel(null);
                                   fileInputRef.current?.click();
                                 }}
-                                className="flex min-h-11 w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-claude-text hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40 disabled:cursor-not-allowed disabled:opacity-50"
+                                className="flex min-h-11 w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-claude-text hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
                               >
-                                {uploading
-                                  ? <Loader2 className="h-5 w-5 animate-spin text-claude-secondary" />
-                                  : <FileUp className="h-5 w-5 text-claude-secondary" />}
+                                <FileUp className="h-5 w-5 text-claude-secondary" />
                                 <span className="flex-1">上传文件</span>
                               </button>
                             )}
@@ -848,31 +919,7 @@ export function ChatInput({
         </p>
       </div>
 
-      {previewImage && (
-        <div
-          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 backdrop-blur-sm p-6"
-          onClick={() => setPreviewImage(null)}
-        >
-          <div
-            className="relative max-w-[90vw] max-h-[90vh] bg-white rounded-2xl p-3"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <img
-              src={previewImage.src}
-              alt={previewImage.name}
-              className="max-w-[88vw] max-h-[82vh] object-contain rounded-xl"
-            />
-            <button
-              type="button"
-              onClick={() => setPreviewImage(null)}
-              className="absolute -top-2 -right-2 w-8 h-8 rounded-full bg-black text-white flex items-center justify-center"
-              aria-label="关闭图片预览"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
+      <DraftAttachmentPreview file={previewFile} onClose={() => setPreviewFile(null)} />
     </div>
   );
 }

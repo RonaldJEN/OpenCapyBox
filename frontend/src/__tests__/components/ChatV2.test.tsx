@@ -3,7 +3,7 @@ import { StrictMode, forwardRef, useImperativeHandle } from 'react';
 import { render, screen, fireEvent, waitFor, act } from '../utils/test-utils';
 import { ChatV2 } from '../../components/ChatV2';
 import { apiService } from '../../services/api';
-import { RoundData } from '../../types';
+import { type DraftUploadResult, RoundData } from '../../types';
 import { makeChatV2DefaultProps } from '../utils/chatv2-helpers';
 import { startSendStream } from '../../services/chatStreamClient';
 import {
@@ -43,6 +43,9 @@ vi.mock('../../services/api', () => ({
     sendMessageStreamV2: vi.fn(),
     resumeStream: vi.fn(),
     uploadFile: vi.fn(),
+    uploadDraftAttachment: vi.fn(),
+    removeDraftAttachment: vi.fn(),
+    claimDraftAttachments: vi.fn(),
     getRunningSessions: vi.fn(),
     createSession: vi.fn(),
     abortChat: vi.fn(),
@@ -175,7 +178,7 @@ vi.mock('../../services/chatStreamClient', async () => {
 
 // Mock 子组件
 vi.mock('../../components/Round', () => ({
-  Round: ({ round, isStreaming }: any) => (
+  Round: ({ round, isStreaming, preparing, userAttachments }: any) => (
     <div
       data-testid="round"
       data-assistant={round.final_response}
@@ -187,6 +190,7 @@ vi.mock('../../components/Round', () => ({
       <span>Round: {round.round_id}</span>
       <span>Streaming: {String(isStreaming)}</span>
       <span>User: {round.user_message}</span>
+      {preparing && <><span>正在准备请求...</span><span>{userAttachments.map((file: any) => file.name).join(',')}</span></>}
     </div>
   ),
 }));
@@ -346,6 +350,10 @@ describe('ChatV2 组件', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.clearAllMocks();
+    vi.stubGlobal('URL', {
+      createObjectURL: vi.fn(() => `blob:test-${crypto.randomUUID()}`),
+      revokeObjectURL: vi.fn(),
+    });
     vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(600);
     vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false })));
     Element.prototype.scrollTo = vi.fn(function (this: Element, options?: ScrollToOptions | number) {
@@ -370,6 +378,17 @@ describe('ChatV2 组件', () => {
     });
     vi.mocked(apiService.resumeStream).mockResolvedValue(undefined);
     vi.mocked(apiService.abortChat).mockResolvedValue(ABORT_RESPONSE);
+    vi.mocked(apiService.uploadDraftAttachment).mockImplementation(async (draftId, attachmentId, file) => ({
+      draft_id: draftId,
+      attachment_id: attachmentId,
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      sha256: 'test-sha256',
+      status: 'ready',
+    }));
+    vi.mocked(apiService.removeDraftAttachment).mockResolvedValue(undefined);
+    vi.mocked(apiService.claimDraftAttachments).mockResolvedValue([]);
     workspaceClient.get.mockResolvedValue({
       data: { items: [], next_cursor: null, workspace_revision: 1 },
     });
@@ -380,7 +399,7 @@ describe('ChatV2 组件', () => {
       <ChatV2
         sessionId=""
         {...defaultProps}
-        selectedModelId={undefined as unknown as string}
+        catalogDefaultModelId=""
         availableModels={[]}
       />,
     )).not.toThrow();
@@ -746,7 +765,7 @@ describe('ChatV2 组件', () => {
 
     expect(screen.queryByText('正在开启对话')).not.toBeInTheDocument();
     expect(screen.queryByText('开启中')).not.toBeInTheDocument();
-    expect(screen.getByText('你好，有什么可以帮你的？')).toBeInTheDocument();
+    expect(screen.getByTestId('chat-message-column')).toHaveTextContent('测试过渡消息');
 
     await act(async () => {
       resolveCreate('new-session-id');
@@ -886,7 +905,7 @@ describe('ChatV2 组件', () => {
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
 
     await waitFor(() => {
-      expect(textarea).toBeDisabled();
+      expect(textarea).not.toBeDisabled();
     });
 
     const chatArea = container.querySelector('.overflow-y-auto.relative.bg-claude-bg') as HTMLDivElement;
@@ -1099,7 +1118,8 @@ describe('ChatV2 组件', () => {
     await waitFor(() => expect(workspacePreviewControls.save).toHaveBeenCalledTimes(1));
     expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '发送消息' }).querySelector('.animate-spin')).not.toBeNull();
+    expect(screen.getByRole('button', { name: '发送消息' }).querySelector('.animate-spin')).toBeNull();
+    expect(screen.getByTestId('chat-message-column')).toHaveTextContent('正在准备请求...');
 
     await act(async () => resolveSave({ ok: true, stale: false }));
 
@@ -1434,12 +1454,14 @@ describe('ChatV2 组件', () => {
     });
   });
 
-  it('输入文本超过上限时应提示明确且不发送', async () => {
+  it.each([30000, 30001])('输入 %i 个 Unicode 码点时按三万上限发送或保留草稿', async (length) => {
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       rounds: [],
       session_id: 'test-session',
       total: 0,
     });
+
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
 
     render(
       <ChatV2
@@ -1448,7 +1470,7 @@ describe('ChatV2 组件', () => {
       />
     );
 
-    const longText = 'a'.repeat(10001);
+    const longText = '😀'.repeat(length);
     const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
 
     await act(async () => {
@@ -1459,10 +1481,17 @@ describe('ChatV2 组件', () => {
       fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
     });
 
-    expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
-    expect(textarea.value).toBe(longText);
-    expect(screen.getByText(/消息太长（10001 字）/)).toBeInTheDocument();
-    expect(screen.getByText(/当前最多支持 10000 字/)).toBeInTheDocument();
+    if (length === 30000) {
+      expect(apiService.sendMessageStreamV2).toHaveBeenCalledWith(
+        'test-session', [{ type: 'text', text: longText }], expect.any(Object),
+      );
+      expect(screen.queryByText(/消息太长/)).not.toBeInTheDocument();
+    } else {
+      expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
+      expect(textarea.value).toBe(longText);
+      expect(screen.getByText(/消息太长（30001 字）/)).toBeInTheDocument();
+      expect(screen.getByText(/当前最多支持 30000 字/)).toBeInTheDocument();
+    }
   });
 
   it('上传目标状态无法确认时应显示避免覆盖的明确提示', async () => {
@@ -1471,7 +1500,7 @@ describe('ChatV2 组件', () => {
       session_id: 'test-session',
       total: 0,
     });
-    vi.mocked(apiService.uploadFile).mockRejectedValue({
+    vi.mocked(apiService.uploadDraftAttachment).mockRejectedValue({
       response: {
         data: {
           detail: '文件保存失败: 无法确认上传目标是否存在: /home/user/sessions/test-session/report.txt',
@@ -1493,7 +1522,8 @@ describe('ChatV2 组件', () => {
       fireEvent.change(fileInput, { target: { files: [file] } });
     });
 
-    expect(await screen.findByText('文件上传失败：无法确认目标文件是否已存在。为避免覆盖已有文件，本次上传已取消，请稍后重试。')).toBeInTheDocument();
+    expect(await screen.findByText('上传失败')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument();
   });
 
   it('应该显示底部版权信息', async () => {
@@ -1580,14 +1610,8 @@ describe('ChatV2 组件', () => {
       session_id: targetSessionId,
       total: 0,
     }));
-    let resolveUpload!: (file: {
-      name: string;
-      path: string;
-      size: number;
-      modified: string;
-      type: string;
-    }) => void;
-    vi.mocked(apiService.uploadFile).mockImplementation(() => new Promise((resolve) => {
+    let resolveUpload!: (file: DraftUploadResult) => void;
+    vi.mocked(apiService.uploadDraftAttachment).mockImplementation(() => new Promise((resolve) => {
       resolveUpload = resolve;
     }));
 
@@ -1600,11 +1624,8 @@ describe('ChatV2 组件', () => {
     rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
     await act(async () => {
       resolveUpload({
-        name: 'session-a.txt',
-        path: 'session-a.txt',
-        size: 1,
-        modified: new Date().toISOString(),
-        type: 'text/plain',
+        attachment_id: 'attachment-a', draft_id: 'draft-a', sha256: 'sha', status: 'ready',
+        name: 'session-a.txt', size: 1, type: 'text/plain',
       });
     });
 
@@ -1620,14 +1641,8 @@ describe('ChatV2 组件', () => {
       total: 0,
     });
     vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
-    let resolveUpload!: (file: {
-      name: string;
-      path: string;
-      size: number;
-      modified: string;
-      type: string;
-    }) => void;
-    vi.mocked(apiService.uploadFile).mockImplementation(() => new Promise((resolve) => {
+    let resolveUpload!: (file: DraftUploadResult) => void;
+    vi.mocked(apiService.uploadDraftAttachment).mockImplementation(() => new Promise((resolve) => {
       resolveUpload = resolve;
     }));
 
@@ -1645,11 +1660,8 @@ describe('ChatV2 组件', () => {
 
     await act(async () => {
       resolveUpload({
-        name: 'pending.txt',
-        path: 'pending.txt',
-        size: 7,
-        modified: new Date().toISOString(),
-        type: 'text/plain',
+        attachment_id: 'attachment-pending', draft_id: 'draft-pending', sha256: 'sha', status: 'ready',
+        name: 'pending.txt', size: 7, type: 'text/plain',
       });
     });
 
@@ -1659,19 +1671,9 @@ describe('ChatV2 组件', () => {
     });
   });
 
-  it('欢迎页并发上传只能触发一次隐式建会话', async () => {
-    let resolveCreateSession!: (sessionId: string) => void;
-    const onCreateSession = vi.fn(() => new Promise<string>((resolve) => {
-      resolveCreateSession = resolve;
-    }));
+  it('欢迎页批量附件立即进入草稿队列且不隐式建会话', async () => {
+    const onCreateSession = vi.fn();
     const onSessionCreated = vi.fn();
-    vi.mocked(apiService.uploadFile).mockResolvedValue({
-      name: 'first.txt',
-      path: 'first.txt',
-      size: 5,
-      modified: new Date().toISOString(),
-      type: 'text/plain',
-    });
 
     const { container } = render(
       <ChatV2
@@ -1689,19 +1691,13 @@ describe('ChatV2 组件', () => {
       target: { files: [new File(['second'], 'second.txt', { type: 'text/plain' })] },
     });
 
-    expect(onCreateSession).toHaveBeenCalledTimes(1);
-    await act(async () => {
-      resolveCreateSession('created-session');
-    });
-
     await waitFor(() => {
-      expect(apiService.uploadFile).toHaveBeenCalledTimes(1);
-      expect(apiService.uploadFile).toHaveBeenCalledWith('created-session', expect.objectContaining({
-        name: 'first.txt',
-      }));
-      expect(onSessionCreated).toHaveBeenCalledTimes(1);
-      expect(onSessionCreated).toHaveBeenCalledWith('created-session');
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(2);
+      expect(screen.getByText('first.txt')).toBeInTheDocument();
+      expect(screen.getByText('second.txt')).toBeInTheDocument();
     });
+    expect(onCreateSession).not.toHaveBeenCalled();
+    expect(onSessionCreated).not.toHaveBeenCalled();
   });
 
   it('迟到的隐式建会话响应不应抢回用户已切换的会话', async () => {
@@ -1799,17 +1795,13 @@ describe('ChatV2 组件', () => {
       total: 0,
     }));
     vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
-    // A 会话的上传一直 pending，B 会话的上传正常完成
-    vi.mocked(apiService.uploadFile).mockImplementation((targetSessionId: string) => {
-      if (targetSessionId === 'session-a') return new Promise(() => {});
-      return Promise.resolve({
-        name: 'b.txt',
-        path: 'b.txt',
-        size: 1,
-        modified: new Date().toISOString(),
-        type: 'text/plain',
-      });
-    });
+    // 第一个草稿附件 pending，B 草稿的附件正常完成。
+    vi.mocked(apiService.uploadDraftAttachment)
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockImplementation(async (draftId, attachmentId, file) => ({
+        draft_id: draftId, attachment_id: attachmentId, name: file.name, size: file.size,
+        type: file.type, sha256: 'sha', status: 'ready',
+      }));
 
     const { container, rerender } = render(<ChatV2 sessionId="session-a" {...defaultProps} />);
     const fileInputA = container.querySelector('input[type="file"]') as HTMLInputElement;
@@ -1817,7 +1809,9 @@ describe('ChatV2 组件', () => {
       target: { files: [new File(['A'], 'a.txt', { type: 'text/plain' })] },
     });
     await waitFor(() => {
-      expect(apiService.uploadFile).toHaveBeenCalledWith('session-a', expect.any(File));
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledWith(
+        expect.any(String), expect.any(String), expect.objectContaining({ name: 'a.txt' }), expect.any(AbortSignal), expect.any(Function),
+      );
     });
 
     // A 上传仍 pending 时切换到 session-b
@@ -1830,22 +1824,15 @@ describe('ChatV2 组件', () => {
       target: { files: [new File(['B'], 'b.txt', { type: 'text/plain' })] },
     });
     await waitFor(() => {
-      expect(apiService.uploadFile).toHaveBeenCalledWith('session-b', expect.any(File));
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledWith(
+        expect.any(String), expect.any(String), expect.objectContaining({ name: 'b.txt' }), expect.any(AbortSignal), expect.any(Function),
+      );
       expect(screen.getByText('b.txt')).toBeInTheDocument();
     });
 
-    // B 上传完成后仍可正常发送
-    const sendButton = screen.getByRole('button', { name: '发送消息' });
+    // B 可继续编辑；A 的 pending 上传不应锁死另一个草稿。
     fireEvent.change(textareaB, { target: { value: 'B 消息' } });
-    expect(sendButton).toBeEnabled();
-    fireEvent.keyDown(textareaB, { key: 'Enter', shiftKey: false });
-    await waitFor(() => {
-      expect(apiService.sendMessageStreamV2).toHaveBeenCalledWith(
-        'session-b',
-        expect.any(Array),
-        expect.any(Object),
-      );
-    });
+    expect(textareaB).toHaveValue('B 消息');
   });
 
   it('从已有会话点击新建后应回到欢迎空状态', async () => {
@@ -1874,22 +1861,15 @@ describe('ChatV2 组件', () => {
     });
   });
 
-  it('隐式创建会话后应协调迁移正文、附件和统一偏好草稿', async () => {
+  it('欢迎页附件不隐式建会话，正文和本轮偏好保留在同一草稿', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
       rounds: [],
       session_id: targetSessionId,
       total: 0,
     }));
-    vi.mocked(apiService.uploadFile).mockResolvedValue({
-      name: 'combined.txt',
-      path: 'combined.txt',
-      size: 8,
-      modified: new Date().toISOString(),
-      type: 'text/plain',
-    });
     const onCreateSession = vi.fn().mockResolvedValue('new-session');
 
-    const { container, rerender } = render(
+    const { container } = render(
       <ChatV2 sessionId="" {...defaultProps} onCreateSession={onCreateSession} />,
     );
     fireEvent.click(screen.getByRole('button', { name: '添加内容' }));
@@ -1908,16 +1888,17 @@ describe('ChatV2 组件', () => {
     });
 
     await waitFor(() => {
-      expect(apiService.uploadFile).toHaveBeenCalledWith('new-session', expect.any(File));
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledWith(
+        expect.any(String), expect.any(String), expect.objectContaining({ name: 'combined.txt' }), expect.any(AbortSignal), expect.any(Function),
+      );
     });
-    rerender(<ChatV2 sessionId="new-session" {...defaultProps} onCreateSession={onCreateSession} />);
-
     await waitFor(() => {
-      expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('组合草稿');
+      expect(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...')).toHaveValue('组合草稿');
       expect(screen.getByText('combined.txt')).toBeInTheDocument();
       expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('PDF 处理');
       expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('东方财富数据');
     });
+    expect(onCreateSession).not.toHaveBeenCalled();
   });
 
   it('欢迎页创建会话后应该自动发送暂存消息', async () => {
@@ -1980,6 +1961,53 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('创建会话和 claim 等待期间立即展示提交，切换不串页，失败撤下并恢复后可重试', async () => {
+    let resolveCreate!: (id: string) => void;
+    let rejectClaim!: (error: Error) => void;
+    const onCreateSession = vi.fn(() => new Promise<string>((resolve) => { resolveCreate = resolve; }));
+    vi.mocked(apiService.claimDraftAttachments).mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectClaim = reject;
+    }));
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (id) => ({
+      session_id: id, model_id: 'test-model', rounds: [], total: 0,
+    }));
+    const { container, rerender } = render(<ChatV2 sessionId="" {...defaultProps} onCreateSession={onCreateSession} />);
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [new File(['zip'], 'early.zip', { type: 'application/zip' })] },
+    });
+    await screen.findByText('已就绪');
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '提前展示这条消息' } });
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(screen.getByTestId('chat-message-column')).toHaveTextContent('提前展示这条消息');
+    expect(screen.getByTestId('chat-message-column')).toHaveTextContent('early.zip');
+    expect(screen.getByText('正在准备请求...')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    expect(screen.getByRole('button', { name: '发送消息' }).querySelector('.animate-spin')).toBeNull();
+    expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
+
+    await act(async () => { resolveCreate('prepared-session'); });
+    rerender(<ChatV2 sessionId="prepared-session" {...defaultProps} onCreateSession={onCreateSession} />);
+    expect(screen.getByText('正在准备请求...')).toBeInTheDocument();
+    rerender(<ChatV2 sessionId="other-session" {...defaultProps} onCreateSession={onCreateSession} />);
+    expect(screen.queryByText('正在准备请求...')).not.toBeInTheDocument();
+    await act(async () => { rejectClaim(new Error('claim unavailable')); });
+    rerender(<ChatV2 sessionId="prepared-session" {...defaultProps} onCreateSession={onCreateSession} />);
+    expect(screen.getByRole('textbox')).toHaveValue('提前展示这条消息');
+    expect(screen.getByText('early.zip')).toBeInTheDocument();
+    expect(screen.queryByText('正在准备请求...')).not.toBeInTheDocument();
+    expect(container.querySelectorAll('[data-round-id]')).toHaveLength(0);
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+
+    vi.mocked(apiService.claimDraftAttachments).mockImplementation(async (_session, _draft, ids) => ids.map((id) => ({
+      attachment_id: id, name: 'early.zip', path: `attachments/${id}/early.zip`, size: 3,
+      modified: '', type: 'application/zip', composer_draft_attachment_id: id,
+    })));
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1));
+    expect(container.querySelectorAll('[data-round-id]')).toHaveLength(1);
+    expect(onCreateSession).toHaveBeenCalledTimes(1);
+  });
+
   it('欢迎页创建会话后若在 stream accepted 前被拒绝，应恢复统一偏好草稿', async () => {
     vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (targetSessionId: string) => ({
       rounds: [],
@@ -1991,9 +2019,16 @@ describe('ChatV2 组件', () => {
     vi.mocked(apiService.sendMessageStreamV2).mockImplementation(() => new Promise((_resolve, reject) => {
       rejectSend = reject;
     }));
+    vi.mocked(apiService.claimDraftAttachments).mockImplementation(async (_sessionId, _draftId, attachmentIds) => (
+      attachmentIds.map((attachmentId) => ({
+        attachment_id: attachmentId, name: 'retry.txt', path: `attachments/${attachmentId}/retry.txt`,
+        size: 5, type: 'text/plain', modified: new Date().toISOString(),
+        composer_draft_attachment_id: attachmentId,
+      }))
+    ));
     const onCreateSession = vi.fn().mockResolvedValue('new-session');
 
-    const { rerender } = render(
+    const { container, rerender } = render(
       <ChatV2
         sessionId=""
         {...defaultProps}
@@ -2011,6 +2046,10 @@ describe('ChatV2 组件', () => {
     fireEvent.click(await screen.findByText('东方财富数据'));
     expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('东方财富数据');
 
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [new File(['retry'], 'retry.txt', { type: 'text/plain' })] } });
+    await waitFor(() => expect(screen.getByText('retry.txt')).toBeInTheDocument());
+
     const textarea = screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...');
     fireEvent.change(textarea, { target: { value: '触发发送前拒绝' } });
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
@@ -2018,7 +2057,7 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(apiService.sendMessageStreamV2).toHaveBeenCalledWith(
         'new-session',
-        [{ type: 'text', text: '触发发送前拒绝' }],
+        expect.any(Array),
         expect.any(Object),
       );
     });
@@ -2042,7 +2081,9 @@ describe('ChatV2 组件', () => {
       expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('PDF 处理');
       expect(screen.getByLabelText('已选择本轮偏好')).toHaveTextContent('东方财富数据');
       expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('触发发送前拒绝');
+      expect(screen.getByText('retry.txt')).toBeInTheDocument();
     });
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
   });
 
   it('欢迎页连续提交两次时只创建并发送一次', async () => {
@@ -2148,6 +2189,98 @@ describe('ChatV2 组件', () => {
       expect(screen.getByTestId('question-card')).toBeInTheDocument();
       expect(screen.getByText(/resume failed/)).toBeInTheDocument();
     });
+  });
+
+  it('已有会话等待权威 history 模型时不能抢跑，水合后才按该模型发送', async () => {
+    let resolveHistory!: (value: any) => void;
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(() => new Promise((resolve) => {
+      resolveHistory = resolve;
+    }));
+    vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+    render(<ChatV2 sessionId="delayed-session" {...defaultProps} />);
+
+    const textarea = screen.getByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '只能等权威模型' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    expect(startSendStream).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveHistory({ rounds: [], session_id: 'delayed-session', model_id: 'test-model', total: 0 });
+    });
+    await waitFor(() => expect(screen.getByRole('button', { name: /选择模型，当前 Test Model/ })).toBeInTheDocument());
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    await waitFor(() => expect(startSendStream).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(startSendStream).mock.calls[0][0].modelId).toBe('test-model');
+  });
+
+  it('欢迎页未手选模型的草稿在切换其他会话模型后仍保留初始模型和推理草稿', async () => {
+    const otherModel = {
+      ...defaultProps.availableModels[0],
+      id: 'other-model',
+      name: 'Other Model',
+    };
+    vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sessionId) => ({
+      rounds: [],
+      session_id: sessionId,
+      model_id: 'other-model',
+      total: 0,
+    }));
+    const { rerender } = render(
+      <ChatV2 sessionId="" {...defaultProps} availableModels={[defaultProps.availableModels[0], otherModel]} />,
+    );
+    const welcomeTextarea = screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...');
+    await waitFor(() => expect(screen.getByRole('button', { name: /选择模型，当前 Test Model/ })).toBeInTheDocument());
+    fireEvent.change(welcomeTextarea, { target: { value: '欢迎页草稿' } });
+
+    rerender(
+      <ChatV2 sessionId="other-session" {...defaultProps} catalogDefaultModelId="other-model"
+        availableModels={[defaultProps.availableModels[0], otherModel]} />,
+    );
+    await waitFor(() => expect(screen.getByRole('button', { name: /选择模型，当前 Other Model/ })).toBeInTheDocument());
+
+    rerender(
+      <ChatV2 sessionId="" {...defaultProps} catalogDefaultModelId="other-model"
+        availableModels={[defaultProps.availableModels[0], otherModel]} />,
+    );
+    expect(await screen.findByPlaceholderText('输入你的问题，按 Enter 开始对话...')).toHaveValue('欢迎页草稿');
+    expect(screen.getByRole('button', { name: /选择模型，当前 Test Model/ })).toBeInTheDocument();
+  });
+
+  it('stream accepted 仅释放本次提交的附件 URL', async () => {
+    const onCreateSession = vi.fn().mockResolvedValue('accepted-session');
+    vi.mocked(URL.createObjectURL)
+      .mockReturnValueOnce('blob:submission-a')
+      .mockReturnValueOnce('blob:session-b');
+    vi.mocked(apiService.claimDraftAttachments).mockImplementation(async (_sessionId, _draftId, attachmentIds) => (
+      attachmentIds.map((attachmentId) => ({
+        attachment_id: attachmentId, name: 'accepted.txt', path: `attachments/${attachmentId}/accepted.txt`,
+        size: 2, type: 'text/plain', modified: new Date().toISOString(),
+        composer_draft_attachment_id: attachmentId,
+      }))
+    ));
+    let acceptSubmissionA: (() => void) | undefined;
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sessionId, _content, callbacks) => {
+      acceptSubmissionA = callbacks.onStreamAccepted;
+    });
+    const { container, rerender } = render(<ChatV2 sessionId="" {...defaultProps} onCreateSession={onCreateSession} />);
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [new File(['a'], 'submission-a.txt', { type: 'text/plain' })] } });
+    await waitFor(() => expect(screen.getByText('submission-a.txt')).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...'), { target: { value: '发送附件 A' } });
+    fireEvent.keyDown(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...'), { key: 'Enter', shiftKey: false });
+    await waitFor(() => expect(acceptSubmissionA).toBeTypeOf('function'));
+
+    rerender(<ChatV2 sessionId="session-b" {...defaultProps} onCreateSession={onCreateSession} />);
+    const fileInputB = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInputB, { target: { files: [new File(['b'], 'session-b.txt', { type: 'text/plain' })] } });
+    await waitFor(() => expect(screen.getByText('session-b.txt')).toBeInTheDocument());
+
+    await act(async () => {
+      acceptSubmissionA?.();
+    });
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:submission-a');
+    expect(URL.revokeObjectURL).not.toHaveBeenCalledWith('blob:session-b');
+    expect(screen.getByText('session-b.txt')).toBeInTheDocument();
   });
 
   it('连续 interaction_requested 应按 interaction id 重建问题卡本地状态', async () => {
@@ -2494,7 +2627,7 @@ describe('ChatV2 组件', () => {
 
     await waitFor(() => {
       const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
-      expect(textarea).toBeDisabled();
+      expect(textarea).not.toBeDisabled();
     });
   });
 
@@ -2654,31 +2787,27 @@ describe('ChatV2 组件', () => {
       vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
         rounds: [],
         session_id: 'test-session',
+        model_id: 'graded-model',
         total: 0,
       });
       vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
     });
 
     it('切换模型后按新模型目录默认值重置推理选择', async () => {
-      const { rerender } = render(
+      render(
         <ChatV2
-          sessionId="test-session"
+          sessionId=""
           {...defaultProps}
-          selectedModelId="graded-model"
+          catalogDefaultModelId="graded-model"
           availableModels={[gradedModel, switchModel]}
         />,
       );
 
       expect(await screen.findByRole('button', { name: /推理等级 High/ })).toBeInTheDocument();
 
-      rerender(
-        <ChatV2
-          sessionId="test-session"
-          {...defaultProps}
-          selectedModelId="switch-model"
-          availableModels={[gradedModel, switchModel]}
-        />,
-      );
+      fireEvent.click(screen.getByRole('button', { name: /选择模型，当前 Graded Model/ }));
+      fireEvent.click(await screen.findByRole('menuitem', { name: /^模型/ }));
+      fireEvent.click(await screen.findByRole('option', { name: /Switch Model/ }));
 
       expect(await screen.findByRole('button', { name: /推理等级 Off/ })).toBeInTheDocument();
     });
@@ -2688,7 +2817,7 @@ describe('ChatV2 组件', () => {
         <ChatV2
           sessionId="test-session"
           {...defaultProps}
-          selectedModelId="graded-model"
+          catalogDefaultModelId="graded-model"
           availableModels={[gradedModel]}
         />,
       );
@@ -2703,8 +2832,9 @@ describe('ChatV2 组件', () => {
         effort: 'high',
       });
 
-      // 会话已锁定模型，触发器直接展开推理等级面板。
+      // 只读模型下先进入根菜单，再进入推理等级子菜单。
       fireEvent.click(screen.getByRole('button', { name: /推理等级 High/ }));
+      fireEvent.click(await screen.findByRole('menuitem', { name: /推理等级 High/ }));
       fireEvent.click(await screen.findByRole('menuitemradio', { name: 'Max' }));
 
       expect(startSendStream).toHaveBeenCalledTimes(1);
@@ -2716,11 +2846,17 @@ describe('ChatV2 组件', () => {
     });
 
     it('目录默认强度不应把 provider_default 推断成 enabled', async () => {
+      vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+        rounds: [],
+        session_id: 'test-session',
+        model_id: 'provider-default-effort-model',
+        total: 0,
+      });
       render(
         <ChatV2
           sessionId="test-session"
           {...defaultProps}
-          selectedModelId="provider-default-effort-model"
+          catalogDefaultModelId="provider-default-effort-model"
           availableModels={[providerDefaultEffortModel]}
         />,
       );
@@ -2741,7 +2877,7 @@ describe('ChatV2 组件', () => {
         <ChatV2
           sessionId="test-session"
           {...defaultProps}
-          selectedModelId="graded-model"
+          catalogDefaultModelId="graded-model"
           availableModels={[gradedModel]}
         />,
       );
@@ -2751,6 +2887,7 @@ describe('ChatV2 组件', () => {
       textarea.focus();
 
       fireEvent.click(screen.getByRole('button', { name: /推理等级 High/ }));
+      fireEvent.click(await screen.findByRole('menuitem', { name: /推理等级 High/ }));
       fireEvent.click(await screen.findByRole('menuitemradio', { name: 'Off' }));
 
       expect(textarea).toHaveFocus();
@@ -2767,37 +2904,40 @@ describe('ChatV2 组件', () => {
       vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sessionId) => ({
         rounds: [],
         session_id: sessionId,
+        model_id: 'graded-model',
         total: 0,
       }));
       const { rerender } = render(
         <ChatV2
           sessionId="session-a"
           {...defaultProps}
-          selectedModelId="graded-model"
+          catalogDefaultModelId="graded-model"
           availableModels={[gradedModel]}
         />,
       );
 
       fireEvent.click(await screen.findByRole('button', { name: /推理等级 High/ }));
+      fireEvent.click(await screen.findByRole('menuitem', { name: /推理等级 High/ }));
       fireEvent.click(await screen.findByRole('menuitemradio', { name: 'Off' }));
 
       rerender(
         <ChatV2
           sessionId="session-b"
           {...defaultProps}
-          selectedModelId="graded-model"
+          catalogDefaultModelId="graded-model"
           availableModels={[gradedModel]}
         />,
       );
       expect(await screen.findByRole('button', { name: /推理等级 High/ })).toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: /推理等级 High/ }));
+      fireEvent.click(await screen.findByRole('menuitem', { name: /推理等级 High/ }));
       fireEvent.click(await screen.findByRole('menuitemradio', { name: 'Max' }));
 
       rerender(
         <ChatV2
           sessionId="session-a"
           {...defaultProps}
-          selectedModelId="graded-model"
+          catalogDefaultModelId="graded-model"
           availableModels={[gradedModel]}
         />,
       );
@@ -2815,7 +2955,7 @@ describe('ChatV2 组件', () => {
         <ChatV2
           sessionId="session-b"
           {...defaultProps}
-          selectedModelId="graded-model"
+          catalogDefaultModelId="graded-model"
           availableModels={[gradedModel]}
         />,
       );
@@ -2834,21 +2974,15 @@ describe('ChatV2 组件', () => {
       vi.mocked(apiService.getSessionHistoryV2).mockImplementation(async (sessionId) => ({
         rounds: [],
         session_id: sessionId,
+        model_id: 'graded-model',
         total: 0,
       }));
-      vi.mocked(apiService.uploadFile).mockResolvedValue({
-        name: 'reasoning.txt',
-        path: 'reasoning.txt',
-        size: 9,
-        modified: new Date().toISOString(),
-        type: 'text/plain',
-      });
       const onCreateSession = vi.fn().mockResolvedValue('new-session');
-      const { container, rerender } = render(
+      const { container } = render(
         <ChatV2
           sessionId=""
           {...defaultProps}
-          selectedModelId="graded-model"
+          catalogDefaultModelId="graded-model"
           availableModels={[gradedModel]}
           onCreateSession={onCreateSession}
         />,
@@ -2863,19 +2997,13 @@ describe('ChatV2 组件', () => {
         target: { files: [new File(['reasoning'], 'reasoning.txt', { type: 'text/plain' })] },
       });
       await waitFor(() => {
-        expect(apiService.uploadFile).toHaveBeenCalledWith('new-session', expect.any(File));
+        expect(apiService.uploadDraftAttachment).toHaveBeenCalledWith(
+          expect.any(String), expect.any(String), expect.objectContaining({ name: 'reasoning.txt' }), expect.any(AbortSignal), expect.any(Function),
+        );
       });
 
-      rerender(
-        <ChatV2
-          sessionId="new-session"
-          {...defaultProps}
-          selectedModelId="graded-model"
-          availableModels={[gradedModel]}
-          onCreateSession={onCreateSession}
-        />,
-      );
       expect(await screen.findByRole('button', { name: /推理等级 Off/ })).toBeInTheDocument();
+      expect(onCreateSession).not.toHaveBeenCalled();
     });
 
     it('会话标题栏始终显示动态聊天面板按钮', async () => {
@@ -2883,7 +3011,7 @@ describe('ChatV2 组件', () => {
         <ChatV2
           sessionId="test-session"
           {...defaultProps}
-          selectedModelId="graded-model"
+          catalogDefaultModelId="graded-model"
           availableModels={[gradedModel]}
         />,
       );
@@ -3502,7 +3630,7 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(screen.getByTitle('停止生成')).toBeInTheDocument();
     });
-    expect(textarea).toBeDisabled();
+    expect(textarea).not.toBeDisabled();
     expect(screen.getByText('停止请求失败，后端任务可能仍在运行')).toBeInTheDocument();
   });
 

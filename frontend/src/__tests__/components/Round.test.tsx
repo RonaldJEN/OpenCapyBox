@@ -563,7 +563,7 @@ describe('Round 组件', () => {
       name: '研究',
       is_directory: true,
       entry_id: 'folder-1',
-    }));
+    }), 0);
   });
 
   it('普通正文文件名没有结构化身份时不渲染卡片', () => {

@@ -75,7 +75,7 @@ vi.mock('../../services/configApi', () => ({
 }));
 
 vi.mock('../../components/SessionList', () => ({
-  SessionList: ({ isCollapsed, onOpenConfig, onOpenCron, onOpenSkills, onOpenConnections, activePrimarySurface, onSessionSelect, onModelChange, onNewChat, executingSessionIds, sidebarMode, onSidebarModeChange, onOpenWorkspaceEntry, mobileSheet, onCloseMobileSheet }: any) => (
+  SessionList: ({ isCollapsed, onOpenConfig, onOpenCron, onOpenSkills, onOpenConnections, activePrimarySurface, onSessionSelect, onNewChat, executingSessionIds, sidebarMode, onSidebarModeChange, onOpenWorkspaceEntry, mobileSheet, onCloseMobileSheet }: any) => (
     <div>
       <div data-testid="sidebar-state">{isCollapsed ? 'collapsed' : 'open'}</div>
       <div data-testid="executing-sessions">{Array.from(executingSessionIds ?? []).join(',')}</div>
@@ -92,7 +92,6 @@ vi.mock('../../components/SessionList', () => ({
       <button onClick={() => onSessionSelect?.('session-a')}>select-session-a</button>
       <button onClick={() => onSessionSelect?.('session-b')}>select-session-b</button>
       <button onClick={onNewChat}>new-chat</button>
-      <button onClick={() => onModelChange?.('qwen-plus')}>select-qwen-model</button>
       <button onClick={() => onSidebarModeChange?.('workspace')}>sidebar-workspace</button>
       <button onClick={() => onSidebarModeChange?.('sessions')}>sidebar-sessions</button>
       <button onClick={() => onOpenWorkspaceEntry?.({ entry_id: 'workspace-file', parent_id: null, name: 'report.md', kind: 'file', path: 'report.md', size_bytes: 10, mime_type: 'text/markdown', sha256: 'hash', revision: 1, status: 'active', created_at: 'now', updated_at: 'now' })}>open-workspace-file</button>
@@ -104,8 +103,9 @@ vi.mock('../../components/SessionList', () => ({
 vi.mock('../../components/ChatV2', () => ({
   ChatV2: ({
     sessionId,
-    selectedModelId,
+    catalogDefaultModelId,
     activeSlotSessionIds,
+    onDraftInteraction,
     onCreateSession,
     onSessionCreated,
     onFilesFullChange,
@@ -116,8 +116,9 @@ vi.mock('../../components/ChatV2', () => ({
     onWorkspaceFilesClose,
   }: {
     sessionId?: string;
-    selectedModelId?: string;
+    catalogDefaultModelId?: string;
     activeSlotSessionIds?: Set<string>;
+    onDraftInteraction?: () => void;
     onCreateSession?: (modelId?: string) => Promise<string>;
     onSessionCreated?: (sessionId: string) => void;
     onFilesFullChange?: (full: boolean) => void;
@@ -199,7 +200,7 @@ vi.mock('../../components/ChatV2', () => ({
       <div
         data-testid="chat-v2"
         data-session-id={sessionId}
-        data-selected-model-id={selectedModelId}
+        data-catalog-default-model-id={catalogDefaultModelId}
         data-active-slots={Array.from(activeSlotSessionIds ?? []).join(',')}
         data-workspace-entry-id={workspaceTargetResolving ? '' : workspaceFileTarget?.entry_id || ''}
         data-workspace-target-resolving={String(Boolean(workspaceTargetResolving))}
@@ -210,7 +211,10 @@ vi.mock('../../components/ChatV2', () => ({
           <input
             aria-label="ChatV2 草稿"
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              onDraftInteraction?.();
+            }}
           />
         </label>
         <button type="button" onClick={() => setWaiting(true)}>mock-waiting</button>
@@ -1002,7 +1006,7 @@ describe('App 配置抽屉交互', () => {
     expect(screen.getByTestId('permissions-refresh-token')).toHaveTextContent('2');
   });
 
-  it('模型列表较晚返回时不应覆盖已恢复的会话模型', async () => {
+  it('模型目录默认值独立于会话导航，回欢迎页仍使用目录默认', async () => {
     let resolveModels!: (value: {
       models: Array<{
         id: string;
@@ -1026,8 +1030,9 @@ describe('App 配置抽屉交互', () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByText('select-qwen-model'));
-    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-selected-model-id', 'qwen-plus');
+    fireEvent.click(screen.getByText('select-session-a'));
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-catalog-default-model-id', '');
 
     await act(async () => {
       resolveModels({
@@ -1064,7 +1069,9 @@ describe('App 配置抽屉交互', () => {
       });
     });
 
-    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-selected-model-id', 'qwen-plus');
+    fireEvent.click(screen.getByText('new-chat'));
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', '');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-catalog-default-model-id', 'glm-default');
   });
 
   it('挂载后应立即同步 running-sessions 并选中第一个运行中会话', async () => {
@@ -1083,6 +1090,63 @@ describe('App 配置抽屉交互', () => {
 
     expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-active-slots', 'session-a,session-b');
     expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', 'session-a');
+  });
+
+  it('/schedule 刷新时运行态只同步后台 slot，不能抢占一级页导航', async () => {
+    window.history.replaceState({}, '', '/schedule');
+    vi.mocked(apiService.getRunningSessions).mockResolvedValueOnce({
+      running_sessions: [{ session_id: 'session-a', round_id: 'round-a' }],
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('schedule-page')).toBeInTheDocument();
+      expect(screen.getByTestId('executing-sessions')).toHaveTextContent('session-a');
+    });
+    expect(window.location.pathname).toBe('/schedule');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', '');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-active-slots', 'session-a');
+  });
+
+  it('running-sessions 延迟返回时，用户已导航到日程不得被切回聊天', async () => {
+    const initialRunning = deferred<{ running_sessions: { session_id: string; round_id: string | null }[] }>();
+    vi.mocked(apiService.getRunningSessions).mockReturnValueOnce(initialRunning.promise);
+
+    render(<App />);
+    await waitFor(() => expect(apiService.getRunningSessions).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByText('open-cron'));
+    await waitFor(() => expect(window.location.pathname).toBe('/schedule'));
+
+    await act(async () => {
+      initialRunning.resolve({ running_sessions: [{ session_id: 'session-a', round_id: null }] });
+    });
+
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-active-slots', 'session-a'));
+    expect(window.location.pathname).toBe('/schedule');
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', '');
+  });
+
+  it('running-sessions 延迟返回时，欢迎页已有正文草稿不得被恢复导航覆盖', async () => {
+    const initialRunning = deferred<{ running_sessions: { session_id: string; round_id: string | null }[] }>();
+    vi.mocked(apiService.getRunningSessions).mockReturnValueOnce(initialRunning.promise);
+
+    render(<App />);
+    await waitFor(() => expect(apiService.getRunningSessions).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'ChatV2 草稿' }), {
+      target: { value: '欢迎页未发送正文' },
+    });
+
+    await act(async () => {
+      initialRunning.resolve({ running_sessions: [{ session_id: 'session-a', round_id: null }] });
+    });
+
+    await waitFor(() => expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-active-slots', 'session-a'));
+    expect(screen.getByTestId('chat-v2')).toHaveAttribute('data-session-id', '');
+    expect(screen.getByRole('textbox', { name: 'ChatV2 草稿' })).toHaveValue('欢迎页未发送正文');
+    expect(window.location.pathname).toBe('/');
   });
 
   it('初始 running-sessions 返回前手动选择会话时不应被自动切换覆盖', async () => {

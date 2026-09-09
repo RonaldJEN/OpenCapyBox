@@ -112,6 +112,15 @@
 
 ## 4. 行为语义与不变量
 
+### Web 每轮模型选择
+
+- `POST /api/chat/{session_id}/message/stream` 可提交可选 `model_id`。服务端按目标模型做可访问性、启用状态和本轮推理选择校验；省略时使用 `sessions.model_id`，新会话无该值时才解析用户默认模型。
+- 成功创建 direct Round 时，在同一事务写入 `rounds.model_id`、`rounds.model_display_name` 和 `sessions.model_id`。后者表示最近**已受理**的 direct Round；初始化失败、附件准备失败和幂等冲突都不得改变它。已有 Round 的两个快照保持 NULL，不回填。
+- `waiting_interaction`、运行中恢复和冷恢复始终读取原 Round 的 `model_id`；不得因后续发送请求的 `model_id` 或 Session 默认值改变而改用其他模型。子 Agent 使用 `subagent_default_model`，不改写主会话的最近模型。
+- AgentPool 缓存以 session 与模型身份共同判断可复用性。模型变化只摘除旧热实例并建立新实例；不得关闭仍在执行的实例、打断其后台命令或暂停共享用户沙箱。
+- 累计 checkpoint 记录其 `source_model_id`。跨模型恢复仍复用摘要与精确 suffix，工具调用和结果配对保持；来源模型不同或旧 checkpoint 的来源为 NULL 时，仅清除供应商/协议专属的 opaque replay metadata，不得丢弃摘要正文或永久退回全量事件重建。
+- 持久化和 Agent 内存历史保留原始图片/视频块；供应商请求只投影当前模型支持的媒体。切到不支持图片或视频的模型时，仅在该请求副本把不支持的历史媒体替换为“当前模型未接收该图片/视频”的文本标记，保留同消息文本、文件引用和 tool call/result 配对；不得借此触发摘要、截断或改写历史。切回支持该媒体的模型时，原始块必须重新可用。
+
 ### 配置驱动零硬编码
 
 - 所有模型行为由 DB 中的 `LLMModel` / `ModelConfig` 描述。

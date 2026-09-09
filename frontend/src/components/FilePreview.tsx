@@ -39,6 +39,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import mammoth from 'mammoth';
 import DOMPurify from 'dompurify';
+import { PlainTextPreview } from './file-preview/PlainTextPreview';
 import type { FileInfo } from '../types';
 import { apiService } from '../services/api';
 import { WorkspaceApiError, workspaceApi } from '../services/workspaceApi';
@@ -1819,9 +1820,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
         return renderSource(textContent, descriptor.language || descriptor.type, wrapLongLines);
       case 'text':
         return (
-          <div className="mx-auto max-w-4xl rounded-xl border border-black/[0.05] bg-white p-6 shadow-sm">
-            <pre className={`font-mono text-[13px] leading-6 text-claude-text ${wrapLongLines ? 'whitespace-pre-wrap break-words' : 'overflow-x-auto whitespace-pre'}`}>{textContent}</pre>
-          </div>
+          <PlainTextPreview text={textContent} />
         );
       case 'document':
         if (convertedPdfUrl) {
@@ -1915,7 +1914,9 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     : 'h-16 border-b border-black/[0.06] flex items-center justify-between gap-3 px-6 shrink-0 bg-white/90 backdrop-blur-xl';
   const isRenderedMarkdownWorkspace = descriptor.kind === 'markdown';
   const shouldFillViewport = ['markdown', 'html', 'pdf', 'document', 'spreadsheet', 'presentation'].includes(descriptor.kind);
-  const contentClassName = inline
+  const contentClassName = descriptor.kind === 'text'
+    ? 'flex-1 min-h-0 min-w-0 overflow-auto bg-white p-6 sm:p-8'
+    : inline
     ? shouldFillViewport
       ? `flex-1 min-h-0 min-w-0 overflow-hidden ${isRenderedMarkdownWorkspace ? 'bg-[#f1f1ef]' : 'bg-white'}`
       : 'flex-1 min-h-0 min-w-0 overflow-auto p-4 bg-claude-bg'
@@ -2004,8 +2005,8 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
           {supportsMarkdownEdit && markdownSaveError && (
             <button type="button" onClick={() => void handleSaveMarkdown()} disabled={savingMarkdown} className="rounded-md p-1.5 text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text disabled:cursor-wait disabled:opacity-50" title="重试保存 Markdown" aria-label="重试保存 Markdown"><Save size={16} aria-hidden="true" /></button>
           )}
-          {supportsWrapToggle && (
-            <button type="button" aria-label={wrapLongLines ? '关闭自动换行' : '开启自动换行'} aria-pressed={wrapLongLines} onClick={() => setWrapLongLines((value) => !value)} className={`rounded-md p-1.5 transition-colors hover:bg-claude-hover ${wrapLongLines ? 'text-claude-accent' : 'text-claude-muted'}`} title={wrapLongLines ? '关闭自动换行' : '开启自动换行'}><WrapText size={16} aria-hidden="true" /></button>
+          {descriptor.kind !== 'text' && supportsWrapToggle && (
+            <button type="button" aria-label={wrapLongLines ? '关闭自动换行' : '开启自动换行'} aria-pressed={wrapLongLines} onClick={() => setWrapLongLines(!wrapLongLines)} className={`rounded-md p-1.5 transition-colors hover:bg-claude-hover ${wrapLongLines ? 'text-claude-accent' : 'text-claude-muted'}`} title={wrapLongLines ? '关闭自动换行' : '开启自动换行'}><WrapText size={16} aria-hidden="true" /></button>
           )}
           {descriptor.kind === 'html' && viewMode === 'rendered' && (
             <button type="button" onClick={handleOpenHtml} className="rounded-md p-1.5 text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text" title="在新标签页中查看" aria-label="在新标签页中查看"><ExternalLink size={16} aria-hidden="true" /></button>

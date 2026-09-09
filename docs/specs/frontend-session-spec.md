@@ -10,7 +10,7 @@
 - 会话标题 + 讨论内容搜索
 - 新建 / 删除 / 切换会话
 - App 启动时检测运行中会话集合，并仅在首次恢复时自动选中第一个运行中会话
-- 切换会话时通知下游组件（`ChatV2` 重新加载，`ModelSelector` 同步）
+- 切换会话时通知 `ChatV2` 加载历史并恢复该会话的独立草稿
 
 **不职责**：
 - 会话内消息 → `ChatV2`（见 frontend-chat-spec）
@@ -24,7 +24,7 @@ const [refreshTrigger, setRefreshTrigger] = useState(0);         // 触发 Sessi
 const [optimisticSession, setOptimisticSession] = useState<Session | null>(null);
 const [executingSessionIds, setExecutingSessionIds] = useState<Set<string>>(() => new Set());
 const [activeSlotSessionIds, setActiveSlotSessionIds] = useState<Set<string>>(() => new Set());
-const [selectedModelId, setSelectedModelId] = useState<string>('');
+const [catalogDefaultModelId, setCatalogDefaultModelId] = useState<string>('');
 ```
 
 ## 3. 数据流
@@ -32,7 +32,7 @@ const [selectedModelId, setSelectedModelId] = useState<string>('');
 ```
 App 挂载
   → GET /api/sessions/running-sessions (reconcileRunningSessions, 立即一次 + 5s 周期)
-      → App 标记全部运行中 session 与 active slot，首次 reconcile 返回运行态且当前无 session 时自动 setCurrentSessionId(first)
+      → App 标记全部运行中 session 与 active slot，仅首次且仍持有初始 chat 根入口导航意图时恢复运行会话（见 §4.2）
 
 SessionList 挂载
   → GET /api/sessions/list             (loadSessions)
@@ -45,32 +45,34 @@ SessionList 挂载
 
 用户点击会话
   → onSessionSelect(sid, {roundId?})
-  → App 更新 currentSessionId + selectedModelId + scrollTarget
-  → ChatV2 检测 sessionId 变化 → loadHistory
+  → App 更新 currentSessionId + scrollTarget
+  → ChatV2 检测 sessionId 变化 → loadHistory → 初始化或恢复该会话的模型/推理草稿
   → 普通会话点击（无 roundId）定位到最新消息
   → 若 search result 带 match_round_id，则滚动到对应 round 并短暂高亮
 
 用户新建会话
   → onNewChat → App.setCurrentSessionId('')
   → ChatV2 显示欢迎页
-  → 用户输入第一条消息 → onCreateSession(modelId) → POST /api/sessions
+  → 用户显式发送第一条消息 → onCreateSession(modelId) → POST /api/sessions
   → App 立即写入 optimisticSession，由 SessionList 投影到本地列表
   → setCurrentSessionId(newSid) → sendMessage
 ```
 
 ## 4. 核心不变量
 
-### 4.1 新会话"输入即创建"
+### 4.1 新会话显式发送才创建
 
 **禁止**：点击"新建"立即创建空会话。
 
-**正确**：点击"新建" → `setCurrentSessionId('')` → 欢迎页 → 用户输入第一条消息时才 `POST /api/sessions`。
+**正确**：点击"新建" → `setCurrentSessionId('')` → 欢迎页 → 用户按 Enter 或点击发送时才 `POST /api/sessions`。编辑正文和上传草稿附件均不创建 Session。
 
 原因：避免大量空会话污染列表。
 
 ### 4.2 运行中会话集合由 App 统一收敛
 
-`SessionList` 不得请求 `/running-sessions`。运行态集合统一由 `App.reconcileRunningSessions` 维护：挂载后立即执行一次，之后 5s 周期执行。首次 reconcile 响应若返回运行态且 `currentSessionId` 为空时，可以自动选择第一个运行中会话；该自动选择机会只在首次 reconcile 响应中消耗一次。若首次响应为空，后续周期只同步运行态集合，不再自动切换当前会话，避免用户已在欢迎页或当前会话操作时被后台跳转打断。
+`SessionList` 不得请求 `/running-sessions`。运行态集合统一由 `App.reconcileRunningSessions` 维护：挂载后立即执行一次，之后 5s 周期执行。后台轮询始终只同步 slot/执行标记，不能成为导航来源。
+
+首次 reconcile 仅在**初始明确 chat 根入口**（`/`、无 `?session`）可尝试恢复第一个运行中会话。请求开始时捕获 App 级导航意图 epoch；响应回来前只要用户选择/新建对话、进入工作区或 Skills/日程/数据页、地址栏深链或路由发生变化，该 epoch 即失效，只同步运行态而不得跳转。欢迎页草稿的正文变更、附件选择/移除、模型或推理选择也必须通过 `onDraftInteraction` 失效该资格：它们虽不改 URL，已经表达了留在新对话的意图。`/?session=<id>` 已表达了深链选择，也不得被恢复逻辑覆盖。首次机会无论结果均只消耗一次；后续周期永不自动切换当前会话。
 
 ```ts
 useEffect(() => {
@@ -90,20 +92,15 @@ if (currentSessionId === sessionId) {
 }
 ```
 
-### 4.4 切换会话同步模型
+### 4.4 会话选择与草稿模型归属
 
-```ts
-onSessionSelect(session.id);
-if (session.model_id && onModelChange) {
-  onModelChange(session.model_id);   // ModelSelector 同步显示
-}
-```
+`SessionList` 只通过 `onSessionSelect(session.id)` 选择会话，不向 App 回写共享模型状态。App 只提供独立的模型目录默认值；模型与完整推理选择由 ChatV2 的会话草稿持有，已有会话首次初始化等待权威 history，后续列表刷新不覆盖草稿选择。
 
-原因：不同会话可能用不同模型，输入框工具栏的模型/推理选择器必须反映当前会话的模型。
-
-切换选中项只从已加载的本地列表同步模型，不得把 `currentSessionId` 加入列表请求 effect 的依赖。这样切换会话不会触发整表 loading、列表闪烁或“同步会话”动画。
+不得把 `currentSessionId` 加入列表请求 effect 的依赖。切换会话不触发整表 loading、列表闪烁或“同步会话”动画。
 
 ### 4.5 新会话乐观投影
+
+已建立会话以 `/?session=<id>` 保存当前选择，刷新和浏览器前进/后退按该身份重建历史，不创建新 Session。选择新对话回到 `/`；输入正文或上传临时附件均不得写入真实 Session URL。页面内切换保留独立草稿；完整刷新不承诺恢复未发送的本地 File/正文。
 
 `POST /api/sessions` 成功后，App 立即构造 `optimisticSession` 并传给 `SessionList`。非搜索状态下列表把该会话置顶并按 id 去重，不等待下一次全量刷新；搜索状态不得把不匹配的乐观项强行插入结果。
 

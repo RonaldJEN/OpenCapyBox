@@ -44,6 +44,7 @@ from .context_compaction import (
     is_compaction_model_fallback_error,
     is_context_window_error,
     normalize_history,
+    project_message_media_capabilities,
     truncate_tool_output,
 )
 from .schema.agui_events import (
@@ -735,7 +736,18 @@ class Agent:
         ``self.messages`` or ``conversation_messages``.
         """
         source_messages = self.messages if messages is None else messages
-        request_messages = [msg.model_copy(deep=True) for msg in source_messages]
+        request_messages = [
+            (
+                msg.model_copy(deep=True)
+                if msg.role == "system"
+                else project_message_media_capabilities(
+                    msg,
+                    supports_image=self.supports_image,
+                    supports_video=self.supports_video,
+                )
+            )
+            for msg in source_messages
+        ]
         runtime_context = self._build_runtime_context_block()
         dynamic_prompt = self._build_dynamic_runtime_prompt()
         if dynamic_prompt:

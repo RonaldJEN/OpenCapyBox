@@ -119,6 +119,8 @@ class RunStartedEvent(BaseEvent):
     thread_id: str = Field(..., alias="threadId")
     run_id: str = Field(..., alias="runId")
     parent_run_id: Optional[str] = Field(None, alias="parentRunId")
+    model_id: Optional[str] = Field(None, alias="modelId")
+    model_display_name: Optional[str] = Field(None, alias="modelDisplayName")
     preferred_skills: Optional[List[Dict[str, str]]] = Field(
         None,
         alias="preferredSkills",

@@ -45,6 +45,11 @@ interface PendingSurfaceAction {
   surface: PrimarySurface;
   beforeApply: () => void;
 }
+interface RunningSessionRestoreIntent {
+  epoch: number;
+  locationKey: string;
+  eligible: boolean;
+}
 type SessionScrollTarget = {
   sessionId: string;
   roundId: string;
@@ -98,6 +103,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   const navigate = useNavigate();
   const activeSurface = primarySurfaceForPath(location.pathname);
   const workspaceRouteActive = isWorkspacePath(location.pathname);
+  const routeSessionId = new URLSearchParams(location.search).get('session') || '';
   const workspaceRouteEntryId = workspaceRouteActive
     ? new URLSearchParams(location.search).get('entry')
     : null;
@@ -106,11 +112,12 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     getExecutingSessionIds,
     syncRunningSessions,
   } = useChatRuntime();
-  const [currentSessionId, setCurrentSessionId] = useState<string>('');
+  const [currentSessionId, setCurrentSessionId] = useState<string>(() =>
+    routeSessionId);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sessionFilesOwnsBoundary, setSessionFilesOwnsBoundary] = useState(false);
-  const [selectedModelId, setSelectedModelId] = useState<string>('');
+  const [catalogDefaultModelId, setCatalogDefaultModelId] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [optimisticSession, setOptimisticSession] = useState<Session | null>(null);
   const [activePanel, setActivePanel] = useState<ConfigPanel>(null);
@@ -158,6 +165,13 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   // (address bar edit, back/forward) can be handed back to the browser.
   const committedUrlRef = useRef('/');
   const initialRunningSessionsHandledRef = useRef(false);
+  // 后台运行态只能恢复首次明确进入的空 chat 入口。它不是导航来源：
+  // 任何后续路由或用户选择都会使这次异步恢复资格失效。
+  const runningSessionRestoreIntentRef = useRef<RunningSessionRestoreIntent>({
+    epoch: 0,
+    locationKey: `${location.pathname}${location.search}`,
+    eligible: activeSurface === 'chat' && !workspaceRouteActive && !routeSessionId,
+  });
   const pendingSurfaceActionRef = useRef<PendingSurfaceAction | null>(null);
   const mainContentRef = useRef<HTMLDivElement>(null);
   const primaryContentRef = useRef<HTMLDivElement>(null);
@@ -176,6 +190,26 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   );
   const unsavedConfirmSource: DirtySource | null = pendingNavigation?.source
     ?? (connectionsNavigationBlocker.state === 'blocked' ? 'connections' : null);
+
+  const invalidateRunningSessionRestore = useCallback(() => {
+    const previous = runningSessionRestoreIntentRef.current;
+    runningSessionRestoreIntentRef.current = {
+      ...previous,
+      epoch: previous.epoch + 1,
+      eligible: false,
+    };
+  }, []);
+
+  useEffect(() => {
+    const locationKey = `${location.pathname}${location.search}`;
+    const previous = runningSessionRestoreIntentRef.current;
+    if (previous.locationKey === locationKey) return;
+    runningSessionRestoreIntentRef.current = {
+      epoch: previous.epoch + 1,
+      locationKey,
+      eligible: false,
+    };
+  }, [location.pathname, location.search]);
 
   useEffect(() => {
     void startSessionDraftOutbox();
@@ -253,8 +287,11 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     pendingSurfaceActionRef.current = beforeApply
       ? { surface: target.surface, beforeApply }
       : null;
-    navigate(pathForPrimarySurface(target.surface));
-  }, [activePanel, activeSurface, applyActivePanel, navigate]);
+    invalidateRunningSessionRestore();
+    navigate(target.surface === 'chat' && currentSessionIdRef.current
+      ? `/?session=${encodeURIComponent(currentSessionIdRef.current)}`
+      : pathForPrimarySurface(target.surface));
+  }, [activePanel, activeSurface, applyActivePanel, invalidateRunningSessionRestore, navigate]);
 
   const requestNavigation = useCallback((target: NavigationTarget, beforeApply?: () => void) => {
     const changesSurface = target.kind === 'surface'
@@ -484,7 +521,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
         ? res.default_model
         : models[0]?.id || '';
       setAvailableModels(models);
-      setSelectedModelId((current) => current || defaultModelId);
+      setCatalogDefaultModelId(defaultModelId);
     }).catch((err) => {
       console.error('Failed to load models:', err);
     });
@@ -540,9 +577,10 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     };
   }, [workspaceCronWatchActive]);
 
-  const applySessionSelection = useCallback((sessionId: string, target?: { roundId: string }) => {
+  const applySessionSelection = useCallback((sessionId: string, target?: { roundId: string }, updateUrl = true) => {
     currentSessionIdRef.current = sessionId;
     setCurrentSessionId(sessionId);
+    if (updateUrl) navigate(sessionId ? `/?session=${encodeURIComponent(sessionId)}` : '/');
     if (target?.roundId) {
       setSessionScrollTarget({
         sessionId,
@@ -552,12 +590,14 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     } else {
       setSessionScrollTarget(null);
     }
-  }, []);
+  }, [navigate]);
 
   const saveThenSelectSession = useCallback((
     sessionId: string,
     target?: { roundId: string },
+    updateUrl = true,
   ) => {
+    invalidateRunningSessionRestore();
     const ownerSessionId = currentSessionIdRef.current;
     setSessionSwitchSaveError('');
 
@@ -577,8 +617,16 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
         }
       }
     }
-    applySessionSelection(sessionId, target);
-  }, [applySessionSelection]);
+    applySessionSelection(sessionId, target, updateUrl);
+  }, [applySessionSelection, invalidateRunningSessionRestore]);
+
+  useEffect(() => {
+    if (location.pathname !== '/') return;
+    const routeSessionId = new URLSearchParams(location.search).get('session') || '';
+    if (routeSessionId !== currentSessionIdRef.current) {
+      saveThenSelectSession(routeSessionId, undefined, false);
+    }
+  }, [location.pathname, location.search, saveThenSelectSession]);
 
   const flushCurrentSessionFiles = useCallback((): void => {
     const ownerSessionId = currentSessionIdRef.current;
@@ -596,6 +644,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     entry: WorkspaceEntry,
     options?: { replace?: boolean; preserveSidebarMode?: boolean },
   ) => {
+    invalidateRunningSessionRestore();
     const requestEpoch = ++workspaceOpenRequestEpochRef.current;
     setSessionSwitchSaveError('');
     flushCurrentSessionFiles();
@@ -607,7 +656,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     setWorkspaceFileTarget(entry.kind === 'file' ? { ...entry } : null);
     const params = new URLSearchParams({ entry: entry.entry_id });
     navigate(`/workspace?${params.toString()}`, { replace: options?.replace });
-  }, [flushCurrentSessionFiles, navigate]);
+  }, [flushCurrentSessionFiles, invalidateRunningSessionRestore, navigate]);
 
   const handleWorkspaceTabSelect = useCallback((entry: WorkspaceEntry, options?: { replace?: boolean }) => {
     void openWorkspaceEntry(entry, { ...options, preserveSidebarMode: true });
@@ -740,7 +789,6 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
       runAfterWorkspaceFlush(() => {
         setSidebarMode('sessions');
         setWorkspaceFileTarget(null);
-        if (workspaceRouteActive) navigate('/');
         void saveThenSelectSession(sessionId, target);
       });
     });
@@ -751,7 +799,6 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
       runAfterWorkspaceFlush(() => {
         setSidebarMode('sessions');
         setWorkspaceFileTarget(null);
-        if (workspaceRouteActive) navigate('/');
         void saveThenSelectSession('');
       });
     });
@@ -775,6 +822,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   }, [navigate, requestPrimarySurface, workspaceRouteActive]);
 
   const reconcileRunningSessions = useCallback(async () => {
+    const restoreIntent = runningSessionRestoreIntentRef.current;
     try {
       const result = await apiService.getRunningSessions();
       const sessionIds = result.running_sessions.map((item) => item.session_id);
@@ -782,17 +830,23 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
 
       if (!initialRunningSessionsHandledRef.current) {
         initialRunningSessionsHandledRef.current = true;
-        if (!currentSessionIdRef.current && sessionIds.length > 0) {
+        const latestIntent = runningSessionRestoreIntentRef.current;
+        const restoreStillOwnsNavigation = restoreIntent.eligible
+          && latestIntent.eligible
+          && latestIntent.epoch === restoreIntent.epoch
+          && latestIntent.locationKey === '/';
+        if (!currentSessionIdRef.current && sessionIds.length > 0 && restoreStillOwnsNavigation) {
           console.log(`🔄 检测到运行中的会话: ${sessionIds.join(', ')}`);
           currentSessionIdRef.current = sessionIds[0];
           setCurrentSessionId(sessionIds[0]);
+          navigate(`/?session=${encodeURIComponent(sessionIds[0])}`, { replace: true });
           setSessionScrollTarget(null);
         }
       }
     } catch (error) {
       console.error('Failed to reconcile running sessions:', error);
     }
-  }, [syncRunningSessions]);
+  }, [navigate, syncRunningSessions]);
 
   useEffect(() => {
     void reconcileRunningSessions();
@@ -803,8 +857,9 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     return () => clearInterval(timer);
   }, [reconcileRunningSessions]);
 
-  // 🆕 从 ChatV2 欢迎页触发创建会话（输入即创建）
+  // Welcome drafts create a durable Session only on explicit send.
   const handleCreateSessionForChat = useCallback(async (modelId?: string): Promise<string> => {
+    invalidateRunningSessionRestore();
     const response = await apiService.createSession(modelId);
     const now = new Date().toISOString();
     setOptimisticSession({
@@ -817,16 +872,18 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
       model_id: response.model_id || modelId,
     });
     return response.session_id;
-  }, []);
+  }, [invalidateRunningSessionRestore]);
 
   const handleSessionCreatedForChat = useCallback((sessionId: string) => {
     // The user may have selected another session while creation was in flight.
     // Only activate the created session while the welcome composer is still active.
     if (currentSessionIdRef.current) return;
+    invalidateRunningSessionRestore();
     currentSessionIdRef.current = sessionId;
     setCurrentSessionId(sessionId);
+    navigate(`/?session=${encodeURIComponent(sessionId)}`, { replace: true });
     setSessionScrollTarget(null);
-  }, []);
+  }, [invalidateRunningSessionRestore, navigate]);
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -850,7 +907,6 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
             optimisticSession={optimisticSession}
             executingSessionIds={executingSessionIds}
             isCollapsed={effectiveSidebarCollapsed}
-            onModelChange={setSelectedModelId}
             onNewChat={() => { setMobileSidebarOpen(false); handleNewChat(); }}
             cronUnreadCount={cronUnreadCount}
             onOpenConfig={() => { setMobileSidebarOpen(false); toggleSettingsPanel(); }}
@@ -912,8 +968,8 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
           >
             <ChatV2
               sessionId={currentSessionId}
-              selectedModelId={selectedModelId}
-              onModelChange={setSelectedModelId}
+              catalogDefaultModelId={catalogDefaultModelId}
+              onDraftInteraction={invalidateRunningSessionRestore}
               availableModels={availableModels}
               onCreateSession={handleCreateSessionForChat}
               onSessionCreated={handleSessionCreatedForChat}

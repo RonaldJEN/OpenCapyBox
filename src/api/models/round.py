@@ -71,6 +71,10 @@ class Round(Base):
     # 用戶附件（JSON 字符串，保存 path/name/mime_type 等）
     user_attachments = Column(Text, nullable=True)
 
+    # 本轮实际使用的模型身份快照；旧 Round 保持 NULL，不从 Session 回填。
+    model_id = Column(String(100), nullable=True, index=True)
+    model_display_name = Column(String(200), nullable=True)
+
     # 本轮已解析且实际可用的 Preferred Skills 展示快照。
     # JSON 数组项固定为 {"key": str, "display_name": str}；旧数据为 NULL。
     preferred_skills = Column(Text, nullable=True)

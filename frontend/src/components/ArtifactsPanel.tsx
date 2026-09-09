@@ -350,6 +350,8 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
 
   const goBack = () => {
     updateSessionState((current) => {
+      // 文件预览位于当前目录之内，先返回列表，再回退目录历史。
+      if (current.activePath) return { ...current, activePath: null };
       if (current.historyIndex <= 0) return current;
       const remembered = rememberCurrentListScroll(current);
       const nextIndex = remembered.historyIndex - 1;
@@ -635,82 +637,152 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
     return next;
   });
   const currentDownload = directoryDownload;
-  const shortSessionId = sessionId.length > 12
-    ? `${sessionId.substring(0, 8)}...`
-    : sessionId;
   const displayPath = currentPath
-    ? `~/sessions/${shortSessionId}/${currentPath}`
-    : `~/sessions/${shortSessionId}`;
+    ? `~/sessions/${sessionId}/${currentPath}`
+    : `~/sessions/${sessionId}`;
 
-  const headerClassName = variant === 'workspace'
-    ? 'flex h-14 shrink-0 items-center border-b border-claude-border bg-white px-3'
-    : 'border-b border-claude-border px-4 py-3';
+  const breadcrumbParts = currentPath.split('/').filter(Boolean);
 
   const content = (
     <div className="relative flex h-full min-h-0 w-full min-w-0 flex-col bg-white">
       <div
-        className={headerClassName}
+        className="shrink-0 border-b border-claude-border bg-white px-3"
         data-testid={variant === 'workspace' ? 'session-files-toolbar' : undefined}
       >
-        <div className="flex w-full items-center gap-1">
-          <button
-            type="button"
-            onClick={goBack}
-            disabled={historyIndex <= 0}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover disabled:cursor-not-allowed disabled:opacity-30"
-            title="后退"
-            aria-label="后退"
-          >
-            <ChevronLeft size={15} aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            onClick={goForward}
-            disabled={historyIndex >= pathHistory.length - 1}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover disabled:cursor-not-allowed disabled:opacity-30"
-            title="前进"
-            aria-label="前进"
-          >
-            <ChevronRight size={15} aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            onClick={goUp}
-            disabled={!currentPath}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover disabled:cursor-not-allowed disabled:opacity-30"
-            title="上级目录"
-            aria-label="上级目录"
-          >
-            <ArrowUp size={15} aria-hidden="true" />
-          </button>
-          <button
-            ref={directoryButtonRef}
-            type="button"
-            onClick={showDirectory}
-            className={`inline-flex h-8 w-8 items-center justify-center rounded-md transition-colors ${
-              activePath ? 'text-claude-muted hover:bg-claude-hover' : 'bg-claude-hover text-claude-text'
-            }`}
-            title="查看目录"
-            aria-label="查看目录"
-            aria-pressed={!activePath}
-          >
-            <FolderTree size={15} aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            onClick={() => void loadDir(currentPath)}
-            disabled={loading}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text disabled:cursor-wait disabled:opacity-45"
-            title="刷新当前目录"
-            aria-label="刷新当前目录"
-          >
-            <RotateCcw size={14} className={loading ? 'animate-spin' : ''} aria-hidden="true" />
-          </button>
-          {openTabs.length > 0 ? (
+        <div className="session-files-toolbar-grid">
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={goBack}
+              disabled={!activePath && historyIndex <= 0}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover disabled:cursor-not-allowed disabled:opacity-30"
+              title="后退"
+              aria-label="后退"
+            >
+              <ChevronLeft size={15} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={goForward}
+              disabled={historyIndex >= pathHistory.length - 1}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover disabled:cursor-not-allowed disabled:opacity-30"
+              title="前进"
+              aria-label="前进"
+            >
+              <ChevronRight size={15} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={goUp}
+              disabled={!currentPath}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover disabled:cursor-not-allowed disabled:opacity-30"
+              title="上级目录"
+              aria-label="上级目录"
+            >
+              <ArrowUp size={15} aria-hidden="true" />
+            </button>
+            <button
+              ref={directoryButtonRef}
+              type="button"
+              onClick={showDirectory}
+              className={`inline-flex h-8 w-8 items-center justify-center rounded-md transition-colors ${
+                activePath ? 'text-claude-muted hover:bg-claude-hover' : 'bg-claude-hover text-claude-text'
+              }`}
+              title="查看目录"
+              aria-label="查看目录"
+              aria-pressed={!activePath}
+            >
+              <FolderTree size={15} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={() => void loadDir(currentPath)}
+              disabled={loading}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text disabled:cursor-wait disabled:opacity-45"
+              title="刷新当前目录"
+              aria-label="刷新当前目录"
+            >
+              <RotateCcw size={14} className={loading ? 'animate-spin' : ''} aria-hidden="true" />
+            </button>
+          </div>
+          <nav aria-label="文件位置" className="flex min-w-0 items-center gap-1 overflow-x-auto text-xs text-claude-secondary">
+            <button
+              type="button"
+              onClick={() => navigateTo('')}
+              aria-current={!currentPath ? 'location' : undefined}
+              className="shrink-0 rounded px-1 py-2 hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-claude-accent/45"
+            >
+              会话文件
+            </button>
+            {breadcrumbParts.map((part, index) => (
+              <span key={breadcrumbParts.slice(0, index + 1).join('/')} className="flex min-w-0 shrink-0 items-center gap-1">
+                <ChevronRight size={12} aria-hidden="true" />
+                <button
+                  type="button"
+                  onClick={() => navigateTo(breadcrumbParts.slice(0, index + 1).join('/'))}
+                  aria-current={index === breadcrumbParts.length - 1 ? 'location' : undefined}
+                  title={part}
+                  className="max-w-40 truncate rounded px-1 py-2 hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-claude-accent/45"
+                >
+                  {part}
+                </button>
+              </span>
+            ))}
+          </nav>
+          {!activeFile && (
+            <div className="session-files-toolbar-secondary session-files-directory-search flex h-9 min-w-0 items-center gap-2 rounded-lg border border-claude-border-strong bg-white px-2.5 transition-colors focus-within:border-claude-accent focus-within:ring-2 focus-within:ring-claude-accent/15">
+              <Search size={15} className="shrink-0 text-claude-secondary" aria-hidden="true" />
+              <input
+                type="text"
+                role="searchbox"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape' && searchQuery) {
+                    event.preventDefault();
+                    setSearchQuery('');
+                  }
+                }}
+                disabled={loading || Boolean(loadError)}
+                aria-label="搜索此文件夹"
+                aria-controls="artifacts-file-list"
+                placeholder="搜索此文件夹…"
+                autoComplete="off"
+                className="min-w-0 flex-1 bg-transparent text-[13px] text-claude-text outline-none placeholder:text-claude-secondary disabled:cursor-not-allowed"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45"
+                  aria-label="清空搜索"
+                  title="清空搜索"
+                >
+                  <X size={12} aria-hidden="true" />
+                </button>
+              )}
+            </div>
+          )}
+          <div className="session-files-toolbar-actions flex items-center gap-1">
+            {variant === 'workspace' && onToggleExpanded && (
+              <SessionFilesExpandButton expanded={isExpanded} onToggle={onToggleExpanded} />
+            )}
+            {!activeFile && <button type="button" onClick={() => void handleDirectoryDownload(currentPath)} disabled={directoryDownload?.pending || loading || Boolean(loadError)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45 disabled:opacity-40" title="下载当前文件夹（ZIP）" aria-label="下载当前文件夹（ZIP）"><Download size={15} aria-hidden="true" /></button>}
+            <button
+              type="button"
+              onClick={() => requestPanelClose(true)}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45"
+              aria-label="关闭所有文件"
+              title="关闭所有文件"
+            >
+              <X size={15} aria-hidden="true" />
+            </button>
+          </div>
+          {activeFile && openTabs.length > 0 && (
             <div
               role="tablist"
               aria-label="已打开文件"
-              className="ml-1 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
+              className="session-files-toolbar-secondary flex h-12 min-w-0 items-center gap-1 overflow-x-auto"
             >
               {openTabs.map((tab) => {
                 const tabPath = normalizePathForCompare(tab.path);
@@ -753,27 +825,7 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
                 );
               })}
             </div>
-          ) : (
-            <div
-              className="ml-1 flex h-8 min-w-0 flex-1 items-center truncate rounded-md bg-claude-surface px-2.5 text-[11px] font-mono text-claude-muted select-all"
-              title={displayPath}
-            >
-              {displayPath}
-            </div>
           )}
-          {variant === 'workspace' && onToggleExpanded && (
-            <SessionFilesExpandButton expanded={isExpanded} onToggle={onToggleExpanded} />
-          )}
-          {!activeFile && <button type="button" onClick={() => void handleDirectoryDownload(currentPath)} disabled={directoryDownload?.pending || loading || Boolean(loadError)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-claude-muted hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45 disabled:opacity-40" title="下载当前文件夹（ZIP）" aria-label="下载当前文件夹（ZIP）"><Download size={15} aria-hidden="true" /></button>}
-          <button
-            type="button"
-            onClick={() => requestPanelClose(true)}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45"
-            aria-label="关闭所有文件"
-            title="关闭所有文件"
-          >
-            <X size={15} aria-hidden="true" />
-          </button>
         </div>
       </div>
 
@@ -782,40 +834,6 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
         className={`${activeFile ? 'hidden' : 'flex'} min-h-0 flex-1 flex-col`}
         aria-hidden={Boolean(activeFile)}
       >
-          <div className="shrink-0 px-3 pt-3">
-            <div className="flex h-9 items-center gap-2 rounded-lg border border-claude-border bg-claude-surface/45 px-2.5 transition-colors focus-within:border-claude-accent/55 focus-within:bg-white focus-within:ring-2 focus-within:ring-claude-accent/15">
-              <Search size={14} className="shrink-0 text-claude-muted" aria-hidden="true" />
-              <input
-                type="text"
-                role="searchbox"
-                value={searchQuery}
-                onChange={(event) => setSearchQuery(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Escape' && searchQuery) {
-                    event.preventDefault();
-                    setSearchQuery('');
-                  }
-                }}
-                disabled={loading || Boolean(loadError)}
-                aria-label="搜索当前目录"
-                aria-controls="artifacts-file-list"
-                placeholder="搜索当前目录"
-                autoComplete="off"
-                className="min-w-0 flex-1 bg-transparent text-[13px] text-claude-text outline-none placeholder:text-claude-muted/75 disabled:cursor-not-allowed"
-              />
-              {searchQuery && (
-                <button
-                  type="button"
-                  onClick={() => setSearchQuery('')}
-                  className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-claude-muted transition-colors hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45"
-                  aria-label="清空搜索"
-                  title="清空搜索"
-                >
-                  <X size={12} aria-hidden="true" />
-                </button>
-              )}
-            </div>
-          </div>
           <div
             ref={listScrollRef}
             id="artifacts-file-list"
@@ -923,7 +941,7 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
             <span aria-live="polite">
               {normalizedSearchQuery ? `${visibleItems.length} / ${items.length} 项` : `${items.length} 项`}
             </span>
-            <span className="ml-2 truncate font-mono" title={displayPath}>{displayPath}</span>
+            <span className="ml-2 truncate font-mono select-all" title={displayPath}>{displayPath}</span>
           </div>
       </div>
 

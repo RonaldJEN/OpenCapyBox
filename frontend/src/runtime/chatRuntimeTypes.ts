@@ -53,6 +53,7 @@ export interface HistoryLoadedAction {
   sessionId: string;
   rounds: RoundData[];
   loadedAt: number;
+  modelId?: string | null;
   source: 'history';
 }
 
@@ -91,6 +92,7 @@ export interface ChatRunRuntimeState {
 }
 
 export interface ChatSessionRuntimeState {
+  modelId?: string | null;
   rounds: RoundData[];
   pendingInterrupt: InterruptDetails | null;
   error: string;
@@ -157,6 +159,9 @@ export interface ChatSessionProjection extends ChatSessionRuntimeState {
 
 export interface SendMessageInput {
   sessionId: string;
+  submission?: { id: string; createdAt: string };
+  modelId?: string;
+  modelDisplayName?: string;
   displayMessage: string;
   content: ChatContentBlock[];
   attachments?: FileInfo[];

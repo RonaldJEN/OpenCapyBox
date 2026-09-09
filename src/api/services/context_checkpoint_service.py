@@ -25,6 +25,7 @@ class LoadedContextCheckpoint:
     checkpoint_id: str
     generation: int
     source_round_id: str | None
+    source_model_id: str | None
     source_message_sequence: int
     source_event_sequence: int
     trigger_phase: str
@@ -79,6 +80,7 @@ class ContextCheckpointService:
                 checkpoint_id=row.checkpoint_id,
                 generation=int(row.generation),
                 source_round_id=row.source_round_id,
+                source_model_id=row.source_model_id,
                 source_message_sequence=int(row.source_message_sequence or 0),
                 source_event_sequence=int(row.source_event_sequence or 0),
                 trigger_phase=str(row.trigger_phase or "pre_turn"),
@@ -97,6 +99,7 @@ class ContextCheckpointService:
         *,
         session_id: str,
         source_round_id: str | None,
+        source_model_id: str | None = None,
         source_message_sequence: int = 0,
         source_event_sequence: int = 0,
         trigger_phase: str = "pre_turn",
@@ -123,6 +126,7 @@ class ContextCheckpointService:
             session_id=session_id,
             generation=generation,
             source_round_id=source_round_id,
+            source_model_id=source_model_id,
             source_message_sequence=max(int(source_message_sequence or 0), 0),
             source_event_sequence=max(int(source_event_sequence or 0), 0),
             trigger_phase=trigger_phase,
@@ -143,6 +147,7 @@ class ContextCheckpointService:
             checkpoint_id=row.checkpoint_id,
             generation=generation,
             source_round_id=source_round_id,
+            source_model_id=source_model_id,
             source_message_sequence=row.source_message_sequence,
             source_event_sequence=row.source_event_sequence,
             trigger_phase=trigger_phase,

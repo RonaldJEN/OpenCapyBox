@@ -71,6 +71,8 @@ export interface RunStartedEvent extends AGUIBaseEvent {
   threadId: string;
   runId: string;
   parentRunId?: string;
+  modelId?: string | null;
+  modelDisplayName?: string | null;
   preferredSkills?: PreferredSkillSnapshot[];
   preferredMcpConnections?: PreferredMcpConnectionSnapshot[];
 }
@@ -300,6 +302,7 @@ export interface ImageContentBlock {
     url: string;
   };
   file?: {
+    composer_draft_attachment_id?: string;
     path: string;
     name?: string;
     mime_type?: string;
@@ -320,6 +323,7 @@ export interface FileContentBlock {
 }
 
 export interface SessionChatFileObject {
+  composer_draft_attachment_id?: string;
   source?: "session";
   path: string;
   name?: string;
@@ -516,6 +520,8 @@ export type AssistantFileReference = {
 // 对话轮次
 export interface RoundData {
   round_id: string;
+  model_id?: string | null;
+  model_display_name?: string | null;
   idempotency_key?: string | null;
   last_event_sequence?: number;
   user_message: string;
@@ -538,6 +544,7 @@ export interface RoundData {
 // 历史记录响应 V2
 export interface HistoryResponseV2 {
   session_id: string;
+  model_id?: string | null;
   rounds: RoundData[];
   total: number;
 }
@@ -551,6 +558,7 @@ export interface PendingFileDraftInfo {
 }
 
 export interface FileInfo {
+  composer_draft_attachment_id?: string;
   name: string;
   path: string;
   session_id?: string;
@@ -596,6 +604,28 @@ export type ChatFile = FileInfo & (
     workspace_path: string;
   }
 );
+
+/** Local composer ownership exists before a server Session or Round. */
+export type ComposerAttachment = ChatFile & {
+  clientId?: string;
+  draftId?: string;
+  uploadStatus?: 'waiting' | 'uploading' | 'saving' | 'ready' | 'error';
+  uploadProgress?: number;
+  uploadError?: string;
+  localFile?: File;
+  pastedText?: string;
+  previewUrl?: string;
+};
+
+export interface DraftUploadResult {
+  attachment_id: string;
+  draft_id: string;
+  name: string;
+  size: number;
+  type: string;
+  sha256: string;
+  status: 'ready';
+}
 
 // 文件列表响应
 export interface FileListResponse {

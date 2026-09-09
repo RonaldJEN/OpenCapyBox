@@ -37,6 +37,7 @@ from .mcp import (
 )
 from .tool_permission import ToolPermissionRule, ToolApprovalRequest, ToolPermissionAudit
 from .sandbox_cleanup import SandboxCleanupJob
+from .composer_draft_attachment import ComposerDraftAttachment
 from .workspace import (
     UserWorkspace,
     WorkspaceChangeSet,

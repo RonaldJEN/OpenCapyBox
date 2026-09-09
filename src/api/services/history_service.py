@@ -141,6 +141,9 @@ class HistoryService:
         preferred_mcp_connections: Optional[List[Dict[str, str]]] = None,
         thinking_mode: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        model_id: Optional[str] = None,
+        model_display_name: Optional[str] = None,
+        update_session_model: bool = False,
         idempotency_key: Optional[str] = None,
         parent_run_id: Optional[str] = None,
     ) -> Round:
@@ -149,6 +152,14 @@ class HistoryService:
         若 idempotency_key 觸發唯一約束衝突，返回已有的 Round（其 id != round_id）。
         調用方可通過比較 returned_round.id != round_id 判斷是否為重複請求。
         """
+        if any(item.get("composer_draft_attachment_id") for item in (user_attachments or [])):
+            from src.api.services.composer_draft_attachment_service import ComposerDraftAttachmentService
+
+            owner = self.db.query(Session.user_id).filter(Session.id == session_id).scalar()
+            ComposerDraftAttachmentService(self.db).assert_claimed_blocks(
+                user_id=owner, session_id=session_id,
+                blocks=[{"file": item} for item in user_attachments], bind=True,
+            )
         round_obj = Round(
             id=round_id,
             session_id=session_id,
@@ -186,11 +197,20 @@ class HistoryService:
             ),
             thinking_mode=thinking_mode,
             reasoning_effort=reasoning_effort,
+            model_id=model_id,
+            model_display_name=model_display_name,
             status="running",
             idempotency_key=idempotency_key,
             parent_run_id=parent_run_id,
         )
         self.db.add(round_obj)
+        if update_session_model:
+            session = self.db.query(Session).filter(Session.id == session_id).first()
+            if session is None:
+                self.db.rollback()
+                raise ValueError(f"Session not found: {session_id}")
+            session.model_id = model_id
+            session.updated_at = now_naive()
         try:
             self.db.commit()
         except IntegrityError:
@@ -764,6 +784,8 @@ class HistoryService:
                     "parent_run_id": round_obj.parent_run_id,
                     "idempotency_key": round_obj.idempotency_key,
                     "last_event_sequence": last_event_sequence,
+                    "model_id": round_obj.model_id,
+                    "model_display_name": round_obj.model_display_name,
                     "user_message": round_obj.user_message,
                     "user_attachments": attachments,
                     "assistant_file_references": list(

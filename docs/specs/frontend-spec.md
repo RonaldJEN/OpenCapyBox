@@ -286,7 +286,7 @@
 - 测试框架：Vitest + `@testing-library/react`（配置见 [frontend/vitest.config.ts](../../frontend/vitest.config.ts)）。
 - 测试位置：`frontend/src/__tests__/`。
 - 回归只保留少量关键门槛；普通功能修改优先改写已有契约用例，不为一个功能默认新增多套独立测试文件，也不为不可达边界堆防御性断言。
-- 交互、性能感受和编辑器行为以真实应用内浏览器高频操作为主证据；涉及持久数据时同时核对数据库当前版本、物理内容与 SHA/解析结果，并派 Terra 只读扫描实际 Sandbox active 文件和版本快照。mock 与 API 回包只能保护局部契约，不能替代浏览器、数据库和沙箱三方事实。
+- 项目级验收固定四项，分别派 Terra 执行并分别报告：①真实应用内浏览器高频用户操作（验收账号 test，凭据按用户当次授权使用）；②只读核对数据库事实、归属、版本与运行记录；③读取真实物理文件、比对字节/SHA并用实际格式解析器验证；④独立只读扫描真实 Sandbox active 文件、临时文件、版本快照和清理账本。每项记录时间、环境、样本身份、结果和未覆盖范围；修复后重验受影响项，不能把不同代码版本的证据合并成通过。mock、API 回包、pytest 与构建只保护局部契约，不能替代任一项。验收同时检查状态和文件的真实归属、受理时机与恢复语义是否符合第一性原理，不能只看表面交互。
 - 覆盖优先级：
   1. `utils/` 纯函数（messageParser、displayBlocks、fileUtils）
   2. `services/chatStreamClient.ts` 的 transport/recovery 与 `chatRuntimeReducer.ts` 纯状态迁移

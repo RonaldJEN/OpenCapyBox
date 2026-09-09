@@ -212,7 +212,13 @@ def test_normalization_strips_unsupported_media():
             {"type": "input_audio", "input_audio": {"data": "x"}},
         ])
     ], supports_image=False)
-    assert normalized[0].content == [{"type": "text", "text": "keep"}]
+    assert normalized[0].content == [
+        {"type": "text", "text": "keep"},
+        {
+            "type": "text",
+            "text": "[历史图片未随本次请求发送：当前模型不支持图片输入。]",
+        },
+    ]
 
 
 def test_tool_output_uses_codex_record_time_byte_policy():

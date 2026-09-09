@@ -287,6 +287,46 @@ def test_valid_checkpoint_still_restores_replacement_plus_exact_suffix(db, monke
     assert service._active_checkpoint_id == saved.checkpoint_id
 
 
+def test_cross_model_checkpoint_reuses_summary_after_clearing_provider_items(db, monkeypatch):
+    add_authoritative_exchange(db)
+    replacement_messages = [
+        Message(role="user", content="summary keeps its meaning"),
+        Message(
+            role="assistant",
+            content="visible answer",
+            provider_items=[{"type": "reasoning", "encrypted_content": "opaque"}],
+        ),
+    ]
+    saved = ContextCheckpointService(db).save(
+        session_id="session-1",
+        source_round_id="run-1",
+        source_model_id="responses-old",
+        source_message_sequence=1,
+        source_event_sequence=0,
+        messages=replacement_messages,
+        source_token_count=100,
+        replacement_token_count=20,
+    )
+    # A later direct Round has switched models; the checkpoint must still be
+    # used instead of rebuilding all earlier events.
+    db.add(Round(
+        id="run-2", session_id="session-1", thread_id="session-1",
+        user_message="new-model turn", status="completed", model_id="chat-new",
+    ))
+    db.commit()
+    use_checkpoint_history_strategy(monkeypatch)
+    service = make_restore_service(db)
+    service.model_id = "chat-new"
+
+    restored = service._build_restored_history_messages()
+
+    assert service._active_checkpoint_id == saved.checkpoint_id
+    assert [message.content for message in restored[:2]] == [
+        "summary keeps its meaning", "visible answer",
+    ]
+    assert restored[1].provider_items is None
+
+
 def test_restore_replays_only_source_round_event_suffix(db):
     add_session_round(db)
     db.add(ConversationMessage(

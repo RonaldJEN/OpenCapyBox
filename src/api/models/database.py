@@ -66,6 +66,7 @@ def _import_models():
         WorkspaceMutation,
     )
     from src.api.models.sandbox_cleanup import SandboxCleanupJob as _  # noqa: F401
+    from src.api.models.composer_draft_attachment import ComposerDraftAttachment as _  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +321,8 @@ _BOOL_TRUE = "TRUE"
 _PENDING_COLUMNS = [
     ("sessions", "model_id", "VARCHAR(50)"),
     ("rounds", "user_attachments", "TEXT"),
+    ("rounds", "model_id", "VARCHAR(100)"),
+    ("rounds", "model_display_name", "VARCHAR(200)"),
     ("rounds", "preferred_skills", "TEXT"),
     ("rounds", "preferred_mcp_connections", "TEXT"),
     ("rounds", "thinking_mode", "VARCHAR(24)"),
@@ -352,6 +355,7 @@ _PENDING_COLUMNS = [
     ("llm_models", "thinking_wire_format", "VARCHAR(32) NOT NULL DEFAULT 'enable_thinking'"),
     ("llm_models", "supported_reasoning_efforts_json", "TEXT"),
     ("context_checkpoints", "source_message_sequence", "INTEGER NOT NULL DEFAULT 0"),
+    ("context_checkpoints", "source_model_id", "VARCHAR(100)"),
     ("context_checkpoints", "source_event_sequence", "INTEGER NOT NULL DEFAULT 0"),
     ("context_checkpoints", "trigger_phase", "VARCHAR(30) NOT NULL DEFAULT 'pre_turn'"),
     ("context_checkpoints", "summary_text", "TEXT NOT NULL DEFAULT ''"),

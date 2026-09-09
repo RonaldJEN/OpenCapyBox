@@ -116,6 +116,7 @@ interface StreamHandlers {
 
 interface StartSendArgs extends StreamIdentity, StreamHandlers {
   content: ChatContentBlock[];
+  modelId?: string;
   idempotencyKey?: string;
   preferredSkillKeys?: string[];
   preferredMcpServerIds?: string[];
@@ -727,6 +728,7 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
         body: JSON.stringify({
           content: args.content,
           idempotency_key: args.idempotencyKey,
+          ...(args.modelId ? { model_id: args.modelId } : {}),
           ...(args.preferredSkillKeys?.length
             ? { preferred_skill_keys: args.preferredSkillKeys }
             : {}),

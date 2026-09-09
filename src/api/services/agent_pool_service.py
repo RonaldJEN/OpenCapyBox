@@ -98,6 +98,11 @@ class AgentPoolService:
         agent_service = self._cache.get(chat_session_id)
         return self._sandbox_id_from_agent(agent_service) if agent_service is not None else None
 
+    def _cached_agent_model_id(self, chat_session_id: str) -> str | None:
+        agent_service = self._cache.get(chat_session_id)
+        model_id = getattr(agent_service, "model_id", None)
+        return model_id if isinstance(model_id, str) and model_id else None
+
     def _resolve_current_sandbox_id(
         self,
         *,
@@ -193,6 +198,7 @@ class AgentPoolService:
         chat_session_id: str,
         sandbox_service,
         db_sandbox_id: str | None,
+        model_id: str | None = None,
     ) -> tuple[bool, str, str | None, str | None]:
         stale, cached_sandbox_id, current_sandbox_id = self._cached_agent_is_stale(
             user_id=user_id,
@@ -202,6 +208,8 @@ class AgentPoolService:
         )
         if chat_session_id in self._invalidated_sessions:
             return True, "marked_invalid", cached_sandbox_id, current_sandbox_id
+        if model_id and self._cached_agent_model_id(chat_session_id) != model_id:
+            return True, "model_changed", cached_sandbox_id, current_sandbox_id
         if self._cached_agent_mcp_is_stale(
             user_id=user_id,
             chat_session_id=chat_session_id,
@@ -586,9 +594,12 @@ class AgentPoolService:
                     chat_session_id=chat_session_id,
                     sandbox_service=sandbox_service,
                     db_sandbox_id=sandbox_id,
+                    model_id=model_id,
                 )
             )
-            if self._cached_agent_is_running(chat_session_id):
+            if rebuild_reason == "model_changed":
+                self._detach_running_agent(chat_session_id)
+            elif self._cached_agent_is_running(chat_session_id):
                 self._detach_running_agent(chat_session_id)
             elif needs_rebuild:
                 logger.warning(
@@ -640,9 +651,12 @@ class AgentPoolService:
                         chat_session_id=chat_session_id,
                         sandbox_service=sandbox_service,
                         db_sandbox_id=sandbox_id,
+                        model_id=model_id,
                     )
                 )
-                if self._cached_agent_is_running(chat_session_id):
+                if rebuild_reason == "model_changed":
+                    self._detach_running_agent(chat_session_id)
+                elif self._cached_agent_is_running(chat_session_id):
                     self._detach_running_agent(chat_session_id)
                 elif needs_rebuild:
                     logger.warning(

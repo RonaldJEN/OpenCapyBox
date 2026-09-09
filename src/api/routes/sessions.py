@@ -907,6 +907,7 @@ async def get_session_history_v2(
 
     return HistoryResponseV2(
         session_id=chat_session_id,
+        model_id=session.model_id,
         rounds=rounds,
         total=len(rounds),
     )

@@ -43,6 +43,14 @@ def _validate_target(owner_kind: str, relative_path: str) -> str:
         and _UUID.fullmatch(parts[3])
         and re.fullmatch(r"[0-9a-f]{32}", parts[4])
     ) or (
+        owner_kind == "composer_draft_attachment"
+        and (
+            re.fullmatch(r"\.composer-drafts/[A-Za-z0-9_-]{1,64}/[0-9a-fA-F-]{36}", normalized)
+            or re.fullmatch(
+                r"sessions/[0-9a-fA-F-]{36}/attachments/[0-9a-fA-F-]{36}", normalized
+            )
+        )
+    ) or (
         owner_kind == "workspace_stage_incoming"
         and re.fullmatch(r"\.incoming-[0-9a-f]{32}", parts[-1])
         and (
@@ -68,13 +76,25 @@ def enqueue_cleanup(
     profile_version: int | None = None,
 ) -> str:
     safe_path = _validate_target(owner_kind, relative_path)
-    existing = db.query(SandboxCleanupJob.cleanup_id).filter(
+    existing = db.query(SandboxCleanupJob).filter(
         SandboxCleanupJob.owner_kind == owner_kind,
         SandboxCleanupJob.owner_id == owner_id,
         SandboxCleanupJob.relative_path == safe_path,
     ).scalar()
     if existing:
-        return str(existing)
+        # A late writer can recreate the exact path after an earlier cleanup
+        # completed.  Re-arm the durable intent instead of treating completed
+        # as a permanent no-op.
+        if owner_kind == "composer_draft_attachment" and existing.state in {"completed", "running"}:
+            existing.state = "queued"
+            existing.generation = int(existing.generation or 0) + 1
+            existing.owner_token = None
+            existing.lease_expires_at = None
+            existing.next_attempt_at = now_naive()
+            existing.completed_at = None
+            existing.error_message = None
+            db.flush()
+        return str(existing.cleanup_id)
     cleanup_id = str(uuid.uuid4())
     db.add(SandboxCleanupJob(
         cleanup_id=cleanup_id,
@@ -253,6 +273,8 @@ def _due_ids(limit: int = 20) -> list[str]:
 async def _loop() -> None:
     while True:
         try:
+            from src.api.services.composer_draft_attachment_service import enqueue_expired_composer_draft_cleanup
+            await asyncio.to_thread(enqueue_expired_composer_draft_cleanup)
             for cleanup_id in await asyncio.to_thread(_due_ids):
                 await run_cleanup_job(cleanup_id)
         except asyncio.CancelledError:

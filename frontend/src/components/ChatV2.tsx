@@ -15,11 +15,13 @@ import {
   AttachmentInfo,
   AskUserQuestion,
   ChatFile,
+  ComposerAttachment,
   ChatContentBlock,
   FileInfo,
   ModelInfo,
   PreferredMcpConnectionSnapshot,
   PendingFileDraftInfo,
+  RoundData,
   ToolApprovalPayload,
   TurnReasoningSelection,
 } from '../types';
@@ -58,6 +60,7 @@ import { ArtifactsPanel, type ArtifactsPanelHandle } from './ArtifactsPanel';
 import { type SessionFileOwnerIdentity } from './FilePreview';
 import { ModelSelector } from './ModelSelector';
 import { ChatInput } from './ChatInput';
+import { DraftAttachmentPreview } from './DraftAttachmentPreview';
 import { QuestionCard } from './QuestionCard';
 import { ToolApprovalCard } from './ToolApprovalCard';
 import {
@@ -158,7 +161,7 @@ interface MessageDraft {
   draftId: string;
   revision: number;
   input: string;
-  attachedFiles: ChatFile[];
+  attachedFiles: ComposerAttachment[];
 }
 
 interface ReasoningDraft {
@@ -196,8 +199,8 @@ interface ChatV2Props {
   onTitleUpdated?: () => void;
   onExecutionStart?: (sessionId: string) => void;
   onExecutionEnd?: (sessionId?: string) => void;
-  selectedModelId: string;
-  onModelChange: (modelId: string) => void;
+  catalogDefaultModelId: string;
+  onDraftInteraction?: () => void;
   availableModels?: ModelInfo[];
   onCreateSession?: (modelId?: string) => Promise<string>;
   onSessionCreated?: (sessionId: string) => void;
@@ -236,8 +239,8 @@ export function ChatV2(props: ChatV2Props) {
 function ChatV2View(props: ChatV2Props) {
   const {
     sessionId,
-    selectedModelId,
-    onModelChange,
+    catalogDefaultModelId,
+    onDraftInteraction,
     availableModels = [],
     onCreateSession,
     onSessionCreated,
@@ -290,7 +293,12 @@ function ChatV2View(props: ChatV2Props) {
     SessionFileOwnerIdentity & { file: FileInfo; nonce: number }
   ) | null>(null);
   const [previewContextNotice, setPreviewContextNotice] = useState('');
-  const [uploadingDraftIds, setUploadingDraftIds] = useState<Set<string>>(new Set());
+  const [localAttachmentPreview, setLocalAttachmentPreview] = useState<ComposerAttachment | null>(null);
+  const [submittingDraftKeys, setSubmittingDraftKeys] = useState<Set<string>>(new Set());
+  const [preparingSubmissions, setPreparingSubmissions] = useState<Record<string, {
+    ownerKey: string;
+    round: RoundData;
+  }>>({});
   const [isDragging, setIsDragging] = useState(false);
   const [stopping, setStopping] = useState(false);
 
@@ -323,12 +331,18 @@ function ChatV2View(props: ChatV2Props) {
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const sessionIdRef = useRef(sessionId);
   const composerDraftsRef = useRef(composerDrafts);
-  const uploadsInFlightRef = useRef(new Set<string>());
+  const uploadControllersRef = useRef(new Map<string, AbortController>());
+  const uploadQueueRef = useRef<Array<{ key: string; file: ComposerAttachment; controller: AbortController }>>([]);
+  const activeUploadsRef = useRef(0);
+  const previewUrlsRef = useRef(new Set<string>());
   const handledScrollTargetNonceRef = useRef<number | null>(null);
   const pendingSendSessionKeysRef = useRef<Set<string>>(new Set());
   const resumeSaveBarrierPendingRef = useRef(false);
-  const selectedModel = availableModels.find((m) => m.id === selectedModelId);
   const currentDraftKey = sessionId || NEW_SESSION_DRAFT_KEY;
+  const preparingSubmission = Object.values(preparingSubmissions)
+    .find((submission) => submission.ownerKey === currentDraftKey);
+  const visibleRounds = useMemo(() => preparingSubmission
+    ? [...rounds, preparingSubmission.round] : rounds, [rounds, preparingSubmission]);
   const currentMessageDraft = composerDrafts.messageDrafts[currentDraftKey] || {
     draftId: `uninitialized:${currentDraftKey}`,
     revision: 0,
@@ -338,14 +352,21 @@ function ChatV2View(props: ChatV2Props) {
   const currentPreferenceDraft = composerDrafts.preferenceDrafts[currentDraftKey]
     || emptyTurnPreferenceDraft();
   const currentReasoningDraft = composerDrafts.reasoningDrafts[currentDraftKey];
-  const turnReasoning = currentReasoningDraft && currentReasoningDraft.modelId === selectedModelId
-    ? currentReasoningDraft.selection
-    : defaultTurnReasoning(selectedModel);
+  const historyModelReady = !sessionId || projection.lastHistoryLoadedAt !== undefined || !!projection.modelId;
+  const initialModelId = sessionId
+    ? projection.modelId || [...rounds].reverse().find((round) => round.model_id)?.model_id || catalogDefaultModelId
+    : catalogDefaultModelId;
+  const initialModel = historyModelReady ? availableModels.find((model) => model.id === initialModelId) : undefined;
+  const selectedModelId = currentReasoningDraft?.modelId || '';
+  const selectedModel = availableModels.find((m) => m.id === selectedModelId);
+  const turnReasoning = currentReasoningDraft?.selection ?? null;
   const input = currentMessageDraft.input;
   const attachedFiles = currentMessageDraft.attachedFiles;
   const currentDraftId = currentMessageDraft.draftId;
   const creatingCurrentDraft = creatingDraftId === currentDraftId;
-  const uploadingCurrentDraft = uploadingDraftIds.has(currentDraftId);
+  const uploadingCurrentDraft = attachedFiles.some((file) =>
+    file.uploadStatus && file.uploadStatus !== 'ready' && file.uploadStatus !== 'error');
+  const attachmentsNotReady = attachedFiles.some((file) => file.uploadStatus && file.uploadStatus !== 'ready');
   const displayError = localError || runtimeError;
   const hasActiveSlot = activeSlotSessionIds?.has(sessionId) ?? false;
   const sessionFilesState = sessionId
@@ -360,9 +381,9 @@ function ChatV2View(props: ChatV2Props) {
   const chatInteractionHidden = isFilesExpanded;
   const reading = useChatReadingPosition({
     sessionId, containerRef: chatAreaRef, contentRef: messagesContentRef,
-    hidden: chatInteractionHidden, loading, hasContent: rounds.length > 0,
+    hidden: chatInteractionHidden, loading: loading && !preparingSubmission, hasContent: visibleRounds.length > 0,
     layoutKey: `${workspacePanelActive ? 'workspace' : 'session'}:${filesLayout}:${chatRatio}`,
-    contentVersion: rounds, scrollTarget,
+    contentVersion: visibleRounds, scrollTarget,
   });
   const { showScrollButton, scrollToBottom } = reading;
   const lastRoundStatus = rounds[rounds.length - 1]?.status || 'empty';
@@ -592,36 +613,24 @@ function ChatV2View(props: ChatV2Props) {
     else void openFilesPanel();
   };
 
-  useEffect(() => {
-    setComposerDrafts((previous) => {
-      if (previous.messageDrafts[currentDraftKey]) return previous;
+  useLayoutEffect(() => {
+    commitComposerDrafts((previous) => {
+      const message = previous.messageDrafts[currentDraftKey];
+      const hasSelection = !!previous.reasoningDrafts[currentDraftKey];
+      if (message && (hasSelection || !initialModel)) return previous;
       return {
         ...previous,
         messageDrafts: {
           ...previous.messageDrafts,
-          [currentDraftKey]: createMessageDraft(),
+          [currentDraftKey]: message || createMessageDraft(),
+        },
+        reasoningDrafts: hasSelection || !initialModel ? previous.reasoningDrafts : {
+          ...previous.reasoningDrafts,
+          [currentDraftKey]: { modelId: initialModel.id, selection: defaultTurnReasoning(initialModel) },
         },
       };
     });
-  }, [currentDraftKey]);
-
-  const addUploadingDraftId = (draftId: string) => {
-    setUploadingDraftIds((previous) => {
-      if (previous.has(draftId)) return previous;
-      const next = new Set(previous);
-      next.add(draftId);
-      return next;
-    });
-  };
-
-  const removeUploadingDraftId = (draftId: string) => {
-    setUploadingDraftIds((previous) => {
-      if (!previous.has(draftId)) return previous;
-      const next = new Set(previous);
-      next.delete(draftId);
-      return next;
-    });
-  };
+  }, [currentDraftKey, initialModel]);
 
   const clearCreatingDraftId = (draftId: string) => {
     setCreatingDraftId((previous) => (previous === draftId ? null : previous));
@@ -632,11 +641,12 @@ function ChatV2View(props: ChatV2Props) {
     updater: (draft: MessageDraft) => MessageDraft,
     expectedDraftId?: string,
   ) => {
-    setComposerDrafts((previous) => {
+    commitComposerDrafts((previous) => {
       const current = previous.messageDrafts[draftKey] || createMessageDraft();
       if (expectedDraftId && current.draftId !== expectedDraftId) return previous;
       const next = updater(current);
       if (next === current) return previous;
+      if (draftKey === NEW_SESSION_DRAFT_KEY && next.revision !== current.revision) onDraftInteraction?.();
       return {
         ...previous,
         messageDrafts: {
@@ -757,6 +767,8 @@ function ChatV2View(props: ChatV2Props) {
           type: 'image_url',
           image_url: { url: file.data_url },
           file: {
+            ...(file.composer_draft_attachment_id
+              ? { composer_draft_attachment_id: file.composer_draft_attachment_id } : {}),
             path: file.path,
             name: file.name,
             mime_type: toMimeType(file.type),
@@ -769,6 +781,8 @@ function ChatV2View(props: ChatV2Props) {
           file: {
             source: 'session',
             path: file.path,
+            ...(file.composer_draft_attachment_id
+              ? { composer_draft_attachment_id: file.composer_draft_attachment_id } : {}),
             name: file.name,
             mime_type: toMimeType(file.type),
             size: file.size,
@@ -846,83 +860,85 @@ function ChatV2View(props: ChatV2Props) {
     return () => clearTimeout(timer);
   }, [scrollTarget, sessionId, loading, rounds]);
 
-  const handleFileUpload = async (files: FileList | File[] | null) => {
-    const capturedDraftId = currentMessageDraft.draftId;
-    if (
-      !files
-      || files.length === 0
-      || uploadsInFlightRef.current.has(capturedDraftId)
-      || sending
-      || resuming
-      || creatingDraftId === capturedDraftId
-      || stopping
-      || pendingSendSessionKeysRef.current.has(currentDraftKey)
-    ) return;
-    const sourceDraftKey = currentDraftKey;
-    uploadsInFlightRef.current.add(capturedDraftId);
-    addUploadingDraftId(capturedDraftId);
-    const uploadedFiles: ChatFile[] = [];
-    try {
-      let targetSessionId = sessionId;
-      if (!targetSessionId) {
-        if (!onCreateSession) {
-          setLocalError('无法创建会话');
-          removeUploadingDraftId(capturedDraftId);
-          return;
-        }
-        setCreatingDraftId(capturedDraftId);
-        try {
-          targetSessionId = await onCreateSession(selectedModelId || undefined);
-        } catch (err) {
-          console.error('Failed to create session for file upload:', err);
-          setLocalError('创建会话失败，无法上传文件');
-          clearCreatingDraftId(capturedDraftId);
-          removeUploadingDraftId(capturedDraftId);
-          return;
-        }
-      }
-
-      const sourceDraft = composerDraftsRef.current.messageDrafts[sourceDraftKey];
-      if (!sourceDraft || sourceDraft.draftId !== capturedDraftId) return;
-      migrateDraftsToSession(sourceDraftKey, targetSessionId, capturedDraftId);
-      if (!sessionIdRef.current) onSessionCreated?.(targetSessionId);
-
-      const uploadQueue = Array.from(files as ArrayLike<File>);
-      for (const file of uploadQueue) {
-        const uploaded = await apiService.uploadFile(targetSessionId, file);
-        const fileInfo: ChatFile = {
-          source: 'session',
-          name: uploaded.name,
-          path: uploaded.path,
-          revision: uploaded.revision,
-          size: uploaded.size,
-          modified: uploaded.modified,
-          session_id: targetSessionId,
-          type: file.type || uploaded.type,
-          is_directory: uploaded.is_directory,
-          data_url: uploaded.data_url,
-        };
-        if (isImageFile(fileInfo)) fileInfo.data_url = await readFileAsDataUrl(file);
-        uploadedFiles.push(fileInfo);
-      }
-      updateMessageDraft(
-        targetSessionId,
-        (draft) => ({
+  // Network completion only patches the exact local file that started it.
+  const drainUploadQueue = () => {
+    while (activeUploadsRef.current < 3 && uploadQueueRef.current.length) {
+      const job = uploadQueueRef.current.shift()!;
+      const { key, file, controller } = job;
+      if (controller.signal.aborted) continue;
+      activeUploadsRef.current += 1;
+      const patchFile = (patch: Partial<ComposerAttachment>) => {
+        if (controller.signal.aborted) return;
+        updateMessageDraft(key, (draft) => ({
           ...draft,
-          revision: draft.revision + 1,
-          attachedFiles: [...draft.attachedFiles, ...uploadedFiles],
-        }),
-        capturedDraftId,
-      );
-    } catch (err) {
-      console.error('Failed to upload files:', err);
-      setLocalError(formatUploadError(err));
-    } finally {
-      uploadsInFlightRef.current.delete(capturedDraftId);
-      removeUploadingDraftId(capturedDraftId);
-      clearCreatingDraftId(capturedDraftId);
+          attachedFiles: draft.attachedFiles.map((item) => item.clientId === file.clientId
+            ? { ...item, ...patch } as ComposerAttachment : item),
+        }), file.draftId);
+      };
+      patchFile({ uploadStatus: 'uploading', uploadProgress: undefined, uploadError: undefined });
+      void (async () => {
+        try {
+          const uploaded = await apiService.uploadDraftAttachment(
+            file.draftId!, file.clientId!, file.localFile!, controller.signal,
+            (percent) => patchFile({
+              uploadProgress: percent,
+              uploadStatus: percent === 100 ? 'saving' : 'uploading',
+            }),
+          );
+          const dataUrl = isImageFile(file) ? await readFileAsDataUrl(file.localFile!) : undefined;
+          patchFile({ name: uploaded.name, size: uploaded.size, data_url: dataUrl,
+            uploadStatus: 'ready', uploadProgress: 100 });
+        } catch (error) {
+          patchFile({ uploadStatus: 'error', uploadError: formatUploadError(error) });
+        } finally {
+          activeUploadsRef.current -= 1;
+          if (uploadControllersRef.current.get(file.clientId!) === controller) {
+            uploadControllersRef.current.delete(file.clientId!);
+          }
+          drainUploadQueue();
+        }
+      })();
     }
   };
+
+  const queueAttachment = (key: string, file: ComposerAttachment) => {
+    const controller = new AbortController();
+    uploadControllersRef.current.set(file.clientId!, controller);
+    uploadQueueRef.current.push({ key, file, controller });
+    drainUploadQueue();
+  };
+
+  const handleFileUpload = (files: FileList | File[] | null, pastedText?: string) => {
+    if (!files?.length || submittingDraftKeys.has(currentDraftKey)) return;
+    const draft = composerDraftsRef.current.messageDrafts[currentDraftKey];
+    if (!draft) return;
+    const additions: ComposerAttachment[] = Array.from(files as ArrayLike<File>).map((file) => {
+      const previewUrl = URL.createObjectURL(file);
+      previewUrlsRef.current.add(previewUrl);
+      return {
+        name: file.name, path: '', size: file.size, type: file.type,
+        modified: new Date(file.lastModified).toISOString(),
+        clientId: crypto.randomUUID(), draftId: draft.draftId,
+        localFile: file, pastedText, previewUrl, uploadStatus: 'waiting',
+      };
+    });
+    updateMessageDraft(currentDraftKey, (current) => ({
+      ...current, revision: current.revision + 1,
+      attachedFiles: [...current.attachedFiles, ...additions],
+    }), draft.draftId);
+    additions.forEach((file) => queueAttachment(currentDraftKey, file));
+  };
+
+  const handlePasteText = (text: string) => {
+    const title = (text.split(/\r?\n/).find((line) => line.trim()) || '粘贴文本')
+      .replace(/^\s*#+\s*/, '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '').trim().slice(0, 48) || '粘贴文本';
+    handleFileUpload([new File([text], `${title}.txt`, { type: 'text/plain;charset=utf-8' })], text);
+  };
+
+  useEffect(() => () => {
+    uploadControllersRef.current.forEach((controller) => controller.abort());
+    previewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+  }, []);
 
   const handleDragOver = (event: React.DragEvent) => {
     event.preventDefault();
@@ -952,11 +968,49 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleRemoveAttachment = (index: number) => {
+    const file = composerDraftsRef.current.messageDrafts[currentDraftKey]?.attachedFiles[index];
+    if (!file || submittingDraftKeys.has(currentDraftKey)) return;
+    if (file.clientId && file.draftId) {
+      uploadControllersRef.current.get(file.clientId)?.abort();
+      uploadControllersRef.current.delete(file.clientId);
+      uploadQueueRef.current = uploadQueueRef.current.filter((job) => job.file.clientId !== file.clientId);
+      void apiService.removeDraftAttachment(file.draftId, file.clientId).catch((error) => {
+        console.warn('Draft attachment cleanup deferred to expiry:', error);
+      });
+    }
+    if (file.previewUrl) {
+      URL.revokeObjectURL(file.previewUrl);
+      previewUrlsRef.current.delete(file.previewUrl);
+    }
+    if (localAttachmentPreview === file) setLocalAttachmentPreview(null);
     updateMessageDraft(currentDraftKey, (draft) => ({
       ...draft,
       revision: draft.revision + 1,
       attachedFiles: draft.attachedFiles.filter((_, itemIndex) => itemIndex !== index),
     }));
+  };
+
+  const handleRetryAttachment = (index: number) => {
+    const file = composerDraftsRef.current.messageDrafts[currentDraftKey]?.attachedFiles[index];
+    if (!file?.localFile || !file.clientId || file.uploadStatus !== 'error') return;
+    queueAttachment(currentDraftKey, file);
+  };
+
+  const handleRestorePastedText = (index: number) => {
+    const draft = composerDraftsRef.current.messageDrafts[currentDraftKey];
+    const text = draft?.attachedFiles[index]?.pastedText;
+    if (text === undefined || submittingDraftKeys.has(currentDraftKey)) return;
+    const start = composerTextareaRef.current?.selectionStart ?? draft.input.length;
+    const end = composerTextareaRef.current?.selectionEnd ?? start;
+    handleRemoveAttachment(index);
+    updateMessageDraft(currentDraftKey, (current) => ({
+      ...current, revision: current.revision + 1,
+      input: current.input.slice(0, start) + text + current.input.slice(end),
+    }));
+    requestAnimationFrame(() => {
+      composerTextareaRef.current?.focus();
+      composerTextareaRef.current?.setSelectionRange(start + text.length, start + text.length);
+    });
   };
 
   const previewSessionAttachment = async (file: AttachmentInfo | FileInfo) => {
@@ -1002,6 +1056,10 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handlePreviewDraftAttachment = async (file: AttachmentInfo | FileInfo) => {
+    if ((file as ComposerAttachment).localFile) {
+      setLocalAttachmentPreview(file as ComposerAttachment);
+      return;
+    }
     if (file.source === 'workspace' && file.entry_id) {
       requestOpenWorkspace(
         file.entry_id,
@@ -1190,8 +1248,9 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleSelectedSkillKeysChange = (keys: string[]) => {
+    if (!sessionId) onDraftInteraction?.();
     const draftKey = currentDraftKey;
-    setComposerDrafts((previous) => {
+    commitComposerDrafts((previous) => {
       const current = previous.preferenceDrafts[draftKey] || emptyTurnPreferenceDraft();
       return {
         ...previous,
@@ -1243,8 +1302,9 @@ function ChatV2View(props: ChatV2Props) {
   const handleSelectedMcpConnectionsChange = (
     connections: PreferredMcpConnectionSnapshot[],
   ) => {
+    if (!sessionId) onDraftInteraction?.();
     const draftKey = currentDraftKey;
-    setComposerDrafts((previous) => {
+    commitComposerDrafts((previous) => {
       const current = previous.preferenceDrafts[draftKey] || emptyTurnPreferenceDraft();
       return {
         ...previous,
@@ -1265,11 +1325,13 @@ function ChatV2View(props: ChatV2Props) {
     const capturedDraftId = currentMessageDraft.draftId;
     if (
       (!input.trim() && attachedFiles.length === 0)
+      || !currentReasoningDraft
       || sending
+      || resuming
+      || waitingInteraction
       || creatingDraftId === capturedDraftId
       || stopping
-      || uploadingDraftIds.has(capturedDraftId)
-      || uploadsInFlightRef.current.has(capturedDraftId)
+      || attachmentsNotReady
       || pendingSendSessionKeysRef.current.has(initialSessionKey)
     ) return;
     const messageSnapshot: MessageDraft = {
@@ -1277,7 +1339,14 @@ function ChatV2View(props: ChatV2Props) {
       attachedFiles: [...currentMessageDraft.attachedFiles],
     };
     const draftInput = messageSnapshot.input;
-    const draftAttachments = messageSnapshot.attachedFiles;
+    let draftAttachments = messageSnapshot.attachedFiles;
+    let contentBlocks: ChatContentBlock[];
+    try {
+      contentBlocks = buildContentBlocks(draftInput, draftAttachments);
+    } catch (error: any) {
+      setLocalError(error?.message || '消息构建失败');
+      return;
+    }
     const preferenceSnapshot: TurnPreferenceDraft = {
       skillKeys: [...currentPreferenceDraft.skillKeys],
       mcpConnections: currentPreferenceDraft.mcpConnections.map(
@@ -1292,8 +1361,9 @@ function ChatV2View(props: ChatV2Props) {
     const clearedPreferenceRevision = preferenceSnapshot.revision + 1;
     let restoreDraftKey = initialSessionKey;
     let submissionRestored = false;
+    let submissionAccepted = false;
     const restoreSubmissionSnapshot = () => {
-      if (submissionRestored) return;
+      if (submissionRestored || submissionAccepted) return;
       submissionRestored = true;
       commitComposerDrafts((previous) => {
         const current = previous.messageDrafts[restoreDraftKey];
@@ -1327,20 +1397,90 @@ function ChatV2View(props: ChatV2Props) {
               revision: preferenceRevision + 1,
             },
           },
-          reasoningDrafts: reasoningSnapshot
-            ? {
-              ...previous.reasoningDrafts,
-              [restoreDraftKey]: {
-                modelId: selectedModelId,
-                selection: reasoningSnapshot,
-              },
-            }
-            : previous.reasoningDrafts,
+          // Model selection may already be a choice for the next attempt.
+          reasoningDrafts: previous.reasoningDrafts,
         };
       });
     };
     pendingSendSessionKeysRef.current.add(initialSessionKey);
+    setSubmittingDraftKeys((keys) => new Set(keys).add(initialSessionKey));
     let targetSessionKey = initialSessionKey;
+    let preparingFinished = false;
+    const finishPreparing = () => {
+      if (preparingFinished) return;
+      preparingFinished = true;
+      pendingSendSessionKeysRef.current.delete(initialSessionKey);
+      pendingSendSessionKeysRef.current.delete(targetSessionKey);
+      setSubmittingDraftKeys((keys) => {
+        const next = new Set(keys);
+        next.delete(initialSessionKey);
+        next.delete(targetSessionKey);
+        return next;
+      });
+      setSyncingAttachmentDraftId((current) => current === capturedDraftId ? null : current);
+    };
+    const acceptSubmission = () => {
+      if (submissionAccepted) return;
+      submissionAccepted = true;
+      // These URLs belong to this submission, never to whatever draft is now
+      // visible. Before admission the snapshot still owns them for retry.
+      for (const file of messageSnapshot.attachedFiles) {
+        if (file.previewUrl && previewUrlsRef.current.delete(file.previewUrl)) {
+          URL.revokeObjectURL(file.previewUrl);
+        }
+      }
+      messageSnapshot.attachedFiles = [];
+      draftAttachments = [];
+      finishPreparing();
+    };
+    const removePreparingSubmission = () => setPreparingSubmissions((current) => {
+      if (!current[submission.id]) return current;
+      const next = { ...current };
+      delete next[submission.id];
+      return next;
+    });
+    const userMessage = buildDisplayMessage(draftInput, draftAttachments);
+    const submission = {
+      id: `submission-${capturedDraftId}-${messageSnapshot.revision}`,
+      createdAt: new Date().toISOString(),
+    };
+    setPreparingSubmissions((current) => ({
+      ...current,
+      [submission.id]: {
+        ownerKey: initialSessionKey,
+        round: {
+          round_id: submission.id,
+          model_id: selectedModelId,
+          model_display_name: selectedModel?.name,
+          user_message: userMessage,
+          user_attachments: [...draftAttachments],
+          preferred_skills: preferenceSnapshot.skillKeys.map((key) => ({ key, display_name: key })),
+          preferred_mcp_connections: preferenceSnapshot.mcpConnections,
+          thinking_mode: reasoningSnapshot?.mode,
+          reasoning_effort: reasoningSnapshot?.effort,
+          created_at: submission.createdAt,
+          status: 'running', final_response: '', steps: [], step_count: 0,
+        },
+      },
+    }));
+    commitComposerDrafts((previous) => {
+      const current = previous.messageDrafts[initialSessionKey];
+      if (!current || current.draftId !== messageSnapshot.draftId) return previous;
+      return {
+        messageDrafts: {
+          ...previous.messageDrafts,
+          [initialSessionKey]: { ...current, revision: clearedMessageRevision, input: '', attachedFiles: [] },
+        },
+        preferenceDrafts: {
+          ...previous.preferenceDrafts,
+          [initialSessionKey]: { skillKeys: [], mcpConnections: [], revision: clearedPreferenceRevision },
+        },
+        reasoningDrafts: previous.reasoningDrafts,
+      };
+    });
+    setDisableInitialMotion(false);
+    setLocalError('');
+    let runtimeStarted = false;
     try {
       const attachedWorkspaceEntryIds = Array.from(new Set(
         draftAttachments.flatMap((file) => (
@@ -1354,6 +1494,7 @@ function ChatV2View(props: ChatV2Props) {
         );
         if (saveResult && !saveResult.ok) {
           setLocalError('附件尚未同步完成，请确认文件保存成功后重试');
+          restoreSubmissionSnapshot();
           return;
         }
         try {
@@ -1364,16 +1505,9 @@ function ChatV2View(props: ChatV2Props) {
           }));
         } catch {
           setLocalError('附件尚未同步完成，请确认文件保存成功后重试');
+          restoreSubmissionSnapshot();
           return;
         }
-      }
-
-      let contentBlocks: ChatContentBlock[] = [];
-      try {
-        contentBlocks = buildContentBlocks(draftInput, draftAttachments);
-      } catch (err: any) {
-        setLocalError(err?.message || '消息构建失败');
-        return;
       }
 
       const pendingFileDrafts = captureDirtyEditorsBeforeAgentStart();
@@ -1386,36 +1520,10 @@ function ChatV2View(props: ChatV2Props) {
         item.source === 'workspace' && attachedWorkspacePaths.has(item.path)
       ))) {
         setLocalError('附件在同步期间又发生了修改，请保存完成后重试');
+        restoreSubmissionSnapshot();
         return;
       }
-      const userMessage = buildDisplayMessage(draftInput, draftAttachments);
       const isStartingNewSession = !sessionId;
-      commitComposerDrafts((previous) => {
-        const current = previous.messageDrafts[initialSessionKey];
-        if (!current || current.draftId !== messageSnapshot.draftId) return previous;
-        return {
-          messageDrafts: {
-            ...previous.messageDrafts,
-            [initialSessionKey]: {
-              ...current,
-              revision: clearedMessageRevision,
-              input: '',
-              attachedFiles: [],
-            },
-          },
-          preferenceDrafts: {
-            ...previous.preferenceDrafts,
-            [initialSessionKey]: {
-              skillKeys: [],
-              mcpConnections: [],
-              revision: clearedPreferenceRevision,
-            },
-          },
-          reasoningDrafts: previous.reasoningDrafts,
-        };
-      });
-      setDisableInitialMotion(false);
-      setLocalError('');
 
       let targetSessionId = sessionId;
       if (!targetSessionId) {
@@ -1445,26 +1553,65 @@ function ChatV2View(props: ChatV2Props) {
         }
         restoreDraftKey = targetSessionKey;
         migrateDraftsToSession(initialSessionKey, targetSessionKey, messageSnapshot.draftId);
+        setPreparingSubmissions((current) => ({
+          ...current,
+          [submission.id]: { ...current[submission.id], ownerKey: targetSessionKey },
+        }));
         if (!sessionIdRef.current) onSessionCreated?.(targetSessionKey);
       }
       pendingSendSessionKeysRef.current.add(targetSessionKey);
+      setSubmittingDraftKeys((keys) => new Set(keys).add(targetSessionKey));
       if (isStartingNewSession) clearCreatingDraftId(capturedDraftId);
+      const localAttachments = draftAttachments.filter((file) => file.clientId && file.draftId);
+      if (localAttachments.length) {
+        setSyncingAttachmentDraftId(capturedDraftId);
+        try {
+          const claimed = await apiService.claimDraftAttachments(
+            targetSessionId, capturedDraftId, localAttachments.map((file) => file.clientId!),
+          );
+          draftAttachments = draftAttachments.map((file) => {
+            if (!file.clientId) return file;
+            const persisted = claimed.find((item) => item.attachment_id === file.clientId);
+            if (!persisted) throw new Error('附件准备不完整，请重试');
+            return { ...file, ...persisted, source: 'session', session_id: targetSessionId,
+              type: file.type || persisted.type } as ComposerAttachment;
+          });
+          contentBlocks = buildContentBlocks(draftInput, draftAttachments);
+        } catch (error) {
+          setLocalError(formatUploadError(error));
+          restoreSubmissionSnapshot();
+          return;
+        }
+      }
+      // Transfer the visible submission to the existing runtime optimistic Round
+      // in the same update, without treating preparation as server acceptance.
+      removePreparingSubmission();
+      runtimeStarted = true;
       const sendPromise = runtime.sendMessage({
         sessionId: targetSessionId,
+        submission,
+        modelId: selectedModelId,
+        modelDisplayName: selectedModel?.name,
         displayMessage: userMessage,
         content: contentBlocks,
-        attachments: draftAttachments,
+        attachments: draftAttachments.map(({ localFile: _file, previewUrl: _url, pastedText: _text,
+          clientId: _clientId, draftId: _draftId, uploadStatus: _status,
+          uploadProgress: _progress, uploadError: _error, ...file }) => file),
         preferredSkillKeys: preferenceSnapshot.skillKeys,
         preferredMcpConnections: preferenceSnapshot.mcpConnections,
         reasoning: reasoningSnapshot || undefined,
         pendingFileDrafts,
         onRejectedBeforeAccept: restoreSubmissionSnapshot,
+        onStreamAccepted: acceptSubmission,
       });
       await sendPromise;
+    } catch (error: any) {
+      if (runtimeStarted) throw error;
+      setLocalError(error?.message || '消息准备失败，请重试');
+      restoreSubmissionSnapshot();
     } finally {
-      setSyncingAttachmentDraftId((current) => current === capturedDraftId ? null : current);
-      pendingSendSessionKeysRef.current.delete(initialSessionKey);
-      pendingSendSessionKeysRef.current.delete(targetSessionKey);
+      removePreparingSubmission();
+      finishPreparing();
     }
   };
 
@@ -1490,8 +1637,8 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const syncingCurrentAttachments = syncingAttachmentDraftId === currentDraftId;
-  const inputDisabled = sending || creatingCurrentDraft || syncingCurrentAttachments || resuming || waitingInteraction;
-  const sendingLabel = creatingCurrentDraft
+  const inputDisabled = creatingCurrentDraft || submittingDraftKeys.has(currentDraftKey);
+  const sendingLabel = preparingSubmission ? '' : creatingCurrentDraft
     ? '创建中'
     : syncingCurrentAttachments
       ? '同步附件'
@@ -1551,14 +1698,14 @@ function ChatV2View(props: ChatV2Props) {
         </header>
 
         <div ref={chatAreaRef} className="relative flex-1 overflow-y-auto bg-claude-bg" style={{ overflowAnchor: 'none' }}>
-          {loading && rounds.length === 0 ? (
+          {loading && visibleRounds.length === 0 ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
                 <Loader2 className="w-6 h-6 text-claude-muted animate-spin mx-auto mb-3" />
                 <p className="text-claude-muted text-sm">正在同步会话...</p>
               </div>
             </div>
-          ) : rounds.length === 0 ? (
+          ) : visibleRounds.length === 0 ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center max-w-lg px-6">
                 <h2 className="text-3xl font-medium text-claude-text mb-3">你好，有什么可以帮你的？</h2>
@@ -1585,7 +1732,8 @@ function ChatV2View(props: ChatV2Props) {
             </div>
           ) : (
             <div ref={messagesContentRef} data-testid="chat-message-column" className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6 md:px-8">
-              {rounds.map((round, index) => {
+              {visibleRounds.map((round, index) => {
+                const preparing = preparingSubmission?.round.round_id === round.round_id;
                 const visibleUserAttachments = (round.user_attachments || []).filter((file) => (
                   file.source !== 'workspace' || !isWorkspaceEntryDeleted(file.entry_id)
                 ));
@@ -1609,9 +1757,12 @@ function ChatV2View(props: ChatV2Props) {
                       round={visibleRound}
                       userAttachments={visibleUserAttachments}
                       sessionId={sessionId}
-                      onPreviewAttachment={handlePreviewHistoryAttachment}
+                      onPreviewAttachment={preparing
+                        ? (_file, attachmentIndex) => handlePreviewDraftAttachment(visibleUserAttachments[attachmentIndex])
+                        : handlePreviewHistoryAttachment}
                       onOpenFileInPanel={handleOpenAssistantFile}
                       isStreaming={(sending || resuming) && index === rounds.length - 1}
+                      preparing={preparing}
                       disableMotion={disableInitialMotion}
                     />
                   </div>
@@ -1620,14 +1771,18 @@ function ChatV2View(props: ChatV2Props) {
             </div>
           )}
 
+        </div>
+
+        <div className="relative h-0 shrink-0" data-testid="chat-scroll-control">
           {showScrollButton && (
             <button
               type="button"
               onClick={scrollToBottom}
-              className={`fixed bottom-28 right-8 z-10 flex items-center gap-2 bg-white text-claude-text shadow-lg border border-claude-border transition-[transform,box-shadow] hover:scale-105 active:scale-95 ${
-                hasLiveReplyBelow ? 'live-reply-pill rounded-full px-3.5 py-2.5 ring-2 ring-claude-accent/25 shadow-xl' : 'rounded-full p-2.5'
+              className={`absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex min-h-10 items-center gap-2 whitespace-nowrap rounded-full border border-claude-border bg-white px-3.5 py-2 text-xs text-claude-text shadow-md transition-colors hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/45 ${
+                hasLiveReplyBelow ? 'live-reply-pill ring-2 ring-claude-accent/25' : ''
               }`}
-              aria-label={hasLiveReplyBelow ? '新回复正在生成，回到底部' : '回到底部'}
+              aria-label={hasLiveReplyBelow ? '新回复正在生成，回到底部' : '回到最新消息'}
+              title="回到最新消息"
             >
               {hasLiveReplyBelow && (
                 <>
@@ -1638,7 +1793,8 @@ function ChatV2View(props: ChatV2Props) {
                   <span className="text-xs font-semibold whitespace-nowrap">新回复正在生成</span>
                 </>
               )}
-              <ArrowDown className="w-4 h-4" />
+              {!hasLiveReplyBelow && <span>回到最新消息</span>}
+              <ArrowDown className="h-4 w-4 shrink-0" aria-hidden="true" />
             </button>
           )}
         </div>
@@ -1700,12 +1856,15 @@ function ChatV2View(props: ChatV2Props) {
             onSend={handleSend}
             onStop={(sending || resuming || waitingInteraction) ? handleStop : undefined}
             disabled={inputDisabled}
-            sendDisabled={stopping || uploadingCurrentDraft}
+            sendDisabled={!currentReasoningDraft || stopping || attachmentsNotReady || sending || resuming || waitingInteraction}
             sendingLabel={sendingLabel}
             placeholder={sessionId ? '输入指令...' : '输入你的问题，按 Enter 开始对话...'}
             autoFocus={!sessionId}
             attachedFiles={attachedFiles}
             onRemoveAttachment={handleRemoveAttachment}
+            onRetryAttachment={handleRetryAttachment}
+            onRestorePastedText={handleRestorePastedText}
+            onPasteText={handlePasteText}
             onFileUpload={handleFileUpload}
             onWorkspaceFilesSelected={handleWorkspaceFilesSelected}
             onInputDropHandled={() => setIsDragging(false)}
@@ -1721,8 +1880,9 @@ function ChatV2View(props: ChatV2Props) {
               <ModelSelector
                 selectedModelId={selectedModelId}
                 onModelChange={(modelId) => {
+                  if (!sessionId) onDraftInteraction?.();
                   const model = availableModels.find((item) => item.id === modelId);
-                  setComposerDrafts((previous) => ({
+                  commitComposerDrafts((previous) => ({
                     ...previous,
                     reasoningDrafts: {
                       ...previous.reasoningDrafts,
@@ -1732,13 +1892,13 @@ function ChatV2View(props: ChatV2Props) {
                       },
                     },
                   }));
-                  onModelChange(modelId);
                 }}
                 availableModels={availableModels}
                 reasoningSelection={turnReasoning}
                 onSelectionComplete={() => composerTextareaRef.current?.focus()}
                 onReasoningChange={(selection) => {
-                  setComposerDrafts((previous) => ({
+                  if (!sessionId) onDraftInteraction?.();
+                  commitComposerDrafts((previous) => ({
                     ...previous,
                     reasoningDrafts: {
                       ...previous.reasoningDrafts,
@@ -1746,10 +1906,10 @@ function ChatV2View(props: ChatV2Props) {
                     },
                   }));
                 }}
-                readOnly={!!sessionId}
               />
             )}
           />
+          <DraftAttachmentPreview file={localAttachmentPreview} onClose={() => setLocalAttachmentPreview(null)} />
       </div>
 
       {(sessionId || workspacePanelActive) && (

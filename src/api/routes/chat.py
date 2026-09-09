@@ -54,6 +54,7 @@ from src.api.services.web_chat_adapter import WebCancelAdapter, WebChatAdapter, 
 from src.api.services.workspace_service import WorkspaceError
 from src.api.services.model_access_service import assert_user_can_access_model, resolve_default_model_for_user
 from src.api.models.round import Round
+from src.api.models.agent_interaction import AgentInteraction
 from src.api.services.history_service import HistoryService
 from src.api.models.database import SessionLocal
 import asyncio
@@ -105,19 +106,51 @@ ABORT_OUTCOME_WARNING = (
 )
 
 
-def _resolve_session_model_for_user(db: DBSession, session: Session, user_id: str) -> str:
-    """Validate and resolve a session model for the current user."""
-    if session.model_id:
+def _resolve_session_model_for_user(
+    db: DBSession,
+    session: Session,
+    user_id: str,
+) -> str:
+    """Resolve the next admitted turn's default without eagerly updating Session."""
+    candidate = getattr(session, "model_id", None)
+    if candidate:
         if not isinstance(session, Session):
-            return str(session.model_id)
-        config = assert_user_can_access_model(db, user_id, session.model_id)
-        return config.id
-    config = resolve_default_model_for_user(db, user_id)
-    session.model_id = config.id
-    session.updated_at = now_naive()
-    db.commit()
-    db.refresh(session)
-    return config.id
+            return str(candidate)
+        return assert_user_can_access_model(db, user_id, str(candidate)).id
+    return resolve_default_model_for_user(db, user_id).id
+
+
+def _resolve_send_model_for_user(
+    db: DBSession,
+    session: Session,
+    user_id: str,
+    requested_model_id: str | None,
+) -> str:
+    """Resolve this new turn without changing the Session before admission."""
+    if requested_model_id:
+        return assert_user_can_access_model(db, user_id, requested_model_id).id
+    return _resolve_session_model_for_user(db, session, user_id)
+
+
+def _resolve_resume_model_for_user(
+    db: DBSession,
+    session: Session,
+    user_id: str,
+    interrupt_id: str,
+) -> str:
+    """Resume the suspended Round with its frozen model, never a later default."""
+    model_id = (
+        db.query(Round.model_id)
+        .join(AgentInteraction, AgentInteraction.round_id == Round.id)
+        .filter(
+            AgentInteraction.id == interrupt_id,
+            AgentInteraction.session_id == session.id,
+        )
+        .scalar()
+    )
+    if isinstance(model_id, str) and model_id:
+        return _resolve_send_model_for_user(db, session, user_id, model_id)
+    return _resolve_session_model_for_user(db, session, user_id)
 
 
 def _validate_turn_reasoning_request(
@@ -708,7 +741,9 @@ async def send_message_stream(
         user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
         user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
         round_count = db.query(Round).filter(Round.session_id == chat_session_id).count()
-        model_id = _resolve_session_model_for_user(db, session, user_id)
+        model_id = _resolve_send_model_for_user(
+            db, session, user_id, turn.model_id
+        )
         _validate_turn_reasoning_request(
             db,
             user_id=user_id,
@@ -1005,7 +1040,9 @@ async def resume_interrupt(
     try:
         user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
         user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
-        model_id = _resolve_session_model_for_user(db, session, user_id)
+        model_id = _resolve_resume_model_for_user(
+            db, session, user_id, request.interrupt_id
+        )
     except Exception:
         await _release_user_run_lock_in_new_session(
             user_id=user_id,

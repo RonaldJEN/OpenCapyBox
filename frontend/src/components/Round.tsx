@@ -15,6 +15,7 @@ import {
   Database,
   File,
   Image,
+  Loader2,
   Presentation,
   Table2,
   User,
@@ -38,10 +39,11 @@ import { AuthenticatedImage } from './AuthenticatedImage';
 interface RoundProps {
   round: RoundData;
   isStreaming?: boolean;
+  preparing?: boolean;
   disableMotion?: boolean;
   userAttachments?: AttachmentInfo[];
   sessionId?: string;
-  onPreviewAttachment?: (file: FileInfo) => void;
+  onPreviewAttachment?: (file: FileInfo, index: number) => void;
   onOpenFileInPanel?: (file: FileInfo) => void;
 }
 
@@ -378,7 +380,7 @@ function AssistantFileCard({
   );
 }
 
-export function Round({ round, isStreaming = false, disableMotion = false, userAttachments = [], sessionId, onPreviewAttachment, onOpenFileInPanel }: RoundProps) {
+export function Round({ round, isStreaming = false, preparing = false, disableMotion = false, userAttachments = [], sessionId, onPreviewAttachment, onOpenFileInPanel }: RoundProps) {
   // 解析用户消息，提取附件信息
   const { attachments, cleanContent } = parseMessageContent(round.user_message);
 
@@ -461,7 +463,7 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
                   key={`${file.path}-${idx}`}
                   data-reading-block={`user-file:${file.path}`}
                   type="button"
-                  onClick={() => onPreviewAttachment?.(toFileInfo(file, sessionId))}
+                  onClick={() => onPreviewAttachment?.(toFileInfo(file, sessionId), idx)}
                   className="group relative w-24 h-20 rounded-xl overflow-hidden border border-claude-border bg-white hover:border-claude-border-strong transition-colors"
                   title={`预览 ${file.name}`}
                 >
@@ -520,10 +522,18 @@ export function Round({ round, isStreaming = false, disableMotion = false, userA
         </div>
 
         <div className="flex-1 min-w-0 pt-0.5">
-          <p className="text-xs font-medium text-claude-secondary mb-1.5">助手</p>
+          <p className="text-xs font-medium text-claude-secondary mb-1.5">
+            助手{round.model_display_name ? ` · ${round.model_display_name}` : ''}
+          </p>
 
           {/* 推理面板 */}
-          {(round.steps.length > 0 || isStreaming) && (
+          {preparing && (
+            <div role="status" className="flex items-center gap-2 py-2 text-sm text-claude-secondary">
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              <span>正在准备请求...</span>
+            </div>
+          )}
+          {!preparing && (round.steps.length > 0 || isStreaming) && (
             <ReasoningPanel
               steps={round.steps}
               isStreaming={effectiveStreaming}

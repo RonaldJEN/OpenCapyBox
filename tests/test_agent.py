@@ -101,6 +101,68 @@ class TestAgent:
         assert request_messages[0].content == "REQUEST ONLY\n" + agent.system_prompt
         assert [msg.model_dump(mode="json") for msg in agent.messages] == original_dump
 
+    def test_request_projection_strips_unsupported_history_image_without_breaking_tool_pair(
+        self, mock_llm_client, mock_tool, tmp_path,
+    ):
+        agent = Agent(
+            llm_client=mock_llm_client,
+            system_prompt="Stable system",
+            tools=[mock_tool],
+            workspace_dir=str(tmp_path / "text-only-workspace"),
+            supports_image=False,
+        )
+        image_message = Message(role="user", content=[
+            {"type": "text", "text": "请结合之前的说明继续"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+        tool_call = ToolCall(
+            id="history-tool-call",
+            type="function",
+            function=FunctionCall(name="read_file", arguments={"path": "report.md"}),
+        )
+        agent.messages.extend([
+            image_message,
+            Message(role="assistant", content="我先读取文件", tool_calls=[tool_call]),
+            Message(
+                role="tool", content="文件正文", tool_call_id="history-tool-call", name="read_file",
+            ),
+        ])
+
+        request = agent._build_llm_request_messages()
+
+        assert request[1].content == [
+            {"type": "text", "text": "请结合之前的说明继续"},
+            {"type": "text", "text": "[历史图片未随本次请求发送：当前模型不支持图片输入。]"},
+        ]
+        assert request[2].tool_calls == [tool_call]
+        assert request[3].tool_call_id == "history-tool-call"
+        assert image_message.content[1]["type"] == "image_url"
+
+    def test_history_image_is_projected_again_after_switching_back_to_vision_model(
+        self, mock_llm_client, mock_tool, tmp_path,
+    ):
+        agent = Agent(
+            llm_client=mock_llm_client,
+            system_prompt="Stable system",
+            tools=[mock_tool],
+            workspace_dir=str(tmp_path / "switchable-workspace"),
+            supports_image=False,
+        )
+        agent.add_user_message([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+        ])
+
+        text_request = agent._build_llm_request_messages()
+        agent.supports_image = True
+        vision_request = agent._build_llm_request_messages()
+
+        assert text_request[1].content == [{
+            "type": "text",
+            "text": "[历史图片未随本次请求发送：当前模型不支持图片输入。]",
+        }]
+        assert vision_request[1].content[0]["type"] == "image_url"
+        assert agent.messages[1].content[0]["type"] == "image_url"
+
     def test_dynamic_prompt_provider_is_request_only(self, mock_tool, tmp_path):
         calls = 0
 

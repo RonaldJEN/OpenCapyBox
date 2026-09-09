@@ -64,8 +64,8 @@ export function chatRuntimeReducer(
     case 'LOCAL_RUN_STARTED':
       return applyLocalRunStarted(state, action);
 
-    case 'HISTORY_LOADED':
-      return applyHistoryLoaded(
+    case 'HISTORY_LOADED': {
+      const next = applyHistoryLoaded(
         state,
         action.sessionId,
         action.rounds.map((round) => removeDeletedWorkspaceFiles(
@@ -74,6 +74,10 @@ export function chatRuntimeReducer(
         )),
         action.loadedAt,
       );
+      return action.modelId === undefined ? next : putSession(next, action.sessionId, {
+        ...ensureSession(next, action.sessionId), modelId: action.modelId,
+      });
+    }
 
     case 'STREAM_EVENT':
       return applyStreamEvent(state, action.envelope);
@@ -1085,7 +1089,11 @@ function applyRunStarted(
   );
   const nextState = putSession(state, run.ownerSessionId, {
     ...session,
-    rounds,
+    modelId: envelope.event.modelId ?? session.modelId,
+    rounds: rounds.map((round) => round.round_id === serverRunId || round.round_id === run.tempRoundId
+      ? { ...round, model_id: envelope.event.modelId ?? round.model_id,
+          model_display_name: envelope.event.modelDisplayName ?? round.model_display_name }
+      : round),
     activeRunKeys: unique([...session.activeRunKeys, run.clientRunKey]),
     visibleAgentStateRunKey: run.clientRunKey,
   });

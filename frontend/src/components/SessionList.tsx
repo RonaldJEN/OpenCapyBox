@@ -17,7 +17,6 @@ interface SessionListProps {
   optimisticSession?: Session | null;
   executingSessionIds?: Set<string>;
   isCollapsed?: boolean;
-  onModelChange?: (modelId: string) => void;
   onNewChat?: () => void;
   cronUnreadCount?: number;
   onOpenConfig?: () => void;
@@ -38,7 +37,7 @@ interface DeleteFocusOrigin {
   adjacentSessionIds: string[];
 }
 
-export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, optimisticSession, executingSessionIds, onModelChange, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenCron, activePrimarySurface = 'chat', onOpenSkills, onOpenConnections, sidebarMode = 'sessions', onSidebarModeChange, activeWorkspaceEntryId, onOpenWorkspaceEntry, mobileSheet = false, onCloseMobileSheet }: SessionListProps) {
+export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger, optimisticSession, executingSessionIds, onNewChat, cronUnreadCount = 0, onOpenConfig, onOpenCron, activePrimarySurface = 'chat', onOpenSkills, onOpenConnections, sidebarMode = 'sessions', onSidebarModeChange, activeWorkspaceEntryId, onOpenWorkspaceEntry, mobileSheet = false, onCloseMobileSheet }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -95,14 +94,6 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     ]);
     setLoading(false);
   }, [optimisticSession]);
-
-  useEffect(() => {
-    if (!currentSessionId || !onModelChange) return;
-    const currentSession = sessions.find((session) => session.id === currentSessionId);
-    if (currentSession?.model_id) {
-      onModelChange(currentSession.model_id);
-    }
-  }, [currentSessionId, onModelChange, sessions]);
 
   // 30s 自动刷新会话列表
   useEffect(() => {
@@ -184,9 +175,6 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
       onSessionSelect(session.id, { roundId: session.match_round_id });
     } else {
       onSessionSelect(session.id);
-    }
-    if (session.model_id && onModelChange) {
-      onModelChange(session.model_id);
     }
   };
 

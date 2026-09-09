@@ -80,6 +80,7 @@ describe('chatStreamClient', () => {
       ...identity(),
       content: [{ type: 'text', text: 'hello' }],
       idempotencyKey: 'idem-a',
+      modelId: 'model-b',
       preferredSkillKeys: ['pdf', 'data_analysis'],
       preferredMcpServerIds: ['server-a'],
       reasoning: { mode: 'enabled', effort: 'max' },
@@ -95,6 +96,7 @@ describe('chatStreamClient', () => {
         body: JSON.stringify({
           content: [{ type: 'text', text: 'hello' }],
           idempotency_key: 'idem-a',
+          model_id: 'model-b',
           preferred_skill_keys: ['pdf', 'data_analysis'],
           preferred_mcp_server_ids: ['server-a'],
           thinking_mode: 'enabled',

@@ -262,7 +262,7 @@ describe('ArtifactsPanel 组件', () => {
     });
   });
 
-  it('工作台顶栏应该与聊天顶栏共享 56px 基准线', () => {
+  it('工作台顶栏区分位置导航与搜索，技术路径只显示一次', async () => {
     render(
       <ArtifactsPanel
         sessionId="test-session"
@@ -272,12 +272,12 @@ describe('ArtifactsPanel 组件', () => {
       />,
     );
 
-    expect(screen.getByTestId('session-files-toolbar')).toHaveClass(
-      'h-14',
-      'shrink-0',
-      'border-b',
-      'border-claude-border',
-    );
+    await screen.findByText('report.pdf');
+    const toolbar = screen.getByTestId('session-files-toolbar');
+    expect(toolbar).toContainElement(screen.getByRole('navigation', { name: '文件位置' }));
+    expect(toolbar).toContainElement(screen.getByRole('searchbox', { name: '搜索此文件夹' }));
+    expect(screen.getAllByText('~/sessions/test-session')).toHaveLength(1);
+    expect(toolbar).not.toHaveTextContent('~/sessions/');
   });
 
   it('临时收起保留页签，X 清空全部且重新点同一文件只打开该文件', async () => {
@@ -429,6 +429,39 @@ describe('ArtifactsPanel 组件', () => {
       expect(screen.getByText('data.xlsx')).toBeInTheDocument();
       expect(screen.getByText('script.py')).toBeInTheDocument();
     });
+  });
+
+  it.each(['', 'reports'])('预览后退先回到原目录，再回退目录历史（%s）', async (directoryPath) => {
+    const directory = { ...mockFiles[0], name: 'reports', path: 'reports', is_directory: true };
+    const file = { ...mockFiles[0], path: directoryPath ? `${directoryPath}/report.pdf` : 'report.pdf' };
+    vi.mocked(apiService.getSessionFiles).mockImplementation(async (_sessionId, path) => ({
+      files: path ? [file] : [directory, file],
+      total: path ? 1 : 2,
+    }));
+    render(<ArtifactsPanel sessionId="test-session" isOpen onClose={vi.fn()} variant="workspace" />);
+    if (directoryPath) {
+      fireEvent.click(await screen.findByRole('button', { name: '打开目录 reports' }));
+      await waitFor(() => expect(apiService.getSessionFiles).toHaveBeenLastCalledWith('test-session', 'reports'));
+    }
+    const search = await screen.findByRole('searchbox', { name: '搜索此文件夹' });
+    fireEvent.change(search, { target: { value: 'report.pdf' } });
+    fireEvent.click(await screen.findByRole('button', { name: '预览文件 report.pdf' }));
+    expect(await screen.findByRole('tab', { name: 'report.pdf' })).toBeInTheDocument();
+    const requestsBeforeBack = vi.mocked(apiService.getSessionFiles).mock.calls.length;
+
+    expect(screen.getByRole('button', { name: '后退' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: '后退' }));
+    expect(screen.getByRole('searchbox', { name: '搜索此文件夹' })).toHaveValue('report.pdf');
+    expect(screen.getByRole('button', { name: '预览文件 report.pdf' })).toBeVisible();
+    expect(apiService.getSessionFiles).toHaveBeenCalledTimes(requestsBeforeBack);
+    expect(screen.getByText(`~/sessions/test-session${directoryPath ? '/reports' : ''}`)).toBeVisible();
+
+    if (directoryPath) {
+      fireEvent.click(screen.getByRole('button', { name: '后退' }));
+      expect(await screen.findByRole('button', { name: '打开目录 reports' })).toBeVisible();
+      expect(screen.getByRole('button', { name: '前进' })).toBeEnabled();
+    }
+    expect(screen.getByRole('button', { name: '后退' })).toBeDisabled();
   });
 
   it('应该保留多个文件标签并允许在标签间切换', async () => {
@@ -821,7 +854,7 @@ describe('ArtifactsPanel 组件', () => {
       />,
     );
 
-    const searchInput = await screen.findByRole('searchbox', { name: '搜索当前目录' });
+    const searchInput = await screen.findByRole('searchbox', { name: '搜索此文件夹' });
     await screen.findByText('report.pdf');
 
     fireEvent.change(searchInput, { target: { value: 'REPORT' } });

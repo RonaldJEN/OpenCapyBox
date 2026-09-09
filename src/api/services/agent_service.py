@@ -708,6 +708,10 @@ class AgentService:
                 round_id=child_run_id,
                 user_message=child_user_message,
                 user_attachments=[],
+                model_id=child_service.model_id,
+                model_display_name=getattr(
+                    child_service._model_config, "display_name", None
+                ),
                 parent_run_id=context.run_id,
             )
             child_service.agent.add_user_message(child_user_message)
@@ -956,10 +960,17 @@ class AgentService:
                         len(tail),
                         self.session_id,
                     )
-                    return [
-                        *[message.model_copy(deep=True) for message in checkpoint.messages],
-                        *tail,
+                    replacement = [
+                        message.model_copy(deep=True)
+                        for message in checkpoint.messages
                     ]
+                    if checkpoint.source_model_id != getattr(self, "model_id", None):
+                        # Only provider-native replay data is model-bound. The
+                        # summary, visible thinking, and normalized tool
+                        # call/result history remain semantically valid.
+                        for message in replacement:
+                            message.provider_items = None
+                    return [*replacement, *tail]
 
         self._active_checkpoint_id = None
         self._active_checkpoint_sha256 = None
@@ -1279,6 +1290,12 @@ class AgentService:
                 round_id=rnd.id,
                 synthetic_user_contents=synthetic_user_contents if has_synthetic_user_custom else None,
             )
+            if getattr(rnd, "model_id", None) != getattr(self, "model_id", None):
+                # Tool calls/results are normalized protocol data and remain
+                # replayable. Only Responses provider_items are opaque.
+                for message in round_messages:
+                    if getattr(message, "provider_items", None):
+                        message.provider_items = None
 
             _has_asst_text = any(
                 msg.role == "assistant" and isinstance(msg.content, str) and msg.content
@@ -1591,6 +1608,10 @@ class AgentService:
                         "type": file_obj.get("mime_type") or "",
                         "size": AgentService._parse_file_size(file_obj.get("size")),
                     }
+                    if file_obj.get("composer_draft_attachment_id"):
+                        attachment["composer_draft_attachment_id"] = file_obj[
+                            "composer_draft_attachment_id"
+                        ]
                     if file_obj.get("source") == "workspace":
                         attachment.update({
                             "source": "workspace",
@@ -1624,6 +1645,8 @@ class AgentService:
                             "path": path,
                             "name": file_obj.get("name") or PathlibPath(path).name,
                             "type": file_obj.get("mime_type") or "image/*",
+                            **({"composer_draft_attachment_id": file_obj["composer_draft_attachment_id"]}
+                               if file_obj.get("composer_draft_attachment_id") else {}),
                             "size": AgentService._parse_file_size(file_obj.get("size")),
                         }
                     )
@@ -2315,6 +2338,9 @@ class AgentService:
                 reasoning_effort=(
                     run_context.reasoning.effort if run_context.reasoning else None
                 ),
+                model_id=self.model_id,
+                model_display_name=getattr(self._model_config, "display_name", None),
+                update_session_model=True,
                 idempotency_key=idempotency_key,
             )
         except BaseException:
@@ -3476,6 +3502,7 @@ class AgentService:
             loaded = ContextCheckpointService(self.history_service.db).save(
                 session_id=self.session_id,
                 source_round_id=source_round_id,
+                source_model_id=self.model_id,
                 source_message_sequence=message_sequence,
                 source_event_sequence=event_sequence,
                 trigger_phase=str(payload.get("phase") or "pre_turn"),
@@ -3611,13 +3638,7 @@ class AgentService:
                             f"UserRunLock ownership lost for Round {run_id}"
                         )
 
-                if (
-                    event.type == EventType.RUN_STARTED
-                    and (
-                        round_preferred_skills is not None
-                        or round_preferred_mcp_connections is not None
-                    )
-                ):
+                if event.type == EventType.RUN_STARTED:
                     event = event.model_copy(update={
                         "preferred_skills": [
                             {
@@ -3633,6 +3654,10 @@ class AgentService:
                             }
                             for item in (round_preferred_mcp_connections or [])
                         ],
+                        "model_id": self.model_id,
+                        "model_display_name": getattr(
+                            self._model_config, "display_name", None
+                        ),
                     })
 
                 if (

@@ -271,15 +271,19 @@ pre_accept_pending
 
 #### 会话草稿与发送
 
+- 正文发送上限为 30,000 个 Unicode 码点，与后端单个 `text` 块限制一致。沿用发送前 trim，以实际提交正文计数；恰好 30,000 个允许发送，超过时提示当前长度和上限并保留草稿，不创建 Session 或发起消息请求。从附件恢复的原文、多次粘贴累计正文和手动输入使用同一限制；单次粘贴超过 1,000 个码点转附件的规则独立不变（见 §8）。
+
 - Skill 与 MCP 选择合并为 `TurnPreferenceDraft {skillKeys, mcpConnections, revision}`，按 session key 隔离保存。MCP 客户端快照冻结 `{server_id, display_name}` 供 optimistic 首帧直接显示中文；HTTP 仍只从中映射 `server_id[]`，服务端 `RUN_STARTED/history` 继续权威覆盖。
 - 正文与附件使用独立的 `MessageDraft` 按相同 session key 隔离；草稿包含稳定 `draftId` 与递增 `revision`。正文编辑、附件增删递增 revision，session key 迁移不得改变 draftId。
-- 新会话仍以 `__new_session__` 作为客户端映射 key，但附件上传必须先取得真实 server session ID。上传等异步回调绑定发起时的 `draftId + serverSessionId`，不得根据回调执行时的当前活跃会话决定写入位置。
+- 新会话以 `__new_session__` 作为客户端映射 key，上传只使用独立 `draftId + clientId`，不得创建 Session。异步回调绑定发起时的草稿和附件身份，不能写入当前活跃会话，也不能复活已移除卡片。只在 Enter/发送时创建真实 Session，再把本次附件 claim 到该 Session。
 - 从 `__new_session__` 迁移到真实 session 时，MessageDraft 与 TurnPreferenceDraft 必须在同一转换路径协调迁移；目标已有较新草稿或 draftId 已变化时，迟到响应不得覆盖或重新创建旧草稿。
 - 发送时冻结正文、附件与 TurnPreferenceDraft。若本轮附加的 Workspace 文件正 dirty，必须在发送请求前只等待这些 entry 的 outbox 保存；成功后再让服务端解析 current head，失败或保存回执为 stale 时不创建 Round并保留 composer 草稿。未作为本轮附件的 dirty 文件仍同步抓取到应用级 outbox并在后台保存，不阻断 Agent；这些非附件路径只进入 Agent 的 `pending_file_drafts`，前端不显示全局同步提示。不得传草稿正文。
 - optimistic Round 中尚未取得服务端结果的 Workspace 文件不得进入 Session 文件预览；点击时显示“工作区附件正在准备，请稍后再打开”，不得把原 Workspace path 拼到 `/api/sessions/{id}/files/`。authoritative Round 返回 snapshot 后才按 captured/read-only 链路打开。文件夹卡片始终按稳定 entry_id 打开当前 Workspace 目录，不经过 Session 文件预览，也不承诺与发送时内容一致。
 - 受理前的 `CUSTOM attachment_preparing {index,total,name,kind}` 与 heartbeat 只用于持续产生 SSE 数据、避免客户端把准备阶段误判为断网；前端不得把逐项计数投影给用户。两者都不得把 run 从 `starting` 推进到 `streaming`，也不得触发 `stream_accepted`。
 - 欢迎页创建 Session、迁移草稿与清空 composer 必须通过同步 submission snapshot 收敛；stream accepted 前拒绝时原子恢复正文、附件和本轮偏好，不依赖 React state 提交时序。
+- 点击发送并通过本地校验后，立即将冻结的正文、附件、模型与偏好展示到对话区，助手位置显示“正在准备请求...”；创建 Session、保存附加的 Workspace 草稿和附件 claim 均在此展示期间进行，输入框按钮不重复转圈。准备展示按草稿身份隔离并随 Session 迁移，附件仍使用本地/Workspace 预览；准备完成后一次性交给 runtime optimistic Round，不重复展示。准备失败撤下展示并恢复草稿，不创建假的服务端 Round、不提前发出 `stream_accepted`。
 - HTTP/SSE 响应头不代表 Round 已受理；只有 `RUN_STARTED` 或按幂等键查到 durable Round 才发布 `stream_accepted`。此前收到的无序 `RUN_ERROR` 必须恢复 submission snapshot。
+- 本地 Blob URL 由草稿/提交快照持有：受理前拒绝保留供恢复和重试；`stream_accepted` 时只释放本次快照的 URL 与本地附件引用，不能释放已切换到的其他草稿或下一轮新附件；移除和卸载同样按持有者释放。
 - 提交发送时乐观清空目标 session 的两类偏好。服务端确认 SSE 已接受后保持清空；执行已接受后的流式失败、中断或取消不得恢复旧选择。
 - composer 清空只影响下一条发送，不得删除或隐藏当前 direct Round 已固化的资源胶囊。
 - 若 POST 在收到响应头前发生网络错误，前端须按 §3.3.1 用同一 `idempotency_key` 查询历史：匹配到 running/waiting/终态 Round 即视为已接受，补发一次 `stream_accepted`，随后立即订阅或收敛终态；从历史恢复的失败终态也必须携带真实 `threadId`、`runId` 和末事件序号。只有 3 次 history 均成功且均无匹配时才恢复发送快照并报请求失败；任一次 history 失败则保持歧义、草稿保持清空并提示刷新。确定性的 HTTP 4xx/5xx 仍立即恢复；恢复回调最多执行一次。
@@ -293,8 +297,10 @@ pre_accept_pending
 - 触发器本身只显示模型名与推理等级，不挂能力徽章；模型能力说明（“支持深度思考”“支持图片（最多 N 张）”）保留在模型子菜单的每一项下方，不得因为改版而整体丢失。
 - 会话标题栏不使用固定宽度占位元素来对齐右侧 `Files` 按钮；`Files` 按钮用 `ml-auto` 靠右，欢迎页无按钮时标题栏保持空行高度。
 - 管理端新建 OpenAI 兼容模型时默认填入 `off, on` 且默认等级为 `on`；DeepSeek 等具有分级强度的模型可改为 `off, high, max`。请求协议由独立的 `thinking_wire_format` 技术项配置，不与用户可见等级混用。
-- 新 session 可切换模型；已有 session 的模型保持锁定，但下一轮推理等级仍可编辑。切换模型时按新的模型目录默认值重置选择，绝不把上一模型的强度带过去。目录默认值是 `thinking_mode + reasoning_effort` 的完整二元组：初始化草稿时必须原样冻结，不能因为存在具体强度就把 `provider_default` 推断成 `enabled`。`Default` 始终映射回该完整二元组；显式具体档位映射为 `enabled + effort`，两种状态即使展示强度相同也必须可区分、可往返。
+- 新旧 Session 均可按轮选择模型。模型与推理等级按草稿隔离，默认模型来自 Session 最近受理轮次；新会话使用目录/本地默认。切换模型时按新的模型目录默认值重置推理选择，绝不把上一模型的强度带过去。目录默认值是 `thinking_mode + reasoning_effort` 的完整二元组：初始化草稿时必须原样冻结，不能因为存在具体强度就把 `provider_default` 推断成 `enabled`。`Default` 始终映射回该完整二元组；显式具体档位映射为 `enabled + effort`，两种状态即使展示强度相同也必须可区分、可往返。
+- 发送同时冻结 `model_id`；等待本次准备/受理时保护正文与附件，受理后可以编辑下一条正文、添加附件、预选模型。执行中的 Run 和 same-Round resume 不受草稿修改影响；同一 Session 仍只运行一个 Round，不自动排队发送。所选模型由输入框内的模型选择器展示，不额外显示下一条消息的模型提示。历史助手标题显示 `model_display_name` 快照，旧记录为空时只显示“助手”。
 - 本轮推理选择属于 composer draft，必须按 `sessionId || __new_session__` 隔离；切换到使用同一模型的其他会话不得沿用当前选择，新 session 建立后随原 draft 一起迁移到真实 session id。
+- 首次可解析草稿时必须固化模型 ID 和完整推理二元组，即使用户从未手选。欢迎页的初值来自独立模型目录默认值，不能来自 App 最近查看会话的共享选择；已有 Session 必须先取得权威历史模型再初始化，未初始化期间禁止发送但可编辑正文/上传附件。目录或其他会话选择的迟到变化不能覆盖已有草稿快照。
 - 发送前冻结 `TurnReasoningSelection` 并随 `content` 一并提交为 `thinking_mode` / `reasoning_effort`。正在流式执行时继续修改输入框只影响下一条消息，不得改变已启动 run。
 - 选择 `Off` 必须发送 `{thinking_mode: "disabled", reasoning_effort: null}`；选择 `Default` 发送目录完整默认二元组；选择显式具体档位发送 `{thinking_mode: "enabled", reasoning_effort: "<level>"}`。前端不得按模型名猜测档位或提交目录没有声明的值。
 - 从推理等级或模型菜单提交选项后，焦点必须回到消息输入框，确保用户无需额外点击即可继续输入或按 Enter 发送；通过 Escape 取消菜单时仍将焦点退回菜单触发器。
@@ -310,6 +316,8 @@ pre_accept_pending
 | 用户滚动 | 用户造成的 `scroll` 事件 | 以统一 2px 容差识别是否回到底部，否则捕获文字阅读锚点；程序恢复/平滑定位中间帧不改写用户意图 |
 | 底部按钮 | 用户离开底部 | 点击后平滑滚到底；若有回复正在生成，按钮显示 live reply 指示 |
 
+“回到最新消息”按钮由聊天 pane 内、消息滚动区之后的输入区上沿承载，水平居中并浮在消息区底端；常态显示文字与向下箭头，生成中保留“新回复正在生成”提示。定位随聊天分栏宽度与输入区高度自然变化，禁止使用相对 viewport 的 fixed/right/bottom 偏移；不得落入 Session/Workspace 文件面板，聊天隐藏时随其一起隐藏。
+
 `useChatReadingPosition` 是聊天容器唯一滚动写入者，统一管理首次进入、显式定位、流式跟随、文件布局恢复及 ResizeObserver 通知。容器关闭浏览器原生 overflow anchoring，避免双重补偿；用户 wheel/pointer/键盘输入可中止程序平滑定位。位置恢复不使用 timeout 或多帧猜测布局稳定。full 的隐藏阅读书签按 Session 隔离，具体语义见 Session 文件 spec。平滑定位尊重 prefers-reduced-motion。
 
 **禁止**：
@@ -323,7 +331,7 @@ pre_accept_pending
 - 首次渲染历史：`disableInitialMotion = true`，加载完关闭一次性 flag。
 - 实时新内容：启用 `animate-fade-in`。
 - `suppressAutoScrollRef` 用于阻止历史加载窗口内的流式自动跟随；历史加载完成后，普通进入显式定位到底部，搜索进入交给 `scrollTarget` 处理。
-- 新会话首次发送时保持欢迎页，创建完成后直接进入对话，不显示额外的 bootstrap message 或 session handoff 动画。
+- 新会话首次发送通过本地校验后，立即展示冻结的用户消息和“正在准备请求...”；创建会话及附件准备期间保留该展示，随后交接给 runtime optimistic Round，不重复展示消息或增加 session handoff 动画（见 §3“会话草稿与发送”）。
 
 ## 6. 轮询契约
 
@@ -374,7 +382,12 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 ## 8. 附件上传
 
 - 图片：前端用 `readFileAsDataUrl` 读取原始 Data URL 后发送，避免截图/OCR 场景因压缩降质；体积保护由后端单张 20MB、总量 50MB 限制负责。
-- 其他文件：通过 `apiService.uploadFile` 上传到沙箱，返回 `AttachmentInfo`。
+- Composer 文件选中即建立稳定附件卡片和本地预览，最多三个上传并发；使用临时草稿上传接口，状态为等待、上传、保存、就绪、失败。Axios 字节进度达到 100% 只代表传输完成，后端保存成功才可发送；未知总量不显示伪百分比。失败只影响该文件，支持重试与移除，上传中可以继续输入或追加附件。
+- 单次粘贴超过 1,000 个 Unicode 码点时，原样生成 UTF-8 `.txt` File（`text/plain;charset=utf-8`）；恰好 1,000 个不转换，按本次粘贴文本而非输入框累计长度判断。普通文字、Markdown 和代码统一保存为纯文本，不猜测代码语言或更换后缀；不调用模型、不改写换行/内容、不吞掉已有正文。卡片支持预览、字数、移除与恢复原文到光标位置。文件剪贴板优先且保留原文件名/类型，键盘连续输入不自动转换；中文输入法确认 Enter 不发送消息。该阈值不改变既有正文发送长度限制。
+- 临时附件属于草稿，不进入持久 Workspace。发送前 claim 返回服务端权威 Session 路径，普通文件和图片元数据都携带 `composer_draft_attachment_id`；失败保留草稿以便重试，移除/到期由后端清理未被真实 Round 引用的文件。Session 文件面板的显式上传继续使用既有 Session 接口。
+- claim 的 20 项限制是单批准备上限，不是消息附件数量上限；前端顺序分批并在全部准备成功后才提交消息。中途失败保留原草稿，重试使用同一 Session/draft/attachment ID，已成功批次依靠服务端幂等复用。
+- 本地预览支持图片、文本/Markdown和PDF；其他格式在发送前提供原文件下载，发送后沿用既有 Session 预览。页面内切换会话保留草稿；刷新/关闭页面不承诺恢复未发送的本地正文与 File。服务器临时文件在24小时到期后进入异步清理，物理回收受既有沙箱绑定限制（见 sandbox-spec §4“Composer 草稿附件目录”）。
+- Composer 的 TXT/LOG 本地预览与发送后的文件工作台复用纯文本展示：固定自动换行、系统字体、15px / 1.7 行高、24–32px 留白，不嵌套正文卡片，不提供换行/字体选项或专用工具栏；展示不改变附件字节、复制或恢复原文。
 - 消息体：附件以 `ChatContentBlock[]` 形式发送（`image_url` / `file` 等类型）。
 
 ## 9. 错误处理
@@ -428,7 +441,10 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] 普通 direct Round 在用户正文上方按 Skill/MCP 快照展示独立图标胶囊，无说明行；空数组不展示，same-Round resume 不重复，文案不暗示已使用
 - [ ] `preferredMcpConnections=[]` 能清除 optimistic MCP 胶囊；历史刷新仍按冻结名称恢复
 - [ ] TurnPreferenceDraft 按 session 隔离；A/B 会话的 Skill/MCP 均互不污染，新会话创建后统一迁移
-- [ ] 正文与附件草稿按 session 隔离；切回会话可恢复，迟到上传只更新其捕获的 `draftId + serverSessionId`
+- [ ] 正文与附件草稿按 session 隔离；切回会话可恢复，迟到上传只更新其捕获的 `draftId + clientId`，已移除卡片不复活
+- [ ] 新会话粘贴/上传/移除、未发送离开均不新增 Session；Enter 后创建、claim、受理失败能够重试
+- [ ] 单次粘贴 1,000 个 Unicode 码点保持正文，1,001 个原样转 `.txt`，可预览/恢复；多文件部分失败、上传中追加、取消晚响应和图片立即预览可用
+- [ ] 回答中可预选下一轮模型和编辑草稿；下一轮实际模型及历史快照一致，resume仍使用原轮模型
 - [ ] 新会话的正文、附件与 TurnPreferenceDraft 协调迁移；重复或迟到的创建结果不得覆盖真实 session 下的较新草稿
 - [ ] 发送携带 `preferred_skill_keys` 与 `preferred_mcp_server_ids`，空选择省略；发送后目标 session 的两类选择清空
 - [ ] composer 清空后已发送 Round 的资源胶囊仍保留；刷新或断线恢复后以 `history/v2` 的持久化 `display_name` 快照还原，独立多轮不继承或累积

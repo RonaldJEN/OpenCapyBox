@@ -182,12 +182,18 @@ def build_compacted_history(messages: Iterable[Message], summary: str) -> list[M
     return selected
 
 
-def _strip_unsupported_media(
+def project_message_media_capabilities(
     message: Message,
     *,
     supports_image: bool,
     supports_video: bool,
 ) -> Message:
+    """Return a request-copy with only media the current model can accept.
+
+    The caller owns the returned copy.  This intentionally does not compact,
+    truncate, reorder, or repair tool-call pairs, so it is safe for ordinary
+    request projection as well as context-compaction normalization.
+    """
     copy = message.model_copy(deep=True)
     if not isinstance(copy.content, list):
         return copy
@@ -198,8 +204,16 @@ def _strip_unsupported_media(
             continue
         block_type = block.get("type")
         if block_type == "image_url" and not supports_image:
+            content.append({
+                "type": "text",
+                "text": "[历史图片未随本次请求发送：当前模型不支持图片输入。]",
+            })
             continue
         if block_type == "video_url" and not supports_video:
+            content.append({
+                "type": "text",
+                "text": "[历史视频未随本次请求发送：当前模型不支持视频输入。]",
+            })
             continue
         if block_type in {"audio", "audio_url", "input_audio"}:
             continue
@@ -216,7 +230,7 @@ def normalize_history(
 ) -> list[Message]:
     """Produce provider-valid history like Codex's context manager normalization."""
     source = [
-        _strip_unsupported_media(
+        project_message_media_capabilities(
             message,
             supports_image=supports_image,
             supports_video=supports_video,
