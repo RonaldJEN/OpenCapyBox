@@ -32,7 +32,7 @@
 | `context_window` | int | 上下文窗口大小 |
 | `auto_compact_token_limit` | int/null | 可选自动压缩阈值，最终不得超过 `(context_window - max_tokens) * 80%` |
 | `tool_output_truncation_bytes` | int | 通用工具结果记录截断策略，必须大于 0，默认 42667 bytes；按 1.2 倍序列化余量得到 51200 UTF-8 bytes 正文预算；自行严格限流的内建工具成功结果可豁免 |
-| `reasoning_format` | str | 推理格式配置 |
+| `reasoning_format` | str | `none` / `reasoning_content` / `reasoning`（vLLM）/ `reasoning_details` / `anthropic_thinking`；管理页可选，创建和更新共用目录校验。Chat Completions 的流式与非流式响应均识别字符串 `reasoning_content` 和 `reasoning`（同时返回时前者优先），历史 assistant 消息按所选格式回传思考字段。此选项不改变 Responses 协议或思考开关。 |
 | `reasoning_split` | bool | 目录能力标记：网关是否返回独立的可展示思考内容；Responses 下不发送，Chat Completions 兼容路径发送同名扩展参数 |
 | `thinking_mode` | str | 内部传输字段：`provider_default` 省略开关；`enabled` / `disabled` 显式发送 true / false；管理端不单独暴露 |
 | `thinking_wire_format` | str | 思考开关请求协议：`none`、`enable_thinking` 布尔值或 `thinking_object`（`thinking.type`） |

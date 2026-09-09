@@ -70,7 +70,7 @@ class LLMClient:
             model: Model name to use
             retry_config: Optional retry configuration
             max_tokens: Maximum output tokens
-            reasoning_format: "none"|"reasoning_content"|"reasoning_details"|"anthropic_thinking"
+            reasoning_format: "none"|"reasoning_content"|"reasoning"|"reasoning_details"|"anthropic_thinking"
             enable_reasoning_split: Send Chat Completions extra_body.reasoning_split
             enable_thinking: Send extra_body.enable_thinking
             thinking_mode: provider_default/enabled/disabled

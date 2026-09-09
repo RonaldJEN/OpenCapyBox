@@ -70,6 +70,7 @@ VALID_THINKING_WIRE_FORMATS = {"none", "enable_thinking", "thinking_object"}
 VALID_REASONING_FORMATS = {
     "none",                # 不支援思考
     "reasoning_content",   # OpenAI response.reasoning_content（GLM/Qwen/DeepSeek）
+    "reasoning",           # OpenAI response.reasoning（vLLM）
     "reasoning_details",   # OpenAI response.reasoning_details（MiniMax）
     "anthropic_thinking",  # Anthropic 原生 thinking content blocks
 }

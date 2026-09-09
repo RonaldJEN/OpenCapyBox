@@ -14,6 +14,7 @@
 # reasoning_format 取值：
 #   - none                不支援思考過程
 #   - reasoning_content   OpenAI 協議 response.reasoning_content（GLM/Qwen/DeepSeek）
+#   - reasoning           OpenAI 協議 response.reasoning（vLLM）
 #   - reasoning_details   OpenAI 協議 response.reasoning_details（MiniMax via OpenAI）
 #   - anthropic_thinking  Anthropic 協議原生 thinking content blocks
 #

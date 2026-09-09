@@ -15,6 +15,47 @@ from tests.helpers import FakeAsyncStream
 # ── 模块级 fixtures（消除 5 处重复）─────────────────────────
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reasoning_format", ["reasoning_content", "reasoning"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_string_reasoning_round_trip(reasoning_format, streaming):
+    """SDK 解析、流式回调和历史回传保留新旧推理字段。"""
+    from openai.types.chat import ChatCompletion, ChatCompletionChunk
+
+    client = _make_openai_client(reasoning_format=reasoning_format)
+    thinking = "先分析，再回答。"
+    content = "答案"
+    envelope = {"id": "test", "created": 0, "model": "test"}
+    if streaming:
+        deltas = [{reasoning_format: "先分析，"}, {reasoning_format: "再回答。"}, {"content": content}]
+        chunks = [
+            ChatCompletionChunk.model_validate({
+                **envelope, "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            })
+            for delta in deltas
+        ]
+        client.client.chat.completions.create = AsyncMock(return_value=FakeAsyncStream(chunks))
+        on_thinking = AsyncMock()
+        result = await client._make_stream_request({}, on_thinking=on_thinking)
+        assert [call.args[0] for call in on_thinking.await_args_list] == ["先分析，", "再回答。"]
+    else:
+        response = ChatCompletion.model_validate({
+            **envelope, "object": "chat.completion",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": content, reasoning_format: thinking,
+            }}],
+        })
+        result = client._parse_response(response)
+
+    assert result.thinking == thinking
+    assert result.content == content
+    _, messages = client._convert_messages([
+        Message(role="assistant", content=result.content, thinking=result.thinking),
+    ])
+    assert messages == [{"role": "assistant", "content": content, reasoning_format: thinking}]
+
+
 def _make_openai_client(**kwargs):
     """OpenAI 客户端工厂，减少 import + 构造样板"""
     from src.agent.llm.openai_client import OpenAIClient

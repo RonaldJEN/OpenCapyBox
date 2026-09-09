@@ -240,9 +240,10 @@ class TestModelConfig:
         assert config.tool_output_truncation_bytes == 42667
         assert config.openai_protocol == "chat_completions"
 
-    def test_supports_thinking_true(self):
+    @pytest.mark.parametrize("reasoning_format", ["reasoning_content", "reasoning"])
+    def test_supports_thinking_true(self, reasoning_format):
         """OpenAI 变体显式启用 reasoning split 时公开支持思考。"""
-        cfg = self._make_config(reasoning_format="reasoning_content", reasoning_split=True)
+        cfg = self._make_config(reasoning_format=reasoning_format, reasoning_split=True)
         assert cfg.supports_thinking is True
 
     def test_supports_thinking_false(self):

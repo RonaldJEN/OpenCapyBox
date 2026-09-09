@@ -56,7 +56,7 @@ class OpenAIClient(LLMClientBase):
             retry_config: Optional retry configuration
             enable_reasoning_split: Send extra_body.reasoning_split = true
             max_tokens: Maximum output tokens (from ModelConfig)
-            reasoning_format: Thinking format: "none" | "reasoning_content" | "reasoning_details"
+            reasoning_format: Thinking format: "none" | "reasoning_content" | "reasoning" | "reasoning_details"
             enable_thinking: Legacy switch used when thinking_mode is provider_default
             thinking_mode: provider_default omits the flag; enabled/disabled send a boolean
             thinking_wire_format: none / enable_thinking boolean / thinking.type object
@@ -248,9 +248,8 @@ class OpenAIClient(LLMClientBase):
                 # preserved in Message History and passed back to the model in the next turn.
                 # This ensures the model's chain of thought is not interrupted.
                 if msg.thinking:
-                    if self.reasoning_format == "reasoning_content":
-                        # GLM/Qwen/deepseek format: reasoning_content (string)
-                        assistant_msg["reasoning_content"] = msg.thinking
+                    if self.reasoning_format in {"reasoning_content", "reasoning"}:
+                        assistant_msg[self.reasoning_format] = msg.thinking
                     elif self.reasoning_format == "reasoning_details":
                         # MiniMax format: reasoning_details (list)
                         assistant_msg["reasoning_details"] = [{"text": msg.thinking}]
@@ -314,13 +313,17 @@ class OpenAIClient(LLMClientBase):
         # Extract text content
         text_content = message.content or ""
 
-        # Extract thinking content - support both MiniMax and GLM formats
+        # Extract thinking content from OpenAI-compatible providers.
         thinking_content = ""
 
         # Method 1: GLM format - reasoning_content (string)
         if hasattr(message, "reasoning_content") and message.reasoning_content:
             thinking_content = message.reasoning_content
             logger.debug("Extracted reasoning from reasoning_content (GLM format)")
+
+        elif isinstance(getattr(message, "reasoning", None), str) and message.reasoning:
+            thinking_content = message.reasoning
+            logger.debug("Extracted reasoning from reasoning (vLLM format)")
 
         # Method 2: MiniMax format - reasoning_details (list)
         elif hasattr(message, "reasoning_details") and message.reasoning_details:
@@ -484,6 +487,11 @@ class OpenAIClient(LLMClientBase):
                 # Call thinking callback if provided
                 if on_thinking:
                     await on_thinking(delta.reasoning_content)
+
+            elif isinstance(getattr(delta, "reasoning", None), str) and delta.reasoning:
+                thinking_content += delta.reasoning
+                if on_thinking:
+                    await on_thinking(delta.reasoning)
 
             # Handle tool calls delta
             if delta.tool_calls:
