@@ -8,7 +8,7 @@ from typing import Any
 
 from ..retry import async_retry
 from ..schema import FunctionCall, LLMResponse, Message, ToolCall
-from ..schema.schema import TokenUsage
+from ..schema.schema import AssistantMessageStreamEvent, AssistantTextMessage, TokenUsage
 from .json_parser import robust_json_parse
 from .openai_client import OpenAIClient, STREAM_CHUNK_TIMEOUT
 from .tool_schema import tools_to_responses_schema
@@ -77,7 +77,15 @@ class OpenAIResponsesClient(OpenAIClient):
             if message.role == "assistant":
                 if message.provider_items:
                     input_items.extend(message.provider_items)
-                if message.content:
+                if message.assistant_text_messages is not None:
+                    for text_message in message.assistant_text_messages:
+                        if not text_message.content:
+                            continue
+                        item = {"role": "assistant", "content": text_message.content}
+                        if text_message.phase is not None:
+                            item["phase"] = text_message.phase
+                        input_items.append(item)
+                elif message.content:
                     input_items.append({
                         "role": "assistant",
                         "content": self._responses_content(message.content, assistant=True),
@@ -184,6 +192,20 @@ class OpenAIResponsesClient(OpenAIClient):
             total_tokens=getattr(usage, "total_tokens", 0) or 0,
         )
 
+    @staticmethod
+    def _message_phase(item: Any) -> str | None:
+        phase = getattr(item, "phase", None)
+        return phase if phase in {"commentary", "final_answer"} else None
+
+    @staticmethod
+    def _message_text(item: Any) -> str:
+        return "".join(
+            str(getattr(part, "text", "") or "") if getattr(part, "type", "") == "output_text"
+            else str(getattr(part, "refusal", "") or "") if getattr(part, "type", "") == "refusal"
+            else ""
+            for part in getattr(item, "content", []) or []
+        )
+
     def _parse_response(self, response: Any) -> LLMResponse:
         if getattr(response, "status", None) == "failed":
             error = getattr(response, "error", None)
@@ -193,6 +215,7 @@ class OpenAIResponsesClient(OpenAIClient):
         thinking = ""
         tool_calls: list[ToolCall] = []
         provider_items: list[dict[str, Any]] = []
+        text_messages: list[AssistantTextMessage] = []
         for item in getattr(response, "output", []) or []:
             item_type = getattr(item, "type", "")
             if item_type == "reasoning":
@@ -200,11 +223,12 @@ class OpenAIResponsesClient(OpenAIClient):
                 for summary in getattr(item, "summary", []) or []:
                     thinking += str(getattr(summary, "text", "") or "")
             elif item_type == "message":
-                for part in getattr(item, "content", []) or []:
-                    if getattr(part, "type", "") == "output_text":
-                        content += str(getattr(part, "text", "") or "")
-                    elif getattr(part, "type", "") == "refusal":
-                        content += str(getattr(part, "refusal", "") or "")
+                text = self._message_text(item)
+                content += text
+                text_messages.append(AssistantTextMessage(
+                    content=text, phase=self._message_phase(item),
+                    provider_message_id=getattr(item, "id", None),
+                ))
             elif item_type == "function_call":
                 raw_arguments = str(getattr(item, "arguments", "") or "")
                 arguments = robust_json_parse(raw_arguments, getattr(item, "name", ""))
@@ -237,6 +261,7 @@ class OpenAIResponsesClient(OpenAIClient):
             finish_reason=finish_reason,
             usage=self._usage(response),
             provider_items=provider_items or None,
+            assistant_text_messages=text_messages or None,
         )
 
     async def _make_api_request(
@@ -269,12 +294,62 @@ class OpenAIResponsesClient(OpenAIClient):
         on_content: Any,
         on_thinking: Any,
         on_tool_call: Any,
+        *,
+        on_message: Any = None,
     ) -> LLMResponse:
         stream = await self.client.responses.create(
             **self._request_params(messages, tools, stream=True)
         )
         final_response = None
+        stream_id = uuid.uuid4().hex
+        text_items: dict[str, dict[str, Any]] = {}
         tool_items: dict[str, tuple[int, str, str]] = {}
+
+        async def start_message(item_id: str, phase: str | None = None) -> dict[str, Any]:
+            if not item_id:
+                raise ValueError("Responses text event is missing its message item ID")
+            if item_id not in text_items:
+                text_items[item_id] = {"phase": phase, "content": "", "closed": False, "interrupted": False}
+                await on_message(AssistantMessageStreamEvent(
+                    kind="start", stream_id=stream_id, provider_message_id=item_id, phase=phase,
+                ))
+            return text_items[item_id]
+
+        async def end_message(item: Any) -> None:
+            item_id = str(getattr(item, "id", "") or "")
+            phase = self._message_phase(item)
+            state = await start_message(item_id, phase)
+            full_text = self._message_text(item)
+            phase = phase or state["phase"]
+            if state["closed"]:
+                if full_text != state["content"]:
+                    raise ValueError("Responses terminal message content differs from its completed item")
+                if phase != state["phase"]:
+                    state["phase"] = phase
+                    await on_message(AssistantMessageStreamEvent(
+                        kind="end", stream_id=stream_id, provider_message_id=item_id,
+                        phase=phase, interrupted=state["interrupted"],
+                    ))
+                return
+            if not full_text.startswith(state["content"]):
+                raise ValueError("Responses message content conflicts with its published deltas")
+            # The same identified item's completion may carry an unstreamed
+            # suffix. Publish only that exact suffix; never rewrite old text.
+            suffix = full_text[len(state["content"]):]
+            state["content"] = full_text
+            state["phase"] = phase
+            if suffix:
+                await on_message(AssistantMessageStreamEvent(
+                    kind="delta", stream_id=stream_id, provider_message_id=item_id,
+                    phase=phase, delta=suffix,
+                ))
+            state["closed"] = True
+            state["interrupted"] = getattr(item, "status", "completed") != "completed"
+            await on_message(AssistantMessageStreamEvent(
+                kind="end", stream_id=stream_id, provider_message_id=item_id, phase=phase,
+                interrupted=state["interrupted"],
+            ))
+
         iterator = stream.__aiter__()
         try:
             while True:
@@ -286,8 +361,21 @@ class OpenAIResponsesClient(OpenAIClient):
                 except StopAsyncIteration:
                     break
                 event_type = getattr(event, "type", "")
-                if event_type == "response.output_text.delta" and on_content:
-                    await on_content(str(getattr(event, "delta", "") or ""))
+                if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+                    delta = str(getattr(event, "delta", "") or "")
+                    if on_message:
+                        item_id = str(getattr(event, "item_id", "") or "")
+                        state = await start_message(item_id)
+                        if state["closed"]:
+                            raise ValueError("Responses emitted text after its message ended")
+                        state["content"] += delta
+                        if delta:
+                            await on_message(AssistantMessageStreamEvent(
+                                kind="delta", stream_id=stream_id, provider_message_id=item_id,
+                                phase=state["phase"], delta=delta,
+                            ))
+                    elif on_content:
+                        await on_content(delta)
                 elif event_type in {
                     "response.reasoning_summary_text.delta",
                     "response.reasoning_text.delta",
@@ -296,12 +384,18 @@ class OpenAIResponsesClient(OpenAIClient):
                 elif event_type == "response.output_item.added":
                     item = getattr(event, "item", None)
                     item_type = str(getattr(item, "type", "") or "")
-                    if item_type in {"function_call", "custom_tool_call"}:
+                    if item_type == "message" and on_message:
+                        await start_message(str(getattr(item, "id", "") or ""), self._message_phase(item))
+                    elif item_type in {"function_call", "custom_tool_call"}:
                         tool_items[str(getattr(item, "id", "") or "")] = (
                             int(getattr(event, "output_index", 0) or 0),
                             str(getattr(item, "name", "") or ""),
                             str(getattr(item, "call_id", "") or ""),
                         )
+                elif event_type == "response.output_item.done" and on_message:
+                    item = getattr(event, "item", None)
+                    if getattr(item, "type", None) == "message":
+                        await end_message(item)
                 elif event_type in {
                     "response.function_call_arguments.delta",
                     "response.custom_tool_call_input.delta",
@@ -320,13 +414,33 @@ class OpenAIResponsesClient(OpenAIClient):
                     "response.failed",
                 }:
                     final_response = getattr(event, "response", None)
+            if final_response is None:
+                raise RuntimeError("Responses stream ended without a terminal response")
+            parsed = self._parse_response(final_response)
+            if on_message:
+                for item in getattr(final_response, "output", []) or []:
+                    if getattr(item, "type", None) == "message":
+                        await end_message(item)
+                if any(not item["closed"] for item in text_items.values()):
+                    raise ValueError("Responses terminal response omitted an open message")
+            return parsed
+        except (Exception, asyncio.CancelledError):
+            # Each request attempt owns its messages. A retry/fallback gets a
+            # new stream_id and cannot append to a failed attempt's text.
+            if on_message:
+                for item_id, state in text_items.items():
+                    if not state["interrupted"]:
+                        state["closed"] = True
+                        state["interrupted"] = True
+                        await on_message(AssistantMessageStreamEvent(
+                            kind="end", stream_id=stream_id, provider_message_id=item_id,
+                            phase=state["phase"], interrupted=True,
+                        ))
+            raise
         finally:
             close = getattr(stream, "close", None)
             if callable(close):
                 await close()
-        if final_response is None:
-            raise RuntimeError("Responses stream ended without a terminal response")
-        return self._parse_response(final_response)
 
     async def generate_stream(
         self,
@@ -335,6 +449,8 @@ class OpenAIResponsesClient(OpenAIClient):
         on_content: Any = None,
         on_thinking: Any = None,
         on_tool_call: Any = None,
+        *,
+        on_message: Any = None,
     ) -> LLMResponse:
         call = self._make_stream_request
         if self.retry_config.enabled:
@@ -342,4 +458,4 @@ class OpenAIResponsesClient(OpenAIClient):
                 config=self.retry_config,
                 on_retry=self.retry_callback,
             )(call)
-        return await call(messages, tools, on_content, on_thinking, on_tool_call)
+        return await call(messages, tools, on_content, on_thinking, on_tool_call, on_message=on_message)

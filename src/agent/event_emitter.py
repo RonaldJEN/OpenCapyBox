@@ -3,7 +3,7 @@
 此模組封裝了 AG-UI 事件的生成邏輯，使 Agent 能夠直接輸出標準 AG-UI 事件流。
 """
 
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 import uuid
 import time
 
@@ -13,7 +13,7 @@ from .schema.agui_events import (
     StepStartedEvent, StepFinishedEvent,
     TextMessageStartEvent, TextMessageContentEvent, TextMessageEndEvent,
     ThinkingTextMessageStartEvent, ThinkingTextMessageContentEvent, ThinkingTextMessageEndEvent,
-    ToolCallStartEvent, ToolCallArgsEvent, ToolCallEndEvent, ToolCallResultEvent,
+    ToolCallStartEvent, ToolCallArgsEvent, ToolCallEndEvent, ToolCallResultEvent, ToolDisplay,
     StateSnapshotEvent, StateDeltaEvent, AgentState,
     ActivitySnapshotEvent, ActivityDeltaEvent,
     CustomEvent,
@@ -35,7 +35,8 @@ class AGUIEventEmitter:
         yield emitter.run_finished()
     """
     
-    def __init__(self, thread_id: str, run_id: str):
+    def __init__(self, thread_id: str, run_id: str, *,
+                 tool_display_resolver: Callable[[str], ToolDisplay | None] | None = None):
         """初始化事件發射器
         
         Args:
@@ -44,10 +45,12 @@ class AGUIEventEmitter:
         """
         self.thread_id = thread_id
         self.run_id = run_id
+        self._tool_display_resolver = tool_display_resolver
         self._sequence = 0
         
         # 流式狀態追蹤
         self._current_message_id: Optional[str] = None
+        self._last_message_id: Optional[str] = None
         self._current_thinking_id: Optional[str] = None
         self._current_activity_id: Optional[str] = None
         self._tool_call_states: dict[str, dict] = {}  # tool_call_id -> {started, args_sent}
@@ -72,7 +75,7 @@ class AGUIEventEmitter:
             run_id=self.run_id,
         )
     
-    def run_finished(self, outcome: str = "success", result: Any = None, interrupt: Any = None) -> RunFinishedEvent:
+    def run_finished(self, outcome: str = "success", result: Any = None, interrupt: Any = None, *, final_message_ids: Optional[list[str]] = None) -> RunFinishedEvent:
         """發射運行結束事件
         
         Args:
@@ -80,12 +83,18 @@ class AGUIEventEmitter:
             result: 可選的運行結果數據
             interrupt: 可選的中斷詳情（Human-in-the-Loop）
         """
+        has_answer = outcome == "success" and isinstance(result, dict) and bool(
+            result.get("finalResponse") or result.get("final_response")
+        )
+        ids = final_message_ids if final_message_ids is not None else ([self._last_message_id] if self._last_message_id else [])
         return RunFinishedEvent(
             thread_id=self.thread_id,
             run_id=self.run_id,
             outcome=outcome,
             result=result,
             interrupt=interrupt,
+            final_message_id=ids[0] if has_answer and len(ids) == 1 else None,
+            final_message_ids=ids if has_answer and len(ids) > 1 else None,
         )
     
     def run_error(self, message: str, code: Optional[str] = None) -> RunErrorEvent:
@@ -117,7 +126,7 @@ class AGUIEventEmitter:
     # 文本消息事件
     # =========================================================================
     
-    def text_message_start(self, role: str = "assistant", message_id: Optional[str] = None) -> TextMessageStartEvent:
+    def text_message_start(self, role: str = "assistant", message_id: Optional[str] = None, *, phase: Optional[str] = None) -> TextMessageStartEvent:
         """發射文本消息開始事件
         
         Args:
@@ -128,9 +137,10 @@ class AGUIEventEmitter:
         return TextMessageStartEvent(
             message_id=self._current_message_id,
             role=role,
+            phase=phase,
         )
     
-    def text_message_content(self, delta: str) -> Optional[TextMessageContentEvent]:
+    def text_message_content(self, delta: str, *, message_id: Optional[str] = None) -> Optional[TextMessageContentEvent]:
         """發射文本消息內容事件
         
         Args:
@@ -139,23 +149,28 @@ class AGUIEventEmitter:
         Returns:
             TextMessageContentEvent 或 None（如果 delta 為空或無活動消息）
         """
-        if not delta or not self._current_message_id:
+        target_id = message_id or self._current_message_id
+        if not delta or not target_id:
             return None
         return TextMessageContentEvent(
-            message_id=self._current_message_id,
+            message_id=target_id,
             delta=delta,
         )
     
-    def text_message_end(self) -> Optional[TextMessageEndEvent]:
+    def text_message_end(self, *, message_id: Optional[str] = None, phase: Optional[str] = None, interrupted: Optional[bool] = None) -> Optional[TextMessageEndEvent]:
         """發射文本消息結束事件
         
         Returns:
             TextMessageEndEvent 或 None（如果無活動消息）
         """
-        if not self._current_message_id:
+        target_id = message_id or self._current_message_id
+        if not target_id:
             return None
-        event = TextMessageEndEvent(message_id=self._current_message_id)
-        self._current_message_id = None
+        event = TextMessageEndEvent(message_id=target_id, phase=phase, interrupted=interrupted)
+        if not interrupted:
+            self._last_message_id = target_id
+        if self._current_message_id == target_id:
+            self._current_message_id = None
         return event
     
     @property
@@ -231,6 +246,7 @@ class AGUIEventEmitter:
             tool_call_id=tool_call_id,
             tool_call_name=tool_name,
             parent_message_id=parent_message_id or self._current_message_id,
+            tool_display=self._tool_display_resolver(tool_name) if self._tool_display_resolver else None,
         )
     
     def tool_call_args(self, tool_call_id: str, delta: str) -> Optional[ToolCallArgsEvent]:
@@ -266,6 +282,8 @@ class AGUIEventEmitter:
         content: str,
         message_id: Optional[str] = None,
         execution_time_ms: Optional[int] = None,
+        *,
+        success: Optional[bool] = None,
     ) -> ToolCallResultEvent:
         """發射工具調用結果事件
         
@@ -274,11 +292,13 @@ class AGUIEventEmitter:
             content: 工具執行結果
             message_id: 可選的結果消息 ID，未提供則自動生成
             execution_time_ms: 工具執行耗時（毫秒）
+            success: 明确的调用结果；缺失时保持未知，不表示子任务运行终态
         """
         return ToolCallResultEvent(
             message_id=message_id or self._gen_id("result"),
             tool_call_id=tool_call_id,
             content=content,
+            success=success,
             role="tool",
             execution_time_ms=execution_time_ms,
         )

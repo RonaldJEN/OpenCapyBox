@@ -9,6 +9,8 @@ import { makeChatV2DefaultProps } from '../utils/chatv2-helpers';
 let lastChatInputProps: any = null;
 let lastArtifactsPanelProps: any = null;
 let lastFilePreviewProps: any = null;
+let panelDirty = false;
+const savePanelDrafts = vi.fn().mockResolvedValue({ ok: true, stale: false, failedPaths: [] });
 
 vi.mock('../../services/api', () => ({
   apiService: {
@@ -105,12 +107,16 @@ vi.mock('../../components/Round', () => ({
   },
 }));
 
-vi.mock('../../components/ArtifactsPanel', () => ({
-  ArtifactsPanel: (props: any) => {
+vi.mock('../../components/ArtifactsPanel', async () => {
+  const { forwardRef, useImperativeHandle } = await import('react');
+  return { ArtifactsPanel: forwardRef((props: any, ref) => {
     lastArtifactsPanelProps = props;
+    useImperativeHandle(ref, () => ({ ownerSessionId: props.sessionId, ownerEpoch: props.ownerEpoch,
+      hasDirty: () => panelDirty, pendingFileDrafts: () => [], saveDirty: savePanelDrafts,
+    }));
     return <div data-testid="artifacts-panel" data-open={String(props.isOpen)} />;
-  },
-}));
+  }) };
+});
 
 vi.mock('../../components/FilePreview', () => ({
   FilePreview: (props: any) => {
@@ -122,8 +128,38 @@ vi.mock('../../components/FilePreview', () => ({
 describe('ChatV2 structured assistant file wiring', () => {
   const defaultProps = makeChatV2DefaultProps();
 
+  it.each(['user', 'assistant', 'assistant-fallback'])('关闭后拒绝迟到的 %s 打开意图', async (kind) => {
+    let resolve!: (value: any) => void;
+    let reject!: (reason: Error) => void;
+    const pending = new Promise<any>((yes, no) => { resolve = yes; reject = no; });
+    vi.mocked(apiService.getSessionFiles).mockReturnValue(pending);
+    const file = { source: 'session' as const, session_id: 'test-session', path: 'report.pdf', name: 'report.pdf', size: 0, type: 'pdf' };
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+      session_id: 'test-session', total: 1, rounds: [{
+        round_id: 'round-late', user_message: 'test', final_response: 'done',
+        user_attachments: kind === 'user' ? [file] : [],
+        assistant_file_references: kind !== 'user' ? [{ ...file, ref_id: 'ref-late', revision: '1', modified: '', snapshot_path: 'snapshot.pdf' }] : [],
+        steps: [], step_count: 0, status: 'completed', created_at: '2026-09-10T08:00:00Z',
+      }],
+    });
+    render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    fireEvent.click(await screen.findByTestId(kind === 'user' ? 'open-user-attachment' : 'open-captured'));
+    await waitFor(() => expect(apiService.getSessionFiles).toHaveBeenCalled());
+    panelDirty = true;
+    act(() => lastArtifactsPanelProps.onClose());
+    expect(savePanelDrafts).toHaveBeenCalledWith(expect.objectContaining({ ownerSessionId: 'test-session' }));
+    await act(async () => {
+      if (kind === 'assistant-fallback') reject(new Error('unavailable'));
+      else resolve({ files: [{ ...file, size: 100 }], total: 1 });
+      await pending.catch(() => undefined);
+    });
+    expect(lastArtifactsPanelProps.isOpen).toBe(false);
+    expect(lastArtifactsPanelProps.targetFile).toBeFalsy();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
+    panelDirty = false;
     resetWorkspaceEventsForTests();
     lastChatInputProps = null;
     lastArtifactsPanelProps = null;
@@ -195,6 +231,33 @@ describe('ChatV2 structured assistant file wiring', () => {
     act(() => lastArtifactsPanelProps.onClose());
     expect(lastArtifactsPanelProps.isOpen).toBe(false);
     expect(chatArea.scrollTop).toBe(1800);
+  });
+
+  it.each(['new-assistant-file', 'new-session'])('迟到用户附件不能覆盖 %s', async (next) => {
+    let finish!: (value: any) => void;
+    vi.mocked(apiService.getSessionFiles).mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+    const oldFile = { name: 'old.pdf', path: 'old.pdf', size: 0, type: 'pdf', modified: '', source: 'session' as const, session_id: 'test-session' };
+    const newFile = { ...oldFile, name: 'new.pdf', path: 'new.pdf', size: 20 };
+    const base = { user_message: 'files', final_response: 'done', steps: [], step_count: 0, status: 'completed', created_at: '2026-09-10T08:00:00Z' };
+    vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({ session_id: 'test-session', total: 2, rounds: [
+      { ...base, round_id: 'old-round', user_attachments: [oldFile] },
+      { ...base, round_id: 'new-round', assistant_file_references: [{ ...newFile, ref_id: 'new-ref', revision: '1', modified: '' }] },
+    ] });
+    const view = render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    fireEvent.click(await screen.findByTestId('open-user-attachment'));
+    await waitFor(() => expect(apiService.getSessionFiles).toHaveBeenCalledTimes(1));
+    if (next === 'new-session') {
+      vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({ session_id: 'other', rounds: [], total: 0 });
+      view.rerender(<ChatV2 sessionId="other" {...defaultProps} />);
+      await waitFor(() => expect(lastArtifactsPanelProps.sessionId).toBe('other'));
+    } else {
+      vi.mocked(apiService.getSessionFiles).mockResolvedValue({ files: [newFile], total: 1 });
+      fireEvent.click(screen.getByTestId('open-captured'));
+      await waitFor(() => expect(lastArtifactsPanelProps.targetFile?.name).toBe('new.pdf'));
+    }
+    await act(async () => { finish({ files: [{ ...oldFile, size: 10 }], total: 1 }); });
+    if (next === 'new-session') expect(lastArtifactsPanelProps.isOpen).toBe(false);
+    else expect(lastArtifactsPanelProps.targetFile?.name).toBe('new.pdf');
   });
 
   it('authoritative Workspace snapshot 仍以只读 Session 快照打开', async () => {

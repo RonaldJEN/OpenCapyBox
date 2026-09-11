@@ -81,6 +81,8 @@ export interface ChatRunRuntimeState {
   idempotencyKey?: string;
   source: StreamSource | 'history' | 'init';
   status: RunStatus;
+  localOutputStopped?: boolean;
+  cancelRequest?: 'pending' | 'confirmed' | 'failed' | 'unknown';
   lastSequence: number;
   /** Latest durable interaction_requested / interaction_resolved boundary. */
   lastInteractionSequence?: number;
@@ -138,6 +140,8 @@ export type ChatRuntimeAction =
       serverRunId?: string;
     }
   | { type: 'LOCAL_CANCELLED'; sessionId: string; clientRunKey?: string }
+  | { type: 'LOCAL_STOP_REQUESTED'; sessionId: string; runKeys: string[] }
+  | { type: 'CANCEL_RECONCILED'; sessionId: string; runKeys: string[]; status?: string; request: 'confirmed' | 'failed' | 'unknown' }
   | { type: 'LOCAL_INIT_SLOT_CLEARED'; sessionId: string }
   | {
       type: 'RESTORE_PENDING_INTERACTION';
@@ -155,6 +159,7 @@ export type ChatRuntimeAction =
 export interface ChatSessionProjection extends ChatSessionRuntimeState {
   sending: boolean;
   resuming: boolean;
+  stopping?: boolean;
 }
 
 export interface SendMessageInput {

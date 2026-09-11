@@ -127,11 +127,22 @@ Runtime behavior:
 - The parent receives one `TOOL_CALL_RESULT` for display and LLM context. The
   durable source of parent/child metadata is the `subagent_runs` edge, not the
   human-readable result text.
-- UI/Admin code should resolve child run id, edge id, status, agent type, model
-  id and profile from structured metadata or `subagent_runs`. Parsing
-  `child_run_id:` / `edge_id:` lines from `TOOL_CALL_RESULT.content` is only a
-  temporary compatibility fallback for the current web adapter and must not be
-  treated as the primary contract.
+- `TOOL_CALL_RESULT.success` is the result of that parent tool call, not child
+  lifecycle evidence. A failed call with no edge/child must not fabricate a child
+  Round; the UI still shows the launch attempt and its result details.
+  A reliable successful launch with an edge but no child is only `requested`;
+  it is never child completion. `completed` / `failed` / `cancelled` are decided
+  independently from the associated child Round's authoritative terminal state.
+- Web task entries resolve child identity from history `subagent_tasks` and
+  durable parent `subagent_run_updated` events; Admin queries `subagent_runs`.
+  Tool output text is not an identity source. Entries without a child id do not
+  offer a detail link. A child's authoritative terminal status takes precedence
+  over a stale graph edge in read projections; old edges are not rewritten.
+- `GET /api/chat/{session_id}/round/{round_id}/snapshot` returns one authorized
+  main or child Round through the shared history projection. Child details then
+  subscribe to that Round only; leaving the view stops observation, not execution.
+  See [Chat Spec](./chat-spec.md#子任务详情与父任务状态) and
+  [Sessions Spec](./sessions-spec.md) for the snapshot and event contracts.
 - Parent history reconstruction skips rounds referenced by
   `subagent_runs.child_run_id`, preserving sidechain isolation. The parent sees
   the subagent result through its own tool result only.

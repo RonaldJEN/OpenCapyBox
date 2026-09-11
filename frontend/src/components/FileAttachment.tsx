@@ -47,13 +47,13 @@ export function FileAttachment({ filename, size }: FileAttachmentProps) {
   return (
     <div 
       data-testid="file-attachment"
-      className="inline-flex items-center gap-2 px-3 py-2 bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-lg transition-colors cursor-default mr-2 mb-2"
+      className="chat-user-chip chat-user-file-card cursor-default"
+      title={`${filename}\n${size}`}
     >
-      {getFileIcon(filename)}
-      <div className="flex flex-col">
-        <span className="text-sm font-medium text-gray-700">{filename}</span>
-        <span className="text-xs text-gray-500">{size}</span>
-      </div>
+      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-claude-surface [&>svg]:h-3.5 [&>svg]:w-3.5" aria-hidden="true">
+        {getFileIcon(filename)}
+      </span>
+      <span className="min-w-0 truncate">{filename}</span>
     </div>
   );
 }

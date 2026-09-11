@@ -11,7 +11,7 @@ from src.api.model_registry import get_model_registry
 from src.api.models.round import Round
 from src.api.models.session import Session
 from src.api.models.subagent_run import SubagentRun
-from src.api.schemas.subagent_graph import SubagentGraphEdge, SubagentGraphNode, SubagentRunGraph
+from src.api.schemas.subagent_graph import SubagentGraphEdge, SubagentGraphNode, SubagentRunGraph, SubagentTaskSnapshot
 from src.api.services.auth_service import get_enabled_user
 from src.api.utils.timezone import now_naive
 
@@ -156,7 +156,7 @@ class SubagentGraphService:
                 run_ids.add(edge.child_run_id)
         rounds = {
             round_obj.id: round_obj
-            for round_obj in db.query(Round).filter(Round.id.in_(run_ids)).all()
+            for round_obj in db.query(Round).filter(Round.session_id == session_id, Round.id.in_(run_ids)).all()
         }
         nodes = [
             self._node_from_round(round_obj, kind="root" if round_obj.id == root.id else "subagent")
@@ -167,7 +167,7 @@ class SubagentGraphService:
             root_run_id=root.id,
             requested_run_id=requested.id,
             nodes=nodes,
-            edges=[self._edge_schema(edge) for edge in edges],
+            edges=[self._edge_schema(edge, rounds.get(edge.child_run_id)) for edge in edges],
         )
 
     def _validate_user_session(self, db: DBSession, *, user_id: str, session_id: str) -> Session:
@@ -269,7 +269,8 @@ class SubagentGraphService:
             completed_at=round_obj.completed_at,
         )
 
-    def _edge_schema(self, edge: SubagentRun) -> SubagentGraphEdge:
+    def _edge_schema(self, edge: SubagentRun, child: Round | None = None) -> SubagentGraphEdge:
+        task = SubagentTaskSnapshot.from_edge(edge, child)
         return SubagentGraphEdge(
             edge_id=edge.id,
             root_run_id=edge.root_run_id,
@@ -283,13 +284,13 @@ class SubagentGraphService:
             prompt=edge.prompt,
             isolation=edge.isolation,
             worktree_path=edge.worktree_path,
-            status=edge.status,
+            status=task.status,
             output=edge.output,
             error=edge.error,
             metadata=self._load_metadata(edge.metadata_json),
             created_at=edge.created_at,
             started_at=edge.started_at,
-            completed_at=edge.completed_at,
+            completed_at=task.completed_at,
             updated_at=edge.updated_at,
         )
 

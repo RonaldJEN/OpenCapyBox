@@ -113,6 +113,9 @@ class _StreamViewFilter:
     def is_duplicate(self, event: dict[str, Any]) -> bool:
         if event.get("type") not in self._DELTA_TYPES:
             return False
+        if event.get("isAggregate") is False:
+            # New durable deltas are de-duplicated by sequence by the subscriber.
+            return False
         segment_key = self._segment_key(event)
         if not segment_key:
             return False
@@ -215,9 +218,8 @@ class AguiEventBus:
     ) -> StoredEvent | None:
         """Persist a durable event and fan it out after commit.
 
-        Streaming delta events are live-only and return ``None``.  Their
-        aggregated replay representation is written when the matching END event
-        arrives.
+        Main assistant text is committed before either direct SSE or subscriber
+        publication. Thinking/tool argument deltas retain the legacy END aggregate.
         """
         event_dict = self._event_to_dict(event)
         event_type = self._normalise_event_type(event_dict.get("type"))
@@ -235,7 +237,9 @@ class AguiEventBus:
                 raise RoundTerminalWriteSuppressed(run_id)
 
             enum_type = self._event_type_to_enum(event_type)
-            if enum_type in self._STREAM_DELTA_EVENTS:
+            if enum_type == EventType.TEXT_MESSAGE_CONTENT:
+                event_dict["isAggregate"] = False
+            elif enum_type in self._STREAM_DELTA_EVENTS:
                 try:
                     if continuation_fence is not None:
                         AgentInteractionService.fence_continuation_write(

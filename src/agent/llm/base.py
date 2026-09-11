@@ -14,6 +14,9 @@ class LLMClientBase(ABC):
     regardless of the underlying API protocol (Anthropic, OpenAI, etc.).
     """
 
+    # Interface capability only; it does not claim the provider supplies phases.
+    supports_message_callbacks = True
+
     def __init__(
         self,
         api_key: str,
@@ -63,6 +66,8 @@ class LLMClientBase(ABC):
         on_content: Any = None,
         on_thinking: Any = None,
         on_tool_call: Any = None,
+        *,
+        on_message: Any = None,
     ) -> LLMResponse:
         """Generate response from LLM with streaming support.
 

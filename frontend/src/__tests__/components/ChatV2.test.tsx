@@ -178,12 +178,13 @@ vi.mock('../../services/chatStreamClient', async () => {
 
 // Mock 子组件
 vi.mock('../../components/Round', () => ({
-  Round: ({ round, isStreaming, preparing, userAttachments }: any) => (
+  Round: ({ round, run, isStreaming, preparing, userAttachments }: any) => (
     <div
       data-testid="round"
       data-assistant={round.final_response}
       data-steps={JSON.stringify(round.steps)}
       data-status={round.status}
+      data-cancel-request={run?.cancelRequest}
       data-preferred-skills={JSON.stringify(round.preferred_skills || [])}
       data-preferred-mcp={JSON.stringify(round.preferred_mcp_connections || [])}
     >
@@ -674,6 +675,11 @@ describe('ChatV2 组件', () => {
         ? new DOMRect(0, 700 - (chat?.scrollTop ?? 0), 500, 200)
         : new DOMRect(0, 0, 500, 600);
     });
+    // jsdom has no layout. A visible search target must have client rects as well
+    // as its mocked bounding rect; hidden process targets remain reveal-gated.
+    vi.spyOn(HTMLElement.prototype, 'getClientRects').mockImplementation(function (this: HTMLElement) {
+      return [this.getBoundingClientRect()] as unknown as DOMRectList;
+    });
     const { container } = render(
       <ChatV2
         sessionId="test-session"
@@ -886,6 +892,30 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it.each(['Enter', 'button'])('阅读上文时通过 %s 发送应立即跟随新一轮，不等待响应', async (method) => {
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(2400);
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(600);
+    vi.mocked(apiService.sendMessageStreamV2).mockImplementation(() => new Promise(() => {}));
+    const { container } = render(<ChatV2 sessionId="test-session" {...defaultProps} />);
+    await screen.findByText('Round: round-1');
+    const area = container.querySelector('[data-testid="chat-pane"] > .overflow-y-auto') as HTMLDivElement;
+    area.scrollTop = 400;
+    fireEvent.wheel(area);
+    fireEvent.scroll(area);
+    expect(screen.getByLabelText('回到最新消息')).toBeInTheDocument();
+    const input = screen.getByPlaceholderText('输入指令...');
+    fireEvent.change(input, { target: { value: '针对上文的新问题' } });
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: true });
+    expect(area.scrollTop).toBe(400);
+    expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
+    if (method === 'Enter') fireEvent.keyDown(input, { key: 'Enter' });
+    else fireEvent.click(screen.getByLabelText('发送消息'));
+    await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledOnce());
+    expect(area.scrollTop).toBe(1800);
+    expect(screen.queryByLabelText('回到最新消息')).not.toBeInTheDocument();
+    expect(screen.getByText('User: 针对上文的新问题')).toBeInTheDocument();
+  });
+
   it('不在底部且正在生成时应提示新回复正在生成', async () => {
     vi.mocked(apiService.sendMessageStreamV2).mockImplementation(async (_sid, _content, callbacks) => {
       callbacks.onStreamAccepted?.();
@@ -937,15 +967,15 @@ describe('ChatV2 组件', () => {
     await waitFor(() => {
       expect(screen.getByTestId('artifacts-panel')).toBeInTheDocument();
     });
-    expect(screen.getByTestId('chat-message-column')).toHaveClass('mx-auto', 'w-full', 'max-w-5xl');
-    expect(screen.getByTestId('chat-input-column')).toHaveClass('mx-auto', 'w-full', 'max-w-5xl');
+    expect(screen.getByTestId('chat-message-column')).toHaveClass('chat-column');
+    expect(screen.getByTestId('chat-input-column')).toHaveClass('chat-column');
 
     // 初始状态面板关闭
     expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-open', 'false');
 
     const filesButton = screen.getByRole('button', { name: '查看文件' });
     expect(filesButton).toHaveClass('h-6', 'w-6');
-    expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '恢复分栏' })).toBeInTheDocument();
     fireEvent.click(filesButton);
 
     await waitFor(() => {
@@ -955,7 +985,7 @@ describe('ChatV2 组件', () => {
       expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
       expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: '查看文件' })).toHaveAttribute('aria-expanded', 'true');
-      expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '只看聊天' })).toBeInTheDocument();
     });
 
     fireEvent.click(filesButton);
@@ -1140,7 +1170,7 @@ describe('ChatV2 组件', () => {
     const { container } = render(<ChatV2 sessionId="test-session" {...defaultProps} />);
     const filesButton = screen.getByRole('button', { name: '查看文件' });
 
-    expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '恢复分栏' })).toBeInTheDocument();
     fireEvent.click(filesButton);
 
     await waitFor(() => {
@@ -1148,13 +1178,13 @@ describe('ChatV2 组件', () => {
       expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'false');
       expect(screen.getByTestId('chat-pane')).not.toHaveAttribute('inert');
       expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' })).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: '展开面板' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '只看聊天' })).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '只看聊天' }));
     await waitFor(() => {
       expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
-      expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '恢复分栏' })).toBeInTheDocument();
     });
   });
 
@@ -1166,6 +1196,8 @@ describe('ChatV2 组件', () => {
       />
     );
 
+    const textarea = screen.getByPlaceholderText('输入指令...');
+    fireEvent.change(textarea, { target: { value: '返回聊天后继续编辑的草稿' } });
     fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
     await waitFor(() => {
       expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
@@ -1176,12 +1208,18 @@ describe('ChatV2 组件', () => {
       expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'full');
       expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'true');
       expect(screen.getByTestId('artifacts-panel')).toHaveAttribute('data-expanded', 'true');
+      expect(screen.queryByTestId('chat-toolbar')).not.toBeInTheDocument();
+      expect(textarea).toBeInTheDocument();
+      expect(textarea).toHaveValue('返回聊天后继续编辑的草稿');
     });
 
     fireEvent.click(screen.getByRole('button', { name: 'Toggle Expand' }));
     await waitFor(() => {
       expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
       expect(screen.getByTestId('chat-pane')).toHaveAttribute('aria-hidden', 'false');
+      expect(screen.getByTestId('chat-toolbar')).toBeInTheDocument();
+      expect(screen.getByPlaceholderText('输入指令...')).toBe(textarea);
+      expect(textarea).toHaveValue('返回聊天后继续编辑的草稿');
     });
   });
 
@@ -1213,21 +1251,21 @@ describe('ChatV2 组件', () => {
       <ChatV2 sessionId="test-session" {...defaultProps} />
     );
 
-    expect(screen.getByRole('button', { name: '收起面板' })).toHaveAttribute('aria-expanded', 'false');
-    expect(screen.queryByRole('button', { name: '展开面板' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '恢复分栏' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: '只看聊天' })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '恢复分栏' }));
     await waitFor(() => {
       expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
     });
-    expect(screen.getByRole('button', { name: '展开面板' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: '只看聊天' })).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '只看聊天' }));
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
     expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' }))
       .toHaveAttribute('aria-valuenow', '100');
-    expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '恢复分栏' })).toBeInTheDocument();
   });
 
   it('session 切换保留当前 split，关闭后再打开固定恢复 45/55', async () => {
@@ -1241,9 +1279,9 @@ describe('ChatV2 组件', () => {
     expect(container.querySelector('.session-files-shell')).toHaveStyle({
       '--session-files-chat-ratio': '47%',
     });
-    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '只看聊天' }));
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
-    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '恢复分栏' }));
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
     expect(container.querySelector('.session-files-shell')).toHaveStyle({
       '--session-files-chat-ratio': '45%',
@@ -1285,11 +1323,11 @@ describe('ChatV2 组件', () => {
     fireEvent.keyDown(splitter, { key: 'End' });
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'closed');
     expect(screen.getByRole('button', { name: '查看文件' })).toHaveAttribute('aria-pressed', 'false');
-    expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '恢复分栏' })).toBeInTheDocument();
     expect(screen.getByRole('separator', { name: '调整聊天和文件面板宽度' }))
       .toHaveAttribute('aria-valuenow', '100');
 
-    fireEvent.click(screen.getByRole('button', { name: '收起面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '恢复分栏' }));
     expect(container.querySelector('.session-files-shell')).toHaveAttribute('data-layout', 'split');
     expect(container.querySelector('.session-files-shell')).toHaveStyle({
       '--session-files-chat-ratio': '45%',
@@ -3020,9 +3058,9 @@ describe('ChatV2 组件', () => {
       expect(header).toHaveClass('h-14', 'shrink-0', 'border-b', 'border-claude-border');
       expect(header.querySelectorAll('.w-\\[88px\\]')).toHaveLength(0);
       expect(await screen.findByRole('button', { name: '查看文件' })).toHaveClass('h-6', 'w-6');
-      expect(screen.getByRole('button', { name: '收起面板' })).toHaveClass('h-6', 'w-6');
+      expect(screen.getByRole('button', { name: '恢复分栏' })).toHaveClass('h-6', 'w-6');
       fireEvent.click(screen.getByRole('button', { name: '查看文件' }));
-      expect(await screen.findByRole('button', { name: '展开面板' })).toHaveClass('h-6', 'w-6');
+      expect(await screen.findByRole('button', { name: '只看聊天' })).toHaveClass('h-6', 'w-6');
       expect(header.querySelector('.ml-auto')).toBeInTheDocument();
     });
   });
@@ -3131,7 +3169,7 @@ describe('ChatV2 组件', () => {
     expect(screen.queryByText(/SSE_STREAM_CLOSED|订阅连接已断开/)).not.toBeInTheDocument();
   });
 
-  it('running history 收到终态时应清理临时 assistant_content', async () => {
+  it('running history 收到终态时保留过程正文并独立展示最终结果', async () => {
     const runningRound: RoundData = {
       round_id: 'round-live-final',
       user_message: '运行中',
@@ -3188,7 +3226,7 @@ describe('ChatV2 组件', () => {
     });
 
     const steps = JSON.parse(screen.getByTestId('round').getAttribute('data-steps') || '[]');
-    expect(steps[0].assistant_content).toBe('');
+    expect(steps[0].assistant_content).toBe('临时正文');
     expect(steps[0].status).toBe('completed');
   });
 
@@ -3265,7 +3303,7 @@ describe('ChatV2 组件', () => {
     );
   });
 
-  it('handleStop 应该立即更新 UI 状态而不等待 SSE', async () => {
+  it('handleStop 立即停本地输出，确认目标终态与准入释放后无需等待 SSE 即可发送', async () => {
     // 模拟一个运行中的轮次
     const runningRounds: RoundData[] = [
       {
@@ -3303,7 +3341,13 @@ describe('ChatV2 组件', () => {
 
     let resolveAbort: () => void = () => {};
     vi.mocked(apiService.abortChat).mockImplementation(() => new Promise((resolve) => {
-      resolveAbort = () => resolve(ABORT_RESPONSE);
+      resolveAbort = () => {
+        vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+          session_id: 'test-session', total: 1,
+          rounds: [{ ...runningRounds[0], status: 'cancelled' }],
+        });
+        resolve({ ...ABORT_RESPONSE, round_id: 'round-running-stop', round_status: 'cancelled', admission_released: true });
+      };
     }));
 
     render(
@@ -3329,11 +3373,13 @@ describe('ChatV2 组件', () => {
     });
 
     // abort API 应该被调用
-    expect(apiService.abortChat).toHaveBeenCalledWith('test-session');
+    expect(apiService.abortChat).toHaveBeenCalledWith('test-session', 'round-running-stop');
 
-    // UI 应该在 abort HTTP 返回前立即更新 — 不再显示停止按钮，输入框可用
+    // HTTP 尚未确认时只停止本地输出，不伪造 cancelled；输入仍可编辑。
     expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
-    expect(screen.getByTestId('round')).toHaveAttribute('data-status', 'cancelled');
+    expect(screen.getByTestId('round')).toHaveAttribute('data-status', 'running');
+    expect(screen.getByTestId('round')).toHaveAttribute('data-cancel-request', 'pending');
+    expect(mockAbort).toHaveBeenCalled();
 
     const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
     expect(textarea).not.toBeDisabled();
@@ -3354,6 +3400,8 @@ describe('ChatV2 组件', () => {
     await act(async () => {
       resolveAbort();
     });
+    expect(screen.getByTestId('round')).toHaveAttribute('data-status', 'cancelled');
+    expect(screen.getByTestId('round')).toHaveAttribute('data-cancel-request', 'confirmed');
 
     // 停止成功后不再重复展示后端的保守副作用提示。
     expect(screen.queryByTestId('runtime-warning')).not.toBeInTheDocument();
@@ -3454,7 +3502,7 @@ describe('ChatV2 组件', () => {
     expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('test-session');
   });
 
-  it('abort 时应清理残留的 pendingInterrupt（QuestionCard 不应残留）', async () => {
+  it('abort 权威确认后清理 pendingInterrupt，确认前禁用 QuestionCard', async () => {
     const waitingRounds: RoundData[] = [
       {
         round_id: 'round-int-1',
@@ -3486,7 +3534,16 @@ describe('ChatV2 组件', () => {
       promise: Promise.resolve(),
     } as any);
 
-    vi.mocked(apiService.abortChat).mockResolvedValue(ABORT_RESPONSE);
+    let confirmAbort!: () => void;
+    vi.mocked(apiService.abortChat).mockImplementation(() => new Promise((resolve) => {
+      confirmAbort = () => {
+        vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+          session_id: 'test-session', total: 1,
+          rounds: [{ ...waitingRounds[0], status: 'cancelled', interrupt: undefined }],
+        });
+        resolve({ ...ABORT_RESPONSE, round_id: 'round-int-1', round_status: 'cancelled', admission_released: true });
+      };
+    }));
 
     render(
       <ChatV2
@@ -3506,6 +3563,12 @@ describe('ChatV2 组件', () => {
     await act(async () => {
       fireEvent.click(screen.getByTitle('停止生成'));
     });
+
+    expect(apiService.abortChat).toHaveBeenCalledWith('test-session', 'round-int-1');
+    expect(screen.getByTestId('question-card')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Submit Question' })).toBeDisabled();
+    expect(screen.getByTestId('round')).toHaveAttribute('data-cancel-request', 'pending');
+    await act(async () => { confirmAbort(); });
 
     await waitFor(() => {
       expect(screen.queryByTestId('question-card')).not.toBeInTheDocument();
@@ -3552,7 +3615,7 @@ describe('ChatV2 组件', () => {
     expect(apiService.abortChat).not.toHaveBeenCalled();
   });
 
-  it('abort 请求失败前先本地停止，失败后重新同步运行态', async () => {
+  it('abort 请求失败后校准历史但不复活旧订阅，保持可编辑和发送禁用', async () => {
     const runningRounds: RoundData[] = [
       {
         round_id: 'round-abort-fail',
@@ -3613,7 +3676,7 @@ describe('ChatV2 组件', () => {
     });
 
     // abort API 被调用
-    expect(apiService.abortChat).toHaveBeenCalledWith('test-session');
+    expect(apiService.abortChat).toHaveBeenCalledWith('test-session', 'round-abort-fail');
 
     // abort HTTP 尚未返回时，UI 已经先本地停止。
     expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
@@ -3626,12 +3689,20 @@ describe('ChatV2 组件', () => {
       rejectAbort(new Error('Network Error'));
     });
 
-    // abort 失败后重新拉取历史；若后端仍是 running，则恢复运行态并提示错误。
+    // 失败后的 running 历史无法证明已取消，旧订阅不能重新接回。
     await waitFor(() => {
-      expect(screen.getByTitle('停止生成')).toBeInTheDocument();
+      expect(screen.getByTestId('round')).toHaveAttribute('data-cancel-request', 'failed');
     });
+    expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(2);
+    expect(apiService.subscribeToRound).toHaveBeenCalledTimes(1);
+    expect(mockAbort).toHaveBeenCalled();
+    expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
+    expect(screen.getByTestId('round')).toHaveAttribute('data-status', 'running');
     expect(textarea).not.toBeDisabled();
-    expect(screen.getByText('停止请求失败，后端任务可能仍在运行')).toBeInTheDocument();
+    fireEvent.change(textarea, { target: { value: '新问题' } });
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
   });
 
   it('abort 失败但终态事件已到达时，不应丢失收敛回调', async () => {
@@ -3710,7 +3781,7 @@ describe('ChatV2 组件', () => {
     expect(defaultProps.onExecutionEnd).toHaveBeenCalledWith('test-session');
   });
 
-  it('abort 返回 409 时应按已停止处理，立即恢复 UI', async () => {
+  it('abort 返回 409 但历史仍 running 时不得认作取消成功或恢复发送', async () => {
     const runningRounds: RoundData[] = [
       {
         round_id: 'round-abort-409',
@@ -3765,7 +3836,7 @@ describe('ChatV2 组件', () => {
       fireEvent.click(screen.getByTitle('停止生成'));
     });
 
-    expect(apiService.abortChat).toHaveBeenCalledWith('test-session');
+    expect(apiService.abortChat).toHaveBeenCalledWith('test-session', 'round-abort-409');
 
     await waitFor(() => {
       expect(screen.queryByTitle('停止生成')).not.toBeInTheDocument();
@@ -3773,6 +3844,15 @@ describe('ChatV2 组件', () => {
 
     const textarea = screen.getByPlaceholderText('输入指令...') as HTMLTextAreaElement;
     expect(textarea).not.toBeDisabled();
+    expect(screen.getByTestId('round')).toHaveAttribute('data-status', 'running');
+    expect(screen.getByTestId('round')).toHaveAttribute('data-cancel-request', 'unknown');
+    expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(2);
+    expect(apiService.subscribeToRound).toHaveBeenCalledTimes(1);
+    expect(mockAbort).toHaveBeenCalled();
+    fireEvent.change(textarea, { target: { value: '新问题' } });
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
     expect(defaultProps.onExecutionEnd).toHaveBeenCalled();
   });
 

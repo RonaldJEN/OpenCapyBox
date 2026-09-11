@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -26,6 +26,28 @@ class ToolCall(BaseModel):
     function: FunctionCall
 
 
+AssistantMessagePhase = Literal["commentary", "final_answer"]
+
+
+class AssistantTextMessage(BaseModel):
+    """Ordered assistant text with provider-supplied semantics, if available."""
+
+    content: str = ""
+    phase: AssistantMessagePhase | None = None
+    provider_message_id: str | None = None
+
+
+class AssistantMessageStreamEvent(BaseModel):
+    """Internal callback payload; never part of a provider request."""
+
+    kind: Literal["start", "delta", "end"]
+    stream_id: str
+    provider_message_id: str
+    phase: AssistantMessagePhase | None = None
+    delta: str = ""
+    interrupted: bool = False
+
+
 class Message(BaseModel):
     """Chat message."""
 
@@ -40,6 +62,7 @@ class Message(BaseModel):
     is_synthetic: bool = False  # True = 系統注入的合成消息（truncation retry / empty nudge / step reminder）
     # Provider-native reasoning items needed by stateless Responses follow-ups.
     provider_items: list[dict[str, Any]] | None = None
+    assistant_text_messages: list[AssistantTextMessage] | None = None
 
 
 class TokenUsage(BaseModel):
@@ -59,3 +82,4 @@ class LLMResponse(BaseModel):
     finish_reason: str
     usage: TokenUsage | None = None
     provider_items: list[dict[str, Any]] | None = None
+    assistant_text_messages: list[AssistantTextMessage] | None = None

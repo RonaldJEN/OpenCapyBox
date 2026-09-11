@@ -62,6 +62,7 @@ interface LoadHistoryOptions {
   /** Reads the latest App/runtime slot snapshot; timers must not reuse a captured boolean. */
   isActiveSlotCurrent?: () => boolean;
   throwOnError?: boolean;
+  onSnapshot?: (rounds: RoundData[]) => void;
 }
 
 interface ChatRuntimeContextValue {
@@ -437,6 +438,7 @@ export function ChatRuntimeProvider({
         runOwnershipRef.current,
       )
       || `run:${roundId}`;
+    if (stateRef.current.runs[clientRunKey]?.localOutputStopped) return;
     runOwnershipRef.current.serverRoundIdToClientRunKey[roundId] = clientRunKey;
     const existing = streamRegistryRef.current[clientRunKey];
     if (existing?.subscription || existing?.retryTimer) {
@@ -570,6 +572,7 @@ export function ChatRuntimeProvider({
         dispatch({ type: 'SESSION_LOADING', sessionId, loading: false });
         return;
       }
+      options?.onSnapshot?.(response.rounds);
       for (const round of response.rounds) {
         const historyRunKey = findClientRunKeyForRound(
           stateRef.current,
@@ -1206,53 +1209,51 @@ export function ChatRuntimeProvider({
   const stopSessionRun = useCallback(async (sessionId: string) => {
     const session = stateRef.current.sessions[sessionId];
     if (!session) return;
-    const waitingRound = session.rounds.find(
-      (round) => round.status === 'waiting_interaction' && round.interrupt?.id,
-    );
-    const waitingRunKey = waitingRound
-      ? stateRef.current.serverRunIdToClientRunKey[waitingRound.round_id]
-      : undefined;
-    const stoppedRunKeys = session.activeRunKeys.length > 0
-      ? [...session.activeRunKeys]
-      : waitingRunKey
-        ? [waitingRunKey]
-        : [];
-    if (stoppedRunKeys.length === 0) return;
-    for (const runKey of stoppedRunKeys) {
-      stoppingRunKeysRef.current.add(runKey);
-      invalidateRunTransport(runKey);
+    const retryKeys = Object.values(stateRef.current.runs).filter((run) => run.ownerSessionId === sessionId
+      && (run.cancelRequest === 'unknown' || run.cancelRequest === 'failed')).map((run) => run.clientRunKey);
+    const waitingRound = session.rounds.find((round) => round.status === 'waiting_interaction');
+    const waitingKey = waitingRound ? stateRef.current.serverRunIdToClientRunKey[waitingRound.round_id] : undefined;
+    const stoppedRunKeys = retryKeys.length ? retryKeys : session.activeRunKeys.length ? [...session.activeRunKeys] : waitingKey ? [waitingKey] : [];
+    if (!stoppedRunKeys.length || stoppedRunKeys.some((key) => stateRef.current.runs[key]?.cancelRequest === 'pending')) return;
+    const targetRunId = stoppedRunKeys.map((key) => stateRef.current.runs[key]?.serverRunId).find(Boolean);
+    for (const key of stoppedRunKeys) {
+      stoppingRunKeysRef.current.add(key);
+      invalidateRunTransport(key);
     }
-    dispatch({
-      type: 'LOCAL_CANCELLED',
-      sessionId,
-      clientRunKey: session.activeRunKeys.length === 0 ? waitingRunKey : undefined,
-    });
+    dispatch({ type: 'LOCAL_STOP_REQUESTED', sessionId, runKeys: stoppedRunKeys });
     notifyEnd(sessionId);
+    let status: string | undefined;
+    let admissionReleased = false;
+    let requestFailed = false;
+    const observeSnapshot = (rounds: RoundData[]) => {
+      const target = rounds.find((round) => targetRunId && round.round_id === targetRunId);
+      if (target && TERMINAL_HISTORY_ROUND_STATUSES.has(target.status)) status = target.status;
+    };
     try {
-      await apiService.abortChat(sessionId);
-      for (const runKey of stoppedRunKeys) {
-        releaseRunTransport(runKey);
-      }
+      const result = await apiService.abortChat(sessionId, targetRunId);
+      if (result?.round_status && TERMINAL_HISTORY_ROUND_STATUSES.has(result.round_status)) status = result.round_status;
+      if (!targetRunId && result?.reason === 'force_unlocked') status = 'cancelled';
+      admissionReleased = result?.admission_released === true;
+      // Also install authoritative text and any newer independently started Round.
+      await loadSessionHistory(sessionId, { throwOnError: true, onSnapshot: observeSnapshot });
     } catch (error) {
-      const statusCode = (error as { response?: { status?: number } })?.response?.status;
-      if (statusCode === 409) {
-        for (const runKey of stoppedRunKeys) {
-          releaseRunTransport(runKey);
-        }
-        return;
-      }
-      if (stoppedRunKeys.some((runKey) => terminalRunKeysRef.current.has(runKey))) {
-        for (const runKey of stoppedRunKeys) {
-          releaseRunTransport(runKey);
-        }
-        return;
-      }
-      console.warn('Abort request failed, reloading running state:', error);
-      await loadSessionHistory(sessionId);
-      for (const runKey of stoppedRunKeys) {
-        stoppingRunKeysRef.current.delete(runKey);
-      }
-      dispatch({ type: 'SESSION_ERROR', sessionId, error: '停止请求失败，后端任务可能仍在运行' });
+      const code = (error as { response?: { status?: number } })?.response?.status;
+      requestFailed = code !== 409;
+      try { await loadSessionHistory(sessionId, { throwOnError: true, onSnapshot: observeSnapshot }); } catch { /* Keep the last proven facts. */ }
+    }
+    if (!admissionReleased && status) {
+      try {
+        const running = await apiService.getRunningSessions();
+        admissionReleased = Array.isArray(running.running_sessions)
+          && !running.running_sessions.some((item) => item.session_id === sessionId
+            && (!targetRunId || !item.round_id || item.round_id === targetRunId));
+      } catch { /* A failed query cannot prove admission is available. */ }
+    }
+    const confirmed = Boolean(status && admissionReleased);
+    dispatch({ type: 'CANCEL_RECONCILED', sessionId, runKeys: stoppedRunKeys, status,
+      request: confirmed ? 'confirmed' : requestFailed ? 'failed' : 'unknown' });
+    if (confirmed) {
+      for (const key of stoppedRunKeys) releaseRunTransport(key);
     }
   }, [invalidateRunTransport, loadSessionHistory, notifyEnd, releaseRunTransport]);
 
@@ -1282,8 +1283,9 @@ export function ChatRuntimeProvider({
       .filter(Boolean);
     return {
       ...session,
-      sending: activeRuns.some((run) => run.status === 'starting' || run.status === 'streaming'),
-      resuming: activeRuns.some((run) => run.source === 'resume' && (run.status === 'starting' || run.status === 'streaming')),
+      sending: activeRuns.some((run) => !run.localOutputStopped && (run.status === 'starting' || run.status === 'streaming')),
+      resuming: activeRuns.some((run) => !run.localOutputStopped && run.source === 'resume' && (run.status === 'starting' || run.status === 'streaming')),
+      stopping: Object.values(stateRef.current.runs).some((run) => run.ownerSessionId === sessionId && run.cancelRequest && run.cancelRequest !== 'confirmed'),
     };
   }, []);
 
@@ -1292,7 +1294,7 @@ export function ChatRuntimeProvider({
     for (const [sessionId, session] of Object.entries(stateRef.current.sessions)) {
       if (session.activeRunKeys.some((key) => {
         const run = stateRef.current.runs[key];
-        return run?.status === 'streaming';
+        return run?.status === 'streaming' && !run.localOutputStopped;
       })) {
         ids.add(sessionId);
       }

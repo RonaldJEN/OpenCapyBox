@@ -3,17 +3,6 @@ import { fireEvent, render, screen, waitFor } from '../utils/test-utils';
 import { Round } from '../../components/Round';
 import { RoundData, type AttachmentInfo } from '../../types';
 
-// Mock ReasoningPanel 组件
-vi.mock('../../components/ReasoningPanel', () => ({
-  ReasoningPanel: ({ steps, isStreaming, isCompleted }: any) => (
-    <div data-testid="reasoning-panel">
-      <span>Steps: {steps.length}</span>
-      <span>Streaming: {String(isStreaming)}</span>
-      <span>Completed: {String(isCompleted)}</span>
-    </div>
-  ),
-}));
-
 // Mock FileAttachment 组件
 vi.mock('../../components/FileAttachment', () => ({
   FileAttachment: ({ filename, size }: any) => (
@@ -98,7 +87,7 @@ describe('Round 组件', () => {
     render(<Round round={round} isStreaming={false} />);
 
     expect(screen.getByText('Tool approval: allow_once')).toBeInTheDocument();
-    expect(screen.getByText('你')).toBeInTheDocument();
+    expect(screen.getByText(round.user_message).closest('.chat-user-bubble')).toBeInTheDocument();
   });
 
   it('应该渲染助手最终响应', () => {
@@ -174,61 +163,10 @@ describe('Round 组件', () => {
     expect(screen.getByRole('button', { name: '复制回复' }).parentElement).not.toHaveClass('opacity-0');
   });
 
-  it('应该渲染 ReasoningPanel 组件', () => {
-    const round = createMockRound();
-
-    render(<Round round={round} isStreaming={false} />);
-
-    expect(screen.getByTestId('reasoning-panel')).toBeInTheDocument();
-    expect(screen.getByText('Steps: 1')).toBeInTheDocument();
-  });
-
-  it('流式传输时应该传递正确的 props 给 ReasoningPanel', () => {
-    const round = createMockRound({ status: 'running' });
-
-    render(<Round round={round} isStreaming={true} />);
-
-    expect(screen.getByText('Streaming: true')).toBeInTheDocument();
-    expect(screen.getByText('Completed: false')).toBeInTheDocument();
-  });
-
-  it('完成时应该传递 isCompleted=true', () => {
-    const round = createMockRound({ status: 'completed' });
-
-    render(<Round round={round} isStreaming={false} />);
-
-    expect(screen.getByText('Completed: true')).toBeInTheDocument();
-  });
-
-  it('终态 round 即使父级仍传入 isStreaming 也不应继续按流式渲染', () => {
-    const round = createMockRound({
-      status: 'completed',
-      final_response: '最终响应',
-      steps: [
-        {
-          step_number: 1,
-          thinking: '',
-          assistant_content: '临时正文',
-          tool_calls: [],
-          tool_results: [],
-          status: 'completed',
-        },
-      ],
-    });
-
-    render(<Round round={round} isStreaming={true} />);
-
-    expect(screen.getByText('Streaming: false')).toBeInTheDocument();
-    expect(screen.getByText('Completed: true')).toBeInTheDocument();
-    expect(screen.getByText('最终响应')).toBeInTheDocument();
-  });
-
-  it('没有步骤时不应该渲染 ReasoningPanel', () => {
-    const round = createMockRound({ steps: [] });
-
-    render(<Round round={round} isStreaming={false} />);
-
-    expect(screen.queryByTestId('reasoning-panel')).not.toBeInTheDocument();
+  it('终态忽略父级的过期流式标记，最终正文保持可见', () => {
+    render(<Round round={createMockRound()} isStreaming />);
+    expect(screen.queryByText('运行中')).not.toBeInTheDocument();
+    expect(screen.getByText('这是我的分析结果...')).toBeVisible();
   });
 
   it('失败状态应该显示错误提示', () => {
@@ -244,7 +182,7 @@ describe('Round 组件', () => {
 
     render(<Round round={round} isStreaming={false} />);
 
-    expect(screen.getByText('达到最大步数限制')).toBeInTheDocument();
+    expect(screen.getByText('达到步数限制')).toBeInTheDocument();
   });
 
   it('取消状态应该显示中性提示而不是错误', () => {
@@ -256,7 +194,7 @@ describe('Round 组件', () => {
 
     render(<Round round={round} isStreaming={false} />);
 
-    expect(screen.getByText('已取消')).toBeInTheDocument();
+    expect(screen.getByText('已停止')).toBeInTheDocument();
     expect(screen.queryByText('执行失败')).not.toBeInTheDocument();
   });
 
@@ -269,7 +207,7 @@ describe('Round 组件', () => {
 
     render(<Round round={round} isStreaming={false} />);
 
-    expect(screen.getByText('已取消')).toBeInTheDocument();
+    expect(screen.getByText('已停止')).toBeInTheDocument();
     expect(screen.queryByText('执行失败')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
   });
@@ -284,7 +222,7 @@ describe('Round 组件', () => {
     render(<Round round={round} isStreaming={false} />);
 
     expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
-    expect(screen.getByText('已取消')).toBeInTheDocument();
+    expect(screen.getByText('已停止')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
   });
 
@@ -298,8 +236,8 @@ describe('Round 组件', () => {
     render(<Round round={round} isStreaming={false} />);
 
     expect(screen.getByText('Cancelled after completing the cleanup.')).toBeInTheDocument();
-    expect(screen.getByText('已取消')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
+    expect(screen.getByText('已停止')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '复制回复' })).toBeInTheDocument();
   });
 
   it.each(['', 'Cancelled'])(
@@ -324,7 +262,7 @@ describe('Round 组件', () => {
 
       expect(screen.getByText('取消前已经生成的有效正文。')).toBeInTheDocument();
       expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
-      expect(screen.getByText('已取消')).toBeInTheDocument();
+      expect(screen.getByText('已停止')).toBeInTheDocument();
       expect(screen.queryByRole('button', { name: '复制回复' })).not.toBeInTheDocument();
     },
   );
@@ -357,7 +295,7 @@ describe('Round 组件', () => {
 
     expect(screen.getByText('取消前已经生成的有效正文。')).toBeInTheDocument();
     expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
-    expect(screen.getByText('已取消')).toBeInTheDocument();
+    expect(screen.getByText('已停止')).toBeInTheDocument();
   });
 
   it('非取消状态应该保留内容恰为 Cancelled 的完整响应', () => {
@@ -418,35 +356,13 @@ describe('Round 组件', () => {
     expect(screen.getByTestId('file-attachment')).toBeInTheDocument();
   });
 
-  it('应该正确应用 Apple 风格的消息气泡样式', () => {
-    const round = createMockRound();
-
-    render(<Round round={round} isStreaming={false} />);
-
-    const userText = screen.getByText('请帮我分析这个问题');
-    expect(userText).toBeInTheDocument();
-    expect(userText.className).toContain('text-claude-text');
-    expect(userText.className).toContain('leading-relaxed');
-  });
-
-  it('用户头像应该使用正确的样式', () => {
-    const round = createMockRound();
-
-    const { container } = render(<Round round={round} isStreaming={false} />);
-
-    const userAvatar = container.querySelector('.w-7.h-7.rounded-full.bg-claude-surface');
-    expect(userAvatar).toBeInTheDocument();
-  });
-
-  it('助手头像应该使用品牌图片', () => {
-    const round = createMockRound();
-
-    render(<Round round={round} isStreaming={false} />);
-
-    const avatar = screen.getByAltText('AI');
-    expect(avatar).toBeInTheDocument();
-    expect(avatar).toHaveAttribute('src', '/logo.jpg');
-    expect(avatar.className).toContain('object-cover');
+  it('用户消息保留左侧身份标签，助手模型名独立显示', () => {
+    const { container } = render(<Round round={createMockRound({ model_display_name: 'Qwen' })} />);
+    expect(screen.getByText('你')).toBeInTheDocument();
+    expect(screen.getByText('请帮我分析这个问题')).toHaveClass('chat-user-bubble');
+    expect(container.querySelector('.chat-user-row')).toBeInTheDocument();
+    expect(container.querySelector('.chat-assistant')).toHaveTextContent('这是我的分析结果...');
+    expect(screen.getByLabelText('本轮模型：Qwen')).toHaveTextContent('Qwen');
   });
 
   it('默认应该有淡入动画', () => {
@@ -555,8 +471,8 @@ describe('Round 组件', () => {
       />,
     );
 
-    const folderCard = screen.getByTitle('预览 研究');
-    expect(folderCard).toHaveTextContent('文件夹');
+    const folderCard = screen.getByRole('button', { name: '预览 研究' });
+    expect(folderCard).toHaveAttribute('title', '预览 研究\n文件夹');
     expect(folderCard).toHaveTextContent('研究');
     fireEvent.click(folderCard);
     expect(onPreviewAttachment).toHaveBeenCalledWith(expect.objectContaining({
@@ -564,6 +480,23 @@ describe('Round 组件', () => {
       is_directory: true,
       entry_id: 'folder-1',
     }), 0);
+  });
+
+  it('仅附件消息的文件标签仍按原索引和冻结身份打开预览', () => {
+    const onPreviewAttachment = vi.fn();
+    const files: AttachmentInfo[] = [
+      { name: '摘要.pdf', path: 'uploads/摘要.pdf', type: 'pdf', size: 2048, session_id: 's1' },
+      { name: '财务模型.xlsx', path: '.workspace-snapshots/report/v2/财务模型.xlsx', type: 'xlsx', size: 8192,
+        source: 'workspace', entry_id: 'entry-model', version_id: 'version-2', revision: 2 },
+    ];
+    const { container } = render(<Round round={createMockRound({ user_message: '' })} userAttachments={files}
+      sessionId="s1" onPreviewAttachment={onPreviewAttachment} />);
+    fireEvent.click(screen.getByRole('button', { name: '预览 财务模型.xlsx' }));
+    expect(onPreviewAttachment).toHaveBeenCalledWith(expect.objectContaining({
+      name: '财务模型.xlsx', path: '.workspace-snapshots/report/v2/财务模型.xlsx', source: 'workspace',
+      entry_id: 'entry-model', version_id: 'version-2', revision: 2,
+    }), 1);
+    expect(container.querySelector('.chat-user-bubble')).not.toBeInTheDocument();
   });
 
   it('普通正文文件名没有结构化身份时不渲染卡片', () => {

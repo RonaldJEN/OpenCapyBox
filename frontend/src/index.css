@@ -7,7 +7,7 @@
 
 /* Claude-style global font — system font stack */
 body {
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   background-color: #FAF9F6;
@@ -15,6 +15,11 @@ body {
 }
 
 @layer components {
+  /* One shared text measure and gutter for messages, composer and interaction cards. */
+  .chat-column {
+    @apply mx-auto w-full max-w-[860px] px-4 md:px-8;
+  }
+
   /* 响应式容器 */
   .container-responsive {
     @apply w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8;

@@ -12,25 +12,30 @@ interface CodeBlockProps {
 
 export function CodeBlock({ language, value, readingBlockId }: CodeBlockProps) {
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(value);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyFailed(false);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { setCopyFailed(true); }
   };
 
   return (
-    <div className="relative my-4 rounded-2xl overflow-hidden border border-claude-border group">
+    <div className="chat-code-block not-prose relative my-4 rounded-2xl overflow-hidden bg-[#242424] text-[#ededed]">
       {/* Header with Language & Copy Button */}
-      <div className="flex items-center justify-between px-4 py-2 bg-claude-surface border-b border-claude-border">
-        <span className="text-xs font-medium text-claude-muted font-mono uppercase tracking-wider">
-          {language}
+      <div className="flex items-center justify-between px-5 pt-3 pb-1">
+        <span className="text-sm font-medium">
+          {language === 'bash' ? 'Bash' : language || '文本'}
         </span>
         <button
           type="button"
           onClick={handleCopy}
-          className="p-1.5 rounded-md text-claude-muted hover:text-claude-text hover:bg-claude-hover transition-[color,background-color,opacity] opacity-0 group-hover:opacity-100 focus:opacity-100"
-          title="复制"
+          className="p-2 rounded-md text-[#c9c9c9] hover:text-white hover:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+          title={copyFailed ? '复制失败，请重试' : copied ? '已复制' : '复制代码'}
+          aria-label={copyFailed ? '复制失败，请重试' : copied ? '已复制' : '复制代码'}
         >
           {copied ? <Check size={14} className="text-claude-success" /> : <Copy size={14} />}
         </button>
@@ -43,8 +48,10 @@ export function CodeBlock({ language, value, readingBlockId }: CodeBlockProps) {
           style={vscDarkPlus}
           customStyle={{
             margin: 0,
-            padding: '1.5rem',
-            background: '#1e1e1e', // Dark theme background
+            padding: '1rem 1.25rem 1.25rem',
+            background: 'transparent',
+            border: 0,
+            borderRadius: 0,
             fontSize: '13px',
             lineHeight: '1.6',
           }}

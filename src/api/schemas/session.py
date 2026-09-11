@@ -31,6 +31,7 @@ class SessionResponse(BaseModel):
     match_type: Optional[Literal["title", "user", "assistant"]] = None
     match_excerpt: Optional[str] = None
     match_round_id: Optional[str] = None
+    match_message_id: Optional[str] = None
 
     class Config:
         from_attributes = True

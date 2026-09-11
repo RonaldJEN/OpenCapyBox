@@ -4,7 +4,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sqlalchemy import create_engine
+import pytest
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -247,6 +248,51 @@ def test_history_excludes_subagent_child_rounds():
         rounds = HistoryService(db).get_session_rounds("s1")
 
         assert [round_data["round_id"] for round_data in rounds] == ["root-run"]
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+@pytest.mark.parametrize("child_status", ["completed", "cancelled", "max_steps_reached", "running"])
+def test_stale_edge_terminal_projection_is_read_only(child_status):
+    engine, db = _make_db()
+    try:
+        _seed(db, include_grandchild=False)
+        service = SubagentGraphService()
+        edge = service.create_edge(
+            db, user_id="u1", session_id="s1", parent_run_id="root-run",
+            child_run_id="child-run", model_id="sonnet", prompt="legacy task", status="running",
+        )
+        child = db.get(Round, "child-run")
+        child.status = child_status
+        child.completed_at = now_naive() if child_status != "running" else None
+        original_completed_at = edge.created_at if child_status == "completed" else None
+        edge.completed_at = original_completed_at
+        db.commit()
+        expected_status = "failed" if child_status == "max_steps_reached" else child_status
+        expected_time = original_completed_at or child.completed_at
+        writes = []
+
+        def capture_writes(_conn, _cursor, statement, _params, _context, _many):
+            if statement.lstrip().split(None, 1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}:
+                writes.append(statement)
+
+        event.listen(engine, "before_cursor_execute", capture_writes)
+        history = HistoryService(db).get_session_rounds("s1")
+        snapshot = HistoryService(db).get_round_snapshot("s1", "root-run")
+        projected_edge = service.get_graph(db, user_id="u1", session_id="s1", run_id="root-run").edges[0]
+        assert history[0]["subagent_tasks"] == snapshot["subagent_tasks"]
+        task = snapshot["subagent_tasks"][0]
+        assert task["status"] == projected_edge.status == expected_status
+        assert task["completed_at"] == (expected_time.isoformat() if expected_time else None)
+        assert projected_edge.completed_at == expected_time
+        assert not db.dirty
+        db.expire_all()
+        assert db.get(SubagentRun, edge.id).status == "running"
+        assert db.get(SubagentRun, edge.id).completed_at == original_completed_at
+        assert writes == []
+        event.remove(engine, "before_cursor_execute", capture_writes)
     finally:
         db.close()
         Base.metadata.drop_all(bind=engine)

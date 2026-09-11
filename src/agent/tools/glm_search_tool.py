@@ -80,6 +80,7 @@ def _parse_bocha_response(data: dict, with_summary: bool = True) -> list[dict[st
                 "snippet": content,
                 "link": item.get("url", ""),
                 "source": item.get("siteName", ""),
+                "icon": item.get("siteIcon") or "",
                 "datePublished": date_published,
                 "dateLastCrawled": date_crawled,
             }
@@ -144,6 +145,8 @@ def _format_search_results(results: list[QuerySearchResult]) -> str:
             output_parts.append(f"\n[{idx}] {result['title']}")
             output_parts.append(f"URL: {result['link']}")
             output_parts.append(f"Source: {result['source']}")
+            if result.get("icon"):
+                output_parts.append(f"Icon: {result['icon']}")
             if result.get("datePublished"):
                 output_parts.append(f"Published: {result['datePublished']}")
             elif result.get("dateLastCrawled"):

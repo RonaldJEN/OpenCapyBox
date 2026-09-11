@@ -84,6 +84,8 @@ export interface RunFinishedEvent extends AGUIBaseEvent {
   result?: any;
   outcome?: "success" | "interrupt";
   interrupt?: InterruptDetails;
+  finalMessageId?: string | null;
+  finalMessageIds?: string[] | null;
 }
 
 export interface RunErrorEvent extends AGUIBaseEvent {
@@ -107,6 +109,7 @@ export interface TextMessageStartEvent extends AGUIBaseEvent {
   type: AGUIEventType.TEXT_MESSAGE_START;
   messageId: string;
   role: string;
+  phase?: 'commentary' | 'final_answer' | null;
 }
 
 export interface TextMessageContentEvent extends AGUIBaseEvent {
@@ -118,6 +121,8 @@ export interface TextMessageContentEvent extends AGUIBaseEvent {
 export interface TextMessageEndEvent extends AGUIBaseEvent {
   type: AGUIEventType.TEXT_MESSAGE_END;
   messageId: string;
+  phase?: 'commentary' | 'final_answer' | null;
+  interrupted?: boolean;
 }
 
 // 思考过程事件
@@ -137,11 +142,20 @@ export interface ThinkingTextMessageEndEvent extends AGUIBaseEvent {
   messageId: string;
 }
 
+/** Display identity captured at invocation time, never rebuilt from the current catalog. */
+export interface ToolDisplayMetadata {
+  provider?: string | null;
+  server_name?: string | null;
+  tool_name?: string | null;
+  tool_title?: string | null;
+}
+
 // 工具调用事件
 export interface ToolCallStartEvent extends AGUIBaseEvent {
   type: AGUIEventType.TOOL_CALL_START;
   toolCallId: string;
   toolCallName: string;
+  toolDisplay?: ToolDisplayMetadata | null;
   parentMessageId?: string;
 }
 
@@ -161,6 +175,7 @@ export interface ToolCallResultEvent extends AGUIBaseEvent {
   messageId: string;
   toolCallId: string;
   content: string;
+  success?: boolean | null;
   role?: "tool";
 }
 
@@ -393,6 +408,7 @@ export interface Session {
   match_type?: 'title' | 'user' | 'assistant';
   match_excerpt?: string;
   match_round_id?: string;
+  match_message_id?: string | null;
 }
 
 // 认证响应
@@ -423,8 +439,10 @@ export interface SessionListResponse {
 
 // 工具调用
 export interface ToolCall {
+  sequence?: number | null;
   id?: string;  // 工具调用 ID（可选，用于流式更新）
   name: string;
+  tool_display?: ToolDisplayMetadata | null;
   input: Record<string, any>;
   started_at_ts?: number;   // TOOL_CALL_START 事件 timestamp (ms)
   ended_at_ts?: number;     // TOOL_CALL_END 事件 timestamp (ms)
@@ -433,7 +451,7 @@ export interface ToolCall {
 // 工具结果
 export interface ToolResult {
   tool_call_id?: string;  // 关联的工具调用 ID（可选）
-  success?: boolean;
+  success?: boolean | null;
   content: string;
   error?: string;
   received_at_ts?: number;      // TOOL_CALL_RESULT 事件 timestamp (ms)
@@ -445,12 +463,15 @@ export interface StepData {
   step_number: number;
   thinking?: string;
   assistant_content?: string;
+  /** Proves text-event provenance; absent on legacy snapshots. */
+  assistant_content_source?: 'text_message' | null;
   tool_calls: ToolCall[];
   tool_results: ToolResult[];
   status: string;
   created_at?: string;
   // AG-UI timestamp 元数据
   thinking_start_ts?: number;   // THINKING_START 事件 timestamp (ms)
+  thinking_start_sequence?: number | null;
   thinking_end_ts?: number;     // THINKING_END 事件 timestamp (ms)
   started_at_ts?: number;       // STEP_STARTED 事件 timestamp (ms)
   finished_at_ts?: number;      // STEP_FINISHED 事件 timestamp (ms)
@@ -488,6 +509,7 @@ export interface PreferredMcpConnectionSnapshot {
 }
 
 export type AssistantFileReference = {
+  event_sequence?: number | null;
   ref_id: string;
   name: string;
   path: string;
@@ -517,9 +539,51 @@ export type AssistantFileReference = {
     }
 );
 
+export interface AssistantMessageData {
+  phase?: 'commentary' | 'final_answer' | null;
+  message_id: string;
+  step_number: number;
+  first_sequence?: number | null;
+  last_sequence?: number | null;
+  content: string;
+  state: 'streaming' | 'complete' | 'interrupted' | 'superseded';
+  content_committed: boolean;
+}
+
+export interface TerminalPresentationMetadata {
+  final_response_origin: 'assistant' | 'run_error' | 'system_notice' | 'unknown';
+  error?: {
+    source: 'durable_run_error' | 'live_run_error';
+    sequence?: number | null;
+    code?: string | null;
+    message: string;
+  } | null;
+}
+
+/** Parent-facing task snapshot; child content lives in its own Round. */
+export interface SubagentTask {
+  edge_id: string;
+  parent_run_id: string;
+  child_run_id: string | null;
+  tool_call_id: string | null;
+  agent_name: string | null;
+  description: string | null;
+  agent_type: string | null;
+  model_id: string | null;
+  status: 'requested' | 'running' | 'completed' | 'failed' | 'cancelled';
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  /** Optional detail decoration from the graph or the parent's tool call. */
+  prompt?: string;
+  error?: string | null;
+}
+
 // 对话轮次
 export interface RoundData {
   round_id: string;
+  parent_run_id?: string | null;
+  subagent_tasks?: SubagentTask[];
   model_id?: string | null;
   model_display_name?: string | null;
   idempotency_key?: string | null;
@@ -532,6 +596,13 @@ export interface RoundData {
   thinking_mode?: 'provider_default' | 'enabled' | 'disabled' | null;
   reasoning_effort?: string | null;
   final_response: string | null;
+  terminal_presentation?: TerminalPresentationMetadata | null;
+  assistant_messages?: AssistantMessageData[] | null;
+  transcript_coverage?: { kind: 'complete' | 'partial' | 'legacy'; durable_through_sequence: number } | null;
+  final_message_id?: string | null;
+  final_message_ids?: string[] | null;
+  started_at_ts?: number | null;
+  finished_at_ts?: number | null;
   steps: StepData[];
   step_count: number;
   status: string;

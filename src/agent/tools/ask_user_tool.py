@@ -8,6 +8,8 @@
 
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 from .base import Tool, ToolExposure, ToolResult
 
 # ask_user 的 tool name 常量，方便 agent.py 引用
@@ -85,6 +87,13 @@ class AskUserQuestionTool(Tool):
             },
             "required": ["questions"],
         }
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> str | None:
+        """Validate every question before the Agent publishes a waiting interaction."""
+        error = next(Draft202012Validator(self.parameters).iter_errors(arguments), None)
+        if error is not None:
+            return f"{error.json_path}: {error.message}"
+        return None
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         """防御性实现 — 正常情况下不应被调用。

@@ -321,9 +321,10 @@ describe('chatStreamClient', () => {
         type: 'RUN_ERROR',
         threadId: 'sess-a',
         runId: 'server-failed-r1',
-        message: 'provider failed',
+        message: 'Run failed',
         code: 'RUN_FAILED',
         sequence: 7,
+        terminalPresentation: { final_response_origin: 'unknown' },
       },
     });
   });

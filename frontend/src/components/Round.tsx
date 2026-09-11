@@ -1,8 +1,10 @@
+import './chat-transcript.css';
 import {
   type AssistantFileReference,
   type AttachmentInfo,
   type FileInfo,
   type RoundData,
+  type SubagentTask,
 } from '../types';
 import { useState } from 'react';
 import {
@@ -21,23 +23,27 @@ import {
   User,
   type LucideIcon,
 } from 'lucide-react';
-import { ReasoningPanel } from './ReasoningPanel';
+import { projectRoundTranscript } from '../transcript/projectRoundTranscript';
+import { InlineRoundTranscript } from './InlineRoundTranscript';
+import type { ChatRunRuntimeState } from '../runtime/chatRuntimeTypes';
 import { FileAttachment } from './FileAttachment';
-import { CodeBlock } from './CodeBlock';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import { differenceInCalendarDays, format, isSameDay } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
 import { parseMessageContent } from '../utils/messageParser';
 import {
   assistantFileReferenceToFileInfo,
-  resolveAssistantFileReferenceFromHref,
 } from '../utils/assistantFileRefs';
-import { detectFileCategory, getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, toFileInfo, buildSandboxFileUrl, isImageFile } from '../utils/fileUtils';
+import { detectFileCategory, getFileIcon, getFileExtLabel, getFileIconClass, toFileInfo, buildSandboxFileUrl, isImageFile } from '../utils/fileUtils';
 import { AuthenticatedImage } from './AuthenticatedImage';
 
 interface RoundProps {
   round: RoundData;
+  run?: ChatRunRuntimeState;
+  reveal?: { messageId?: string; nonce: number };
+  onRetryStop?: () => void;
+  onInspectProcess?: () => void;
+  onOpenSubtask?: (task: SubagentTask) => void;
+  showUserMessage?: boolean;
   isStreaming?: boolean;
   preparing?: boolean;
   disableMotion?: boolean;
@@ -45,14 +51,6 @@ interface RoundProps {
   sessionId?: string;
   onPreviewAttachment?: (file: FileInfo, index: number) => void;
   onOpenFileInPanel?: (file: FileInfo) => void;
-}
-
-const CANCELLED_RESPONSE_SENTINEL = 'Cancelled';
-
-function isCancelledResponseSentinel(content: string | null | undefined, status: string): boolean {
-  return status === 'cancelled'
-    && typeof content === 'string'
-    && content.normalize('NFKC').trim() === CANCELLED_RESPONSE_SENTINEL;
 }
 
 async function copyTextToClipboard(text: string): Promise<void> {
@@ -73,170 +71,6 @@ async function copyTextToClipboard(text: string): Promise<void> {
   } finally {
     document.body.removeChild(textarea);
   }
-}
-
-function AssistantMarkdown({
-  content,
-  fileReferences,
-  onOpenFile,
-}: {
-  content: string;
-  fileReferences: AssistantFileReference[];
-  onOpenFile?: (file: FileInfo) => void;
-}) {
-  const readingId = (node: any) => `answer:${node.tagName}:${node.position?.start?.offset}`;
-  return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        code: ({ node, className, children, ...props }: any) => {
-          const match = /language-(\w+)/.exec(className || '');
-          const language = match ? match[1] : '';
-          const isInline = !match && !children?.toString().includes('\n');
-
-          if (isInline) {
-            return (
-              <code
-                className="px-1.5 py-0.5 bg-claude-surface text-orange-700 rounded-md text-[0.875em] font-mono border border-claude-border"
-                {...props}
-              >
-                {children}
-              </code>
-            );
-          }
-
-          return (
-            <CodeBlock
-              language={language}
-              value={String(children).replace(/\n$/, '')}
-              readingBlockId={readingId(node)}
-            />
-          );
-        },
-        pre: ({ children, ...props }: any) => {
-          if (children && typeof children === 'object' && 'props' in children) {
-            return <>{children}</>;
-          }
-          return (
-            <pre className="bg-[#1e1e1e] text-gray-300 rounded-2xl overflow-x-auto p-4 my-4 whitespace-pre-wrap break-words font-mono text-[13px]" {...props}>
-              {children}
-            </pre>
-          );
-        },
-        img: ({ node, src: imgSrc, alt: imgAlt, ...imgRest }: any) => {
-          if (typeof imgSrc !== 'string') {
-            return null;
-          }
-          if (imgSrc.startsWith('/api/')) {
-            return (
-              <AuthenticatedImage
-                data-reading-block={readingId(node)}
-                src={imgSrc}
-                alt={imgAlt || ''}
-                className="max-w-full rounded-lg my-2"
-                {...imgRest}
-              />
-            );
-          }
-          if (/^(https?:|data:image\/|blob:)/i.test(imgSrc)) {
-            return <img data-reading-block={readingId(node)} src={imgSrc} alt={imgAlt || ''} className="max-w-full rounded-lg my-2" {...imgRest} />;
-          }
-          return null;
-        },
-        a: ({ children, href, ...props }: any) => {
-          const reference = typeof href === 'string'
-            ? resolveAssistantFileReferenceFromHref(href, fileReferences)
-            : null;
-          if (reference && onOpenFile) {
-            return (
-              <a
-                href={href}
-                className="text-blue-600 hover:underline underline-offset-2 cursor-pointer"
-                onClick={(event) => {
-                  event.preventDefault();
-                  onOpenFile(assistantFileReferenceToFileInfo(reference));
-                }}
-                {...props}
-              >
-                {children}
-              </a>
-            );
-          }
-          const externalHref = typeof href === 'string'
-            && /^(?:https?:|mailto:|#|\/api\/)/i.test(href);
-          if (!externalHref) {
-            return (
-              <span
-                className="text-claude-secondary"
-                title="没有可验证的文件版本，无法打开"
-              >
-                {children}
-              </span>
-            );
-          }
-          return (
-            <a
-              href={href}
-              className="text-blue-600 hover:underline underline-offset-2"
-              target="_blank"
-              rel="noopener noreferrer"
-              {...props}
-            >
-              {children}
-            </a>
-          );
-        },
-        blockquote: ({ children, ...props }: any) => (
-          <blockquote
-            className="border-l-2 border-claude-accent bg-claude-bg/60 pl-4 py-2 my-4 rounded-r-lg text-claude-secondary"
-            {...props}
-          >
-            {children}
-          </blockquote>
-        ),
-        ul: ({ children, ...props }: any) => (
-          <ul className="space-y-1 my-2" {...props}>{children}</ul>
-        ),
-        ol: ({ children, ...props }: any) => (
-          <ol className="space-y-1 my-2" {...props}>{children}</ol>
-        ),
-        p: ({ node, children, ...props }: any) => (
-          <p data-reading-block={readingId(node)} {...props}>{children}</p>
-        ),
-        li: ({ node, children, ...props }: any) => (
-          <li data-reading-block={readingId(node)} className="text-claude-text" {...props}>{children}</li>
-        ),
-        h1: ({ node, children, ...props }: any) => (
-          <h1 data-reading-block={readingId(node)} className="text-[1.5em] font-semibold text-claude-text tracking-tight mt-6 mb-3" {...props}>{children}</h1>
-        ),
-        h2: ({ node, children, ...props }: any) => (
-          <h2 data-reading-block={readingId(node)} className="text-[1.25em] font-semibold text-claude-text tracking-tight mt-5 mb-2" {...props}>{children}</h2>
-        ),
-        h3: ({ node, children, ...props }: any) => (
-          <h3 data-reading-block={readingId(node)} className="text-[1.1em] font-semibold text-claude-text tracking-tight mt-4 mb-2" {...props}>{children}</h3>
-        ),
-        h4: ({ node, children, ...props }: any) => <h4 data-reading-block={readingId(node)} {...props}>{children}</h4>,
-        h5: ({ node, children, ...props }: any) => <h5 data-reading-block={readingId(node)} {...props}>{children}</h5>,
-        h6: ({ node, children, ...props }: any) => <h6 data-reading-block={readingId(node)} {...props}>{children}</h6>,
-        table: ({ children, ...props }: any) => (
-          <div className="overflow-x-auto my-4 rounded-xl border border-claude-border">
-            <table className="min-w-full" {...props}>{children}</table>
-          </div>
-        ),
-        thead: ({ children, ...props }: any) => (
-          <thead className="bg-claude-surface" {...props}>{children}</thead>
-        ),
-        th: ({ node, children, ...props }: any) => (
-          <th data-reading-block={readingId(node)} className="px-4 py-2 text-left text-[12px] font-semibold text-claude-secondary uppercase tracking-wider" {...props}>{children}</th>
-        ),
-        td: ({ node, children, ...props }: any) => (
-          <td data-reading-block={readingId(node)} className="px-4 py-2 text-[14px] text-claude-text border-t border-claude-border/50" {...props}>{children}</td>
-        ),
-      }}
-    >
-      {content}
-    </ReactMarkdown>
-  );
 }
 
 function MessageTimestamp({ value, label }: { value: string; label: string }) {
@@ -281,7 +115,7 @@ function AssistantActions({ content }: { content: string }) {
   };
 
   return (
-    <div className="not-prose -ml-1 mt-2 flex items-center gap-1">
+    <div className="chat-response-actions">
       <button
         type="button"
         onClick={handleCopy}
@@ -380,38 +214,30 @@ function AssistantFileCard({
   );
 }
 
-export function Round({ round, isStreaming = false, preparing = false, disableMotion = false, userAttachments = [], sessionId, onPreviewAttachment, onOpenFileInPanel }: RoundProps) {
+function attachmentSizeLabel(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${Number((size / 1024).toFixed(1))} KB`;
+  return `${Number((size / (1024 * 1024)).toFixed(1))} MB`;
+}
+
+export function Round({ round, run, reveal, onRetryStop, onInspectProcess, onOpenSubtask, showUserMessage = true, isStreaming = false, preparing = false, disableMotion = false, userAttachments = [], sessionId, onPreviewAttachment, onOpenFileInPanel }: RoundProps) {
   // 解析用户消息，提取附件信息
   const { attachments, cleanContent } = parseMessageContent(round.user_message);
 
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'max_steps_reached', 'cancelled']);
   const isCompleted = TERMINAL_STATUSES.has(round.status);
   const effectiveStreaming = isStreaming && !isCompleted;
-  const latestStepContent = [...round.steps]
-    .reverse()
-    .find((step) => (
-      step.assistant_content
-      && !isCancelledResponseSentinel(step.assistant_content, round.status)
-    ))
-    ?.assistant_content;
-  const visibleFinalResponse = isCancelledResponseSentinel(round.final_response, round.status)
-    ? undefined
-    : round.final_response;
-  const visibleStepContent = latestStepContent || undefined;
-  const assistantContent = visibleFinalResponse
-    || ((effectiveStreaming || round.status === 'cancelled') ? visibleStepContent : undefined);
-  const canCopyAssistantContent = round.status === 'completed' && !!round.final_response;
-  const visibleAssistantFiles = round.assistant_file_references || [];
+  const transcript = projectRoundTranscript(round, effectiveStreaming);
 
   return (
-    <div className={`space-y-6 ${disableMotion ? '' : 'animate-fade-in'}`}>
+    <div className={`chat-round ${disableMotion ? '' : 'animate-fade-in'}`}>
       {/* ── 用户消息 ── */}
-      <div className="flex items-start gap-3">
-        <div className="w-7 h-7 rounded-full bg-claude-surface flex items-center justify-center flex-shrink-0 mt-0.5">
-          <User size={14} className="text-claude-secondary" />
+      {showUserMessage && <div className="chat-user-row">
+        <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-claude-surface">
+          <User size={20} className="text-claude-secondary" aria-hidden="true" />
         </div>
-        <div className="group/reply flex-1 min-w-0 pt-0.5">
-          <p className="text-xs font-medium text-claude-secondary mb-1.5">你</p>
+        <div className="chat-user-content">
+          <p className="mb-1.5 text-xs font-medium text-claude-secondary">你</p>
           {((round.preferred_skills?.length || 0) > 0
             || (round.preferred_mcp_connections?.length || 0) > 0) && (
             <div
@@ -423,7 +249,7 @@ export function Round({ round, isStreaming = false, preparing = false, disableMo
                 return (
                   <span
                     key={`${skill.key}-${index}`}
-                    className="inline-flex max-w-full items-center gap-2 rounded-xl border border-claude-border bg-white px-3 py-2 text-sm font-medium text-claude-text shadow-sm"
+                    className="chat-user-chip"
                     title={skill.key}
                     aria-label={`Skill ${label}`}
                   >
@@ -439,7 +265,7 @@ export function Round({ round, isStreaming = false, preparing = false, disableMo
                 return (
                   <span
                     key={`${connection.server_id}-${index}`}
-                    className="inline-flex max-w-full items-center gap-2 rounded-xl border border-claude-border bg-white px-3 py-2 text-sm font-medium text-claude-text shadow-sm"
+                    className="chat-user-chip"
                     title={connection.server_id}
                     aria-label={`数据连接 ${label}`}
                   >
@@ -452,54 +278,40 @@ export function Round({ round, isStreaming = false, preparing = false, disableMo
               })}
             </div>
           )}
-          <div data-reading-block="user" className="text-[15px] text-claude-text leading-relaxed whitespace-pre-wrap break-words">
-            {cleanContent}
-          </div>
           {/* 附件展示 */}
           {userAttachments.length > 0 ? (
-            <div className="mt-3 flex flex-wrap gap-2">
-              {userAttachments.map((file, idx) => (
+            <div className="chat-user-attachments">
+              {userAttachments.map((file, idx) => {
+                const Icon = getFileIcon(file);
+                const image = isImageFile(file);
+                return (
                 <button
                   key={`${file.path}-${idx}`}
                   data-reading-block={`user-file:${file.path}`}
                   type="button"
                   onClick={() => onPreviewAttachment?.(toFileInfo(file, sessionId), idx)}
-                  className="group relative w-24 h-20 rounded-xl overflow-hidden border border-claude-border bg-white hover:border-claude-border-strong transition-colors"
-                  title={`预览 ${file.name}`}
+                  className="chat-user-chip chat-user-file-card group"
+                  title={`预览 ${file.name}\n${getFileExtLabel(file)}${!file.is_directory && file.size !== undefined ? ` · ${attachmentSizeLabel(file.size)}` : ''}`}
+                  aria-label={`预览 ${file.name}`}
                 >
-                  <div className={`absolute top-1.5 right-1.5 text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-wide z-10 ${getFileBadgeClass(file)}`}>
-                    {getFileExtLabel(file)}
-                  </div>
-                  {isImageFile(file) && (file.data_url || sessionId) ? (
-                    <AuthenticatedImage
-                      src={file.data_url || buildSandboxFileUrl(sessionId!, file.path)}
-                      alt={file.name}
-                      className="w-full h-full object-cover transition-transform group-hover:scale-105"
-                      fallback={
-                        <div className="w-full h-full flex items-center justify-center bg-claude-surface">
-                          {(() => {
-                            const Icon = getFileIcon(file);
-                            return <Icon className={`w-6 h-6 ${getFileIconClass(file)}`} />;
-                          })()}
-                        </div>
-                      }
-                    />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center bg-claude-surface">
-                      {(() => {
-                        const Icon = getFileIcon(file);
-                        return <Icon className={`w-6 h-6 ${getFileIconClass(file)}`} />;
-                      })()}
-                    </div>
-                  )}
-                  <div className="absolute inset-x-0 bottom-0 bg-black/55 text-white text-[10px] px-1.5 py-1 truncate">
-                    {file.name}
-                  </div>
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-md bg-claude-surface">
+                    {image && (file.data_url || sessionId) ? (
+                      <AuthenticatedImage
+                        src={file.data_url || buildSandboxFileUrl(sessionId!, file.path)}
+                        alt={file.name}
+                        className="h-full w-full object-cover"
+                        fallback={<Icon size={14} className={getFileIconClass(file)} aria-hidden="true" />}
+                      />
+                    ) : (
+                      <Icon size={14} className={getFileIconClass(file)} aria-hidden="true" />
+                    )}
+                  </span>
+                  <span className="min-w-0 truncate text-left">{file.name}</span>
                 </button>
-              ))}
+              ); })}
             </div>
           ) : attachments.length > 0 && (
-            <div className="mt-3 flex flex-wrap gap-2">
+            <div className="chat-user-attachments">
               {attachments.map((attachment, idx) => (
                 <FileAttachment
                   key={idx}
@@ -509,23 +321,23 @@ export function Round({ round, isStreaming = false, preparing = false, disableMo
               ))}
             </div>
           )}
-          <div className="mt-2">
+          {cleanContent && <div data-reading-block="user" className="chat-user-bubble whitespace-pre-wrap break-words">
+            {cleanContent}
+          </div>}
+          <div className="chat-user-time">
             <MessageTimestamp value={round.created_at} label="消息发送时间" />
           </div>
         </div>
-      </div>
+      </div>}
 
-      {/* ── 助手响应 ── */}
-      <div className="flex items-start gap-3">
-        <div className="w-7 h-7 rounded-full overflow-hidden flex-shrink-0 mt-0.5">
-          <img src="/logo.jpg" alt="AI" className="w-full h-full object-cover" />
+      <section className="chat-message-row chat-assistant" aria-label="助手回复">
+        <div className="chat-message-avatar">
+          <img src="/logo.jpg" alt="AI" className="h-full w-full object-cover" />
         </div>
-
-        <div className="flex-1 min-w-0 pt-0.5">
-          <p className="text-xs font-medium text-claude-secondary mb-1.5">
-            助手{round.model_display_name ? ` · ${round.model_display_name}` : ''}
+        <div className="chat-message-content">
+          <p className="chat-message-label text-xs font-medium text-claude-secondary">
+            助手{round.model_display_name && <span aria-label={`本轮模型：${round.model_display_name}`}>{` · ${round.model_display_name}`}</span>}
           </p>
-
           {/* 推理面板 */}
           {preparing && (
             <div role="status" className="flex items-center gap-2 py-2 text-sm text-claude-secondary">
@@ -533,66 +345,29 @@ export function Round({ round, isStreaming = false, preparing = false, disableMo
               <span>正在准备请求...</span>
             </div>
           )}
-          {!preparing && (round.steps.length > 0 || isStreaming) && (
-            <ReasoningPanel
-              steps={round.steps}
-              isStreaming={effectiveStreaming}
-              isCompleted={isCompleted && !!round.final_response}
-              disableMotion={disableMotion}
-            />
+          {(!preparing || transcript.nodes.length > 0 || Boolean(round.assistant_file_references?.length)) && <InlineRoundTranscript round={round} run={run} streaming={effectiveStreaming} reveal={reveal} onRetryStop={onRetryStop} onInspectProcess={onInspectProcess} onOpenSubtask={onOpenSubtask}
+            onOpenFile={onOpenFileInPanel} renderFile={(reference) => <AssistantFileCard reference={reference} onOpen={onOpenFileInPanel} />} />}
+          {transcript.error && (
+            <details className="mt-2 text-sm text-claude-error">
+              <summary className="cursor-pointer">错误详情</summary>
+              <div className="mt-1 whitespace-pre-wrap break-words">{transcript.error}</div>
+            </details>
+          )}
+          {transcript.notice && (
+            <details className="mt-2 text-sm text-claude-secondary">
+              <summary className="cursor-pointer">{transcript.notice.label}</summary>
+              <div className="mt-1 whitespace-pre-wrap break-words">{transcript.notice.text}</div>
+            </details>
           )}
 
-          {/* 最终答案 OR 流式传输中的答案 */}
-          {assistantContent && (
-            <div className="prose max-w-none mt-4">
-              <AssistantMarkdown
-                content={assistantContent}
-                fileReferences={visibleAssistantFiles}
-                onOpenFile={onOpenFileInPanel}
-              />
-              {/* 流式传输光标 */}
-              {!round.final_response && effectiveStreaming && (
-                <span className="inline-block w-0.5 h-5 bg-claude-muted ml-0.5 animate-blink align-middle" />
-              )}
-              {/* 底部文件卡片（去重） */}
-              {visibleAssistantFiles.length > 0 && (
-                <div className="not-prose mt-3 flex max-w-[520px] flex-col items-stretch gap-1.5 sm:items-start">
-                  {visibleAssistantFiles.map((reference) => (
-                    <AssistantFileCard
-                      key={reference.ref_id}
-                      reference={reference}
-                      onOpen={onOpenFileInPanel}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* 状态提示 */}
-          {round.status === 'failed' && (
-            <div className="text-xs text-claude-error font-medium mt-2">
-              执行失败
-            </div>
-          )}
-          {round.status === 'max_steps_reached' && (
-            <div className="text-xs text-claude-warning font-medium mt-2">
-              达到最大步数限制
-            </div>
-          )}
-          {round.status === 'cancelled' && (
-            <div className="text-xs text-claude-muted font-medium mt-2">
-              已取消
-            </div>
-          )}
-          {canCopyAssistantContent && (
-            <AssistantActions content={round.final_response ?? ''} />
-          )}
+          <div className="chat-response-footer">
+            {transcript.copyText && <AssistantActions content={transcript.copyText} />}
+          </div>
         </div>
-      </div>
+      </section>
 
       {/* 分隔线 */}
-      <div className="border-b border-claude-border/50" />
+      <div className="chat-round-separator" />
     </div>
   );
 }

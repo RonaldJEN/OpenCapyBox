@@ -701,7 +701,7 @@ async def test_run_completion_service_fans_out_committed_terminal(db):
 
 
 @pytest.mark.asyncio
-async def test_event_bus_fans_out_stream_aggregate_before_end_for_late_subscriber(db):
+async def test_event_bus_persists_text_before_end_for_late_subscriber(db):
     _add_user_session(db)
     run_id = "r-stream-late-subscriber"
     db.add(
@@ -724,15 +724,17 @@ async def test_event_bus_fans_out_stream_aggregate_before_end_for_late_subscribe
 
     try:
         stored = await bus.publish(run_id, TextMessageEndEvent(messageId="msg-1"))
-        aggregate = await asyncio.wait_for(queue.get(), timeout=1.0)
         end = await asyncio.wait_for(queue.get(), timeout=1.0)
+        text = (await bus.replay(run_id, 0))[0]
 
         assert stored is not None
-        assert aggregate["type"] == "TEXT_MESSAGE_CONTENT"
-        assert aggregate["delta"] == "hel"
-        assert aggregate["sequence"] == 1
+        assert text["type"] == "TEXT_MESSAGE_CONTENT"
+        assert text["delta"] == "hel"
+        assert text["sequence"] == 1
+        assert text["isAggregate"] is False
         assert end["type"] == "TEXT_MESSAGE_END"
         assert end["sequence"] == 2
+        assert queue.empty()  # No second aggregate duplicating already committed text.
     finally:
         with bus.subscribers_lock:
             bus.subscribers.pop(run_id, None)

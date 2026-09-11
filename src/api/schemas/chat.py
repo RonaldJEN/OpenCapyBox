@@ -8,6 +8,12 @@ from src.agent.schema.skill_key import (
     normalize_optional_skill_key,
 )
 from src.agent.schema.run_context import normalize_optional_mcp_server_id
+from src.agent.schema.agui_events import ToolDisplay
+from src.api.schemas.subagent_graph import SubagentTaskSnapshot
+
+
+class AbortChatRequest(BaseModel):
+    round_id: Optional[str] = None
 
 
 class TextContentBlock(BaseModel):
@@ -220,9 +226,11 @@ class ResumeRequest(BaseModel):
 # 🆕 新增 Round/Step 相关 Schema
 
 class ToolCall(BaseModel):
+    sequence: Optional[int] = None
     """工具调用"""
     id: Optional[str] = None
     name: str
+    tool_display: Optional[ToolDisplay] = None
     input: Dict[str, Any]
     started_at_ts: Optional[int] = None
     ended_at_ts: Optional[int] = None
@@ -231,7 +239,7 @@ class ToolCall(BaseModel):
 class ToolResult(BaseModel):
     """工具结果"""
     tool_call_id: Optional[str] = None
-    success: bool
+    success: Optional[bool] = None
     content: str
     error: Optional[str] = None
     received_at_ts: Optional[int] = None
@@ -256,6 +264,7 @@ class AssistantFileReference(BaseModel):
     """One file identity explicitly presented by a Round."""
 
     ref_id: str
+    event_sequence: Optional[int] = None
     source: Literal["session", "workspace"]
     name: str
     path: str
@@ -287,21 +296,52 @@ class StepData(BaseModel):
     step_number: int
     thinking: Optional[str] = None
     assistant_content: Optional[str] = None
+    assistant_content_source: Optional[Literal["text_message"]] = None
     tool_calls: List[ToolCall] = Field(default_factory=list)
     tool_results: List[ToolResult] = Field(default_factory=list)
     status: str = "completed"
     created_at: Optional[str] = None
     thinking_start_ts: Optional[int] = None
+    thinking_start_sequence: Optional[int] = None
     thinking_end_ts: Optional[int] = None
     started_at_ts: Optional[int] = None
     finished_at_ts: Optional[int] = None
 
 
 
+class TerminalErrorPresentation(BaseModel):
+    source: Literal["durable_run_error", "live_run_error"]
+    sequence: Optional[int] = None
+    code: Optional[str] = None
+    message: str
+
+
+class TerminalPresentationMetadata(BaseModel):
+    final_response_origin: Literal["assistant", "run_error", "system_notice", "unknown"]
+    error: Optional[TerminalErrorPresentation] = None
+
+
+class AssistantMessageData(BaseModel):
+    message_id: str
+    step_number: int
+    first_sequence: Optional[int] = None
+    last_sequence: Optional[int] = None
+    content: str = ""
+    phase: Optional[Literal["commentary", "final_answer"]] = None
+    state: Literal["streaming", "complete", "interrupted", "superseded"]
+    content_committed: bool = True
+
+
+class TranscriptCoverage(BaseModel):
+    kind: Literal["complete", "partial", "legacy"]
+    durable_through_sequence: int = 0
+
+
 class RoundData(BaseModel):
     """对话轮次数据"""
     round_id: str
     parent_run_id: Optional[str] = None
+    subagent_tasks: List[SubagentTaskSnapshot] = Field(default_factory=list)
     idempotency_key: Optional[str] = None
     last_event_sequence: int = 0
     model_id: Optional[str] = None
@@ -316,6 +356,13 @@ class RoundData(BaseModel):
     thinking_mode: Optional[Literal["provider_default", "enabled", "disabled"]] = None
     reasoning_effort: Optional[str] = None
     final_response: Optional[str] = None
+    terminal_presentation: Optional[TerminalPresentationMetadata] = None
+    assistant_messages: Optional[List[AssistantMessageData]] = None
+    transcript_coverage: Optional[TranscriptCoverage] = None
+    final_message_id: Optional[str] = None
+    final_message_ids: Optional[List[str]] = None
+    started_at_ts: Optional[int] = None
+    finished_at_ts: Optional[int] = None
     steps: List[StepData] = Field(default_factory=list)
     step_count: int
     status: str

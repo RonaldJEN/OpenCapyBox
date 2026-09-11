@@ -173,7 +173,7 @@ describe('APIService', () => {
       );
     });
 
-    it('abortChat 应返回远端副作用不确定警告', async () => {
+    it('abortChat 应携带目标轮次并返回权威停止结果', async () => {
       const axiosModule = await import('axios');
       const client = vi.mocked(axiosModule.default.create).mock.results[0].value as unknown as {
         post: ReturnType<typeof vi.fn>;
@@ -183,11 +183,14 @@ describe('APIService', () => {
         request_id: 'cancel-1',
         reason: 'force_aborted',
         outcome_warning: '远端副作用可能已经发生',
+        round_id: 'round-1',
+        round_status: 'cancelled',
+        admission_released: true,
       };
       client.post.mockResolvedValue({ data: payload });
 
-      await expect(apiService.abortChat('session-1')).resolves.toEqual(payload);
-      expect(client.post).toHaveBeenCalledWith('/chat/session-1/abort');
+      await expect(apiService.abortChat('session-1', 'round-1')).resolves.toEqual(payload);
+      expect(client.post).toHaveBeenCalledWith('/chat/session-1/abort', { round_id: 'round-1' });
     });
   });
 

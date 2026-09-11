@@ -74,3 +74,38 @@ def test_responses_replays_custom_call_and_matching_output_items():
         "custom_tool_call_output",
     ]
     assert items[0]["call_id"] == items[1]["call_id"] == "call-1"
+
+
+def test_responses_replays_native_messages_once_with_phases_and_tool_pairing():
+    reasoning = {"type": "reasoning", "id": "rs-1", "encrypted_content": "opaque"}
+    call = ToolCall(
+        id="call-lookup", type="function",
+        function=FunctionCall(name="lookup", arguments={"query": "资料"}),
+    )
+    message = Message(
+        role="assistant",
+        content="先查资料。未标注阶段。结论。",
+        provider_items=[reasoning],
+        assistant_text_messages=[
+            {"content": "先查资料。", "phase": "commentary", "provider_message_id": "msg-1"},
+            {"content": "未标注阶段。", "provider_message_id": "msg-2"},
+            {"content": "结论。", "phase": "final_answer", "provider_message_id": "msg-3"},
+        ],
+        tool_calls=[call],
+    )
+
+    _, items = make_client()._convert_messages([
+        message,
+        Message(role="tool", content="已找到", name="lookup", tool_call_id=call.id),
+    ])
+
+    assistant_items = [item for item in items if item.get("role") == "assistant"]
+    assert [item["content"] for item in assistant_items] == [
+        "先查资料。", "未标注阶段。", "结论。",
+    ]
+    assert [item.get("phase") for item in assistant_items] == ["commentary", None, "final_answer"]
+    assert items[0] == reasoning
+    assert len(items) == 6
+    assert items[-2]["type"] == "function_call"
+    assert items[-1]["type"] == "function_call_output"
+    assert items[-2]["call_id"] == items[-1]["call_id"] == "call-lookup"

@@ -53,6 +53,7 @@ interface RunningSessionRestoreIntent {
 type SessionScrollTarget = {
   sessionId: string;
   roundId: string;
+  messageId?: string;
   nonce: number;
 };
 
@@ -577,7 +578,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     };
   }, [workspaceCronWatchActive]);
 
-  const applySessionSelection = useCallback((sessionId: string, target?: { roundId: string }, updateUrl = true) => {
+  const applySessionSelection = useCallback((sessionId: string, target?: { roundId: string; messageId?: string }, updateUrl = true) => {
     currentSessionIdRef.current = sessionId;
     setCurrentSessionId(sessionId);
     if (updateUrl) navigate(sessionId ? `/?session=${encodeURIComponent(sessionId)}` : '/');
@@ -585,6 +586,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
       setSessionScrollTarget({
         sessionId,
         roundId: target.roundId,
+        ...(target.messageId ? { messageId: target.messageId } : {}),
         nonce: ++sessionScrollNonceRef.current,
       });
     } else {
@@ -594,7 +596,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
 
   const saveThenSelectSession = useCallback((
     sessionId: string,
-    target?: { roundId: string },
+    target?: { roundId: string; messageId?: string },
     updateUrl = true,
   ) => {
     invalidateRunningSessionRestore();
@@ -784,7 +786,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
     action();
   }, [flushWorkspaceFiles]);
 
-  const handleSessionSelect = useCallback((sessionId: string, target?: { roundId: string }) => {
+  const handleSessionSelect = useCallback((sessionId: string, target?: { roundId: string; messageId?: string }) => {
     requestPrimarySurface('chat', () => {
       runAfterWorkspaceFlush(() => {
         setSidebarMode('sessions');

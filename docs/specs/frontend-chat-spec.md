@@ -1,4 +1,4 @@
-# 前端 Chat Spec — 聊天 / SSE / 推理面板
+# 前端 Chat Spec — 聊天 / SSE / 行内执行过程
 
 > 父级：[frontend-spec.md](./frontend-spec.md) · 对应后端：[chat-spec.md](./chat-spec.md)
 
@@ -8,7 +8,7 @@
 
 - 发送用户消息（含附件、引用图片）
 - 消费后端 SSE（AG-UI 事件）增量构建 `RoundData[]`
-- 渲染消息流（user → reasoning → assistant）
+- 渲染消息流（user → content/工具过程 → 最终答复）
 - 选择并发送仅作用于当前逻辑执行链的 Skill/MCP 统一偏好
 - 从用户持久工作区选择冻结版本附件，并投影工作区资源变更
 - 将后端结构化助手文件引用投影为回复底部卡片，并统一在聊天右侧文件面板打开
@@ -156,7 +156,7 @@ catch (SSE error)
 
 订阅断连且目标 Round 仍为 `running` 或 `waiting_interaction` 时，前端最多静默重试 3 次；重试期间不得展示错误横幅。waiting 订阅用于跨标签页接收 `interaction_resolved`、后续输出、取消和终态，不计为 `sending`。重试耗尽后才展示刷新提示。用户点击 Stop 时必须先清除该 Round 已安排但尚未执行的 retry timer，并使旧 transport identity 失效，再发起 abort；旧 timer 不得在取消窗口重建订阅或用较早 history 恢复 waiting。
 
-history 的 `last_event_sequence` 只有在同一 snapshot 的 `steps/final_response/interrupt/status` 已完整投影后才能成为新 cursor；禁止保留局部本地 steps 却直接跳到服务端高水位。text / thinking / tool args delta 在 END 前是 live-only、没有 durable sequence；全局 cursor 变大只证明某个 durable 事件已提交，不证明每个交错 segment 都已写入 aggregate。只要本地仍有 dirty segment，history 必须逐 segment 证明其对应 projection 已包含本地前缀（工具参数以同 `tool_call_id` 的持久化调用为证），否则即使 cursor 更高也要保留本地 projection 与 buffer。direct / resume 内嵌 subscribe 若恢复出非终态，必须以结构化 handoff 把同一 `clientRunKey + roundId + cursor` 交给 Provider 继续 subscribe，不得合成 Round terminal `RUN_ERROR`。无 durable sequence 的 `SUBSCRIBE_FAILED` 属于 transport 控制错误；只有持久化或 history 权威恢复的 `RUN_ERROR` 才能终态化 Round。
+history 的 `last_event_sequence` 只有在同一 snapshot 的 `steps/final_response/interrupt/status` 已完整投影后才能成为新 cursor；禁止保留局部本地 steps 却直接跳到服务端高水位。新主助手 text delta 已提交并带 durable sequence；旧协议 text 以及 thinking / tool args 在 END 前仍是 live-only、没有 durable sequence；全局 cursor 变大只证明某个 durable 事件已提交，不证明每个交错 segment 都已写入 aggregate。只要本地仍有 dirty segment，history 必须逐 segment 证明其对应 projection 已包含本地前缀（工具参数以同 `tool_call_id` 的持久化调用为证），否则即使 cursor 更高也要保留本地 projection 与 buffer。direct / resume 内嵌 subscribe 若恢复出非终态，必须以结构化 handoff 把同一 `clientRunKey + roundId + cursor` 交给 Provider 继续 subscribe，不得合成 Round terminal `RUN_ERROR`。无 durable sequence 的 `SUBSCRIBE_FAILED` 属于 transport 控制错误；只有持久化或 history 权威恢复的 `RUN_ERROR` 才能终态化 Round。
 
 一旦收到新的持久化 `interaction_requested`，它就是权威等待边界。即使紧接着断网且 history 查询也失败，前端也必须保留新卡片和 `waiting_interaction`，不得再合成 `RUN_ERROR` 覆盖它。
 
@@ -191,36 +191,31 @@ pre_accept_pending
 
 ### 3.5 取消语义
 
-用户点击取消：
-1. 前端点击后必须立即取消当前订阅（`subscription.abort()`），防止后续迟到回调覆盖状态。
-2. 本地将当前 `running` 或 `waiting_interaction` Round 先收敛为取消态 `cancelled`（用于即时反馈），结束 `sending/resuming` 并移除交互卡；不得等待 `/abort` HTTP 响应或 SSE 终态事件。
-3. 进入 `stopping` 状态：输入框保持可编辑，但新的发送动作必须禁用，直到 `/abort` 返回，避免用户立即发送新问题时撞到后端尚未释放的 user/session lock。
-4. 同步发起 POST `/api/chat/{sid}/abort`。
-5. 若请求返回 409（会话已无运行任务）：按“已停止”处理，保持本地已收敛 UI。
-6. 成功响应中的 `outcome_warning` 仅作为后端诊断信息，聊天页不再展示独立提示；取消状态保持成功。
-7. 其他请求失败：重新拉取历史以恢复真实运行态，并提示停止请求失败。
-8. 后端规范终态为 `RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled)`，
-  前端按 `isUserCancelledOutcome()` 识别为"已取消"，**不是错误**。
+本节约定已发起停止请求后的行为；`ask_user` 等待回答时的聊天页不提供停止入口，见 §3.6。
 
-**判定**：`outcome === 'interrupt' && result?.reason === 'user_cancelled'`。outcome=interrupt 但无 reason 的保守处理为非取消。
+用户点击停止时，先使旧 transport epoch 和 retry timer 失效，标记 `localOutputStopped`，立即停止本地输出。`cancelRequest` 独立记录 pending / confirmed / failed / unknown；不凭点击将业务 Round 改为 cancelled。
 
-#### 3.5.1 取消态 `final_response` 渲染规则
+调用 `/api/chat/{sid}/abort` 时携带已知 `round_id`。成功响应返回 `round_id/round_status/admission_released`：只有目标权威终态和目标准入释放均已确认，才结束 stopping 并恢复发送。历史/运行列表用于补充确认；HTTP 409 本身不证明已取消。先完成的 Round 保持 completed，较新 Round 不受旧取消影响。
 
-`RoundData.final_response` 类型为 `string | null`，取消态下允许为 `null`、空串或占位串。任何直接读取（如 `round.final_response.trim()`）都必须先处理 `null`。
+确认期间输入可编辑，发送和回答/审批动作禁用。失败或无法确定时显示“停止结果待确认”和重新确认入口；重新读历史，不复活旧正文订阅、不恢复草稿、不重发已受理请求。`outcome_warning` 保留后端诊断，不另作全局横幅。`RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled)` 显示“已停止”，不作为执行错误。
 
-`Round.tsx` 通过 `isCancelledResponseSentinel(content, status)` 判定占位符，只有 `status === 'cancelled'` 且 `content` 经 `NFKC` 归一化并 `trim()` 后精确等于 `"Cancelled"` 时才成立。据此的渲染约定：
+#### 3.5.1 正文、终态说明与复制
 
-| 场景 | `final_response` | 展示 |
-|---|---|---|
-| 正常完成 | 普通字符串 | 原样展示，显示复制按钮 |
-| 取消前已有有效助手正文 | 有效正文 | 继续展示该正文（`final_response` 无效时回退到最后一个非占位 step 的 `assistant_content`） |
-| 取消且完整正文即占位符 | `"Cancelled"` | 隐藏占位串，只展示"已取消" |
-| 取消且从未生成正文 | `null` / 空串 | 只展示"已取消" |
+- `projectRoundTranscript` 是步骤正文的唯一展示与复制投影。所有非空步骤正文按现有步骤顺序保留，不受工具调用、流式/完成/失败/取消状态影响。空白判断不改写正文；不同步骤的相同文本不去重。
+- `final_response` 先按 `terminal_presentation.final_response_origin` 分流。确认的助手终稿及正常完成 legacy 终稿进入正文；取消态无来源且非占位的终稿保留原有兼容展示。仅当正文候选与最后一条步骤正文完全相等时作为别名显示一次，部分重叠仍保留。失败态来源未知的独立终稿放入“运行结束说明（旧版记录）”，不默认复制为回复。
+- `RUN_ERROR` 保持现有终态和取消语义。真实错误记录独立的 Round 级来源与说明；已有助手终稿不因后续错误改标。历史使用可选终态来源投影；恢复合成的 `RUN_ERROR` 不构成原始来源证据，缺少来源时只合成通用失败状态。
+- `assistant_content_source=text_message` 表示有文本事件依据，即使内容等于 `Cancelled` 或异常说明也保留。仅无来源 legacy 的 cancelled 占位串在 trim 后精确等于 `Cancelled` 时隐藏；不做 Unicode 归一化或错误关键词识别。
+- “复制回复”仅复制共享投影的 `answerNodes`：有效最终别名、原生 final_answer、明确交付主体以及合法的最终响应回退，按消息顺序保留多段答复，不按相同文本去重。进展、interrupted/superseded尝试、工具、系统错误及运行说明不混入。尚无明确答复时隐藏主按钮，保留已有正文供阅读与选中复制；过程展开/收起不改变主复制范围。多最终别名仅部分恢复时使用完整回退一份，避免同时复制已恢复片段和全量终稿。
+- 附件只来自合法 `assistant_file_references`，在正文条件外独立渲染。消息级 ErrorBoundary 只将出错消息降级为转义纯文本，其他消息、附件、复制继续可用。
+- Markdown 块锚点为 `answer:<稳定正文节点>:<tag>:<offset或AST路径>`，节点由运行的幂等键（旧记录回退 Round ID）和 messageId 构成，legacy 使用步骤号；终稿兜底用独立键。完成/中断不换节点键；React key 和 DOM 锚点均保持身份。复用原阅读位置捕获/恢复算法。
+- 工具投影仅输出按调用身份关联结果的工具项，行内组件按消息和工具的事件顺序展示；不再计算旧面板的思考分组、工具汇总或累计耗时。
+- 使用 `assistant_messages` 保留服务端 messageId、step_number、first/last_sequence、content、state 和 content_committed；可选 `phase` 仅接受供应商明确的 `commentary/final_answer`。`final_message_id` 指向单段终稿，多段终稿使用有序 `final_message_ids`，别名全部可解析时不再重复渲染聚合 `final_response`。步骤仅作为 legacy 投影。同一步多条正文不共用一个身份，failover 旧段标 interrupted，替代关系未知时不推断 superseded。
+- 历史的 transcript_coverage 和 status 以同次事件扫描为准；快照必须覆盖同消息的已提交 END 才能替换旧 live-only 尾段。新主正文增量采用提交后发布，显式 isAggregate=false；重连按 sequence 去重。思考和工具参数仍保留旧 END 聚合语义。
+- 保证已提交并发布的主正文在消息 END 前进程退出后仍可回放；不保证模型尚未返回、数据库提交失败或旧协议未提交的内存尾段。
 
-补充约束：
-- 仅 `cancelled` 状态套用 sentinel 隐藏规则；正常完成态即使正文恰好等于 `"Cancelled"` 也必须原样展示，不得隐藏。
-- 取消态不显示复制按钮：`canCopyAssistantContent = status === 'completed' && !!final_response`。
-- 回退取正文时，step 级 `assistant_content` 同样按 sentinel 规则过滤占位串。
+#### 3.5.2 文件打开意图
+
+用户附件和助手文件的上层异步打开共用一个请求世代。新打开、关闭文件面板、切换会话/工作区目标及卸载使旧世代失效；成功、异常回退都须校验世代和会话归属后才能写 target、提示或重新开面板。关闭态发起的新打开仍然有效。失效只针对展示意图，不取消 `saveDirty` 或 Workspace 草稿保存。
 
 ### 3.6 Human-in-the-Loop 暂停与恢复
 
@@ -228,7 +223,11 @@ pre_accept_pending
   - 以原 `round_id` 恢复/绑定 runtime run，`agentState.status='waiting'`；
   - 渲染 `QuestionCard` 或工具审批卡；
   - 从 `last_event_sequence` 继续订阅同一 Round，等待其他标签页的动作。
-- waiting 时普通发送必须禁用。卡片不得提供“只在本地隐藏”的 X；用户只能回答/审批，或点击 Stop 取消整个 Round，避免进入既不能回答也不能发送的死角。
+- waiting 时普通发送必须禁用。卡片不得提供“只在本地隐藏”的 X；回答/审批继续复用同一 Round。
+- `ask_user` 等待回答（`input_required`）时，聊天页不提供本轮的停止、取消或问答关闭入口；用户通过回答或跳过并提交继续原 Round。提交启动后恢复普通输入区及执行中的停止按钮。该约定仅限问答等待界面，工具审批等待、后端 abort 能力及跨端终态同步沿用原契约。
+- `QuestionCard` 按 interaction ID 隔离答案状态，在组件入口解析原始题目数据，翻页、选项判断与提交共用解析结果。已保存题目若缺少有效选项，保留原题文并提示直接输入，不把题目顶层的 `label/description` 猜成选项；缺少题文时仅在卡片内报错，不能让整个聊天页崩溃。前后翻页保留选择和输入，提交仍以原题文作为答案键；新请求由后端按完整工具 schema 校验。
+- 单选使用圆圈与选中圆点，多选使用方框与勾选，并按题目定义显示“单选/可多选”；页码显示 `1 / N`。普通页使用“跳过”，最后一页使用“跳过并提交”，两者均把本题记为无偏好。
+- 问答卡独占当前输入区，普通输入框、附件和模型控件保持挂载并隐藏，草稿不变；不以负 margin 叠压输入框。卡片使用轻阴影，题目区可滚动、翻页和提交区常驻，卡片下方不附加提示或停止入口。提交启动后立即隐藏卡片并恢复普通输入区，运行摘要显示“正在继续”；后端确认前沿用该 waiting Round 的 interrupt 隐藏保留原答案，提交失败恢复问题时可继续编辑，不把恢复等待留在禁用卡片上。textarea 隐藏时不测量高度，恢复可见时重新计算，避免文字被裁切。文件全屏与子任务视图沿用原隐藏和焦点归属。
 - 提交回答时复用原 client run key 与 server `round_id`，不追加 optimistic child Round。收到 `interaction_resolved` 后清卡、把同一 Round 改回 `running` 并继续消费事件。
 - resume transport 已消费 durable terminal 后，即使 reader 在 clean EOF 前再次报错，也必须成功 settle，保留 terminal、禁止回拉旧 waiting 快照。若显式收到 `interaction_resolved`，或在漏收该事件后由权威 history 确认同一 Round 已是 `running`，都表示 continuation 已不可逆启动；后续 history 连续失败，或返回与本次 resume 相同 `interaction_id` 的陈旧 waiting 快照时，都必须保持 running 并从最新 cursor 续订，不得恢复 resume 前捕获的问题卡。只有不同 `interaction_id` 的后续 `interaction_requested` 可以再次进入 waiting。
 - HTTP 200 / 本地 `stream_accepted` 只是传输接受，不是 continuation 边界。若在 `interaction_resolved` 前收到 `NO_PENDING_INTERRUPT`、`RESUME_CONFLICT`、`INVALID_INTERACTION_RESPONSE`、`AGENT_INIT_FAILED` 等 `RUN_ERROR`，不得将原 Round 置 `failed`；应立即回拉 history，并按 waiting / running / 终态权威恢复。
@@ -314,9 +313,12 @@ pre_accept_pending
 | 搜索命中进入 | `scrollTarget` 指向当前 session/round | 管理器平滑定位目标 round 中部并短暂高亮；不得先滚到底部 |
 | 流式新内容 | 正文渲染或几何尺寸变化 | 跟随底部时直接保持末尾；阅读模式保持同一可见字符，不反复启动平滑动画追赶 token |
 | 用户滚动 | 用户造成的 `scroll` 事件 | 以统一 2px 容差识别是否回到底部，否则捕获文字阅读锚点；程序恢复/平滑定位中间帧不改写用户意图 |
-| 底部按钮 | 用户离开底部 | 点击后平滑滚到底；若有回复正在生成，按钮显示 live reply 指示 |
+| 发送新问题 | Enter 或发送按钮通过本地发送校验 | 立即将阅读意图切为跟随底部，展示准备中/新一轮后继续跟随；不等待网络响应。Shift+Enter、输入法确认或未通过校验不触发 |
+| 底部按钮 | 当前实际距底部超过 2px | 点击后平滑滚到底；若有回复正在生成，按钮显示 live reply 指示；实际到达底部或内容不足一屏时隐藏 |
 
 “回到最新消息”按钮由聊天 pane 内、消息滚动区之后的输入区上沿承载，水平居中并浮在消息区底端；常态显示文字与向下箭头，生成中保留“新回复正在生成”提示。定位随聊天分栏宽度与输入区高度自然变化，禁止使用相对 viewport 的 fixed/right/bottom 偏移；不得落入 Session/Workspace 文件面板，聊天隐藏时随其一起隐藏。
+
+按钮显隐依据当前 `scrollHeight - scrollTop - clientHeight`，不直接使用阅读/跟随意图。工具收起导致内容不足一屏时隐藏按钮，但保留阅读锚点；重新展开仍恢复原阅读位置，不把布局造成的到底误记为用户主动跟随。
 
 `useChatReadingPosition` 是聊天容器唯一滚动写入者，统一管理首次进入、显式定位、流式跟随、文件布局恢复及 ResizeObserver 通知。容器关闭浏览器原生 overflow anchoring，避免双重补偿；用户 wheel/pointer/键盘输入可中止程序平滑定位。位置恢复不使用 timeout 或多帧猜测布局稳定。full 的隐藏阅读书签按 Session 隔离，具体语义见 Session 文件 spec。平滑定位尊重 prefers-reduced-motion。
 
@@ -337,47 +339,40 @@ pre_accept_pending
 
 ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session，由用户在「日程管理」一级页的「执行记录」中查看（见 frontend-panel-spec §6）。
 
-## 7. 推理面板（ReasoningPanel）
+## 7. 行内执行过程
 
-### 7.1 数据转换
+过程与最终答案共享聊天正文列，文件面板保留原有 owner 与布局。ReasoningPanel 仅提供工具详情。
 
-`transformToDisplayBlocks(steps: StepData[]): DisplayBlock[]`
+- 助手回复顶部保留原头像与“助手 · 模型名称”，名称取本轮 `model_display_name` 快照，缺失时仅显示“助手”；底部不重复模型名。
+- 明确的 `commentary` 归入过程；收到原生 `final_answer` START 即收起过程并显示“正在回答”，所有有效正式答复段落留在外面，但不改变 Run 终态或停止按钮。未知 phase 不按长度、关键词推断；仍沿用活动尾段与终态别名规则。明确 `PRESENTED` 文件引用通过 `tool_call_id` 匹配 `present_files` 时，其同一步交付正文也留在过程外，防止主体简报被后续补充遮住；其他文件操作不能作为此依据。
+- 运行期间默认展示最新一段未中断的普通 `content` 进展，以及其后最新步骤的工具组；较早仍在运行的工具继续可见，较早已结束或结果未知的工具归入此前过程。无进展正文时显示最新工具组。顺序依据现有消息/工具身份，不按文本长短或关键词猜测。正文不截断为标题、不套单段折叠；`reasoning_content/thinking` 不进入正文或主复制，模型没有生成 content 时不补写。
+- 思考预览仅出现在状态栏：Round为running、run为streaming且当前thinking segment开放并有文本时，显示静态原子图标、“思考中”和最新单行片段；以100ms固定节奏采样最新180个字符，轻微过渡并遵守reduced-motion，不按字逐个排队播放、不从历史thinking补播。预览不向读屏器逐token播报，也不成为正文阅读锚点。没有有效片段时使用转圈“运行中”；停止、等待交互、终态或原生正式答复优先。普通正文segment已开放且有内容时也先隐藏旧思考预览，不改变其后台生命周期。
+- STEP边界只清空当前thinking指针，保留恢复所需buffer；无timestamp的END仍结束预览，旧ID的迟到END不得关闭新片段。“思考中”和“运行中”都是同一running任务的展示状态，不影响取消、准入或终态。点击状态栏仍是原有过程展开入口。
+- 工具详情默认折叠；完成后整个过程默认收为“处理了 X 秒”，最终答案留在外面。耗时使用 RUN_STARTED/终态时间戳，缺失时显示“处理过程”，不把并行工具耗时相加。
+- “运行中”等状态摘要是唯一的过程展开入口：点击完整展开，再次点击回到最新进展，不额外显示“查看此前过程”按钮。手动回看状态跨新消息/步骤保持，不因新进展自动关闭；展开前由唯一滚动管理器 `beginReading` 固定当前阅读锚点，即使原来位于底部也不自动追随追加内容。所有历史仍保留，不删除、重排消息或改变复制范围。
+- 收起的运行预览预留 `clamp(160px, 32vh, 240px)` 高度，工具数量变化时在区域内滚动，不推挤下方布局；新工具组从预览顶部开始，同组更新保持位置。只有流式正文时允许自然增高，展开完整过程、确认正式答复或文件交付时解除预留限制，避免裁切长答案。此处仅管理局部工具区滚动，外部聊天滚动仍归统一阅读管理器。
+- 顶部状态与工具行主图标复用 ActivityIcon（16px、线宽1.75），主箭头14px，主文字统一14px/24px；运行/结束只切图形与状态，不切尺寸。命令代码13px、网站专用20px外圈保留。
+- 原生正式答复 START 或进入终态时统一收起过程；运行中手动展开、工具焦点、上滚或旧搜索均不阻止这次收起。完成后允许再次展开，刷新历史默认收起；运行态刷新则恢复最新进展视图。主过程不持久化运行期展开偏好，工具二级详情仍可按用户+Round+工具身份保存 sessionStorage 偏好，不保存文本。
+- 搜索 nonce 在目标正文存在时消费一次（包括已可见的活动尾段），必要时展开过程；旧搜索不在完成后再次触发。过程收起时，位于隐藏工具内的焦点回到摘要按钮；已移除正文的阅读锚点按消息身份映射到本轮摘要，由 useChatReadingPosition 继续单独负责滚动。
+- 对没有原生 phase 的消息，RUN_FINISHED 前无法证明流式文本属于终稿。最新未知 phase 正文按当前进展保留可见，直到后续进展替换；这不赋予其正式答复或主复制资格。终态仍使用明确终稿别名，缺少可靠终稿时保留已有有效正文。
+- 最终消息使用同一父列表和稳定 key；Markdown 渲染器在正文增量更新时保持类型稳定。语义阅读锚点沿用 `useChatReadingPosition`，不增加第二个滚动写入者。文件卡片独立可见；最终展示与主复制共用 `answerNodes`，收起或展开的进展均不进入主复制。
+- 工具结果统一投影为 `success: true | false | null`：事件/历史顶层布尔 `success` 优先，其次顶层布尔 `isError` 反转，再读取旧 `content` JSON 对象中的布尔 `success/isError`；缺字段一律为 `null`，绝不因收到结果、`error` 存在或缺少、关键词推断成败。结构化 error 与原始 content 仅作为展示上下文保留。工具状态只依据该真实结果：成功为 completed，明确失败为 failed；终态缺失结果为 unknown，不显示“完成”。工具失败只在所属工具或子任务入口表达，不生成顶部“有工具执行失败”汇总提示。命令工具折叠为状态＋实际 command/cmd 单行预览，超长省略；仅预览压缩空白，详情与复制保留原文。展开使用一个 Shell 小框，命令、输出、独立错误均直接可见，取消输出的二次折叠；内部最高220px并可键盘滚动，含顶栏整框约260px。命令、输出可分别复制，失败允许重试；没有命令的输出读取/进程停止操作保留其动作名及原参数。MCP、网站和普通正文代码块沿用各自的展示。
+- MCP 工具通过 START 的 `toolDisplay` 与 history 的 `tool_display` 保存调用时身份，折叠显示 `server_name · (tool_title || tool_name || toolCallName)`；展开显示完整调用标识和不同的原工具名、参数与输出。身份不从参数/结果或当前目录推断；旧记录只有模型名时原样显示，不统一退成“调用工具”。已收到的身份按 toolCallId 在同轮恢复合并中保留，权威历史有快照时优先使用历史。
+- `glm_search/glm_batch_search` 使用专用网站行：按工具结果的结构化文本头解析 HTTP(S) 来源，按 hostname 去重后显示“已搜索 N 个网站”；展开显示域名胶囊与真实目标链接，搜索详情二次展开。图标来自工具返回的 siteIcon，缺失/加载失败用本地通用图标，不向额外图标服务发送域名。部分失败保留已获得的来源并明确标注，未确认与零结果分开。
+- 消息、输入框、错误和交互卡共用 `.chat-column`（最大宽度 860px，含统一的 16px / 桌面 32px 左右内边距），消息区域与输入卡外边缘对齐。以用户栏现有位置与间距为基准：两边头像均为 28px，头像与内容列间距 12px；助手标题、处理状态、正文、文件和复制按钮统一放入右侧内容列，与用户标题、正文和附件左对齐。用户保留“你”标签和左对齐时间，正文不使用气泡底色，每轮助手顶部展示一次头像与身份，分段正文不重复标题。正文沿用主题的 15px / 1.7，工具与状态 14px，代码 13px；不在行内消息上重复覆盖字号。相邻可见过程行保留18px留白，连续命令行收紧至8px；隐藏行不占间距，正文首尾margin归零。表格只保留外层间距和横向分隔线，内部table margin为0，引用不叠加上下padding。按钮有键盘焦点、aria-expanded，窄屏胶囊换行，动画尊重reduced-motion。
+- 用户附件排在正文上方；本地文件、工作区文件与文件夹和 Skill/数据资源共用紧凑单行标签样式（42px 高、14px 字号、24px 图标区），前置文件类型图标，图片在图标区显示认证缩略图。名称超长省略，完整名称、类型与文件大小放在悬停提示，多附件按可用宽度换行。旧文本附件沿用同尺寸但不补造预览身份。正文与附件各自换行，纯附件不绘制空正文；文件点击仍传原身份与索引。
 
-- `ThinkingBlock`：连续 `type === 'thinking'` 合并。
-- `ToolGroupBlock`：连续工具调用合并（**跨 step**），但新的 `ThinkingBlock` 必须切断上一组工具调用；即使同一个 step 同时包含 thinking 与新的 tool_call，也不得把该 tool_call 合并进 thinking 之前的工具组。
-- `NarrativeBlock`：其他文本步骤。若流式正文与工具调用暂时落在同一个 step，前端也必须先结束当前 ToolGroupBlock，再按 NarrativeBlock 处理正文，避免正文到达后仍显示工具结果处理中。
+### 子任务入口与独立详情
 
-### 7.2 工具描述
+- 相邻 `sub_agent` 调用显示为紧凑任务组：单个与多个都保留同样的数量汇总、行高、字号和间距；展示真实标题、准备中/进行中/已完成/失败/已停止状态，完成数只按带 child 的 graph `status=completed` 计。父 `subagent_run_updated` 事件与 history 的 `subagent_tasks` 提供 `tool_call_id → child_run_id` 关联；不再从工具输出字符串猜身份。graph 已有 task 时其 status 是唯一 child 生命周期来源，`requested/running` 不得被工具启动成功覆盖。无 child 时，明确启动失败显示“启动失败”，明确启动成功显示“已发起，等待状态同步”，旧记录或不可靠结果显示“状态未知”；均不伪造 child。任务行本身是唯一入口：无 child 点击该行展开调用结果，有 child 点击该行进入独立详情；不得在行下增加“失败原因”或“调用结果”第二按钮。已确认的启动失败只显示简短原因，已有带堆栈的失败记录只取错误首行作为展示摘要，不用于状态推断；未知旧记录仍保留原始结果。
+- 点击后在当前聊天区域进入只读子任务详情，不增加右侧活动栏或新会话。父聊天DOM与输入框保持挂载并隐藏，草稿、模型选择、附件归属保持；子任务使用单Round snapshot＋按该Round订阅，独立reducer，不能进入主ChatRuntimeProvider消息列表。
+- 主history继续排除child。子订阅断线只读取对应Round snapshot；停止观察/返回/切换会话中止本地请求，不调用abortChat、不停止子任务。迟到快照与事件按视图身份和epoch拒绝。任务终态不被旧requested/running事件回退，非空child ID不被旧null清除。
+- 顶部提供“返回主对话/返回上级子任务”与任务名，任务说明放次级details；正文、工具和最终复制复用现有Round展示，隐藏内部委派用户消息。每层阅读管理器拥有独立child身份，上层视图保持挂载；返回恢复原锚点及可见入口焦点，主任务完成不强制离开子视图。
+- 子任务只复制自己的最终答复，主任务仍只复制主助手最终汇总。文件引用沿原预览接口、删除过滤和打开意图世代；切换父子视图使旧迟到打开意图失效，不取消保存。
 
-`getToolDescription(tool_name, tool_args)`：
+### 搜索定位
 
-| 工具 | 模板 | 截断策略 |
-|---|---|---|
-| `read_file` | `Read {path}` | Keep-Head |
-| `apply_patch` | `Update {path}` / `Update N files` | 从 Patch 头提取路径，历史旧工具继续兼容 |
-| `present_files` | `Present {path}` / `Present N files` | 只展示显式交付路径 |
-| `bash` | `Run \`{cmd}\`` | Keep-Head |
-| `search_*` | `Search "{query}"` | Keep-Head |
-| `sub_agent` | `委派子任务 {description 或 prompt 首行}` | Keep-Head |
-| 其他 | `{tool_name}` | — |
-
-### 7.3 分组摘要
-
-`getGroupSummary(group: ToolGroupBlock)`：
-- 完成态按真实工具语义聚合：`apply_patch` 使用 `Updated {path}` / `Updated N files`，`present_files` 使用 `Presented {path}` / `Presented N files`；历史 `edit_file` 继续使用 `Edited`，不得把 `present_files` 降级显示为 `Used a tool`
-- 其他示例：`Edited 2 files, Read a file`
-- 运行态：`Reading src/app.py...`（Typewriter Preview）
-
-### 7.4 活动入口与抽屉
-
-- ThinkingBlock / ThinkingGroupBlock：在单个 round 内聚合为一个思考入口，不按 step 或工具分隔重复渲染多个入口。
-  - 进行中：渲染醒目的 `正在思考` 卡片，显示实时耗时、当前最新 thinking 的最多 3 行滚动预览与 `查看活动` 入口；完整内容保留在活动抽屉。预览默认每 3 个动画帧跟随末尾，用户滚离底部后必须暂停自动跟随，回到底部后恢复；末尾用流式闪烁点表示仍在生成。
-  - 完成态：渲染紧凑的 `已完成思考` 胶囊，显示整轮思考总耗时。
-  - 点击 `查看活动` 或完成态胶囊后打开右侧活动抽屉；不得在主聊天区展开 thinking 详情。
-- 活动抽屉与全屏遮罩必须通过 React Portal 直接挂到 `document.body`，不得作为 Round/消息/聊天滚动容器的后代；遮罩和抽屉在垂直方向各 overscan 4px（`-inset-y-1` / `-top-1 -bottom-1`），覆盖 in-app viewport 的顶部偏移，避免出现横向白缝。
-- ToolGroupBlock：完成态不在主聊天区直接渲染；工具摘要、工具项、输入输出、`✓ Done` 标记均在活动抽屉内展示。若 round 没有 thinking 但存在已完成工具活动，主聊天区渲染紧凑的 `已完成活动` 入口，仅用于打开活动抽屉。只有 round 仍处于 streaming 时，最新 ToolGroupBlock 的未返回工具结果才可视为运行中；若最新 ToolGroupBlock 仍在运行且没有正在流式的 thinking，主聊天区必须显示 `正在调用工具` 活动态卡片和工具摘要。终态 round 中缺少 tool_result 的工具调用不得显示 `正在调用工具`。若工具已返回但 round 仍处于 streaming，且下一段 thinking/正文尚未到达，主聊天区必须显示 `正在处理工具结果` 活动态卡片，避免 think/tool 与下一段 think 之间的空窗期看起来已经完成。
-- ToolItem：在活动抽屉内 hover 显示展开箭头，点击查看工具入参/结果。
-- `sub_agent` ToolItem 必须使用专用子任务胶囊展示：折叠态保持单行，仅显示 `委派子任务`、业务标题、`subagent_type` 与耗时；不得默认展开原始 JSON 入参。点击展开后展示任务 prompt、子任务输出/错误与可选 child run id，便于理解长耗时委派执行。child run id 等父子 run 元数据应优先来自结构化 metadata 或 `subagent_runs` 查询；从 `TOOL_CALL_RESULT.content` 文本中解析仅允许作为当前兼容兜底。
+搜索从同一持久化 AssistantMessageProjection 匹配完整消息，允许关键词跨 CONTENT 增量。排除其他用户、subagent 子运行、系统/错误文本；legacy 保持旧助手消息/终稿降级。返回 `match_round_id + match_message_id`，前端先恢复历史并展开目标过程，待目标 DOM 可见后定位到对应正文。阅读管理器在内容、布局与 ResizeObserver 通知中优先完成待定位目标，可见前不消费 nonce 或恢复到底部；新目标可替换旧平滑定位，完成后同一 nonce 不再抢回用户滚动。无 messageId 的旧结果沿用轮次定位；不按模型文本猜身份。
 
 ## 8. 附件上传
 
@@ -405,8 +400,8 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 ## 10. 测试清单
 
 - [ ] 切换会话时旧 SSE 事件不污染新会话（mock 迟到事件）
-- [ ] 取消后 UI 显示"已取消"而非"错误"
-- [ ] 取消成功后无需等待 SSE，即刻恢复输入并允许重发
+- [ ] 取消权威确认后 UI 显示“已停止”，确认失败与执行错误分开
+- [ ] 确认目标终态与准入释放后无需等待 SSE 即可发送；确认前仅允许编辑输入
 - [ ] 取消成功返回 `outcome_warning`：取消状态不变，聊天页不展示重复的副作用提示
 - [ ] ask_user / 工具审批暂停：刷新页面后同一 waiting Round 的卡片正常显示且继续订阅
 - [ ] 另一个标签页回答或取消 waiting Round，本页通过 subscribe 收到 resolved、后续输出或终态，无需刷新
@@ -417,9 +412,10 @@ ChatV2 不做定时轮询。Cron 任务执行结果**不**注入聊天 Session�
 - [ ] resume 已 resolved 后 history 返回相同 `interaction_id` 的 waiting 快照：视为陈旧状态且不复活旧卡；不同 ID 的新 Interaction 仍可进入 waiting
 - [ ] 陈旧标签页发送消息收到 `INTERACTION_PENDING`：恢复未受理草稿、waiting 卡片与订阅
 - [ ] 收到下一次 `interaction_requested` 后立刻断网且 history 失败：新卡片仍保留，不被 RUN_ERROR 覆盖
-- [ ] waiting subscribe 已安排 retry 时点击 Stop：旧 timer 不再建连，慢 abort 期间 UI 不回跳 waiting
+- [ ] 工具审批 waiting subscribe 已安排 retry 时点击 Stop：旧 timer 不再建连，慢 abort 期间 UI 不回跳 waiting
 - [ ] equal 或 unrelated higher cursor history 不覆盖尚未 END 的 text / thinking / tool args dirty segment；只有逐 segment 匹配的 server projection / aggregate 才可权威替换并推进 cursor
-- [ ] waiting 卡片无纯本地关闭入口；回答与 Stop 均可离开等待态
+- [ ] ask_user 等待时无停止、取消或关闭入口；回答或跳过并提交后恢复普通输入区及执行中的停止按钮
+- [ ] 工具审批等待时无纯本地关闭入口；审批与 Stop 均可离开等待态
 - [ ] SSE 断连后自动恢复（history API 查询终态，running/waiting 续订）
 - [ ] 幂等冲突自动切 subscribe
 - [ ] 普通进入长会话时定位到底部；A 滚到中间 → 切 B → 切回 A，A 仍定位到底部

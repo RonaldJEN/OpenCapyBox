@@ -11,9 +11,9 @@ import {
 } from 'react';
 
 import { apiService } from '../services/api';
+import { roundRenderKey } from '../transcript/projectRoundTranscript';
 import {
   AttachmentInfo,
-  AskUserQuestion,
   ChatFile,
   ComposerAttachment,
   ChatContentBlock,
@@ -22,6 +22,7 @@ import {
   PreferredMcpConnectionSnapshot,
   PendingFileDraftInfo,
   RoundData,
+  SubagentTask,
   ToolApprovalPayload,
   TurnReasoningSelection,
 } from '../types';
@@ -55,6 +56,7 @@ import {
   messageTooLongText,
 } from '../utils/errorMessages';
 import { Round } from './Round';
+import { SubagentDetailView } from './SubagentDetailView';
 import { useChatReadingPosition } from './useChatReadingPosition';
 import { ArtifactsPanel, type ArtifactsPanelHandle } from './ArtifactsPanel';
 import { type SessionFileOwnerIdentity } from './FilePreview';
@@ -216,6 +218,7 @@ interface ChatV2Props {
   scrollTarget?: {
     sessionId: string;
     roundId: string;
+    messageId?: string;
     nonce: number;
   } | null;
 }
@@ -268,6 +271,11 @@ function ChatV2View(props: ChatV2Props) {
   const sending = projection.sending;
   const resuming = projection.resuming;
   const pendingInterrupt = projection.pendingInterrupt;
+  const questionInterruptCandidate = pendingInterrupt
+    ?? (resuming ? rounds.find((round) => round.status === 'waiting_interaction')?.interrupt : null);
+  const questionInterrupt = questionInterruptCandidate?.reason === 'input_required'
+    && questionInterruptCandidate.payload?.questions ? questionInterruptCandidate : null;
+  const showQuestionComposer = Boolean(questionInterrupt) && !resuming;
   const waitingInteraction = rounds.some((round) => round.status === 'waiting_interaction');
   const runtimeError = projection.error;
   const hasLocalActiveTransport = projection.activeRunKeys.some((runKey) => {
@@ -277,6 +285,10 @@ function ChatV2View(props: ChatV2Props) {
 
   const [disableInitialMotion, setDisableInitialMotion] = useState(false);
   const [highlightedRoundId, setHighlightedRoundId] = useState<string | null>(null);
+  const [subtaskNavigation, setSubtaskNavigation] = useState<{ sessionId: string; path: Array<{ task: SubagentTask; returnFocus: HTMLElement | null }> }>({ sessionId, path: [] });
+  const subtaskFrames = subtaskNavigation.sessionId === sessionId ? subtaskNavigation.path : [];
+  const viewingSubtask = subtaskFrames.length > 0;
+  const returningSubtaskFocus = useRef<HTMLElement | null>(null);
   const initialDraftKey = sessionId || NEW_SESSION_DRAFT_KEY;
   const [composerDrafts, setComposerDrafts] = useState<ComposerDraftState>(() => ({
     messageDrafts: { [initialDraftKey]: createMessageDraft() },
@@ -300,11 +312,14 @@ function ChatV2View(props: ChatV2Props) {
     round: RoundData;
   }>>({});
   const [isDragging, setIsDragging] = useState(false);
-  const [stopping, setStopping] = useState(false);
+  const stopping = projection.stopping || false;
+  const cancellationPending = Object.values(runtime.state.runs).some((run) => run.ownerSessionId === sessionId && run.cancelRequest === 'pending');
 
   const messagesContentRef = useRef<HTMLDivElement>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const chatPaneRef = useRef<HTMLDivElement>(null);
+  const questionComposerRef = useRef<HTMLElement>(null);
+  const previousQuestionViewRef = useRef<{ sessionId: string; id: string | null }>({ sessionId, id: null });
   const sessionFilesShellRef = useRef<HTMLDivElement>(null);
   const sessionFilesPaneRef = useRef<HTMLElement>(null);
   const sessionFilesHandleRef = useRef<ArtifactsPanelHandle | null>(null);
@@ -326,8 +341,9 @@ function ChatV2View(props: ChatV2Props) {
   const focusBeforeFilesRef = useRef<Record<string, HTMLElement | null>>({});
   const previousFilesStateRef = useRef({ sessionId, isOpen: false });
   const filePanelTargetNonceRef = useRef(0);
-  const attachmentPreviewRequestIdRef = useRef(0);
-  const assistantFileOpenRequestIdRef = useRef(0);
+  // All upper-level entry points share one display intent, independent of file saves.
+  const previewOpenRequestIdRef = useRef(0);
+  useLayoutEffect(() => () => { previewOpenRequestIdRef.current += 1; }, [sessionId, workspaceFileTarget?.entry_id]);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const sessionIdRef = useRef(sessionId);
   const composerDraftsRef = useRef(composerDrafts);
@@ -336,6 +352,7 @@ function ChatV2View(props: ChatV2Props) {
   const activeUploadsRef = useRef(0);
   const previewUrlsRef = useRef(new Set<string>());
   const handledScrollTargetNonceRef = useRef<number | null>(null);
+  const searchLoadNonceRef = useRef<number | null>(null);
   const pendingSendSessionKeysRef = useRef<Set<string>>(new Set());
   const resumeSaveBarrierPendingRef = useRef(false);
   const currentDraftKey = sessionId || NEW_SESSION_DRAFT_KEY;
@@ -381,11 +398,40 @@ function ChatV2View(props: ChatV2Props) {
   const chatInteractionHidden = isFilesExpanded;
   const reading = useChatReadingPosition({
     sessionId, containerRef: chatAreaRef, contentRef: messagesContentRef,
-    hidden: chatInteractionHidden, loading: loading && !preparingSubmission, hasContent: visibleRounds.length > 0,
+    hidden: chatInteractionHidden || viewingSubtask, loading: loading && !preparingSubmission, hasContent: visibleRounds.length > 0,
     layoutKey: `${workspacePanelActive ? 'workspace' : 'session'}:${filesLayout}:${chatRatio}`,
     contentVersion: visibleRounds, scrollTarget,
   });
   const { showScrollButton, scrollToBottom } = reading;
+  const openSubtask = (task: SubagentTask) => {
+    if (!task.child_run_id) return;
+    previewOpenRequestIdRef.current += 1;
+    reading.beginReading();
+    const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setIsDragging(false);
+    setSubtaskNavigation(current => {
+      const path = current.sessionId === sessionId ? current.path : [];
+      if (path.some(frame => frame.task.child_run_id === task.child_run_id)) return current;
+      return { sessionId, path: [...path, { task, returnFocus }] };
+    });
+  };
+  const closeSubtask = () => {
+    previewOpenRequestIdRef.current += 1;
+    returningSubtaskFocus.current = subtaskFrames[subtaskFrames.length - 1]?.returnFocus || null;
+    setSubtaskNavigation(current => ({ sessionId, path: current.sessionId === sessionId ? current.path.slice(0, -1) : [] }));
+  };
+  useLayoutEffect(() => {
+    setSubtaskNavigation(current => current.sessionId === sessionId ? current : { sessionId, path: [] });
+    returningSubtaskFocus.current = null;
+  }, [sessionId]);
+  useLayoutEffect(() => {
+    const target = returningSubtaskFocus.current;
+    if (!target || chatInteractionHidden) return;
+    returningSubtaskFocus.current = null;
+    const destination = target.isConnected && target.getClientRects().length > 0 ? target
+      : Array.from(chatPaneRef.current?.querySelectorAll<HTMLElement>('[data-process-summary], .chat-subtask-back') || []).find(element => element.getClientRects().length > 0);
+    destination?.focus({ preventScroll: true });
+  }, [subtaskFrames.length, chatInteractionHidden]);
   const lastRoundStatus = rounds[rounds.length - 1]?.status || 'empty';
   const filesRefreshNonce = `${rounds.length}:${lastRoundStatus}:${Number(sending)}:${Number(resuming)}`;
   const activeSlotSessionIdsRef = useRef(activeSlotSessionIds);
@@ -441,7 +487,7 @@ function ChatV2View(props: ChatV2Props) {
     return () => onFilesFullChange?.(false);
   }, [chatInteractionHidden, onFilesFullChange]);
 
-  const updateCurrentFilesState = (
+  const updateCurrentFilesState = useCallback((
     updater: (current: SessionFilesViewState) => SessionFilesViewState,
   ) => {
     if (!sessionId) return;
@@ -450,10 +496,11 @@ function ChatV2View(props: ChatV2Props) {
       const next = updater(current);
       return next === current ? previous : { ...previous, [sessionId]: next };
     });
-  };
+  }, [defaultChatRatio, sessionId]);
 
-  const setCurrentFilesLayout = (layout: SessionFilesLayout) => {
-    if (layout !== filesLayout) reading.beforeLayoutChange();
+  const beforeFilesLayoutChange = reading.beforeLayoutChange;
+  const setCurrentFilesLayout = useCallback((layout: SessionFilesLayout) => {
+    if (layout !== filesLayout) beforeFilesLayoutChange();
     if (workspacePanelActive) {
       setWorkspaceFilesState((current) => current.layout === layout ? current : { ...current, layout });
       return;
@@ -462,7 +509,7 @@ function ChatV2View(props: ChatV2Props) {
       if (current.layout === layout) return current;
       return { ...current, layout };
     });
-  };
+  }, [filesLayout, beforeFilesLayoutChange, updateCurrentFilesState, workspacePanelActive]);
 
   const saveWorkspaceFilesInBackground = () => {
     const workspaceHandle = workspaceFilesHandleRef.current;
@@ -540,6 +587,7 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const closeFilesPanel = () => {
+    previewOpenRequestIdRef.current += 1;
     if (workspacePanelActive) {
       reading.beforeLayoutChange();
       saveWorkspaceFilesInBackground();
@@ -557,6 +605,13 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   useLayoutEffect(() => {
+    const pane = chatPaneRef.current;
+    if (!pane) return;
+    if (chatInteractionHidden) pane.setAttribute('inert', '');
+    else pane.removeAttribute('inert');
+  }, [chatInteractionHidden]);
+
+  useLayoutEffect(() => {
     const previous = previousFilesStateRef.current;
     if (
       previous.sessionId === sessionId
@@ -572,13 +627,6 @@ function ChatV2View(props: ChatV2Props) {
     }
     previousFilesStateRef.current = { sessionId, isOpen: isFilesOpen };
   }, [isFilesOpen, sessionId]);
-
-  useLayoutEffect(() => {
-    const pane = chatPaneRef.current;
-    if (!pane) return;
-    if (chatInteractionHidden) pane.setAttribute('inert', '');
-    else pane.removeAttribute('inert');
-  }, [chatInteractionHidden]);
 
   const handleFilesRatioChange = (ratio: number) => {
     reading.beforeLayoutChange();
@@ -813,7 +861,6 @@ function ChatV2View(props: ChatV2Props) {
     setFilePanelTarget(null);
     setPreviewContextNotice('');
     setLocalError('');
-    setStopping(false);
     void loadSessionHistory(sessionId, {
       hasActiveSlot,
       isActiveSlotCurrent: () => (
@@ -851,14 +898,25 @@ function ChatV2View(props: ChatV2Props) {
   useEffect(() => {
     if (!scrollTarget || scrollTarget.sessionId !== sessionId || loading) return;
     if (handledScrollTargetNonceRef.current === scrollTarget.nonce) return;
-    if (!rounds.some((round) => round.round_id === scrollTarget.roundId)) return;
-    handledScrollTargetNonceRef.current = scrollTarget.nonce;
-    setHighlightedRoundId(scrollTarget.roundId);
-    const timer = setTimeout(() => {
-      setHighlightedRoundId((current) => (current === scrollTarget.roundId ? null : current));
-    }, 1800);
+    const target = rounds.find((round) => round.round_id === scrollTarget.roundId);
+    if (!target || (scrollTarget.messageId && !target.assistant_messages?.some((message) => message.message_id === scrollTarget.messageId))) {
+      if (searchLoadNonceRef.current !== scrollTarget.nonce) {
+        searchLoadNonceRef.current = scrollTarget.nonce;
+        void loadSessionHistory(sessionId);
+      }
+      return;
+    }
+    if (filesLayout === 'full') setCurrentFilesLayout('split');
+      handledScrollTargetNonceRef.current = scrollTarget.nonce;
+      setSubtaskNavigation({ sessionId, path: [] });
+      setHighlightedRoundId(scrollTarget.roundId);
+  }, [scrollTarget, sessionId, loading, rounds, loadSessionHistory, filesLayout, setCurrentFilesLayout]);
+
+  useEffect(() => {
+    if (!highlightedRoundId) return;
+    const timer = setTimeout(() => setHighlightedRoundId(null), 1800);
     return () => clearTimeout(timer);
-  }, [scrollTarget, sessionId, loading, rounds]);
+  }, [highlightedRoundId]);
 
   // Network completion only patches the exact local file that started it.
   const drainUploadQueue = () => {
@@ -1014,7 +1072,7 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const previewSessionAttachment = async (file: AttachmentInfo | FileInfo) => {
-    const requestId = ++attachmentPreviewRequestIdRef.current;
+    const requestId = ++previewOpenRequestIdRef.current;
     const targetSessionId = file.session_id || sessionId;
     if (!targetSessionId) {
       return;
@@ -1036,7 +1094,7 @@ function ChatV2View(props: ChatV2Props) {
         console.warn('Failed to hydrate file metadata for preview:', err);
       }
     }
-    if (requestId !== attachmentPreviewRequestIdRef.current) return;
+    if (requestId !== previewOpenRequestIdRef.current || sessionIdRef.current !== sessionId) return;
     if (normalizedFile.is_directory) {
       void handleOpenAssistantFile(normalizedFile);
       return;
@@ -1056,6 +1114,7 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handlePreviewDraftAttachment = async (file: AttachmentInfo | FileInfo) => {
+    previewOpenRequestIdRef.current += 1;
     if ((file as ComposerAttachment).localFile) {
       setLocalAttachmentPreview(file as ComposerAttachment);
       return;
@@ -1070,6 +1129,7 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handlePreviewHistoryAttachment = async (file: AttachmentInfo | FileInfo) => {
+    previewOpenRequestIdRef.current += 1;
     if (file.source === 'workspace') {
       if (isWorkspaceEntryDeleted(file.entry_id)) {
         setLocalError('工作区文件已永久删除，历史中不再保留可读取副本。');
@@ -1091,8 +1151,8 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleOpenAssistantFile = async (file: FileInfo) => {
+    const requestId = ++previewOpenRequestIdRef.current;
     if (!sessionId) return;
-    const requestId = ++assistantFileOpenRequestIdRef.current;
     const ownerSessionId = sessionId;
     setLocalError('');
     setPreviewContextNotice('');
@@ -1100,7 +1160,7 @@ function ChatV2View(props: ChatV2Props) {
 
     const showCapturedFallback = (message: string, currentOnlyMessage?: string) => {
       if (
-        requestId !== assistantFileOpenRequestIdRef.current
+        requestId !== previewOpenRequestIdRef.current
         || sessionIdRef.current !== ownerSessionId
       ) return;
       if (normalizedFile.source === 'workspace') {
@@ -1135,7 +1195,7 @@ function ChatV2View(props: ChatV2Props) {
       try {
         const currentEntry = await workspaceApi.getEntry(normalizedFile.entry_id);
         if (
-          requestId !== assistantFileOpenRequestIdRef.current
+          requestId !== previewOpenRequestIdRef.current
           || sessionIdRef.current !== ownerSessionId
         ) return;
         setPreviewContextNotice('');
@@ -1162,7 +1222,7 @@ function ChatV2View(props: ChatV2Props) {
           !item.is_directory && item.path.replace(/^\/+/, '') === targetPath
         ));
         if (
-          requestId !== assistantFileOpenRequestIdRef.current
+          requestId !== previewOpenRequestIdRef.current
           || sessionIdRef.current !== ownerSessionId
         ) return;
         if (!currentFile) {
@@ -1480,6 +1540,9 @@ function ChatV2View(props: ChatV2Props) {
     });
     setDisableInitialMotion(false);
     setLocalError('');
+    // Sending is an explicit request to follow the new turn. Set that intent
+    // before preparation commits, so the sole scroll owner follows its new height.
+    scrollToBottom();
     let runtimeStarted = false;
     try {
       const attachedWorkspaceEntryIds = Array.from(new Set(
@@ -1616,17 +1679,12 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleStop = async () => {
-    if (!sessionId || !(sending || resuming || waitingInteraction) || stopping) return;
-    setStopping(true);
-    try {
-      await runtime.stopSessionRun(sessionId);
-    } finally {
-      setStopping(false);
-    }
+    if (!sessionId || !(sending || resuming || waitingInteraction || stopping) || cancellationPending) return;
+    await runtime.stopSessionRun(sessionId);
   };
 
   const handleResumeSubmit = async (answers: Record<string, string>) => {
-    if (!sessionId || !pendingInterrupt?.id || resumeSaveBarrierPendingRef.current) return;
+    if (!sessionId || !pendingInterrupt?.id || stopping || resumeSaveBarrierPendingRef.current) return;
     resumeSaveBarrierPendingRef.current = true;
     try {
       const pendingFileDrafts = captureDirtyEditorsBeforeAgentStart();
@@ -1638,6 +1696,14 @@ function ChatV2View(props: ChatV2Props) {
 
   const syncingCurrentAttachments = syncingAttachmentDraftId === currentDraftId;
   const inputDisabled = creatingCurrentDraft || submittingDraftKeys.has(currentDraftKey);
+  const questionId = showQuestionComposer ? questionInterrupt?.id || null : null;
+  useLayoutEffect(() => {
+    const previous = previousQuestionViewRef.current;
+    previousQuestionViewRef.current = { sessionId, id: questionId };
+    if (chatInteractionHidden || viewingSubtask || previous.sessionId !== sessionId || previous.id === questionId) return;
+    if (questionId) questionComposerRef.current?.focus({ preventScroll: true });
+    else if (previous.id) composerTextareaRef.current?.focus({ preventScroll: true });
+  }, [sessionId, questionId, chatInteractionHidden, viewingSubtask]);
   const sendingLabel = preparingSubmission ? '' : creatingCurrentDraft
     ? '创建中'
     : syncingCurrentAttachments
@@ -1662,10 +1728,11 @@ function ChatV2View(props: ChatV2Props) {
         ref={chatPaneRef}
         className="session-files-chat-pane relative flex flex-col"
         data-testid="chat-pane"
+        data-subtask-open={viewingSubtask}
         aria-hidden={chatInteractionHidden}
-        onDragOver={handleDragOver}
+        onDragOver={viewingSubtask ? undefined : handleDragOver}
         onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
+        onDrop={viewingSubtask ? (event) => event.preventDefault() : handleDrop}
       >
         {isDragging && (
           <div className="absolute inset-0 flex items-center justify-center bg-claude-accent/5 backdrop-blur-sm z-50 pointer-events-none border-2 border-dashed border-claude-accent/40 rounded-2xl m-4">
@@ -1677,7 +1744,8 @@ function ChatV2View(props: ChatV2Props) {
           </div>
         )}
 
-        <header
+        {!chatInteractionHidden && <header
+          data-parent-chat-view
           data-testid="chat-toolbar"
           className="sticky top-0 z-20 flex h-14 shrink-0 items-center border-b border-claude-border bg-claude-bg/80 px-6 backdrop-blur-sm"
         >
@@ -1695,9 +1763,9 @@ function ChatV2View(props: ChatV2Props) {
               />
             )}
           </div>
-        </header>
+        </header>}
 
-        <div ref={chatAreaRef} className="relative flex-1 overflow-y-auto bg-claude-bg" style={{ overflowAnchor: 'none' }}>
+        <div ref={chatAreaRef} data-parent-chat-view className="relative flex-1 overflow-y-auto bg-claude-bg" style={{ overflowAnchor: 'none' }}>
           {loading && visibleRounds.length === 0 ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
@@ -1731,7 +1799,7 @@ function ChatV2View(props: ChatV2Props) {
               </div>
             </div>
           ) : (
-            <div ref={messagesContentRef} data-testid="chat-message-column" className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6 md:px-8">
+            <div ref={messagesContentRef} data-testid="chat-message-column" className="chat-column space-y-6 py-6">
               {visibleRounds.map((round, index) => {
                 const preparing = preparingSubmission?.round.round_id === round.round_id;
                 const visibleUserAttachments = (round.user_attachments || []).filter((file) => (
@@ -1745,7 +1813,7 @@ function ChatV2View(props: ChatV2Props) {
                   : { ...round, assistant_file_references: visibleAssistantFileReferences };
                 return (
                   <div
-                    key={round.round_id}
+                    key={roundRenderKey(round)}
                     data-round-id={round.round_id}
                     className={`scroll-mt-20 rounded-2xl transition-colors duration-300 ${
                       highlightedRoundId === round.round_id
@@ -1755,6 +1823,12 @@ function ChatV2View(props: ChatV2Props) {
                   >
                     <Round
                       round={visibleRound}
+                      run={runtime.state.runs[runtime.state.serverRunIdToClientRunKey[round.round_id]
+                        || runtime.state.idempotencyKeyToClientRunKey[round.idempotency_key || '']]}
+                      reveal={scrollTarget?.roundId === round.round_id ? { messageId: scrollTarget.messageId, nonce: scrollTarget.nonce } : undefined}
+                      onRetryStop={handleStop}
+                      onInspectProcess={reading.beginReading}
+                      onOpenSubtask={openSubtask}
                       userAttachments={visibleUserAttachments}
                       sessionId={sessionId}
                       onPreviewAttachment={preparing
@@ -1773,7 +1847,7 @@ function ChatV2View(props: ChatV2Props) {
 
         </div>
 
-        <div className="relative h-0 shrink-0" data-testid="chat-scroll-control">
+        <div data-parent-chat-view className="relative h-0 shrink-0" data-testid="chat-scroll-control">
           {showScrollButton && (
             <button
               type="button"
@@ -1800,8 +1874,8 @@ function ChatV2View(props: ChatV2Props) {
         </div>
 
         {displayError && (
-          <div className="px-6 py-3 bg-red-50 border-t border-red-100">
-            <div className="mx-auto w-full max-w-5xl">
+          <div data-parent-chat-view className="py-3 bg-red-50 border-t border-red-100">
+            <div className="chat-column">
               <div className="flex items-start gap-3">
                 <AlertCircle className="w-4 h-4 text-claude-error flex-shrink-0 mt-0.5" />
                 <div className="flex-1 min-w-0 overflow-hidden">
@@ -1824,29 +1898,33 @@ function ChatV2View(props: ChatV2Props) {
           </div>
         )}
 
-        {pendingInterrupt && pendingInterrupt.reason === 'input_required' && pendingInterrupt.payload?.questions && (pendingInterrupt.payload.questions as AskUserQuestion[]).length > 0 && (
-          <div className="relative z-20 mx-auto mb-[-3.5rem] w-full max-w-5xl px-4 md:px-8">
+        {questionInterrupt && (
+          <section ref={questionComposerRef} data-parent-chat-view data-question-composer tabIndex={-1}
+            aria-label="回答问题" aria-hidden={!showQuestionComposer}
+            className={showQuestionComposer ? 'chat-column shrink-0 pb-5 pt-3 focus:outline-none' : 'hidden'}>
             <QuestionCard
-              key={pendingInterrupt.id}
-              questions={pendingInterrupt.payload.questions as AskUserQuestion[]}
+              key={questionInterrupt.id}
+              questions={questionInterrupt.payload?.questions}
               onSubmit={handleResumeSubmit}
-              disabled={resuming}
+              disabled={resuming || stopping}
             />
-          </div>
+          </section>
         )}
 
         {pendingInterrupt && pendingInterrupt.reason === 'human_approval' && pendingInterrupt.payload?.kind === 'tool_approval' && (
-          <div className="relative z-20 mx-auto mb-[-3.5rem] w-full max-w-5xl px-4 md:px-8">
+          <div data-parent-chat-view className="chat-column relative z-20 mb-[-3.5rem]">
             <ToolApprovalCard
               approval={pendingInterrupt.payload as ToolApprovalPayload}
               onSubmit={handleResumeSubmit}
-              disabled={resuming}
+              disabled={resuming || stopping}
             />
           </div>
         )}
 
-        <ChatInput
+        <div data-parent-chat-view className={showQuestionComposer ? 'hidden' : 'contents'} aria-hidden={showQuestionComposer ? true : undefined}>
+          <ChatInput
             textareaRef={composerTextareaRef}
+            visible={!showQuestionComposer && !chatInteractionHidden && !viewingSubtask}
             value={input}
             onChange={(value) => updateMessageDraft(currentDraftKey, (draft) => (
               draft.input === value
@@ -1910,6 +1988,10 @@ function ChatV2View(props: ChatV2Props) {
             )}
           />
           <DraftAttachmentPreview file={localAttachmentPreview} onClose={() => setLocalAttachmentPreview(null)} />
+        </div>
+        {subtaskFrames.map((frame, index) => <SubagentDetailView key={frame.task.child_run_id || frame.task.edge_id}
+          sessionId={sessionId} task={frame.task} active={index === subtaskFrames.length - 1 && !chatInteractionHidden}
+          onBack={closeSubtask} backLabel={index === 0 ? '返回主对话' : '返回上级子任务'} onOpenSubtask={openSubtask} onOpenFile={handleOpenAssistantFile} />)}
       </div>
 
       {(sessionId || workspacePanelActive) && (
@@ -1939,6 +2021,7 @@ function ChatV2View(props: ChatV2Props) {
             resolvingTarget={workspaceTargetResolving}
             isOpen={isFilesOpen}
             onClose={() => {
+              previewOpenRequestIdRef.current += 1;
               setPreviewContextNotice('');
               // The panel captures all closing drafts before invoking this callback.
               reading.beforeLayoutChange();

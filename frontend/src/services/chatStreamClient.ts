@@ -130,6 +130,8 @@ interface SubscribeArgs extends StreamIdentity, StreamHandlers {
   serverRunId: string;
   lastSequence?: number;
   durableInteractionObserved?: boolean;
+  /** Child views recover a single Round; parent history intentionally excludes them. */
+  snapshotScope?: 'round';
 }
 
 interface ResumeArgs extends StreamIdentity, StreamHandlers {
@@ -183,6 +185,26 @@ async function getSessionHistoryWithAbort(
     );
     if (abort.userAborted) throw new UserAbort();
     return history;
+  } catch (error) {
+    if (abort.userAborted || controller.signal.aborted) throw new UserAbort();
+    throw error;
+  } finally {
+    abort.controllers.delete(controller);
+  }
+}
+
+async function getRoundSnapshotWithAbort(
+  abort: AbortState,
+  ownerSessionId: string,
+  runId: string,
+): Promise<RoundData> {
+  if (abort.userAborted) throw new UserAbort();
+  const controller = new AbortController();
+  abort.controllers.add(controller);
+  try {
+    const round = await apiService.getRoundSnapshot(ownerSessionId, runId, controller.signal);
+    if (abort.userAborted) throw new UserAbort();
+    return round;
   } catch (error) {
     if (abort.userAborted || controller.signal.aborted) throw new UserAbort();
     throw error;
@@ -250,6 +272,7 @@ function metaForEvent(event: any, source: StreamSource): StreamDeltaMeta | undef
   const sequence = eventSequence(event);
   const explicitAggregate = event?.isAggregate ?? event?.aggregate ?? event?.replay;
   const replayAggregate = source === 'subscribe'
+    && explicitAggregate === undefined
     && sequence !== undefined
     && DELTA_EVENT_TYPES.has(event?.type);
 
@@ -259,7 +282,7 @@ function metaForEvent(event: any, source: StreamSource): StreamDeltaMeta | undef
 
   return {
     sequence,
-    isAggregate: Boolean(explicitAggregate) || replayAggregate || undefined,
+    isAggregate: explicitAggregate === undefined ? replayAggregate || undefined : Boolean(explicitAggregate),
   };
 }
 
@@ -270,9 +293,11 @@ function terminalFromRound(round: any, threadId: string, runId: string): any | n
       type: 'RUN_ERROR',
       threadId,
       runId,
-      message: round.final_response || 'Run failed',
+      message: round.terminal_presentation?.error?.message || 'Run failed',
       code: 'RUN_FAILED',
       sequence: round.last_event_sequence,
+      terminalPresentation: round.terminal_presentation ?? { final_response_origin: 'unknown' },
+      presentationSource: 'history',
     };
   }
 
@@ -298,6 +323,10 @@ function terminalFromRound(round: any, threadId: string, runId: string): any | n
     outcome,
     interrupt: round.interrupt,
     sequence: round.last_event_sequence,
+    terminalPresentation: round.terminal_presentation,
+    presentationSource: 'history',
+    finalMessageId: round.final_message_id,
+    finalMessageIds: round.final_message_ids,
   };
 }
 
@@ -535,6 +564,7 @@ function subscribeOnce(args: SubscribeArgs, abort: AbortState): RuntimeSubscript
         abort,
         undefined,
         (event) => {
+          if (abort.userAborted) throw new UserAbort();
           if (isSubscribeControlError(event)) {
             throw new NonTerminalStreamError(
               'subscribe_control_error',
@@ -572,10 +602,13 @@ function subscribeOnce(args: SubscribeArgs, abort: AbortState): RuntimeSubscript
       }
       let recoveredReason: NonTerminalStreamReason | null = null;
       try {
-        const history = await getSessionHistoryWithAbort(abort, identity.ownerSessionId);
-        const round = history.rounds.find((item: any) => item.round_id === args.serverRunId);
+        const rounds = args.snapshotScope === 'round'
+          ? [await getRoundSnapshotWithAbort(abort, identity.ownerSessionId, args.serverRunId)]
+          : (await getSessionHistoryWithAbort(abort, identity.ownerSessionId)).rounds;
+        if (abort.userAborted) return;
+        const round = rounds.find((item) => item.round_id === args.serverRunId);
         if (round) {
-          emitHistorySnapshot(args, identity, history.rounds, args.serverRunId);
+          emitHistorySnapshot(args, identity, rounds, args.serverRunId);
           latestSequence = Math.max(latestSequence, round.last_event_sequence || 0);
         }
         if (emitRecoveredTerminal(args, identity, round, args.serverRunId)) {

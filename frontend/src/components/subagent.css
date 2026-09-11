@@ -1,0 +1,26 @@
+.chat-subtasks { min-width: 0; }
+.chat-subtasks-summary { margin-bottom: 6px; color: var(--chat-muted, #73736f); font-size: 12px; }
+.chat-subtask-row { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 38px; padding: 5px 0; border-radius: 6px; color: var(--chat-muted, #73736f); font-size: 14px; line-height: 24px; text-align: left; }
+.chat-subtask-row:not(:disabled):hover { color: var(--chat-ink, #242424); background: var(--chat-bubble, #eeede9); }
+.chat-subtask-row:disabled { cursor: default; }
+.chat-subtask-row:focus-visible, .chat-subtask-back:focus-visible { outline: 2px solid #cc785c; outline-offset: 3px; }
+.chat-subtask-title { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.chat-subtask-status { flex-shrink: 0; font-size: 14px; line-height: 24px; }
+.chat-subtask-result { margin: 6px 0 8px 22px; padding: 10px 12px; max-height: 220px; overflow: auto; border-radius: 8px; background: var(--chat-bubble, #eeede9); color: var(--chat-ink, #242424); font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-subtask-detail { position: relative; display: flex; flex: 1; min-height: 0; min-width: 0; flex-direction: column; }
+.chat-subtask-header { display: flex; align-items: center; gap: 10px; padding: 12px 20px; border-bottom: 1px solid #e5e4df; }
+.chat-subtask-back { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; gap: 6px; padding: 6px; min-width: 36px; height: 36px; border-radius: 7px; color: #73736f; font-size: 12px; }
+.chat-subtask-back:hover { background: #eeede9; }
+.chat-subtask-header-caption { color: #73736f; font-size: 12px; }
+.chat-subtask-header-title { color: #242424; font-weight: 500; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-subtask-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+.chat-subtask-instructions { margin-bottom: 24px; color: #73736f; font-size: 13px; }
+.chat-subtask-instructions summary { cursor: pointer; width: fit-content; }
+.chat-subtask-instructions p { margin-top: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-subtask-error { margin: 12px 0; color: #9b4545; font-size: 13px; }
+.chat-subtask-error button { margin-top: 6px; text-decoration: underline; text-underline-offset: 3px; }
+.chat-subtask-scroll-control { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); }
+.chat-subtask-scroll-control button { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 8px 14px; border: 1px solid #e5e4df; border-radius: 24px; background: white; font-size: 12px; white-space: nowrap; box-shadow: 0 2px 8px #00000012; }
+/* Parent nodes remain mounted so the composer and its draft retain ownership. */
+[data-subtask-open="true"] > [data-parent-chat-view] { display: none !important; }
+@media (max-width: 640px) { .chat-subtask-row { min-height: 44px; } .chat-subtask-header { padding: 10px 12px; } .chat-subtask-back { min-width: 40px; height: 40px; } }

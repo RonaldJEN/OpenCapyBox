@@ -5,6 +5,7 @@ import type {
   SessionListResponse,
   ModelsResponse,
   HistoryResponseV2,
+  RoundData,
   FileListResponse,
   FileInfo,
   DraftUploadResult,
@@ -30,9 +31,12 @@ function arrayBufferToBase64(content: ArrayBuffer): string {
 
 export interface AbortChatResponse {
   status: 'cancelled';
-  request_id: string;
+  request_id: string | null;
   reason: string;
   outcome_warning: string | null;
+  round_id?: string | null;
+  round_status?: string | null;
+  admission_released?: boolean;
 }
 
 /**
@@ -342,8 +346,8 @@ class APIService {
    * 中止正在进行的 Agent 执行
    * 后端会立即收敛本地终态，并返回无法撤销远端副作用的保守警告
    */
-  async abortChat(chatSessionId: string): Promise<AbortChatResponse> {
-    const response = await this.client.post<AbortChatResponse>(`/chat/${chatSessionId}/abort`);
+  async abortChat(chatSessionId: string, roundId?: string): Promise<AbortChatResponse> {
+    const response = await this.client.post<AbortChatResponse>(`/chat/${chatSessionId}/abort`, roundId ? { round_id: roundId } : undefined);
     return response.data;
   }
 
@@ -1108,6 +1112,18 @@ class APIService {
           'Content-Type': 'multipart/form-data',
         },
       }
+    );
+    return response.data;
+  }
+
+  async getRoundSnapshot(
+    chatSessionId: string,
+    roundId: string,
+    signal?: AbortSignal,
+  ): Promise<RoundData> {
+    const response = await this.client.get<RoundData>(
+      `/chat/${chatSessionId}/round/${roundId}/snapshot`,
+      { signal },
     );
     return response.data;
   }

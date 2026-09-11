@@ -463,6 +463,8 @@ class AnthropicClient(LLMClientBase):
         on_content: Any = None,
         on_thinking: Any = None,
         on_tool_call: Any = None,
+        *,
+        on_message: Any = None,
     ) -> LLMResponse:
         """Generate response from Anthropic LLM with streaming support.
 

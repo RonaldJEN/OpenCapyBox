@@ -1,7 +1,7 @@
 # 前端总 Spec
 
 > 本文是 OpenCapyBox 前端的**单一事实源**。细分模块见：
-> - [frontend-chat-spec.md](./frontend-chat-spec.md) — 聊天/SSE/推理面板
+> - [frontend-chat-spec.md](./frontend-chat-spec.md) — 聊天/SSE/行内执行过程
 > - [frontend-session-spec.md](./frontend-session-spec.md) — 会话列表与切换
 > - [frontend-session-files-spec.md](./frontend-session-files-spec.md) — Session 文件分栏、多标签与格式预览
 > - [frontend-panel-spec.md](./frontend-panel-spec.md) — 日程/Skills/数据一级页与 SettingsCenter/二级面板
@@ -24,8 +24,10 @@
 | `runtime/chatRuntimeReducer.ts` | 纯状态迁移与 AG-UI 事件归并 | 网络请求、定时器 |
 | `components/ChatV2.tsx` | 会话内消息渲染、草稿、滚动、交互卡与用户动作 | 直接拥有 SSE transport |
 | `components/SessionList.tsx` | 会话 CRUD、运行中检测、日程/Skills/数据一级入口 | 消息渲染 |
-| `components/Round.tsx` | 单轮（user+assistant+reasoning）视觉渲染 | 消息状态管理 |
-| `components/ReasoningPanel.tsx` | `StepData[]` → Display Blocks 可视化 | 事件接收 |
+| `components/Round.tsx` | 单轮用户消息、助手正文和附件渲染 | 消息状态管理 |
+| `components/InlineRoundTranscript.tsx` | 消息与工具按身份排序、过程展开及子任务入口 | 事件接收 |
+| `components/ReasoningPanel.tsx` | 普通工具详情，命令和网站委托专用组件 | 子任务身份解析 |
+| `components/SubagentDetailView.tsx` | 子任务只读详情与独立订阅，保持父视图挂载 | 主任务状态或发送准入 |
 | `components/ArtifactsPanel.tsx` + `components/session-files/*` | Session 文件目录、多标签、分栏/全屏状态 | 聊天运行态、用户级工作区 |
 | `components/FilePreview.tsx` + `components/file-preview/*` | 按文件类型选择安全预览器；为当前 Session 的 Markdown、CSV、XLSX 提供受限编辑 | Word/PowerPoint 在线编辑、Round 状态管理 |
 | `components/SettingsCenter.tsx` | 设置中心居中弹窗：MEMORY/USER/SOUL 编辑 + 权限管控 | Skills/MCP 入口与状态、Cron |
@@ -37,7 +39,7 @@
 | `services/chatStreamClient.ts` | direct/resume/subscribe fetch + SSE 解析、序号恢复与控制面错误分类 | React 状态更新 |
 | `services/configApi.ts` | 记忆文件、Skills、未读计数 API | 聊天相关 |
 | `utils/messageParser.ts` | AG-UI 事件 → RoundData/StepData | 渲染 |
-| `utils/displayBlocks.ts` | `StepData[]` → `DisplayBlock[]`（跨 step 合并工具调用）| — |
+| `utils/displayBlocks.ts` | `projectToolItems` 按调用身份投影工具项、结果与展示元数据| — |
 
 ## 3. 数据流总览
 
@@ -46,13 +48,14 @@
   → services/chatStreamClient.ts（fetch/解析 + StreamEnvelope + recovery）
       → ChatRuntimeProvider（transport ownership/epoch guard）
         → chatRuntimeReducer（Round/Run 单一投影）
-          → ChatV2 → Round → ReasoningPanel → DisplayBlock 渲染
+          → ChatV2 → Round → InlineRoundTranscript（共享正文投影与工具详情）
 ```
 
 **关键不变量**：
 - 所有后端事件必须形成带 `ownerSessionId/clientRunKey/transportEpoch/connectionId` 的 `StreamEnvelope`，不允许组件直接拥有 EventSource。
 - Provider 必须按 connection identity 丢弃迟到 transport；history 必须受 request id 与 stream watermark 双重保护。
 - `running` 与 `waiting_interaction` 都保持同一 Round 的 subscribe；waiting 不计为 sending。
+- `ask_user` 等待回答时问答卡独占输入区，聊天页不提供本轮的停止、取消或问答关闭入口；回答或跳过并提交后恢复普通输入区及执行中的停止按钮。工具审批等待沿用原交互，细则见 [frontend-chat-spec.md](./frontend-chat-spec.md#36-human-in-the-loop-暂停与恢复)。
 
 ## 4. 全局行为契约
 
@@ -207,7 +210,7 @@
 
 ### 5.5 组件风格
 
-- **用户消息**：`w-7 h-7` 圆形头像 `bg-claude-text text-white`，角色标签"你"。
+- **用户消息**：左侧 `w-7 h-7` 中性用户图标与角色标签“你”，正文、附件和时间左对齐，正文无气泡底色。
 - **助手消息**：`w-7 h-7` 圆形头像 `bg-claude-accent/20 text-claude-accent`，角色标签"助手"。
 - **按钮 Primary**：`bg-claude-text text-white rounded-xl hover:bg-claude-text/90`
 - **按钮 Ghost**：`hover:bg-claude-hover text-claude-secondary`
@@ -238,20 +241,17 @@
 
 历史消息首次渲染**禁用逐条动画**（`disableMotion=true`），避免大量历史消息产生瀑布式动效。仅实时新消息使用 `animate-fade-in`。
 
-### 5.9 推理面板（Reasoning Panel）
+### 5.9 行内执行过程
 
-采用 **Display Blocks** 模式（非编号列表）：
-- `transformToDisplayBlocks`：`StepData[]` → `DisplayBlock[]`（ThinkingBlock / ToolGroupBlock / NarrativeBlock）。
-- **跨 step 合并**：连续工具调用步骤合并为一个 ToolGroupBlock。
-- **分组摘要**：`getGroupSummary()` 生成 "Edited 2 files, read a file" 风格。
-- 主聊天区只显示一个思考/活动入口；工具调用和完整思考详情通过右侧覆盖式活动抽屉查看。
-- 外层**无边框容器**，不使用 `rounded-xl border` 包裹整个面板。
+- 正文展示与复制共用 `projectRoundTranscript`；消息身份、原生 phase 与终稿别名决定内容归属。
+- `InlineRoundTranscript` 按事件顺序显示正文和工具；运行时默认最新进展，状态栏可展开完整过程，正式答复或终态到达后收起。
+- 工具详情默认折叠，命令与网站使用专用展示；子任务按持久化 graph 身份进入独立只读详情，父聊天及草稿保持挂载。
+- thinking 仅在运行状态栏显示当前片段，不进入正文与主复制。完整规则见 [frontend-chat-spec.md](./frontend-chat-spec.md#7-行内执行过程)。
 
 ### 5.10 文字语言约定
 
-- 工具描述、摘要、技术术语：**英文**（"Read src/app.py"、"Edited 2 files"、"Done"）。
-- UI 标签、提示、按钮：**中文**（"正在思考"、"已完成思考 3s"、"正在分析请求..."、"输入"、"输出"）。
-- 例外：`sub_agent` 面向业务理解长耗时委派执行，工具摘要使用中文 `委派子任务`，并在活动抽屉中以专用胶囊展示任务标题、类型与耗时。
+- 工具描述、摘要、按钮与状态使用中文；工具原始标识、文件路径和命令保持原文。
+- MCP 显示调用时的服务名与工具标题；缺少展示快照的旧记录保留原始工具名。
 
 ### 5.11 交互微动效
 
@@ -260,13 +260,11 @@
 - Active：`active:scale-95`。
 - 加载动画：3 点 `animate-dot-pulse`。
 
-### 5.12 实时反馈（Typewriter Preview）
+### 5.12 实时反馈
 
-应用场景：推理面板、日志输出、状态栏。
-
-**截断策略**：
-- **Keep-Head**：关键信息在头部（Search/Bash/Read File），`search: "react hooks..."`
-- **Keep-Tail**：追加生成型（Write/Edit File），`...import { useState } from 'react';`（字符左滚动）
+- 状态栏仅对开放中的 thinking 片段按 100ms 采样最新尾段，不逐字排队，不从历史补播。
+- 普通 content 按完整正文展示；命令行只在折叠预览中省略，详情与复制保留原文。
+- 运行状态、过程展开与阅读位置分别由状态投影、行内组件和唯一滚动管理器负责。
 
 ## 6. 前端开发清单（Pre-Delivery Checklist）
 

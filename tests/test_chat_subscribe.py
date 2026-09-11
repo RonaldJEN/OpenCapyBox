@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 import json
 import asyncio
 
-from tests.helpers import make_mock_round
+from tests.helpers import make_agent_service, make_mock_round
 from src.api.services.agui_event_bus import get_agui_event_bus
 
 
@@ -829,15 +829,12 @@ class TestSseDetachedProducer:
     async def test_run_round_stream_finally_marks_round(self):
         """_run_round_stream 在未知异常退出时应标记为 failed（非用户取消）。"""
         from unittest.mock import MagicMock, AsyncMock, patch
-        from src.api.services.agent_service import AgentService
 
         mock_history = MagicMock()
         mock_history.save_agui_event = AsyncMock()
         mock_history.complete_round = MagicMock()
 
-        service = object.__new__(AgentService)
-        service.history_service = mock_history
-        service.session_id = "test-session"
+        service = make_agent_service(history_service=mock_history, session_id="test-session")
         service.cancel_token = None
         service._active_run_count = 0
         service.agent = MagicMock()
@@ -875,7 +872,6 @@ class TestSseDetachedProducer:
     async def test_run_round_stream_finally_fans_out_fallback_terminal(self):
         """异常兜底写入 terminal 后应广播给本地订阅者。"""
         from unittest.mock import MagicMock, AsyncMock
-        from src.api.services.agent_service import AgentService
         from src.api.services.agui_event_bus import StoredEvent, get_agui_event_bus
         from src.agent.schema.agui_events import RunStartedEvent
 
@@ -893,9 +889,7 @@ class TestSseDetachedProducer:
         mock_history.complete_round = MagicMock()
         mock_history.last_terminal_event = StoredEvent(run_id, 2, terminal_payload)
 
-        service = object.__new__(AgentService)
-        service.history_service = mock_history
-        service.session_id = "test-session"
+        service = make_agent_service(history_service=mock_history, session_id="test-session")
         service.cancel_token = None
         service._active_run_count = 0
         service.agent = MagicMock()
@@ -928,7 +922,6 @@ class TestSseDetachedProducer:
     async def test_run_round_stream_yields_durable_terminal_when_externally_terminated(self):
         """abort 已持久化终态时，原始 stream 仍应收到 durable RUN_FINISHED。"""
         from unittest.mock import MagicMock, patch
-        from src.api.services.agent_service import AgentService
         from src.api.services.agui_event_bus import StoredEvent
         from src.agent.schema.agui_events import RunStartedEvent
 
@@ -948,9 +941,7 @@ class TestSseDetachedProducer:
         mock_history.reset_session = MagicMock()
         mock_history.complete_round = MagicMock()
 
-        service = object.__new__(AgentService)
-        service.history_service = mock_history
-        service.session_id = "test-session"
+        service = make_agent_service(history_service=mock_history, session_id="test-session")
         service.cancel_token = asyncio.Event()
         service._active_run_count = 0
         service.agent = MagicMock()
@@ -988,7 +979,6 @@ class TestSseDetachedProducer:
         """事件写库失败后，收尾更新 round 前必须先 rollback 当前 Session。"""
         from unittest.mock import MagicMock, AsyncMock
         from sqlalchemy.exc import OperationalError
-        from src.api.services.agent_service import AgentService
         from src.agent.schema.agui_events import RunStartedEvent
 
         mock_history = MagicMock()
@@ -999,9 +989,7 @@ class TestSseDetachedProducer:
         )
         mock_history.complete_round = MagicMock()
 
-        service = object.__new__(AgentService)
-        service.history_service = mock_history
-        service.session_id = "test-session"
+        service = make_agent_service(history_service=mock_history, session_id="test-session")
         service.cancel_token = None
         service._active_run_count = 0
         service.agent = MagicMock()
@@ -1027,15 +1015,12 @@ class TestSseDetachedProducer:
     async def test_run_round_stream_finally_marks_cancelled_when_cancel_token_set(self):
         """_run_round_stream 异常退出且本地 cancel_token 已触发时标记为 cancelled。"""
         from unittest.mock import MagicMock, AsyncMock
-        from src.api.services.agent_service import AgentService
 
         mock_history = MagicMock()
         mock_history.save_agui_event = AsyncMock()
         mock_history.complete_round = MagicMock()
 
-        service = object.__new__(AgentService)
-        service.history_service = mock_history
-        service.session_id = "test-session"
+        service = make_agent_service(history_service=mock_history, session_id="test-session")
         service.cancel_token = asyncio.Event()
         service.cancel_token.set()
         service._active_run_count = 0
@@ -1073,7 +1058,6 @@ class TestSseDetachedProducer:
         因此当 complete_round 抛异常时 finally 兜底分支能再试一次。
         """
         from unittest.mock import MagicMock, AsyncMock, call
-        from src.api.services.agent_service import AgentService
         from src.agent.schema.agui_events import (
             RunStartedEvent, RunFinishedEvent, StepStartedEvent, StepFinishedEvent,
             TextMessageStartEvent, TextMessageContentEvent, TextMessageEndEvent,
@@ -1086,9 +1070,7 @@ class TestSseDetachedProducer:
             side_effect=[RuntimeError("DB connection lost"), None]
         )
 
-        service = object.__new__(AgentService)
-        service.history_service = mock_history
-        service.session_id = "test-session"
+        service = make_agent_service(history_service=mock_history, session_id="test-session")
         service.cancel_token = None
         service._active_run_count = 0
         service.agent = MagicMock()
@@ -1480,8 +1462,8 @@ class TestSubscribePersistedPolling:
         assert any("RUN_FINISHED" in c for c in chunks)
 
     @pytest.mark.asyncio
-    async def test_subscribe_catchup_skips_aggregate_when_live_raw_delta_is_queued(self):
-        """同一 EventBus 订阅连接已接收 live raw delta 时，聚合 CONTENT 不应重复输出。"""
+    async def test_subscribe_catchup_deduplicates_durable_text_by_sequence(self):
+        """同一 EventBus 订阅连接收到已提交增量后，END 不再重复发出聚合正文。"""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
         from sqlalchemy.pool import StaticPool
@@ -1528,7 +1510,8 @@ class TestSubscribePersistedPolling:
                 first = await asyncio.wait_for(first_event_task, timeout=1.0)
                 assert first["type"] == "TEXT_MESSAGE_CONTENT"
                 assert first["delta"] == "he"
-                assert "sequence" not in first
+                assert first["sequence"] == 1
+                assert first["isAggregate"] is False
 
                 second_event_task = asyncio.create_task(iterator.__anext__())
                 await bus.publish(run_id, TextMessageEndEvent(messageId="msg-1"))
@@ -1545,8 +1528,8 @@ class TestSubscribePersistedPolling:
             engine.dispose()
 
     @pytest.mark.asyncio
-    async def test_late_subscriber_suppresses_raw_suffix_and_receives_aggregate(self):
-        """中途订阅者错过 live-only 前缀时，应等聚合 CONTENT 补全整段内容。"""
+    async def test_late_subscriber_replays_committed_prefix_before_live_suffix(self):
+        """中途订阅者直接重放已提交前缀，再接收后续增量，无需等待 END。"""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
         from sqlalchemy.pool import StaticPool
@@ -1593,26 +1576,21 @@ class TestSubscribePersistedPolling:
                 assert first["type"] == "TEXT_MESSAGE_START"
                 assert first["sequence"] == 1
 
+                prefix = await asyncio.wait_for(iterator.__anext__(), timeout=1.0)
+                assert prefix["delta"] == "he" and prefix["sequence"] == 2
+                assert prefix["isAggregate"] is False
                 next_event_task = asyncio.create_task(iterator.__anext__())
                 for _ in range(50):
                     with bus.subscribers_lock:
                         if bus.subscribers.get(run_id):
                             break
                     await asyncio.sleep(0.01)
-
                 await bus.publish(run_id, TextMessageContentEvent(messageId="msg-1", delta="llo"))
-                await asyncio.sleep(0.05)
-                assert not next_event_task.done()
-
+                suffix = await asyncio.wait_for(next_event_task, timeout=1.0)
+                assert suffix["delta"] == "llo" and suffix["sequence"] == 3
                 await bus.publish(run_id, TextMessageEndEvent(messageId="msg-1"))
-                aggregate = await asyncio.wait_for(next_event_task, timeout=1.0)
-                assert aggregate["type"] == "TEXT_MESSAGE_CONTENT"
-                assert aggregate["delta"] == "hello"
-                assert aggregate["sequence"] == 2
-
                 end = await asyncio.wait_for(iterator.__anext__(), timeout=1.0)
-                assert end["type"] == "TEXT_MESSAGE_END"
-                assert end["sequence"] == 3
+                assert end["type"] == "TEXT_MESSAGE_END" and end["sequence"] == 4
             finally:
                 await iterator.aclose()
                 with bus.subscribers_lock:
@@ -2077,7 +2055,6 @@ class TestUserCancelledRoundStatus:
     @pytest.mark.asyncio
     async def test_run_finished_user_cancelled_sets_status_cancelled(self):
         """Agent yield RUN_FINISHED(outcome=interrupt, result.reason=user_cancelled) → status=cancelled"""
-        from src.api.services.agent_service import AgentService
         from src.agent.schema.agui_events import (
             RunStartedEvent, RunFinishedEvent,
             StepStartedEvent, StepFinishedEvent,
@@ -2087,9 +2064,7 @@ class TestUserCancelledRoundStatus:
         mock_history.save_agui_event = AsyncMock()
         mock_history.complete_round = MagicMock()
 
-        service = object.__new__(AgentService)
-        service.history_service = mock_history
-        service.session_id = "test-session"
+        service = make_agent_service(history_service=mock_history, session_id="test-session")
         service.cancel_token = None
         service._active_run_count = 0
         service.agent = MagicMock()

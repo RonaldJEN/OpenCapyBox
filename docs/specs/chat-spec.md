@@ -672,6 +672,10 @@ SSE 事件流。
 }
 ```
 
+`history/v2` 向后兼容提供 `terminal_presentation`：`final_response_origin` 为 `assistant | run_error | system_notice | unknown`，可选 `error` 包含 `source=durable_run_error`、`sequence`、`code`、`message`。在原有事件重建查询中读取终态，不新增逐轮额外查询，不修改原记录或事件写入。来源以当前终态事件及对应写入语义为依据；终态内容与旧字段不一致时保持 unknown，不能按词语分类。`RUN_ERROR` 的 message 与 Round.final_response 在原终态事务中对应时归 run_error；成功终态对应终稿归 assistant；明确取消/步数限制的系统终态说明归 system_notice。缺少证据的旧记录由前端独立显示旧版运行说明。步骤文本来自 TEXT_MESSAGE 事件时附 `assistant_content_source=text_message`，以区别旧取消占位数据。
+
+这些字段只服务展示和复制，不改变运行成功/失败/取消判定、搜索或恢复水位。主助手正文按 §4.4 提交后发布；thinking 与工具参数仍在 END 聚合提交。来源投影本身不保证旧协议未提交尾段的刷新恢复。错误字段沿用历史已授权错误可见性，不增加第三方日志或原文遥测。
+
 响应顶层 `model_id` 是 Session 最近已受理 direct Round 的模型；每个 Round 的 `model_id` / `model_display_name` 是不可变快照。旧 Round 为 `null`，不得用顶层值伪回填。
 
 `preferred_skills` 与 `preferred_mcp_connections` 分别是 Skill、MCP 连接的不可变展示快照，并遵循以下投影规则：
@@ -921,17 +925,16 @@ rolling startup 清理采用同一判定：heartbeat CAS 删除 stale lock 后�
 
 不同类型的事件采用不同的持久化策略，以平衡实时性和写入性能：
 
-#### 流式 Delta 事件 — 内存缓冲
+#### 流式 Delta 事件 — 正文提交后发布，其余内存缓冲
 
 以下事件在内存中缓冲，不逐条写入 DB：
 
-- `TEXT_MESSAGE_CONTENT` — 文本 delta
 - `THINKING_TEXT_MESSAGE_CONTENT` — 思考过程 delta
 - `TOOL_CALL_ARGS` — 工具参数 delta
 
-当对应的 `*_END` 事件到达时，触发**聚合写入**：将所有缓冲的 delta 合并为一条完整内容，与 END 事件一起写入 DB。
+主助手 `TEXT_MESSAGE_CONTENT` 每个增量在事务提交后才发布到 direct SSE 和 subscriber，显式携带 `isAggregate=false` 与 sequence；`TEXT_MESSAGE_END` 只结束消息，不重复写一份正文。thinking / tool args 仍在各自 END 到达时聚合写入。旧主正文 END 聚合记录仍可回放。
 
-> **设计决策**: 流式 delta 可能有数十到数百条，逐条持久化会产生大量小写入。聚合后只写 2 条记录（合并的 CONTENT + END），大幅减少 DB 压力。
+> **恢复边界**：已提交并发布的主正文不依赖 END 即可恢复；提交失败的正文不得发布。代价是主正文每个增量一次写事务。该策略不构成并发容量或发布延迟保证。
 
 #### 关键生命周期事件 — 立即提交
 
@@ -943,7 +946,7 @@ rolling startup 清理采用同一判定：heartbeat CAS 删除 stale lock 后�
 
 #### 其他事件 — 逐事件提交
 
-除上述两类以外的非 delta 事件，在写入后立即提交。这样可以避免 SSE/Agent 的异步等待间隙持有 PostgreSQL 事务；流式高频 delta 仍通过内存聚合减少写入量。
+除上述两类以外的非 delta 事件，在写入后立即提交。这样可以避免 SSE/Agent 的异步等待间隙持有 PostgreSQL 事务；thinking / tool args 的高频 delta 仍通过内存聚合减少写入量；主正文采用提交后发布。
 
 ### 4.5 上下文压缩
 
@@ -1026,6 +1029,22 @@ pre-turn 压缩排除正在进入会话的当前 user，发布 replacement 后�
 |                     | `assistant_file_referenced`     | Agent 通过 `present_files` 明确展示当前 Session 文件      |
 |                     | 其他自定义事件                    | 按需扩展                                                  |
 
+#### 工具展示身份
+
+`TOOL_CALL_START` 可携带 `toolDisplay={provider, server_name?, tool_name, tool_title?}`，其中 `provider=builtin | mcp`，内部字段保持 snake_case。Agent 从该次调用对应的已注册工具快照生成此字段；MCP 的 `tool_name` 是远端原始名，`tool_title` 和 `server_name` 来自已有目录元数据，不从模型参数、结果或工具名猜测。`toolCallName` 始终保留模型调用标识，未知或未注册工具不补造展示身份。
+
+同一 emitter 的所有 START 路径共用该投影，包括正常调用和被跳过的调用。字段随事件持久化，history/v2 原样投影到 `ToolCall.tool_display`；服务或工具后来改名不重写旧记录，缺失元数据的旧调用保留原始名称。展示身份不改变工具路由、权限或执行结果。
+
+#### `TOOL_CALL_RESULT` 成功事实
+
+新事件携带可空布尔 `success`，它是工具执行的唯一三态事实：`true` 表示可靠成功，`false` 表示可靠失败，缺失表示未知。direct SSE、subscribe/replay 与 history/v2 必须原样保留此三态；不得从 `content`、`error`、工具名或自然语言关键词猜测失败。
+
+为兼容旧事件，history 只接受明确布尔事实，且优先级固定为顶层 `success`、顶层 `isError`、旧 `content` / `result` JSON 对象中的 `success`、再到其中的 `isError`。其余旧结果，即使文本看起来像错误或带 `error` 字段，也仍为 `success=null`。新写入不得再依赖这些兼容字段。
+
+工具调用异常只向模型和事件返回异常类型与原因，完整 traceback 留在服务端诊断日志，不作为工具结果重复传递。
+
+`interaction_resolved` 只确认回答或审批交接。仅对应 `ask_user` 且 `resolution=answered` 时可确认回答工具成功；审批交接不等于工具执行成功，实际结果仍由后续 `TOOL_CALL_RESULT` 决定。
+
 #### Human-in-the-Loop CUSTOM wire schema
 
 ```json
@@ -1107,9 +1126,21 @@ Session `assistant_file_referenced` 只能由主 Agent 的 `present_files` 产�
 | `messageId`  | `msg_{runId}_{step}` | `msg_e5f6g7h8_3` |
 | `toolCallId` | `tc_{runId}_{step}`  | `tc_e5f6g7h8_3`  |
 
+#### 主助手消息投影与搜索
+
+历史扫描同时产出 `assistant_messages`、`transcript_coverage`、`final_message_id` / `final_message_ids` 和运行起止时间，不另建消息事实库。消息身份由 TEXT_MESSAGE_START 的 messageId 决定；旧数据无法证明完整身份时标 legacy 并沿用步骤。failover 保留旧消息并标 interrupted，不靠相似度推断替代。终态与正文以同次事件快照为准，避免较早 Round 头与较晚事件尾不一致。
+
+- 原生 Responses 消息边界通过独立的 START / CONTENT / END 保留；每次请求尝试把 provider message ID 映射为新的本地短 ID，重试不得拼接旧尝试的正文。`TEXT_MESSAGE_START.phase` 和 `TEXT_MESSAGE_END.phase` 可为 `commentary | final_answer`，仅透传供应商明确给出的阶段；缺失或未知值保持未知，不按长度、措辞或 reasoning 文本推断。消息阶段与运行状态分离，不改变 Round 终态、取消或准入语义。
+- `TEXT_MESSAGE_END.interrupted=true` 标记消息中断，也可纠正已正常 END、随后请求失败的消息。已提交正文继续保留在 UI 历史中；冷模型历史排除身份明确且被 END、failover 或运行终态投影标记中断的尝试。取消终态先于 END 落库时也遵守此规则，不绕过终态写入围栏；旧数据身份不完整时保留兼容聚合，不猜测删除正文。
+- 成功终态的 `RUN_FINISHED.finalMessageId` 只别名单条最终消息；多个最终段使用有序 `finalMessageIds`，二者互斥，历史对应 `final_message_id` / `final_message_ids`。有明确 `final_answer` 时，`result.final_response` 仅按顺序以双换行连接其非空段；没有该阶段时沿用兼容正文及对应消息别名，不反向补写 phase。别名用于关联已有正文，不能把整份聚合答复重复渲染为最后一条消息。
+
+`/chat/{sid}/abort` 接受可选 `round_id`，返回权威 `round_status` 和 `admission_released`。目标已终态时只返回该目标事实，不取消较新运行；目标已变化且仍非终态返回 409。前端将本地停止、取消确认、业务终态和准入分开，不根据单个 HTTP 状态猜最终结果。
+
 ### 4.7 Human-in-the-Loop 暂停与恢复
 
 Human-in-the-Loop 机制允许 Agent 在执行过程中向用户提问或请求工具审批。默认语义是暂停并继续同一个逻辑 Round。
+
+`ask_user` 在发出等待交互前，按工具 schema 校验全部题目及嵌套选项：每题必须包含 `question`、`header` 和 2–4 个 `options`，每个选项包含 `label`、`description`。任一题无效时返回带字段路径的工具参数错误供模型更正，不创建 pending interaction；已持久化的问题定义保持原样。
 
 #### same-Round 暂停流程
 
@@ -1342,6 +1373,14 @@ GET /subscribe?last_sequence={last_seq}
 ---
 
 ## 6. 可观测性
+
+### 子任务详情与父任务状态
+
+- `GET /api/chat/{session_id}/round/{round_id}/snapshot` 返回一个 `RoundData`，包括 child Round。与 history/v2 共用正文、消息身份、终态和附件投影；主 history 仍不混入 child。鉴权同时要求当前用户拥有 Session、Round 属于该 Session，任一不匹配返回 404。
+- 父流以持久化 `CUSTOM name=subagent_run_updated` 推送任务身份，`value` 为 Sessions Spec 中的 `SubagentTaskSnapshot`：创建 graph 的 `requested`、绑定 child 的 `running`、以及执行终态各一次；不推送 child 正文到父流。child 的正文和工具继续通过自己的 Round `/subscribe?last_sequence=...` 读取。
+- 更新经过父运行正常 AG-UI 保存和发布链，direct 与 subscribe 共享 sequence。它服从父 Round 终态和 continuation 写入 fence；UI 更新不能自行完成 continuation。父已终止时不追加迟到更新，刷新从 graph 恢复已提交的子任务状态。
+- 单条 UI 更新的排队或普通发布失败只记录 warning，不能把成功 child 的结果改成失败；graph 是恢复来源。运行级终态/归属丢失仍遵循既有退出路径。队列与父 run 绑定，流退出时取消等待并关闭 child 迭代，保留原取消/异常语义。
+- `sub_agent` 的 `TOOL_CALL_RESULT.success` 只说明那次工具调用本身的可靠结果，不能取代 graph。调用失败且未创建 edge/child 时不伪造 child Round，仍展示启动调用及错误结果入口；调用成功但尚无 child 时至多表示已发起，绝不表示 child 已完成。只有关联 child Round 的权威终态才能把任务投影为 completed / failed / cancelled。
 
 ### 日志事件
 

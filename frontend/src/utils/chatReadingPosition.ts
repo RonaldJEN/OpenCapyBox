@@ -34,9 +34,9 @@ function textRects(node: Text, start: number, end: number): DOMRect[] {
   return Array.from(range.getClientRects());
 }
 
-export function captureChatReadingPosition(container: HTMLElement): ChatReadingPosition {
+export function captureChatReadingPosition(container: HTMLElement, preferReading = false): ChatReadingPosition {
   const { scrollTop, scrollHeight, clientHeight } = container;
-  if (clientHeight > 0 && scrollHeight - scrollTop - clientHeight <= CHAT_BOTTOM_TOLERANCE) {
+  if (!preferReading && clientHeight > 0 && scrollHeight - scrollTop - clientHeight <= CHAT_BOTTOM_TOLERANCE) {
     return { mode: 'bottom' };
   }
   const viewport = container.getBoundingClientRect();
@@ -108,7 +108,14 @@ export function chatReadingScrollTop(container: HTMLElement, position: ChatReadi
     .find((element) => element.dataset.roundId === anchor.roundId);
   const block = anchor.blockId === null ? round : Array.from(round?.querySelectorAll<HTMLElement>(BLOCK_SELECTOR) ?? [])
     .find((element) => element.dataset.readingBlock === anchor.blockId);
-  if (!block) return position.scrollTop;
+  if (!block || block.closest('[data-process-row][hidden]')) {
+    // The process has collapsed. Its message row keeps identity even when the
+    // Markdown is unmounted; map that anchor to this round's surviving summary.
+    const collapsedRow = Array.from(round?.querySelectorAll<HTMLElement>('[data-process-row="true"][hidden][data-transcript-node]') ?? [])
+      .find((row) => anchor.blockId?.startsWith(`answer:${row.dataset.transcriptNode}:`));
+    const summary = collapsedRow?.closest('[data-process-container]')?.querySelector<HTMLElement>('[data-process-summary]');
+    return summary ? container.scrollTop + summary.getBoundingClientRect().top - container.getBoundingClientRect().top : position.scrollTop;
+  }
   let rect = block.getBoundingClientRect();
   let offset = anchor.offset;
   if (anchor.character !== null) {

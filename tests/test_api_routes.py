@@ -2538,6 +2538,32 @@ class TestSandboxListDir:
 class TestAbortEndpoint:
     """Abort 端點測試"""
 
+    @pytest.mark.parametrize("target_status,expected_code", [("completed", 200), ("cancelled", 200), ("running", 409)])
+    def test_targeted_abort_never_cancels_a_newer_run(self, client, target_status, expected_code):
+        from src.api.models.session import Session as SessionModel
+        from src.api.models.round import Round as RoundModel
+        from src.api.models.user_run_lock import UserRunLock
+        from src.api.utils.timezone import now_naive
+        old = MagicMock(id="old-round", status=target_status)
+        newer = MagicMock(id="new-round", status="running")
+        lock = MagicMock(lock_id="new-lock", updated_at=now_naive())
+        def query(model):
+            chain = MagicMock()
+            chain.filter.return_value.first.return_value = (
+                MagicMock(id="session-1") if model is SessionModel else old if model is RoundModel else lock if model is UserRunLock else None
+            )
+            return chain
+        self._mock_db_session.query.side_effect = query
+        with patch("src.api.routes.chat.get_main_running_round", return_value=newer), patch("src.api.routes.chat.get_agent_pool") as pool:
+            response = client.post("/chat/session-1/abort", json={"round_id": "old-round"})
+            assert response.status_code == expected_code
+            pool.assert_not_called()
+            self._mock_db_session.add.assert_not_called()
+            if expected_code == 200:
+                assert response.json()["round_status"] == target_status
+                assert response.json()["round_id"] == "old-round"
+                assert response.json()["admission_released"] is True
+
     @staticmethod
     def _cancel_result(request_id: str):
         from src.api.schemas.turn import CancelResult

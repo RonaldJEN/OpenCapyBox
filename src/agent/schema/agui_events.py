@@ -139,6 +139,8 @@ class RunFinishedEvent(BaseEvent):
     result: Optional[Any] = None
     outcome: Optional[RunFinishedOutcome] = None
     interrupt: Optional[InterruptDetails] = None
+    final_message_id: Optional[str] = Field(None, alias="finalMessageId")
+    final_message_ids: Optional[List[str]] = Field(None, alias="finalMessageIds")
 
 
 class RunErrorEvent(BaseEvent):
@@ -169,6 +171,7 @@ class TextMessageStartEvent(BaseEvent):
     type: Literal[EventType.TEXT_MESSAGE_START] = EventType.TEXT_MESSAGE_START
     message_id: str = Field(..., alias="messageId")
     role: Role
+    phase: Optional[Literal["commentary", "final_answer"]] = None
 
 
 class TextMessageContentEvent(BaseEvent):
@@ -182,6 +185,8 @@ class TextMessageEndEvent(BaseEvent):
     """文本消息结束事件"""
     type: Literal[EventType.TEXT_MESSAGE_END] = EventType.TEXT_MESSAGE_END
     message_id: str = Field(..., alias="messageId")
+    phase: Optional[Literal["commentary", "final_answer"]] = None
+    interrupted: Optional[bool] = None
 
 
 class TextMessageChunkEvent(BaseEvent):
@@ -219,12 +224,21 @@ class ThinkingTextMessageEndEvent(BaseEvent):
 # 工具调用事件
 # =============================================================================
 
+class ToolDisplay(BaseModel):
+    """Display-only identity captured from the registered tool at invocation."""
+    provider: Literal["builtin", "mcp"]
+    tool_name: str
+    server_name: Optional[str] = None
+    tool_title: Optional[str] = None
+
+
 class ToolCallStartEvent(BaseEvent):
     """工具调用开始事件"""
     type: Literal[EventType.TOOL_CALL_START] = EventType.TOOL_CALL_START
     tool_call_id: str = Field(..., alias="toolCallId")
     tool_call_name: str = Field(..., alias="toolCallName")
     parent_message_id: Optional[str] = Field(None, alias="parentMessageId")
+    tool_display: Optional[ToolDisplay] = Field(None, alias="toolDisplay")
 
 
 class ToolCallArgsEvent(BaseEvent):
@@ -246,6 +260,7 @@ class ToolCallResultEvent(BaseEvent):
     message_id: str = Field(..., alias="messageId")
     tool_call_id: str = Field(..., alias="toolCallId")
     content: str
+    success: Optional[bool] = None
     role: Optional[Literal["tool"]] = "tool"
     execution_time_ms: Optional[int] = Field(None, alias="executionTimeMs")
 

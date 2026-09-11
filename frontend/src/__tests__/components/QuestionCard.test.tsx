@@ -15,76 +15,38 @@ const mockQuestions: AskUserQuestion[] = [
 ];
 
 describe('QuestionCard 组件', () => {
-  it('未传 onDismiss 时不渲染关闭按钮', () => {
-    render(
-      <QuestionCard questions={mockQuestions} onSubmit={vi.fn()} />
-    );
-
-    expect(screen.queryByLabelText('关闭问题')).not.toBeInTheDocument();
-  });
-
-  it('传 onDismiss 时渲染关闭按钮，点击触发回调且不提交答案', () => {
-    const onDismiss = vi.fn();
+  it('第二题缺 options 时保留题文与自由输入，来回翻页不丢答案', () => {
     const onSubmit = vi.fn();
-
-    render(
-      <QuestionCard
-        questions={mockQuestions}
-        onSubmit={onSubmit}
-        onDismiss={onDismiss}
-      />
-    );
-
-    const closeBtn = screen.getByLabelText('关闭问题');
-    expect(closeBtn).toBeInTheDocument();
-
-    fireEvent.click(closeBtn);
-
-    expect(onDismiss).toHaveBeenCalledTimes(1);
-    expect(onSubmit).not.toHaveBeenCalled();
+    const questions = [mockQuestions[0], { header: '防覆盖', question: '是否保留补丁？', label: '另存补丁并记忆', description: '错误地铺在题目顶层' }];
+    render(<QuestionCard questions={questions} onSubmit={onSubmit} />);
+    fireEvent.click(screen.getByRole('button', { name: /PostgreSQL/ }));
+    fireEvent.click(screen.getByRole('button', { name: /下一题/ }));
+    expect(screen.getByText('是否保留补丁？')).toBeVisible();
+    expect(screen.getByText('本题未提供有效选项，请直接输入回答。')).toBeVisible();
+    expect(screen.queryByRole('button', { name: '另存补丁并记忆' })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole('textbox', { name: '是否保留补丁？' }), { target: { value: '只保存补丁' } });
+    fireEvent.click(screen.getByRole('button', { name: /上一题/ }));
+    expect(screen.getByRole('button', { name: /PostgreSQL/ })).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(screen.getByRole('button', { name: /下一题/ }));
+    expect(screen.getByRole('textbox', { name: '是否保留补丁？' })).toHaveValue('只保存补丁');
+    fireEvent.click(screen.getByRole('button', { name: '提交' }));
+    expect(onSubmit).toHaveBeenCalledWith({ '选哪个数据库？': 'PostgreSQL', '是否保留补丁？': '只保存补丁' });
   });
 
-  it('disabled 时关闭按钮不可用，点击不触发 onDismiss', () => {
-    const onDismiss = vi.fn();
-
-    render(
-      <QuestionCard
-        questions={mockQuestions}
-        onSubmit={vi.fn()}
-        onDismiss={onDismiss}
-        disabled
-      />
-    );
-
-    const closeBtn = screen.getByLabelText('关闭问题') as HTMLButtonElement;
-    expect(closeBtn).toBeDisabled();
-
-    fireEvent.click(closeBtn);
-    expect(onDismiss).not.toHaveBeenCalled();
-  });
-
-  it('Skip 与 Dismiss 是不同路径：Skip 提交 [No preference]，Dismiss 不提交', () => {
+  it('旧的多选题 options 为 null 时自由输入与跳过都可用', () => {
     const onSubmit = vi.fn();
-    const onDismiss = vi.fn();
-
-    render(
-      <QuestionCard
-        questions={mockQuestions}
-        onSubmit={onSubmit}
-        onDismiss={onDismiss}
-      />
-    );
-
-    // 点击 Skip：单题场景下直接提交 [No preference]
-    fireEvent.click(screen.getByText('Skip'));
-    expect(onSubmit).toHaveBeenCalledTimes(1);
-    expect(onSubmit).toHaveBeenCalledWith({ '选哪个数据库？': '[No preference]' });
-    expect(onDismiss).not.toHaveBeenCalled();
-
-    // 点击 Dismiss：不提交，仅触发 onDismiss
-    onSubmit.mockClear();
-    fireEvent.click(screen.getByLabelText('关闭问题'));
-    expect(onDismiss).toHaveBeenCalledTimes(1);
-    expect(onSubmit).not.toHaveBeenCalled();
+    render(<QuestionCard questions={[{ header: '旧题', question: '输入要求', options: null, multiSelect: true }]} onSubmit={onSubmit} />);
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '保留格式' } });
+    fireEvent.click(screen.getByRole('button', { name: '提交' }));
+    expect(onSubmit).toHaveBeenLastCalledWith({ '输入要求': '保留格式' });
+    fireEvent.click(screen.getByRole('button', { name: '跳过并提交' }));
+    expect(onSubmit).toHaveBeenLastCalledWith({ '输入要求': '[No preference]' });
   });
+
+  it('题目正文缺失时局部提示错误，不提交无法识别的问题', () => {
+    render(<QuestionCard questions={[{ options: mockQuestions[0].options }]} onSubmit={vi.fn()} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('问题内容不完整');
+    expect(screen.queryByRole('button', { name: '提交' })).not.toBeInTheDocument();
+  });
+
 });

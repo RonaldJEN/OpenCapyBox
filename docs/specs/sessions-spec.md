@@ -39,7 +39,7 @@
 
 别名：Thread（AG-UI 协议中 session = thread）
 
-`match_type` / `match_excerpt` 是列表搜索响应的派生字段，不落库。
+`match_type` / `match_excerpt` / `match_round_id` / `match_message_id` 是列表搜索响应的派生字段，不落库。
 
 ## 3. API 契约
 
@@ -54,13 +54,14 @@
 ### GET /api/sessions/list
 
 - Query: `q: str | None`（可选；搜索会话标题或讨论内容）
-- Response 200: `{sessions: [{id, user_id, status, created_at, updated_at, title, model_id, match_type?, match_excerpt?, match_round_id?}]}`
+- Response 200: `{sessions: [{id, user_id, status, created_at, updated_at, title, model_id, match_type?, match_excerpt?, match_round_id?, match_message_id?}]}`
 - `q` 为空或全空格时返回完整列表；非空时仅返回当前用户匹配的 sessions
-- 搜索范围：`sessions.title` + `rounds.user_message` + `conversation_messages(role=assistant).content` + `rounds.final_response`
+- 搜索范围：`sessions.title` + `rounds.user_message` + 持久化主助手消息投影；无完整消息事件身份的 legacy 记录回退 `conversation_messages(role=assistant).content` / `rounds.final_response`。
+- 所有正文搜索来源在排序和截断前统一排除 `subagent_runs.child_run_id` 对应轮次，包括子任务内部用户消息与 legacy 助手正文/终稿；不以 `parent_run_id` 非空或文本关键词判断。主助手自己的汇总仍可搜索。
 - 用户消息只搜索 `rounds.user_message` 这种前端可见文本，不搜索 `conversation_messages(role=user).content` 中的 Agent 内部上下文 / 附件提示 / Data URL
-- Agent 回复搜索 `conversation_messages(role=assistant).content`，排除 `tool` / `summary` / `synthetic`；`rounds.final_response` 作为历史重建兜底
-- 搜索使用 PostgreSQL 兼容的 `ILIKE ... ESCAPE` 轻量匹配，用户输入中的 `\`、`%`、`_` 必须转义为普通字符
-- 非空搜索最多返回 50 个 sessions；各搜索来源在 DB 侧按 session 取最佳命中并截断，避免侧栏搜索拉回无界历史
+- 主助手使用与 history 相同的 AssistantMessageProjection，按 messageId 重建增量后做字面量 casefold 匹配，支持关键词跨增量边界；排除 subagent 子运行、其他用户、tool、summary、synthetic 和系统错误。legacy completed 终稿作为兼容兜底。命中返回对应 Round/messageId。
+- 标题、用户消息和 legacy 搜索使用 PostgreSQL 兼容的 `ILIKE ... ESCAPE`，用户输入中的 `\`、`%`、`_` 转义为普通字符；主助手消息使用完整正文的字面量 casefold 匹配。
+- 非空搜索最多返回 50 个 sessions。主消息事件以 256 行流式批次读取，每轮重建并在足够命中时停止；无命中时仍需扫描该用户可见正文事件，暂未建立全文索引。其他来源在 DB 侧按 session 取最佳命中并截断。
 - `match_type` 取值：`title` / `user` / `assistant`
 - `match_round_id` 在命中具体轮次时返回，供前端切换 session 后定位
 - 排序优先级：title → user → assistant；同级内按更新时间倒序
@@ -83,6 +84,7 @@
 {
   "round_id": "...",
   "parent_run_id": "... | null",
+  "subagent_tasks": [SubagentTaskSnapshot],
   "idempotency_key": "... | null",
   "last_event_sequence": 0,
   "user_message": "...",
@@ -90,6 +92,10 @@
   "thinking_mode": "enabled | disabled | provider_default | null",
   "reasoning_effort": "max | null",
   "final_response": "...",
+  "assistant_messages": [AssistantMessageData],
+  "transcript_coverage": {"kind": "complete | partial | legacy", "durable_through_sequence": 0},
+  "final_message_id": null,
+  "final_message_ids": null,
   "steps": [StepData],
   "step_count": 0,
   "status": "running | waiting_interaction | completed | failed | cancelled | max_steps_reached",
@@ -101,6 +107,20 @@
 
 `idempotency_key` 由客户端发送消息时生成；history/v2 必须返回该字段，供 accepted 但尚未收到 `runId` 的断线恢复路径按因果标识定位本次 round，不能用时间窗口猜测旧 round。
 `last_event_sequence` 是该 Round 已持久化 AG-UI 事件的最大 sequence；前端在 history 已经重建 `running` 或 `waiting_interaction` Round 后订阅 SSE 时必须从该 sequence 之后接续，避免重复消费已展示事件。
+
+`subagent_tasks` 来自持久化 graph 中当前 Round 直接委派的任务，按创建顺序返回。每项为 `{edge_id,parent_run_id,child_run_id,tool_call_id,agent_name,description,agent_type,model_id,status,created_at,started_at,completed_at}`；`status` 为 `requested | running | completed | failed | cancelled`，尚未创建 child Round 时 `child_run_id=null`。该数组不包含子任务 prompt、正文或结果，也不从工具输出字符串推断身份。旧 graph 记录无需回填即可恢复。
+
+`TOOL_CALL_RESULT.success` 不能创建、完成或失败一个子任务：没有 child 的成功最多是已发起，终态只由关联 child Round 决定。
+
+graph 在正文事件 watermark 之后读取，避免遗漏已包含在 watermark 内的新任务关联；状态可能比该 watermark 更新。客户端按 `edge_id` 合并时，后续旧生命周期事件不得把已知终态退回 requested/running，也不得用 null 清掉已有 child_run_id。
+
+若真实关联的 child Round 已达权威终态，任务数组和 graph edge 只读投影以该终态为准（`max_steps_reached → failed`）；完成时间仅在 edge 缺失时取 child.completed_at。不改写旧 edge，不推断缺失或仍运行的 child 状态。
+
+会话 history/v2 继续排除 child Round；点击子任务通过 `GET /api/chat/{session_id}/round/{child_run_id}/snapshot` 获取同语义的单 RoundData，随后用其 `last_event_sequence` 接续对应子运行的 SSE。
+
+`assistant_messages` 按原消息顺序返回 `message_id/step_number/first_sequence/last_sequence/content/state/content_committed`，以及可空的 `phase=commentary | final_answer`。phase 只来自供应商明确标记，未知或缺失不推断；`state=interrupted` 的已提交正文保留给 UI。冷模型历史另行排除身份明确的中断尝试，包括取消终态先于 END 提交的情况；旧数据无法证明完整身份时维持 legacy 聚合。
+
+`final_message_id` 对应单条最终消息；多个最终段使用有序 `final_message_ids`，有最终消息别名的新终态只填其中一个，均不是额外正文。它们分别投影 `RUN_FINISHED.finalMessageId/finalMessageIds`；`final_response` 可汇总多个最终段，客户端依据别名避免重复展示。
 
 当 `status=waiting_interaction` 时，`interrupt` 必须由该 Round 的 pending `agent_interactions` 投影：`id` 为 Interaction id，`reason` 按 kind 映射为 `input_required` / `human_approval`，`payload` 包含 kind-specific 请求和 `tool_call_id`。same-Round 路径不生成额外 Q/A Round。
 
@@ -119,6 +139,7 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
     {
       "id": "...",
       "name": "...",
+      "tool_display": {"provider": "mcp", "server_name": "资料服务", "tool_name": "lookup", "tool_title": "查找资料"},
       "input": {},
       "started_at_ts": 1710000000000,
       "ended_at_ts": 1710000000100
@@ -144,6 +165,10 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 ```
 
 `*_ts` 字段均为 AG-UI 事件时间戳（毫秒），用于前端恢复历史时重建思考、工具调用和工具结果耗时；旧事件缺少对应时间戳时字段为 `null` 或省略。
+
+`tool_results[].success` 是 `true | false | null` 三态：新 `TOOL_CALL_RESULT.success` 是唯一的写入事实；`null` 表示旧事件没有可证实的结果状态。兼容读取仅识别显式布尔，依次为顶层 `success`、顶层 `isError`、`content/result` JSON 的 `success`、其中的 `isError`；文本或 `error` 字段不参与推断。history 返回该三态，不得以展示需要把 `null` 改成成功或失败。
+
+`ToolCall.tool_display` 可空，来自对应 `TOOL_CALL_START.toolDisplay` 的调用时快照：`provider=builtin | mcp`，`tool_name` 为原始工具名，`server_name/tool_title` 可空。`name` 仍是模型调用标识。历史读取不得查询当前工具目录替旧记录补写名称或来源；没有展示快照的旧调用继续使用 `name`。
 
 - Error 404
 

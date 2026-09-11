@@ -1,6 +1,8 @@
 """Schema definitions for OpenCapyBox."""
 
 from .schema import (
+    AssistantMessageStreamEvent,
+    AssistantTextMessage,
     FunctionCall,
     LLMProvider,
     LLMResponse,
@@ -73,6 +75,8 @@ from .skill_key import (
 )
 
 __all__ = [
+    "AssistantMessageStreamEvent",
+    "AssistantTextMessage",
     # 原有導出
     "FunctionCall",
     "LLMProvider",

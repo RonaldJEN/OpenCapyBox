@@ -91,19 +91,71 @@ class TestAgentInterrupt:
 
     @pytest.mark.asyncio
     async def test_interrupt_saves_pending_state(self, tmp_path):
-        """中断后 agent._pending_interrupt 应有正确状态"""
+        """合法多题必须完整保留在同一 pending interaction。"""
         llm = MockLLMClient()
-        llm.responses = [_make_ask_user_response()]
+        response = _make_ask_user_response()
+        questions = response.tool_calls[0].function.arguments["questions"]
+        questions.append({
+            "question": "Where should it run?",
+            "header": "Deployment",
+            "options": [
+                {"label": "Local", "description": "On this computer"},
+                {"label": "Cloud", "description": "On a hosted server"},
+            ],
+        })
+        llm.responses = [response]
 
         agent = make_agent(tmp_path, llm=llm, tools=[AskUserQuestionTool()])
         agent.add_user_message("Help me choose")
 
-        await collect_agui_events(agent)
+        events, _ = await collect_agui_events(agent)
 
         assert agent._pending_interrupt is not None
         assert "interrupt_id" in agent._pending_interrupt
         assert agent._pending_interrupt["tool_call_id"] == "tc_ask_1"
-        assert len(agent._pending_interrupt["questions"]) == 1
+        assert agent._pending_interrupt["questions"] == questions
+        requested = [
+            event for event in events
+            if event.type == EventType.CUSTOM and event.name == "interaction_requested"
+        ]
+        assert len(requested) == 1
+        assert requested[0].value["payload"]["questions"] == questions
+
+    @pytest.mark.asyncio
+    async def test_missing_options_in_second_question_returns_tool_error(self, tmp_path):
+        """第二题错把选项铺到顶层时不发卡片，模型收到具体路径并继续。"""
+        response = _make_ask_user_response()
+        response.tool_calls[0].function.arguments["questions"].append({
+            "question": "Should the examples be updated?",
+            "header": "Examples",
+            "label": "Update examples",
+            "description": "Use the corrected paths",
+        })
+        llm = MockLLMClient()
+        llm.responses = [response]
+        agent = make_agent(tmp_path, llm=llm, tools=[AskUserQuestionTool()])
+        agent.add_user_message("Help me choose")
+
+        events, _ = await collect_agui_events(agent)
+
+        assert agent._pending_interrupt is None
+        assert not any(
+            event.type == EventType.CUSTOM and event.name == "interaction_requested"
+            for event in events
+        )
+        results = [
+            event for event in events
+            if event.type == EventType.TOOL_CALL_RESULT and event.tool_call_id == "tc_ask_1"
+        ]
+        assert len(results) == 1
+        assert "$.questions[1]" in results[0].content
+        assert "'options' is a required property" in results[0].content
+        tool_messages = [
+            message for message in agent.messages
+            if message.role == "tool" and message.tool_call_id == "tc_ask_1"
+        ]
+        assert [message.content for message in tool_messages] == [results[0].content]
+        assert llm.call_count == 2
 
     @pytest.mark.asyncio
     async def test_interrupt_has_placeholder_tool_result(self, tmp_path):

@@ -19,6 +19,7 @@ from src.api.utils.timezone import get_timezone, get_timezone_offset
 from .llm import LLMClient
 from .logger import AgentLogger
 from .schema import FunctionCall, Message, ToolCall
+from .schema.schema import AssistantMessageStreamEvent
 from .schema.run_context import (
     LLMRequestContext,
     render_pending_file_drafts_context_block,
@@ -48,7 +49,7 @@ from .context_compaction import (
     truncate_tool_output,
 )
 from .schema.agui_events import (
-    AGUIEvent, AgentState, CustomEvent, EventType,
+    AGUIEvent, AgentState, CustomEvent, EventType, ToolDisplay,
 )
 
 logger = logging.getLogger(__name__)
@@ -1941,6 +1942,19 @@ class Agent:
             function_name = ""
         return tool_call_id, function_name, arguments
 
+    def _tool_display(self, function_name: str) -> ToolDisplay | None:
+        """Snapshot display identity without interpreting model arguments or names."""
+        tool = self.tools.get(function_name)
+        if tool is None:
+            return None
+        ref = tool.tool_ref
+        return ToolDisplay(
+            provider=ref.provider,
+            tool_name=ref.name,
+            server_name=getattr(tool, "server_name", None),
+            tool_title=getattr(tool, "title", None),
+        )
+
     @staticmethod
     def _tool_call_events(
         emitter: AGUIEventEmitter,
@@ -2084,13 +2098,12 @@ class Agent:
                     outcome_uncertain=True,
                 )
             except Exception as e:
-                import traceback
+                logger.exception("Tool invocation failed: %s", function_name)
                 error_detail = f"{type(e).__name__}: {str(e)}"
-                error_trace = traceback.format_exc()
                 result = ToolResult(
                     success=False,
                     content="",
-                    error=f"Tool execution failed: {error_detail}\n\nTraceback:\n{error_trace}",
+                    error=error_detail,
                 )
             finally:
                 execution_time_ms = int((perf_counter() - start_time) * 1000)
@@ -3211,7 +3224,7 @@ class Agent:
                 print(f"Event: {event.type}")
         """
         # 初始化事件發射器
-        emitter = AGUIEventEmitter(thread_id, run_id)
+        emitter = AGUIEventEmitter(thread_id, run_id, tool_display_resolver=self._tool_display)
         tool_loop_guard = _ToolLoopGuard(workspace_dir=self._model_workspace_dir)
 
         def _observe_tool_record(record: _ExecutedToolCall) -> None:
@@ -3245,6 +3258,7 @@ class Agent:
         
         step = max(int(initial_step or 0), 0)
         final_response: Optional[str] = None
+        final_message_ids: list[str] | None = None
 
         # 多層退出檢查計數器
         output_truncation_retries = 0
@@ -3280,6 +3294,7 @@ class Agent:
                     {"toolCallId": approved_record.tool_call_id},
                 )
                 yield emitter.tool_call_result(
+                    success=approved_record.result.success,
                     tool_call_id=approved_record.tool_call_id,
                     content=approved_record.result_content,
                     execution_time_ms=approved_record.execution_time_ms,
@@ -3386,6 +3401,34 @@ class Agent:
 
                 thinking_started = False
                 message_started = False
+                native_messages_seen = False
+                native_stream_id: str | None = None
+                native_message_ids: dict[tuple[str, str], str] = {}
+
+                async def on_native_message(message: AssistantMessageStreamEvent):
+                    nonlocal native_messages_seen, native_stream_id
+                    native_messages_seen = True
+                    native_stream_id = message.stream_id
+                    key = (message.stream_id, message.provider_message_id)
+                    if message.kind == "start":
+                        if key in native_message_ids:
+                            raise ValueError("Native assistant message started twice")
+                        event = emitter.text_message_start(role="assistant", phase=message.phase)
+                        native_message_ids[key] = event.message_id
+                    else:
+                        local_id = native_message_ids.get(key)
+                        if local_id is None:
+                            raise ValueError("Native assistant message event has no START")
+                        if message.kind == "delta":
+                            _mark_first_token()
+                            event = emitter.text_message_content(message.delta, message_id=local_id)
+                        else:
+                            event = emitter.text_message_end(
+                                message_id=local_id, phase=message.phase,
+                                interrupted=True if message.interrupted else None,
+                            )
+                    if event:
+                        await event_queue.put(event)
 
                 async def on_content_delta(delta: str):
                     _mark_first_token()
@@ -3421,7 +3464,8 @@ class Agent:
                     fallback_kwargs: dict[str, Any],
                 ) -> dict[str, Any]:
                     """Reset streaming state and compact for a smaller fallback."""
-                    nonlocal thinking_started, message_started
+                    nonlocal thinking_started, message_started, native_messages_seen
+                    native_messages_seen = False
                     if thinking_started:
                         await event_queue.put(emitter.thinking_end())
                         thinking_started = False
@@ -3506,6 +3550,8 @@ class Agent:
                                 on_content=on_content_delta,
                                 on_thinking=on_thinking_delta,
                                 on_tool_call=on_tool_call_delta,
+                                **({"on_message": on_native_message}
+                                   if getattr(self.llm, "supports_message_callbacks", False) is True else {}),
                             )
                         except Exception as e:
                             return e
@@ -3517,6 +3563,8 @@ class Agent:
 
                     # 消费循环（带 cancel_token 检查，可在 LLM 调用期间响应取消）
                     cancelled_during_llm = False
+                    published_text_message_ids: set[str] = set()
+                    cancelled_queue_item = None
 
                     # 构建 cancel 等待 future（如果有 cancel_token）
                     cancel_future: asyncio.Future | None = None
@@ -3533,7 +3581,10 @@ class Agent:
 
                         if cancel_future in done:
                             # 用户取消
-                            get_task.cancel()
+                            if get_task in done:
+                                cancelled_queue_item = get_task.result()
+                            else:
+                                get_task.cancel()
                             cancelled_during_llm = True
                             producer_task.cancel()
                             try:
@@ -3547,6 +3598,8 @@ class Agent:
                         if item is SENTINEL:
                             break
                         if isinstance(item, AGUIEvent):
+                            if item.type == EventType.TEXT_MESSAGE_START:
+                                published_text_message_ids.add(item.message_id)
                             yield item
 
                     # 清理未使用的 cancel_future
@@ -3556,6 +3609,16 @@ class Agent:
                     # 如果是 LLM 调用期间被用户取消
                     if cancelled_during_llm:
                         logger.info("⏹️  用戶取消了執行 (LLM 調用期間)")
+                        # Preserve failure facts for already published native
+                        # messages without publishing queued post-stop content.
+                        pending = [cancelled_queue_item]
+                        while not event_queue.empty():
+                            pending.append(event_queue.get_nowait())
+                        for event in pending:
+                            if (getattr(event, "type", None) == EventType.TEXT_MESSAGE_END
+                                    and getattr(event, "interrupted", False)
+                                    and event.message_id in published_text_message_ids):
+                                yield event
                         if thinking_started:
                             yield emitter.thinking_end()
                         if message_started:
@@ -3662,6 +3725,7 @@ class Agent:
                     thinking=response.thinking,
                     tool_calls=response.tool_calls,
                     provider_items=response.provider_items,
+                    assistant_text_messages=response.assistant_text_messages,
                 )
                 self.messages.append(assistant_msg)
 
@@ -3674,7 +3738,26 @@ class Agent:
                 # 补发 text message 事件：
                 # 如果流式 delta 触发了 message_started，正常发 END；
                 # 如果流式未产生 delta（如模型一次性返回 content），补发完整 START/CONTENT/END
-                if message_started:
+                response_message_ids: list[str] = []
+                if native_messages_seen:
+                    # Native item ENDs have already been emitted. Do not merge
+                    # their text into a second anonymous assistant message.
+                    for text_message in response.assistant_text_messages or []:
+                        local_id = native_message_ids.get((native_stream_id, text_message.provider_message_id))
+                        if local_id is None:
+                            raise ValueError("Responses final message has no matching streamed identity")
+                        response_message_ids.append(local_id)
+                elif response.assistant_text_messages is not None:
+                    # Non-streaming compatible clients still retain boundaries.
+                    for text_message in response.assistant_text_messages:
+                        start_event = emitter.text_message_start(role="assistant", phase=text_message.phase)
+                        response_message_ids.append(start_event.message_id)
+                        yield start_event
+                        evt = emitter.text_message_content(text_message.content)
+                        if evt:
+                            yield evt
+                        yield emitter.text_message_end(phase=text_message.phase)
+                elif message_started:
                     yield emitter.text_message_end()
                     print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
                     print(f"{response.content}")
@@ -3690,8 +3773,17 @@ class Agent:
 
                 # 多層退出檢查（借鑑 Claude Code 的 needsFollowUp 模式）
                 if not response.tool_calls:
+                    text_messages = response.assistant_text_messages
+                    final_indexes = [index for index, part in enumerate(text_messages or [])
+                                     if part.phase == "final_answer"]
+                    if final_indexes:
+                        final_indexes = [index for index in final_indexes if text_messages[index].content.strip()]
+                        answer_content = "\n\n".join(text_messages[index].content for index in final_indexes)
+                    else:
+                        answer_content = response.content
+                        final_indexes = [index for index, part in enumerate(text_messages or []) if part.content]
                     # 非空正常回覆時重置空響應標記
-                    if response.content and response.content.strip():
+                    if answer_content and answer_content.strip():
                         empty_response_nudged = False
 
                     # CHECK 1: 輸出截斷恢復
@@ -3720,7 +3812,7 @@ class Agent:
 
                     # CHECK 2: 空響應兜底
                     # 模型返回空 content + 無 tool_calls 是異常行為，nudge 一次
-                    if not (response.content and response.content.strip()) and not empty_response_nudged:
+                    if not (answer_content and answer_content.strip()) and not empty_response_nudged:
                         empty_response_nudged = True
                         print(f"\n{Colors.BRIGHT_YELLOW}⚠️  Empty response with no tool calls, nudging model...{Colors.RESET}")
                         nudge_content = (
@@ -3740,7 +3832,7 @@ class Agent:
                         continue  # 再給一次機會
 
                     # CHECK 3: 連續空響應，視為異常退出
-                    if not (response.content and response.content.strip()):
+                    if not (answer_content and answer_content.strip()):
                         error_msg = "Model returned empty response twice with no tool calls. Ending run."
                         print(f"\n{Colors.BRIGHT_RED}🚫 {error_msg}{Colors.RESET}")
                         yield emitter.step_finished(step_name)
@@ -3748,7 +3840,9 @@ class Agent:
                         return
 
                     # 正常完成
-                    final_response = response.content
+                    final_response = answer_content
+                    if text_messages is not None:
+                        final_message_ids = [response_message_ids[index] for index in final_indexes]
                     yield emitter.step_finished(step_name)
                     break
                 
@@ -3777,6 +3871,7 @@ class Agent:
                             )
                             yield emitter.tool_call_end(remaining_id)
                             yield emitter.tool_call_result(
+                                success=False,
                                 tool_call_id=remaining_id,
                                 content="Cancelled by user",
                                 execution_time_ms=0,
@@ -3823,6 +3918,7 @@ class Agent:
                             execution_time_ms=0,
                         )
                         yield emitter.tool_call_result(
+                            success=False,
                             tool_call_id=tool_call_id,
                             content=blocked_content,
                             execution_time_ms=0,
@@ -3846,6 +3942,7 @@ class Agent:
                             yield emitter.tool_call_end(remaining_id)
                             skipped_content = "[Skipped: runtime tool loop detected]"
                             yield emitter.tool_call_result(
+                                success=False,
                                 tool_call_id=remaining_id,
                                 content=skipped_content,
                                 execution_time_ms=0,
@@ -3918,6 +4015,7 @@ class Agent:
                             execution_time_ms=0,
                         )
                         yield emitter.tool_call_result(
+                            success=False,
                             tool_call_id=tool_call_id,
                             content=exposure_error,
                             execution_time_ms=0,
@@ -3962,6 +4060,7 @@ class Agent:
                             execution_time_ms=0,
                         )
                         yield emitter.tool_call_result(
+                            success=False,
                             tool_call_id=tool_call_id,
                             content=_TOOL_UNAVAILABLE_MESSAGE,
                             execution_time_ms=0,
@@ -4015,6 +4114,7 @@ class Agent:
                                 execution_time_ms=0,
                             )
                             yield emitter.tool_call_result(
+                                success=False,
                                 tool_call_id=tool_call_id,
                                 content=blocked_content,
                                 execution_time_ms=0,
@@ -4069,6 +4169,7 @@ class Agent:
                                     execution_time_ms=0,
                                 )
                                 yield emitter.tool_call_result(
+                                    success=False,
                                     tool_call_id=tool_call_id,
                                     content=blocked_content,
                                     execution_time_ms=0,
@@ -4098,6 +4199,7 @@ class Agent:
                                 )
                                 yield emitter.tool_call_end(remaining_id)
                                 yield emitter.tool_call_result(
+                                    success=False,
                                     tool_call_id=remaining_id,
                                     content="[Skipped: tool approval pending]",
                                     execution_time_ms=0,
@@ -4164,6 +4266,7 @@ class Agent:
                                 for _index, batch_tool_call in batch:
                                     batch_id, batch_name, _batch_args = self._tool_call_identity(batch_tool_call)
                                     yield emitter.tool_call_result(
+                                        success=False,
                                         tool_call_id=batch_id,
                                         content="Cancelled by user",
                                         execution_time_ms=0,
@@ -4185,6 +4288,7 @@ class Agent:
                                     )
                                     yield emitter.tool_call_end(remaining_id)
                                     yield emitter.tool_call_result(
+                                        success=False,
                                         tool_call_id=remaining_id,
                                         content="Cancelled by user",
                                         execution_time_ms=0,
@@ -4213,6 +4317,7 @@ class Agent:
                             )
                             for record in records:
                                 yield emitter.tool_call_result(
+                                    success=record.result.success,
                                     tool_call_id=record.tool_call_id,
                                     content=record.result_content,
                                     execution_time_ms=record.execution_time_ms,
@@ -4237,6 +4342,7 @@ class Agent:
                     if cancel_token and cancel_token.is_set():
                         print(f"\n{Colors.BRIGHT_YELLOW}⏹️  用戶取消了執行 (跳過工具 {function_name}){Colors.RESET}")
                         yield emitter.tool_call_result(
+                            success=False,
                             tool_call_id=tool_call_id,
                             content="Cancelled by user",
                             execution_time_ms=0,
@@ -4258,6 +4364,7 @@ class Agent:
                             )
                             yield emitter.tool_call_end(remaining_id)
                             yield emitter.tool_call_result(
+                                success=False,
                                 tool_call_id=remaining_id,
                                 content="Cancelled by user",
                                 execution_time_ms=0,
@@ -4279,13 +4386,18 @@ class Agent:
                         return
 
                     # 🛑 Human-in-the-Loop: ask_user 拦截点
-                    if function_name == ASK_USER_TOOL_NAME and self.allow_human_interrupts:
+                    if (
+                        function_name == ASK_USER_TOOL_NAME
+                        and self.allow_human_interrupts
+                        and validation_error is None
+                    ):
                         questions_payload = arguments.get("questions", []) if isinstance(arguments, dict) else []
 
                         # 防御性校验：空 questions 不应触发中断，返回错误结果继续执行
                         if not questions_payload:
                             error_msg = "ask_user called with empty questions list; skipping interrupt."
                             yield emitter.tool_call_result(
+                                success=False,
                                 tool_call_id=tool_call_id,
                                 content=error_msg,
                                 execution_time_ms=0,
@@ -4328,6 +4440,7 @@ class Agent:
                             )
                             yield emitter.tool_call_end(remaining_id)
                             yield emitter.tool_call_result(
+                                success=False,
                                 tool_call_id=remaining_id,
                                 content="[Skipped: user question pending]",
                                 execution_time_ms=0,
@@ -4379,6 +4492,7 @@ class Agent:
                         allowed_policy_effects=frozenset({"allow"}),
                     )
                     yield emitter.tool_call_result(
+                        success=record.result.success,
                         tool_call_id=record.tool_call_id,
                         content=record.result_content,
                         execution_time_ms=record.execution_time_ms,
@@ -4420,7 +4534,7 @@ class Agent:
                 )
             else:
                 # 正常完成
-                yield emitter.run_finished(outcome="success", result={"final_response": final_response})
+                yield emitter.run_finished(outcome="success", result={"final_response": final_response}, final_message_ids=final_message_ids)
                 
         except ContinuationOwnershipLostError:
             raise

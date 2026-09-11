@@ -40,6 +40,8 @@ class LLMClient:
         client = LLMClient(api_key=..., provider=..., api_base=..., model=...)
     """
 
+    supports_message_callbacks = True
+
     def __init__(
         self,
         api_key: str,
@@ -385,6 +387,8 @@ class LLMClient:
         on_content=None,
         on_thinking=None,
         on_tool_call=None,
+        *,
+        on_message=None,
     ) -> LLMResponse:
         """Generate response from LLM with streaming support (with failover).
 
@@ -402,4 +406,5 @@ class LLMClient:
             "generate_stream",
             messages=messages, tools=tools,
             on_content=on_content, on_thinking=on_thinking, on_tool_call=on_tool_call,
+            **({"on_message": on_message} if on_message is not None else {}),
         )

@@ -1,15 +1,33 @@
-import { useState, useCallback } from 'react';
-import { MessageCircle, Check, Send, ChevronLeft, ChevronRight, X } from 'lucide-react';
+import { useState, useCallback, useMemo } from 'react';
+import { MessageCircle, Check, Send, ChevronLeft, ChevronRight } from 'lucide-react';
 import type { AskUserQuestion } from '../types';
 
 interface QuestionCardProps {
-  questions: AskUserQuestion[];
+  questions: unknown;
   onSubmit: (answers: Record<string, string>) => void;
-  onDismiss?: () => void;
   disabled?: boolean;
 }
 
 const NO_PREFERENCE = '[No preference]';
+const EMPTY_QUESTIONS: AskUserQuestion[] = [];
+
+// Stored interactions can predate nested ask_user validation. Preserve each
+// question/answer key, but never assume that its wire payload contains options.
+function parseQuestions(input: unknown): AskUserQuestion[] | null {
+  if (!Array.isArray(input)) return null;
+  const result: AskUserQuestion[] = [];
+  for (const [index, value] of input.entries()) {
+    if (!value || typeof value !== 'object' || typeof value.question !== 'string' || !value.question.trim()) return null;
+    const options = Array.isArray(value.options) ? value.options.flatMap((option: unknown) => {
+      if (!option || typeof option !== 'object' || !('label' in option)
+        || typeof option.label !== 'string' || !option.label.trim()) return [];
+      return [{ label: option.label, description: 'description' in option && typeof option.description === 'string' ? option.description : '' }];
+    }) : [];
+    result.push({ question: value.question, header: typeof value.header === 'string' ? value.header : `问题 ${index + 1}`,
+      options, multiSelect: value.multiSelect === true });
+  }
+  return result;
+}
 
 function splitSelections(value: string): string[] {
   return value
@@ -32,7 +50,9 @@ function isAnswerFromOptions(question: AskUserQuestion, answer: string): boolean
   return question.options.some((opt) => opt.label === answer);
 }
 
-export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false }: QuestionCardProps) {
+export function QuestionCard({ questions: rawQuestions, onSubmit, disabled = false }: QuestionCardProps) {
+  const parsedQuestions = useMemo(() => parseQuestions(rawQuestions), [rawQuestions]);
+  const questions = parsedQuestions ?? EMPTY_QUESTIONS;
   // answers: question index -> selected label(s) or freeform text
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -102,6 +122,9 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
     setCurrentIndex((prev) => Math.min(prev + 1, totalQuestions - 1));
   };
 
+  if (!parsedQuestions) return <div role="alert" className="rounded-xl border border-claude-border bg-white p-4 text-sm text-claude-secondary">
+    问题内容不完整，请停止本轮后重试。
+  </div>;
   if (!currentQuestion) return null;
 
   const selectedValues = currentQuestion.multiSelect
@@ -111,44 +134,37 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
   const canSubmit = !disabled && totalQuestions > 0;
 
   return (
-    <div className="bg-white border border-claude-border rounded-2xl overflow-hidden shadow-xl">
+    <div className="flex max-h-[min(560px,70dvh)] flex-col overflow-hidden rounded-2xl border border-claude-border bg-white shadow-sm">
       {/* Header */}
-      <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-claude-border bg-claude-surface/50">
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-claude-border px-4 py-3">
         <div className="flex items-center gap-2 min-w-0">
           <MessageCircle size={16} className="text-claude-accent flex-shrink-0" />
-          <span className="text-sm font-medium text-claude-text truncate">Agent 需要你的输入</span>
+          <span className="truncate text-sm font-semibold text-claude-text">请确认以下问题</span>
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
           {totalQuestions > 1 && (
             <span className="text-xs text-claude-secondary font-medium">
-              {`<${safeIndex + 1}/${totalQuestions}>`}
+              {`${safeIndex + 1} / ${totalQuestions}`}
             </span>
-          )}
-          {onDismiss && (
-            <button
-              type="button"
-              onClick={onDismiss}
-              disabled={disabled}
-              className="p-0.5 rounded-md hover:bg-claude-hover transition-colors text-claude-muted hover:text-claude-secondary disabled:opacity-50"
-              aria-label="关闭问题"
-            >
-              <X size={14} />
-            </button>
           )}
         </div>
       </div>
 
       {/* Questions */}
-      <div className="px-3 py-3 space-y-3">
+      <div className="min-h-0 space-y-3 overflow-y-auto px-4 py-3">
         {/* Question header tag + text */}
-        <div className="flex items-start gap-2 mb-2">
+        <div className="mb-2 flex flex-wrap items-center gap-2">
           <span className="inline-block px-1.5 py-0.5 rounded-md bg-claude-surface text-[11px] font-medium text-claude-secondary flex-shrink-0">
             {currentQuestion.header}
           </span>
-          <p className="text-[13px] text-claude-text leading-relaxed">{currentQuestion.question}</p>
+          {currentQuestion.options.length > 0 && <span className="text-xs text-claude-secondary">
+            {currentQuestion.multiSelect ? '可多选' : '单选'}
+          </span>}
+          <p className="w-full text-sm font-medium leading-relaxed text-claude-text">{currentQuestion.question}</p>
         </div>
 
         {/* Option buttons */}
+        {currentQuestion.options.length === 0 && <p className="text-xs text-claude-secondary">本题未提供有效选项，请直接输入回答。</p>}
         <div className="space-y-1.5">
           {currentQuestion.options.map((opt) => {
             const selected = currentQuestion.multiSelect
@@ -160,6 +176,7 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
                 key={opt.label}
                 type="button"
                 disabled={disabled}
+                aria-pressed={selected}
                 onClick={() => toggleOption(safeIndex, opt.label, currentQuestion.multiSelect)}
                 className={`w-full text-left px-3 py-2 rounded-lg border transition-[background-color,border-color,box-shadow,opacity,transform] text-[13px] ${
                   selected
@@ -168,10 +185,12 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
                 } ${disabled ? 'opacity-50 cursor-not-allowed' : 'active:scale-[0.99]'}`}
               >
                 <div className="flex items-start gap-2.5">
-                  <div className={`w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center flex-shrink-0 mt-0.5 transition-colors ${
+                  <div aria-hidden="true" className={`w-3.5 h-3.5 ${currentQuestion.multiSelect ? 'rounded-[3px]' : 'rounded-full'} border-2 flex items-center justify-center flex-shrink-0 mt-0.5 transition-colors ${
                     selected ? 'border-claude-text bg-claude-text' : 'border-claude-muted'
                   }`}>
-                    {selected && <Check size={10} className="text-white" />}
+                    {selected && (currentQuestion.multiSelect
+                      ? <Check size={10} className="text-white" />
+                      : <span className="h-1.5 w-1.5 rounded-full bg-white" />)}
                   </div>
                   <div className="flex-1 min-w-0">
                     <span className={`font-medium text-[13px] ${selected ? 'text-claude-text' : 'text-claude-secondary'}`}>
@@ -192,7 +211,8 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
           <input
             type="text"
             disabled={disabled}
-            placeholder="或输入自定义回答..."
+            aria-label={currentQuestion.question}
+            placeholder={currentQuestion.options.length ? '或输入自定义回答...' : '请输入回答...'}
             value={freeformValue}
             onChange={(e) => setFreeform(safeIndex, e.target.value)}
             className="w-full px-2.5 py-1.5 text-[13px] border border-claude-border rounded-lg bg-transparent text-claude-text placeholder:text-claude-muted focus:outline-none focus:border-claude-text/30 transition-colors disabled:opacity-50"
@@ -201,7 +221,7 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
       </div>
 
       {/* Footer actions */}
-      <div className="px-3 pb-3 flex items-center justify-between gap-2">
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-claude-border px-4 py-3">
         <button
           type="button"
           disabled={disabled || safeIndex === 0}
@@ -227,7 +247,7 @@ export function QuestionCard({ questions, onSubmit, onDismiss, disabled = false 
                 : 'border-claude-border text-claude-secondary hover:border-claude-border-strong hover:bg-claude-hover'
             }`}
           >
-            Skip
+            {isLastQuestion ? '跳过并提交' : '跳过'}
           </button>
 
           {isLastQuestion ? (

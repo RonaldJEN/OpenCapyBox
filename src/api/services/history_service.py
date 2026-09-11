@@ -15,6 +15,7 @@ from src.api.models.agui_event import AGUIEventLog
 from src.api.models.agent_interaction import AgentInteraction
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.models.subagent_run import SubagentRun
+from src.api.schemas.subagent_graph import SubagentTaskSnapshot
 from src.api.models.tool_permission import ToolApprovalRequest
 from src.api.models.workspace import WorkspaceFileVersion
 from src.agent.schema.agui_events import AGUIEvent, EventType
@@ -22,6 +23,8 @@ from src.agent.context_compaction import SUMMARY_PREFIX
 from src.api.services.agui_event_bus import AguiEventBus, StoredEvent, get_agui_event_bus
 from src.api.services.agent_interaction_service import ContinuationWriteFence
 from src.api.services.run_completion_service import RunCompletionService
+from src.api.services.terminal_presentation import project_terminal_presentation
+from src.api.services.assistant_message_projection import AssistantMessageProjection
 from typing import List, Dict, Optional, AsyncIterator, Any
 from datetime import datetime
 from src.api.utils.timezone import now_naive
@@ -29,6 +32,24 @@ import json
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_result_success(event: dict[str, Any], content: Any) -> bool | None:
+    """Preserve explicit result facts, including structured legacy results."""
+    if type(event.get("success")) is bool:
+        return event["success"]
+    if type(event.get("isError")) is bool:
+        return not event["isError"]
+    try:
+        legacy = json.loads(content) if isinstance(content, str) else content
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(legacy, dict):
+        if type(legacy.get("success")) is bool:
+            return legacy["success"]
+        if type(legacy.get("isError")) is bool:
+            return not legacy["isError"]
+    return None
 
 
 class HistoryService:
@@ -279,6 +300,8 @@ class HistoryService:
         *,
         return_last_sequence: bool = False,
         assistant_file_references: list[dict] | None = None,
+        terminal_events: list[dict] | None = None,
+        transcript: dict | None = None,
     ) -> List[Dict] | tuple[List[Dict], int]:
         """从 AG-UI 事件重建步骤列表
         
@@ -304,6 +327,7 @@ class HistoryService:
         last_event_sequence = max((event_sequence(event_log) for event_log in events), default=0)
         
         steps = []
+        message_projection = AssistantMessageProjection()
         current_step = None
         current_tool_call = None
 
@@ -337,6 +361,7 @@ class HistoryService:
             ):
                 return
             assistant_file_references.append({
+                "event_sequence": event_sequence(event_log),
                 "ref_id": ref_id,
                 "source": source,
                 "name": name,
@@ -379,6 +404,10 @@ class HistoryService:
                 event_data = json.loads(event_log.payload)
                 event_type = event_log.event_type
                 timestamp = event_timestamp(event_log, event_data)
+                message_projection.apply({**event_data, "type": event_type}, event_sequence(event_log))
+
+                if terminal_events is not None and event_type in {"RUN_ERROR", "RUN_FINISHED"}:
+                    terminal_events.append({**event_data, "type": event_type, "sequence": event_sequence(event_log)})
                 
                 if event_type == "STEP_STARTED":
                     # 开始新步骤
@@ -414,6 +443,7 @@ class HistoryService:
 
                 elif event_type == "THINKING_TEXT_MESSAGE_START" and current_step:
                     current_step["thinking_start_ts"] = timestamp
+                    current_step.setdefault("thinking_start_sequence", event_sequence(event_log))
                     
                 # === CONTENT delta 事件：累積內容（新格式 + 舊數據兼容）===
                 elif event_type == "THINKING_TEXT_MESSAGE_CONTENT" and current_step:
@@ -423,6 +453,7 @@ class HistoryService:
                 elif event_type == "TEXT_MESSAGE_CONTENT" and current_step:
                     delta = event_data.get("delta", "")
                     current_step["assistant_content"] += delta
+                    current_step["assistant_content_source"] = "text_message"
                     
                 # === *_END 事件：向下兼容舊數據的 fullContent ===
                 elif event_type == "THINKING_TEXT_MESSAGE_END" and current_step:
@@ -435,12 +466,15 @@ class HistoryService:
                     full_content = event_data.get("fullContent", "")
                     if full_content and not current_step["assistant_content"]:
                         current_step["assistant_content"] = full_content
+                        current_step["assistant_content_source"] = "text_message"
                     
                 elif event_type == "TOOL_CALL_START" and current_step:
                     # 开始工具调用
                     current_tool_call = {
+                        "sequence": event_sequence(event_log),
                         "id": event_data.get("toolCallId", ""),
                         "name": event_data.get("toolCallName", ""),
+                        "tool_display": event_data.get("toolDisplay"),
                         "input": "",
                         "started_at_ts": timestamp,
                     }
@@ -469,12 +503,13 @@ class HistoryService:
                 elif event_type == "TOOL_CALL_RESULT" and current_step:
                     # 工具调用结果（匹配 ToolResult Schema: success, content, error）
                     result_content = event_data.get("result", event_data.get("content", ""))
-                    is_error = event_data.get("isError", False)
+                    success = _tool_result_success(event_data, result_content)
+                    result_content = result_content if isinstance(result_content, str) else json.dumps(result_content, ensure_ascii=False)
                     result = {
                         "tool_call_id": event_data.get("toolCallId", ""),
-                        "success": not is_error,
-                        "content": result_content if isinstance(result_content, str) else json.dumps(result_content, ensure_ascii=False),
-                        "error": result_content if is_error else None,
+                        "success": success,
+                        "content": result_content,
+                        "error": result_content if success is False else None,
                         "received_at_ts": timestamp,
                         "execution_time_ms": event_data.get("executionTimeMs"),
                     }
@@ -506,9 +541,12 @@ class HistoryService:
                         item.get("tool_call_id") == tool_call_id
                         for item in current_step["tool_results"]
                     ):
+                        call = next((item for item in current_step["tool_calls"]
+                                     if item.get("id") == tool_call_id), None)
+                        answered = bool(call and call["name"] == "ask_user" and value.get("resolution") == "answered")
                         current_step["tool_results"].append({
                             "tool_call_id": tool_call_id,
-                            "success": True,
+                            "success": True if answered else _tool_result_success({}, value.get("toolResultContent", "")),
                             "content": value.get("toolResultContent", ""),
                             "error": None,
                             "received_at_ts": timestamp,
@@ -577,6 +615,8 @@ class HistoryService:
                 print(f"⚠️ 解析事件失败: {e} (run_id={run_id}, id={event_log.id})")
                 continue
         
+        if transcript is not None:
+            transcript.update(message_projection.result(last_event_sequence))
         if return_last_sequence:
             return steps, last_event_sequence
         return steps
@@ -630,19 +670,29 @@ class HistoryService:
         return failed_run_ids
 
     def get_session_rounds(self, session_id: str) -> List[Dict]:
+        return self._project_rounds(session_id)
+
+    def get_round_snapshot(self, session_id: str, round_id: str) -> Dict | None:
+        """Project one main or child Round through the same history contract."""
+        rounds = self._project_rounds(session_id, round_id=round_id)
+        return rounds[0] if rounds else None
+
+    def _project_rounds(self, session_id: str, *, round_id: str | None = None) -> List[Dict]:
         """获取会话的所有轮次
 
         步骤(steps)从 AG-UI 事件日志动态重建，而非单独存储。
         """
         if isinstance(self.db, DBSession):
             self.recover_expired_interaction_continuations(session_id)
-        subagent_child_round_ids = self._get_subagent_child_round_ids(session_id)
-        rounds = (
+        subagent_child_round_ids = self._get_subagent_child_round_ids(session_id) if round_id is None else set()
+        rounds_query = (
             self.db.query(Round)
             .filter(Round.session_id == session_id)
             .order_by(Round.created_at)
-            .all()
         )
+        if round_id is not None:
+            rounds_query = rounds_query.filter(Round.id == round_id)
+        rounds = rounds_query.all()
         resumable_approval_ids: set[str] | None = None
         if isinstance(self.db, DBSession):
             from src.api.services.tool_permission_service import (
@@ -686,10 +736,14 @@ class HistoryService:
         for round_obj in rounds:
             # 从 AG-UI 事件重建步骤
             assistant_file_references: List[Dict] = []
+            terminal_events: List[Dict] = []
+            transcript: Dict = {}
             steps, last_event_sequence = self._rebuild_steps_from_events(
                 round_obj.id,
                 return_last_sequence=True,
                 assistant_file_references=assistant_file_references,
+                terminal_events=terminal_events,
+                transcript=transcript,
             )
             deduplicated_file_references: dict[str, Dict] = {}
             for reference in assistant_file_references:
@@ -778,9 +832,28 @@ class HistoryService:
                         },
                     }
 
+            # The Round row may have been read before the event query under READ
+            # COMMITTED. A terminal in this exact event window owns its outcome.
+            projected_status = round_obj.status
+            projected_final = round_obj.final_response
+            if terminal_events and round_obj.status not in Round.COMPLETE_TERMINAL_STATUSES:
+                terminal = terminal_events[-1]
+                terminal_result = terminal.get("result")
+                terminal_result = terminal_result if isinstance(terminal_result, dict) else {}
+                if terminal.get("type") == "RUN_ERROR":
+                    projected_status = "failed"
+                    projected_final = terminal.get("message") or projected_final
+                elif terminal.get("outcome", "success") == "success":
+                    projected_status = "completed"
+                    projected_final = terminal_result.get("finalResponse") or terminal_result.get("final_response") or projected_final
+                elif terminal_result.get("reason") in {"user_cancelled", "max_steps_reached"}:
+                    projected_status = "cancelled" if terminal_result["reason"] == "user_cancelled" else "max_steps_reached"
+                    projected_final = terminal_result.get("finalResponse") or projected_final
+
             result.append(
                 {
                     "round_id": round_obj.id,
+                    **transcript,
                     "parent_run_id": round_obj.parent_run_id,
                     "idempotency_key": round_obj.idempotency_key,
                     "last_event_sequence": last_event_sequence,
@@ -795,9 +868,12 @@ class HistoryService:
                     "preferred_mcp_connections": preferred_mcp_connections,
                     "thinking_mode": round_obj.thinking_mode,
                     "reasoning_effort": round_obj.reasoning_effort,
-                    "final_response": round_obj.final_response,
-                    "step_count": round_obj.step_count,
-                    "status": round_obj.status,
+                    "final_response": projected_final,
+                    "terminal_presentation": project_terminal_presentation(
+                        projected_status, projected_final, terminal_events,
+                    ),
+                    "step_count": max(round_obj.step_count or 0, len(steps)),
+                    "status": projected_status,
                     "created_at": round_obj.created_at.isoformat(),
                     "completed_at": round_obj.completed_at.isoformat()
                     if round_obj.completed_at
@@ -806,6 +882,27 @@ class HistoryService:
                     "interrupt": interrupt_details,
                 }
             )
+
+        # Read graph after event watermarks: a concurrently created edge must
+        # not be absent while its already-projected start event is skipped on SSE.
+        tasks_by_parent: dict[str, list[Dict]] = {}
+        if rounds:
+            edges = self.db.query(SubagentRun).filter(
+                SubagentRun.session_id == session_id,
+                SubagentRun.parent_run_id.in_([round_obj.id for round_obj in rounds]),
+            ).order_by(SubagentRun.created_at, SubagentRun.id).all()
+            child_ids = {edge.child_run_id for edge in edges if edge.child_run_id}
+            children = {
+                child.id: child for child in self.db.query(Round).filter(
+                    Round.session_id == session_id, Round.id.in_(child_ids),
+                ).all()
+            } if child_ids else {}
+            for edge in edges:
+                tasks_by_parent.setdefault(edge.parent_run_id, []).append(
+                    SubagentTaskSnapshot.from_edge(edge, children.get(edge.child_run_id)).model_dump(mode="json")
+                )
+        for item in result:
+            item["subagent_tasks"] = tasks_by_parent.get(item["round_id"], [])
 
         session_user_id = self.db.query(Session.user_id).filter(
             Session.id == session_id,

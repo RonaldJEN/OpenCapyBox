@@ -13,7 +13,7 @@ interface Options {
   layoutKey: string;
   contentVersion: unknown;
   hasContent: boolean;
-  scrollTarget?: { sessionId: string; roundId: string; nonce: number } | null;
+  scrollTarget?: { sessionId: string; roundId: string; messageId?: string; nonce: number } | null;
 }
 
 const sizeOf = (element: HTMLElement) => `${element.clientWidth}:${element.clientHeight}:${element.scrollHeight}`;
@@ -29,7 +29,17 @@ export function useChatReadingPosition(options: Options) {
   const resizing = useRef(false);
   const measuredSize = useRef('');
   const handledTarget = useRef('');
-  const [followingBottom, setFollowingBottom] = useState(true);
+  const [showScrollButton, setShowScrollButton] = useState(false);
+
+  // Reading intent survives reflow; button visibility describes current geometry.
+  // Collapsing a tool can put the viewport at the bottom without opting into follow.
+  const updateScrollButton = useCallback(() => {
+    const ctx = current.current;
+    const element = ctx.containerRef.current;
+    setShowScrollButton(Boolean(element && !ctx.hidden && !ctx.loading
+      && element.clientWidth > 0 && element.clientHeight > 0
+      && element.scrollHeight - element.scrollTop - element.clientHeight > CHAT_BOTTOM_TOLERANCE));
+  }, []);
 
   const remember = useCallback(() => {
     const ctx = current.current;
@@ -38,9 +48,9 @@ export function useChatReadingPosition(options: Options) {
       || element.clientWidth === 0 || element.clientHeight === 0) return;
     const position = captureChatReadingPosition(element);
     positions.current.set(ctx.sessionId, position);
-    setFollowingBottom(position.mode === 'bottom');
+    updateScrollButton();
     measuredSize.current = sizeOf(element);
-  }, []);
+  }, [updateScrollButton]);
 
   const write = useCallback((top: number, smooth = false) => {
     const element = current.current.containerRef.current;
@@ -56,18 +66,48 @@ export function useChatReadingPosition(options: Options) {
       element.scrollTop = target;
       writtenTop.current = element.scrollTop;
     }
-  }, []);
+    updateScrollButton();
+  }, [updateScrollButton]);
 
   const restore = useCallback(() => {
     const ctx = current.current;
     const element = ctx.containerRef.current;
-    if (!element || ctx.hidden || ctx.loading || navigatingTo.current !== null) return;
+    updateScrollButton();
+    if (!element || ctx.hidden || ctx.loading) return;
     // CSS can already have zero width while React still says split, including
     // between two pointer gestures. Such geometry never owns the bookmark.
     if (element.clientWidth === 0 || element.clientHeight === 0) return;
+    const targetRequest = ctx.scrollTarget;
+    const targetKey = targetRequest ? `${targetRequest.sessionId}:${targetRequest.nonce}` : '';
+    if (targetRequest?.sessionId === ctx.sessionId && handledTarget.current !== targetKey) {
+      const targetRound = Array.from(element.querySelectorAll<HTMLElement>('[data-round-id]'))
+        .find((round) => round.dataset.roundId === targetRequest.roundId);
+      const target = targetRequest.messageId ? Array.from(targetRound?.querySelectorAll<HTMLElement>('[data-message-id]') || [])
+        .find((message) => message.dataset.messageId === targetRequest.messageId) : targetRound;
+      // Reveal can commit in the child alone. Layout notifications must finish
+      // this same pending navigation before restoring a previous reading intent.
+      if (!target || target.getClientRects().length === 0) return;
+      handledTarget.current = targetKey;
+      const top = element.scrollTop + target.getBoundingClientRect().top - element.getBoundingClientRect().top
+        - (targetRequest.messageId ? 24 : (element.clientHeight - target.getBoundingClientRect().height) / 2);
+      positions.current.set(ctx.sessionId, { mode: 'reading', scrollTop: top, anchor: null });
+      write(top, true);
+      if (navigatingTo.current === null) remember();
+      return;
+    }
+    if (navigatingTo.current !== null) return;
     const position = positions.current.get(ctx.sessionId) ?? { mode: 'bottom' };
     write(chatReadingScrollTop(element, position));
-    setFollowingBottom(position.mode === 'bottom');
+  }, [write, updateScrollButton, remember]);
+
+  const beginReading = useCallback(() => {
+    const ctx = current.current;
+    const element = ctx.containerRef.current;
+    if (!element || ctx.hidden || ctx.loading || element.clientWidth === 0 || element.clientHeight === 0) return;
+    // Explicitly opening the process means reading, even if its compact preview
+    // previously fitted on screen. Preserve that view before inserting history.
+    positions.current.set(ctx.sessionId, captureChatReadingPosition(element, true));
+    write(element.scrollTop);
   }, [write]);
 
   const beforeLayoutChange = useCallback(() => {
@@ -88,7 +128,6 @@ export function useChatReadingPosition(options: Options) {
   }, [restore]);
   const scrollToBottom = useCallback(() => {
     positions.current.set(current.current.sessionId, { mode: 'bottom' });
-    setFollowingBottom(true);
     const element = current.current.containerRef.current;
     if (element) write(element.scrollHeight - element.clientHeight, true);
   }, [write]);
@@ -107,24 +146,8 @@ export function useChatReadingPosition(options: Options) {
   });
 
   useLayoutEffect(() => {
-    if (loading || hidden) return;
-    const element = containerRef.current;
-    const targetKey = scrollTarget ? `${scrollTarget.sessionId}:${scrollTarget.nonce}` : '';
-    if (element && scrollTarget?.sessionId === sessionId && handledTarget.current !== targetKey) {
-      const target = Array.from(element.querySelectorAll<HTMLElement>('[data-round-id]'))
-        .find((round) => round.dataset.roundId === scrollTarget.roundId);
-      if (!target) return; // History has not projected the requested round yet.
-      handledTarget.current = targetKey;
-      setFollowingBottom(false);
-      const top = element.scrollTop + target.getBoundingClientRect().top - element.getBoundingClientRect().top
-        - (element.clientHeight - target.getBoundingClientRect().height) / 2;
-      positions.current.set(sessionId, { mode: 'reading', scrollTop: top, anchor: null });
-      write(top, true);
-      if (navigatingTo.current === null) remember();
-      return;
-    }
     restore();
-  }, [sessionId, hidden, loading, layoutKey, contentVersion, scrollTarget, containerRef, restore, write, remember]);
+  }, [sessionId, hidden, loading, layoutKey, contentVersion, scrollTarget, containerRef, restore]);
 
   useLayoutEffect(() => {
     const element = containerRef.current;
@@ -139,6 +162,7 @@ export function useChatReadingPosition(options: Options) {
     };
     const onScroll = () => {
       if (current.current.hidden || current.current.loading || resizing.current) return;
+      updateScrollButton();
       if (navigatingTo.current !== null) {
         if (Math.abs(element.scrollTop - navigatingTo.current) <= CHAT_BOTTOM_TOLERANCE) {
           navigatingTo.current = null;
@@ -169,7 +193,7 @@ export function useChatReadingPosition(options: Options) {
       element.removeEventListener('pointerdown', onUserInput);
       element.removeEventListener('keydown', onUserInput);
     };
-  }, [sessionId, hasContent, containerRef, contentRef, remember, restore]);
+  }, [sessionId, hasContent, containerRef, contentRef, remember, restore, updateScrollButton]);
 
-  return { showScrollButton: !followingBottom, scrollToBottom, beforeLayoutChange, beginResize, restore, endResize };
+  return { showScrollButton, scrollToBottom, beginReading, beforeLayoutChange, beginResize, restore, endResize };
 }

@@ -58,6 +58,40 @@ function stream(state: ChatRuntimeState, event: any, overrides: Partial<StreamEn
 }
 
 describe('chatRuntimeReducer', () => {
+  it('保留调用时工具身份，旧历史补入名称时不覆盖较新的参数', () => {
+    const display = { provider: 'mcp', server_name: '资料服务', tool_name: 'search_reports', tool_title: '检索研报' };
+    let state = startRun();
+    state = stream(state, { type: 'RUN_STARTED', threadId: 'sess-a', runId: 'server-r1' }, { sequence: 1 });
+    state = stream(state, { type: 'TOOL_CALL_START', toolCallId: 'tool-1', toolCallName: 'mcp__123__search_reports' }, { sequence: 2 });
+    state = stream(state, { type: 'TOOL_CALL_ARGS', toolCallId: 'tool-1', delta: '{"query":"local"}' }, { sequence: 3 });
+    const persisted = round({ round_id: 'server-r1', idempotency_key: 'idem-a', last_event_sequence: 2,
+      steps: [{ step_number: 1, thinking: '', assistant_content: '', status: 'streaming', tool_results: [],
+        tool_calls: [{ id: 'tool-1', name: 'mcp__123__search_reports', input: {}, tool_display: display }] }] });
+    state = chatRuntimeReducer(state, { type: 'HISTORY_LOADED', sessionId: 'sess-a', rounds: [persisted], loadedAt: 2000, source: 'history' });
+    expect(state.sessions['sess-a'].rounds[0].steps[0].tool_calls[0]).toMatchObject({
+      input: { query: 'local' }, tool_display: display,
+    });
+    state = stream(state, { type: 'TOOL_CALL_START', toolCallId: 'tool-1', toolCallName: 'mcp__123__search_reports',
+      toolDisplay: { ...display, server_name: '重新命名的当前服务' } }, { sequence: 4 });
+    expect(state.sessions['sess-a'].rounds[0].steps[0].tool_calls[0].tool_display).toEqual(display);
+  });
+
+  it('实时 START 的工具身份在缺字段的终态历史中保留，仅按调用 ID 合并', () => {
+    const display = { provider: 'mcp', server_name: '资料服务', tool_name: 'query' };
+    let state = startRun();
+    state = stream(state, { type: 'RUN_STARTED', threadId: 'sess-a', runId: 'server-r1' }, { sequence: 1 });
+    state = stream(state, { type: 'TOOL_CALL_START', toolCallId: 'tool-1', toolCallName: 'mcp__123__query', toolDisplay: display }, { sequence: 2 });
+    state = chatRuntimeReducer(state, { type: 'HISTORY_LOADED', sessionId: 'sess-a', loadedAt: 2000, source: 'history',
+      rounds: [round({ round_id: 'server-r1', idempotency_key: 'idem-a', status: 'completed', last_event_sequence: 4,
+        steps: [{ step_number: 1, thinking: '', assistant_content: '', status: 'completed', tool_results: [], tool_calls: [
+          { id: 'tool-1', name: 'mcp__123__query', input: {} },
+          { id: 'tool-2', name: 'mcp__123__query', input: {} },
+        ] }] })] });
+    const calls = state.sessions['sess-a'].rounds[0].steps[0].tool_calls;
+    expect(calls[0].tool_display).toEqual(display);
+    expect(calls[1].tool_display).toBeUndefined();
+  });
+
   it('binds RUN_STARTED to the temp round and run maps', () => {
     let state = startRun(initialChatRuntimeState, {
       preferred_skills: [
@@ -223,6 +257,7 @@ describe('chatRuntimeReducer', () => {
       type: 'TOOL_CALL_RESULT',
       toolCallId: 'tool-a',
       content: '{"output":"first result"}',
+      success: true,
       timestamp: 2000,
     }, { sequence: 5 });
 
@@ -247,12 +282,14 @@ describe('chatRuntimeReducer', () => {
       type: 'TOOL_CALL_RESULT',
       toolCallId: 'tool-a',
       content: '{"output":"first result"}',
+      success: true,
       timestamp: 2000,
     }, { sequence: 10 });
 
     const steps = state.sessions['sess-a'].rounds[0].steps;
     expect(steps[0].tool_calls).toEqual([{
       id: 'tool-a',
+      sequence: 2,
       name: 'mcp_tool_search',
       input: { query: 'capy' },
       started_at_ts: 1000,
@@ -1047,6 +1084,7 @@ describe('chatRuntimeReducer', () => {
       type: 'TOOL_CALL_RESULT',
       toolCallId: 'tool-1',
       content: '{"output":"found"}',
+      success: true,
     }, { sequence: 12 });
 
     expect(state.sessions['sess-a'].rounds[0].steps[0].tool_results).toEqual([

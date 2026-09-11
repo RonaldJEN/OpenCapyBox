@@ -45,10 +45,7 @@ interface ChatPaneButtonProps {
 }
 
 export function ChatPaneButton({ filesOpen, onToggle }: ChatPaneButtonProps) {
-  // The label describes the chat pane, matching AlphaPai: when files are
-  // visible the action expands chat (closing the right pane); when files are
-  // closed the action contracts chat (restoring the right pane).
-  const label = filesOpen ? '展开面板' : '收起面板';
+  const label = filesOpen ? '只看聊天' : '恢复分栏';
   const Icon = filesOpen ? PanelRightOpen : PanelRightClose;
   return (
     <button
@@ -70,7 +67,7 @@ interface SessionFilesExpandButtonProps {
 }
 
 export function SessionFilesExpandButton({ expanded, onToggle }: SessionFilesExpandButtonProps) {
-  const label = expanded ? '收起面板' : '展开面板';
+  const label = expanded ? '恢复分栏' : '只看文件';
   const Icon = expanded ? PanelRightOpen : PanelRightClose;
   return (
     <button

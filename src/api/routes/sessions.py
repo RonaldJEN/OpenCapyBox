@@ -19,6 +19,7 @@ from src.api.models.database import get_db
 from src.api.deps import get_current_user
 from src.api.models.session import Session
 from src.api.models.round import Round
+from src.api.models.subagent_run import SubagentRun
 from src.api.models.agui_event import AGUIEventLog
 from src.api.models.llm_call_record import LLMCallRecord
 from src.api.schemas.session import CreateSessionResponse, SessionResponse, SessionListResponse, FileListResponse, FileInfo, UpdateSessionFileRequest, UpdateSessionTitleRequest
@@ -31,6 +32,7 @@ from src.api.services.sandbox_service import (
     is_within_sandbox_root,
 )
 from src.api.services.history_service import HistoryService
+from src.api.services.assistant_message_search import search_assistant_messages
 from src.api.services.agent_service import AgentService
 from src.api.services.workspace_service import WorkspaceService
 from src.api.services.session_file_edit_service import SessionFileEditService
@@ -349,6 +351,7 @@ def _set_session_match(
     excerpt: str | None,
     *,
     round_id: str | None = None,
+    message_id: str | None = None,
 ) -> None:
     priority = _SESSION_MATCH_PRIORITY[match_type]
     existing = matches.get(session.id)
@@ -358,6 +361,7 @@ def _set_session_match(
     session.match_type = match_type
     session.match_excerpt = excerpt
     session.match_round_id = round_id
+    session.match_message_id = message_id
     matches[session.id] = (session, priority)
 
 
@@ -753,6 +757,7 @@ async def list_sessions(
             )
             .filter(
                 *_visible_web_session_filters(user_id),
+                ~exists().where(SubagentRun.child_run_id == Round.id),
                 Round.user_message.ilike(pattern, escape="\\"),
             )
             .subquery()
@@ -781,6 +786,14 @@ async def list_sessions(
             )
 
     if len(matches) < search_limit:
+        for session, round_id, message_id, content in search_assistant_messages(
+            db, session_filters=_visible_web_session_filters(user_id), query=query,
+            limit=search_limit - len(matches), excluded_sessions=matches,
+        ):
+            _set_session_match(matches, session, "assistant", _make_match_excerpt(content, query),
+                               round_id=round_id, message_id=message_id)
+
+    if len(matches) < search_limit:
         message_ranked = (
             db.query(
                 ConversationMessage.session_id.label("session_id"),
@@ -802,6 +815,9 @@ async def list_sessions(
                 ConversationMessage.role == "assistant",
                 ConversationMessage.is_summary.is_(False),
                 ConversationMessage.is_synthetic.is_(False),
+                ~exists().where(SubagentRun.child_run_id == ConversationMessage.round_id),
+                ~exists().where(AGUIEventLog.run_id == ConversationMessage.round_id)
+                .where(AGUIEventLog.event_type == "TEXT_MESSAGE_START").where(AGUIEventLog.message_id.isnot(None)),
                 ConversationMessage.content.ilike(pattern, escape="\\"),
             )
             .subquery()
@@ -844,7 +860,11 @@ async def list_sessions(
             )
             .filter(
                 *_visible_web_session_filters(user_id),
+                ~exists().where(SubagentRun.child_run_id == Round.id),
                 Round.final_response.ilike(pattern, escape="\\"),
+                Round.status == "completed",
+                ~exists().where(AGUIEventLog.run_id == Round.id)
+                .where(AGUIEventLog.event_type == "TEXT_MESSAGE_START").where(AGUIEventLog.message_id.isnot(None)),
             )
             .subquery()
         )

@@ -12,7 +12,7 @@ import { discardSessionDrafts } from '../services/sessionDraftOutbox';
 
 interface SessionListProps {
   currentSessionId?: string;
-  onSessionSelect: (sessionId: string, target?: { roundId: string }) => void;
+  onSessionSelect: (sessionId: string, target?: { roundId: string; messageId?: string }) => void;
   refreshTrigger?: number;
   optimisticSession?: Session | null;
   executingSessionIds?: Set<string>;
@@ -172,7 +172,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
 
   const selectSession = (session: Session) => {
     if (session.match_round_id) {
-      onSessionSelect(session.id, { roundId: session.match_round_id });
+      onSessionSelect(session.id, { roundId: session.match_round_id, ...(session.match_message_id ? { messageId: session.match_message_id } : {}) });
     } else {
       onSessionSelect(session.id);
     }

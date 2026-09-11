@@ -56,6 +56,8 @@ from src.api.services.run_completion_service import RunCompletionService
 from src.api.services.context_checkpoint_service import ContextCheckpointService
 from src.api.services.sandbox_service import get_sandbox_service
 from src.api.services.subagent_graph_service import get_subagent_graph_service
+from src.api.services.subagent_activity import SubagentActivity
+from src.api.schemas.subagent_graph import SubagentTaskSnapshot
 from src.api.services.tool_factory import create_agent_tools
 from src.api.config import get_settings
 from src.api.model_registry import get_model_registry
@@ -253,6 +255,7 @@ class AgentService:
         self._active_checkpoint_sha256: str | None = None
         self._resume_lock = asyncio.Lock()  # 防止并发 resume 调用
         self._active_run_count = 0
+        self._subagent_activities: dict[str, SubagentActivity] = {}
         # 每個 session 使用沙箱內的隔離子目錄
         mount = get_sandbox_mount_path(user_id)
         self._workspace_dir = workspace_dir or (f"{mount}/sessions/{session_id}" if session_id else mount)
@@ -607,6 +610,15 @@ class AgentService:
         header.append(output or "(no output)")
         return "\n".join(header)
 
+    def _queue_subagent_update(self, edge: Any) -> None:
+        """Queue only UI identity; graph remains authoritative if publication fails."""
+        try:
+            activity = self._subagent_activities.get(edge.parent_run_id)
+            if activity is not None:
+                activity.put(SubagentTaskSnapshot.from_edge(edge).model_dump(mode="json"))
+        except Exception:
+            logger.warning("无法排队子任务状态快照: edge=%s", edge.id, exc_info=True)
+
     async def _run_subagent_invocation(
         self,
         *,
@@ -667,6 +679,7 @@ class AgentService:
                 },
             )
             edge_id = edge.id
+            self._queue_subagent_update(edge)
 
             child_service = AgentService(
                 sandbox=self.sandbox,
@@ -721,7 +734,7 @@ class AgentService:
                 round_id=child_run_id,
             )
 
-            graph_service.attach_child_run(
+            edge = graph_service.attach_child_run(
                 graph_db,
                 edge_id=edge_id,
                 user_id=self.user_id,
@@ -729,6 +742,7 @@ class AgentService:
                 child_run_id=child_run_id,
                 status=SubagentRun.RUNNING,
             )
+            self._queue_subagent_update(edge)
 
             async for _event in child_service.run_prepared_round(
                 PreparedAgentRun(
@@ -763,7 +777,7 @@ class AgentService:
                 child_status = SubagentRun.FAILED
                 child_error = f"sub-agent ended in unsupported status: {round_status}"
 
-            graph_service.mark_status(
+            edge = graph_service.mark_status(
                 graph_db,
                 edge_id=edge_id,
                 user_id=self.user_id,
@@ -772,6 +786,7 @@ class AgentService:
                 output=child_output if child_status == SubagentRun.COMPLETED else None,
                 error=child_error,
             )
+            self._queue_subagent_update(edge)
 
             if child_status != SubagentRun.COMPLETED:
                 return ToolResult(success=False, error=child_error or "sub-agent failed")
@@ -808,11 +823,34 @@ class AgentService:
                 ) or None,
             )
 
+        except asyncio.CancelledError:
+            # The child stream's finally has already committed its outcome.
+            # Preserve that outcome when cancellation lands just after completion.
+            if edge_id:
+                try:
+                    child_history.reset_session()
+                    child_round = child_history.db.query(Round).filter(
+                        Round.id == child_run_id, Round.session_id == self.session_id,
+                    ).first()
+                    ended_status = getattr(child_round, "status", None)
+                    child_status = ended_status if ended_status in {
+                        SubagentRun.COMPLETED, SubagentRun.CANCELLED, SubagentRun.FAILED,
+                    } else (SubagentRun.CANCELLED if context.cancel_token and context.cancel_token.is_set() else SubagentRun.FAILED)
+                    edge = get_subagent_graph_service().mark_status(
+                        graph_db, edge_id=edge_id, user_id=self.user_id,
+                        session_id=self.session_id, status=child_status,
+                        output=getattr(child_round, "final_response", None) if child_status == SubagentRun.COMPLETED else None,
+                        error=None if child_status == SubagentRun.COMPLETED else "sub-agent execution interrupted",
+                    )
+                    self._queue_subagent_update(edge)
+                except Exception:
+                    logger.warning("收敛取消的子任务状态失败: edge=%s", edge_id, exc_info=True)
+            raise
         except Exception as exc:
             child_error = f"{type(exc).__name__}: {exc}"
             if edge_id:
                 try:
-                    get_subagent_graph_service().mark_status(
+                    edge = get_subagent_graph_service().mark_status(
                         graph_db,
                         edge_id=edge_id,
                         user_id=self.user_id,
@@ -820,6 +858,7 @@ class AgentService:
                         status=SubagentRun.FAILED,
                         error=child_error,
                     )
+                    self._queue_subagent_update(edge)
                 except Exception:
                     logger.warning("标记 subagent edge 失败: edge=%s", edge_id, exc_info=True)
             return ToolResult(success=False, error=f"sub-agent execution failed: {child_error}")
@@ -1379,11 +1418,15 @@ class AgentService:
 
         解析事件流，重建 assistant（含 tool_calls）和 tool result 消息。
         """
-        from src.agent.schema import ToolCall, FunctionCall
+        from src.agent.schema import AssistantTextMessage, ToolCall, FunctionCall
+        from src.api.services.assistant_message_projection import AssistantMessageProjection
 
         messages: list[AgentMessage] = []
         # Per-step 狀態
         step_text = ""
+        step_text_messages: dict[str, AssistantTextMessage] = {}
+        step_interrupted_message_ids: set[str] = set()
+        step_text_identity_complete = True
         step_tool_calls: list[ToolCall] = []
         step_tool_results: list[dict] = []
         tc_id_to_name: dict[str, str] = {}
@@ -1393,13 +1436,19 @@ class AgentService:
 
         def flush_step_messages() -> None:
             nonlocal step_text, step_tool_calls, step_tool_results
-            if step_text or step_tool_calls:
+            nonlocal step_text_messages, step_text_identity_complete, step_interrupted_message_ids
+            text_messages = [part for message_id, part in step_text_messages.items()
+                             if message_id not in step_interrupted_message_ids
+                             and message_id not in terminal_interrupted_ids] if step_text_messages and step_text_identity_complete else None
+            content = "".join(part.content for part in text_messages) if text_messages is not None else step_text
+            if content or step_tool_calls:
                 messages.append(AgentMessage(
                     role="assistant",
                     id=f"{round_id}:assistant:{len(messages) + 1}" if round_id else None,
                     run_id=round_id,
-                    content=step_text,
+                    content=content,
                     tool_calls=step_tool_calls if step_tool_calls else None,
+                    assistant_text_messages=text_messages,
                 ))
             for tr in step_tool_results:
                 messages.append(AgentMessage(
@@ -1411,10 +1460,16 @@ class AgentService:
                     name=tr["name"],
                 ))
             step_text = ""
+            step_text_messages = {}
+            step_interrupted_message_ids = set()
+            step_text_identity_complete = True
             step_tool_calls = []
             step_tool_results = []
 
-        for evt in events:
+        event_payloads: list[dict[str, Any]] = []
+        message_start_counts: dict[str, int] = {}
+        message_projection = AssistantMessageProjection()
+        for index, evt in enumerate(events):
             if isinstance(evt.payload, dict):
                 payload = evt.payload
             elif isinstance(evt.payload, str):
@@ -1431,10 +1486,61 @@ class AgentService:
                 _skipped += 1
                 continue
 
+            event_payloads.append(payload)
+            if payload.get("type") == "TEXT_MESSAGE_START" and payload.get("messageId"):
+                message_id = payload["messageId"]
+                message_start_counts[message_id] = message_start_counts.get(message_id, 0) + 1
+            message_projection.apply(payload, index + 1)
+
+        # An immediate abort may commit the run terminal before a late message
+        # END can pass the write fence. Use the same terminal closure facts as
+        # UI history, including when STEP_FINISHED preceded the terminal.
+        terminal_interrupted_ids = {
+            message["message_id"] for message in message_projection.messages
+            if message["state"] == "interrupted" and message_start_counts.get(message["message_id"]) == 1
+        }
+
+        for payload in event_payloads:
             evt_type = payload.get("type", "")
 
-            if evt_type == "TEXT_MESSAGE_CONTENT":
-                step_text += payload.get("delta", "")
+            if evt_type == "TEXT_MESSAGE_START":
+                message_id = payload.get("messageId")
+                if message_id and payload.get("role", "assistant") == "assistant":
+                    if message_start_counts.get(message_id) != 1:
+                        step_text_identity_complete = False
+                    if message_id in step_text_messages:
+                        step_text_identity_complete = False
+                    else:
+                        phase = payload.get("phase")
+                        step_text_messages[message_id] = AssistantTextMessage(
+                            phase=phase if phase in {"commentary", "final_answer"} else None,
+                        )
+
+            elif evt_type == "TEXT_MESSAGE_CONTENT":
+                delta = payload.get("delta", "")
+                step_text += delta
+                part = step_text_messages.get(payload.get("messageId"))
+                if part is None:
+                    step_text_identity_complete = False
+                elif payload.get("isAggregate") is True:
+                    part.content = delta
+                else:
+                    part.content += delta
+
+            elif evt_type == "TEXT_MESSAGE_END":
+                part = step_text_messages.get(payload.get("messageId"))
+                if part is not None:
+                    if payload.get("interrupted") is True:
+                        step_interrupted_message_ids.add(payload["messageId"])
+                    if not part.content and payload.get("fullContent"):
+                        part.content = payload["fullContent"]
+                    if payload.get("phase") in {"commentary", "final_answer"}:
+                        part.phase = payload["phase"]
+
+            elif evt_type == "CUSTOM" and payload.get("name") == "failover_reset":
+                # This is an explicit failed request boundary, not a text
+                # similarity heuristic. Keep its output in UI history only.
+                step_interrupted_message_ids.update(step_text_messages)
 
             elif evt_type == "TOOL_CALL_START":
                 tc_id = payload.get("toolCallId", "")
@@ -3526,6 +3632,7 @@ class AgentService:
         if callable(compaction_hook_setter):
             compaction_hook_setter(_persist_compaction)
 
+        subagent_events = None
         try:
             run_agui_kwargs = {
                 "thread_id": self.session_id,
@@ -3607,7 +3714,10 @@ class AgentService:
                     async for agent_event in self.agent.run_agui(**run_agui_kwargs):
                         yield agent_event
 
-            async for event in _events_with_interaction_prelude():
+            activity = SubagentActivity()
+            self._subagent_activities[run_id] = activity
+            subagent_events = activity.merge(_events_with_interaction_prelude())
+            async for event in subagent_events:
                 # 本輪已被外部收斂為終態（常見於 abort 立即 cancelled）時，
                 # 停止處理遲到事件，避免污染 conversation_messages 與 round 狀態。
                 if self.history_service.is_round_terminal(run_id) is True:
@@ -3792,7 +3902,9 @@ class AgentService:
                     and continuation_claim_token
                     and not continuation_claim_completed
                 ):
-                    if event.type in {EventType.RUN_FINISHED, EventType.RUN_ERROR}:
+                    if event.type in {EventType.RUN_FINISHED, EventType.RUN_ERROR} or (
+                        isinstance(event, CustomEvent) and event.name == "subagent_run_updated"
+                    ):
                         transition = "validate"
                     elif is_interaction_prelude:
                         transition = "start"
@@ -3853,6 +3965,10 @@ class AgentService:
                 except Exception:
                     if pending_interaction_to_commit is not None:
                         self.history_service.db.rollback()
+                    if isinstance(event_to_store, CustomEvent) and event_to_store.name == "subagent_run_updated":
+                        self.history_service.reset_session()
+                        logger.warning("子任务状态快照发布失败，将从 graph 恢复: run=%s", run_id, exc_info=True)
+                        continue
                     raise
                 finally:
                     continuation_completion_in_flight = False
@@ -4053,6 +4169,12 @@ class AgentService:
             _final_response = f"{error_label}: {str(e)}"
             raise
         finally:
+            if subagent_events is not None:
+                try:
+                    await subagent_events.aclose()
+                except Exception:
+                    logger.warning("关闭子任务状态流失败: run=%s", run_id, exc_info=True)
+            self._subagent_activities.pop(run_id, None)
             await _release_uncommitted_continuation_start()
             # 統一處理 round 完成：正常路徑、異常、GeneratorExit、CancelledError
             if not _round_finished and not _round_suspended:

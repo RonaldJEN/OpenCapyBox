@@ -22,7 +22,7 @@ from src.api.deps import get_current_user
 from src.api.models.session import Session
 from src.api.models.user_run_lock import UserRunLock
 from src.api.models.run_cancel_request import RunCancelRequest
-from src.api.schemas.chat import SendMessageRequest, ResumeRequest
+from src.api.schemas.chat import SendMessageRequest, ResumeRequest, AbortChatRequest, RoundData
 from src.api.services.agent_pool_service import get_agent_pool
 from src.api.services.auth_service import enforce_token_limits
 from src.api.models.user_sandbox import UserSandbox
@@ -1267,6 +1267,25 @@ async def subscribe_to_round(
     )
 
 
+@router.get("/{chat_session_id}/round/{round_id}/snapshot", response_model=RoundData)
+async def get_round_snapshot(
+    chat_session_id: str,
+    round_id: str,
+    user_id: str = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """Read one main or child Round without mixing it into the parent history."""
+    session = db.query(Session).filter(
+        Session.id == chat_session_id, Session.user_id == user_id,
+    ).first()
+    if session is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    snapshot = HistoryService(db).get_round_snapshot(chat_session_id, round_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="轮次不存在")
+    return snapshot
+
+
 @router.get("/{chat_session_id}/round/{round_id}/subagent-graph")
 async def get_subagent_graph(
     chat_session_id: str,
@@ -1289,6 +1308,7 @@ async def abort_chat(
     chat_session_id: str,
     user_id: str = Depends(get_current_user),
     db: DBSession = Depends(get_db),
+    payload: AbortChatRequest | None = None,
 ):
     """中止正在進行的 Agent 執行
 
@@ -1328,6 +1348,20 @@ async def abort_chat(
     if user_lock and user_lock.updated_at:
         lock_heartbeat_age = (now_naive() - user_lock.updated_at).total_seconds()
         lock_recent = lock_heartbeat_age < stale_threshold
+
+    if payload and payload.round_id:
+        requested_round = db.query(Round).filter(
+            Round.id == payload.round_id, Round.session_id == chat_session_id,
+        ).first()
+        if requested_round is None:
+            raise HTTPException(status_code=404, detail="运行不存在")
+        if requested_round.status in Round.COMPLETE_TERMINAL_STATUSES:
+            return {"status": "cancelled", "request_id": None, "reason": "already_terminal",
+                    "outcome_warning": None, "round_id": requested_round.id,
+                    "round_status": requested_round.status,
+                    "admission_released": not lock_recent or bool(running_round and running_round.id != requested_round.id)}
+        if running_round_id != requested_round.id:
+            raise HTTPException(status_code=409, detail="运行已变化，请刷新状态后再操作")
 
     if not running_round and not lock_recent:
         raise HTTPException(status_code=409, detail="該會話沒有正在進行的執行")
@@ -1446,11 +1480,15 @@ async def abort_chat(
             reason = "worker_dead"
         else:
             reason = "force_aborted"
+        authoritative_status = db.query(Round.status).filter(Round.id == running_round_id).scalar()
         return {
             "status": "cancelled",
             "request_id": request_id,
             "reason": reason,
             "outcome_warning": outcome_warning,
+            "round_id": running_round_id,
+            "round_status": authoritative_status if isinstance(authoritative_status, str) else None,
+            "admission_released": True,
         }
 
     # 僅處於 init-window（有鎖無 round）時也立即解除阻塞。
@@ -1459,6 +1497,9 @@ async def abort_chat(
         "request_id": request_id,
         "reason": "force_unlocked",
         "outcome_warning": None,
+        "round_id": None,
+        "round_status": None,
+        "admission_released": True,
     }
 
 

@@ -1,0 +1,1335 @@
+{
+  "schema": 1,
+  "provenance": "Generated legacy protocol fixtures from isolated SQLite, EventBus and HistoryService; not production captures",
+  "cases": [
+    {
+      "id": "A-normal",
+      "direct": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-A-normal",
+          "threadId": "session-A-normal",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-summary",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-summary",
+          "delta": "体检通知关键事项：请提前预约，并携带有效证件。",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-summary",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "TOOL_CALL_START",
+          "toolCallId": "present-manual",
+          "toolCallName": "present_files",
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "TOOL_CALL_ARGS",
+          "toolCallId": "present-manual",
+          "delta": "{\"paths\":[\"手册.md\"]}",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TOOL_CALL_END",
+          "toolCallId": "present-manual",
+          "timestamp": 1789027200000,
+          "sequence": 8
+        },
+        {
+          "type": "TOOL_CALL_RESULT",
+          "toolCallId": "present-manual",
+          "messageId": "result-manual",
+          "content": "{\"success\":true}",
+          "timestamp": 1789027200000,
+          "sequence": 9
+        },
+        {
+          "type": "CUSTOM",
+          "name": "assistant_file_referenced",
+          "value": {
+            "ref_id": "manual-ref",
+            "source": "session",
+            "session_id": "session-A-normal",
+            "path": "手册.md",
+            "name": "手册.md",
+            "size": 44,
+            "type": "md",
+            "revision": "fixture-v1",
+            "toolCallId": "present-manual"
+          },
+          "timestamp": 1789027200000,
+          "sequence": 10
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 11
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_2",
+          "timestamp": 1789027200000,
+          "sequence": 12
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-final",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 13
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-final",
+          "delta": "以上就是全部要点。",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-final",
+          "timestamp": 1789027200000,
+          "sequence": 15
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_2",
+          "timestamp": 1789027200000,
+          "sequence": 16
+        },
+        {
+          "type": "RUN_FINISHED",
+          "outcome": "success",
+          "result": {
+            "finalResponse": "以上就是全部要点。"
+          },
+          "runId": "round-A-normal",
+          "threadId": "session-A-normal",
+          "timestamp": 1789027201000,
+          "sequence": 17
+        }
+      ],
+      "durable": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-A-normal",
+          "threadId": "session-A-normal",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-summary",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "delta": "体检通知关键事项：请提前预约，并携带有效证件。",
+          "messageId": "msg-summary",
+          "sequence": 4
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-summary",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "TOOL_CALL_START",
+          "toolCallId": "present-manual",
+          "toolCallName": "present_files",
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "TOOL_CALL_ARGS",
+          "delta": "{\"paths\":[\"手册.md\"]}",
+          "toolCallId": "present-manual",
+          "sequence": 7
+        },
+        {
+          "type": "TOOL_CALL_END",
+          "toolCallId": "present-manual",
+          "timestamp": 1789027200000,
+          "sequence": 8
+        },
+        {
+          "type": "TOOL_CALL_RESULT",
+          "toolCallId": "present-manual",
+          "messageId": "result-manual",
+          "content": "{\"success\":true}",
+          "timestamp": 1789027200000,
+          "sequence": 9
+        },
+        {
+          "type": "CUSTOM",
+          "name": "assistant_file_referenced",
+          "value": {
+            "ref_id": "manual-ref",
+            "source": "session",
+            "session_id": "session-A-normal",
+            "path": "手册.md",
+            "name": "手册.md",
+            "size": 44,
+            "type": "md",
+            "revision": "fixture-v1",
+            "toolCallId": "present-manual"
+          },
+          "timestamp": 1789027200000,
+          "sequence": 10
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 11
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_2",
+          "timestamp": 1789027200000,
+          "sequence": 12
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-final",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 13
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "delta": "以上就是全部要点。",
+          "messageId": "msg-final",
+          "sequence": 14
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-final",
+          "timestamp": 1789027200000,
+          "sequence": 15
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_2",
+          "timestamp": 1789027200000,
+          "sequence": 16
+        },
+        {
+          "type": "RUN_FINISHED",
+          "outcome": "success",
+          "result": {
+            "finalResponse": "以上就是全部要点。"
+          },
+          "runId": "round-A-normal",
+          "threadId": "session-A-normal",
+          "timestamp": 1789027201000,
+          "sequence": 17
+        }
+      ],
+      "history": {
+        "round_id": "round-A-normal",
+        "parent_run_id": null,
+        "idempotency_key": "idem-A-normal",
+        "last_event_sequence": 17,
+        "model_id": null,
+        "model_display_name": null,
+        "user_message": "读取演示通知",
+        "user_attachments": [],
+        "assistant_file_references": [
+          {
+            "ref_id": "manual-ref",
+            "source": "session",
+            "name": "手册.md",
+            "path": "手册.md",
+            "size": 44,
+            "modified": "",
+            "type": "md",
+            "revision": "fixture-v1",
+            "operation": null,
+            "tool_call_id": "present-manual",
+            "sha256": null,
+            "session_id": "session-A-normal",
+            "snapshot_path": null,
+            "entry_id": null,
+            "workspace_path": null,
+            "version_id": null
+          }
+        ],
+        "preferred_skills": [],
+        "preferred_mcp_connections": [],
+        "thinking_mode": null,
+        "reasoning_effort": null,
+        "final_response": "以上就是全部要点。",
+        "terminal_presentation": {
+          "final_response_origin": "assistant",
+          "error": null
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "thinking": "",
+            "assistant_content": "体检通知关键事项：请提前预约，并携带有效证件。",
+            "assistant_content_source": "text_message",
+            "tool_calls": [
+              {
+                "id": "present-manual",
+                "name": "present_files",
+                "input": {
+                  "paths": [
+                    "手册.md"
+                  ]
+                },
+                "started_at_ts": 1789027200000,
+                "ended_at_ts": 1789027200000
+              }
+            ],
+            "tool_results": [
+              {
+                "tool_call_id": "present-manual",
+                "success": true,
+                "content": "{\"success\":true}",
+                "error": null,
+                "received_at_ts": 1789027200000,
+                "execution_time_ms": null
+              }
+            ],
+            "status": "completed",
+            "created_at": "2026-09-10T08:00:00",
+            "thinking_start_ts": null,
+            "thinking_end_ts": null,
+            "started_at_ts": 1789027200000,
+            "finished_at_ts": 1789027200000
+          },
+          {
+            "step_number": 2,
+            "thinking": "",
+            "assistant_content": "以上就是全部要点。",
+            "assistant_content_source": "text_message",
+            "tool_calls": [],
+            "tool_results": [],
+            "status": "completed",
+            "created_at": "2026-09-10T08:00:00",
+            "thinking_start_ts": null,
+            "thinking_end_ts": null,
+            "started_at_ts": 1789027200000,
+            "finished_at_ts": 1789027200000
+          }
+        ],
+        "step_count": 2,
+        "status": "completed",
+        "created_at": "2026-09-10T08:00:00",
+        "completed_at": "2026-09-10T08:00:01",
+        "interrupt": null
+      },
+      "expected_b1": [
+        {
+          "messageId": "msg-summary",
+          "text": "体检通知关键事项：请提前预约，并携带有效证件。",
+          "state": "complete",
+          "committed": true
+        },
+        {
+          "messageId": "msg-final",
+          "text": "以上就是全部要点。",
+          "state": "complete",
+          "committed": true
+        }
+      ]
+    },
+    {
+      "id": "A-error",
+      "direct": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-A-error",
+          "threadId": "session-A-error",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-partial",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-partial",
+          "delta": "已经确认的有效正文。",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-partial",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "RUN_ERROR",
+          "message": "Provider unavailable: fixture",
+          "code": "RUN_FAILED",
+          "runId": "round-A-error",
+          "threadId": "session-A-error",
+          "timestamp": 1789027201000,
+          "sequence": 7
+        }
+      ],
+      "durable": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-A-error",
+          "threadId": "session-A-error",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-partial",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "delta": "已经确认的有效正文。",
+          "messageId": "msg-partial",
+          "sequence": 4
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-partial",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "RUN_ERROR",
+          "message": "Provider unavailable: fixture",
+          "code": "RUN_FAILED",
+          "runId": "round-A-error",
+          "threadId": "session-A-error",
+          "timestamp": 1789027201000,
+          "sequence": 7
+        }
+      ],
+      "history": {
+        "round_id": "round-A-error",
+        "parent_run_id": null,
+        "idempotency_key": "idem-A-error",
+        "last_event_sequence": 7,
+        "model_id": null,
+        "model_display_name": null,
+        "user_message": "读取演示通知",
+        "user_attachments": [],
+        "assistant_file_references": [],
+        "preferred_skills": [],
+        "preferred_mcp_connections": [],
+        "thinking_mode": null,
+        "reasoning_effort": null,
+        "final_response": "Provider unavailable: fixture",
+        "terminal_presentation": {
+          "final_response_origin": "run_error",
+          "error": {
+            "source": "durable_run_error",
+            "sequence": 7,
+            "code": "RUN_FAILED",
+            "message": "Provider unavailable: fixture"
+          }
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "thinking": "",
+            "assistant_content": "已经确认的有效正文。",
+            "assistant_content_source": "text_message",
+            "tool_calls": [],
+            "tool_results": [],
+            "status": "completed",
+            "created_at": "2026-09-10T08:00:00",
+            "thinking_start_ts": null,
+            "thinking_end_ts": null,
+            "started_at_ts": 1789027200000,
+            "finished_at_ts": 1789027200000
+          }
+        ],
+        "step_count": 1,
+        "status": "failed",
+        "created_at": "2026-09-10T08:00:00",
+        "completed_at": "2026-09-10T08:00:01",
+        "interrupt": null
+      },
+      "expected_b1": [
+        {
+          "messageId": "msg-partial",
+          "text": "已经确认的有效正文。",
+          "state": "complete",
+          "committed": true
+        }
+      ]
+    },
+    {
+      "id": "F1",
+      "direct": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F1",
+          "threadId": "session-F1",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-one",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-one",
+          "delta": "第一条正常正文。",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-one",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-two",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-two",
+          "delta": "第二条正常正文。",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-two",
+          "timestamp": 1789027200000,
+          "sequence": 8
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 9
+        },
+        {
+          "type": "RUN_FINISHED",
+          "outcome": "success",
+          "result": {
+            "finalResponse": "第二条正常正文。"
+          },
+          "runId": "round-F1",
+          "threadId": "session-F1",
+          "timestamp": 1789027201000,
+          "sequence": 10
+        }
+      ],
+      "durable": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F1",
+          "threadId": "session-F1",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-one",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "delta": "第一条正常正文。",
+          "messageId": "msg-one",
+          "sequence": 4
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-one",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-two",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "delta": "第二条正常正文。",
+          "messageId": "msg-two",
+          "sequence": 7
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-two",
+          "timestamp": 1789027200000,
+          "sequence": 8
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 9
+        },
+        {
+          "type": "RUN_FINISHED",
+          "outcome": "success",
+          "result": {
+            "finalResponse": "第二条正常正文。"
+          },
+          "runId": "round-F1",
+          "threadId": "session-F1",
+          "timestamp": 1789027201000,
+          "sequence": 10
+        }
+      ],
+      "history": {
+        "round_id": "round-F1",
+        "parent_run_id": null,
+        "idempotency_key": "idem-F1",
+        "last_event_sequence": 10,
+        "model_id": null,
+        "model_display_name": null,
+        "user_message": "读取演示通知",
+        "user_attachments": [],
+        "assistant_file_references": [],
+        "preferred_skills": [],
+        "preferred_mcp_connections": [],
+        "thinking_mode": null,
+        "reasoning_effort": null,
+        "final_response": "第二条正常正文。",
+        "terminal_presentation": {
+          "final_response_origin": "assistant",
+          "error": null
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "thinking": "",
+            "assistant_content": "第一条正常正文。第二条正常正文。",
+            "assistant_content_source": "text_message",
+            "tool_calls": [],
+            "tool_results": [],
+            "status": "completed",
+            "created_at": "2026-09-10T08:00:00",
+            "thinking_start_ts": null,
+            "thinking_end_ts": null,
+            "started_at_ts": 1789027200000,
+            "finished_at_ts": 1789027200000
+          }
+        ],
+        "step_count": 1,
+        "status": "completed",
+        "created_at": "2026-09-10T08:00:00",
+        "completed_at": "2026-09-10T08:00:01",
+        "interrupt": null
+      },
+      "expected_b1": [
+        {
+          "messageId": "msg-one",
+          "text": "第一条正常正文。",
+          "state": "complete",
+          "committed": true
+        },
+        {
+          "messageId": "msg-two",
+          "text": "第二条正常正文。",
+          "state": "complete",
+          "committed": true
+        }
+      ]
+    },
+    {
+      "id": "F2",
+      "direct": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F2",
+          "threadId": "session-F2",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-primary",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-primary",
+          "delta": "主模型已经输出的部分内容……",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-primary",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "CUSTOM",
+          "name": "failover_reset",
+          "value": {
+            "model": "fixture-fallback"
+          },
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-fallback",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 7
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-fallback",
+          "delta": "备用模型的回答。",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-fallback",
+          "timestamp": 1789027200000,
+          "sequence": 9
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 10
+        },
+        {
+          "type": "RUN_FINISHED",
+          "outcome": "success",
+          "result": {
+            "finalResponse": "备用模型的回答。"
+          },
+          "runId": "round-F2",
+          "threadId": "session-F2",
+          "timestamp": 1789027201000,
+          "sequence": 11
+        }
+      ],
+      "durable": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F2",
+          "threadId": "session-F2",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-primary",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "delta": "主模型已经输出的部分内容……",
+          "messageId": "msg-primary",
+          "sequence": 4
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-primary",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "CUSTOM",
+          "name": "failover_reset",
+          "value": {
+            "model": "fixture-fallback"
+          },
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-fallback",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 7
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "delta": "备用模型的回答。",
+          "messageId": "msg-fallback",
+          "sequence": 8
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-fallback",
+          "timestamp": 1789027200000,
+          "sequence": 9
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 10
+        },
+        {
+          "type": "RUN_FINISHED",
+          "outcome": "success",
+          "result": {
+            "finalResponse": "备用模型的回答。"
+          },
+          "runId": "round-F2",
+          "threadId": "session-F2",
+          "timestamp": 1789027201000,
+          "sequence": 11
+        }
+      ],
+      "history": {
+        "round_id": "round-F2",
+        "parent_run_id": null,
+        "idempotency_key": "idem-F2",
+        "last_event_sequence": 11,
+        "model_id": null,
+        "model_display_name": null,
+        "user_message": "读取演示通知",
+        "user_attachments": [],
+        "assistant_file_references": [],
+        "preferred_skills": [],
+        "preferred_mcp_connections": [],
+        "thinking_mode": null,
+        "reasoning_effort": null,
+        "final_response": "备用模型的回答。",
+        "terminal_presentation": {
+          "final_response_origin": "assistant",
+          "error": null
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "thinking": "",
+            "assistant_content": "主模型已经输出的部分内容……备用模型的回答。",
+            "assistant_content_source": "text_message",
+            "tool_calls": [],
+            "tool_results": [],
+            "status": "completed",
+            "created_at": "2026-09-10T08:00:00",
+            "thinking_start_ts": null,
+            "thinking_end_ts": null,
+            "started_at_ts": 1789027200000,
+            "finished_at_ts": 1789027200000
+          }
+        ],
+        "step_count": 1,
+        "status": "completed",
+        "created_at": "2026-09-10T08:00:00",
+        "completed_at": "2026-09-10T08:00:01",
+        "interrupt": null
+      },
+      "expected_b1": [
+        {
+          "messageId": "msg-primary",
+          "text": "主模型已经输出的部分内容……",
+          "state": "interrupted",
+          "committed": true
+        },
+        {
+          "messageId": "msg-fallback",
+          "text": "备用模型的回答。",
+          "state": "complete",
+          "committed": true
+        }
+      ]
+    },
+    {
+      "id": "F3",
+      "direct": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F3",
+          "threadId": "session-F3",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-repeat",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-repeat",
+          "delta": "哈",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-repeat",
+          "delta": "哈",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-repeat",
+          "delta": " ",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-repeat",
+          "delta": " ",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-repeat",
+          "delta": "好",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-repeat",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "RUN_FINISHED",
+          "outcome": "success",
+          "result": {
+            "finalResponse": "哈哈  好"
+          },
+          "runId": "round-F3",
+          "threadId": "session-F3",
+          "timestamp": 1789027201000,
+          "sequence": 7
+        }
+      ],
+      "durable": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F3",
+          "threadId": "session-F3",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-repeat",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "delta": "哈哈  好",
+          "messageId": "msg-repeat",
+          "sequence": 4
+        },
+        {
+          "type": "TEXT_MESSAGE_END",
+          "messageId": "msg-repeat",
+          "timestamp": 1789027200000,
+          "sequence": 5
+        },
+        {
+          "type": "STEP_FINISHED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 6
+        },
+        {
+          "type": "RUN_FINISHED",
+          "outcome": "success",
+          "result": {
+            "finalResponse": "哈哈  好"
+          },
+          "runId": "round-F3",
+          "threadId": "session-F3",
+          "timestamp": 1789027201000,
+          "sequence": 7
+        }
+      ],
+      "history": {
+        "round_id": "round-F3",
+        "parent_run_id": null,
+        "idempotency_key": "idem-F3",
+        "last_event_sequence": 7,
+        "model_id": null,
+        "model_display_name": null,
+        "user_message": "读取演示通知",
+        "user_attachments": [],
+        "assistant_file_references": [],
+        "preferred_skills": [],
+        "preferred_mcp_connections": [],
+        "thinking_mode": null,
+        "reasoning_effort": null,
+        "final_response": "哈哈  好",
+        "terminal_presentation": {
+          "final_response_origin": "assistant",
+          "error": null
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "thinking": "",
+            "assistant_content": "哈哈  好",
+            "assistant_content_source": "text_message",
+            "tool_calls": [],
+            "tool_results": [],
+            "status": "completed",
+            "created_at": "2026-09-10T08:00:00",
+            "thinking_start_ts": null,
+            "thinking_end_ts": null,
+            "started_at_ts": 1789027200000,
+            "finished_at_ts": 1789027200000
+          }
+        ],
+        "step_count": 1,
+        "status": "completed",
+        "created_at": "2026-09-10T08:00:00",
+        "completed_at": "2026-09-10T08:00:01",
+        "interrupt": null
+      },
+      "expected_b1": [
+        {
+          "messageId": "msg-repeat",
+          "text": "哈哈  好",
+          "state": "complete",
+          "committed": true
+        }
+      ]
+    },
+    {
+      "id": "F4",
+      "direct": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F4",
+          "threadId": "session-F4",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-open",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-open",
+          "delta": "尚未结束的正文尾段",
+          "timestamp": 1789027200000
+        }
+      ],
+      "durable": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F4",
+          "threadId": "session-F4",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-open",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        }
+      ],
+      "history": {
+        "round_id": "round-F4",
+        "parent_run_id": null,
+        "idempotency_key": "idem-F4",
+        "last_event_sequence": 3,
+        "model_id": null,
+        "model_display_name": null,
+        "user_message": "读取演示通知",
+        "user_attachments": [],
+        "assistant_file_references": [],
+        "preferred_skills": [],
+        "preferred_mcp_connections": [],
+        "thinking_mode": null,
+        "reasoning_effort": null,
+        "final_response": null,
+        "terminal_presentation": {
+          "final_response_origin": "unknown",
+          "error": null
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "thinking": "",
+            "assistant_content": "",
+            "assistant_content_source": null,
+            "tool_calls": [],
+            "tool_results": [],
+            "status": "running",
+            "created_at": "2026-09-10T08:00:00",
+            "thinking_start_ts": null,
+            "thinking_end_ts": null,
+            "started_at_ts": 1789027200000,
+            "finished_at_ts": null
+          }
+        ],
+        "step_count": 0,
+        "status": "running",
+        "created_at": "2026-09-10T08:00:00",
+        "completed_at": null,
+        "interrupt": null
+      },
+      "expected_b1": [
+        {
+          "messageId": "msg-open",
+          "text": "尚未结束的正文尾段",
+          "state": "streaming",
+          "committed": false
+        }
+      ]
+    },
+    {
+      "id": "F5",
+      "direct": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F5",
+          "threadId": "session-F5",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-open",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TEXT_MESSAGE_CONTENT",
+          "messageId": "msg-open",
+          "delta": "尚未结束的正文尾段",
+          "timestamp": 1789027200000
+        },
+        {
+          "type": "TOOL_CALL_START",
+          "toolCallId": "later-tool",
+          "toolCallName": "read_file",
+          "timestamp": 1789027200000,
+          "sequence": 4
+        }
+      ],
+      "durable": [
+        {
+          "type": "RUN_STARTED",
+          "runId": "round-F5",
+          "threadId": "session-F5",
+          "timestamp": 1789027200000,
+          "sequence": 1
+        },
+        {
+          "type": "STEP_STARTED",
+          "stepName": "step_1",
+          "timestamp": 1789027200000,
+          "sequence": 2
+        },
+        {
+          "type": "TEXT_MESSAGE_START",
+          "messageId": "msg-open",
+          "role": "assistant",
+          "timestamp": 1789027200000,
+          "sequence": 3
+        },
+        {
+          "type": "TOOL_CALL_START",
+          "toolCallId": "later-tool",
+          "toolCallName": "read_file",
+          "timestamp": 1789027200000,
+          "sequence": 4
+        }
+      ],
+      "history": {
+        "round_id": "round-F5",
+        "parent_run_id": null,
+        "idempotency_key": "idem-F5",
+        "last_event_sequence": 4,
+        "model_id": null,
+        "model_display_name": null,
+        "user_message": "读取演示通知",
+        "user_attachments": [],
+        "assistant_file_references": [],
+        "preferred_skills": [],
+        "preferred_mcp_connections": [],
+        "thinking_mode": null,
+        "reasoning_effort": null,
+        "final_response": null,
+        "terminal_presentation": {
+          "final_response_origin": "unknown",
+          "error": null
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "thinking": "",
+            "assistant_content": "",
+            "assistant_content_source": null,
+            "tool_calls": [],
+            "tool_results": [],
+            "status": "running",
+            "created_at": "2026-09-10T08:00:00",
+            "thinking_start_ts": null,
+            "thinking_end_ts": null,
+            "started_at_ts": 1789027200000,
+            "finished_at_ts": null
+          }
+        ],
+        "step_count": 0,
+        "status": "running",
+        "created_at": "2026-09-10T08:00:00",
+        "completed_at": null,
+        "interrupt": null
+      },
+      "expected_b1": [
+        {
+          "messageId": "msg-open",
+          "text": "尚未结束的正文尾段",
+          "state": "streaming",
+          "committed": false
+        }
+      ]
+    }
+  ]
+}

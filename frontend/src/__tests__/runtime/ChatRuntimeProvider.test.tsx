@@ -346,7 +346,7 @@ describe('ChatRuntimeProvider resume transport ownership', () => {
         promise: failedSubscription.promise,
         getLatestSequence: () => 7,
       });
-      vi.mocked(apiService.abortChat).mockReturnValue(abortRequest.promise as any);
+      vi.mocked(apiService.abortChat).mockReturnValue(abortRequest.promise.then(() => ({ status: 'cancelled', round_status: 'cancelled', admission_released: true })) as any);
       const view = render(
         <ChatRuntimeProvider>
           <RuntimeProbe />
@@ -369,7 +369,7 @@ describe('ChatRuntimeProvider resume transport ownership', () => {
         await Promise.resolve();
       });
       expect(subscribeAbort).not.toHaveBeenCalled();
-      expect(runtime!.getSessionProjection('sess-a').rounds[0].status).toBe('cancelled');
+      expect(runtime!.getSessionProjection('sess-a').rounds[0].status).toBe('waiting_interaction');
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1000);
@@ -393,13 +393,15 @@ describe('ChatRuntimeProvider resume transport ownership', () => {
           receivedAt: Date.now(),
         });
       });
-      expect(runtime!.getSessionProjection('sess-a').rounds[0].status).toBe('cancelled');
+      expect(runtime!.getSessionProjection('sess-a').rounds[0].status).toBe('waiting_interaction');
 
       await act(async () => {
         abortRequest.resolve();
         await stop;
       });
-      expect(apiService.abortChat).toHaveBeenCalledWith('sess-a');
+      expect(apiService.abortChat).toHaveBeenCalledWith('sess-a', 'server-r1');
+      expect(runtime!.getSessionProjection('sess-a').rounds[0].status).toBe('cancelled');
+      expect(runtime!.getSessionProjection('sess-a').stopping).toBe(false);
       view.unmount();
     } finally {
       vi.useRealTimers();
@@ -1301,9 +1303,8 @@ describe('ChatRuntimeProvider resume transport ownership', () => {
     });
 
     expect(apiService.getSessionHistoryV2).toHaveBeenCalledTimes(3);
-    expect(runtime!.getSessionProjection('sess-a').error).toBe(
-      '停止请求失败，后端任务可能仍在运行',
-    );
+    expect(runtime!.getSessionProjection('sess-a').stopping).toBe(true);
+    expect(runtime!.getSessionProjection('sess-a').sending).toBe(false);
     view.unmount();
   });
 

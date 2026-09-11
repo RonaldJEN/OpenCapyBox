@@ -2,6 +2,7 @@ import {
   useCallback,
   useRef,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
   type MutableRefObject,
@@ -60,6 +61,8 @@ interface ChatInputProps {
   onSend: () => void;
   /** 停止生成回调，传入后发送中按钮变为可点击的 Stop */
   onStop?: () => void;
+  /** 保持挂载的输入区恢复可见时，重新计算文本高度。 */
+  visible?: boolean;
 
   /** 是否禁用（发送中 / 创建会话中） */
   disabled?: boolean;
@@ -112,6 +115,7 @@ export function ChatInput({
   onChange,
   onSend,
   onStop,
+  visible = true,
   disabled = false,
   sendDisabled = false,
   sendingLabel,
@@ -351,10 +355,11 @@ export function ChatInput({
     items[nextIndex].focus();
   };
 
-  // 自动调整 textarea 高度
-  useEffect(() => {
+  // Hidden composers have no measurable scrollHeight. Resize before painting
+  // when the same mounted textarea becomes visible again.
+  useLayoutEffect(() => {
     const textarea = textareaRef.current;
-    if (!textarea) return;
+    if (!visible || !textarea || textarea.clientWidth === 0) return;
 
     textarea.style.height = 'auto';
     const scrollHeight = textarea.scrollHeight;
@@ -365,7 +370,7 @@ export function ChatInput({
     if (!hasOverflow) {
       textarea.scrollTop = 0;
     }
-  }, [value]);
+  }, [value, visible]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
@@ -443,8 +448,8 @@ export function ChatInput({
   const canSend = hasContent && !disabled && !sendDisabled;
 
   return (
-    <div className="bg-claude-bg px-4 pb-5 pt-3 md:px-8">
-      <div data-testid="chat-input-column" className="mx-auto w-full max-w-5xl">
+    <div className="bg-claude-bg pb-5 pt-3">
+      <div data-testid="chat-input-column" className="chat-column">
         {/* 附件列表 */}
         {attachedFiles.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2">

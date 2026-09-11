@@ -13,7 +13,6 @@ from src.api.services.history_service import HistoryService
 from src.api.models.round import Round
 from src.agent.schema.agui_events import (
     RunFinishedEvent,
-    TextMessageContentEvent,
     TextMessageStartEvent,
 )
 from tests.helpers import make_query_db
@@ -285,6 +284,7 @@ class TestHistoryServiceGetSessionRounds:
         mock_db.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
             [mock_round],  # rounds 查詢
             [mock_event, mock_workspace_resource, mock_event_end],  # events 查詢
+            [],  # parent task graph snapshots
         ]
         
         rounds = history_service.get_session_rounds("session-123")
@@ -328,7 +328,7 @@ class TestHistoryServiceGetSessionRounds:
                 parent_run_id=None,
                 idempotency_key=None,
             ))
-        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = rows
+        mock_db.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [rows, []]
 
         rounds = history_service.get_session_rounds("session-123")
 
@@ -390,6 +390,7 @@ class TestHistoryServiceRebuildSteps:
 
         assert steps == []
         assert references == [{
+            "event_sequence": 1,
             "ref_id": "session:s1:r1:report",
             "source": "session",
             "name": "report.md",
@@ -740,18 +741,6 @@ class TestHistoryServiceLateEventDrop:
 
         assert result is not None
         mock_db.add.assert_called_once()
-        mock_db.commit.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_save_agui_event_commits_delta_status_read_transaction(self, history_service, mock_db):
-        """delta 事件不写行，但终态读取产生的事务也要立即提交释放。"""
-        mock_db.query.return_value.filter.return_value.first.return_value = None
-        event = TextMessageContentEvent(messageId="msg-1", delta="hello")
-
-        result = await history_service.save_agui_event("run-1", event)
-
-        assert result is None
-        mock_db.add.assert_not_called()
         mock_db.commit.assert_called_once()
 
     @pytest.mark.asyncio
