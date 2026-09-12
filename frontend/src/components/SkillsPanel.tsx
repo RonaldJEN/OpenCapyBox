@@ -16,6 +16,7 @@ import {
   type SkillScanIssue,
   type SkillSandboxStatus,
 } from '../services/configApi';
+import FeedbackMessage from './FeedbackMessage';
 
 type SkillStatusFilter = 'all' | 'enabled' | 'disabled';
 type SkillSourceFilter = 'all' | 'official' | 'user';
@@ -286,10 +287,12 @@ export default function SkillsPanel() {
       </div>
 
       {error ? (
-        <div role="alert" className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-[#efd0ca] bg-[#fff5f3] px-4 py-3 text-xs font-medium text-[#9b473a]">
-          <span>{error}</span>
-          <button type="button" onClick={() => void loadSkills({ refresh: true })} disabled={loading} className="shrink-0 rounded-lg border border-current px-2.5 py-1.5 font-semibold hover:bg-[#fde9e5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c75c4a]/30 disabled:opacity-50">重新加载</button>
-        </div>
+        <FeedbackMessage tone="error" messageKey={error} className="mb-4 rounded-xl border border-[#efd0ca] bg-[#fff5f3] px-4 py-3 text-xs font-medium text-[#9b473a]">
+          <span className="flex items-center justify-between gap-3">
+            <span>{error}</span>
+            <button type="button" onClick={() => void loadSkills({ refresh: true })} disabled={loading} className="shrink-0 rounded-lg border border-current px-2.5 py-1.5 font-semibold hover:bg-[#fde9e5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c75c4a]/30 disabled:opacity-50">重新加载</button>
+          </span>
+        </FeedbackMessage>
       ) : null}
 
       {issues.length > 0 && !error ? (

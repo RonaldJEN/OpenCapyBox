@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from pathlib import Path
 import json
 
-from src.agent.agent import Agent, Colors
+from src.agent.agent import Agent
 from src.agent.tools.base import ToolResult
 from src.agent.schema import Message, LLMResponse, ToolCall, FunctionCall
 from tests.helpers import MockLLMClient, MockTool, make_agent, collect_agui_events

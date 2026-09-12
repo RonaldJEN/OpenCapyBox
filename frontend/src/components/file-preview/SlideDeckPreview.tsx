@@ -12,6 +12,7 @@ import type {
   PDFDocumentProxy,
   RenderTask,
 } from 'pdfjs-dist';
+import FeedbackMessage from '../FeedbackMessage';
 import './SlideDeckPreview.css';
 
 interface SlideDeckPreviewProps {
@@ -169,14 +170,16 @@ function SlideCanvas({ document, pageNumber, variant }: SlideCanvasProps) {
     <div
       ref={frameRef}
       className={`slide-deck-preview__canvas-frame slide-deck-preview__canvas-frame--${variant}`}
-      role="img"
+      role={status === 'error' && variant !== 'thumbnail' ? undefined : 'img'}
       aria-label={`第 ${pageNumber} 页`}
       aria-busy={status === 'loading'}
     >
       {status === 'loading' && <div className="slide-deck-preview__page-skeleton" aria-hidden="true" />}
       {status === 'error' && (
-        <div className="slide-deck-preview__page-error" role="alert">
-          第 {pageNumber} 页渲染失败
+        <div className="slide-deck-preview__page-error">
+          {variant === 'thumbnail' ? '无法预览' : (
+            <FeedbackMessage tone="error">{`第 ${pageNumber} 页渲染失败`}</FeedbackMessage>
+          )}
         </div>
       )}
       <canvas
@@ -274,10 +277,9 @@ function SlideDeckFallback({ source, title }: Pick<SlideDeckPreviewProps, 'sourc
 
   return (
     <div className="slide-deck-preview slide-deck-preview--fallback">
-      <div className="slide-deck-preview__fallback-notice" role="alert">
-        <AlertTriangle size={17} aria-hidden="true" />
-        <span>高级幻灯片浏览器加载失败，已切换为浏览器 PDF 预览。</span>
-      </div>
+      <FeedbackMessage tone="error" icon={<AlertTriangle size={17} />} className="slide-deck-preview__fallback-notice">
+        高级幻灯片浏览器加载失败，已切换为浏览器 PDF 预览。
+      </FeedbackMessage>
       <iframe
         src={src}
         className="slide-deck-preview__fallback-frame"

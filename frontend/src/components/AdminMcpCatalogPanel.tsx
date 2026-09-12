@@ -744,7 +744,11 @@ export default function AdminMcpCatalogPanel({
                   ? '平台必需 MCP 必须使用当前配置测试成功后才能发布；修改 URL、认证、凭证或网络边界后需重新测试。'
                   : '网络边界选项会扩大服务端出站访问范围，仅为受信任的内部服务启用。'}</p>
               </div>
-              {formError ? <div className="admin-error admin-inline-message" role="alert"><AlertCircle size={14} />{formError}</div> : null}
+              {formError ? (
+                <FeedbackMessage className="admin-error admin-inline-message" tone="error" icon={<AlertCircle size={14} />} onDismiss={() => setFormError('')}>
+                  {formError}
+                </FeedbackMessage>
+              ) : null}
               <div className="admin-mcp-drawer-foot"><button type="button" className="admin-button" disabled={saving} onClick={closeDrawer}>取消</button><button type="submit" className="admin-button admin-primary-button" disabled={saving}>{saving ? <Loader2 className="admin-mcp-spin" size={14} /> : <CheckCircle2 size={14} />}保存服务</button></div>
             </form>
           </aside>

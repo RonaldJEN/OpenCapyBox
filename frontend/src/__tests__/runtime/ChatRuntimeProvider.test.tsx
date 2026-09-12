@@ -15,6 +15,7 @@ import type { RoundData } from '../../types';
 
 vi.mock('../../services/api', () => ({
   apiService: {
+    getAuthHeaders: vi.fn(),
     getSessionHistoryV2: vi.fn(),
     abortChat: vi.fn(),
   },
@@ -106,6 +107,72 @@ describe('ChatRuntimeProvider resume transport ownership', () => {
       getLatestSequence: () => 0,
     });
     runtime = null;
+  });
+
+  it.each([
+    {
+      rejection: 'HTTP 429 concurrency limit',
+      status: 429,
+      message: '当前有正在运行的任务，运行任务数已达上限（1），请等待完成后再发送新消息',
+    },
+    { rejection: 'HTTP 422 validation', status: 422, message: '消息内容不符合要求' },
+    { rejection: 'HTTP 500 server error', status: 500, message: '服务暂时不可用，请稍后重试' },
+    { rejection: 'SSE pre-accept error', status: 200, message: 'Agent 初始化失败' },
+  ])('shows $rejection and restores the draft without a persisted Round', async ({ status, message }) => {
+    const actualClient = await vi.importActual<typeof import('../../services/chatStreamClient')>(
+      '../../services/chatStreamClient',
+    );
+    vi.mocked(startSendStream).mockImplementation(actualClient.startSendStream);
+    vi.mocked(apiService.getAuthHeaders).mockReturnValue({});
+    const body = status === 200
+      ? `data: ${JSON.stringify({ type: 'RUN_ERROR', code: 'AGENT_INIT_FAILED', message })}\n\n`
+      : JSON.stringify({ detail: message });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, {
+      status,
+      headers: { 'Content-Type': status === 200 ? 'text/event-stream' : 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.useFakeTimers();
+    const restoreDraft = vi.fn();
+    const streamAccepted = vi.fn();
+    const view = render(
+      <ChatRuntimeProvider>
+        <RuntimeProbe />
+      </ChatRuntimeProvider>,
+    );
+
+    try {
+      await act(async () => {
+        await runtime!.sendMessage({
+          sessionId: 'sess-a',
+          displayMessage: '第二个问题',
+          content: [{ type: 'text', text: '第二个问题' }],
+          onRejectedBeforeAccept: restoreDraft,
+          onStreamAccepted: streamAccepted,
+        });
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+
+      expect(restoreDraft).toHaveBeenCalledTimes(1);
+      expect(streamAccepted).not.toHaveBeenCalled();
+      expect(runtime!.getSessionProjection('sess-a')).toMatchObject({
+        error: message,
+        rounds: [],
+        sending: false,
+        activeRunKeys: [],
+      });
+      expect(view.getByTestId('runtime-probe')).toHaveAttribute('data-error', message);
+      expect(runtime!.state.runs).toEqual({});
+      expect(runtime!.getActiveSlotSessionIds().has('sess-a')).toBe(false);
+      expect(startSendStream).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(startSubscribeStream).not.toHaveBeenCalled();
+      expect(apiService.getSessionHistoryV2).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
   });
 
   it('drops a late error from the replaced resume transport and clears the settled subscription', async () => {

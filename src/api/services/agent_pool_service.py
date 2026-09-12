@@ -280,8 +280,6 @@ class AgentPoolService:
         )
         if stats.get("failed", 0):
             logger.warning(msg, *args)
-        else:
-            logger.info(msg, *args)
 
     async def _interrupt_background_commands_for_agent(
         self,
@@ -335,7 +333,6 @@ class AgentPoolService:
 
         running_session_ids = self._running_session_ids_for_user(user_id)
         removed = 0
-        skipped_running = 0
         for session_id in list(self._user_sessions.get(user_id, set())):
             if session_id == keep_session_id:
                 continue
@@ -346,26 +343,10 @@ class AgentPoolService:
                     session_id in running_session_ids
                     or self._cached_agent_is_running(session_id)
                 ):
-                    skipped_running += 1
                     continue
                 if await self.remove_async(session_id):
                     removed += 1
 
-        if removed:
-            logger.warning(
-                "用戶沙箱已切換，已异步失效同用戶舊 Agent 快取 (user=%s, sandbox_id=%s, sessions=%d)",
-                user_id,
-                new_sandbox_id,
-                removed,
-            )
-        if skipped_running:
-            logger.info(
-                "用戶沙箱已切換，保留仍在運行的舊 Agent 快取等待懶失效 "
-                "(user=%s, sandbox_id=%s, sessions=%d)",
-                user_id,
-                new_sandbox_id,
-                skipped_running,
-            )
         return removed
 
     def _cached_agent_is_running(self, chat_session_id: str) -> bool:
@@ -502,7 +483,7 @@ class AgentPoolService:
                     if status == 404 or isinstance(sandbox_content, FileNotFoundError):
                         write_items.append((file_type, filename, path, db_content))
                     else:
-                        logger.warning("读取沙箱文件失败 (%s)，跳过同步: %s", filename, sandbox_content)
+                        logger.warning("读取沙箱记忆失败: user=%s file=%s error_type=%s", user_id, filename, type(sandbox_content).__name__)
                     continue
 
                 if sandbox_content and sandbox_content.strip():
@@ -518,11 +499,6 @@ class AgentPoolService:
                         except Exception as e:
                             logger.warning("同步记忆到沙箱失败 (%s): %s", filename, e)
                             continue
-                        logger.info(
-                            "沙箱优先：%s 已从沙箱回写 DB (%d chars)",
-                            filename,
-                            len(sandbox_content),
-                        )
                     continue
 
                 write_items.append((file_type, filename, path, db_content))
@@ -538,7 +514,7 @@ class AgentPoolService:
         synced = 0
         for (_, filename, _, _), write_result in zip(write_items, write_results):
             if isinstance(write_result, BaseException):
-                logger.warning("同步记忆到沙箱失败 (%s): %s", filename, write_result)
+                logger.warning("同步记忆到沙箱失败: user=%s file=%s error_type=%s", user_id, filename, type(write_result).__name__)
                 continue
             synced += 1
 
@@ -588,7 +564,7 @@ class AgentPoolService:
 
         # 先嘗試從緩存獲取（無鎖快速路徑）
         if chat_session_id in self._cache:
-            needs_rebuild, rebuild_reason, cached_sandbox_id, current_sandbox_id = (
+            needs_rebuild, rebuild_reason, _, current_sandbox_id = (
                 self._cached_agent_needs_rebuild(
                     user_id=user_id,
                     chat_session_id=chat_session_id,
@@ -602,15 +578,6 @@ class AgentPoolService:
             elif self._cached_agent_is_running(chat_session_id):
                 self._detach_running_agent(chat_session_id)
             elif needs_rebuild:
-                logger.warning(
-                    "Agent 快取需要重建，移除舊實例 "
-                    "(reason=%s, user=%s, session=%s, cached=%s, current=%s)",
-                    rebuild_reason,
-                    user_id,
-                    chat_session_id,
-                    cached_sandbox_id,
-                    current_sandbox_id,
-                )
                 if rebuild_reason in {"sandbox_stale", "profile_stale"}:
                     self._invalidate_sandbox_cache_if_stale(
                         sandbox_service=sandbox_service,
@@ -645,7 +612,7 @@ class AgentPoolService:
         async with lock:
             # Double-check：取得鎖後再次確認緩存
             if chat_session_id in self._cache:
-                needs_rebuild, rebuild_reason, cached_sandbox_id, current_sandbox_id = (
+                needs_rebuild, rebuild_reason, _, current_sandbox_id = (
                     self._cached_agent_needs_rebuild(
                         user_id=user_id,
                         chat_session_id=chat_session_id,
@@ -659,15 +626,6 @@ class AgentPoolService:
                 elif self._cached_agent_is_running(chat_session_id):
                     self._detach_running_agent(chat_session_id)
                 elif needs_rebuild:
-                    logger.warning(
-                        "Agent 快取需要重建，鎖內移除舊實例 "
-                        "(reason=%s, user=%s, session=%s, cached=%s, current=%s)",
-                        rebuild_reason,
-                        user_id,
-                        chat_session_id,
-                        cached_sandbox_id,
-                        current_sandbox_id,
-                    )
                     if rebuild_reason in {"sandbox_stale", "profile_stale"}:
                         self._invalidate_sandbox_cache_if_stale(
                             sandbox_service=sandbox_service,
@@ -772,7 +730,7 @@ class AgentPoolService:
         try:
             await sandbox.commands.run(f"mkdir -p {session_workspace}")
         except Exception as e:
-            logger.warning("沙箱會話目錄創建失敗（bash 可能不可用）: %s", e)
+            logger.warning("沙箱会话目录创建失败: session=%s error_type=%s", chat_session_id, type(e).__name__)
 
         agent_service = AgentService(
             sandbox=sandbox,
@@ -783,9 +741,7 @@ class AgentPoolService:
         )
 
         try:
-            logger.info("正在初始化 Agent (session=%s, user=%s)...", chat_session_id, user_id)
             await agent_service.initialize_agent()
-            logger.info("Agent 初始化成功 (session=%s)", chat_session_id)
         except Exception:
             try:
                 agent_service.close()
@@ -850,7 +806,6 @@ class AgentPoolService:
         if agent_svc is not None:
             self._drop_session_metadata(chat_session_id, drop_lock=drop_lock)
             removed = True
-            logger.info("已从 Agent 热缓存摘除，开始异步清理: %s", chat_session_id)
 
             await self._interrupt_background_commands_for_agent(chat_session_id, agent_svc)
 
@@ -858,7 +813,6 @@ class AgentPoolService:
                 agent_svc.close()
             except Exception:
                 pass
-            logger.info("已异步移除 Agent 緩存: %s", chat_session_id)
         else:
             self._drop_session_metadata(chat_session_id, drop_lock=drop_lock)
         return removed
@@ -903,26 +857,17 @@ class AgentPoolService:
         sandbox_service = get_sandbox_service()
         for session_id in sessions_to_remove:
             await self.remove_async(session_id)
-            logger.info("清理過期 Agent 緩存: %s", session_id)
-
-        skipped_running = len(expired_sessions) - len(sessions_to_remove)
-        if skipped_running:
-            logger.info("跳過仍在运行的過期 Agent 緩存: sessions=%d", skipped_running)
 
         for user_id in users_to_pause:
             # ★ 再次檢查：在 await 間隙可能有新 session 被注冊
             if user_id in self._user_creating:
-                logger.info("用戶正在創建 Agent，跳過暫停沙箱: user=%s", user_id)
                 continue
             current_sessions = self._user_sessions.get(user_id, set())
             if current_sessions:
-                logger.info("用戶已有新活躍 session，跳過暫停沙箱: user=%s", user_id)
                 continue
             if self._user_has_fresh_run_lock(user_id):
-                logger.info("其他 worker 仍有活躍運行鎖，跳過暫停沙箱: user=%s", user_id)
                 continue
             await sandbox_service.pause(user_id)
-            logger.info("用戶所有 session 均過期，暫停沙箱: user=%s", user_id)
 
         return sessions_to_remove
 
@@ -943,8 +888,6 @@ class AgentPoolService:
             if await self.remove_async(session_id):
                 removed += 1
 
-        if removed:
-            logger.info("已异步失效用户 Agent 缓存: user=%s, sessions=%d", user_id, removed)
         return removed
 
     async def invalidate_all_async(self, *, preserve_running: bool = True) -> int:

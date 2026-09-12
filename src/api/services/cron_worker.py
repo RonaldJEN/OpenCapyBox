@@ -353,17 +353,6 @@ def _enqueue_scheduled_run(
             if job is None:
                 return None
             current_definition_version = int(job.definition_version or 1)
-            if (
-                definition_version is not None
-                and current_definition_version != definition_version
-            ):
-                logger.info(
-                    "cron definition advanced before durable enqueue; using latest "
-                    "job_id=%s expected=%s actual=%s",
-                    job_id,
-                    definition_version,
-                    current_definition_version,
-                )
             snapshot = build_cron_definition_snapshot(job)
             run_id = str(uuid.uuid4())
             fire_id = str(uuid.uuid4())
@@ -854,21 +843,8 @@ async def _run(
             expected_rule_version,
         )
         if latest is None:
-            logger.info(
-                "cron skip stale job before execute job_id=%s worker=%s (deleted or disabled)",
-                scheduled_job_id,
-                worker_id,
-            )
             return
 
-    logger.info(
-        "cron start worker=%s user=%s job=%s run=%s source=%s",
-        worker_id,
-        user_id,
-        job_name,
-        actual_run_id,
-        source,
-    )
     try:
         await run_cron_job(
             user_id,
@@ -904,11 +880,6 @@ async def _run_by_id(
         expected_rule_version,
     )
     if snapshot is None:
-        logger.info(
-            "cron skip stale job job_id=%s worker=%s (deleted or disabled)",
-            job_id,
-            worker_id,
-        )
         return
 
     user_id, name, rule_version = snapshot

@@ -1228,7 +1228,11 @@ export default function McpConnectionsPanel({
                 此处只控制工具是否发布给 Agent。调用时的 <strong>ALLOW / ASK / DENY</strong> 在“权限管控”中单独设置。
               </div>
 
-              {toolManager.error ? <div className="mcp-user-alert error" role="alert"><AlertCircle size={15} />{toolManager.error}</div> : null}
+              {toolManager.error ? (
+                <FeedbackMessage className="mcp-user-alert error" tone="error" icon={<AlertCircle size={15} />}>
+                  {toolManager.error}
+                </FeedbackMessage>
+              ) : null}
               {!toolManager.loading && toolManager.catalog ? (
                 <fieldset className="mcp-user-tool-mode" disabled={toolManager.saving}>
                   <legend>新发现工具的发布方式</legend>
@@ -1442,7 +1446,11 @@ export default function McpConnectionsPanel({
                 {editor.server?.required ? '平台必需连接始终启用' : '保存后启用此连接'}
               </label>
 
-              {editorError ? <div className="mcp-user-alert error" role="alert"><AlertCircle size={15} />{editorError}</div> : null}
+              {editorError ? (
+                <FeedbackMessage className="mcp-user-alert error" tone="error" icon={<AlertCircle size={15} />} onDismiss={() => setEditorError('')}>
+                  {editorError}
+                </FeedbackMessage>
+              ) : null}
               <div className="mcp-user-modal-foot">
                 <button type="button" onClick={closeEditor} disabled={editorSaving}>取消</button>
                 <button type="submit" className="primary" disabled={editorSaving}>

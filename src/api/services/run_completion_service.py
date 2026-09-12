@@ -256,12 +256,6 @@ class RunCompletionService:
                         run_id=run_id,
                         status=round_obj.status,
                     )
-                    logger.info(
-                        "Round %s 已处于终态 %s，跳过 complete(status=%s)",
-                        run_id,
-                        round_obj.status,
-                        status,
-                    )
                     if human_work_changed:
                         db.commit()
                     else:

@@ -149,7 +149,7 @@ export default function AdminUsageReportPanel({ refreshToken = 0 }: { refreshTok
         <span className="admin-subline">按下方已查询日期导出三个 Sheet，不受分页或明细筛选影响</span>
       </div>
     </div>
-    {error && <FeedbackMessage tone="error" onDismiss={() => setError('')} autoDismissMs={5000}>{error}</FeedbackMessage>}
+    {error && <FeedbackMessage tone="error" onDismiss={() => setError('')}>{error}</FeedbackMessage>}
     {loading && <div role="status" className="usage-loading">正在查询使用数据…</div>}
     {data && <>
       <div className="usage-result-heading">

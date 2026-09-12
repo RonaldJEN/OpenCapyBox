@@ -2638,7 +2638,7 @@ function UsersPanel({
               {loginEventsLoading ? (
                 <div className="admin-loading">正在加载登录历史</div>
               ) : loginEventsError ? (
-                <div className="admin-error admin-inline-message">{loginEventsError}</div>
+                <FeedbackMessage className="admin-error admin-inline-message" tone="error">{loginEventsError}</FeedbackMessage>
               ) : (loginEvents?.events.length || 0) > 0 ? (
                 <div className="admin-table-wrap">
                   <table className="admin-table admin-login-events-table">

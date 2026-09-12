@@ -1478,12 +1478,30 @@ class TestAgentServiceChatAgui:
         assert create_kwargs["user_attachments"][0]["path"] == "report.pdf"
 
     @pytest.mark.asyncio
-    async def test_chat_agui_with_image_not_supported(self, service):
+    @pytest.mark.parametrize("file_metadata", [
+        None,
+        {
+            "path": "attachments/draft-image/a.png",
+            "name": "a.png",
+            "mime_type": "image/png",
+            "composer_draft_attachment_id": "draft-image",
+        },
+    ])
+    async def test_chat_agui_with_image_not_supported(self, service, file_metadata):
+        service._materialize_workspace_attachments = AsyncMock()
         with pytest.raises(ValueError, match="不支持图片"):
             async for _ in service.chat_agui([
-                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/a.png"},
+                    "file": file_metadata,
+                },
             ]):
                 pass
+
+        service._materialize_workspace_attachments.assert_not_awaited()
+        service.history_service.create_round.assert_not_called()
+        service.agent.add_user_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_chat_agui_with_image_supported(self, service):

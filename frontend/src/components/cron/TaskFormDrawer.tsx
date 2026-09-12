@@ -17,6 +17,7 @@ import {
   type SchedulePreviewResult,
 } from '../../services/configApi';
 import SchedulePicker, { defaultScheduleForKind } from './SchedulePicker';
+import FeedbackMessage from '../FeedbackMessage';
 
 interface Props {
   /** 编辑模式：传入要编辑的任务；新建模式：null。 */
@@ -115,6 +116,7 @@ const TaskFormDrawer: React.FC<Props> = ({ task, onClose, onSaved }) => {
   }, [name, content, schedule, enabled]);
 
   useEffect(() => {
+    setPreviewError(null);
     const payload = schedule !== null
       ? { schedule, n: 5 }
       : task?.cron_expr
@@ -222,7 +224,7 @@ const TaskFormDrawer: React.FC<Props> = ({ task, onClose, onSaved }) => {
               className="w-full px-2.5 py-1.5 border border-claude-border rounded bg-claude-bg text-claude-text disabled:opacity-60"
             />
             {!isEdit && name && !NAME_RE.test(name) && (
-              <div className="mt-1 text-xs text-red-500">仅允许字母/数字/下划线/连字符，长度 1-100</div>
+              <FeedbackMessage tone="error" messageKey={name} className="mt-1 text-xs text-red-500">仅允许字母/数字/下划线/连字符，长度 1-100</FeedbackMessage>
             )}
           </div>
 
@@ -277,7 +279,7 @@ const TaskFormDrawer: React.FC<Props> = ({ task, onClose, onSaved }) => {
                   </ol>
                 </>
               ) : (
-                <div className="text-xs text-red-600">{previewError}</div>
+                <FeedbackMessage tone="error" className="text-xs text-red-600">{previewError}</FeedbackMessage>
               )}
             </div>
           )}
@@ -293,9 +295,9 @@ const TaskFormDrawer: React.FC<Props> = ({ task, onClose, onSaved }) => {
           </label>
 
           {error && (
-            <div className="p-2 text-xs rounded bg-red-50 border border-red-200 text-red-700">
+            <FeedbackMessage tone="error" className="p-2 text-xs rounded bg-red-50 border border-red-200 text-red-700">
               {error}
-            </div>
+            </FeedbackMessage>
           )}
         </div>
 

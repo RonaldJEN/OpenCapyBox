@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
+import FeedbackMessage from './FeedbackMessage';
 
 interface ConfirmDialogProps {
   title: string;
@@ -138,9 +139,9 @@ export function ConfirmDialog({
         </div>
         {details}
         {error && (
-          <p role="alert" className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-[13px] text-claude-error">
+          <FeedbackMessage tone="error" className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-[13px] text-claude-error">
             {error}
-          </p>
+          </FeedbackMessage>
         )}
         <div className="mt-5 flex justify-end gap-2">
           <button

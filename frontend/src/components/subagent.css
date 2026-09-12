@@ -17,8 +17,6 @@
 .chat-subtask-instructions { margin-bottom: 24px; color: #73736f; font-size: 13px; }
 .chat-subtask-instructions summary { cursor: pointer; width: fit-content; }
 .chat-subtask-instructions p { margin-top: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.chat-subtask-error { margin: 12px 0; color: #9b4545; font-size: 13px; }
-.chat-subtask-error button { margin-top: 6px; text-decoration: underline; text-underline-offset: 3px; }
 .chat-subtask-scroll-control { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); }
 .chat-subtask-scroll-control button { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 8px 14px; border: 1px solid #e5e4df; border-radius: 24px; background: white; font-size: 12px; white-space: nowrap; box-shadow: 0 2px 8px #00000012; }
 /* Parent nodes remain mounted so the composer and its draft retain ownership. */

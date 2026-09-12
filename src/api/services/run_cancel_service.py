@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -13,8 +12,6 @@ from sqlalchemy.orm import Session as DBSession
 
 from src.api.models.run_cancel_request import RunCancelRequest
 from src.api.utils.timezone import now_naive
-
-logger = logging.getLogger(__name__)
 
 
 _CANCEL_STATE_REQUESTED = "requested"
@@ -137,22 +134,6 @@ class RunCancelService:
 
         if local_hit and entry is not None:
             entry.cancel_token.set()
-            logger.info(
-                "cancel token set: user=%s session=%s run=%s request=%s reason=%s",
-                user_id,
-                session_id,
-                target_run_id,
-                request_id,
-                reason,
-            )
-        else:
-            logger.info(
-                "cancel request audited without local registry hit: user=%s session=%s target=%s request=%s",
-                user_id,
-                session_id,
-                target_run_id,
-                request_id,
-            )
 
         return CancelAuditResult(
             request_id=request_id,

@@ -152,11 +152,9 @@ async def _read_bytes_via_command(sandbox, sandbox_path: str) -> bytes | None:
         stdout_text = _command_stdout_text(cmd_result)
         exit_code = _extract_exit_code(cmd_result)
         if exit_code != 0 or not stdout_text:
-            logger.warning("命令 base64 讀取失敗 (exit=%s): %s", exit_code, sandbox_path)
             return None
         return b64_mod.b64decode(stdout_text)
-    except Exception as e:
-        logger.warning("命令 base64 讀取異常: %s — %s", sandbox_path, e)
+    except Exception:
         return None
 
 
@@ -171,17 +169,15 @@ async def _read_bytes_via_ascii_alias(sandbox, sandbox_path: str) -> bytes | Non
             f"cp {shlex.quote(sandbox_path)} {shlex.quote(alias_path)}"
         )
         if _extract_exit_code(copy_result) != 0:
-            logger.warning("ASCII 別名 cp 失敗: %s -> %s", sandbox_path, alias_path)
             return None
 
         try:
             return await sandbox.files.read_bytes(alias_path)
-        except Exception as e:
-            logger.warning("ASCII 別名 read_bytes 也失敗，改用命令讀取: %s — %s", alias_path, e)
+        except Exception:
+            pass
 
         return await _read_bytes_via_command(sandbox, alias_path)
-    except Exception as e:
-        logger.warning("ASCII 別名回退失敗: %s -> %s — %s", sandbox_path, alias_path, e)
+    except Exception:
         return None
     finally:
         try:
@@ -957,8 +953,6 @@ async def update_session_title(
     db.commit()
     db.refresh(session)
 
-    logger.info("会话标题已更新: %s -> %s", chat_session_id, request.title)
-
     return session
 
 
@@ -982,7 +976,6 @@ async def delete_session(
     # 使用 AgentPoolService 清理 agent 缓存
     agent_pool = get_agent_pool()
     await agent_pool.remove_async(chat_session_id)
-    logger.info("已清理 Agent 缓存: %s", chat_session_id)
 
     user_id = session.user_id
     sandbox_service = get_sandbox_service()
@@ -1083,15 +1076,14 @@ async def get_session_files(
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning("無法連接沙箱獲取文件列表: %s", e)
+        logger.warning("连接沙箱获取文件列表失败: session=%s error_type=%s", chat_session_id, type(e).__name__)
         raise HTTPException(status_code=503, detail="沙箱不可用") from e
 
     try:
         files = await _sandbox_list_dir(sandbox, target_dir, session_root)
         return FileListResponse(files=files, total=len(files))
-    except Exception as e:
+    except Exception:
         # 沙箱可能已過期，清除快取重試一次
-        logger.warning("從沙箱獲取文件列表失敗，嘗試重新連接: %s", e)
         try:
             sandbox = await _ensure_sandbox(
                 sandbox_service,
@@ -1105,7 +1097,7 @@ async def get_session_files(
         except HTTPException:
             raise
         except Exception as retry_error:
-            logger.warning("重連後仍無法獲取文件列表: %s", retry_error)
+            logger.warning("重连后获取文件列表失败: session=%s error_type=%s", chat_session_id, type(retry_error).__name__)
             raise HTTPException(status_code=503, detail="无法读取会话文件") from retry_error
 
 
@@ -1132,7 +1124,7 @@ async def download_session_directory(
     except HTTPException:
         raise
     except Exception as error:
-        logger.warning("Session directory download failed: %s", error)
+        logger.warning("Session directory download failed: session=%s error_type=%s", chat_session_id, type(error).__name__)
         raise HTTPException(503, "文件夹打包失败，请稍后重试") from error
 
 
@@ -1292,7 +1284,7 @@ PY"""
     except HTTPException:
         raise
     except Exception as exc:
-        logger.warning("Session 文件保存失败: %s", exc)
+        logger.warning("Session 文件保存失败: session=%s error_type=%s", chat_session_id, type(exc).__name__)
         raise HTTPException(status_code=500, detail="文件保存失败") from exc
     finally:
         try:
@@ -1324,9 +1316,6 @@ async def download_file(
     if render is not None and not preview:
         raise HTTPException(status_code=400, detail="派生渲染仅可用于预览")
 
-    action = "预览" if preview else "下载"
-    logger.debug(f"文件{action}请求: session={chat_session_id}, path={file_path}")
-
     # 验证会话属于该用户
     session = (
         db.query(Session)
@@ -1348,7 +1337,7 @@ async def download_file(
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning("無法連接沙箱下載文件: %s", e)
+        logger.warning("连接沙箱下载文件失败: session=%s error_type=%s", chat_session_id, type(e).__name__)
         raise HTTPException(status_code=503, detail="沙箱不可用")
 
     # 構建並校驗沙箱中的完整路徑
@@ -1437,26 +1426,18 @@ async def download_file(
                     media_type="application/pdf",
                     headers=rendered_headers,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "派生 PDF 流式讀取失敗，回退到有界一次性讀取: %s — %s",
-                    rendered.sandbox_path,
-                    exc,
-                )
+            except Exception:
+                pass
 
         try:
             rendered_bytes = await sandbox.files.read_bytes(rendered.sandbox_path)
-        except Exception as exc:
-            logger.warning(
-                "files API 讀取派生 PDF 失敗，嘗試命令回退: %s — %s",
-                rendered.sandbox_path,
-                exc,
-            )
+        except Exception:
             rendered_bytes = await _read_bytes_via_command(
                 sandbox,
                 rendered.sandbox_path,
             )
         if rendered_bytes is None or len(rendered_bytes) != rendered.size:
+            logger.warning("读取派生 PDF 失败: session=%s stage=preview_read", chat_session_id)
             raise HTTPException(status_code=422, detail="无法读取转换后的 PDF")
 
         fallback_headers = {
@@ -1494,7 +1475,6 @@ async def download_file(
     # 非 ASCII 路徑（中文等）：proxy 必定 500。预览优先单次命令读取，
     # 下载仍优先 ASCII 别名，以免大文件经过 base64 stdout。
     if has_non_ascii:
-        logger.debug("非 ASCII 路徑，跳過 SDK API 直接走回退: %s", sandbox_path)
         file_bytes = await _read_non_ascii_file_bytes(
             sandbox,
             sandbox_path,
@@ -1514,21 +1494,21 @@ async def download_file(
                     media_type=mime_type or "application/octet-stream",
                     headers=headers,
                 )
-            except Exception as e:
-                logger.warning("流式讀取失敗: %s — %s", sandbox_path, e)
+            except Exception:
+                pass
 
         # 2) 一次性讀取（SDK read_bytes）
         try:
             file_bytes = await sandbox.files.read_bytes(sandbox_path)
-        except Exception as e:
-            logger.warning("files API 讀取失敗: %s — %s", sandbox_path, e)
+        except Exception:
+            pass
 
         # 3) 命令回退：直接用命令讀取（繞過 files API proxy）
         if file_bytes is None:
             file_bytes = await _read_bytes_via_command(sandbox, sandbox_path)
 
     if file_bytes is None:
-        logger.warning("所有回退方式均失敗: %s", sandbox_path)
+        logger.warning("读取文件的所有回退方式均失败: session=%s stage=file_read", chat_session_id)
         raise HTTPException(status_code=404, detail="文件不存在或無法讀取")
 
     return Response(
@@ -1594,8 +1574,6 @@ async def upload_file(
     if file is None:
         raise HTTPException(status_code=400, detail="未选择文件")
 
-    logger.info(f"文件上传: session={chat_session_id}, file={file.filename}, user={user_id}")
-
     # 验证会话属于该用户
     session = (
         db.query(Session)
@@ -1635,7 +1613,7 @@ async def upload_file(
         except HTTPException:
             raise
         except Exception as e:
-            logger.warning("無法連接沙箱上傳文件: %s", e)
+            logger.warning("连接沙箱上传文件失败: session=%s error_type=%s", chat_session_id, type(e).__name__)
             raise HTTPException(status_code=503, detail="沙箱不可用")
 
         try:
@@ -1699,15 +1677,13 @@ PY"""
                 revision=f"v1:{persisted_size}:{persisted_mtime_ns}",
             )
 
-            logger.info(f"文件上傳至沙箱成功: {final_filename} ({len(content)} bytes)")
             return file_info
 
         except Exception as e:
             last_err = e
             if attempt == 0:
-                logger.warning("沙箱操作失敗，將清除快取重試: %s", e)
                 continue
     else:
         # 所有重試均失敗
-        logger.error(f"文件上傳至沙箱失敗: {last_err}")
+        logger.error("文件上传至沙箱失败: session=%s error_type=%s", chat_session_id, type(last_err).__name__)
         raise HTTPException(status_code=500, detail=f"文件保存失敗: {last_err}")

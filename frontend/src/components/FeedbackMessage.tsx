@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useState,
   type ReactNode,
 } from 'react';
 import { X } from 'lucide-react';
@@ -17,9 +18,13 @@ interface FeedbackMessageProps {
   className?: string;
   closeButtonClassName?: string;
   icon?: ReactNode;
-  onDismiss: () => void;
+  onDismiss?: () => void;
   tone: FeedbackTone;
   autoDismissMs?: number;
+  /** Stable identity for feedback with rich content, or a new failed attempt. */
+  messageKey?: unknown;
+  id?: string;
+  closeLabel?: string;
 }
 
 export default function FeedbackMessage({
@@ -30,17 +35,30 @@ export default function FeedbackMessage({
   onDismiss,
   tone,
   autoDismissMs,
+  messageKey,
+  id,
+  closeLabel = '关闭提示',
 }: FeedbackMessageProps) {
   const resolvedAutoDismissMs = autoDismissMs
-    ?? (tone === 'success' || tone === 'info' ? DEFAULT_FEEDBACK_AUTO_DISMISS_MS : 0);
+    ?? (tone === 'warning' ? 0 : DEFAULT_FEEDBACK_AUTO_DISMISS_MS);
+  const feedbackKey = messageKey ?? children;
+  const [dismissed, setDismissed] = useState<{ key: unknown } | null>(null);
+  const visible = !dismissed || !Object.is(dismissed.key, feedbackKey);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const startedAtRef = useRef(0);
   const remainingRef = useRef(resolvedAutoDismissMs);
-  const dismissRef = useRef(onDismiss);
+  const dismissRef = useRef(() => {});
 
   useEffect(() => {
-    dismissRef.current = onDismiss;
-  }, [onDismiss]);
+    setDismissed(null);
+  }, [feedbackKey]);
+
+  useEffect(() => {
+    dismissRef.current = () => {
+      setDismissed({ key: feedbackKey });
+      onDismiss?.();
+    };
+  }, [feedbackKey, onDismiss]);
 
   const clearTimer = useCallback(() => {
     if (timerRef.current !== null) {
@@ -51,19 +69,19 @@ export default function FeedbackMessage({
 
   const startTimer = useCallback(() => {
     clearTimer();
-    if (!resolvedAutoDismissMs || remainingRef.current <= 0) return;
+    if (!visible || !resolvedAutoDismissMs || remainingRef.current <= 0) return;
     startedAtRef.current = Date.now();
     timerRef.current = setTimeout(() => {
       timerRef.current = null;
       dismissRef.current();
     }, remainingRef.current);
-  }, [clearTimer, resolvedAutoDismissMs]);
+  }, [clearTimer, resolvedAutoDismissMs, visible]);
 
   useEffect(() => {
     remainingRef.current = resolvedAutoDismissMs;
     startTimer();
     return clearTimer;
-  }, [children, clearTimer, resolvedAutoDismissMs, startTimer]);
+  }, [feedbackKey, clearTimer, resolvedAutoDismissMs, startTimer]);
 
   const pauseTimer = () => {
     if (timerRef.current === null) return;
@@ -76,8 +94,11 @@ export default function FeedbackMessage({
     startTimer();
   };
 
+  if (!visible) return null;
+
   return (
     <div
+      id={id}
       className={`feedback-message ${className}`.trim()}
       role={tone === 'error' ? 'alert' : 'status'}
       data-tone={tone}
@@ -93,8 +114,11 @@ export default function FeedbackMessage({
       <button
         type="button"
         className={`feedback-message__close ${closeButtonClassName}`.trim()}
-        aria-label="关闭提示"
-        onClick={onDismiss}
+        aria-label={closeLabel}
+        onClick={() => {
+          clearTimer();
+          dismissRef.current();
+        }}
       >
         <X size={14} />
       </button>

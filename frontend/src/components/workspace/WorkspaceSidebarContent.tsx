@@ -22,6 +22,7 @@ import { emitWorkspaceMutation, subscribeWorkspaceMutation } from '../../service
 import { createWorkspaceIdempotencyKey, workspaceApi, workspaceEntryToFileInfo, WorkspaceApiError } from '../../services/workspaceApi';
 import { getFileIcon, getFileIconClass } from '../../utils/fileUtils';
 import { ConfirmDialog } from '../ConfirmDialog';
+import FeedbackMessage from '../FeedbackMessage';
 import { discardWorkspaceDrafts } from '../../services/workspaceDraftOutbox';
 
 const ROOT = '__workspace_sidebar_root__';
@@ -1284,7 +1285,12 @@ export function WorkspaceSidebarContent({
       })()}
       <input ref={uploadRef} type="file" multiple className="hidden" onChange={(event) => void uploadFiles(event.target.files, uploadParentRef.current?.entry_id || null)} />
       {uploadStatus && <div role="status" className="mx-2 mb-2 flex items-center gap-2 text-xs text-claude-secondary"><Loader2 size={13} className="shrink-0 animate-spin" aria-hidden="true" /><span className="min-w-0 truncate" title={uploadStatus}>{uploadStatus}</span></div>}
-      {error && <div className="mx-1 mb-2 flex items-center gap-2 rounded-lg bg-red-50 px-2.5 py-2 text-[11px] text-claude-error" role="alert"><span className="min-w-0 flex-1 whitespace-normal">{error}</span><button type="button" onClick={() => void loadDirectory(null)} disabled={loadingParents.has(ROOT) || searching} className="shrink-0 rounded-md px-1.5 py-1 font-medium hover:bg-white/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-error/30 disabled:opacity-45" aria-label="重试加载工作区">重试</button><button type="button" onClick={() => setError('')} className="shrink-0 rounded p-1 hover:bg-white/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-error/30" aria-label="关闭错误"><X size={12} /></button></div>}
+      {error && (
+        <div className="mx-1 mb-2 flex items-center gap-2 rounded-lg bg-red-50 px-2.5 py-2 text-[11px] text-claude-error">
+          <FeedbackMessage tone="error" closeLabel="关闭错误" className="min-w-0 flex-1">{error}</FeedbackMessage>
+          <button type="button" onClick={() => { setError(''); void loadDirectory(null); }} disabled={loadingParents.has(ROOT) || searching} className="shrink-0 rounded-md px-1.5 py-1 font-medium hover:bg-white/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-error/30 disabled:opacity-45" aria-label="重试加载工作区">重试</button>
+        </div>
+      )}
       <div
         data-testid="workspace-content-body"
         onDragEnter={(event) => {
@@ -1317,7 +1323,7 @@ export function WorkspaceSidebarContent({
             移到工作区根目录
           </div>
         )}
-        {visible.length === 0 && !searching && !activeSearchPending ? (
+        {visible.length === 0 && !searching && !activeSearchPending && !error ? (
           <div data-testid="workspace-empty-state" className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 text-center text-xs text-claude-muted">
             <Folder size={30} className="mb-3 text-claude-border" aria-hidden="true" />
             <span className="font-medium text-claude-secondary">{query ? '没有匹配文件' : '工作区为空'}</span>

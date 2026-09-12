@@ -393,7 +393,7 @@ describe('CronSchedule', () => {
     });
   });
 
-  it('日程操作错误不会自动消失，并可由用户关闭', async () => {
+  it('日程操作失败展示错误，并可由用户手动关闭', async () => {
     const { updateCronJob } = await import('../../services/configApi');
     vi.mocked(updateCronJob).mockRejectedValueOnce(new Error('状态切换失败'));
     render(<CronSchedule />);

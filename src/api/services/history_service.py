@@ -269,10 +269,6 @@ class HistoryService:
         round_obj = self.db.query(Round).filter(Round.id == round_id).first()
         if round_obj:
             if round_obj.status in self._TERMINAL_STATUSES:
-                logger.info(
-                    "Round %s 已處於終態 %s，跳過 complete_round(status=%s)",
-                    round_id, round_obj.status, status,
-                )
                 self.db.expunge(round_obj)
                 self.db.rollback()
                 return round_obj
@@ -612,7 +608,7 @@ class HistoryService:
                     append_assistant_file_reference(event_data.get("value"))
                     
             except (json.JSONDecodeError, KeyError) as e:
-                print(f"⚠️ 解析事件失败: {e} (run_id={run_id}, id={event_log.id})")
+                logger.warning("解析历史事件失败: run=%s event=%s error_type=%s", run_id, event_log.id, type(e).__name__)
                 continue
         
         if transcript is not None:
@@ -1003,7 +999,6 @@ class HistoryService:
         event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
         if event_type in (EventType.RUN_FINISHED.value, EventType.RUN_ERROR.value):
             if self.is_round_terminal(run_id):
-                logger.info("Run %s 已终态，丢弃迟到 terminal 事件: %s", run_id, event_type)
                 return None
             raise ValueError("terminal events must be written via complete_round/RunCompletionService")
         return await AguiEventBus(self.db).publish(
@@ -1054,7 +1049,7 @@ class HistoryService:
                 event_data["sequence"] = event_log.sequence
                 result.append(event_data)
             except json.JSONDecodeError as e:
-                print(f"⚠️ 解析事件失败: {e} (run_id={run_id}, id={event_log.id})")
+                logger.warning("解析历史事件失败: run=%s event=%s error_type=%s", run_id, event_log.id, type(e).__name__)
         return result
 
     # 兼容性别名

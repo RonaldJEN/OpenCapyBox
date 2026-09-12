@@ -3,6 +3,7 @@ import { Check, ChevronRight, Copy, Loader2, Terminal } from 'lucide-react';
 import { formatDuration, type ToolGroupItem } from '../utils/displayBlocks';
 import { useActivityDisclosure } from './useActivityDisclosure';
 import { ActivityIcon } from './ActivityIcon';
+import FeedbackMessage from './FeedbackMessage';
 
 function CopyCommandText({ value, label }: { value: string; label: string }) {
   const [feedback, setFeedback] = useState<'idle' | 'copied' | 'failed'>('idle');
@@ -13,21 +14,23 @@ function CopyCommandText({ value, label }: { value: string; label: string }) {
   }, [feedback]);
 
   const copy = async () => {
+    setFeedback('idle');
     try {
       await navigator.clipboard.writeText(value);
       setFeedback('copied');
     } catch { setFeedback('failed'); }
   };
 
-  return <span className="chat-command-copy-control">
+  return <div className="chat-command-copy-control">
     <span className="chat-command-copy-feedback" role="status">
-      {feedback === 'copied' ? '已复制' : feedback === 'failed' ? '复制失败，请重试' : ''}
+      {feedback === 'copied' ? '已复制' : ''}
     </span>
+    {feedback === 'failed' && <FeedbackMessage tone="error" onDismiss={() => setFeedback('idle')} className="text-xs text-claude-error">复制失败，请重试</FeedbackMessage>}
     <button type="button" className="chat-command-copy" onClick={copy} aria-label={label}
       title={feedback === 'failed' ? '复制失败，请重试' : feedback === 'copied' ? '已复制' : label}>
       {feedback === 'copied' ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
     </button>
-  </span>;
+  </div>;
 }
 
 /** A command and its result share one disclosure; only the preview normalizes whitespace. */

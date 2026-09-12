@@ -370,8 +370,8 @@ class TestDurableRunClaims:
             assert record.run_workspace is None
             assert record.sandbox_id == "sbx-frozen"
         service.acquire_user_sandbox.assert_not_awaited()
-        assert '"sandbox_id": "sbx-frozen"' in caplog.text
-        assert '"remote_state": "not_found"' in caplog.text
+        assert "sandbox_id=sbx-frozen" in caplog.text
+        assert "remote_state=not_found" in caplog.text
 
     def _queued_run(self, cron_db) -> str:
         job = _insert_job(

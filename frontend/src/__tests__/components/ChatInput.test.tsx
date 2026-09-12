@@ -1,8 +1,34 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '../utils/test-utils';
+import { act, render, screen, fireEvent } from '../utils/test-utils';
 import { ChatInput } from '../../components/ChatInput';
 
 describe('ChatInput drag/drop behavior', () => {
+  it.each(['超时', '手动关闭'])('图片错误提示%s后仍阻止发送，且保留不兼容原因', (dismissal) => {
+    vi.useFakeTimers();
+    const onSend = vi.fn();
+    const imageInputError = '当前模型不支持图片输入，请切换至支持图片的模型或移除图片。';
+    const props = { onChange: () => {}, onSend, imageInputError };
+    const view = render(<ChatInput {...props} value="看看图片" />);
+    try {
+      if (dismissal === '超时') {
+        act(() => vi.advanceTimersByTime(1500));
+        view.rerender(<ChatInput {...props} value="看看图片，再描述一下" />);
+        act(() => vi.advanceTimersByTime(1500));
+      } else {
+        fireEvent.click(screen.getByRole('button', { name: '关闭提示' }));
+      }
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      const send = screen.getByRole('button', { name: '发送消息' });
+      expect(send).toBeDisabled();
+      expect(send).toHaveAccessibleDescription(`无法发送：${imageInputError}`);
+      fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+      expect(onSend).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
   it.each([1000, 1001])('单次粘贴 %i 个 Unicode 字符时，仅超过 1000 才转附件', (length) => {
     const onPasteText = vi.fn();
     const onChange = vi.fn();
@@ -115,6 +141,7 @@ describe('ChatInput drag/drop behavior', () => {
     const textarea = screen.getByPlaceholderText('输入消息...') as HTMLTextAreaElement;
     let mockScrollHeight = 360;
 
+    Object.defineProperty(textarea, 'clientWidth', { configurable: true, value: 600 });
     Object.defineProperty(textarea, 'scrollHeight', {
       configurable: true,
       get: () => mockScrollHeight,

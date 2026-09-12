@@ -27,6 +27,7 @@ import {
   workspaceApi,
 } from '../../services/workspaceApi';
 import { emitWorkspaceMutation } from '../../services/workspaceEvents';
+import FeedbackMessage from '../FeedbackMessage';
 
 interface WorkspaceDestinationPickerProps {
   open: boolean;
@@ -420,7 +421,7 @@ export function WorkspaceDestinationPicker({
                   className="mt-2 h-11 w-full rounded-lg border border-claude-border px-3 text-sm outline-none focus:border-claude-accent focus:ring-2 focus:ring-claude-accent/20"
                 />
               </label>
-              {error && <p role="alert" className="mt-3 text-sm text-claude-error">{error}</p>}
+              {error && <FeedbackMessage tone="error" className="mt-3 text-sm text-claude-error">{error}</FeedbackMessage>}
             </div>
             <div className="flex flex-wrap justify-end gap-2 border-t border-claude-border pt-4">
               <button type="button" onClick={() => setConflictEntry(null)} disabled={submitting} className="h-11 rounded-lg border border-claude-border px-4 text-sm font-medium text-claude-text hover:bg-claude-hover disabled:opacity-50">选择其他目录</button>
@@ -451,7 +452,7 @@ export function WorkspaceDestinationPicker({
                   {selectedDirectory === null && <Check size={15} className="ml-auto text-claude-accent" aria-hidden="true" />}
                 </button>
               </div>
-              {visibleDirectories.length === 0 && !searching ? (
+              {visibleDirectories.length === 0 && !searching && !error ? (
                 <div className="flex min-h-48 flex-col items-center justify-center text-center text-sm text-claude-muted">
                   <Folder size={34} className="mb-3 text-claude-border" aria-hidden="true" />
                   {query.trim() ? '没有匹配的文件夹' : '工作区还没有文件夹'}
@@ -491,7 +492,7 @@ export function WorkspaceDestinationPicker({
                 保存为
                 <input value={fileName} onChange={(event) => { setFileName(event.target.value); idempotencyKeyRef.current = createWorkspaceIdempotencyKey('import-session-file'); }} className="mt-1.5 h-10 w-full rounded-lg border border-claude-border bg-white px-3 text-sm text-claude-text outline-none focus:border-claude-accent focus:ring-2 focus:ring-claude-accent/20" />
               </label>
-              {error && <p role="alert" className="mt-2 text-sm text-claude-error">{error}</p>}
+              {error && <FeedbackMessage tone="error" className="mt-2 text-sm text-claude-error">{error}</FeedbackMessage>}
               <div className="mt-3 flex items-center justify-between gap-3">
                 <p className="min-w-0 truncate text-xs text-claude-muted" title={selectedDirectory ? `工作区/${selectedDirectory.path}` : '工作区'}>目标：{selectedDirectory ? `工作区/${selectedDirectory.path}` : '工作区'}</p>
                 <div className="flex shrink-0 gap-2">

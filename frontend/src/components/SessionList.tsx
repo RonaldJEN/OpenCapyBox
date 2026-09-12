@@ -6,6 +6,7 @@ import { Blocks, Database, ChevronDown, MessageSquare, Trash2, LogOut, Loader2, 
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
 import { ConfirmDialog } from './ConfirmDialog';
+import FeedbackMessage from './FeedbackMessage';
 import { WorkspaceSidebarContent } from './workspace/WorkspaceSidebarContent';
 import type { WorkspaceEntry } from '../types/workspace';
 import { discardSessionDrafts } from '../services/sessionDraftOutbox';
@@ -462,8 +463,8 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
             </div>
           </div>
         ) : sessionLoadError ? (
-          <div data-testid="session-load-error" role="alert" className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 text-center">
-            <p className="whitespace-normal text-[12px] font-medium text-claude-secondary">{sessionLoadError}</p>
+          <div data-testid="session-load-error" className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 text-center">
+            <FeedbackMessage tone="error" className="whitespace-normal text-[12px] font-medium text-claude-error">{sessionLoadError}</FeedbackMessage>
             <button
               type="button"
               onClick={() => {

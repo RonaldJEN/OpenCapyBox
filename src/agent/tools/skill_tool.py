@@ -124,8 +124,7 @@ def create_skill_tools(
     loader = SkillLoader(skills_dir)
 
     # Discover and load skills
-    skills = loader.discover_skills()
-    print(f"✅ Discovered {len(skills)} Claude Skills")
+    loader.discover_skills()
 
     # Create only the get_skill tool (Progressive Disclosure Level 2)
     tools = [

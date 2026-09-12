@@ -734,13 +734,6 @@ async def run_cron_job(
         rule_version = int(job.rule_version or 1)
         effective_job_id = int(job.id)
         if expected_rule_version is not None and rule_version != expected_rule_version:
-            logger.info(
-                "Cron 丢弃旧规则触发 (user=%s, job=%s, expected=%s, actual=%s)",
-                user_id,
-                job_name,
-                expected_rule_version,
-                rule_version,
-            )
             _mark_run_failed(
                 run_id,
                 "任务调度规则已修改，请重新执行",
@@ -1079,8 +1072,6 @@ async def run_cron_job(
             logger.warning("Cron 任务失败 (user=%s, job=%s, status=%s)", user_id, job_name, run_status)
             return None
 
-        logger.info("Cron 任务完成 (user=%s, job=%s)", user_id, job_name)
-
         return output
 
     except Exception as e:
@@ -1089,14 +1080,17 @@ async def run_cron_job(
         if isinstance(e, SandboxLifecycleError):
             error_code = e.code
             failure = str(e)
-            diagnostics = json.dumps({
-                "code": e.code,
-                "message": str(e), "sandbox_id": e.sandbox_id,
-                "remote_state": e.remote_state, "stage": e.stage,
-            }, ensure_ascii=False)
-            logger.error("Cron Sandbox 失败 (run=%s): %s", run_id, diagnostics, exc_info=True)
+            logger.error(
+                "Cron Sandbox 失败: run=%s code=%s sandbox_id=%s remote_state=%s stage=%s",
+                run_id, e.code, e.sandbox_id, e.remote_state, e.stage,
+                exc_info=True,
+            )
         else:
-            logger.error("Cron 任务失败 (user=%s, job=%s): %s", user_id, job_name, e, exc_info=True)
+            logger.error(
+                "Cron 任务失败: user=%s run=%s error_type=%s",
+                user_id, run_id, type(e).__name__,
+                exc_info=True,
+            )
         _mark_run_failed(
             run_id,
             failure,

@@ -538,7 +538,6 @@ async def trigger_job(
             db.commit()
         raise
 
-    logger.info("Cron 手动触发已提交后台执行 (user=%s, job=%s, run_id=%s)", user_id, job_name, run_id)
     return {
         "job_name": job_name,
         "run_id": run_id,

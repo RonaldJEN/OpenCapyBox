@@ -82,7 +82,7 @@ import {
 import './file-preview/filePreview.css';
 import type { VditorMarkdownEditorHandle } from './file-preview/VditorMarkdownEditor';
 import type { SpreadsheetEditorHandle } from './file-preview/SpreadsheetEditor';
-import { DEFAULT_FEEDBACK_AUTO_DISMISS_MS } from './FeedbackMessage';
+import FeedbackMessage, { DEFAULT_FEEDBACK_AUTO_DISMISS_MS } from './FeedbackMessage';
 import { WorkspaceDestinationPicker } from './workspace/WorkspaceDestinationPicker';
 
 interface FilePreviewProps {
@@ -1719,9 +1719,9 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
         <h4 className="mb-2 text-[16px] font-semibold text-claude-text">
           {descriptor.kind === 'presentation' ? '演示文稿' : '文档'}
         </h4>
-        <p className="mb-4 text-[13px] leading-6 text-claude-secondary">
+        <FeedbackMessage tone="error" className="mb-4 text-[13px] leading-6 text-claude-secondary">
           {previewNotice || '当前环境无法生成在线预览，请下载原文件查看。'}
-        </p>
+        </FeedbackMessage>
         <dl className="space-y-2 text-[13px]">
           <div className="flex justify-between gap-4 border-b border-claude-border py-2">
             <dt className="text-claude-muted">文件名</dt>
@@ -1829,7 +1829,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
         if (docxHtml) {
           return (
             <div className="mx-auto max-w-[820px]">
-              {previewNotice && <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">{previewNotice}</div>}
+              {previewNotice && <FeedbackMessage tone="warning" autoDismissMs={DEFAULT_FEEDBACK_AUTO_DISMISS_MS} className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">{previewNotice}</FeedbackMessage>}
               <article className="file-preview-report prose" dangerouslySetInnerHTML={{ __html: docxHtml }} />
             </div>
           );
@@ -2076,33 +2076,26 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       )}
 
       {workspaceDraftLossNotice && (
-        <div
-          className="flex shrink-0 items-center gap-2 border-b border-red-200 bg-red-50 px-3 py-2 text-xs text-red-900"
-          role="alert"
-          data-testid="workspace-draft-loss-notice"
+        <FeedbackMessage
+          tone="error"
+          messageKey={workspaceDraftLossNotice}
+          onDismiss={() => setWorkspaceDraftLossNotice(null)}
+          closeLabel="关闭未保存提示"
+          icon={<AlertCircle size={14} />}
+          className="shrink-0 border-b border-red-200 bg-red-50 px-3 py-2 text-xs text-red-900"
         >
-          <AlertCircle size={14} className="shrink-0" aria-hidden="true" />
-          <span className="min-w-0 flex-1">
+          <span data-testid="workspace-draft-loss-notice">
             {workspaceDraftLossNotice.message}
             {workspaceDraftLossNotice.lastSavedAt
               ? ` 最近保存：${formatModifiedTime(workspaceDraftLossNotice.lastSavedAt)}`
               : ''}
           </span>
-          <button
-            type="button"
-            onClick={() => setWorkspaceDraftLossNotice(null)}
-            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-red-700 hover:bg-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40"
-            aria-label="关闭未保存提示"
-          >
-            <X size={15} aria-hidden="true" />
-          </button>
-        </div>
+        </FeedbackMessage>
       )}
 
       {previewNotice && refreshingRequestIdRef.current !== null && (
-        <div className="flex shrink-0 items-center gap-2 border-b border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900" role="status">
-          <AlertCircle size={14} className="shrink-0" aria-hidden="true" />
-          <span className="min-w-0 flex-1">{previewNotice}</span>
+        <div className="flex shrink-0 items-center gap-2 border-b border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          <FeedbackMessage tone="error" icon={<AlertCircle size={14} />} className="min-w-0 flex-1">{previewNotice}</FeedbackMessage>
           <button type="button" onClick={() => { setPreviewNotice(''); setLocalReloadNonce((value) => value + 1); }} className="h-8 shrink-0 rounded-md border border-amber-300 bg-white px-2.5 font-medium hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40">重试加载</button>
         </div>
       )}
@@ -2131,7 +2124,12 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
           </aside>
         )}
         {error ? (
-          <div role="alert" className="flex items-center gap-3 rounded-2xl border border-red-100 bg-red-50 p-4"><AlertCircle className="h-5 w-5 text-claude-error" /><span className="font-medium text-claude-error">{error}</span></div>
+          <div className="space-y-3">
+            <FeedbackMessage tone="error" icon={<AlertCircle className="h-5 w-5" />} className="rounded-2xl border border-red-100 bg-red-50 p-4 font-medium text-claude-error">{error}</FeedbackMessage>
+            <button type="button" onClick={() => setLocalReloadNonce((value) => value + 1)} className="inline-flex items-center gap-1.5 rounded-lg border border-claude-border px-3 py-1.5 text-xs text-claude-text hover:bg-claude-hover">
+              <RotateCcw size={13} aria-hidden="true" />重试加载
+            </button>
+          </div>
         ) : loading && !backgroundRefreshing && !presentationRendererStarting ? (
           <div className="flex flex-col items-center justify-center gap-4 py-24 text-center" data-testid="file-preview-loading" role="status" aria-live="polite">
             <div className="flex space-x-2" aria-hidden="true">{[0, 1, 2].map((index) => <div key={index} className="h-2 w-2 animate-dot-pulse rounded-full bg-claude-accent" style={{ animationDelay: `${index * 200}ms` }} />)}</div>

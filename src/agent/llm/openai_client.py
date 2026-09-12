@@ -85,13 +85,6 @@ class OpenAIClient(LLMClientBase):
             raise ValueError(f"Unsupported thinking_wire_format: {thinking_wire_format}")
         self.thinking_wire_format = thinking_wire_format
         self.reasoning_effort = reasoning_effort
-        logger.info(
-            "OpenAIClient initialized: model=%s, reasoning_format=%s, "
-            "reasoning_split=%s, thinking_mode=%s, thinking_wire_format=%s, "
-            "reasoning_effort=%s, max_tokens=%d",
-            model, reasoning_format, enable_reasoning_split,
-            self.effective_thinking_mode, thinking_wire_format, reasoning_effort, max_tokens,
-        )
 
     async def _make_api_request(
         self,
@@ -137,11 +130,11 @@ class OpenAIClient(LLMClientBase):
             raise ValueError("API returned None response")
 
         if not hasattr(response, 'choices') or response.choices is None:
-            logger.error(f"API response missing choices field. Response: {response}")
+            logger.error("API response missing choices field: response_type=%s", type(response).__name__)
             raise ValueError(f"API response missing choices field. Response type: {type(response)}")
 
         if len(response.choices) == 0:
-            logger.error(f"API response has empty choices array. Response: {response}")
+            logger.error("API response has empty choices array")
             raise ValueError("API response has empty choices array")
 
         return response
@@ -319,18 +312,15 @@ class OpenAIClient(LLMClientBase):
         # Method 1: GLM format - reasoning_content (string)
         if hasattr(message, "reasoning_content") and message.reasoning_content:
             thinking_content = message.reasoning_content
-            logger.debug("Extracted reasoning from reasoning_content (GLM format)")
 
         elif isinstance(getattr(message, "reasoning", None), str) and message.reasoning:
             thinking_content = message.reasoning
-            logger.debug("Extracted reasoning from reasoning (vLLM format)")
 
         # Method 2: MiniMax format - reasoning_details (list)
         elif hasattr(message, "reasoning_details") and message.reasoning_details:
             for detail in message.reasoning_details:
                 if hasattr(detail, "text"):
                     thinking_content += detail.text
-            logger.debug("Extracted reasoning from reasoning_details (MiniMax format)")
 
         # Extract tool calls
         tool_calls = []
@@ -517,11 +507,6 @@ class OpenAIClient(LLMClientBase):
                         if tool_call_delta.function.name:
                             tool_calls_dict[idx]["function"]["name"] = tool_call_delta.function.name
                         if tool_call_delta.function.arguments:
-                            # 🔍 调试日志：记录每个原始参数块
-                            logger.debug(
-                                f"Tool call [{idx}] '{tool_calls_dict[idx]['function']['name']}' "
-                                f"arguments chunk: {repr(tool_call_delta.function.arguments)}"
-                            )
                             tool_calls_dict[idx]["function"]["arguments"] += tool_call_delta.function.arguments
 
                             # 🔥 调用流式回调，实时推送 tool call 增量更新
@@ -546,13 +531,6 @@ class OpenAIClient(LLMClientBase):
                 continue
 
             arguments_str = tc["function"]["arguments"]
-
-            # 🔍 调试日志：记录完整的原始参数字符串
-            logger.debug(
-                f"[RAW_JSON] Tool '{tool_name}': {repr(arguments_str[:500])}..."
-                if len(arguments_str) > 500 else
-                f"[RAW_JSON] Tool '{tool_name}': {repr(arguments_str)}"
-            )
 
             if not arguments_str or not arguments_str.strip():
                 arguments = {}

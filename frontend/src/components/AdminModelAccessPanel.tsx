@@ -964,34 +964,14 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
       ) : null}
 
       {actionError ? (
-        <div className="admin-model-error-backdrop" role="presentation" onClick={() => setActionError('')}>
-          <section
-            className="admin-model-error-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="admin-model-error-title"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="admin-model-error-head">
-              <div className="admin-model-error-icon">
-                <AlertTriangle size={18} />
-              </div>
-              <div>
-                <h3 id="admin-model-error-title">操作失败</h3>
-                <p>请检查提示后再重试。</p>
-              </div>
-              <button className="admin-button admin-icon-only-button" type="button" onClick={() => setActionError('')} aria-label="关闭错误弹窗">
-                <X size={15} />
-              </button>
-            </div>
-            <div className="admin-model-error-body">{actionError}</div>
-            <div className="admin-model-error-actions">
-              <button className="admin-button admin-primary-button" type="button" onClick={() => setActionError('')}>
-                知道了
-              </button>
-            </div>
-          </section>
-        </div>
+        <FeedbackMessage
+          className="admin-error admin-inline-message fixed bottom-6 right-6 z-[120] max-w-[min(520px,calc(100vw-48px))] shadow-xl"
+          tone="error"
+          icon={<AlertTriangle size={18} />}
+          onDismiss={() => setActionError('')}
+        >
+          {actionError}
+        </FeedbackMessage>
       ) : null}
     </div>
   );

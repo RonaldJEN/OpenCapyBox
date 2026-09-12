@@ -317,11 +317,6 @@ class AgentService:
             self._token_limit = model_config.compute_token_limit()
             self._model_config = model_config
 
-            logger.info(
-                "创建 LLM 客户端: model=%s, provider=%s, api_base=%s",
-                model_config.model_name, model_config.provider, model_config.api_base,
-            )
-
             # 收集 fallback 模型（排除当前主模型，按目录顺序），并保持多模态能力不降级。
             fallback_configs = [
                 m for m in registry_models
@@ -895,9 +890,7 @@ class AgentService:
 
             db = self.history_service.db
             mem_svc = MemoryService(db)
-            count = mem_svc.provision_default_files(self.user_id)
-            if count > 0:
-                logger.info("新用户默认文件初始化完成: user=%s, count=%d", self.user_id, count)
+            mem_svc.provision_default_files(self.user_id)
         except Exception as e:
             logger.warning("默认文件初始化失败（非致命）: %s", e)
         finally:
@@ -992,13 +985,6 @@ class AgentService:
                 else:
                     self._active_checkpoint_id = checkpoint.checkpoint_id
                     self._active_checkpoint_sha256 = None
-                    logger.info(
-                        "命中累计上下文 checkpoint: generation=%d replacement=%d tail=%d session=%s",
-                        checkpoint.generation,
-                        len(checkpoint.messages),
-                        len(tail),
-                        self.session_id,
-                    )
                     replacement = [
                         message.model_copy(deep=True)
                         for message in checkpoint.messages
@@ -1144,10 +1130,6 @@ class AgentService:
                 self.agent.messages
             )
 
-        logger.info(
-            "已刷新 Agent runtime messages: history=%d total=%d (session=%s)",
-            len(restored_messages), len(self.agent.messages), self.session_id,
-        )
         self._last_saved_index = len(self.agent.messages)
 
     def _restore_history(self):
@@ -1371,10 +1353,6 @@ class AgentService:
 
             messages.extend(round_messages)
 
-        logger.info(
-            "歷史重建完成: %d rounds → %d messages (session=%s)",
-            len(rounds), len(messages), self.session_id,
-        )
         self.history_service.reset_session()
         return messages
 
@@ -1478,8 +1456,8 @@ class AgentService:
                 except (json.JSONDecodeError, TypeError):
                     _skipped += 1
                     logger.warning(
-                        "事件 payload 解析失敗 (round=%s, seq=%s, preview=%.200s)",
-                        round_id, getattr(evt, "sequence", "?"), evt.payload[:200] if evt.payload else "",
+                        "事件 payload 解析失败: round=%s seq=%s",
+                        round_id, getattr(evt, "sequence", "?"),
                     )
                     continue
             else:
@@ -2319,7 +2297,10 @@ class AgentService:
             return True
         except Exception as e:
             db.rollback()
-            logger.warning("保存 conversation_message 失敗: %s", e)
+            logger.warning(
+                "保存 conversation_message 失败: session=%s round=%s error_type=%s",
+                self.session_id, round_id, type(e).__name__, exc_info=True,
+            )
             if raise_on_error:
                 raise
             return False
@@ -2373,10 +2354,6 @@ class AgentService:
                 self.session_id, idempotency_key
             )
             if admitted is not None:
-                logger.warning(
-                    "幂等預檢：已存在 Round %s (status=%s)，跳過附件落盤與重複執行 (key=%s)",
-                    admitted.id, admitted.status, idempotency_key,
-                )
                 raise DuplicateRoundError(admitted.id)
 
         persisted_interrupt = self._load_persisted_interrupt(None)
@@ -2456,10 +2433,6 @@ class AgentService:
 
         # 幂等衝突：另一個 Worker 已搶先創建了相同 idempotency_key 的 Round
         if idempotency_key and created_round.id != run_id:
-            logger.warning(
-                "幂等衝突：已存在 Round %s (status=%s)，跳過重複執行 (key=%s)",
-                created_round.id, created_round.status, idempotency_key,
-            )
             if attachment_capture is not None:
                 await self._discard_workspace_attachment_capture(attachment_capture)
             raise DuplicateRoundError(created_round.id)
@@ -2572,7 +2545,6 @@ class AgentService:
             for key in requested.skill_keys:
                 skill = self.skill_loader.get_skill(key)
                 if skill is None:
-                    logger.info("忽略当前 Run 不可用的 preferred Skill: %s", key)
                     continue
                 metadata = skill.metadata if isinstance(skill.metadata, dict) else {}
                 display_name = str(metadata.get("display_name") or skill.name)
@@ -2594,10 +2566,6 @@ class AgentService:
         for server_id in requested.mcp_server_ids if requested is not None else ():
             connection = available_connections.get(server_id)
             if connection is None:
-                logger.info(
-                    "忽略当前 Run 不可用的 preferred MCP connection: %r",
-                    server_id,
-                )
                 continue
             display_name = (
                 connection.get("server_name")
@@ -3619,12 +3587,6 @@ class AgentService:
             )
             self._active_checkpoint_id = loaded.checkpoint_id
             self._active_checkpoint_sha256 = None
-            logger.info(
-                "Persisted Codex compacted history immediately: generation=%d phase=%s session=%s",
-                loaded.generation,
-                loaded.trigger_phase,
-                self.session_id,
-            )
             return loaded.checkpoint_id
 
         self.agent.set_llm_call_hook(_record_llm_call)
@@ -3722,11 +3684,6 @@ class AgentService:
                 # 停止處理遲到事件，避免污染 conversation_messages 與 round 狀態。
                 if self.history_service.is_round_terminal(run_id) is True:
                     current_status = self.history_service.get_round_status(run_id) or "cancelled"
-                    logger.info(
-                        "Round %s 已被外部收斂為 %s，停止處理遲到事件",
-                        run_id,
-                        current_status,
-                    )
                     status = current_status
                     _round_finished = True
                     _externally_terminated = True
@@ -3791,11 +3748,6 @@ class AgentService:
                         )
                         continue
                     if materialized_reference is None:
-                        logger.info(
-                            "助手文件引用在持久化前已失效，已跳过: session=%s round=%s",
-                            self.session_id,
-                            run_id,
-                        )
                         continue
                     event = event.model_copy(update={"value": materialized_reference})
 
@@ -4264,10 +4216,6 @@ class AgentService:
                         # 仅对 USER 和 MEMORY 重建语义索引
                         if changed and ft in ("user_md", "memory_md"):
                             await mem_svc.rebuild_embeddings(self.user_id, filename, content)
-                        logger.info(
-                            "记忆同步完成: %s (%d chars, changed=%s)",
-                            filename, len(content), changed,
-                        )
             finally:
                 db.close()
         except Exception as e:
@@ -4284,18 +4232,13 @@ class AgentService:
             db = SessionLocal()
             try:
                 mem_svc = MemoryService(db)
-                count = await mem_svc.index_conversation_round(
+                await mem_svc.index_conversation_round(
                     user_id=self.user_id,
                     session_id=self.session_id,
                     round_id=round_id,
                     user_message=user_message,
                     assistant_response=assistant_response,
                 )
-                if count:
-                    logger.info(
-                        "对话自动索引完成: session=%s, round=%s, chunks=%d",
-                        self.session_id, round_id, count,
-                    )
             finally:
                 db.close()
         except Exception as e:
@@ -4348,10 +4291,9 @@ class AgentService:
             # 移除可能的引号
             title = title.strip('"\'')
 
-            logger.info("生成会话标题: %s", title)
             return title
 
         except Exception as e:
-            logger.warning("标题生成失败: %s", e)
+            logger.warning("标题生成失败: session=%s error_type=%s", self.session_id, type(e).__name__)
             # 失败时返回默认标题
             return first_message[:30] if len(first_message) > 30 else first_message

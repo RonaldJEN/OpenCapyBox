@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import FeedbackMessage from './FeedbackMessage';
 import {
   Check,
   Layers,
@@ -368,7 +369,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
             className="min-h-[220px] w-full resize-y rounded-xl border border-[#e8e3d9] bg-[#fdfcfa] px-3.5 py-3 font-mono text-[13.5px] leading-7 text-[#1c1a16] outline-none transition focus:border-[#b8814a] focus:ring-2 focus:ring-[#b8814a]/20 disabled:cursor-not-allowed disabled:opacity-70"
           />
           {state.error && (
-            <p className="mt-2 text-xs font-medium text-claude-error">{state.error}</p>
+            <FeedbackMessage tone="error" className="mt-2 text-xs font-medium text-claude-error">{state.error}</FeedbackMessage>
           )}
           <div className="mt-3 flex gap-2">
             <button
@@ -398,7 +399,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     }
 
     if (state.error) {
-      return <p className="text-sm text-claude-error">{state.error}</p>;
+      return <FeedbackMessage tone="error" className="text-sm text-claude-error">{state.error}</FeedbackMessage>;
     }
 
     return view;

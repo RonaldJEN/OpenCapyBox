@@ -193,10 +193,9 @@ Human-in-the-Loop 不提供协议切换配置：`ask_user` 与工具审批始终
 
 ## 6. 可观测性
 
-- 工具注册列表日志
-- Skill 发现结果日志
-- exclude 警告日志
-- Skill push 结果日志
+- 实际模型请求中的工具清单由 `llm_call_records.request_tools` 保存；不重复输出工具注册、Skill 发现或推送成功日志。
+- 工具配置及 Skill 清单通过配置接口与持久化记录查看，不在应用日志中复制名称列表或完整连接地址。
+- 保留非法 exclude、Skill 加载/推送失败、配置刷新失败等故障摘要。
 
 ## 7. 非目标
 

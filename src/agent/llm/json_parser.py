@@ -406,21 +406,14 @@ def robust_json_parse(json_str: str, tool_name: str = "unknown") -> dict[str, An
     if not json_str or not json_str.strip():
         return {}
 
-    # 🔍 调试日志：记录原始输入
-    logger.debug(f"[JSON_PARSER] [{tool_name}] Raw input: {repr(json_str[:500])}")
-
     # 1. 规范化引号（将中文引号转换为英文引号）
-    original_json_str = json_str
     json_str = _normalize_quotes(json_str)
-    if json_str != original_json_str:
-        logger.info(f"Normalized Chinese quotes in JSON for tool '{tool_name}'")
-        logger.debug(f"[{tool_name}] After quote normalization: {repr(json_str[:500])}")
 
     # 2. 首先尝试标准解析（最快路径）
     try:
         return json.loads(json_str)
-    except json.JSONDecodeError as e:
-        logger.debug(f"Standard JSON parse failed for tool '{tool_name}': {e}")
+    except json.JSONDecodeError:
+        pass
 
     # 2.1 修复 GLM 等模型在 JSON 末尾多输出 {} 的问题
     # 例如: {"command": "pwd"}{} -> {"command": "pwd"}
@@ -428,40 +421,41 @@ def robust_json_parse(json_str: str, tool_name: str = "unknown") -> dict[str, An
         trimmed = json_str.rstrip()[:-2].rstrip()
         try:
             result = json.loads(trimmed)
-            logger.info(f"Fixed trailing '{{}}' in JSON for tool '{tool_name}'")
             return result
         except json.JSONDecodeError:
             pass
 
     # 3. 分析 JSON 结构
     stats = JsonTokenizer(json_str).analyze_structure()
-    logger.debug(f"JSON structure analysis for tool '{tool_name}': {stats}")
 
     # 4. 尝试修复尾部截断
     fixed_json = _try_fix_trailing(json_str, stats)
     if fixed_json:
         try:
             result = json.loads(fixed_json)
-            logger.info(f"Successfully fixed truncated JSON for tool '{tool_name}'")
             return result
-        except json.JSONDecodeError as e:
-            logger.debug(f"Fixed JSON still failed for tool '{tool_name}': {e}")
+        except json.JSONDecodeError:
+            pass
 
     # 5. 最后尝试：提取键值对
     try:
         result = _extract_key_value_pairs(json_str, tool_name)
         if result:
             logger.warning(
-                f"Extracted partial data from malformed JSON for tool '{tool_name}': "
-                f"keys={list(result.keys())}"
+                "Extracted partial data from malformed JSON: tool=%s input_length=%d "
+                "error_category=malformed_json",
+                tool_name,
+                len(json_str),
             )
             return result
-    except Exception as e:
-        logger.debug(f"Key-value extraction failed for tool '{tool_name}': {e}")
+    except Exception:
+        pass
 
     # 6. 所有修复尝试失败
     logger.error(
-        f"Failed to parse JSON for tool '{tool_name}' after all attempts. "
-        f"Input (truncated): {json_str[:200]}..."
+        "Failed to parse JSON after all attempts: tool=%s input_length=%d "
+        "error_category=unparseable_json",
+        tool_name,
+        len(json_str),
     )
     return None

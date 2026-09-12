@@ -46,6 +46,7 @@ import {
 } from '../runtime/ChatRuntimeProvider';
 import { readFileAsDataUrl } from '../utils/imageUtils';
 import { toFileInfo, isImageFile } from '../utils/fileUtils';
+import { getImageInputError, isConversationImageInput } from '../utils/chatImageInput';
 import {
   emptyTurnPreferenceDraft,
   type TurnPreferenceDraft,
@@ -62,6 +63,7 @@ import { ArtifactsPanel, type ArtifactsPanelHandle } from './ArtifactsPanel';
 import { type SessionFileOwnerIdentity } from './FilePreview';
 import { ModelSelector } from './ModelSelector';
 import { ChatInput } from './ChatInput';
+import FeedbackMessage from './FeedbackMessage';
 import { DraftAttachmentPreview } from './DraftAttachmentPreview';
 import { QuestionCard } from './QuestionCard';
 import { ToolApprovalCard } from './ToolApprovalCard';
@@ -79,7 +81,6 @@ import {
   Loader2,
   AlertCircle,
   Paperclip,
-  X,
   ArrowDown,
 } from 'lucide-react';
 
@@ -295,7 +296,14 @@ function ChatV2View(props: ChatV2Props) {
     preferenceDrafts: {},
     reasoningDrafts: {},
   }));
-  const [localError, setLocalError] = useState('');
+  const [localFeedback, setLocalFeedback] = useState<{ message: string } | null>(null);
+  const localError = localFeedback?.message || '';
+  const setLocalError = useCallback((message: string) => {
+    setLocalFeedback(message ? { message } : null);
+  }, []);
+  const [attachmentUploadError, setAttachmentUploadError] = useState<{
+    draftId: string; modelId: string; message: string;
+  } | null>(null);
   const [creatingDraftId, setCreatingDraftId] = useState<string | null>(null);
   const [syncingAttachmentDraftId, setSyncingAttachmentDraftId] = useState<string | null>(null);
   const [defaultChatRatio] = useState(readInitialChatRatio);
@@ -349,6 +357,7 @@ function ChatV2View(props: ChatV2Props) {
   const composerDraftsRef = useRef(composerDrafts);
   const uploadControllersRef = useRef(new Map<string, AbortController>());
   const uploadQueueRef = useRef<Array<{ key: string; file: ComposerAttachment; controller: AbortController }>>([]);
+  const drainUploadQueueRef = useRef<() => void>(() => {});
   const activeUploadsRef = useRef(0);
   const previewUrlsRef = useRef(new Set<string>());
   const handledScrollTargetNonceRef = useRef<number | null>(null);
@@ -380,6 +389,9 @@ function ChatV2View(props: ChatV2Props) {
   const input = currentMessageDraft.input;
   const attachedFiles = currentMessageDraft.attachedFiles;
   const currentDraftId = currentMessageDraft.draftId;
+  const imageInputError = getImageInputError(attachedFiles, selectedModel);
+  const attachmentError = attachmentUploadError?.draftId === currentDraftId
+    && attachmentUploadError.modelId === selectedModelId ? attachmentUploadError.message : '';
   const creatingCurrentDraft = creatingDraftId === currentDraftId;
   const uploadingCurrentDraft = attachedFiles.some((file) =>
     file.uploadStatus && file.uploadStatus !== 'ready' && file.uploadStatus !== 'error');
@@ -785,13 +797,8 @@ function ChatV2View(props: ChatV2Props) {
       blocks.push({ type: 'text', text: trimmed });
     }
 
-    const imageFiles = files.filter((file) => file.source !== 'workspace' && isImageFile(file));
-    if (imageFiles.length > 0 && !(selectedModel?.supports_image ?? false)) {
-      throw new Error(`当前模型 ${selectedModel?.name || selectedModelId} 不支持图片输入`);
-    }
-    if (imageFiles.length > 0 && imageFiles.length > (selectedModel?.max_images ?? 0)) {
-      throw new Error(`当前模型最多支持 ${selectedModel?.max_images ?? 0} 张图片`);
-    }
+    const imageError = getImageInputError(files, selectedModel);
+    if (imageError) throw new Error(imageError);
 
     for (const file of files) {
       if (file.source === 'workspace') {
@@ -920,10 +927,21 @@ function ChatV2View(props: ChatV2Props) {
 
   // Network completion only patches the exact local file that started it.
   const drainUploadQueue = () => {
-    while (activeUploadsRef.current < 3 && uploadQueueRef.current.length) {
+    let remaining = uploadQueueRef.current.length;
+    while (activeUploadsRef.current < 3 && remaining-- > 0) {
       const job = uploadQueueRef.current.shift()!;
       const { key, file, controller } = job;
       if (controller.signal.aborted) continue;
+      const ownerDraft = composerDraftsRef.current.messageDrafts[key];
+      const ownerModelId = composerDraftsRef.current.reasoningDrafts[key]?.modelId;
+      const ownerModel = availableModels.find((model) => model.id === ownerModelId);
+      if (isConversationImageInput(file) && ownerDraft
+        && getImageInputError(ownerDraft.attachedFiles, ownerModel)) {
+        // Keep accepted images queued until their own draft becomes compatible.
+        // Other drafts and ordinary files can continue using the free slots.
+        uploadQueueRef.current.push(job);
+        continue;
+      }
       activeUploadsRef.current += 1;
       const patchFile = (patch: Partial<ComposerAttachment>) => {
         if (controller.signal.aborted) return;
@@ -953,11 +971,16 @@ function ChatV2View(props: ChatV2Props) {
           if (uploadControllersRef.current.get(file.clientId!) === controller) {
             uploadControllersRef.current.delete(file.clientId!);
           }
-          drainUploadQueue();
+          drainUploadQueueRef.current();
         }
       })();
     }
   };
+
+  useLayoutEffect(() => { drainUploadQueueRef.current = drainUploadQueue; });
+  useEffect(() => {
+    drainUploadQueueRef.current();
+  }, [composerDrafts, availableModels]);
 
   const queueAttachment = (key: string, file: ComposerAttachment) => {
     const controller = new AbortController();
@@ -970,7 +993,14 @@ function ChatV2View(props: ChatV2Props) {
     if (!files?.length || submittingDraftKeys.has(currentDraftKey)) return;
     const draft = composerDraftsRef.current.messageDrafts[currentDraftKey];
     if (!draft) return;
-    const additions: ComposerAttachment[] = Array.from(files as ArrayLike<File>).map((file) => {
+    const candidates = Array.from(files as ArrayLike<File>);
+    const imageError = candidates.some(isConversationImageInput)
+      ? getImageInputError([...draft.attachedFiles, ...candidates], selectedModel, 'upload') : '';
+    setAttachmentUploadError(imageError
+      ? { draftId: draft.draftId, modelId: selectedModelId, message: imageError } : null);
+    const acceptedFiles = imageError ? candidates.filter((file) => !isConversationImageInput(file)) : candidates;
+    if (!acceptedFiles.length) return;
+    const additions: ComposerAttachment[] = acceptedFiles.map((file) => {
       const previewUrl = URL.createObjectURL(file);
       previewUrlsRef.current.add(previewUrl);
       return {
@@ -1028,6 +1058,7 @@ function ChatV2View(props: ChatV2Props) {
   const handleRemoveAttachment = (index: number) => {
     const file = composerDraftsRef.current.messageDrafts[currentDraftKey]?.attachedFiles[index];
     if (!file || submittingDraftKeys.has(currentDraftKey)) return;
+    setAttachmentUploadError(null);
     if (file.clientId && file.draftId) {
       uploadControllersRef.current.get(file.clientId)?.abort();
       uploadControllersRef.current.delete(file.clientId);
@@ -1049,8 +1080,16 @@ function ChatV2View(props: ChatV2Props) {
   };
 
   const handleRetryAttachment = (index: number) => {
-    const file = composerDraftsRef.current.messageDrafts[currentDraftKey]?.attachedFiles[index];
+    const draft = composerDraftsRef.current.messageDrafts[currentDraftKey];
+    const file = draft?.attachedFiles[index];
     if (!file?.localFile || !file.clientId || file.uploadStatus !== 'error') return;
+    const imageError = isConversationImageInput(file)
+      ? getImageInputError(draft.attachedFiles, selectedModel, 'upload') : '';
+    if (imageError) {
+      setAttachmentUploadError({ draftId: draft.draftId, modelId: selectedModelId, message: imageError });
+      return;
+    }
+    setAttachmentUploadError(null);
     queueAttachment(currentDraftKey, file);
   };
 
@@ -1407,6 +1446,7 @@ function ChatV2View(props: ChatV2Props) {
       setLocalError(error?.message || '消息构建失败');
       return;
     }
+    setAttachmentUploadError(null);
     const preferenceSnapshot: TurnPreferenceDraft = {
       skillKeys: [...currentPreferenceDraft.skillKeys],
       mcpConnections: currentPreferenceDraft.mcpConnections.map(
@@ -1876,24 +1916,18 @@ function ChatV2View(props: ChatV2Props) {
         {displayError && (
           <div data-parent-chat-view className="py-3 bg-red-50 border-t border-red-100">
             <div className="chat-column">
-              <div className="flex items-start gap-3">
-                <AlertCircle className="w-4 h-4 text-claude-error flex-shrink-0 mt-0.5" />
-                <div className="flex-1 min-w-0 overflow-hidden">
-                  <pre className="text-xs whitespace-pre-wrap break-words font-mono text-claude-error overflow-x-auto max-w-full">
-                    {displayError}
-                  </pre>
-                </div>
-                <button
-                  onClick={() => {
+              <FeedbackMessage tone="error" messageKey={localFeedback ?? `${sessionId}:${runtimeError}`}
+                  icon={<AlertCircle className="w-4 h-4 text-claude-error" />}
+                  closeLabel="关闭错误提示"
+                  onDismiss={() => {
                     setLocalError('');
                     if (sessionId) runtime.clearError(sessionId);
                   }}
-                  className="p-1 hover:bg-red-100 rounded-full transition-colors"
-                  aria-label="关闭错误提示"
-                >
-                  <X className="w-3.5 h-3.5 text-claude-error" />
-                </button>
-              </div>
+                  className="text-claude-error">
+                <pre className="text-xs whitespace-pre-wrap break-words font-mono overflow-x-auto max-w-full">
+                  {displayError}
+                </pre>
+              </FeedbackMessage>
             </div>
           </div>
         )}
@@ -1934,11 +1968,14 @@ function ChatV2View(props: ChatV2Props) {
             onSend={handleSend}
             onStop={(sending || resuming || waitingInteraction) ? handleStop : undefined}
             disabled={inputDisabled}
-            sendDisabled={!currentReasoningDraft || stopping || attachmentsNotReady || sending || resuming || waitingInteraction}
+            sendDisabled={!currentReasoningDraft || !!imageInputError || stopping || attachmentsNotReady || sending || resuming || waitingInteraction}
             sendingLabel={sendingLabel}
             placeholder={sessionId ? '输入指令...' : '输入你的问题，按 Enter 开始对话...'}
             autoFocus={!sessionId}
             attachedFiles={attachedFiles}
+            imageInputError={imageInputError}
+            attachmentError={attachmentError}
+            attachmentErrorKey={attachmentError ? attachmentUploadError : `${currentDraftId}:${selectedModelId}`}
             onRemoveAttachment={handleRemoveAttachment}
             onRetryAttachment={handleRetryAttachment}
             onRestorePastedText={handleRestorePastedText}
@@ -1958,6 +1995,7 @@ function ChatV2View(props: ChatV2Props) {
               <ModelSelector
                 selectedModelId={selectedModelId}
                 onModelChange={(modelId) => {
+                  setAttachmentUploadError(null);
                   if (!sessionId) onDraftInteraction?.();
                   const model = availableModels.find((item) => item.id === modelId);
                   commitComposerDrafts((previous) => ({

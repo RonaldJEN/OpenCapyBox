@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
 import { AlertCircle, ShieldCheck } from 'lucide-react';
+import FeedbackMessage from './FeedbackMessage';
 
 const loginSpecificErrorMessages = new Set(['账户已被禁用']);
 const adminLoginErrorMessage = '用户名或密码错误';
@@ -67,10 +68,9 @@ export function Login({ mode = 'user' }: LoginProps) {
 
         {/* Error Message */}
         {error && (
-          <div className="mb-6 p-4 bg-red-50 border border-red-100 rounded-lg flex items-center gap-3 text-claude-error">
-            <AlertCircle className="w-5 h-5 flex-shrink-0" />
-            <span className="text-sm">{error}</span>
-          </div>
+          <FeedbackMessage tone="error" icon={<AlertCircle className="w-5 h-5" />} className="mb-6 rounded-lg border border-red-100 bg-red-50 p-4 text-sm text-claude-error">
+            {error}
+          </FeedbackMessage>
         )}
 
         {/* Login Form */}

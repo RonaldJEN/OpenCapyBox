@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useId,
   useRef,
   useEffect,
   useLayoutEffect,
@@ -30,6 +31,7 @@ import {
 } from '../types';
 import type { WorkspaceEntry } from '../types/workspace';
 import { getFileIcon, getFileExtLabel, getFileBadgeClass, getFileIconClass, isImageFile } from '../utils/fileUtils';
+import { isConversationImageInput } from '../utils/chatImageInput';
 import {
   getSkills,
   type SkillInfo,
@@ -42,6 +44,7 @@ import {
 } from '../utils/turnPreferenceDrafts';
 import { WorkspaceFilePicker } from './workspace/WorkspaceFilePicker';
 import { DraftAttachmentPreview } from './DraftAttachmentPreview';
+import FeedbackMessage from './FeedbackMessage';
 
 const MAX_TEXTAREA_HEIGHT = 200;
 const PASTED_TEXT_ATTACHMENT_THRESHOLD = 1000;
@@ -79,6 +82,10 @@ interface ChatInputProps {
 
   // ---- 文件上传 ----
   attachedFiles?: ComposerAttachment[];
+  /** 根据当前模型派生的图片兼容性，与上传状态分开。 */
+  imageInputError?: string;
+  attachmentError?: string;
+  attachmentErrorKey?: unknown;
   onRemoveAttachment?: (index: number) => void;
   onFileUpload?: (files: FileList | File[] | null) => void;
   onWorkspaceFilesSelected?: (entries: WorkspaceEntry[]) => void;
@@ -123,6 +130,9 @@ export function ChatInput({
   autoFocus = false,
   textareaRef: externalTextareaRef,
   attachedFiles = [],
+  imageInputError,
+  attachmentError,
+  attachmentErrorKey,
   onRemoveAttachment,
   onFileUpload,
   onWorkspaceFilesSelected,
@@ -138,6 +148,10 @@ export function ChatInput({
   modelControl,
   onInputChangeRaw,
 }: ChatInputProps) {
+  const attachmentErrorId = useId();
+  const attachmentMessage = imageInputError || attachmentError;
+  const attachmentMessageKey = useMemo(() => ({ message: attachmentMessage, attempt: attachmentErrorKey }),
+    [attachmentMessage, attachmentErrorKey]);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const setTextareaRef = useCallback((node: HTMLTextAreaElement | null) => {
     textareaRef.current = node;
@@ -376,7 +390,7 @@ export function ChatInput({
     if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      if (sendDisabled) return;
+      if (sendDisabled || imageInputError) return;
       onSend();
     }
   };
@@ -445,7 +459,7 @@ export function ChatInput({
   };
 
   const hasContent = value.trim().length > 0 || attachedFiles.length > 0;
-  const canSend = hasContent && !disabled && !sendDisabled;
+  const canSend = hasContent && !disabled && !sendDisabled && !imageInputError;
 
   return (
     <div className="bg-claude-bg pb-5 pt-3">
@@ -458,9 +472,10 @@ export function ChatInput({
                 ?? file.draftId
                 ?? `legacy:${file.path}:${file.name}:${file.modified}:${file.size}`;
               const status = file.uploadStatus ?? 'ready';
+              const incompatible = !!imageInputError && isConversationImageInput(file);
               const hasProgress = typeof file.uploadProgress === 'number';
               const progress = Math.max(0, Math.min(100, file.uploadProgress ?? 0));
-              const statusLabel = status === 'waiting'
+              const statusLabel = incompatible ? '不兼容' : status === 'waiting'
                 ? '等待上传'
                 : status === 'uploading'
                   ? (hasProgress ? `上传中 ${progress}%` : '上传中')
@@ -482,6 +497,7 @@ export function ChatInput({
                   }}
                   className="group relative h-20 w-28 overflow-hidden rounded-xl border border-claude-border bg-white transition-colors hover:border-claude-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
                   title={`预览 ${file.name}`}
+                  aria-describedby={incompatible ? attachmentErrorId : undefined}
                 >
                   <div className={`absolute top-1.5 right-1.5 text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-wide z-10 ${getFileBadgeClass(file)}`}>
                     {getFileExtLabel(file)}
@@ -506,9 +522,9 @@ export function ChatInput({
                 </button>
 
                 <div
-                  className="mt-1 min-h-4 truncate text-[10px] text-claude-muted"
+                  className={`mt-1 min-h-4 truncate text-[10px] ${incompatible ? 'text-claude-error' : 'text-claude-muted'}`}
                   aria-live="polite"
-                  title={status === 'error' ? file.uploadError : undefined}
+                  title={incompatible ? imageInputError : status === 'error' ? file.uploadError : undefined}
                 >
                   {file.pastedText !== undefined ? `${Array.from(file.pastedText).length} 字 · ${statusLabel}` : statusLabel}
                 </div>
@@ -530,7 +546,8 @@ export function ChatInput({
                       <button
                         type="button"
                         onClick={() => onRetryAttachment(index)}
-                        className="rounded px-1 text-[10px] text-claude-secondary hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
+                        disabled={incompatible}
+                        className="rounded px-1 text-[10px] text-claude-secondary hover:bg-claude-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40 disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         重试
                       </button>
@@ -564,6 +581,13 @@ export function ChatInput({
               );
             })}
           </div>
+        )}
+
+        {imageInputError && <span id={attachmentErrorId} className="sr-only">无法发送：{imageInputError}</span>}
+        {attachmentMessage && (
+          <FeedbackMessage tone="error" messageKey={attachmentMessageKey} className="mb-2 text-xs text-claude-error">
+            {attachmentMessage}
+          </FeedbackMessage>
         )}
 
         {/* 输入框容器 — 膠囊形 */}
@@ -820,12 +844,12 @@ export function ChatInput({
                               {skillsLoading && !skillsLoaded && <div className="flex items-center justify-center gap-2 p-6 text-sm text-claude-muted"><Loader2 className="h-4 w-4 animate-spin" />加载中</div>}
                               {skillsError && !skillsLoaded && (
                                 <div className="flex flex-col items-center gap-2 p-6 text-center text-sm text-claude-error">
-                                  <span>{skillsError}</span>
+                                  <FeedbackMessage tone="error">{skillsError}</FeedbackMessage>
                                   <button type="button" onClick={() => setSkillsLoadRevision((revision) => revision + 1)} className="rounded-lg border border-claude-border px-3 py-1.5 text-xs text-claude-secondary hover:bg-claude-hover">重新加载</button>
                                 </div>
                               )}
                               {skillsLoaded && skillsLoading && <div aria-label="正在刷新 Skill 列表" className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] text-claude-muted"><Loader2 className="h-3 w-3 animate-spin" />正在刷新</div>}
-                              {skillsLoaded && skillsError && <div className="mx-2 mb-1 flex items-center justify-between gap-2 rounded-lg bg-claude-error/5 px-2.5 py-2 text-xs text-claude-error"><span>{skillsError}</span><button type="button" onClick={() => setSkillsLoadRevision((revision) => revision + 1)} className="shrink-0 rounded-md border border-claude-border bg-white px-2 py-1 text-[11px] text-claude-secondary hover:bg-claude-hover">重试</button></div>}
+                              {skillsLoaded && skillsError && <div className="mx-2 mb-1 flex items-center justify-between gap-2 rounded-lg bg-claude-error/5 px-2.5 py-2 text-xs text-claude-error"><FeedbackMessage tone="error" className="min-w-0 flex-1">{skillsError}</FeedbackMessage><button type="button" onClick={() => setSkillsLoadRevision((revision) => revision + 1)} className="shrink-0 rounded-md border border-claude-border bg-white px-2 py-1 text-[11px] text-claude-secondary hover:bg-claude-hover">重试</button></div>}
                               {skillsLoaded && skillsInventoryState === 'stale' && !skillsError && <div role="status" className="mx-2 mb-1 rounded-lg bg-[#fff8ec] px-2.5 py-2 text-xs text-[#8a5a2f]">刷新失败，正在显示上次成功加载的 Skill 清单。</div>}
                               {skillsLoaded && filteredSkills.length === 0 && <div className="p-6 text-center text-sm text-claude-muted">没有匹配的 Skill</div>}
                               {skillsLoaded && filteredSkills.map((skill) => {
@@ -858,9 +882,9 @@ export function ChatInput({
                             </div>
                             <div role="group" aria-label="可选数据连接" className="max-h-[50vh] overflow-y-auto p-2">
                               {mcpLoading && !mcpLoaded && <div className="flex items-center justify-center gap-2 p-6 text-sm text-claude-muted"><Loader2 className="h-4 w-4 animate-spin" />加载中</div>}
-                              {mcpError && !mcpLoaded && <div className="flex flex-col items-center gap-2 p-6 text-center text-sm text-claude-error"><span>{mcpError}</span><button type="button" onClick={() => setMcpLoadRevision((revision) => revision + 1)} className="rounded-lg border border-claude-border px-3 py-1.5 text-xs text-claude-secondary hover:bg-claude-hover">重新加载</button></div>}
+                              {mcpError && !mcpLoaded && <div className="flex flex-col items-center gap-2 p-6 text-center text-sm text-claude-error"><FeedbackMessage tone="error">{mcpError}</FeedbackMessage><button type="button" onClick={() => setMcpLoadRevision((revision) => revision + 1)} className="rounded-lg border border-claude-border px-3 py-1.5 text-xs text-claude-secondary hover:bg-claude-hover">重新加载</button></div>}
                               {mcpLoaded && mcpLoading && <div aria-label="正在刷新数据连接列表" className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] text-claude-muted"><Loader2 className="h-3 w-3 animate-spin" />正在刷新</div>}
-                              {mcpLoaded && mcpError && <div className="mx-2 mb-1 flex items-center justify-between gap-2 rounded-lg bg-claude-error/5 px-2.5 py-2 text-xs text-claude-error"><span>{mcpError}</span><button type="button" onClick={() => setMcpLoadRevision((revision) => revision + 1)} className="shrink-0 rounded-md border border-claude-border bg-white px-2 py-1 text-[11px] text-claude-secondary hover:bg-claude-hover">重试</button></div>}
+                              {mcpLoaded && mcpError && <div className="mx-2 mb-1 flex items-center justify-between gap-2 rounded-lg bg-claude-error/5 px-2.5 py-2 text-xs text-claude-error"><FeedbackMessage tone="error" className="min-w-0 flex-1">{mcpError}</FeedbackMessage><button type="button" onClick={() => setMcpLoadRevision((revision) => revision + 1)} className="shrink-0 rounded-md border border-claude-border bg-white px-2 py-1 text-[11px] text-claude-secondary hover:bg-claude-hover">重试</button></div>}
                               {mcpLoaded && filteredMcpServers.length === 0 && <div className="p-6 text-center text-sm text-claude-muted">没有可用的数据连接</div>}
                               {mcpLoaded && filteredMcpServers.map((server) => {
                                 const selected = selectedMcpServerIds.includes(server.id);
@@ -900,6 +924,7 @@ export function ChatInput({
                   onClick={onSend}
                   disabled={!canSend}
                   aria-label="发送消息"
+                  aria-describedby={imageInputError ? attachmentErrorId : undefined}
                   title="发送消息"
                   className={`w-8 h-8 rounded-full flex items-center justify-center transition-[background-color,color,opacity,transform] ${
                     canSend

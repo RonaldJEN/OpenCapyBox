@@ -1,6 +1,7 @@
 import { useState, useCallback, useMemo } from 'react';
 import { MessageCircle, Check, Send, ChevronLeft, ChevronRight } from 'lucide-react';
 import type { AskUserQuestion } from '../types';
+import FeedbackMessage from './FeedbackMessage';
 
 interface QuestionCardProps {
   questions: unknown;
@@ -122,9 +123,9 @@ export function QuestionCard({ questions: rawQuestions, onSubmit, disabled = fal
     setCurrentIndex((prev) => Math.min(prev + 1, totalQuestions - 1));
   };
 
-  if (!parsedQuestions) return <div role="alert" className="rounded-xl border border-claude-border bg-white p-4 text-sm text-claude-secondary">
+  if (!parsedQuestions) return <FeedbackMessage tone="error" messageKey={rawQuestions} className="rounded-xl border border-claude-border bg-white p-4 text-sm text-claude-error">
     问题内容不完整，请停止本轮后重试。
-  </div>;
+  </FeedbackMessage>;
   if (!currentQuestion) return null;
 
   const selectedValues = currentQuestion.multiSelect

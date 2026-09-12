@@ -4,28 +4,10 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.agent.agent import Agent, Colors
-from src.agent.logger import AgentLogger
+from src.agent.agent import Agent
 from src.agent.tools.base import Tool, ToolResult
 from src.agent.schema import FunctionCall, Message, LLMResponse, ToolCall
 from tests.helpers import MockLLMClient, MockTool
-
-
-class TestColors:
-    """終端顏色類測試"""
-
-    def test_color_codes_exist(self):
-        """測試顏色代碼存在"""
-        assert Colors.RESET == "\033[0m"
-        assert Colors.BOLD == "\033[1m"
-        assert Colors.RED == "\033[31m"
-        assert Colors.GREEN == "\033[32m"
-        assert Colors.BLUE == "\033[34m"
-
-    def test_bright_colors(self):
-        """測試亮色代碼"""
-        assert Colors.BRIGHT_WHITE == "\033[97m"
-        assert Colors.BRIGHT_CYAN == "\033[96m"
 
 
 class TestAgent:
@@ -382,8 +364,8 @@ class TestAgent:
 
         assert "chars truncated" in bounded
 
-    def test_record_failed_tool_result_logs_detail_content(self, agent):
-        """失败工具日志调用不应丢弃 result.content。"""
+    def test_record_failed_tool_result_preserves_detail_content(self, agent):
+        """失败工具消息仍应包含 error 和详细 result.content。"""
         result = ToolResult(
             success=False,
             error="CommandExecError: 1",
@@ -396,39 +378,12 @@ class TestAgent:
             result_content=agent._tool_result_content("mock_tool", result),
             tool_call_id="call-1",
         )
-        agent.logger.log_tool_result = MagicMock()
-
         agent._record_tool_result(record)
 
-        agent.logger.log_tool_result.assert_called_once_with(
-            tool_name="mock_tool",
-            arguments={"query": "select ChiName from t"},
-            result_success=False,
-            result_content='{"detail":"Invalid column name ChiName"}',
-            result_error="CommandExecError: 1",
-        )
         assert agent.messages[-1].role == "tool"
         assert agent.messages[-1].tool_call_id == "call-1"
         assert "CommandExecError: 1" in agent.messages[-1].content
         assert "Invalid column name ChiName" in agent.messages[-1].content
-
-    def test_failed_tool_result_writes_error_and_result(self):
-        """失败工具日志应保留 error 与详细 result。"""
-        logger = AgentLogger()
-        logger._write_log = MagicMock()
-
-        logger.log_tool_result(
-            tool_name="sandbox_bash",
-            arguments={"cmd": "query"},
-            result_success=False,
-            result_content='{"detail":"Invalid column name ChiName"}',
-            result_error="CommandExecError: 1",
-        )
-
-        logger._write_log.assert_called_once()
-        _log_type, content = logger._write_log.call_args.args
-        assert '"error": "CommandExecError: 1"' in content
-        assert '"result": "{\\"detail\\":\\"Invalid column name ChiName\\"}"' in content
 
     def test_tool_result_content_blocks_serialization_compatible(self):
         """ToolResult 新增 content_blocks 默认值不破坏旧工具结果。"""

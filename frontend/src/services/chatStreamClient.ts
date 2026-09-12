@@ -696,10 +696,13 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
     return false;
   };
 
-  const notifyRejectedBeforeAccept = () => {
+  const notifyRejectedBeforeAccept = (message: string, code?: string) => {
     if (streamAccepted || preAcceptRejectionNotified) return;
     preAcceptRejectionNotified = true;
     args.onRejectedBeforeAccept?.();
+    // Rejection removes the optimistic run. Keep its feedback on the session,
+    // so the following RUN_ERROR does not depend on that run still existing.
+    args.onError?.(message, code);
   };
 
   const markStreamAccepted = () => {
@@ -791,8 +794,13 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
           currentRunId = currentRunId || event.value?.runId || null;
           currentThreadId = currentThreadId || args.ownerSessionId;
         }
-        if (!currentRunId && isUnsequencedRunError(event)) {
-          notifyRejectedBeforeAccept();
+        if (
+          !currentRunId
+          && isUnsequencedRunError(event)
+          && event.code !== 'ROUND_IN_PROGRESS'
+          && event.code !== 'INTERACTION_PENDING'
+        ) {
+          notifyRejectedBeforeAccept(event.message || '发送失败', event.code);
           runCompleted = true;
         }
         handleStreamEvent(
@@ -892,14 +900,14 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
       }
 
       if (is4xx(error)) {
-        notifyRejectedBeforeAccept();
         const code = error.status === 429 ? 'USER_BUSY' : 'HTTP_CLIENT_ERROR';
+        notifyRejectedBeforeAccept(error.message, code);
         emit(args, identity, { type: 'RUN_ERROR', message: error.message, code });
         return;
       }
 
       if (is5xx(error)) {
-        notifyRejectedBeforeAccept();
+        notifyRejectedBeforeAccept(error.message, 'SERVER_ERROR');
         emit(args, identity, { type: 'RUN_ERROR', message: error.message, code: 'SERVER_ERROR' });
         return;
       }
@@ -1040,12 +1048,12 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
           && failedHistoryChecks === 0
         );
         if (confirmedNotAccepted) {
+          notifyRejectedBeforeAccept('网络中断，请检查连接后重试', 'REQUEST_FAILED');
           emit(args, identity, {
             type: 'RUN_ERROR',
             message: '网络中断，请检查连接后重试',
             code: 'REQUEST_FAILED',
           });
-          notifyRejectedBeforeAccept();
         } else {
           handoffKnownRound('unknown', null);
           args.onError?.(

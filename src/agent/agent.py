@@ -17,7 +17,6 @@ import tiktoken
 
 from src.api.utils.timezone import get_timezone, get_timezone_offset
 from .llm import LLMClient
-from .logger import AgentLogger
 from .schema import FunctionCall, Message, ToolCall
 from .schema.schema import AssistantMessageStreamEvent
 from .schema.run_context import (
@@ -36,7 +35,6 @@ from .tools.tool_discovery import (
     ToolSearchDocument,
     bound_tool_search_text,
 )
-from .utils import calculate_display_width
 from .event_emitter import AGUIEventEmitter
 from .context_compaction import (
     DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES,
@@ -494,33 +492,6 @@ class _ToolLoopGuard:
         ))
 
 
-# ANSI color codes
-class Colors:
-    """Terminal color definitions"""
-
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-
-    # Foreground colors
-    RED = "\033[31m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    MAGENTA = "\033[35m"
-    CYAN = "\033[36m"
-
-    # Bright colors
-    BRIGHT_BLACK = "\033[90m"
-    BRIGHT_RED = "\033[91m"
-    BRIGHT_GREEN = "\033[92m"
-    BRIGHT_YELLOW = "\033[93m"
-    BRIGHT_BLUE = "\033[94m"
-    BRIGHT_MAGENTA = "\033[95m"
-    BRIGHT_CYAN = "\033[96m"
-    BRIGHT_WHITE = "\033[97m"
-
-
 class Agent:
     """Single agent with basic tools and MCP support."""
 
@@ -628,9 +599,6 @@ class Agent:
 
         # Initialize message history
         self.messages: list[Message] = [Message(role="system", content=system_prompt)]
-
-        # Initialize logger
-        self.logger = AgentLogger()
 
         # 🔥 Token缓存优化
         self._cached_token_count = 0
@@ -1976,24 +1944,6 @@ class Agent:
         events.append(emitter.tool_call_end(tool_call_id))
         return events
 
-    @staticmethod
-    def _print_tool_call(function_name: str, arguments: Any) -> None:
-        print(f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}")
-        print(f"{Colors.DIM}   Arguments:{Colors.RESET}")
-        truncated_args = {}
-        if isinstance(arguments, dict):
-            for key, value in arguments.items():
-                value_str = str(value)
-                if len(value_str) > 200:
-                    truncated_args[key] = value_str[:200] + "..."
-                else:
-                    truncated_args[key] = value
-        else:
-            truncated_args = {"_raw": str(arguments)}
-        args_display = json.dumps(truncated_args, indent=2, ensure_ascii=False)
-        for line in args_display.split("\n"):
-            print(f"   {Colors.DIM}{line}{Colors.RESET}")
-
     async def _execute_tool_call_for_record(
         self,
         *,
@@ -2679,22 +2629,6 @@ class Agent:
         *,
         replace_interrupt_placeholder: bool = False,
     ) -> None:
-        if record.result.success:
-            result_text = record.result.content
-            if len(result_text) > 500:
-                result_text = result_text[:500] + f"{Colors.DIM}...{Colors.RESET}"
-            print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result_text}")
-        else:
-            print(f"{Colors.BRIGHT_RED}✗ Error:{Colors.RESET} {Colors.RED}{record.result.error}{Colors.RESET}")
-
-        self.logger.log_tool_result(
-            tool_name=record.function_name,
-            arguments=record.arguments,
-            result_success=record.result.success,
-            result_content=record.result.content,
-            result_error=record.result.error if not record.result.success else None,
-        )
-
         replaced = (
             self.replace_interrupt_tool_result(record.tool_call_id, record.result_content)
             if replace_interrupt_placeholder
@@ -3252,10 +3186,6 @@ class Agent:
                 return emitter.custom_event("synthetic_user_message", {"content": synthetic_msg.content})
             return None
         
-        # 開始日誌記錄
-        self.logger.start_new_run()
-        print(f"{Colors.DIM}📝 Log file: {self.logger.get_log_file_path()}{Colors.RESET}")
-        
         step = max(int(initial_step or 0), 0)
         final_response: Optional[str] = None
         final_message_ids: list[str] | None = None
@@ -3309,13 +3239,11 @@ class Agent:
             while step < self.max_steps:
                 # 🛑 取消檢查點 1: 每個 step 開始前
                 if cancel_token and cancel_token.is_set():
-                    print(f"\n{Colors.BRIGHT_YELLOW}⏹️  用戶取消了執行 (step {step + 1}){Colors.RESET}")
                     yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
                     return
 
                 # 漸進式提醒（倒數第2步時提醒 LLM）
                 if step == self.max_steps - 2:
-                    print(f"\n{Colors.BRIGHT_YELLOW}💡 剩餘步驟不多，建議 LLM 考慮總結...{Colors.RESET}")
                     reminder_msg = Message(
                         role="user",
                         id=f"{run_id}:synthetic:{step + 1}:step-limit",
@@ -3330,15 +3258,6 @@ class Agent:
                 
                 # STEP_STARTED
                 yield emitter.step_started(step_name)
-                
-                # 打印步驟頭
-                BOX_WIDTH = 58
-                step_text = f"{Colors.BOLD}{Colors.BRIGHT_CYAN}💭 Step {step + 1}/{self.max_steps}{Colors.RESET}"
-                step_display_width = calculate_display_width(step_text)
-                padding = max(0, BOX_WIDTH - 1 - step_display_width)
-                print(f"\n{Colors.DIM}╭{'─' * BOX_WIDTH}╮{Colors.RESET}")
-                print(f"{Colors.DIM}│{Colors.RESET} {step_text}{' ' * padding}{Colors.DIM}│{Colors.RESET}")
-                print(f"{Colors.DIM}╰{'─' * BOX_WIDTH}╯{Colors.RESET}")
                 
                 # 獲取工具列表
                 # DENY tools are omitted from the model schema; ASK/ALLOW remain
@@ -3368,7 +3287,6 @@ class Agent:
                 except asyncio.CancelledError:
                     if cancel_token is None or not cancel_token.is_set():
                         raise
-                    logger.info("⏹️  用戶取消了執行 (上下文壓縮期間)")
                     yield emitter.step_finished(step_name)
                     yield emitter.run_finished(
                         outcome="interrupt",
@@ -3376,7 +3294,6 @@ class Agent:
                     )
                     return
                 compaction_stats_snapshot = dict(self._last_compaction_stats)
-                self.logger.log_request(messages=llm_request_messages, tools=tool_list)
                 request_messages_snapshot = [msg.model_dump(exclude_none=True) for msg in llm_request_messages]
                 request_tools_snapshot = [tool.name for tool in tool_list]
                 step_index = step + 1
@@ -3533,10 +3450,6 @@ class Agent:
                         name="failover_reset",
                         value={"model": model_id},
                     ))
-                    logger.info(
-                        "Failover reset: next model=%s, context_window=%d, max_output_tokens=%d",
-                        model_id, self.context_window, self.max_output_tokens,
-                    )
                     return fallback_kwargs
 
                 self.llm.failover_notify = on_failover_reset
@@ -3608,7 +3521,6 @@ class Agent:
 
                     # 如果是 LLM 调用期间被用户取消
                     if cancelled_during_llm:
-                        logger.info("⏹️  用戶取消了執行 (LLM 調用期間)")
                         # Preserve failure facts for already published native
                         # messages without publishing queued post-stop content.
                         pending = [cancelled_queue_item]
@@ -3670,8 +3582,6 @@ class Agent:
                         }
                     )
 
-                    print(f"\n{Colors.BRIGHT_RED}❌ Error:{Colors.RESET} {error_msg}")
-
                     yield emitter.step_finished(step_name)
                     yield emitter.run_error(message=error_msg)
                     return
@@ -3708,14 +3618,6 @@ class Agent:
                 if response.usage is not None and response.usage.total_tokens:
                     self._active_context_tokens = int(response.usage.total_tokens)
 
-                # 記錄 LLM 響應
-                self.logger.log_response(
-                    content=response.content or "",
-                    thinking=response.thinking,
-                    tool_calls=response.tool_calls,
-                    finish_reason=response.finish_reason,
-                )
-
                 # 添加助手消息
                 assistant_msg = Message(
                     role="assistant",
@@ -3732,8 +3634,6 @@ class Agent:
                 # 补发结束事件 (END)
                 if thinking_started:
                     yield emitter.thinking_end()
-                    print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
-                    print(f"{Colors.DIM}{response.thinking}{Colors.RESET}")
 
                 # 补发 text message 事件：
                 # 如果流式 delta 触发了 message_started，正常发 END；
@@ -3759,8 +3659,6 @@ class Agent:
                         yield emitter.text_message_end(phase=text_message.phase)
                 elif message_started:
                     yield emitter.text_message_end()
-                    print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
-                    print(f"{response.content}")
                 elif response.content:
                     # LLM 返回了 content 但流式 delta 未触发，补发完整事件
                     yield emitter.text_message_start(role="assistant")
@@ -3768,8 +3666,6 @@ class Agent:
                     if evt:
                         yield evt
                     yield emitter.text_message_end()
-                    print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant (non-stream):{Colors.RESET}")
-                    print(f"{response.content}")
 
                 # 多層退出檢查（借鑑 Claude Code 的 needsFollowUp 模式）
                 if not response.tool_calls:
@@ -3791,8 +3687,6 @@ class Agent:
                     # 注入恢復消息讓模型從中斷點繼續（最多重試 MAX_TRUNCATION_RETRIES 次）
                     if response.finish_reason == "length" and output_truncation_retries < MAX_TRUNCATION_RETRIES:
                         output_truncation_retries += 1
-                        print(f"\n{Colors.BRIGHT_YELLOW}🔄 Output truncated (finish_reason=length), "
-                              f"retry {output_truncation_retries}/{MAX_TRUNCATION_RETRIES}{Colors.RESET}")
                         truncation_content = (
                             "Your output was truncated before you could finish or call a tool. "
                             "Resume EXACTLY where you stopped — no repeat, no recap, no apology. "
@@ -3814,7 +3708,6 @@ class Agent:
                     # 模型返回空 content + 無 tool_calls 是異常行為，nudge 一次
                     if not (answer_content and answer_content.strip()) and not empty_response_nudged:
                         empty_response_nudged = True
-                        print(f"\n{Colors.BRIGHT_YELLOW}⚠️  Empty response with no tool calls, nudging model...{Colors.RESET}")
                         nudge_content = (
                             "You returned an empty response with no tool calls. "
                             "Please provide your answer or call a tool to continue working."
@@ -3834,7 +3727,6 @@ class Agent:
                     # CHECK 3: 連續空響應，視為異常退出
                     if not (answer_content and answer_content.strip()):
                         error_msg = "Model returned empty response twice with no tool calls. Ending run."
-                        print(f"\n{Colors.BRIGHT_RED}🚫 {error_msg}{Colors.RESET}")
                         yield emitter.step_finished(step_name)
                         yield emitter.run_error(message=error_msg)
                         return
@@ -3848,7 +3740,6 @@ class Agent:
                 
                 # 🛑 取消檢查點 2: LLM 回覆後、工具執行前
                 if cancel_token and cancel_token.is_set():
-                    print(f"\n{Colors.BRIGHT_YELLOW}⏹️  用戶取消了執行 (LLM 已回覆，跳過工具調用){Colors.RESET}")
                     yield emitter.step_finished(step_name)
                     yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
                     return
@@ -3862,7 +3753,6 @@ class Agent:
 
                     # 🛑 取消檢查點 3: 每個工具執行前
                     if cancel_token and cancel_token.is_set():
-                        print(f"\n{Colors.BRIGHT_YELLOW}⏹️  用戶取消了執行 (跳過工具 {function_name}){Colors.RESET}")
                         for remaining_tc in tool_calls[tool_call_index:]:
                             remaining_id, remaining_name, _remaining_args = self._tool_call_identity(remaining_tc)
                             yield emitter.tool_call_start(
@@ -3906,7 +3796,6 @@ class Agent:
                             arguments=arguments,
                         ):
                             yield event
-                        self._print_tool_call(function_name, arguments)
                         blocked_content = f"tool_loop_detected: {loop_error}"
                         blocked = _ExecutedToolCall(
                             index=tool_call_index,
@@ -4004,7 +3893,6 @@ class Agent:
                             arguments=arguments,
                         ):
                             yield event
-                        self._print_tool_call(function_name, arguments)
                         blocked = _ExecutedToolCall(
                             index=tool_call_index,
                             tool_call_id=tool_call_id,
@@ -4049,7 +3937,6 @@ class Agent:
                             arguments=arguments,
                         ):
                             yield event
-                        self._print_tool_call(function_name, arguments)
                         blocked = _ExecutedToolCall(
                             index=tool_call_index,
                             tool_call_id=tool_call_id,
@@ -4102,7 +3989,6 @@ class Agent:
                                 arguments=arguments,
                             ):
                                 yield event
-                            self._print_tool_call(function_name, arguments)
                             blocked_content = _TOOL_UNAVAILABLE_MESSAGE
                             blocked = _ExecutedToolCall(
                                 index=tool_call_index,
@@ -4143,7 +4029,6 @@ class Agent:
                                 arguments=arguments,
                             ):
                                 yield event
-                            self._print_tool_call(function_name, arguments)
                             try:
                                 interrupt_id, approval_payload = self._create_tool_approval(
                                     tool=tool,
@@ -4259,10 +4144,8 @@ class Agent:
                                     arguments=batch_args,
                                 ):
                                     yield event
-                                self._print_tool_call(batch_name, batch_args)
 
                             if cancel_token and cancel_token.is_set():
-                                print(f"\n{Colors.BRIGHT_YELLOW}⏹️  用戶取消了執行 (跳過 sub_agent batch){Colors.RESET}")
                                 for _index, batch_tool_call in batch:
                                     batch_id, batch_name, _batch_args = self._tool_call_identity(batch_tool_call)
                                     yield emitter.tool_call_result(
@@ -4337,10 +4220,8 @@ class Agent:
                         arguments=arguments,
                     ):
                         yield event
-                    self._print_tool_call(function_name, arguments)
 
                     if cancel_token and cancel_token.is_set():
-                        print(f"\n{Colors.BRIGHT_YELLOW}⏹️  用戶取消了執行 (跳過工具 {function_name}){Colors.RESET}")
                         yield emitter.tool_call_result(
                             success=False,
                             tool_call_id=tool_call_id,
@@ -4415,8 +4296,6 @@ class Agent:
                             continue
 
                         interrupt_id = str(uuid.uuid4())
-
-                        print(f"\n{Colors.BRIGHT_MAGENTA}❓ Ask User:{Colors.RESET} {len(questions_payload)} question(s) — interrupting for user input")
 
                         # 内存中的占位仅用于进程内 Agent/冷恢复模型上下文。wire
                         # 不把占位内容投影给前端，回答后由 interaction_resolved
@@ -4523,8 +4402,6 @@ class Agent:
             # 運行結束
             if step >= self.max_steps:
                 # 達到最大步數
-                error_msg = f"任務在 {self.max_steps} 步後未能完成。"
-                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
                 yield emitter.run_finished(
                     outcome="interrupt",
                     result={
@@ -4539,9 +4416,13 @@ class Agent:
         except ContinuationOwnershipLostError:
             raise
         except Exception as e:
-            import traceback
             error_detail = f"{type(e).__name__}: {str(e)}"
-            print(f"\n{Colors.BRIGHT_RED}❌ Unexpected error:{Colors.RESET} {error_detail}")
+            logger.exception(
+                "Agent run failed unexpectedly: run_id=%s thread_id=%s error_type=%s",
+                run_id,
+                thread_id,
+                type(e).__name__,
+            )
             yield emitter.run_error(message=error_detail)
 
     def get_history(self) -> list[Message]:

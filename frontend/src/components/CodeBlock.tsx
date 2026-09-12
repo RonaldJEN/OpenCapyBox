@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { Check, Copy } from 'lucide-react';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import FeedbackMessage from './FeedbackMessage';
 
 interface CodeBlockProps {
   language: string;
@@ -15,9 +16,9 @@ export function CodeBlock({ language, value, readingBlockId }: CodeBlockProps) {
   const [copyFailed, setCopyFailed] = useState(false);
 
   const handleCopy = async () => {
+    setCopyFailed(false);
     try {
       await navigator.clipboard.writeText(value);
-      setCopyFailed(false);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch { setCopyFailed(true); }
@@ -40,6 +41,7 @@ export function CodeBlock({ language, value, readingBlockId }: CodeBlockProps) {
           {copied ? <Check size={14} className="text-claude-success" /> : <Copy size={14} />}
         </button>
       </div>
+      {copyFailed && <FeedbackMessage tone="error" onDismiss={() => setCopyFailed(false)} className="mx-5 my-1 text-xs text-red-300">复制失败，请重试</FeedbackMessage>}
 
       {/* Code Container */}
       <div data-reading-block={readingBlockId} className="text-sm font-mono overflow-auto select-text cursor-text">

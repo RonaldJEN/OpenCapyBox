@@ -2,6 +2,7 @@ import { Component, type ReactNode } from 'react';
 import type { AssistantFileReference, FileInfo } from '../types';
 import type { TranscriptTextNode } from '../transcript/projectRoundTranscript';
 import { AssistantMarkdown } from './AssistantMarkdown';
+import FeedbackMessage from './FeedbackMessage';
 
 class MessageErrorBoundary extends Component<{
   node: TranscriptTextNode;
@@ -12,7 +13,7 @@ class MessageErrorBoundary extends Component<{
   render() {
     if (!this.state.failed) return this.props.children;
     return <>
-      <p className="not-prose text-xs text-claude-muted">此段格式显示失败，已显示原文。</p>
+      <FeedbackMessage tone="error" messageKey={this.props.node.id} className="not-prose text-xs text-claude-error">此段格式显示失败，已显示原文。</FeedbackMessage>
       <div data-reading-block={`answer:${this.props.node.id}:plain`} className="whitespace-pre-wrap break-words">
         {this.props.node.text}
       </div>

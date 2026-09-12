@@ -1123,7 +1123,7 @@ class TestEventsToMessagesDiagnostics:
         return e
 
     def test_malformed_payload_logs_warning(self, caplog):
-        """畸形 payload 应记录 warning 而非静默跳过"""
+        """畸形 payload 应记录关联信息，但不复制原始正文。"""
         from src.api.services.agent_service import AgentService
         import logging
 
@@ -1135,7 +1135,9 @@ class TestEventsToMessagesDiagnostics:
             msgs = AgentService._events_to_messages([bad_evt], round_id="r-bad")
 
         assert msgs == []
-        assert any("payload 解析失敗" in r.message for r in caplog.records)
+        assert any("payload 解析失败" in r.message for r in caplog.records)
+        assert "round=r-bad seq=1" in caplog.text
+        assert bad_evt.payload not in caplog.text
 
     def test_dict_payload_accepted(self):
         """payload 已是 dict 时应直接使用而非 json.loads"""

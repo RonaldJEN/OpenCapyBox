@@ -503,12 +503,6 @@ class SandboxSessionService:
     ) -> Sandbox:
         """Create an unbound sandbox candidate without mutating process cache."""
         connection_config = _build_connection_config(runtime_config)
-        logger.info(
-            "正在創建沙箱 (user=%s, profile=%s)...",
-            user_id,
-            runtime_config.profile_name,
-        )
-
         try:
             volumes = self._build_persistent_volumes(user_id, runtime_config)
             sandbox = await Sandbox.create(
@@ -785,13 +779,11 @@ class SandboxSessionService:
 
             if sandbox_state in _CONNECTABLE_SANDBOX_STATES:
                 try:
-                    logger.info("正在連接沙箱 (user=%s, sandbox_id=%s)...", user_id, sandbox_id)
                     sandbox = await Sandbox.connect(
                         sandbox_id,
                         connection_config=connection_config,
                         connect_timeout=timedelta(seconds=settings.sandbox_ready_timeout_seconds),
                     )
-                    logger.info("沙箱連接成功 (user=%s, sandbox_id=%s)", user_id, sandbox_id)
                     self._store_cache(user_id, sandbox, runtime_config)
                     return sandbox
                 except Exception as e:
@@ -803,7 +795,6 @@ class SandboxSessionService:
 
             if sandbox_state == "paused":
                 try:
-                    logger.info("正在恢復沙箱 (user=%s, sandbox_id=%s)...", user_id, sandbox_id)
                     sandbox = await Sandbox.resume(
                         sandbox_id,
                         connection_config=connection_config,
@@ -1335,7 +1326,6 @@ class SandboxSessionService:
             )
 
             if not files_to_push:
-                logger.info("沒有需要推送的 skill 檔案")
                 return True
 
             # 批次上傳到沙箱（使用 SDK 批量 API）
@@ -1343,9 +1333,6 @@ class SandboxSessionService:
             entries = [WriteEntry(path=p, data=c) for p, c in files_to_push]
             await sandbox.files.write_files(entries)
 
-            logger.info(
-                "已推送 %d 個 skill 檔案到沙箱 (user=%s)", len(files_to_push), user_id
-            )
             return True
 
         except Exception as e:
@@ -1363,20 +1350,9 @@ class SandboxSessionService:
         """Push one skill while respecting the latest logical enable state."""
         async with self._get_skill_lock(user_id, skill_name):
             if enabled_check is not None and not enabled_check():
-                logger.info(
-                    "skill 已禁用，取消推送 (user=%s, skill=%s)",
-                    user_id,
-                    skill_name,
-                )
                 return False
             pushed = await self._push_skill_unlocked(user_id, skills_dir, skill_name)
             if pushed and enabled_check is not None and not enabled_check():
-                logger.info(
-                    "skill 推送期间被禁用，保留文件但不暴露给 Agent "
-                    "(user=%s, skill=%s)",
-                    user_id,
-                    skill_name,
-                )
                 return False
             return pushed
 
@@ -1439,12 +1415,6 @@ class SandboxSessionService:
             entries = [WriteEntry(path=p, data=c) for p, c in files_to_push]
             await sandbox.files.write_files(entries)
             pushed.add(skill_name)
-            logger.info(
-                "已按需推送 skill (user=%s, skill=%s, files=%d)",
-                user_id,
-                skill_name,
-                len(files_to_push),
-            )
             return True
         except Exception as e:
             logger.error(
@@ -1689,11 +1659,6 @@ class SandboxSessionService:
                 continue
             results.append(normalized_candidate)
 
-        logger.info(
-            "discover_sandbox_skills: 發現 %d 個用戶 Skill (user=%s)",
-            len(results),
-            user_id,
-        )
         return SkillDiscoveryResult(results, issues)
 
     async def read_sandbox_skill_content(

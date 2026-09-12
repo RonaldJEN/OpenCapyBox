@@ -73,7 +73,7 @@ try:
         import opensandbox.adapters.converter.execution_event_dispatcher as _disp_module
         _disp_module.EventNode = _PatchedEventNode
     except Exception as _e:
-        logger.debug("execution_event_dispatcher patch 跳过: %s", _e)
+        logger.debug("execution_event_dispatcher patch 跳过: error_type=%s", type(_e).__name__)
 
     # 同时 patch ExecutionEventDispatcher.dispatch:
     # 沙箱事件 timestamp 可能为 None，但下游 OutputMessage/ExecutionInit 等
@@ -98,11 +98,10 @@ try:
         _disp_module.ExecutionEventDispatcher.dispatch = _patched_dispatch
         _disp_module.ExecutionEventDispatcher._handle_error = _patched_handle_error
     except Exception as _e:
-        logger.warning("dispatch/handle_error patch 失败（bash 可能返回空结果）: %s", _e)
+        logger.warning("dispatch/handle_error patch 失败（bash 可能返回空结果）: error_type=%s", type(_e).__name__)
 
-    logger.info("已修补 OpenSandbox EventNode: timestamp 允许 None, traceback 允许 None")
 except Exception as _patch_err:
-    logger.warning("OpenSandbox EventNode monkey-patch 失败: %s", _patch_err)
+    logger.warning("OpenSandbox EventNode monkey-patch 失败: error_type=%s", type(_patch_err).__name__)
 
 
 def _normalize_workspace_dir(workspace_dir: str) -> str:
@@ -358,10 +357,10 @@ class _BackgroundCommandTracker:
             except Exception as e:
                 logger.warning(
                     "查询后台命令状态失败，将尝试 best-effort interrupt "
-                    "(bash_id=%s, command_id=%s): %s",
+                    "(bash_id=%s, command_id=%s): error_type=%s",
                     bash_id,
                     command_id,
-                    e,
+                    type(e).__name__,
                 )
 
             if not should_interrupt:
@@ -377,10 +376,10 @@ class _BackgroundCommandTracker:
             except Exception as e:
                 stats["failed"] += 1
                 logger.warning(
-                    "interrupt 后台命令失败 (bash_id=%s, command_id=%s): %s",
+                    "interrupt 后台命令失败 (bash_id=%s, command_id=%s): error_type=%s",
                     bash_id,
                     command_id,
-                    e,
+                    type(e).__name__,
                 )
 
         for bash_id, _ in matched:
@@ -509,7 +508,12 @@ Examples:
                 return await self._run_foreground(command, timeout)
 
         except Exception as e:
-            logger.exception("沙箱命令執行異常: %s", command)
+            logger.exception(
+                "沙箱命令执行异常: background=%s timeout_seconds=%s error_type=%s",
+                run_in_background,
+                self._background_timeout_seconds if run_in_background else timeout,
+                type(e).__name__,
+            )
             return SandboxBashOutputResult(
                 success=False,
                 stdout="",
@@ -520,8 +524,6 @@ Examples:
 
     async def _run_foreground(self, command: str, timeout: int) -> SandboxBashOutputResult:
         """前台執行命令"""
-        logger.debug("沙箱前台命令: %s (timeout=%ds)", command, timeout)
-
         opts = RunCommandOpts(
             background=False,
             timeout=timedelta(seconds=timeout),
@@ -531,7 +533,7 @@ Examples:
 
         # --- Defensive checks: detect abnormal SDK responses ---
         if execution is None:
-            logger.warning("沙箱命令返回 None execution: %s", command)
+            logger.warning("沙箱命令返回 None execution: timeout_seconds=%s", timeout)
             return SandboxBashOutputResult(
                 success=False,
                 stdout="",
@@ -542,10 +544,12 @@ Examples:
 
         logs = getattr(execution, "logs", None)
         if logs is None:
-            logger.warning(
-                "沙箱命令返回 None logs (execution=%r): %s", execution, command
-            )
             exit_code = _extract_exit_code(execution)
+            logger.warning(
+                "沙箱命令返回 None logs: execution_id=%s exit_code=%s",
+                getattr(execution, "id", None),
+                exit_code,
+            )
             return SandboxBashOutputResult(
                 success=False,
                 stdout="",
@@ -579,17 +583,13 @@ Examples:
                 exit_code = 0
 
         is_success = exit_code == 0
-        # 诊断日志：当结果为空时记录 execution 对象细节，便于排查
+        # 异常执行只记录关联信息，具体执行错误仍返回给模型。
         if not stdout and not stderr and not is_success:
             logger.warning(
-                "沙箱命令无输出且失败 (cmd=%s): execution.id=%s, "
-                "execution.error=%r, execution.result=%r, logs.stdout=%r, logs.stderr=%r",
-                command[:80],
+                "沙箱命令无输出且失败: execution_id=%s exit_code=%s error_type=%s",
                 getattr(execution, "id", None),
-                exec_error,
-                getattr(execution, "result", None),
-                getattr(logs, "stdout", None),
-                getattr(logs, "stderr", None),
+                exit_code,
+                type(exec_error).__name__ if exec_error is not None else None,
             )
 
         error_msg = None
@@ -624,7 +624,6 @@ Examples:
     async def _run_background(self, command: str) -> SandboxBashOutputResult:
         """後台執行命令"""
         bash_id = str(uuid.uuid4())[:8]
-        logger.debug("沙箱後台命令: %s (bash_id=%s)", command, bash_id)
 
         opts_kwargs: dict[str, Any] = {
             "background": True,
@@ -636,7 +635,7 @@ Examples:
         execution = await self._sandbox.commands.run(command, opts=opts)
 
         if execution is None:
-            logger.warning("沙箱後台命令返回 None execution: %s", command)
+            logger.warning("沙箱后台命令返回 None execution: bash_id=%s", bash_id)
             return SandboxBashOutputResult(
                 success=False,
                 stdout="",
@@ -648,12 +647,6 @@ Examples:
         # 追蹤後台命令
         command_id = execution.id if hasattr(execution, 'id') else bash_id
         self._tracker.add(bash_id, self._sandbox, command_id)
-        logger.info(
-            "沙箱后台命令已启动: bash_id=%s, command_id=%s, timeout_seconds=%s",
-            bash_id,
-            command_id,
-            self._background_timeout_seconds,
-        )
         return SandboxBashOutputResult(
             success=True,
             stdout=f"Background command started with ID: {bash_id}",
@@ -799,7 +792,12 @@ Example: bash_kill(bash_id="abc12345")"""
             try:
                 await sandbox.commands.interrupt(command_id)
             except Exception as e:
-                logger.warning("interrupt 後台命令失敗 (bash_id=%s): %s", bash_id, e)
+                logger.warning(
+                    "interrupt 后台命令失败 (bash_id=%s, command_id=%s): error_type=%s",
+                    bash_id,
+                    command_id,
+                    type(e).__name__,
+                )
                 return SandboxBashOutputResult(
                     success=False,
                     stdout="",

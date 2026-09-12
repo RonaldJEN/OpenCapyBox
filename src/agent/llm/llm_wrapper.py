@@ -138,16 +138,8 @@ class LLMClient:
             if openai_protocol == "chat_completions":
                 client_kwargs["enable_reasoning_split"] = enable_reasoning_split
             self._client = client_class(**client_kwargs)
-            logger.info(
-                "OpenAI client: protocol=%s, reasoning_format=%s, "
-                "thinking_mode=%s, thinking_wire_format=%s, max_tokens=%d (model: %s)",
-                openai_protocol, reasoning_format, thinking_mode,
-                thinking_wire_format, max_tokens, model,
-            )
         else:
             raise ValueError(f"Unsupported provider: {provider}")
-
-        logger.info("Initialized LLM client: provider=%s, api_base=%s", provider, full_api_base)
 
         # 最近一次实际发送给 provider 的请求快照
         self._last_request_snapshot: dict[str, Any] | None = None
@@ -202,12 +194,6 @@ class LLMClient:
             _api_base_is_full=True,
         )
         instance._fallback_configs = list(fallback_configs or [])
-        if instance._fallback_configs:
-            logger.info(
-                "Failover enabled: %d fallback model(s) — %s",
-                len(instance._fallback_configs),
-                [c.id for c in instance._fallback_configs],
-            )
         return instance
 
     @property
@@ -300,8 +286,8 @@ class LLMClient:
             if not self._fallback_configs:
                 raise
             logger.warning(
-                "Primary model '%s' exhausted retries: %s — starting failover",
-                self.model, primary_err.last_exception,
+                "Primary model '%s' exhausted retries: error_type=%s — starting failover",
+                self.model, type(primary_err.last_exception).__name__,
             )
 
         # 2) 依序嘗試 fallback 模型
@@ -349,8 +335,8 @@ class LLMClient:
             except RetryExhaustedError as fb_err:
                 self._sync_last_request_snapshot(fb_client)
                 logger.warning(
-                    "Failover model '%s' also failed: %s",
-                    fb_config.id, fb_err,
+                    "Failover model '%s' also failed: error_type=%s",
+                    fb_config.id, type(fb_err.last_exception).__name__,
                 )
                 last_error = fb_err
 

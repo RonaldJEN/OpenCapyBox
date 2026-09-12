@@ -293,11 +293,8 @@ async def create_agent_tools(
             from src.agent.tools.glm_search_tool import GLMSearchTool, GLMBatchSearchTool
             tools.append(GLMSearchTool(api_key=bocha_appcode))
             tools.append(GLMBatchSearchTool(api_key=bocha_appcode))
-            logger.info("已加载 Bocha 搜索工具")
         except Exception as e:
             logger.warning("Bocha 搜索工具加载失败: %s", e)
-    else:
-        logger.info("未配置 BOCHA_SEARCH_APPCODE，跳过搜索工具")
 
     # Skills（复杂加载流程）
     skills_dir = _auto_locate_skills_dir(settings.skills_dir)
@@ -328,9 +325,7 @@ async def create_agent_tools(
             # 保留完整技能清单，仅在运行时按 DB 配置过滤。
             try:
                 skill_loader.set_disabled_skills_provider(_load_disabled_skills)
-                disabled_skills = skill_loader.refresh_disabled_skills()
-                if disabled_skills:
-                    logger.info("已按用户配置禁用 %d 个 Skills: %s", len(disabled_skills), disabled_skills)
+                skill_loader.refresh_disabled_skills()
             except Exception as e:
                 logger.warning("查询 UserSkillConfig 失败，加载全部 Skills: %s", e)
 
@@ -369,12 +364,6 @@ async def create_agent_tools(
                     if registry_skill_infos is None:
                         raise RuntimeError("扫描结果已过期，且无同代际胜出快照")
                 _replace_sandbox_skill_infos(skill_loader, registry_skill_infos)
-                if registry_skill_infos:
-                    logger.info(
-                        "已发现 %d 个用户沙箱 Skills: %s",
-                        len(registry_skill_infos),
-                        [i["name"] for i in registry_skill_infos],
-                    )
             except Exception as e:
                 logger.warning("沙箱 Skill 发现失败（不影响官方 Skills）: %s", e)
 
@@ -455,15 +444,7 @@ async def create_agent_tools(
                         exc_info=True,
                     )
                     return
-                before_names = set(skill_loader.sandbox_skills.keys())
                 _replace_sandbox_skill_infos(skill_loader, registry_skill_infos)
-                current_names = set(skill_loader.sandbox_skills.keys())
-                new_names = current_names - before_names
-                removed_names = before_names - current_names
-                if new_names:
-                    logger.info("get_skill miss 后刷新发现用户沙箱 Skills: %s", sorted(new_names))
-                if removed_names:
-                    logger.info("刷新后移除已卸载用户沙箱 Skills: %s", sorted(removed_names))
 
             skill_loader.set_inventory_refresher(_refresh_sandbox_skills)
 
@@ -487,12 +468,6 @@ async def create_agent_tools(
                 except Exception as e:
                     logger.warning("读取后刷新 Skill 启停配置失败，沿用上次状态: %s", e)
                 if not skill_loader.is_skill_enabled(skill_name):
-                    logger.info(
-                        "用户 Skill 读取期间被禁用，丢弃内容 "
-                        "(user=%s, skill=%s)",
-                        user_id,
-                        skill_name,
-                    )
                     return None
                 return content
 
@@ -503,13 +478,6 @@ async def create_agent_tools(
                 refresh_sandbox_skills=_refresh_sandbox_skills,
             ))
             skill_loader_ref = skill_loader
-            skill_count = len(skill_loader.list_skills())
-            logger.info(
-                "已加载 %d 个 Skills（官方 %d + 用户 %d）",
-                skill_count,
-                len(skill_loader.loaded_skills),
-                len(skill_loader.sandbox_skills),
-            )
         else:
             logger.warning("Skills 目录不存在: %s", skills_dir)
     except Exception as e:

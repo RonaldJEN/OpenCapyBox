@@ -52,4 +52,25 @@ describe('FeedbackMessage', () => {
     );
     expect(screen.getByRole('alert')).toHaveTextContent('操作失败');
   });
+
+  it('错误 3 秒后隐藏，富文本重渲染不续期，新一次相同错误重新展示', () => {
+    vi.useFakeTimers();
+    const view = render(<FeedbackMessage tone="error" messageKey={1}><span>操作失败</span></FeedbackMessage>);
+    act(() => vi.advanceTimersByTime(1500));
+    view.rerender(<FeedbackMessage tone="error" messageKey={1}><span>操作失败</span></FeedbackMessage>);
+    act(() => vi.advanceTimersByTime(1499));
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(1));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    view.rerender(<FeedbackMessage tone="error" messageKey={2}><span>操作失败</span></FeedbackMessage>);
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '关闭提示' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(3000));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    view.rerender(<FeedbackMessage tone="error" messageKey={3}>另一个错误</FeedbackMessage>);
+    view.rerender(<FeedbackMessage tone="error" messageKey={2}>操作失败</FeedbackMessage>);
+    expect(screen.getByRole('alert')).toHaveTextContent('操作失败');
+  });
 });

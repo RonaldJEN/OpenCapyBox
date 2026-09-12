@@ -77,7 +77,7 @@ DATABASE_URL = _settings.database_url
 # 系统事实库只支持 PostgreSQL：非 PG URL 直接 fail-fast，避免误用 SQLite。
 if not DATABASE_URL.startswith(("postgresql", "postgres")):
     raise RuntimeError(
-        f"DATABASE_URL 必须是 PostgreSQL（当前: {DATABASE_URL!r}）。"
+        "DATABASE_URL 必须是 PostgreSQL。"
         "本项目只支持 PostgreSQL 作为事实库。"
     )
 
@@ -87,6 +87,7 @@ if not DATABASE_URL.startswith(("postgresql", "postgres")):
 engine = create_engine(
     DATABASE_URL,
     echo=False,
+    hide_parameters=True,
     pool_size=_settings.database_pool_size,
     max_overflow=_settings.database_max_overflow,
     pool_timeout=_settings.database_pool_timeout_seconds,

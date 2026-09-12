@@ -59,7 +59,6 @@ from src.api.services.history_service import HistoryService
 from src.api.models.database import SessionLocal
 import asyncio
 import json
-import traceback
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
@@ -419,7 +418,6 @@ async def _sse_from_turn_execution(
     """
     settings = get_settings()
     current_run_id = execution.handle.run_id
-    run_completed = False
     iterator = execution.event_source.__aiter__()
     next_event_task = asyncio.create_task(iterator.__anext__())
     heartbeat_task = asyncio.create_task(asyncio.sleep(settings.sse_heartbeat_interval))
@@ -467,20 +465,17 @@ async def _sse_from_turn_execution(
             yield _encode_event(event)
 
             if event_type == EventType.RUN_FINISHED or event_type == EventType.RUN_FINISHED.value:
-                run_completed = True
                 if on_run_finished:
                     async for extra in await on_run_finished(current_run_id):
                         yield extra
                 break
 
             if event_type == EventType.RUN_ERROR or event_type == EventType.RUN_ERROR.value:
-                run_completed = True
                 break
 
             next_event_task = asyncio.create_task(iterator.__anext__())
     except Exception as e:
-        run_completed = True
-        logger.error("orchestrated AG-UI 事件流錯誤: %s\n%s", e, traceback.format_exc())
+        logger.error("orchestrated AG-UI 事件流错误: session=%s run=%s error_type=%s", execution.handle.session_id, current_run_id, type(e).__name__, exc_info=True)
         if isinstance(e, DuplicateRoundError):
             display_msg = e.existing_round_id
             display_code = "ROUND_IN_PROGRESS"
@@ -498,12 +493,6 @@ async def _sse_from_turn_execution(
                 pass
             except Exception:
                 logger.debug("closing orchestrated SSE event iterator raised", exc_info=True)
-        if not run_completed:
-            logger.info(
-                "SSE 連接斷開，orchestrated Agent 繼續後台運行 (session=%s, run=%s)",
-                execution.handle.session_id,
-                current_run_id,
-            )
         try:
             await heartbeat_task
         except asyncio.CancelledError:
@@ -625,7 +614,7 @@ def _resolve_agent_init(init_task: asyncio.Task):
     try:
         return init_task.result()
     except Exception as e:
-        logger.error("Agent 初始化失敗: %s: %s", type(e).__name__, e, exc_info=True)
+        logger.error("Agent 初始化失败: error_type=%s", type(e).__name__, exc_info=True)
         error_msg = f"Agent 初始化失敗: {type(e).__name__}: {str(e)}"
         if "api_key" in str(e).lower() or "apikey" in str(e).lower():
             error_msg += "\n\n💡 提示：請檢查 .env 文件中的 LLM_API_KEY 配置是否正確"
@@ -812,11 +801,6 @@ async def send_message_stream(
             session_id=chat_session_id,
             started_at=run_guard_started_at,
         ):
-            logger.info(
-                "初始化窗口檢測到較新 cancel activity，短路本次請求: user=%s session=%s",
-                user_id,
-                chat_session_id,
-            )
             yield event_encoder.encode(RunErrorEvent(message="Aborted by user", code="USER_ABORT"))
             await _complete_cancel_request_in_new_session(user_id=user_id, session_id=chat_session_id)
             await _release_user_run_lock_in_new_session(
@@ -832,8 +816,6 @@ async def send_message_stream(
         title_run_ready = asyncio.Event()
         try:
             if round_count == 0:
-                print(f"🏷️  檢測到第一條消息，啟動標題生成任務...")
-
                 async def generate_title_async():
                     try:
                         title_source = _extract_text_for_title(turn.content)
@@ -844,7 +826,6 @@ async def send_message_stream(
                                 title_session.title = title
                                 title_session.updated_at = now_naive()
                                 title_db.commit()
-                                print(f"✅ 會話標題已保存: {title}")
                                 await title_run_ready.wait()
                                 if title_run_id:
                                     title_event = CustomEvent(
@@ -868,7 +849,7 @@ async def send_message_stream(
                                         )
                                 return title
                     except Exception as e:
-                        print(f"⚠️  標題生成失敗: {e}")
+                        logger.warning("标题保存失败: session=%s error_type=%s", chat_session_id, type(e).__name__)
                         return None
 
                 title_generation_task = asyncio.create_task(generate_title_async())
@@ -886,7 +867,7 @@ async def send_message_stream(
                                 )
                                 yield event_encoder.encode(title_event)
                         except Exception as e:
-                            print(f"⚠️  等待標題生成失敗: {e}")
+                            logger.warning("等待标题生成失败: session=%s error_type=%s", chat_session_id, type(e).__name__)
                 return _extra()
 
             attachment_progress_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -1090,11 +1071,6 @@ async def resume_interrupt(
                 session_id=chat_session_id,
                 started_at=run_guard_started_at,
             ):
-                logger.info(
-                    "resume 檢測到較新 cancel activity，短路本次請求: user=%s session=%s",
-                    user_id,
-                    chat_session_id,
-                )
                 yield event_encoder.encode(RunErrorEvent(message="Aborted by user", code="USER_ABORT"))
                 await _complete_cancel_request_in_new_session(user_id=user_id, session_id=chat_session_id)
                 return
@@ -1409,11 +1385,6 @@ async def abort_chat(
     agent_service = agent_pool.get(chat_session_id)
     if agent_service and agent_service.cancel_token:
         agent_service.cancel_token.set()
-        logger.info("cancel_token 已設置 (fast-path): session=%s", chat_session_id)
-
-    local_runner = _active_runners.get(chat_session_id)
-    if local_runner and not local_runner.done():
-        logger.info("abort 命中本地 runner，等待其通过 cancel_token/终态检查退出: session=%s", chat_session_id)
 
     # 若有 running round，立即收斂本地状态为 cancelled，避免前端與
     # running-sessions 視圖回跳。终态事务只把 waiting interaction 与

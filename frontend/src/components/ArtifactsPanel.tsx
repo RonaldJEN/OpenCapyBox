@@ -36,6 +36,7 @@ import {
   type SessionFileOwnerIdentity,
 } from './FilePreview';
 import { SessionFilesExpandButton } from './session-files/SessionFilesControls';
+import FeedbackMessage from './FeedbackMessage';
 
 interface ArtifactsPanelProps {
   sessionId: string;
@@ -829,7 +830,17 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
         </div>
       </div>
 
-      {currentDownload && <div className="flex items-center gap-2 border-b border-claude-border px-3 py-2 text-xs text-claude-secondary" role={currentDownload.pending ? 'status' : 'alert'}>{currentDownload.pending && <Loader2 size={13} className="shrink-0 animate-spin" aria-hidden="true" />}<span className="min-w-0 flex-1 break-words">{currentDownload.pending ? `正在打包并下载：${currentDownload.path.split('/').pop() || '会话文件'}` : currentDownload.error}</span>{!currentDownload.pending && <><button type="button" className="shrink-0 rounded px-2 py-1 hover:bg-claude-hover" onClick={() => void handleDirectoryDownload(currentDownload.path)}>重试</button><button type="button" aria-label="关闭下载错误" className="shrink-0 rounded p-1 hover:bg-claude-hover" onClick={clearDirectoryDownload}><X size={13} /></button></>}</div>}
+      {currentDownload && (currentDownload.pending ? (
+        <div className="flex items-center gap-2 border-b border-claude-border px-3 py-2 text-xs text-claude-secondary" role="status">
+          <Loader2 size={13} className="shrink-0 animate-spin" aria-hidden="true" />
+          <span className="min-w-0 flex-1 break-words">正在打包并下载：{currentDownload.path.split('/').pop() || '会话文件'}</span>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 border-b border-claude-border px-3 py-2 text-xs text-claude-error">
+          <FeedbackMessage tone="error" messageKey={currentDownload} closeLabel="关闭下载错误" className="min-w-0 flex-1">{currentDownload.error}</FeedbackMessage>
+          <button type="button" className="shrink-0 rounded px-2 py-1 hover:bg-claude-hover" onClick={() => void handleDirectoryDownload(currentDownload.path)}>重试</button>
+        </div>
+      ))}
       <div
         className={`${activeFile ? 'hidden' : 'flex'} min-h-0 flex-1 flex-col`}
         aria-hidden={Boolean(activeFile)}
@@ -847,7 +858,7 @@ export const ArtifactsPanel = forwardRef<ArtifactsPanelHandle, ArtifactsPanelPro
             ) : loadError ? (
               <div className="flex h-full min-h-[300px] flex-col items-center justify-center text-center">
                 <FolderOpen size={38} className="mb-3 text-claude-border" />
-                <p className="mb-3 text-[13px] text-claude-muted">{loadError}</p>
+                <FeedbackMessage tone="error" className="mb-3 text-[13px] text-claude-error">{loadError}</FeedbackMessage>
                 <button
                   type="button"
                   onClick={() => void loadDir(currentPath)}

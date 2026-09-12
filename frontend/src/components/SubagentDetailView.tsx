@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef } from 'react';
 import { ArrowDown, ArrowLeft, Loader2 } from 'lucide-react';
 import type { FileInfo, SubagentTask } from '../types';
 import { Round } from './Round';
+import FeedbackMessage from './FeedbackMessage';
 import { subagentTitle } from './SubagentTaskGroup';
 import { useSubagentRound } from './useSubagentRound';
 import { useChatReadingPosition } from './useChatReadingPosition';
@@ -34,7 +35,7 @@ export function SubagentDetailView({ sessionId, task, active, onBack, backLabel 
       <div ref={contentRef} className="chat-column py-6" data-round-id={round?.round_id || task.child_run_id}>
         {task.prompt && <details className="chat-subtask-instructions"><summary>任务说明</summary><p>{task.prompt}</p></details>}
         {loading && !round && <div role="status" className="flex items-center gap-2 text-sm text-claude-secondary"><Loader2 size={15} className="animate-spin" aria-hidden="true" />正在载入子任务…</div>}
-        {error && <div role="alert" className="chat-subtask-error"><p>{error}</p><button type="button" onClick={retry}>重新连接</button></div>}
+        {error && <div className="my-3 text-[13px] text-claude-error"><FeedbackMessage tone="error">{error}</FeedbackMessage><button type="button" className="mt-1.5 underline underline-offset-4" onClick={retry}>重新连接</button></div>}
         {visibleRound && <Round round={visibleRound} showUserMessage={false} isStreaming={visibleRound.status === 'running'} disableMotion
           sessionId={sessionId} onInspectProcess={reader.beginReading} onOpenSubtask={openChild} onOpenFileInPanel={onOpenFile} />}
         {!loading && !error && !round && <p className="text-sm text-claude-secondary">{task.error || '子任务正在准备，暂时还没有输出。'}</p>}

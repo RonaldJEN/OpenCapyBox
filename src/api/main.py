@@ -24,10 +24,15 @@ import os
 
 # 配置日志等级（从环境变量 LOG_LEVEL 读取，默认 INFO）
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+application_log_level = getattr(logging, log_level, logging.INFO)
 logging.basicConfig(
-    level=getattr(logging, log_level, logging.INFO),
+    level=application_log_level,
     format="%(levelname)s:     %(name)s - %(message)s",
 )
+# SDK 的正常请求日志会包含 URL 或请求详情，业务排障使用数据库快照。
+for sdk_logger_name in ("httpx", "httpcore", "openai", "anthropic"):
+    logging.getLogger(sdk_logger_name).setLevel(max(logging.WARNING, application_log_level))
+logger = logging.getLogger(__name__)
 
 # 修复 Windows 平台特定问题
 if platform.system() == "Windows":
@@ -341,7 +346,6 @@ async def startup_event():
     """应用启动时执行"""
     # 初始化数据库
     init_db()
-    print(f"✅ 数据库初始化完成")
 
     from src.api.models.database import SessionLocal
     from src.api.services.auth_service import bootstrap_auth_users
@@ -349,7 +353,7 @@ async def startup_event():
     with SessionLocal() as db:
         bootstrapped_users = bootstrap_auth_users(db)
     if bootstrapped_users:
-        print(f"✅ 已从 SIMPLE_AUTH_USERS 初始化 {bootstrapped_users} 个认证用户")
+        logger.info("认证用户初始化完成: count=%d", bootstrapped_users)
 
     try:
         from src.api.services.workspace_service import reconcile_workspace_mutations
@@ -357,9 +361,9 @@ async def startup_event():
         with SessionLocal() as db:
             reconciled_workspace_mutations = await reconcile_workspace_mutations(db)
         if reconciled_workspace_mutations:
-            print(f"⚠️  已收敛 {reconciled_workspace_mutations} 条工作区 prepared mutation")
-    except Exception as e:
-        print(f"⚠️  工作区 mutation 恢复失败，将在首次写入时重试: {e}")
+            logger.warning("启动时收敛工作区 mutation: count=%d", reconciled_workspace_mutations)
+    except Exception:
+        logger.warning("工作区 mutation 恢复失败，将在首次写入时重试", exc_info=True)
 
     # 对账运行状态；新鲜 lease 可能属于其他 worker，绝不能 blanket fail。
     try:
@@ -368,59 +372,50 @@ async def startup_event():
 
         with SessionLocal() as db:
             stale_count, _reserved_count, stale_lock_count, stale_cron_count = cleanup_stale_runtime_state(db)
-            if stale_count:
-                print(f"⚠️  已清理 {stale_count} 个残留的 running 轮次（标记为 failed）")
-            if stale_lock_count:
-                print(f"⚠️  已清理 {stale_lock_count} 条残留的 user_run_locks")
-            if stale_cron_count:
-                print(f"⚠️  已对账 {stale_cron_count} 条 lease 过期的 cron running 记录")
-    except Exception as e:
-        print(f"⚠️  清理残留运行状态失败: {e}")
+            if stale_count or stale_lock_count or stale_cron_count:
+                logger.warning(
+                    "启动时收敛过期运行状态: rounds=%d locks=%d cron_runs=%d",
+                    stale_count, stale_lock_count, stale_cron_count,
+                )
+    except Exception:
+        logger.warning("清理残留运行状态失败", exc_info=True)
 
     # 校驗 Model Registry（啟動時預檢，自動停用 key 缺失的模型）
     try:
         from src.api.model_registry import get_model_registry
         registry = get_model_registry()
-        enabled = registry.list_models(enabled_only=True)
-        print(f"✅ Model Registry 就緒: {len(enabled)} 個可用模型, 默認: {registry.default_model_id}")
-        for m in enabled:
-            print(f"   📦 {m.id} ({m.display_name}) — {m.provider}")
-    except Exception as e:
-        print(f"⚠️  Model Registry 加載失敗: {e}")
-        print(f"   將使用 .env 中的 LLM_API_KEY/LLM_API_BASE/LLM_MODEL 作為 fallback")
-
-    print(f"✅ {settings.app_name} v{settings.app_version} 启动成功")
+        registry.list_models(enabled_only=True)
+    except Exception:
+        logger.warning("Model Registry 加载失败，将使用环境中的模型配置", exc_info=True)
 
     # 启动去中心化 cron worker（每个 worker 独立运行）
     try:
         await start_cron_worker(app)
-        print("✅ Cron worker 已启动（无主去中心化模式）")
-    except Exception as e:
-        print(f"⚠️  Cron worker 启动失败: {e}")
+    except Exception:
+        logger.warning("Cron worker 启动失败", exc_info=True)
 
     try:
         from src.api.services.approval_reconciler import start_approval_reconciler
 
         await start_approval_reconciler(app)
-        print("✅ 工具审批执行 lease reconciler 已启动")
-    except Exception as e:
-        print(f"⚠️  工具审批执行 lease reconciler 启动失败: {e}")
+    except Exception:
+        logger.warning("工具审批执行 lease reconciler 启动失败", exc_info=True)
 
     try:
         from src.api.services.workspace_maintenance import start_workspace_maintenance
 
         await start_workspace_maintenance(app)
-        print("✅ Workspace 内容对象维护任务已启动")
-    except Exception as e:
-        print(f"⚠️  Workspace 内容对象维护任务启动失败: {e}")
+    except Exception:
+        logger.warning("Workspace 内容对象维护任务启动失败", exc_info=True)
 
     try:
         from src.api.services.sandbox_cleanup_service import start_sandbox_cleanup_worker
 
         await start_sandbox_cleanup_worker(app)
-        print("✅ Sandbox 持久清理任务已启动")
-    except Exception as e:
-        print(f"⚠️  Sandbox 持久清理任务启动失败: {e}")
+    except Exception:
+        logger.warning("Sandbox 持久清理任务启动失败", exc_info=True)
+
+    logger.info("应用启动完成: app=%s version=%s", settings.app_name, settings.app_version)
 
 
 @app.on_event("shutdown")
@@ -430,32 +425,31 @@ async def shutdown_event():
         from src.api.services.sandbox_cleanup_service import stop_sandbox_cleanup_worker
 
         await stop_sandbox_cleanup_worker(app)
-    except Exception as e:
-        print(f"⚠️  Sandbox 持久清理任务关闭失败: {e}")
+    except Exception:
+        logger.warning("Sandbox 持久清理任务关闭失败", exc_info=True)
 
     try:
         from src.api.services.workspace_maintenance import stop_workspace_maintenance
 
         await stop_workspace_maintenance(app)
-        print("✅ Workspace 内容对象维护任务已关闭")
-    except Exception as e:
-        print(f"⚠️  Workspace 内容对象维护任务关闭失败: {e}")
+    except Exception:
+        logger.warning("Workspace 内容对象维护任务关闭失败", exc_info=True)
 
     try:
         from src.api.services.approval_reconciler import stop_approval_reconciler
 
         await stop_approval_reconciler(app)
-        print("✅ 工具审批执行 lease reconciler 已关闭")
-    except Exception as e:
-        print(f"⚠️  工具审批执行 lease reconciler 关闭失败: {e}")
+    except Exception:
+        logger.warning("工具审批执行 lease reconciler 关闭失败", exc_info=True)
 
     try:
         from src.api.services.cron_worker import stop_cron_worker
 
         await stop_cron_worker(app)
-        print("✅ Cron worker 已关闭")
-    except Exception as e:
-        print(f"⚠️  Cron worker 关闭失败: {e}")
+    except Exception:
+        logger.warning("Cron worker 关闭失败", exc_info=True)
+
+    logger.info("应用关闭完成: app=%s", settings.app_name)
 
 
 # 路由

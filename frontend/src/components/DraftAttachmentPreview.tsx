@@ -3,6 +3,7 @@ import { Download, FileText, X } from 'lucide-react';
 import type { ComposerAttachment } from '../types';
 import { isImageFile } from '../utils/fileUtils';
 import { PlainTextPreview } from './file-preview/PlainTextPreview';
+import FeedbackMessage from './FeedbackMessage';
 
 interface DraftAttachmentPreviewProps {
   file: ComposerAttachment | null;
@@ -147,7 +148,7 @@ export function DraftAttachmentPreview({ file, onClose }: DraftAttachmentPreview
               <p className="text-xs">可下载后使用对应应用打开。</p>
             </div>
           )}
-          {textError && <p className="text-sm text-claude-error">无法读取此文本文件。</p>}
+          {textError && <FeedbackMessage tone="error" messageKey={file} className="text-sm text-claude-error">无法读取此文本文件。</FeedbackMessage>}
         </div>
       </section>
     </div>

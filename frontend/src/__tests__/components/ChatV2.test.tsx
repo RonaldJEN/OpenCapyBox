@@ -408,14 +408,17 @@ describe('ChatV2 组件', () => {
     expect(screen.getByPlaceholderText('输入你的问题，按 Enter 开始对话...')).toBeInTheDocument();
   });
 
-  it('工作区文件多选去重并以 workspace identity 发送，不上传或编码 Data URL', async () => {
+  it.each([
+    ['日报.md', 'text/markdown'],
+    ['图表.png', 'image/png'],
+  ])('工作区文件 %s 多选去重并以 workspace identity 发送，不受模型图片输入限制', async (name, mimeType) => {
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       rounds: [], session_id: 'test-session', total: 0,
     });
     vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
     const workspaceEntry = {
-      entry_id: 'entry-report', parent_id: null, name: '日报.md', kind: 'file', path: '研究/日报.md',
-      size_bytes: 88, mime_type: 'text/markdown', sha256: 'hash', revision: 5,
+      entry_id: 'entry-report', parent_id: null, name, kind: 'file', path: `研究/${name}`,
+      size_bytes: 88, mime_type: mimeType, sha256: 'hash', revision: 5,
       current_version_id: 'version-5', status: 'active',
       created_at: '2026-08-26T00:00:00Z', updated_at: '2026-08-26T00:00:00Z',
     };
@@ -434,12 +437,12 @@ describe('ChatV2 组件', () => {
       fireEvent.keyDown(screen.getByRole('menu', { name: '添加内容' }), { key: 'ArrowDown' });
       expect(screen.getByRole('menuitem', { name: '上传文件' })).toHaveFocus();
       fireEvent.click(screen.getByRole('menuitem', { name: '工作区文件' }));
-      fireEvent.click(await screen.findByRole('button', { name: '日报.md' }));
+      fireEvent.click(await screen.findByRole('button', { name }));
       fireEvent.click(screen.getByRole('button', { name: '添加到对话' }));
     };
     await selectWorkspaceFile();
     await selectWorkspaceFile();
-    expect(screen.getAllByRole('button', { name: '移除 日报.md' })).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: `移除 ${name}` })).toHaveLength(1);
 
     const textarea = screen.getByPlaceholderText('输入指令...');
     fireEvent.change(textarea, { target: { value: '分析日报' } });
@@ -452,8 +455,8 @@ describe('ChatV2 组件', () => {
       file: {
         source: 'workspace',
         entry_id: 'entry-report',
-        name: '日报.md',
-        mime_type: 'text/markdown',
+        name,
+        mime_type: mimeType,
         size: 88,
       },
     });
@@ -1492,6 +1495,28 @@ describe('ChatV2 组件', () => {
     });
   });
 
+  it('再次触发相同正文校验错误时重新计时，保留未受理正文', () => {
+    vi.useFakeTimers();
+    const { unmount } = render(<ChatV2 sessionId="" {...defaultProps} />);
+    const input = screen.getByRole('textbox');
+    const text = '字'.repeat(30001);
+    try {
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.keyDown(input, { key: 'Enter' });
+      act(() => vi.advanceTimersByTime(2500));
+      fireEvent.keyDown(input, { key: 'Enter' });
+      act(() => vi.advanceTimersByTime(500));
+      expect(screen.getByRole('alert')).toHaveTextContent('消息太长');
+      act(() => vi.advanceTimersByTime(2500));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(input).toHaveValue(text);
+      expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
   it.each([30000, 30001])('输入 %i 个 Unicode 码点时按三万上限发送或保留草稿', async (length) => {
     vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
       rounds: [],
@@ -1530,6 +1555,222 @@ describe('ChatV2 组件', () => {
       expect(screen.getByText(/消息太长（30001 字）/)).toBeInTheDocument();
       expect(screen.getByText(/当前最多支持 30000 字/)).toBeInTheDocument();
     }
+  });
+
+  describe('对话图片附件与模型能力', () => {
+    it('拒绝图片的提示 3 秒消失，再次添加相同图片时重新显示并可手动关闭', () => {
+      vi.useFakeTimers();
+      const { container, unmount } = render(<ChatV2 sessionId="" {...defaultProps} />);
+      const file = new File(['image'], 'blocked.png', { type: 'image/png' });
+      const input = container.querySelector('input[type="file"]')!;
+      try {
+        fireEvent.change(input, { target: { files: [file] } });
+        expect(screen.getByRole('alert')).toHaveTextContent('当前模型不支持图片输入');
+        act(() => vi.advanceTimersByTime(3000));
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        fireEvent.change(input, { target: { files: [file] } });
+        expect(screen.getByRole('alert')).toHaveTextContent('当前模型不支持图片输入');
+        fireEvent.click(screen.getByRole('button', { name: '关闭提示' }));
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(apiService.uploadDraftAttachment).not.toHaveBeenCalled();
+        expect(URL.createObjectURL).not.toHaveBeenCalled();
+      } finally {
+        unmount();
+        vi.useRealTimers();
+      }
+    });
+
+    const visionModel = {
+      ...defaultProps.availableModels[0],
+      id: 'vision-model', name: 'Vision Model', supports_image: true, max_images: 1,
+    };
+    const chooseModel = async (name: string) => {
+      fireEvent.click(screen.getByRole('button', { name: /选择模型，当前/ }));
+      fireEvent.click(await screen.findByRole('menuitem', { name: /^模型/ }));
+      fireEvent.click(await screen.findByRole('option', { name: new RegExp(name) }));
+    };
+
+    it.each(['选择文件', '粘贴图片', '输入框拖拽', '页面拖拽'])(
+      '不支持图片模型通过%s添加图片时，先拦截再创建预览和上传', async (entry) => {
+        const { container } = render(<ChatV2 sessionId="" {...defaultProps} />);
+        const file = new File(['image'], 'blocked.png', { type: 'image/png' });
+        const textarea = screen.getByRole('textbox');
+
+        if (entry === '选择文件') {
+          fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files: [file] } });
+        } else if (entry === '粘贴图片') {
+          fireEvent.paste(textarea, {
+            clipboardData: { items: [{ kind: 'file', getAsFile: () => file }] },
+          });
+        } else {
+          fireEvent.drop(entry === '页面拖拽' ? screen.getByTestId('chat-pane') : textarea, {
+            dataTransfer: { files: [file], types: ['Files'] },
+          });
+        }
+
+        expect(await screen.findByText('当前模型不支持图片输入，请切换至支持图片的模型后再上传。')).toBeInTheDocument();
+        expect(apiService.uploadDraftAttachment).not.toHaveBeenCalled();
+        expect(URL.createObjectURL).not.toHaveBeenCalled();
+        expect(screen.queryByRole('button', { name: '移除 blocked.png' })).not.toBeInTheDocument();
+        expect(screen.queryByText('已就绪')).not.toBeInTheDocument();
+        expect(defaultProps.onCreateSession).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['不支持图片', '超出图片上限'])(
+      '%s时整批拒绝新增图片，同时允许同批普通文件上传', async (reason) => {
+        const model = reason === '不支持图片' ? defaultProps.availableModels[0] : visionModel;
+        const { container } = render(
+          <ChatV2 sessionId="" {...defaultProps} catalogDefaultModelId={model.id} availableModels={[model]} />,
+        );
+        const document = new File(['report'], 'report.txt', { type: 'text/plain' });
+        fireEvent.change(container.querySelector('input[type="file"]')!, {
+          target: { files: [
+            new File(['one'], 'first.png', { type: 'image/png' }),
+            document,
+            new File(['two'], 'second.png', { type: 'image/png' }),
+          ] },
+        });
+
+        await screen.findByText('已就绪');
+        expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(apiService.uploadDraftAttachment).mock.calls[0][2]).toBe(document);
+        expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
+        expect(URL.createObjectURL).toHaveBeenCalledWith(document);
+        expect(screen.queryByText('first.png')).not.toBeInTheDocument();
+        expect(screen.queryByText('second.png')).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: '移除 report.txt' })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
+      },
+    );
+
+    it('上传中的图片占用当前模型图片额度，拒绝追加图片且保留原上传', async () => {
+      vi.mocked(apiService.uploadDraftAttachment).mockImplementation(() => new Promise(() => {}));
+      const { container } = render(
+        <ChatV2 sessionId="" {...defaultProps} catalogDefaultModelId={visionModel.id} availableModels={[visionModel]} />,
+      );
+      const fileInput = container.querySelector('input[type="file"]')!;
+      fireEvent.change(fileInput, { target: { files: [new File(['one'], 'pending.png', { type: 'image/png' })] } });
+      fireEvent.change(fileInput, { target: { files: [new File(['two'], 'extra.png', { type: 'image/png' })] } });
+
+      await waitFor(() => expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(1));
+      expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('button', { name: '移除 pending.png' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '移除 extra.png' })).not.toBeInTheDocument();
+      expect(screen.getByRole('alert')).toHaveTextContent('当前模型最多支持 1 张图片');
+      fireEvent.click(screen.getByRole('button', { name: '移除 pending.png' }));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('模型切换暂停尚未开始的图片上传，切回后原附件队列自动继续', async () => {
+      const completeUploads: Array<() => void> = [];
+      vi.mocked(apiService.uploadDraftAttachment).mockImplementation((draftId, attachmentId, file, _signal, onProgress) => {
+        onProgress?.(50);
+        return new Promise((resolve) => {
+          completeUploads.push(() => resolve({
+            draft_id: draftId, attachment_id: attachmentId, name: file.name,
+            size: file.size, type: file.type, sha256: 'sha', status: 'ready',
+          }));
+        });
+      });
+      const { container } = render(
+        <ChatV2 sessionId="" {...defaultProps} catalogDefaultModelId={visionModel.id}
+          availableModels={[{ ...visionModel, max_images: 4 }, defaultProps.availableModels[0]]} />,
+      );
+      const files = Array.from({ length: 4 }, (_, index) => new File(['image'], `image-${index}.png`, { type: 'image/png' }));
+      fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files } });
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(3);
+      expect(screen.getByText('等待上传')).toBeInTheDocument();
+      const queuedPreview = screen.getByAltText(files[3].name);
+      const queuedPreviewUrl = queuedPreview.getAttribute('src');
+
+      await chooseModel('Test Model');
+      await act(async () => completeUploads.slice(0, 3).forEach((complete) => complete()));
+      await waitFor(() => expect(screen.queryAllByRole('progressbar')).toHaveLength(0));
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(3);
+      expect(screen.getAllByText('不兼容')).toHaveLength(4);
+      expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+
+      await chooseModel('Vision Model');
+      await waitFor(() => expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(4));
+      expect(vi.mocked(apiService.uploadDraftAttachment).mock.calls[3][2]).toBe(files[3]);
+      expect(screen.getByAltText(files[3].name)).toBe(queuedPreview);
+      expect(queuedPreview).toHaveAttribute('src', queuedPreviewUrl);
+      expect(URL.createObjectURL).toHaveBeenCalledTimes(4);
+      expect(apiService.removeDraftAttachment).not.toHaveBeenCalled();
+      await act(async () => completeUploads[3]());
+      await waitFor(() => expect(screen.getAllByText('已就绪')).toHaveLength(4));
+      expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
+    });
+
+    it('已就绪图片切到不支持模型时保留并阻止提交，切回后无需重传即可发送', async () => {
+      const onCreateSession = vi.fn().mockResolvedValue('image-session');
+      vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+      vi.mocked(apiService.claimDraftAttachments).mockImplementation(async (_session, _draft, ids) => ids.map((id) => ({
+        attachment_id: id, composer_draft_attachment_id: id, name: 'retained.png',
+        path: `attachments/${id}/retained.png`, size: 5, type: 'image/png', modified: '',
+      })));
+      const { container } = render(
+        <ChatV2 sessionId="" {...defaultProps} onCreateSession={onCreateSession}
+          catalogDefaultModelId={visionModel.id} availableModels={[visionModel, defaultProps.availableModels[0]]} />,
+      );
+      fireEvent.change(container.querySelector('input[type="file"]')!, {
+        target: { files: [new File(['image'], 'retained.png', { type: 'image/png' })] },
+      });
+      await screen.findByText('已就绪');
+      const previewUrl = screen.getByAltText('retained.png').getAttribute('src');
+      fireEvent.change(screen.getByRole('textbox'), { target: { value: '看看这张图' } });
+
+      await chooseModel('Test Model');
+      expect(screen.getByText('不兼容')).toBeInTheDocument();
+      expect(screen.queryByText('已就绪')).not.toBeInTheDocument();
+      expect(screen.getByText('当前模型不支持图片输入，请切换至支持图片的模型或移除图片。')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+      fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+      expect(onCreateSession).not.toHaveBeenCalled();
+      expect(apiService.claimDraftAttachments).not.toHaveBeenCalled();
+      expect(apiService.sendMessageStreamV2).not.toHaveBeenCalled();
+      expect(screen.getByRole('textbox')).toHaveValue('看看这张图');
+      expect(screen.getByAltText('retained.png')).toHaveAttribute('src', previewUrl);
+      expect(apiService.removeDraftAttachment).not.toHaveBeenCalled();
+
+      await chooseModel('Vision Model');
+      expect(screen.getByText('已就绪')).toBeInTheDocument();
+      expect(screen.queryByText('不兼容')).not.toBeInTheDocument();
+      expect(screen.queryByText('当前模型不支持图片输入，请切换至支持图片的模型或移除图片。')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(1);
+      expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+      fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+      await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(apiService.sendMessageStreamV2).mock.calls[0][1]).toContainEqual(expect.objectContaining({
+        type: 'image_url', image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) },
+      }));
+    });
+
+    it('上传失败图片切到不支持模型后不能重试，切回后可重试原附件', async () => {
+      vi.mocked(apiService.uploadDraftAttachment).mockRejectedValueOnce(new Error('network unavailable'));
+      const { container } = render(
+        <ChatV2 sessionId="" {...defaultProps} catalogDefaultModelId={visionModel.id}
+          availableModels={[visionModel, defaultProps.availableModels[0]]} />,
+      );
+      fireEvent.change(container.querySelector('input[type="file"]')!, {
+        target: { files: [new File(['image'], 'retry.png', { type: 'image/png' })] },
+      });
+      await screen.findByText('上传失败');
+      await chooseModel('Test Model');
+      expect(screen.getByRole('button', { name: '重试' })).toBeDisabled();
+      fireEvent.click(screen.getByRole('button', { name: '重试' }));
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(1);
+
+      await chooseModel('Vision Model');
+      fireEvent.click(screen.getByRole('button', { name: '重试' }));
+      await screen.findByText('已就绪');
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(2);
+      const uploads = vi.mocked(apiService.uploadDraftAttachment).mock.calls;
+      expect(uploads[1].slice(0, 3)).toEqual(uploads[0].slice(0, 3));
+      expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('上传目标状态无法确认时应显示避免覆盖的明确提示', async () => {

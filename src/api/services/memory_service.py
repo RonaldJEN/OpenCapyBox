@@ -243,9 +243,7 @@ class MemoryService:
 
             self.upsert_memory_file(user_id, file_type, content)
             count += 1
-            logger.info("已为新用户写入默认模板: user=%s, file=%s", user_id, template_name)
 
-        logger.info("新用户默认文件初始化完成: user=%s, count=%d", user_id, count)
         return count
 
     def get_agents_template_content(self) -> str:
@@ -718,10 +716,6 @@ class MemoryService:
                         # 沙箱有实质内容 → 保留沙箱版本并回写 DB
                         if sandbox_content != db_content:
                             self.upsert_memory_file(user_id, file_type, sandbox_content)
-                            logger.info(
-                                "沙箱优先：%s 已从沙箱回写 DB (%d chars)",
-                                filename, len(sandbox_content),
-                            )
                         continue
 
                 # force 模式 或 沙箱无内容：DB → 沙箱推送
@@ -878,8 +872,4 @@ class MemoryService:
             self.db.add(record)
 
         self.db.commit()
-        logger.info(
-            "对话内容已索引: user=%s, session=%s, round=%s, chunks=%d",
-            user_id, session_id, round_id, len(chunks),
-        )
         return len(chunks)

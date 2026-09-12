@@ -233,7 +233,6 @@ class AguiEventBus:
             if self._is_round_terminal(db, run_id):
                 db.rollback()
                 self._terminal_runs.add(run_id)
-                logger.info("Run %s 已终态，丢弃迟到事件: %s", run_id, event_type)
                 raise RoundTerminalWriteSuppressed(run_id)
 
             enum_type = self._event_type_to_enum(event_type)
@@ -257,10 +256,6 @@ class AguiEventBus:
                             in Round.SUBSCRIBE_TERMINAL_STATUSES
                         ):
                             self._terminal_runs.add(run_id)
-                            logger.info(
-                                "Run %s reached terminal state before ephemeral fanout; dropping",
-                                run_id,
-                            )
                             db.rollback()
                             raise RoundTerminalWriteSuppressed(run_id)
                     # Fanout while the Round lock is held. A concurrent abort
@@ -540,10 +535,6 @@ class AguiEventBus:
                         in Round.SUBSCRIBE_TERMINAL_STATUSES
                     ):
                         self._terminal_runs.add(run_id)
-                        logger.info(
-                            "Run %s reached terminal state before durable event lock; dropping",
-                            run_id,
-                        )
                         raise RoundTerminalWriteSuppressed(run_id)
                     if continuation_fence is not None:
                         AgentInteractionService.fence_continuation_write(

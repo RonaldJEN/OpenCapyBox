@@ -400,7 +400,10 @@ type WorkspaceFile = {
 
 **图片约束**:
 
-- 模型必须支持图片（`supports_image=true`），否则拒绝
+- 约束对象是作为视觉输入提交的 `image_url` block。模型必须支持图片（`supports_image=true`），否则拒绝；带 `composer_draft_attachment_id` 的草稿图片沿用同一校验，不因文件已上传或 claim 成功而视为模型可用。
+- Composer 的文件选择、图片粘贴、拖拽添加必须按当前模型统一校验，在发起临时上传前拦截不支持的图片，不创建“已就绪”附件；提示“当前模型不支持图片输入，请切换至支持图片的模型后再上传。”
+- 已有图片后切换模型时保留附件，按新模型实时显示“不兼容”并禁用发送，提示切换模型或移除图片；切回支持的模型后恢复兼容状态。发送前再次按本次模型快照校验，不能只依赖添加时的判断。
+- 后端在创建 Round、写入本轮 Agent 上下文及冻结 Workspace 文件前校验本次视觉输入；前端拦截不替代此校验。Workspace 单独上传图片，以及通过 `file` block 提供给工具处理的图片文件，遵守普通文件契约，不因模型缺少图片输入能力而拒绝。
 - 单张图片大小上限：20MB
 - 总图片大小上限：50MB
 - 单次消息图片数量上限：由模型配置 `max_images` 决定
@@ -1384,17 +1387,22 @@ GET /subscribe?last_sequence={last_seq}
 
 ### 日志事件
 
-| 日志事件         | 级别    | 包含信息                                                       | 触发时机           |
-| ---------------- | ------- | -------------------------------------------------------------- | ------------------ |
-| Agent 执行开始   | INFO    | `session_id`, `round_id`, `user_id`, 模型名称            | Round 创建时       |
-| Agent 执行结束   | INFO    | `session_id`, `round_id`, `status`, `step_count`, 耗时 | Round 到达终态时   |
-| 上下文压缩触发   | INFO    | 压缩级别, 压缩前/后 Token 数                                   | 每次压缩执行时     |
-| LLM 重试         | WARNING | 模型名称, 错误信息, 重试次数, 延迟时间                         | 每次重试时         |
-| LLM Failover     | WARNING | Primary 模型, Fallback 模型, 原始错误                          | 切换 Fallback 时   |
-| 取消请求状态变化 | INFO    | `session_id`, `request_id`, 新状态                         | 每次状态流转时     |
-| 工具执行耗时     | DEBUG   | 工具名称,`session_id`, 耗时                                  | 每次工具执行完成时 |
-| 心跳发送         | DEBUG   | `session_id`, `round_id`                                   | 每次心跳时         |
-| Worker 死亡检测  | WARNING | `user_id`, `session_id`, 锁龄                              | abort 检测到死锁时 |
+业务排障以 PostgreSQL 为来源：`llm_call_records` 保存实际模型请求、回答、Thinking、调用错误和用量/延迟；`agui_events` 保存工具交互；`rounds`、`context_checkpoints` 保存运行终态与压缩信息。
+
+- 移除旧 `AgentLogger` 及 `~/.OpenCapyBox/log/agent_run_*.log` 写入，不再向控制台复制对话、Thinking、工具参数、工具结果或每步装饰输出。
+- 正常初始化、标题生成/保存、历史重建、checkpoint 命中/保存、幂等命中、正常取消与迟到事件丢弃不再逐项记录日志。
+- 工具结果在事件及模型历史中沿用既有截断规则；不另存截断前原文。取消或进程退出发生在调用快照提交前时，也不额外保存请求全文文件。
+- 解析失败等日志不附原始 JSON、事件 preview、Shell 命令或完整响应对象；业务错误内容仍按原有授权链路返回模型并持久化。
+- 数据库引擎隐藏 SQL 参数，HTTP/模型 SDK logger 最低为 WARNING，避免正常请求 URL 和 SDK DEBUG 请求详情进入应用日志；必要故障堆栈继续保留。
+
+| 日志事件 | 级别 | 保留信息 |
+| --- | --- | --- |
+| 应用启动/关闭 | INFO | 应用名称、版本等生命周期摘要 |
+| LLM 重试/Failover | WARNING | 模型、错误类型、次数、延迟或目标模型 |
+| Agent 未捕获异常 | ERROR | `thread_id`、`run_id`、错误类型及故障堆栈 |
+| 快照、消息、终态或审计写入失败 | WARNING/ERROR | 关联 ID、失败阶段及必要故障堆栈 |
+| 执行权丢失、审批执行结果未知 | WARNING/ERROR | 运行/审批 ID、执行状态与错误类型 |
+| 启动恢复或物理回收异常 | WARNING/ERROR | 关联 ID、阶段、处理数量及故障原因 |
 
 ---
 
