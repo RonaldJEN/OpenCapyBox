@@ -937,23 +937,23 @@ async def update_session_title(
     db: DBSession = Depends(get_db),
 ):
     """更新会话标题"""
-    # 验证会话属于该用户
-    session = (
+    session_query = (
         db.query(Session)
         .filter(Session.id == chat_session_id, Session.user_id == user_id)
-        .first()
     )
-
-    if not session:
+    updated = session_query.update(
+        {
+            Session.title: request.title,
+            Session.title_is_manual: True,
+            Session.updated_at: Session.updated_at,
+        },
+        synchronize_session=False,
+    )
+    if not updated:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    # 更新标题
-    session.title = request.title
-    session.updated_at = now_naive()
     db.commit()
-    db.refresh(session)
-
-    return session
+    return session_query.one()
 
 
 @router.delete("/{chat_session_id}")

@@ -32,6 +32,7 @@
 | id | String(36) | PK |
 | user_id | String(100) | NOT NULL, indexed |
 | title | String(255) | nullable |
+| title_is_manual | Boolean | NOT NULL, default=false；手动重命名后为 true，阻止自动标题覆盖，不作为客户端响应字段 |
 | status | String(20) | default="active", indexed。取值：active / paused / completed |
 | model_id | String(50) | nullable, indexed |
 | created_at | DateTime | default=now, indexed |
@@ -174,10 +175,13 @@ history 读取前会处理过期 continuation claim：仅 `continuation_started_
 
 ### PATCH /api/sessions/{id}/title
 
-- Body: `{title: str}`（1-255 字符）
+- Body: `{title: str}`（去除首尾空白后 1-255 字符；空白标题和超长标题返回 422）
 - Response 200: SessionResponse
 - Error 404
-- 注意：前端目前不使用此端点，标题由后端通过 CUSTOM SSE 事件自动生成
+- 仅允许更新当前用户的会话；不存在或不属于当前用户统一返回 404。
+- 成功时在同一事务更新 `title`、`title_is_manual=true`，保留数据库当前 `updated_at`，返回持久化后的会话。标题更新不算会话活动，不改变列表时间、排序、会话身份、历史或当前运行，可用于正在生成首轮回复的会话；不得用请求读取的旧时间覆盖并发聊天更新后的时间。
+- 手动标题优先：首轮自动生成尚未开始时跳过；已开始时只能在 `title_is_manual=false` 的条件更新成功后落库并发送 `CUSTOM title_updated`。名称是否与默认标题相同不影响手动归属。
+- 新部署通过既有启动增列迁移添加 `title_is_manual BOOLEAN NOT NULL DEFAULT FALSE`；保留存量标题值。
 
 ### DELETE /api/sessions/{id}
 

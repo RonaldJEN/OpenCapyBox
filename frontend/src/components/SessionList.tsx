@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiService } from '../services/api';
 import type { Session } from '../types';
-import { Blocks, Database, ChevronDown, MessageSquare, Trash2, LogOut, Loader2, PenSquare, Plus, Settings, Clock, Search, ShieldCheck, X } from 'lucide-react';
+import { Blocks, Database, ChevronDown, MessageSquare, Trash2, LogOut, Loader2, Pencil, PenSquare, Plus, Settings, Clock, Search, ShieldCheck, X } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
 import { ConfirmDialog } from './ConfirmDialog';
+import { SessionRenameForm } from './SessionRenameForm';
 import FeedbackMessage from './FeedbackMessage';
 import { WorkspaceSidebarContent } from './workspace/WorkspaceSidebarContent';
 import type { WorkspaceEntry } from '../types/workspace';
@@ -53,6 +54,8 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
   const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
   const [deletePending, setDeletePending] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [renameTarget, setRenameTarget] = useState<Session | null>(null);
+  const restoreRenameFocusRef = useRef<string | null>(null);
   const searchRequestSeqRef = useRef(0);
   const debouncedSearchQueryRef = useRef('');
   const allSessionsRef = useRef<Session[]>([]);
@@ -141,6 +144,13 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
 
     newChatButtonRef.current?.focus();
   }, [deleteTarget, sessions]);
+
+  useEffect(() => {
+    if (renameTarget || !restoreRenameFocusRef.current) return;
+    const target = sessionItemRefs.current.get(restoreRenameFocusRef.current) ?? searchInputRef.current;
+    target?.focus();
+    restoreRenameFocusRef.current = null;
+  }, [renameTarget, sessions]);
 
   const loadSessions = async (query = debouncedSearchQueryRef.current) => {
     const requestSeq = ++searchRequestSeqRef.current;
@@ -239,6 +249,23 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     if (deletingCurrentSession) {
       onSessionSelect('');
     }
+    void loadSessions();
+  };
+
+  const finishRenaming = (sessionId: string) => {
+    restoreRenameFocusRef.current = sessionId;
+    setRenameTarget(null);
+  };
+
+  const handleSessionRenamed = (updatedSession: Session) => {
+    // 已提交的新名称同时更新搜索清空缓存，并使提交前发起的列表请求失效。
+    searchRequestSeqRef.current += 1;
+    const replaceSession = (session: Session) => session.id === updatedSession.id
+      ? { ...session, ...updatedSession }
+      : session;
+    allSessionsRef.current = allSessionsRef.current.map(replaceSession);
+    setSessions((currentSessions) => currentSessions.map(replaceSession));
+    finishRenaming(updatedSession.id);
     void loadSessions();
   };
 
@@ -510,7 +537,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
                 onClick={() => selectSession(session)}
                 className="absolute inset-0 z-0 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/30"
               />
-              <div className="pointer-events-none relative z-[1] flex h-full min-w-0 flex-col justify-center pr-6">
+              <div className="pointer-events-none relative z-[1] flex h-full min-w-0 flex-col justify-center pr-14">
                 <div className="flex min-w-0 items-center">
                 <span className={`min-w-0 flex-1 truncate font-sans text-[13px] font-medium leading-5 ${
                   currentSessionId === session.id ? 'font-semibold' : ''
@@ -545,6 +572,13 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
               </div>
 
                 {/* 桌面端悬停显示，移动端始终可见。 */}
+                <button
+                  type="button"
+                  aria-label={`重命名会话 ${session.title || session.id.slice(0, 8)}`}
+                  title={`重命名会话 ${session.title || session.id.slice(0, 8)}`}
+                  onClick={() => setRenameTarget(session)}
+                  className="pointer-events-auto absolute right-9 top-1/2 z-10 inline-flex h-7 w-7 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md text-claude-muted opacity-100 transition-[background-color,color,opacity] hover:bg-claude-hover hover:text-claude-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/35 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100"
+                ><Pencil size={12} /></button>
                 <button
                   ref={(element) => {
                     if (element) deleteButtonRefs.current.set(session.id, element);
@@ -623,6 +657,14 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
           </>
         )}
       </div>
+
+      {renameTarget && (
+        <SessionRenameForm
+          session={renameTarget}
+          onSaved={handleSessionRenamed}
+          onCancel={() => finishRenaming(renameTarget.id)}
+        />
+      )}
 
       {deleteTarget && (
         <ConfirmDialog

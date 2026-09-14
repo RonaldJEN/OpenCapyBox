@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import userEvent from '@testing-library/user-event';
 import { render, screen, fireEvent, waitFor, act, within } from '../utils/test-utils';
 import { SessionList } from '../../components/SessionList';
 import { apiService } from '../../services/api';
@@ -10,6 +11,7 @@ const workspaceClient = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), put: vi
 vi.mock('../../services/api', () => ({
   apiService: {
     getSessions: vi.fn(),
+    renameSession: vi.fn(),
     deleteSession: vi.fn(),
     logout: vi.fn(),
     getUserId: vi.fn(() => 'mock-session'),
@@ -532,6 +534,153 @@ describe('SessionList 組件', () => {
 
     expect(screen.getByText('新结果')).toBeInTheDocument();
     expect(screen.queryByText('旧结果')).not.toBeInTheDocument();
+  });
+
+  it('Enter 重命名保留时间和顺序且不切换会话，成功立即投影并拒绝保存前的迟到列表', async () => {
+    const user = userEvent.setup();
+    const onSessionSelect = vi.fn();
+    const renamedSession = { ...mockSessions[0], title: '项目周报' };
+    let resolveRename!: (session: typeof renamedSession) => void;
+    let resolveOldList!: (value: { sessions: typeof mockSessions }) => void;
+    vi.mocked(apiService.getSessions)
+      .mockResolvedValueOnce({ sessions: mockSessions })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOldList = resolve; }))
+      .mockImplementation(() => new Promise(() => {}));
+    vi.mocked(apiService.renameSession).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveRename = resolve; }),
+    );
+    const { rerender } = render(
+      <SessionList currentSessionId="session-2" refreshTrigger={0} onSessionSelect={onSessionSelect} />,
+    );
+
+    const renameButton = await screen.findByRole('button', { name: '重命名会话 測試會話 1' });
+    const originalRecency = screen.getByTestId('session-row-session-1').querySelector('p')!.textContent;
+    fireEvent.click(renameButton);
+    const input = screen.getByRole('textbox', { name: '会话名称' }) as HTMLInputElement;
+    expect(input).toHaveFocus();
+    expect(input.value.substring(input.selectionStart!, input.selectionEnd!)).toBe(mockSessions[0].title);
+    fireEvent.change(input, { target: { value: '  项目周报  ' } });
+
+    rerender(<SessionList currentSessionId="session-2" refreshTrigger={1} onSessionSelect={onSessionSelect} />);
+    await waitFor(() => expect(apiService.getSessions).toHaveBeenCalledTimes(2));
+    await act(async () => user.keyboard('{Enter}'));
+    expect(apiService.renameSession).toHaveBeenCalledWith('session-1', '项目周报');
+    expect(input).toHaveAttribute('readonly');
+    expect(screen.getByRole('button', { name: '保存名称' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '取消重命名' })).toBeDisabled();
+    fireEvent.submit(screen.getByRole('form', { name: '重命名会话' }));
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(apiService.renameSession).toHaveBeenCalledTimes(1);
+    expect(input).toBeInTheDocument();
+
+    await act(async () => resolveRename(renamedSession));
+    expect(screen.queryByRole('textbox', { name: '会话名称' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '打开会话 项目周报' })).toHaveFocus();
+    expect(apiService.getSessions).toHaveBeenCalledTimes(3);
+    await act(async () => resolveOldList({ sessions: mockSessions }));
+    expect(screen.getByText('项目周报')).toBeInTheDocument();
+    expect(screen.getByTestId('session-row-session-1').querySelector('p')!.textContent).toBe(originalRecency);
+    expect(screen.getAllByRole('button', { name: /^打开会话 / }).map((button) => button.getAttribute('aria-label')))
+      .toEqual(['打开会话 项目周报', '打开会话 測試會話 2']);
+    expect(screen.queryByText('測試會話 1')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '打开会话 測試會話 2' })).toHaveAttribute('aria-current', 'page');
+    expect(onSessionSelect).not.toHaveBeenCalled();
+  });
+
+  it('中文输入法选词时 Enter 不提交重命名', async () => {
+    render(<SessionList onSessionSelect={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: '重命名会话 測試會話 1' }));
+    const input = screen.getByRole('textbox', { name: '会话名称' });
+    fireEvent.change(input, { target: { value: '未完成的输入' } });
+    fireEvent.compositionStart(input);
+    expect(fireEvent.keyDown(input, { key: 'Enter', isComposing: true, keyCode: 229 })).toBe(false);
+    expect(apiService.renameSession).not.toHaveBeenCalled();
+  });
+
+  it('重命名失败保留弹窗及名称草稿，允许重试成功', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const renamedSession = { ...mockSessions[0], title: '季度复盘' };
+    vi.mocked(apiService.getSessions)
+      .mockResolvedValueOnce({ sessions: mockSessions })
+      .mockImplementation(() => new Promise(() => {}));
+    vi.mocked(apiService.renameSession)
+      .mockRejectedValueOnce(new Error('network error'))
+      .mockResolvedValueOnce(renamedSession);
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '重命名会话 測試會話 1' }));
+    fireEvent.change(screen.getByRole('textbox', { name: '会话名称' }), { target: { value: '季度复盘' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存名称' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('重命名失败，请重试。');
+    expect(screen.getByRole('textbox', { name: '会话名称' })).toHaveValue('季度复盘');
+    expect(screen.getByRole('textbox', { name: '会话名称' })).not.toHaveAttribute('readonly');
+    fireEvent.click(screen.getByRole('button', { name: '保存名称' }));
+
+    expect(await screen.findByText('季度复盘')).toBeInTheDocument();
+    expect(apiService.renameSession).toHaveBeenCalledTimes(2);
+    expect(apiService.renameSession).toHaveBeenLastCalledWith('session-1', '季度复盘');
+    expect(screen.queryByRole('textbox', { name: '会话名称' })).not.toBeInTheDocument();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('后台列表加载失败或移除目标行不丢失重命名草稿及保存状态', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onSessionSelect = vi.fn();
+    const renamedSession = { ...mockSessions[0], title: '保留我的名称' };
+    let resolveRename!: (session: typeof renamedSession) => void;
+    vi.mocked(apiService.getSessions)
+      .mockResolvedValueOnce({ sessions: mockSessions })
+      .mockRejectedValueOnce(new Error('background refresh failed'))
+      .mockResolvedValueOnce({ sessions: [mockSessions[1]] })
+      .mockImplementation(() => new Promise(() => {}));
+    vi.mocked(apiService.renameSession).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveRename = resolve; }),
+    );
+    const { rerender } = render(<SessionList refreshTrigger={0} onSessionSelect={onSessionSelect} />);
+    fireEvent.click(await screen.findByRole('button', { name: '重命名会话 測試會話 1' }));
+    fireEvent.change(screen.getByRole('textbox', { name: '会话名称' }), { target: { value: '保留我的名称' } });
+    rerender(<SessionList refreshTrigger={1} onSessionSelect={onSessionSelect} />);
+    await screen.findByTestId('session-load-error');
+    expect(screen.getByRole('textbox', { name: '会话名称' })).toHaveValue('保留我的名称');
+
+    fireEvent.click(screen.getByRole('button', { name: '保存名称' }));
+    rerender(<SessionList refreshTrigger={2} onSessionSelect={onSessionSelect} />);
+    await waitFor(() => expect(screen.queryByTestId('session-row-session-1')).not.toBeInTheDocument());
+    expect(screen.getByRole('textbox', { name: '会话名称' })).toHaveValue('保留我的名称');
+    expect(screen.getByRole('textbox', { name: '会话名称' })).toHaveAttribute('readonly');
+    expect(screen.getByRole('button', { name: '保存名称' })).toBeDisabled();
+    await act(async () => resolveRename(renamedSession));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(apiService.renameSession).toHaveBeenCalledTimes(1);
+    expect(apiService.renameSession).toHaveBeenCalledWith('session-1', '保留我的名称');
+    expect(onSessionSelect).not.toHaveBeenCalled();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('搜索结果重命名后按原查询重新匹配，清空搜索立即使用更新后的完整列表缓存', async () => {
+    const renamedSession = { ...mockSessions[0], title: '需求跟进' };
+    const onSessionSelect = vi.fn();
+    vi.mocked(apiService.getSessions)
+      .mockResolvedValueOnce({ sessions: mockSessions })
+      .mockResolvedValueOnce({ sessions: [mockSessions[0]] })
+      .mockResolvedValueOnce({ sessions: [] })
+      .mockImplementation(() => new Promise(() => {}));
+    vi.mocked(apiService.renameSession).mockResolvedValueOnce(renamedSession);
+    render(<SessionList onSessionSelect={onSessionSelect} />);
+    await screen.findByText('測試會話 1');
+    fireEvent.change(screen.getByRole('textbox', { name: '搜索会话' }), { target: { value: '測試會話 1' } });
+    await waitFor(() => expect(apiService.getSessions).toHaveBeenCalledWith('測試會話 1'));
+
+    fireEvent.click(screen.getByRole('button', { name: '重命名会话 測試會話 1' }));
+    fireEvent.change(screen.getByRole('textbox', { name: '会话名称' }), { target: { value: '需求跟进' } });
+    fireEvent.submit(screen.getByRole('form', { name: '重命名会话' }));
+    expect(await screen.findByText('没有匹配的对话')).toBeInTheDocument();
+    expect(apiService.getSessions).toHaveBeenLastCalledWith('測試會話 1');
+    fireEvent.click(screen.getByRole('button', { name: '清空搜索' }));
+    expect(screen.getByText('需求跟进')).toBeInTheDocument();
+    expect(screen.getByText('測試會話 2')).toBeInTheDocument();
+    expect(screen.queryByText('測試會話 1')).not.toBeInTheDocument();
+    expect(onSessionSelect).not.toHaveBeenCalled();
   });
 
   it('删除按钮应有可访问名称，并打开应用内确认弹窗而不选中会话', async () => {

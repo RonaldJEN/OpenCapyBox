@@ -321,6 +321,7 @@ _BOOL_TRUE = "TRUE"
 # 格式: (表名, 列名, 列 DDL 片段)
 _PENDING_COLUMNS = [
     ("sessions", "model_id", "VARCHAR(50)"),
+    ("sessions", "title_is_manual", f"BOOLEAN NOT NULL DEFAULT {_BOOL_FALSE}"),
     ("rounds", "user_attachments", "TEXT"),
     ("rounds", "model_id", "VARCHAR(100)"),
     ("rounds", "model_display_name", "VARCHAR(200)"),

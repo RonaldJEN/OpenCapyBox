@@ -1165,6 +1165,8 @@ Agent 调用 ask_user 工具
 
 首条消息在此处暂停仍必须完成标题生成生命周期：waiting 被视为本段流已稳定落库，服务端等待标题任务完成并把 `CUSTOM title_updated` 追加到原 SSE；若原客户端已断开，标题任务不得被取消，仍须落库并向 waiting Round 的现有 subscriber 投递临时标题事件。
 
+首轮自动标题仅适用于尚未手动命名的会话。`PATCH /api/sessions/{id}/title` 持久化 `title_is_manual=true`；已启动的自动标题任务必须用单条带 `title_is_manual=false` 条件的 UPDATE 提交，更新未命中时不发送自动标题事件。手动命名优先于生成结果，包括用户将标题命名为“新会话”的情况；消息活跃时间的更新不参与标题归属判断。手动与自动标题更新均保留数据库当前 `updated_at`，不刷新列表时间或排序，也不回写读取时的旧时间。
+
 #### same-Round 恢复流程
 
 ```

@@ -191,6 +191,31 @@ class TestDatabaseConfig:
 class TestDatabaseMigration:
     """测试数据库迁移逻辑"""
 
+    def test_session_manual_title_migration_preserves_existing_titles(self):
+        from sqlalchemy import create_engine, text
+
+        from src.api.models import database as database_module
+
+        sqlite_engine = create_engine("sqlite://")
+        try:
+            with sqlite_engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE TABLE sessions (id VARCHAR(36) PRIMARY KEY, "
+                    "user_id VARCHAR(100), title VARCHAR(255), model_id VARCHAR(100), "
+                    "created_at DATETIME, updated_at DATETIME)"
+                ))
+                conn.execute(text("INSERT INTO sessions (id, title) VALUES ('legacy', '原有标题')"))
+
+            database_module._migrate_add_columns(sqlite_engine)
+            database_module._migrate_add_columns(sqlite_engine)
+
+            with sqlite_engine.connect() as conn:
+                row = conn.execute(text("SELECT title, title_is_manual FROM sessions")).one()
+                assert row.title == "原有标题"
+                assert row.title_is_manual == 0
+        finally:
+            sqlite_engine.dispose()
+
     def test_round_preference_snapshots_use_cross_dialect_add_column_migration(self):
         from sqlalchemy import create_engine, inspect, text
 

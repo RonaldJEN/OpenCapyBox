@@ -1,7 +1,7 @@
 """会话相关 Schema"""
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 
 class SessionCreate(BaseModel):
@@ -60,7 +60,9 @@ class FileInfo(BaseModel):
 class UpdateSessionTitleRequest(BaseModel):
     """更新会话标题请求"""
 
-    title: str = Field(..., min_length=1, max_length=255, description="新标题")
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)] = Field(
+        ..., description="新标题"
+    )
 
 
 class FileListResponse(BaseModel):

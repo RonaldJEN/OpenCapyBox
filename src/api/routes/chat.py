@@ -730,6 +730,7 @@ async def send_message_stream(
         user_sandbox = db.query(UserSandbox).filter(UserSandbox.user_id == user_id).first()
         user_sandbox_id = user_sandbox.sandbox_id if user_sandbox else None
         round_count = db.query(Round).filter(Round.session_id == chat_session_id).count()
+        should_generate_title = round_count == 0 and not session.title_is_manual
         model_id = _resolve_send_model_for_user(
             db, session, user_id, turn.model_id
         )
@@ -815,17 +816,22 @@ async def send_message_stream(
         title_run_id: str | None = None
         title_run_ready = asyncio.Event()
         try:
-            if round_count == 0:
+            if should_generate_title:
                 async def generate_title_async():
                     try:
                         title_source = _extract_text_for_title(turn.content)
                         title = await agent_service.generate_session_title(title_source)
                         with SessionLocal() as title_db:
-                            title_session = title_db.query(Session).filter(Session.id == chat_session_id).first()
-                            if title_session:
-                                title_session.title = title
-                                title_session.updated_at = now_naive()
-                                title_db.commit()
+                            updated = title_db.query(Session).filter(
+                                Session.id == chat_session_id,
+                                Session.user_id == user_id,
+                                Session.title_is_manual.is_(False),
+                            ).update(
+                                {Session.title: title, Session.updated_at: Session.updated_at},
+                                synchronize_session=False,
+                            )
+                            title_db.commit()
+                            if updated:
                                 await title_run_ready.wait()
                                 if title_run_id:
                                     title_event = CustomEvent(

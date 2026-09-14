@@ -303,6 +303,48 @@ class TestSessionsRouter:
             updated_at=updated,
         ))
 
+    async def test_rename_session_writes_requested_title_and_keeps_current_activity_time(self, sessions_client):
+        from src.api.models.session import Session as SessionModel
+        from src.api.schemas.session import UpdateSessionTitleRequest
+
+        with sessions_client.SessionLocal() as db:
+            self._add_session(db, "rename-stale", title="新会话")
+            db.commit()
+
+        with sessions_client.SessionLocal() as rename_db:
+            stale = rename_db.get(SessionModel, "rename-stale")
+            with sessions_client.SessionLocal() as concurrent_db:
+                concurrent = concurrent_db.get(SessionModel, "rename-stale")
+                concurrent.title = "自动标题"
+                concurrent.updated_at = datetime(2026, 5, 17, 10)
+                concurrent_db.commit()
+            assert stale.title == "新会话"
+            renamed = await sessions.update_session_title(
+                "rename-stale", UpdateSessionTitleRequest(title="新会话"),
+                user_id="user-1", db=rename_db,
+            )
+            assert renamed.title == "新会话"
+            assert renamed.title_is_manual is True
+            assert renamed.updated_at == datetime(2026, 5, 17, 10)
+
+    @pytest.mark.parametrize("session_id", ["other-user", "missing"])
+    def test_rename_session_requires_ownership(self, sessions_client, session_id):
+        from src.api.models.session import Session as SessionModel
+
+        with sessions_client.SessionLocal() as db:
+            self._add_session(db, "other-user", user_id="user-2", title="原标题")
+            db.commit()
+
+        response = sessions_client.patch(
+            f"/sessions/{session_id}/title", json={"title": "新标题"}
+        )
+
+        assert response.status_code == 404
+        with sessions_client.SessionLocal() as db:
+            unchanged = db.get(SessionModel, "other-user")
+            assert unchanged.title == "原标题"
+            assert unchanged.title_is_manual is False
+
     def _add_message(
         self,
         db,

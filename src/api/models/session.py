@@ -6,7 +6,7 @@ AG-UI 協議概念映射：
 
 Session 表同時作為 AG-UI 的 Thread 表使用。
 """
-from sqlalchemy import Column, String, Integer, DateTime
+from sqlalchemy import Boolean, Column, String, Integer, DateTime, false
 from datetime import datetime
 from .database import Base
 from src.api.utils.timezone import now_naive
@@ -30,6 +30,7 @@ class Session(Base):
     
     # 會話標題（用於 UI 顯示）
     title = Column(String(255), nullable=True)
+    title_is_manual = Column(Boolean, nullable=False, default=False, server_default=false())
     
     # 會話狀態
     # "active" = 活躍中

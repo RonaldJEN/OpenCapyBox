@@ -1770,7 +1770,7 @@ class TestSendMessageConcurrencyBlock:
         assert "INTERNAL_ERROR" not in body
         release_lock.assert_called_once()
 
-    async def test_first_message_waiting_stream_persists_and_emits_title(self):
+    async def test_first_message_waiting_stream_persists_and_emits_title(self, lock_db_session):
         from src.agent.schema.agui_events import CustomEvent
         from src.api.routes.chat import send_message_stream
         from src.api.schemas.chat import SendMessageRequest
@@ -1781,6 +1781,7 @@ class TestSendMessageConcurrencyBlock:
             user_id="testuser",
             status="active",
             model_id="model-1",
+            title_is_manual=False,
         )
 
         def query_side_effect(model):
@@ -1801,12 +1802,11 @@ class TestSendMessageConcurrencyBlock:
             return chain
 
         mock_db.query.side_effect = query_side_effect
-        title_session = MagicMock(id="session-1", title="新会话")
-        title_db = MagicMock()
-        title_db.query.return_value.filter.return_value.first.return_value = title_session
-        title_db_context = MagicMock()
-        title_db_context.__enter__.return_value = title_db
-        title_db_context.__exit__.return_value = False
+        title_session = Session(id="session-1", user_id="testuser", title="新会话")
+        lock_db_session.add(title_session)
+        lock_db_session.commit()
+        previous_updated_at = title_session.updated_at
+        title_db_factory = sessionmaker(bind=lock_db_session.bind)
 
         mock_agent_service = MagicMock()
         mock_agent_service.generate_session_title = AsyncMock(return_value="恢复确认")
@@ -1842,7 +1842,7 @@ class TestSendMessageConcurrencyBlock:
             return_value=True,
         ), patch(
             "src.api.routes.chat.SessionLocal",
-            return_value=title_db_context,
+            title_db_factory,
         ), patch(
             "src.api.routes.chat._agui_event_bus.publish_ephemeral",
             new_callable=AsyncMock,
@@ -1861,11 +1861,12 @@ class TestSendMessageConcurrencyBlock:
         body = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
         assert "title_updated" in body
         assert "恢复确认" in body
+        lock_db_session.refresh(title_session)
         assert title_session.title == "恢复确认"
-        title_db.commit.assert_called_once()
+        assert title_session.updated_at == previous_updated_at
         publish_ephemeral.assert_awaited_once()
 
-    async def test_first_message_disconnect_still_fans_out_title_to_waiting_subscriber(self):
+    async def test_first_message_disconnect_still_fans_out_title_to_waiting_subscriber(self, lock_db_session):
         from src.agent.schema.agui_events import CustomEvent
         from src.api.routes.chat import send_message_stream
         from src.api.schemas.chat import SendMessageRequest
@@ -1876,6 +1877,7 @@ class TestSendMessageConcurrencyBlock:
             user_id="testuser",
             status="active",
             model_id="model-1",
+            title_is_manual=False,
         )
 
         def query_side_effect(model):
@@ -1896,12 +1898,10 @@ class TestSendMessageConcurrencyBlock:
             return chain
 
         mock_db.query.side_effect = query_side_effect
-        title_session = MagicMock(id="session-1", title="新会话")
-        title_db = MagicMock()
-        title_db.query.return_value.filter.return_value.first.return_value = title_session
-        title_db_context = MagicMock()
-        title_db_context.__enter__.return_value = title_db
-        title_db_context.__exit__.return_value = False
+        title_session = Session(id="session-1", user_id="testuser", title="新会话")
+        lock_db_session.add(title_session)
+        lock_db_session.commit()
+        title_db_factory = sessionmaker(bind=lock_db_session.bind)
         title_release = asyncio.Event()
         title_published = asyncio.Event()
 
@@ -1951,7 +1951,7 @@ class TestSendMessageConcurrencyBlock:
             return_value=True,
         ), patch(
             "src.api.routes.chat.SessionLocal",
-            return_value=title_db_context,
+            title_db_factory,
         ), patch(
             "src.api.routes.chat._agui_event_bus.publish_ephemeral",
             new_callable=AsyncMock,
@@ -1974,10 +1974,84 @@ class TestSendMessageConcurrencyBlock:
             title_release.set()
             await asyncio.wait_for(title_published.wait(), timeout=1)
 
+        lock_db_session.refresh(title_session)
         assert title_session.title == "断线后标题"
-        title_db.commit.assert_called_once()
         publish_ephemeral.assert_awaited_once()
         assert publish_ephemeral.await_args.args[0] == "round-title-disconnect"
+
+    @pytest.mark.parametrize("rename_before_send", [True, False])
+    async def test_manual_title_survives_first_message_generation(self, lock_db_session, rename_before_send):
+        from src.agent.schema.agui_events import CustomEvent
+        from src.api.routes.chat import send_message_stream
+        from src.api.routes.sessions import update_session_title
+        from src.api.schemas.chat import SendMessageRequest
+        from src.api.schemas.session import UpdateSessionTitleRequest
+
+        lock_db_session.add(Session(
+            id="manual-title", user_id="testuser", title="新会话", model_id="model-1"
+        ))
+        lock_db_session.commit()
+        title_db_factory = sessionmaker(bind=lock_db_session.bind)
+        title_started = asyncio.Event()
+        title_release = asyncio.Event()
+
+        async def rename():
+            with title_db_factory() as rename_db:
+                await update_session_title(
+                    "manual-title", UpdateSessionTitleRequest(title="新会话"),
+                    user_id="testuser", db=rename_db,
+                )
+
+        async def generate_title(_source):
+            title_started.set()
+            await title_release.wait()
+            return "迟到的自动标题"
+
+        async def waiting_events():
+            yield CustomEvent(name="interaction_requested", value={"runId": "title-run"})
+
+        agent_service = MagicMock()
+        agent_service.generate_session_title = AsyncMock(side_effect=generate_title)
+        execution = SimpleNamespace(
+            handle=SimpleNamespace(run_id="title-run", session_id="manual-title"),
+            event_source=waiting_events(),
+        )
+        if rename_before_send:
+            await rename()
+
+        with patch("src.api.routes.chat.enforce_token_limits"), patch(
+            "src.api.routes.chat._acquire_lock_and_clear_cancel", new_callable=AsyncMock,
+            return_value="title-lock",
+        ), patch(
+            "src.api.routes.chat._resolve_send_model_for_user", return_value="model-1",
+        ), patch("src.api.routes.chat._validate_turn_reasoning_request"), patch(
+            "src.api.routes.chat.get_agent_pool",
+        ) as get_pool, patch(
+            "src.api.routes.chat._turn_orchestrator.submit_turn", new_callable=AsyncMock,
+            return_value=execution,
+        ), patch("src.api.routes.chat.SessionLocal", title_db_factory), patch(
+            "src.api.routes.chat._agui_event_bus.publish_ephemeral", new_callable=AsyncMock,
+        ) as publish_ephemeral:
+            get_pool.return_value.get_or_create = AsyncMock(return_value=agent_service)
+            response = await send_message_stream(
+                "manual-title", SendMessageRequest(content=[{"type": "text", "text": "hello"}]),
+                user_id="testuser", db=lock_db_session,
+            )
+            first_chunk = await response.body_iterator.__anext__()
+            if not rename_before_send:
+                await asyncio.wait_for(title_started.wait(), timeout=1)
+                await rename()
+            title_release.set()
+            chunks = [first_chunk, *[chunk async for chunk in response.body_iterator]]
+
+        with title_db_factory() as verify_db:
+            saved = verify_db.get(Session, "manual-title")
+            assert saved.title == "新会话"
+            assert saved.title_is_manual is True
+        body = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
+        assert "title_updated" not in body
+        publish_ephemeral.assert_not_awaited()
+        assert agent_service.generate_session_title.await_count == (0 if rename_before_send else 1)
 
     def test_non_sqlite_exception_returns_503(self):
         """_acquire_user_run_lock 抛非 SQLite 异常时应返回 503（系统错误）。

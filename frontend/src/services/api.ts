@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from 'axios';
 import type {
   AuthResponse,
   CreateSessionResponse,
+  Session,
   SessionListResponse,
   ModelsResponse,
   HistoryResponseV2,
@@ -311,6 +312,16 @@ class APIService {
     return response.data;
   }
 
+
+  /** 手动重命名会话。 */
+  async renameSession(chatSessionId: string, title: string): Promise<Session> {
+    const response = await this.client.patch<Session>(
+      `/sessions/${chatSessionId}/title`,
+      { title },
+      { timeout: 8000 },
+    );
+    return response.data;
+  }
 
   /**
    * 删除会话
