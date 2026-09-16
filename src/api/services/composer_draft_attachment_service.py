@@ -10,6 +10,7 @@ import uuid
 from datetime import timedelta
 
 from fastapi import HTTPException, UploadFile
+from opensandbox.exceptions import SandboxApiException
 from sqlalchemy.orm import Session as DBSession
 from sqlalchemy.exc import IntegrityError
 
@@ -128,6 +129,7 @@ class ComposerDraftAttachmentService:
         # The Sandbox identity is frozen before the network write.  A later
         # profile replacement cannot redirect this attachment to another owner.
         from src.api.routes.sessions import _ensure_sandbox, _get_sandbox_binding_state
+        sandbox = None
         try:
             binding = _get_sandbox_binding_state(self.db, user_id)
             sandbox = await _ensure_sandbox(sandbox_service, user_id, self.db, binding_state=binding)
@@ -160,6 +162,10 @@ class ComposerDraftAttachmentService:
             if _extract_exit_code(verification) != 0:
                 raise RuntimeError("草稿附件落盘校验失败")
         except BaseException as exc:
+            if sandbox is not None and isinstance(exc, SandboxApiException) and exc.status_code == 404:
+                # The SDK may omit the response's error code. Drop only this
+                # handle; the next request confirms loss with the control plane.
+                sandbox_service.invalidate_cache(user_id, expected_sandbox=sandbox)
             self.db.rollback()
             failed = self.db.query(ComposerDraftAttachment).filter(
                 ComposerDraftAttachment.attachment_id == attachment_id,

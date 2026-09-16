@@ -521,7 +521,7 @@ async def _ensure_sandbox(
                 required_sandbox_id,
             )
             sandbox_service.invalidate_cache(user_id)
-        else:
+        elif await sandbox_service.is_cached_healthy(user_id, sandbox):
             return sandbox
 
     if binding.active_owner:

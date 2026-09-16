@@ -2231,7 +2231,6 @@ async def test_workspace_refuses_non_persistent_sandbox_before_connecting():
 
 @pytest.mark.asyncio
 async def test_active_run_workspace_reconnects_exact_sandbox_without_rebuild():
-    WorkspaceService._sandbox_validation_deadlines.clear()
     exact = SimpleNamespace(id="sandbox-current")
     get_existing = AsyncMock(return_value=exact)
     rebuild = AsyncMock()

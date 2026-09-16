@@ -79,6 +79,8 @@
 - `get_current_profile_fingerprint(user_id) -> tuple[str, int]`
 - `get_cached_profile_fingerprint(user_id) -> tuple[str|None, int|None]`
 - `cached_is_current(user_id, sandbox_id=None) -> bool`
+- `is_cached_healthy(user_id, sandbox, force_check=False) -> bool` — 对具体缓存对象执行锁外健康验证；高频文件请求共享 10 秒健康期限，生命周期恢复强制复查；失败只失效被检查的对象，不影响并发替换的新对象。
+- `invalidate_cache(user_id, expected_sandbox=None)` — 可指定本次请求使用的对象，防止旧请求的迟到失败清除新缓存。
 - `push_skills(user_id, skills_dir) -> bool` — 批量上传（排除 node_modules, __pycache__, .git, .venv）
 - `push_skill(user_id, skills_dir, skill_name, enabled_check=None) -> bool` — 单个按需推送，幂等；可在推送前后复核逻辑启用状态
 - `discover_sandbox_skills(user_id, official_names, strict=False) -> SkillDiscoveryResult` — 结果兼容技能列表并携带同一扫描的 `issues`；默认容错返回空结果，严格模式仅对沙箱级/扫描级故障抛错，单个损坏 `SKILL.md` 始终隔离
@@ -89,6 +91,7 @@
 ### Composer 草稿附件目录
 
 - 草稿附件物理目录是当前用户 Sandbox mount 下严格受控的 `.composer-drafts/{draft_id}/{attachment_id}/`，不是 Workspace，也不是隐藏 Session。ledger 冻结 `user_id`、Sandbox ID、mount、文件名、大小和 SHA-256 后才允许 I/O；网络 I/O 不持有数据库事务。
+- 上传通过共享健康验证获取 Sandbox；已回收的缓存进入既有控制面确认与恢复流程。I/O 中的 SDK 404 只失效本次对象并保留附件 failed 状态，下一次同 attachment_id 上传重新获取 Sandbox；不在已开始写入的请求内切换代际重放，也不把文件 404 直接当成容器丢失。
 - claim 的专属 Session 目标固定为 `sessions/{session_id}/attachments/{attachment_id}/`，使该文件可由普通 Session 文件列表展示。删除和 24 小时到期通过既有 `SandboxCleanupJob` 排入异步清理，仅处理严格匹配的草稿根或未被 Round 引用的专属目标，不扫描同级目录、不跟随 symlink；cleanup lease/generation 防止迟到回调复活或误删新文件。
 - 既有清理边界：worker 使用任务冻结的 Sandbox ID 调用 `get_existing`，不自动迁移到重绑后的当前 Sandbox。旧绑定不可用时任务保留错误并重试，持久卷上的文件可能尚未回收；24 小时是到期进入清理的条件，不是物理删除完成时限。Composer 沿用这项历史基础设施限制，本次未实现跨沙箱绑定的清理迁移。
 
@@ -123,7 +126,7 @@
 5. 状态查询失败、`connect` 失败或 `resume` 失败均视为暂时性故障，不得继续尝试另一种生命周期操作，也不得创建新沙箱。
 6. 没有持久化 ID 且调用允许创建时才直接创建；`get_existing` 等只读既有代际的调用必须失败而不是创建。
 
-高频文件服务不得为每次命令都进入 per-user 生命周期锁。允许复用 ID/Profile 匹配且在短 TTL 内已验证健康的缓存对象；TTL 到期在锁外做一次轻量健康检查，失败后才失效缓存并进入上述恢复链。这样既不能永久信任 stale cache，也不能让正在初始化 Agent 的长生命周期临界区阻塞预览、新建和拖拽。
+高频文件服务不得为每次命令都进入 per-user 生命周期锁。Session、Composer 和 Workspace 统一使用 SandboxSessionService 的健康验证，复用 ID/Profile 匹配且在 10 秒 TTL 内已验证健康的具体缓存对象；TTL 到期在锁外做一次轻量健康检查，失败后才失效该对象并进入上述恢复链。暂停、销毁和对象替换清除健康期限，迟到的检查结果不得验证或失效新对象。这样既不能永久信任 stale cache，也不能让正在初始化 Agent 的长生命周期临界区阻塞预览、新建和拖拽。
 
 Session/Workspace 文件面板属于被动消费者：读取持久绑定与有效 `UserRunLock` 后必须先提交/回滚请求事务，再等待 OpenSandbox。存在运行锁时只允许 `get_existing(user_id, persisted_sandbox_id)`，远端 404/不可用直接令当前文件请求失败，禁止创建候选容器或 CAS 改绑。Chat/Cron 工具持有该轮启动时取得的 Sandbox 对象，运行中不重新读取全局缓存来切换代际。
 

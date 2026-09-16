@@ -220,6 +220,68 @@ class TestPathHelpers:
         assert is_within_sandbox_root("/tmp/a.txt", "/workspace/app") is False
 
 
+class TestCachedSandboxHealth:
+    @pytest.mark.asyncio
+    async def test_health_ttl_expires_and_force_check_bypasses_it(self, service, mock_sandbox):
+        service._cache["user-1"] = mock_sandbox
+        clock = SimpleNamespace(monotonic=MagicMock(return_value=100.0))
+
+        with patch("src.api.services.sandbox_service.time", clock):
+            assert await service.is_cached_healthy("user-1", mock_sandbox)
+            clock.monotonic.return_value = 109.0
+            assert await service.is_cached_healthy("user-1", mock_sandbox)
+            mock_sandbox.is_healthy.assert_awaited_once()
+
+            clock.monotonic.return_value = 110.0
+            assert await service.is_cached_healthy("user-1", mock_sandbox)
+            assert mock_sandbox.is_healthy.await_count == 2
+
+            assert await service.is_cached_healthy("user-1", mock_sandbox, force_check=True)
+            assert mock_sandbox.is_healthy.await_count == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [False, RuntimeError("health endpoint unavailable")])
+    async def test_failed_health_check_invalidates_cached_instance(self, service, mock_sandbox, failure):
+        service._cache["user-1"] = mock_sandbox
+        service._cache_health_deadlines["user-1"] = (mock_sandbox, 0.0)
+        mock_sandbox.is_healthy = AsyncMock(side_effect=[failure])
+
+        assert not await service.is_cached_healthy("user-1", mock_sandbox)
+
+        assert service.get_cached("user-1") is None
+        assert "user-1" not in service._cache_health_deadlines
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("old_result", [False, True, RuntimeError("old connection failed")])
+    async def test_late_health_result_preserves_replacement_object_and_deadline(self, service, old_result):
+        old = make_mock_sandbox(sandbox_id="sbx-same-id")
+        replacement = make_mock_sandbox(sandbox_id="sbx-same-id")
+        service._cache["user-1"] = old
+        started = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def check_old():
+            started.set()
+            await resume.wait()
+            if isinstance(old_result, Exception):
+                raise old_result
+            return old_result
+
+        old.is_healthy = AsyncMock(side_effect=check_old)
+        checking = asyncio.create_task(service.is_cached_healthy("user-1", old))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        service._cache["user-1"] = replacement
+        replacement_deadline = (replacement, 1234.0)
+        service._cache_health_deadlines["user-1"] = replacement_deadline
+        resume.set()
+
+        assert not await checking
+        service.invalidate_cache("user-1", expected_sandbox=old)
+        assert service.get_cached("user-1") is replacement
+        assert service._cache_health_deadlines["user-1"] == replacement_deadline
+        replacement.is_healthy.assert_not_awaited()
+
+
 # ============== get_or_resume ==============
 
 class TestGetOrResume:

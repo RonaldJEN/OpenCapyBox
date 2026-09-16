@@ -2406,12 +2406,6 @@ def _decode_cursor(cursor: str | None) -> int:
 class WorkspaceService:
     """Authoritative workspace metadata, byte operations, and mutation journal."""
 
-    # A healthy cached sandbox can be reused without entering the per-user
-    # lifecycle lock. Revalidate occasionally so a remotely deleted container
-    # heals without adding a control-plane round trip to every file operation.
-    _sandbox_validation_deadlines: dict[tuple[str, str], float] = {}
-    _sandbox_validation_ttl_seconds = 10.0
-
     def __init__(
         self,
         db: DBSession,
@@ -2629,26 +2623,10 @@ class WorkspaceService:
                     runtime.profile_version,
                 )
             if cache_matches:
-                cached_id = str(cached_id_value or persisted_id)
-                validation_key = (user_id, cached_id)
-                if self._sandbox_validation_deadlines.get(validation_key, 0.0) > time.monotonic():
+                if await self.sandbox_service.is_cached_healthy(user_id, cached):
                     return cached
-                is_healthy = getattr(cached, "is_healthy", None)
-                healthy = True
-                if callable(is_healthy):
-                    try:
-                        healthy = bool(await is_healthy())
-                    except Exception:
-                        healthy = False
-                if healthy:
-                    self._sandbox_validation_deadlines[validation_key] = (
-                        time.monotonic() + self._sandbox_validation_ttl_seconds
-                    )
-                    return cached
-            self.sandbox_service.invalidate_cache(user_id)
-            for validation_key in tuple(self._sandbox_validation_deadlines):
-                if validation_key[0] == user_id:
-                    self._sandbox_validation_deadlines.pop(validation_key, None)
+            else:
+                self.sandbox_service.invalidate_cache(user_id, expected_sandbox=cached)
         if active_run:
             if not persisted_id:
                 raise WorkspaceError(
@@ -2664,18 +2642,10 @@ class WorkspaceService:
                     "ACTIVE_RUN_SANDBOX_UNAVAILABLE",
                     "Agent 运行期间当前 Sandbox 暂时不可用",
                 ) from exc
-            resolved_id = str(getattr(sandbox, "id", None) or persisted_id)
-            self._sandbox_validation_deadlines[(user_id, resolved_id)] = (
-                time.monotonic() + self._sandbox_validation_ttl_seconds
-            )
             return sandbox
-        sandbox, sandbox_id = await self.sandbox_service.get_or_resume_with_persisted_id(
+        sandbox, _ = await self.sandbox_service.get_or_resume_with_persisted_id(
             user_id,
             persisted_id,
-        )
-        resolved_id = str(getattr(sandbox, "id", None) or sandbox_id or persisted_id or "cached")
-        self._sandbox_validation_deadlines[(user_id, resolved_id)] = (
-            time.monotonic() + self._sandbox_validation_ttl_seconds
         )
         return sandbox
 

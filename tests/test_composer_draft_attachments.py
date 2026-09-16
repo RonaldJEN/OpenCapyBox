@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from io import BytesIO
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException, UploadFile
+from opensandbox.exceptions import SandboxApiException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -16,8 +18,12 @@ from src.api.models.round import Round
 from src.api.models.sandbox_cleanup import SandboxCleanupJob
 from src.api.models.session import Session
 from src.api.models.user_sandbox import UserSandbox
+from src.api.models.user_memory import CronJobRun
+from src.api.models.user_run_lock import UserRunLock
 from src.api.services.composer_draft_attachment_service import ComposerDraftAttachmentService
 from src.api.services.sandbox_cleanup_service import _validate_target
+from src.api.services.sandbox_profile_service import SandboxRuntimeConfig
+from src.api.services.sandbox_service import SandboxSessionService
 from src.api.utils.timezone import now_naive
 
 
@@ -45,6 +51,137 @@ def _row(*, state="ready", claimed_session_id=None):
         claimed_path="attachments/11111111-1111-1111-1111-111111111111/原件.xlsx" if claimed_session_id else None,
         expires_at=now_naive() + timedelta(hours=24),
     )
+
+
+@pytest.fixture
+def upload_sandboxes(db, monkeypatch):
+    """Keep lifecycle, request binding and attachment writes on the real code path."""
+    monkeypatch.setattr(SandboxSessionService, "_instance", None)
+    service = SandboxSessionService()
+    runtime = SandboxRuntimeConfig(
+        profile_id="upload-profile", profile_name="upload", profile_version=1,
+        profile_source="default", domain="sandbox.test", protocol="http",
+        api_key="test-key", use_server_proxy=True, mount_path="/home/user",
+    )
+    binding = db.get(UserSandbox, "sandbox-row")
+    binding.active_profile_id = runtime.profile_id
+    binding.active_profile_version = runtime.profile_version
+    db.commit()
+    monkeypatch.setattr("src.api.models.database.SessionLocal", sessionmaker(bind=db.get_bind()))
+    monkeypatch.setattr(service, "_resolve_runtime_config", lambda user_id: runtime)
+    state_query = AsyncMock(return_value="not_found")
+    monkeypatch.setattr(service, "_query_sandbox_state", state_query)
+
+    def sandbox(sandbox_id, healthy):
+        return SimpleNamespace(
+            id=sandbox_id, is_healthy=AsyncMock(return_value=healthy),
+            commands=SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_code=0))),
+            files=SimpleNamespace(write=AsyncMock()),
+        )
+
+    old, replacement = sandbox("sandbox-1", False), sandbox("sandbox-2", True)
+    old.commands.run.side_effect = SandboxApiException(status_code=404)
+    service._store_cache("owner", old, runtime)
+    create = AsyncMock(return_value=replacement)
+    connect = AsyncMock(return_value=old)
+    monkeypatch.setattr("src.api.services.sandbox_service.Sandbox.create", create)
+    monkeypatch.setattr("src.api.services.sandbox_service.Sandbox.connect", connect)
+    monkeypatch.setattr("src.api.services.composer_draft_attachment_service.get_sandbox_service", lambda: service)
+    return SimpleNamespace(service=service, old=old, replacement=replacement,
+                           create=create, connect=connect, state_query=state_query)
+
+
+async def _upload_test_attachment(db):
+    return await ComposerDraftAttachmentService(db).upload(
+        user_id="owner", draft_id="draft_1", attachment_id="11111111-1111-1111-1111-111111111111",
+        file=UploadFile(filename="hello.md", file=BytesIO(b"hello")),
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_recovers_missing_cached_sandbox_before_writing(db, upload_sandboxes):
+    sandboxes = upload_sandboxes
+    result = await _upload_test_attachment(db)
+
+    db.expire_all()
+    row = db.get(ComposerDraftAttachment, result["attachment_id"])
+    assert row.state == "ready"
+    assert row.sandbox_id == db.get(UserSandbox, "sandbox-row").sandbox_id == "sandbox-2"
+    assert row.mount_path == "/home/user"
+    assert row.content_sha256 == hashlib.sha256(b"hello").hexdigest()
+    sandboxes.old.commands.run.assert_not_awaited()
+    sandboxes.replacement.files.write.assert_awaited_once_with(
+        f"/home/user/.composer-drafts/draft_1/{row.attachment_id}/hello.md", b"hello",
+    )
+    assert db.query(Session).count() == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["agent", "cron"])
+async def test_upload_cannot_replace_missing_sandbox_owned_by_active_run(db, upload_sandboxes, owner):
+    if owner == "agent":
+        db.add(UserRunLock(user_id="owner", session_id="session-1"))
+    else:
+        db.add(CronJobRun(
+            id="cron-run", user_id="owner", job_name="running", cron_expr="* * * * *",
+            status="running", sandbox_id="sandbox-1", claim_token="claim",
+            claim_lease_expires_at=now_naive() + timedelta(minutes=5),
+        ))
+    db.commit()
+
+    with pytest.raises(HTTPException) as error:
+        await _upload_test_attachment(db)
+
+    assert error.value.status_code == 503
+    db.expire_all()
+    assert db.get(UserSandbox, "sandbox-row").sandbox_id == "sandbox-1"
+    assert db.query(ComposerDraftAttachment).one().state == "failed"
+    upload_sandboxes.create.assert_not_awaited()
+    upload_sandboxes.old.commands.run.assert_not_awaited()
+    upload_sandboxes.replacement.files.write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage, remote_state", [
+    ("mkdir", "not_found"), ("verify", "not_found"), ("write", "running"),
+])
+async def test_upload_404_rechecks_sandbox_on_next_attempt(db, upload_sandboxes, failure_stage, remote_state):
+    sandboxes = upload_sandboxes
+    sandboxes.old.is_healthy.return_value = True
+    failure = SandboxApiException(status_code=404)
+    if failure_stage == "verify":
+        sandboxes.old.commands.run.side_effect = [SimpleNamespace(exit_code=0), failure]
+    elif failure_stage == "write":
+        sandboxes.old.commands.run.side_effect = None
+        sandboxes.old.files.write.side_effect = failure
+    # The 404 happens after the successful health check; the current upload stays on its owner.
+    with pytest.raises(HTTPException) as error:
+        await _upload_test_attachment(db)
+    assert error.value.status_code == 503
+    assert sandboxes.service.get_cached("owner") is None
+    sandboxes.create.assert_not_awaited()
+    db.expire_all()
+    failed = db.query(ComposerDraftAttachment).one()
+    assert (failed.state, failed.sandbox_id, failed.generation) == ("failed", "sandbox-1", 1)
+
+    sandboxes.state_query.return_value = remote_state
+    sandboxes.old.commands.run.side_effect = None
+    sandboxes.old.files.write.side_effect = None
+    result = await _upload_test_attachment(db)
+
+    db.expire_all()
+    row = db.get(ComposerDraftAttachment, result["attachment_id"])
+    expected_sandbox = "sandbox-2" if remote_state == "not_found" else "sandbox-1"
+    assert (row.state, row.generation) == ("ready", 2)
+    assert row.sandbox_id == db.get(UserSandbox, "sandbox-row").sandbox_id == expected_sandbox
+    assert db.query(ComposerDraftAttachment).count() == 1
+    sandboxes.state_query.assert_awaited()
+    if remote_state == "running":
+        sandboxes.create.assert_not_awaited()
+        sandboxes.connect.assert_awaited_once()
+    else:
+        sandboxes.create.assert_awaited_once()
+        sandboxes.replacement.files.write.assert_awaited_once()
 
 
 @pytest.mark.asyncio

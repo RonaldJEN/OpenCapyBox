@@ -1796,6 +1796,7 @@ class TestEnsureSandbox:
         mock_sandbox = AsyncMock()
         mock_sandbox.id = "sbx-cached"
         sandbox_service = MagicMock()
+        sandbox_service.is_cached_healthy = AsyncMock(return_value=True)
         sandbox_service.get_cached.return_value = mock_sandbox
 
         mock_db = self._binding_db()
@@ -1850,6 +1851,7 @@ class TestEnsureSandbox:
                 sandbox = SimpleNamespace(id="sbx-same")
                 service = SimpleNamespace(
                     get_cached=lambda _: sandbox if cached else None,
+                    is_cached_healthy=AsyncMock(return_value=True),
                     get_or_resume=AsyncMock(return_value=sandbox),
                     get_sandbox_id=lambda _: sandbox.id,
                     get_cached_runtime_config=lambda _: SimpleNamespace(
@@ -2026,6 +2028,7 @@ class TestEnsureSandbox:
 
         sandbox_service = MagicMock()
         # 第一次 get_cached 返回陳舊沙箱，第二次（force_refresh 後）返回 None
+        sandbox_service.is_cached_healthy = AsyncMock(return_value=True)
         sandbox_service.get_cached.side_effect = [stale_sandbox, None]
         sandbox_service.get_or_resume = AsyncMock(return_value=fresh_sandbox)
         sandbox_service.get_sandbox_id.return_value = "sbx-fresh"
@@ -2094,6 +2097,7 @@ class TestEnsureSandbox:
         ])
 
         sandbox_service = MagicMock()
+        sandbox_service.is_cached_healthy = AsyncMock(return_value=True)
         sandbox_service.get_cached.return_value = sandbox
         sandbox_service.get_mount_path.return_value = "/home/user"
 
@@ -2158,6 +2162,7 @@ class TestEnsureSandbox:
         ])
 
         sandbox_service = MagicMock()
+        sandbox_service.is_cached_healthy = AsyncMock(return_value=True)
         sandbox_service.get_cached.return_value = sandbox
         sandbox_service.get_mount_path.return_value = "/home/user"
 
@@ -2221,6 +2226,7 @@ class TestEnsureSandbox:
         ])
 
         sandbox_service = MagicMock()
+        sandbox_service.is_cached_healthy = AsyncMock(return_value=True)
         sandbox_service.get_cached.return_value = sandbox
         sandbox_service.get_mount_path.return_value = "/home/user"
 

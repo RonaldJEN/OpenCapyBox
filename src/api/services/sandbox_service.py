@@ -22,6 +22,7 @@ import re
 import hashlib
 import posixpath
 import shlex
+import time
 from datetime import timedelta
 from enum import Enum
 from typing import Callable, Optional
@@ -207,6 +208,7 @@ class SandboxSessionService:
         if self._initialized:
             return
         self._cache: dict[str, Sandbox] = {}         # user_id → Sandbox
+        self._cache_health_deadlines: dict[str, tuple[Sandbox, float]] = {}
         self._cache_profile_ids: dict[str, str] = {}  # user_id → sandbox_profile_id
         self._cache_profile_versions: dict[str, int] = {}  # user_id → profile.version
         self._cache_mount_paths: dict[str, str] = {}  # user_id → active mount path
@@ -399,6 +401,8 @@ class SandboxSessionService:
         sandbox: Sandbox,
         runtime_config: SandboxRuntimeConfig,
     ) -> None:
+        if self._cache.get(user_id) is not sandbox:
+            self._cache_health_deadlines.pop(user_id, None)
         self._cache[user_id] = sandbox
         self._cache_profile_ids[user_id] = runtime_config.profile_id
         self._cache_profile_versions[user_id] = runtime_config.profile_version
@@ -752,26 +756,9 @@ class SandboxSessionService:
                     runtime_config.profile_version,
                 )
                 self.invalidate_cache(user_id)
-            else:
-                try:
-                    # 驗證沙箱是否仍然健康
-                    is_healthy = False
-                    if hasattr(sandbox, "is_healthy"):
-                        is_healthy = await sandbox.is_healthy()
-                    else:
-                        info = await sandbox.get_info()
-                        state = getattr(getattr(info, "status", None), "state", "")
-                        is_healthy = str(state).lower() in {"running", "pending"}
-
-                    if is_healthy:
-                        logger.debug("沙箱命中快取 (user=%s)", user_id)
-                        return sandbox
-                    else:
-                        logger.warning("快取中的沙箱不健康，重新查询状态 (user=%s)", user_id)
-                        self.invalidate_cache(user_id)
-                except Exception:
-                    logger.warning("沙箱健康檢查失敗，移除快取 (user=%s)", user_id)
-                    self.invalidate_cache(user_id)
+            elif await self.is_cached_healthy(user_id, sandbox, force_check=True):
+                logger.debug("沙箱命中快取 (user=%s)", user_id)
+                return sandbox
 
         # 2. 有 sandbox_id → 先查狀態，只执行与当前状态匹配的一种操作。
         if sandbox_id:
@@ -1043,6 +1030,7 @@ class SandboxSessionService:
             是否成功暫停
         """
         sandbox = self._cache.pop(user_id, None)
+        self._cache_health_deadlines.pop(user_id, None)
         self._cache_profile_ids.pop(user_id, None)
         self._cache_profile_versions.pop(user_id, None)
         self._cache_mount_paths.pop(user_id, None)
@@ -1081,6 +1069,7 @@ class SandboxSessionService:
         """
         # 先從快取移除
         sandbox = self._cache.pop(user_id, None)
+        self._cache_health_deadlines.pop(user_id, None)
         cached_mount_path = self._cache_mount_paths.pop(user_id, None)
         self._cache_profile_ids.pop(user_id, None)
         self._cache_profile_versions.pop(user_id, None)
@@ -1246,9 +1235,42 @@ class SandboxSessionService:
         """獲取快取中的沙箱（不做健康檢查，用於工具層直接存取）"""
         return self._cache.get(user_id)
 
-    def invalidate_cache(self, user_id: str) -> None:
+    async def is_cached_healthy(
+        self, user_id: str, sandbox: Sandbox, *, force_check: bool = False,
+    ) -> bool:
+        """Validate a specific cached instance without taking the lifecycle lock."""
+        if self._cache.get(user_id) is not sandbox:
+            return False
+        validated = self._cache_health_deadlines.get(user_id)
+        if (
+            not force_check and validated is not None
+            and validated[0] is sandbox and validated[1] > time.monotonic()
+        ):
+            return True
+        try:
+            if hasattr(sandbox, "is_healthy"):
+                healthy = bool(await sandbox.is_healthy())
+            else:
+                info = await sandbox.get_info()
+                state = getattr(getattr(info, "status", None), "state", "")
+                healthy = str(getattr(state, "value", state)).lower() in _CONNECTABLE_SANDBOX_STATES
+        except Exception:
+            healthy = False
+        # A slow check must neither validate nor evict a replacement instance.
+        if self._cache.get(user_id) is not sandbox:
+            return False
+        if healthy:
+            self._cache_health_deadlines[user_id] = (sandbox, time.monotonic() + 10.0)
+            return True
+        self.invalidate_cache(user_id, expected_sandbox=sandbox)
+        return False
+
+    def invalidate_cache(self, user_id: str, *, expected_sandbox: Sandbox | None = None) -> None:
         """移除用戶的沙箱快取（用於陳舊沙箱恢復場景）"""
+        if expected_sandbox is not None and self._cache.get(user_id) is not expected_sandbox:
+            return
         removed = self._cache.pop(user_id, None)
+        self._cache_health_deadlines.pop(user_id, None)
         self._cache_profile_ids.pop(user_id, None)
         self._cache_profile_versions.pop(user_id, None)
         self._cache_mount_paths.pop(user_id, None)
