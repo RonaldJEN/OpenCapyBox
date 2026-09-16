@@ -93,7 +93,8 @@
 - 草稿附件物理目录是当前用户 Sandbox mount 下严格受控的 `.composer-drafts/{draft_id}/{attachment_id}/`，不是 Workspace，也不是隐藏 Session。ledger 冻结 `user_id`、Sandbox ID、mount、文件名、大小和 SHA-256 后才允许 I/O；网络 I/O 不持有数据库事务。
 - 上传通过共享健康验证获取 Sandbox；已回收的缓存进入既有控制面确认与恢复流程。I/O 中的 SDK 404 只失效本次对象并保留附件 failed 状态，下一次同 attachment_id 上传重新获取 Sandbox；不在已开始写入的请求内切换代际重放，也不把文件 404 直接当成容器丢失。
 - claim 的专属 Session 目标固定为 `sessions/{session_id}/attachments/{attachment_id}/`，使该文件可由普通 Session 文件列表展示。删除和 24 小时到期通过既有 `SandboxCleanupJob` 排入异步清理，仅处理严格匹配的草稿根或未被 Round 引用的专属目标，不扫描同级目录、不跟随 symlink；cleanup lease/generation 防止迟到回调复活或误删新文件。
-- 既有清理边界：worker 使用任务冻结的 Sandbox ID 调用 `get_existing`，不自动迁移到重绑后的当前 Sandbox。旧绑定不可用时任务保留错误并重试，持久卷上的文件可能尚未回收；24 小时是到期进入清理的条件，不是物理删除完成时限。Composer 沿用这项历史基础设施限制，本次未实现跨沙箱绑定的清理迁移。
+- 后台目录清理继续使用任务冻结的 Sandbox ID 调用 `get_existing`，不自动改绑或创建容器。明确的绑定变更、Profile 不匹配、绑定缺失或容器终态（terminated/failed/not_found）使任务进入 `blocked`，保留原目标与错误原因，不标记物理删除成功、不自动重排。临时连接、状态查询等故障仍重试，间隔从 30 秒指数增长，最多 30 分钟；不得把普通文件/SDK 404 当作容器终态。
+- 清理队列按实际到期时间排序（queued/retry 使用 next_attempt_at，历史空值使用 created_at；running 使用 lease_expires_at），再按创建时间和 ID 排序，每批最多 20 条串行执行。领取时在行锁内再次核对状态及到期时间；完成仍按 token/generation 条件更新，迟到完成不得覆盖重新排队。旧故障任务不能持续占满队首。存量缺少可靠存储归属的任务不跨沙箱迁移；24 小时是附件到期进入清理的条件，不是物理删除完成时限。
 
 ### 单例模式
 

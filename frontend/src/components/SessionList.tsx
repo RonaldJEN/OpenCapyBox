@@ -311,12 +311,12 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
       className={`${mobileSheet ? 'flex' : 'hidden md:flex'} h-full w-full flex-shrink-0 flex-col overflow-hidden whitespace-nowrap border-r border-claude-border bg-claude-surface p-4`}
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-2">
-        <div className="flex items-center space-x-3">
-          <img src="/logo.jpg" alt="OpenCapyBox" className="w-8 h-8 rounded-lg object-cover transition-transform active:scale-95 cursor-pointer" />
-          <span className="font-sans font-semibold text-lg tracking-tight text-claude-text">OpenCapyBox</span>
+      <div className="flex min-w-0 items-center justify-between gap-1 px-2">
+        <div className="flex min-w-0 items-center space-x-3">
+          <img src="/logo.jpg" alt="OpenCapyBox" className="w-8 h-8 shrink-0 rounded-lg object-cover transition-transform active:scale-95 cursor-pointer" />
+          <span className="truncate font-sans font-semibold text-lg tracking-tight text-claude-text">OpenCapyBox</span>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1">
         {onNewChat && (
           <button
             ref={newChatButtonRef}
@@ -533,6 +533,7 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
                 }}
                 type="button"
                 aria-label={`打开会话 ${session.title || session.id.slice(0, 8)}`}
+                title={session.title || `会话 ${session.id.slice(0, 8)}`}
                 aria-current={activePrimarySurface === 'chat' && currentSessionId === session.id ? 'page' : undefined}
                 onClick={() => selectSession(session)}
                 className="absolute inset-0 z-0 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/30"

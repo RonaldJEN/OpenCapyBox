@@ -27,14 +27,17 @@ describe('AppSidebar', () => {
     vi.unstubAllGlobals();
   });
 
-  it('正常状态不展示按钮，rail 状态才展示恢复按钮', () => {
+  it('正常状态不展示按钮，rail 的展开按钮恢复默认宽度', () => {
     render(<Harness />);
     const shell = screen.getByTestId('app-sidebar-shell');
     expect(shell).toHaveStyle({ width: `${DEFAULT_APP_SIDEBAR_WIDTH}px` });
     expect(shell).not.toHaveClass('transition-[width]');
     expect(screen.queryByRole('button', { name: '展开左侧栏', hidden: true })).not.toBeInTheDocument();
 
-    fireEvent.keyDown(screen.getByRole('separator', { name: '调整左侧栏宽度', hidden: true }), { key: 'Home' });
+    const separator = screen.getByRole('separator', { name: '调整左侧栏宽度', hidden: true });
+    fireEvent.keyDown(separator, { key: 'End' });
+    expect(shell).toHaveStyle({ width: '480px' });
+    fireEvent.keyDown(separator, { key: 'Home' });
     expect(shell).toHaveAttribute('data-collapsed', 'true');
     expect(shell).toHaveStyle({ width: `${APP_SIDEBAR_RAIL_WIDTH}px` });
     expect(screen.getByAltText('OpenCapyBox')).toBeInTheDocument();
@@ -48,42 +51,56 @@ describe('AppSidebar', () => {
     expect(screen.queryByRole('button', { name: '从用户 test 展开左侧栏', hidden: true })).not.toBeInTheDocument();
   });
 
-  it('向左拖动吸附为 rail，向右恢复时宽度仍固定为 220px', () => {
+  it('拖动展开保留调整后的宽度，点击展开恢复默认宽度', () => {
     vi.stubGlobal('PointerEvent', MouseEvent);
     render(<Harness />);
     const shell = screen.getByTestId('app-sidebar-shell');
-    vi.spyOn(shell, 'getBoundingClientRect').mockReturnValue({
-      x: 0,
-      y: 0,
-      left: 0,
-      right: 220,
-      top: 0,
-      bottom: 600,
-      width: 220,
-      height: 600,
-      toJSON: () => ({}),
-    });
     const separator = screen.getByRole('separator', { name: '调整左侧栏宽度', hidden: true });
-    expect(separator).toHaveClass('right-0');
-    expect(separator).not.toHaveClass('-right-1');
 
-    fireEvent.pointerDown(separator, { button: 0, pointerId: 1 });
-    fireEvent.pointerMove(window, { clientX: 100, pointerId: 1 });
-    expect(shell).toHaveAttribute('data-collapsed', 'true');
-    fireEvent.pointerMove(window, { clientX: 300, pointerId: 1 });
+    fireEvent.pointerDown(separator, { button: 0, clientX: 256, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 316, pointerId: 1 });
+    expect(shell).toHaveStyle({ width: '320px' });
+    fireEvent.pointerMove(window, { clientX: 256, pointerId: 1 });
+    expect(shell).toHaveStyle({ width: '260px' });
     expect(shell).toHaveAttribute('data-collapsed', 'false');
-    expect(shell).toHaveStyle({ width: '220px' });
+    fireEvent.pointerMove(window, { clientX: 255, pointerId: 1 });
+    expect(shell).toHaveAttribute('data-collapsed', 'false');
+    expect(shell).toHaveStyle({ width: '260px' });
+    fireEvent.pointerMove(window, { clientX: 137, pointerId: 1 });
+    expect(shell).toHaveAttribute('data-collapsed', 'false');
+    expect(shell).toHaveStyle({ width: '260px' });
+    fireEvent.pointerMove(window, { clientX: 136, pointerId: 1 });
+    expect(shell).toHaveAttribute('data-collapsed', 'true');
+    expect(shell).toHaveStyle({ width: `${APP_SIDEBAR_RAIL_WIDTH}px` });
+    fireEvent.pointerMove(window, { clientX: 137, pointerId: 1 });
+    expect(shell).toHaveAttribute('data-collapsed', 'true');
+    fireEvent.pointerMove(window, { clientX: 336, pointerId: 1 });
+    expect(shell).toHaveAttribute('data-collapsed', 'false');
+    expect(shell).toHaveStyle({ width: '340px' });
     fireEvent.pointerUp(window, { pointerId: 1 });
 
     fireEvent.keyDown(separator, { key: 'Home' });
     expect(shell).toHaveAttribute('data-collapsed', 'true');
-    fireEvent.pointerDown(separator, { button: 0, pointerId: 2 });
+    fireEvent.pointerDown(separator, { button: 0, clientX: 60, pointerId: 2 });
     fireEvent.pointerMove(window, { clientX: 80, pointerId: 2 });
     expect(shell).toHaveAttribute('data-collapsed', 'true');
     fireEvent.pointerMove(window, { clientX: 90, pointerId: 2 });
     expect(shell).toHaveAttribute('data-collapsed', 'false');
-    expect(shell).toHaveStyle({ width: '220px' });
+    expect(shell).toHaveStyle({ width: '340px' });
+    fireEvent.pointerMove(window, { clientX: 130, pointerId: 2 });
+    expect(shell).toHaveStyle({ width: '380px' });
     fireEvent.pointerUp(window, { pointerId: 2 });
+
+    fireEvent.pointerDown(separator, { button: 0, clientX: 376, pointerId: 3 });
+    fireEvent.pointerMove(window, { clientX: 276, pointerId: 3 });
+    fireEvent.pointerMove(window, { clientX: 216, pointerId: 3 });
+    expect(shell).toHaveStyle({ width: '260px' });
+    expect(shell).toHaveAttribute('data-collapsed', 'false');
+    fireEvent.pointerMove(window, { clientX: 136, pointerId: 3 });
+    fireEvent.pointerUp(window, { pointerId: 3 });
+    expect(shell).toHaveAttribute('data-collapsed', 'true');
+    fireEvent.click(screen.getByRole('button', { name: '从 Logo 展开左侧栏', hidden: true }));
+    expect(shell).toHaveStyle({ width: `${DEFAULT_APP_SIDEBAR_WIDTH}px` });
   });
 
   it('键盘和按钮均可替代拖动', () => {
@@ -96,9 +113,24 @@ describe('AppSidebar', () => {
     expect(separator).toHaveAttribute('aria-valuenow', '0');
     fireEvent.keyDown(separator, { key: 'ArrowRight' });
     expect(shell).toHaveAttribute('data-collapsed', 'false');
+    fireEvent.keyDown(separator, { key: 'ArrowRight' });
+    expect(shell).toHaveStyle({ width: '280px' });
+    fireEvent.keyDown(separator, { key: 'ArrowLeft' });
+    expect(shell).toHaveStyle({ width: '260px' });
+    fireEvent.keyDown(separator, { key: 'ArrowLeft' });
+    expect(shell).toHaveAttribute('data-collapsed', 'true');
+    fireEvent.keyDown(separator, { key: 'ArrowRight' });
+    expect(shell).toHaveStyle({ width: '260px' });
     fireEvent.keyDown(separator, { key: 'End' });
-    expect(shell).toHaveStyle({ width: '220px' });
-    expect(separator).toHaveAttribute('aria-valuemax', '220');
+    expect(shell).toHaveStyle({ width: '480px' });
+    expect(separator).toHaveAttribute('aria-valuemax', '480');
+
+    vi.stubGlobal('innerWidth', 768);
+    fireEvent(window, new Event('resize'));
+    expect(shell).toHaveStyle({ width: '384px' });
+    expect(separator).toHaveAttribute('aria-valuemax', '384');
+    fireEvent.doubleClick(separator);
+    expect(shell).toHaveStyle({ width: `${DEFAULT_APP_SIDEBAR_WIDTH}px` });
   });
 
   it('会话全屏占用边界时只保留统一的会话分隔条', () => {

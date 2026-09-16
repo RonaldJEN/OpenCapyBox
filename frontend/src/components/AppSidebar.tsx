@@ -1,14 +1,20 @@
 import {
+  useEffect,
   useRef,
+  useState,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from 'react';
 import { ChevronRight } from 'lucide-react';
 
-export const DEFAULT_APP_SIDEBAR_WIDTH = 220;
+export const DEFAULT_APP_SIDEBAR_WIDTH = 260;
+const MIN_APP_SIDEBAR_WIDTH = DEFAULT_APP_SIDEBAR_WIDTH;
+const MAX_APP_SIDEBAR_WIDTH = 480;
 export const APP_SIDEBAR_RAIL_WIDTH = 64;
 const RAIL_REVEAL_DRAG_DISTANCE = 24;
+const SIDEBAR_COLLAPSE_DRAG_DISTANCE = 120;
+const KEYBOARD_RESIZE_STEP = 20;
 
 interface AppSidebarProps {
   children: ReactNode;
@@ -28,45 +34,76 @@ export function AppSidebar({
   onCollapsedChange,
 }: AppSidebarProps) {
   const shellRef = useRef<HTMLDivElement>(null);
-  const renderedWidth = collapsed ? APP_SIDEBAR_RAIL_WIDTH : DEFAULT_APP_SIDEBAR_WIDTH;
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+  const [expandedWidth, setExpandedWidth] = useState(DEFAULT_APP_SIDEBAR_WIDTH);
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  const maxWidth = Math.max(MIN_APP_SIDEBAR_WIDTH, Math.min(MAX_APP_SIDEBAR_WIDTH, Math.floor(viewportWidth / 2)));
+  const renderedWidth = collapsed ? APP_SIDEBAR_RAIL_WIDTH : Math.min(expandedWidth, maxWidth);
   const userInitial = userId.trim().charAt(0).toUpperCase() || 'U';
 
-  const applyWidth = (nextWidth: number) => {
-    const bounded = Math.min(DEFAULT_APP_SIDEBAR_WIDTH, Math.max(0, nextWidth));
-    if (collapsed) {
-      if (bounded <= APP_SIDEBAR_RAIL_WIDTH + RAIL_REVEAL_DRAG_DISTANCE) return;
-      onCollapsedChange(false);
-      return;
-    }
-    if (bounded < DEFAULT_APP_SIDEBAR_WIDTH) {
-      onCollapsedChange(true);
-      return;
-    }
-    onCollapsedChange(false);
-  };
+  useEffect(() => {
+    const handleResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  useEffect(() => () => dragCleanupRef.current?.(), [boundaryClaimed, mobileOpen]);
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     event.preventDefault();
+    dragCleanupRef.current?.();
     const separator = event.currentTarget;
     const pointerId = event.pointerId;
+    let anchorX = event.clientX;
+    let anchorWidth = renderedWidth;
+    let waitingForRailReveal = collapsed;
+    let dragCollapsed = collapsed;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
     separator.setPointerCapture?.(pointerId);
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
-      const bounds = shellRef.current?.getBoundingClientRect();
-      if (!bounds) return;
-      applyWidth(moveEvent.clientX - bounds.left);
+      if (moveEvent.pointerId !== pointerId) return;
+      if (waitingForRailReveal) {
+        if (moveEvent.clientX - anchorX <= RAIL_REVEAL_DRAG_DISTANCE) return;
+        waitingForRailReveal = false;
+        // rail 展开后重设拖动起点，继续向右拖时从记住的宽度平滑扩宽。
+        anchorX = moveEvent.clientX;
+        anchorWidth = Math.min(expandedWidth, maxWidth);
+      }
+      const nextWidth = anchorWidth + moveEvent.clientX - anchorX;
+      // 可视宽度停在最小值，继续左拖 120px 才收起；反向回到最小宽度再展开。
+      const nextCollapsed = dragCollapsed
+        ? nextWidth < MIN_APP_SIDEBAR_WIDTH
+        : nextWidth <= MIN_APP_SIDEBAR_WIDTH - SIDEBAR_COLLAPSE_DRAG_DISTANCE;
+      if (!nextCollapsed) {
+        setExpandedWidth(Math.max(MIN_APP_SIDEBAR_WIDTH, Math.min(maxWidth, Math.round(nextWidth))));
+      }
+      if (nextCollapsed !== dragCollapsed) {
+        // 拖动收起保留起手宽度，避免慢拖经过最小宽度后丢掉用户的展开尺寸。
+        if (nextCollapsed) setExpandedWidth(expandedWidth);
+        dragCollapsed = nextCollapsed;
+        onCollapsedChange(nextCollapsed);
+      }
     };
-    const finish = () => {
-      separator.releasePointerCapture?.(pointerId);
+    const finish = (finishEvent?: PointerEvent) => {
+      if (finishEvent && finishEvent.pointerId !== pointerId) return;
+      if (separator.hasPointerCapture?.(pointerId)) separator.releasePointerCapture(pointerId);
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', finish);
       window.removeEventListener('pointercancel', finish);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      dragCleanupRef.current = null;
     };
 
+    dragCleanupRef.current = finish;
     window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', finish, { once: true });
-    window.addEventListener('pointercancel', finish, { once: true });
+    window.addEventListener('pointerup', finish);
+    window.addEventListener('pointercancel', finish);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -77,21 +114,26 @@ export function AppSidebar({
     }
     if (event.key === 'End') {
       event.preventDefault();
+      setExpandedWidth(maxWidth);
       onCollapsedChange(false);
       return;
     }
     if (event.key === 'ArrowLeft') {
       event.preventDefault();
-      onCollapsedChange(true);
+      if (collapsed) return;
+      if (renderedWidth <= MIN_APP_SIDEBAR_WIDTH) onCollapsedChange(true);
+      else setExpandedWidth(Math.max(MIN_APP_SIDEBAR_WIDTH, renderedWidth - KEYBOARD_RESIZE_STEP));
       return;
     }
     if (event.key === 'ArrowRight') {
       event.preventDefault();
       if (collapsed) onCollapsedChange(false);
+      else setExpandedWidth(Math.min(maxWidth, renderedWidth + KEYBOARD_RESIZE_STEP));
     }
   };
 
   const expandSidebar = () => {
+    setExpandedWidth(DEFAULT_APP_SIDEBAR_WIDTH);
     onCollapsedChange(false);
   };
 
@@ -161,11 +203,14 @@ export function AppSidebar({
           aria-label="调整左侧栏宽度"
           aria-orientation="vertical"
           aria-valuemin={0}
-          aria-valuemax={DEFAULT_APP_SIDEBAR_WIDTH}
-          aria-valuenow={collapsed ? 0 : DEFAULT_APP_SIDEBAR_WIDTH}
+          aria-valuemax={maxWidth}
+          aria-valuenow={collapsed ? 0 : renderedWidth}
+          aria-valuetext={collapsed ? '已收起' : `${renderedWidth} 像素`}
+          title="拖动调整宽度，双击恢复默认宽度"
           tabIndex={0}
           onPointerDown={handlePointerDown}
           onKeyDown={handleKeyDown}
+          onDoubleClick={expandSidebar}
           className="group absolute right-0 inset-y-0 z-10 hidden w-2 cursor-col-resize touch-none outline-none md:block"
         >
           <span className="absolute inset-y-0 right-0 w-px bg-claude-border transition-[width,background-color] group-hover:w-0.5 group-hover:bg-claude-accent/55 group-focus-visible:w-0.5 group-focus-visible:bg-claude-accent" />

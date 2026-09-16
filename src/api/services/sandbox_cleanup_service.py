@@ -11,18 +11,30 @@ import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 
 from src.api.models.database import SessionLocal
 from src.api.models.sandbox_cleanup import SandboxCleanupJob
-from src.api.services.sandbox_service import get_sandbox_service
+from src.api.services.sandbox_service import (
+    SandboxLifecycleError,
+    SandboxTemporarilyUnavailable,
+    get_sandbox_service,
+)
 from src.api.utils.sandbox_helpers import extract_command_stdout
 from src.api.utils.timezone import now_naive
 
 
 _UUID = re.compile(r"^[0-9a-fA-F-]{36}$")
+_BLOCKED_SANDBOX_CODES = frozenset({
+    "sandbox_binding_changed",
+    "sandbox_profile_mismatch",
+    "sandbox_binding_missing",
+    "sandbox_terminated",
+    "sandbox_failed",
+    "sandbox_not_found",
+})
 logger = logging.getLogger(__name__)
 
 
@@ -140,11 +152,13 @@ def _claim(cleanup_id: str) -> _ClaimedCleanup | None:
         row = db.query(SandboxCleanupJob).filter(
             SandboxCleanupJob.cleanup_id == cleanup_id,
         ).with_for_update().one_or_none()
-        if row is None or row.state == "completed":
+        if row is None or row.state not in {"queued", "retry", "running"}:
             db.rollback()
             return None
         now = now_naive()
-        if row.state == "running" and row.lease_expires_at and row.lease_expires_at > now:
+        # A due-list snapshot can outlive another worker's claim or retry.
+        due_at = row.lease_expires_at if row.state == "running" else row.next_attempt_at
+        if (row.state == "running" and due_at is None) or (due_at is not None and due_at > now):
             db.rollback()
             return None
         token = uuid.uuid4().hex
@@ -166,7 +180,7 @@ def _claim(cleanup_id: str) -> _ClaimedCleanup | None:
         )
 
 
-def _finish(claim: _ClaimedCleanup, *, error: str | None) -> None:
+def _finish(claim: _ClaimedCleanup, *, error: str | None, blocked: bool = False) -> None:
     with SessionLocal() as db:
         row = db.query(SandboxCleanupJob).filter(
             SandboxCleanupJob.cleanup_id == claim.cleanup_id,
@@ -182,9 +196,15 @@ def _finish(claim: _ClaimedCleanup, *, error: str | None) -> None:
             row.completed_at = now_naive()
             row.next_attempt_at = None
             row.error_message = None
+        elif blocked:
+            # Retain the original target for review; never infer a new binding.
+            row.state = "blocked"
+            row.next_attempt_at = None
+            row.error_message = error[:2000]
         else:
             row.state = "retry"
-            row.next_attempt_at = now_naive() + timedelta(seconds=30)
+            retry_exponent = min(max(int(row.attempt_count or 1) - 1, 0), 6)
+            row.next_attempt_at = now_naive() + timedelta(seconds=min(30 * 2**retry_exponent, 1800))
             row.error_message = error[:2000]
         row.lease_expires_at = None
         db.commit()
@@ -195,6 +215,7 @@ async def run_cleanup_job(cleanup_id: str) -> bool:
     if claim is None:
         return False
     error: str | None = None
+    blocked = False
     try:
         sandbox = await get_sandbox_service().get_existing(
             claim.user_id,
@@ -244,7 +265,13 @@ async def run_cleanup_job(cleanup_id: str) -> bool:
             raise RuntimeError(str(payload.get("error") or "cleanup failed"))
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-    await asyncio.to_thread(_finish, claim, error=error)
+        if isinstance(exc, SandboxLifecycleError):
+            error = f"{type(exc).__name__} [{exc.code}]: {exc}"
+            blocked = (
+                not isinstance(exc, SandboxTemporarilyUnavailable)
+                and exc.code in _BLOCKED_SANDBOX_CODES
+            )
+    await asyncio.to_thread(_finish, claim, error=error, blocked=blocked)
     return error is None
 
 
@@ -265,7 +292,14 @@ def _due_ids(limit: int = 20) -> list[str]:
                     SandboxCleanupJob.lease_expires_at <= now,
                 ),
             ),
-        ).order_by(SandboxCleanupJob.created_at.asc()).limit(limit).all()
+        ).order_by(
+            case(
+                (SandboxCleanupJob.state == "running", SandboxCleanupJob.lease_expires_at),
+                else_=func.coalesce(SandboxCleanupJob.next_attempt_at, SandboxCleanupJob.created_at),
+            ).asc(),
+            SandboxCleanupJob.created_at.asc(),
+            SandboxCleanupJob.cleanup_id.asc(),
+        ).limit(limit).all()
         db.rollback()
         return [str(row[0]) for row in rows]
 

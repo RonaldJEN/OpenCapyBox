@@ -46,6 +46,11 @@
   outline: none;
 }
 
+.session-files-splitter[data-edge='start'] {
+  /* 全屏共享边界与侧栏分隔线同层，低于 rail 展开按钮（z-index: 15）。 */
+  z-index: 10;
+}
+
 .session-files-splitter[data-edge='end'] {
   margin-left: -8px;
   margin-right: 0;

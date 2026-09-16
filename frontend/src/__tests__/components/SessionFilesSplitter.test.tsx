@@ -150,7 +150,7 @@ describe('SessionFilesSplitter', () => {
       .toHaveAttribute('data-edge', 'end');
   });
 
-  it('左端点以第一次拖动方向锁定操作：向左收导航，向右拉会话', () => {
+  it('左端点以首次方向锁定操作：向左满 120px 收导航，向右立即拉会话', () => {
     vi.stubGlobal('PointerEvent', MouseEvent);
     const collapseSidebar = vi.fn();
     render(<SplitterHarness initialRatio={0} onStartEdgeCollapse={collapseSidebar} />);
@@ -170,6 +170,11 @@ describe('SessionFilesSplitter', () => {
 
     fireEvent.pointerDown(splitter, { button: 0, pointerId: 1, clientX: 100 });
     fireEvent.pointerMove(window, { clientX: 90, pointerId: 1 });
+    expect(collapseSidebar).not.toHaveBeenCalled();
+    fireEvent.pointerMove(window, { clientX: -19, pointerId: 1 });
+    expect(collapseSidebar).not.toHaveBeenCalled();
+    fireEvent.pointerMove(window, { clientX: -20, pointerId: 1 });
+    expect(collapseSidebar).toHaveBeenCalledTimes(1);
     fireEvent.pointerMove(window, { clientX: 400, pointerId: 1 });
     expect(collapseSidebar).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId('splitter-ratio')).toHaveTextContent('0');

@@ -12,6 +12,7 @@ interface SessionFilesSplitterProps {
 
 const MIN_CHAT_RATIO = 0;
 const MAX_CHAT_RATIO = 100;
+const SIDEBAR_COLLAPSE_DRAG_DISTANCE = 120;
 const CHAT_RATIO_CSS_PROPERTY = '--session-files-chat-ratio';
 
 function clampRatio(value: number): number {
@@ -62,7 +63,7 @@ export function SessionFilesSplitter({
         dragOwner = deltaX < 0 && onStartEdgeCollapse ? 'sidebar' : 'files';
       }
       if (dragOwner === 'sidebar') {
-        if (!sidebarCollapsed) {
+        if (!sidebarCollapsed && startX - moveEvent.clientX >= SIDEBAR_COLLAPSE_DRAG_DISTANCE) {
           sidebarCollapsed = true;
           onStartEdgeCollapse?.();
         }
