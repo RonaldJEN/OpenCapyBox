@@ -220,7 +220,7 @@ const handleExecutionEnd = (sessionId?: string) => {
 - SessionList 与其内容容器必须 `h-full`；账户菜单及其中“设置”入口固定保留在侧栏底部，不得被历史列表高度顶出视口。
 - 进入 `/schedule` 日程一级页时保留用户当前左侧栏展开/rail 状态，不得自动折叠。
 - SettingsCenter 为居中弹窗（非右侧抽屉），不得改写用户的左栏折叠状态。
-- Session 文件工作台打开、聊天 pane 的 24×24“展开面板/收起面板”操作均**不得折叠**左侧栏；该按钮只在桌面控制右侧文件工作台 `closed/split`，详见 [frontend-session-files-spec.md](./frontend-session-files-spec.md)。
+- Session 文件工作台打开、聊天 pane 的 24×24“恢复分栏/只看聊天”操作均**不得折叠**左侧栏；该按钮只在桌面控制右侧文件工作台 `closed/split`，详见 [frontend-session-files-spec.md](./frontend-session-files-spec.md)。
 - Skills 与数据一级页面不折叠左侧栏；ChatRuntimeProvider 和真实 ChatV2 保持挂载。
 
 左侧栏调整宽度及展开态/64px rail 切换不做 width 过渡，SessionList 也不得再维护第二套 width/opacity/padding 折叠动画；主内容边界必须一次落位，避免刚点击展开后立即拖动会话 splitter 时，两个水平布局变化叠加造成先内缩再弹出的跳动。
@@ -239,7 +239,7 @@ const handleExecutionEnd = (sessionId?: string) => {
 
 | 错误 | 表现 |
 |---|---|
-| `getSessions` 失败 | `console.error`，显示"加载失败"空态 |
+| `getSessions` 失败 | `console.error`；401 由全局拦截器在组件之外清理登录态并跳转 `/login`，组件不单独处理；其余失败（超时、网关 403/5xx、HTML 响应等）显示"会话加载失败，请重试。"并提供"重试" |
 | `deleteSession` 失败 | `console.error`，保留确认弹窗，展示"删除失败，请重试。"，确认按钮变"重试删除"，允许重试或取消；不从列表移除目标会话（见 §4.7） |
 | `renameSession` 失败 | 保留弹窗及名称草稿，展示"重命名失败，请重试。"，允许修改、重试或取消（见 §4.8） |
 | `getRunningSessions` 失败 | `console.error`，不影响正常流程 |
@@ -251,6 +251,7 @@ const handleExecutionEnd = (sessionId?: string) => {
 - [ ] 删除当前会话回到欢迎页
 - [ ] 删除点击弹出应用内 `alertdialog`，初始焦点在"取消"，Escape/遮罩可取消
 - [ ] 删除进行中锁定两个按钮，Escape 与遮罩点击不生效
+- [ ] 非认证失败（超时、网关异常）显示"会话加载失败，请重试。"并可经"重试"恢复
 - [ ] 删除失败保留弹窗并展示错误，确认按钮变"重试删除"且获得焦点
 - [ ] 删除成功后按"原按钮→同行→相邻行→首行→新建对话"顺序恢复焦点
 - [ ] 重命名自动聚焦全选，Enter 保存、Escape/按钮取消均不切换会话；输入法 Enter 与空白名称不提交

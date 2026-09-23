@@ -104,6 +104,15 @@ describe('SessionList 組件', () => {
     expect(apiService.getSessions).toHaveBeenCalledTimes(2);
   });
 
+  it('超时等非认证失败仍显示会话加载失败并保留重试', async () => {
+    vi.mocked(apiService.getSessions).mockRejectedValueOnce({ code: 'ECONNABORTED', message: 'timeout' });
+
+    render(<SessionList onSessionSelect={vi.fn()} />);
+
+    expect(await screen.findByTestId('session-load-error')).toHaveTextContent('会话加载失败，请重试。');
+    expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument();
+  });
+
   it('應該顯示會話列表', async () => {
     render(<SessionList onSessionSelect={vi.fn()} />);
 

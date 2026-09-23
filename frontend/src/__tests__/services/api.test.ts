@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 
 // 在 import apiService 之前 mock axios
 vi.mock('axios', () => {
@@ -20,9 +20,11 @@ vi.mock('axios', () => {
 
 describe('APIService', () => {
   let apiService: any;
+  let addEventListenerSpy: MockInstance<Parameters<Window['addEventListener']>, void>;
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    addEventListenerSpy = vi.spyOn(window, 'addEventListener');
 
     // 動態 import 以獲取新實例
     vi.resetModules();
@@ -31,6 +33,11 @@ describe('APIService', () => {
   });
 
   afterEach(() => {
+    // 每个测试都会新建 APIService，移除其 storage 监听，避免旧实例响应后续测试派发的事件
+    for (const [type, listener] of addEventListenerSpy.mock.calls) {
+      window.removeEventListener(type, listener);
+    }
+    addEventListenerSpy.mockRestore();
     vi.unstubAllGlobals();
     vi.useRealTimers();
   });
@@ -102,6 +109,117 @@ describe('APIService', () => {
       await expect(responseRejected(error)).rejects.toBe(error);
 
       expect(logoutSpy).not.toHaveBeenCalled();
+    });
+
+    it('非登录请求收到 401 时应交给统一认证失效处理', async () => {
+      const axiosModule = await import('axios');
+      const client = vi.mocked(axiosModule.default.create).mock.results[0].value as any;
+      const responseRejected = client.interceptors.response.use.mock.calls[0][1];
+      const handlerSpy = vi.spyOn(apiService, 'handleAuthFailure').mockImplementation(() => {});
+      const error = {
+        config: { url: '/sessions/list' },
+        response: { status: 401 },
+      };
+
+      await expect(responseRejected(error)).rejects.toBe(error);
+
+      expect(handlerSpy).toHaveBeenCalledTimes(1);
+    });
+
+    describe('其他分页改写登录态', () => {
+      let reload: ReturnType<typeof vi.fn>;
+      let stored: Record<string, string>;
+
+      beforeEach(() => {
+        reload = vi.fn();
+        vi.stubGlobal('location', { pathname: '/', href: '/', reload });
+        apiService.setUserId('demo', 'token-old', 'user');
+        stored = { userId: 'demo', accessToken: 'token-old', userRole: 'user' };
+        vi.mocked(localStorage.getItem).mockImplementation((key: string) => stored[key] ?? null);
+      });
+
+      it('同一用户仅 token 更新时就地同步，后续请求使用新 token 且不重载', async () => {
+        const axiosModule = await import('axios');
+        const client = vi.mocked(axiosModule.default.create).mock.results[0].value as any;
+        const requestFulfilled = client.interceptors.request.use.mock.calls[0][0];
+        stored.accessToken = 'token-new';
+
+        window.dispatchEvent(new StorageEvent('storage', { key: 'accessToken' }));
+
+        const headers = { set: vi.fn() };
+        requestFulfilled({ url: '/cron/jobs', headers });
+        expect(headers.set).toHaveBeenCalledWith('Authorization', 'Bearer token-new');
+        expect(reload).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['换成其他用户', 'userId', { userId: 'bob' }],
+        ['角色变化', 'userRole', { userRole: 'admin' }],
+        ['其他分页登出', 'userId', { userId: undefined }],
+        ['其他分页 clear()', null, { userId: undefined, accessToken: undefined, userRole: undefined }],
+      ])('%s时整页重载，不在旧页面状态上换身份', (_label, key, changes) => {
+        Object.assign(stored, changes);
+
+        window.dispatchEvent(new StorageEvent('storage', { key }));
+
+        expect(reload).toHaveBeenCalled();
+      });
+
+      it('非登录态 key 变化不影响登录态', () => {
+        stored.accessToken = 'token-new';
+
+        window.dispatchEvent(new StorageEvent('storage', { key: 'sidebarWidth' }));
+
+        expect(apiService.getAccessToken()).toBe('token-old');
+        expect(reload).not.toHaveBeenCalled();
+      });
+    });
+
+    it.each([
+      ['超时', { code: 'ECONNABORTED', message: 'timeout of 8000ms exceeded' }],
+      ['网关 403', { response: { status: 403 } }],
+      ['网关 502', { response: { status: 502 } }],
+    ])('%s 不得触发认证失效处理', async (_label, failure) => {
+      const axiosModule = await import('axios');
+      const client = vi.mocked(axiosModule.default.create).mock.results[0].value as any;
+      const responseRejected = client.interceptors.response.use.mock.calls[0][1];
+      const handlerSpy = vi.spyOn(apiService, 'handleAuthFailure').mockImplementation(() => {});
+      const error = { config: { url: '/sessions/list' }, ...failure };
+
+      await expect(responseRejected(error)).rejects.toBe(error);
+
+      expect(handlerSpy).not.toHaveBeenCalled();
+    });
+
+    it('前端源码只有 api.ts 创建 axios 实例与挂拦截器，且不直接用 axios 默认实例发请求', () => {
+      const sources = import.meta.glob(['/src/**/*.{ts,tsx}', '!/src/__tests__/**'], {
+        query: '?raw',
+        import: 'default',
+        eager: true,
+      }) as Record<string, string>;
+      const bypassPattern = /axios\.create|interceptors\.|\baxios\s*\(|\baxios\.(get|post|put|patch|delete|head|request)\s*\(/;
+      const offenders = Object.entries(sources)
+        .filter(([, source]) => bypassPattern.test(source))
+        .map(([path]) => path);
+
+      expect(offenders).toEqual(['/src/services/api.ts']);
+    });
+
+    it.each([
+      ['/workspace', '/login'],
+      ['/admin', '/admin/login'],
+      ['/admin/users', '/admin/login'],
+    ])('handleAuthFailure 在 %s 清理登录态并跳转 %s', (pathname, target) => {
+      apiService.setUserId('demo', 'token-1', 'admin');
+      const locationStub = { pathname, href: pathname };
+      vi.stubGlobal('location', locationStub);
+
+      apiService.handleAuthFailure();
+
+      expect(apiService.isAuthenticated()).toBe(false);
+      expect(localStorage.removeItem).toHaveBeenCalledWith('accessToken');
+      expect(localStorage.removeItem).toHaveBeenCalledWith('userRole');
+      expect(locationStub.href).toBe(target);
     });
 
     it('管理员入口不应保存非管理员登录结果', async () => {

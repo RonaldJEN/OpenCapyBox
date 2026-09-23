@@ -582,7 +582,7 @@ describe('ArtifactsPanel 组件', () => {
     expect(screen.queryByRole('tab', { name: 'saving.md' })).not.toBeInTheDocument();
   });
 
-  it('工作台应该提供展开与收起面板按钮', () => {
+  it('工作台应该提供只看文件与恢复分栏按钮', () => {
     const onToggleExpanded = vi.fn();
     const { rerender } = render(
       <ArtifactsPanel
@@ -595,7 +595,7 @@ describe('ArtifactsPanel 组件', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: '展开面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '只看文件' }));
     expect(onToggleExpanded).toHaveBeenCalledTimes(1);
 
     rerender(
@@ -608,7 +608,7 @@ describe('ArtifactsPanel 组件', () => {
         onToggleExpanded={onToggleExpanded}
       />,
     );
-    expect(screen.getByRole('button', { name: '收起面板' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '恢复分栏' })).toBeInTheDocument();
   });
 
   it('关闭预览后恢复文件列表滚动位置与触发焦点', async () => {

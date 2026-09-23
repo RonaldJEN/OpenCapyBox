@@ -129,6 +129,13 @@ LDAP 用户仍由 `auth_users` 表控制是否开通、是否启用、是否管�
 - 用户被禁用 → 401，已有 token 同步失效（通过 `token_generation` 递增机制）
 - 用户被删除 → 账号行不存在，已有 token 在下一次鉴权查询 `auth_users` 时失效；`user_id` 可重新创建且不继承旧数据
 - 无 Authorization header → 401
+- 前端只有一处认证失效判定与处理：`services/api.ts` 的响应拦截器以 `error.response?.status === 401`（仅后端明确 401）判定，调用 `apiService.handleAuthFailure`（清理登录态并跳转登录页：当前路径以 `/admin` 开头跳 `/admin/login`，与 `AdminRoute` 一致，其余跳 `/login`）；登录接口自身返回 401 不触发登出
+- 前端所有 axios 请求共用 `apiService.getAxiosClient()` 这一个实例（`configApi`/`adminApi`/`mcpApi`/`permissionApi`/`workspaceApi` 均如此），不得再 `axios.create` 另建实例或另挂拦截器（`api.test.ts` 扫描 `src/**/*.{ts,tsx}` 守护此约束：`axios.create`、`interceptors.` 与直接用 axios 默认实例发请求只允许出现在 `services/api.ts`）；因此这些模块的默认超时统一为主实例的 60s，需要更长等待的请求按单次请求传 `timeout`（如 Skills 恢复 240s）
+- 非登录 axios 请求的 401 唯一出口是 `services/api.ts` 的响应拦截器：调用 `handleAuthFailure` 后仍把原错误 reject 给调用方（跳转可能被 `beforeunload` 取消，不能让请求永远挂起），因此硬跳转生效前组件可能短暂展示普通失败态；组件不得再为 401 维护单独的加载态分支（该分支不可观测、无法验证）
+- `apiService` 监听 `window` 的 `storage` 事件，只处理 `userId`/`accessToken`/`userRole`（以及 `clear()` 时 `key === null`）：`userId` 或 `userRole` 与本页不同（其他分页换号、改角色或登出）时整页 `location.reload()`，避免页面仍是旧用户状态却用新身份发请求；仅 `accessToken` 更新时就地同步，避免本页带旧 token 得到 401 后把其他分页新写入的登录态一起清掉
+- `fetch` 直连路径（SSE 流 `chatStreamClient`、文件预览/下载、`AuthenticatedImage`、`sessionDraftOutbox` 等）不在此单点内：401 以 `HttpError` 等形式交给调用方按普通失败展示，尚未收敛
+- 超时（无 `response`）与网关改写后的 403/5xx/HTML 响应不视为认证失效，继续按普通业务失败展示
+- 检测到认证失效使用整页硬跳转（`window.location.href = '/login'` 或 `'/admin/login'`）以彻底清空内存态；用户主动退出登录仍走 `navigate('/login')` 软跳转。二者语义不同，不得混用
 
 ## 6. 可观测性
 

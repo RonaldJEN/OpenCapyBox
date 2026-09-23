@@ -148,6 +148,8 @@ function _matchesAcceptedRequest(round: any, idempotencyKey: string): boolean {
   return round?.idempotency_key === idempotencyKey;
 }
 
+const AUTH_STORAGE_KEYS = ['userId', 'accessToken', 'userRole'];
+
 class APIService {
   private client: AxiosInstance;
   private userId: string | null = null;
@@ -168,6 +170,17 @@ class APIService {
     this.accessToken = localStorage.getItem('accessToken');
     this.userRole = localStorage.getItem('userRole') as 'admin' | 'user' | null;
 
+    // 其他分页改写登录态：身份（用户/角色）变了就整页重载，避免页面仍是旧用户状态却用新身份发请求；
+    // 只有 token 更新时就地同步，避免本页带旧 token 得到 401 后把其他分页新写入的登录态一起清掉
+    window.addEventListener('storage', (event) => {
+      if (event.key !== null && !AUTH_STORAGE_KEYS.includes(event.key)) return;
+      if (localStorage.getItem('userId') !== this.userId || localStorage.getItem('userRole') !== this.userRole) {
+        window.location.reload();
+        return;
+      }
+      this.accessToken = localStorage.getItem('accessToken');
+    });
+
     // 请求拦截器 - 添加 Authorization Bearer Token
     this.client.interceptors.request.use((config) => {
       if (this.accessToken && config.url !== '/auth/login') {
@@ -181,9 +194,9 @@ class APIService {
       (response) => response,
       (error) => {
         const isLoginRequest = error.config?.url === '/auth/login';
+        // 只有后端明确 401 才算认证失效；超时、网关 403/5xx/HTML 响应按普通失败交给调用方
         if (error.response?.status === 401 && !isLoginRequest) {
-          this.logout();
-          window.location.href = '/login';
+          this.handleAuthFailure();
         }
         return Promise.reject(error);
       }
@@ -245,6 +258,12 @@ class APIService {
     localStorage.removeItem('userId');
     localStorage.removeItem('accessToken');
     localStorage.removeItem('userRole');
+  }
+
+  // 认证失效的统一处理入口：清理登录态并回到登录页（管理后台回管理员登录页，与 AdminRoute 一致）
+  handleAuthFailure() {
+    this.logout();
+    window.location.href = window.location.pathname.startsWith('/admin') ? '/admin/login' : '/login';
   }
 
   // ========== 认证 API ==========

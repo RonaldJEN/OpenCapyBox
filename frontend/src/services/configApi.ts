@@ -1,37 +1,7 @@
-import axios, { AxiosHeaders } from 'axios';
+import { apiService } from './api';
 
-// 复用主 API 的 axios 实例配置
-const client = axios.create({
-  baseURL: '/api',
-  timeout: 30000,
-  headers: { 'Content-Type': 'application/json' },
-});
-
-// 自动附加 Bearer Token
-client.interceptors.request.use((config) => {
-  const accessToken = localStorage.getItem('accessToken');
-  if (accessToken) {
-    const headers = config.headers instanceof AxiosHeaders
-      ? config.headers
-      : new AxiosHeaders(config.headers);
-    headers.set('Authorization', `Bearer ${accessToken}`);
-    config.headers = headers;
-  }
-  return config;
-});
-
-// 401 响应拦截：token 过期后清除凭据并跳转登录
-client.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    if (error.response?.status === 401) {
-      localStorage.removeItem('accessToken');
-      localStorage.removeItem('userId');
-      window.location.href = '/login';
-    }
-    return Promise.reject(error);
-  },
-);
+// 复用主 API 的 axios 实例：鉴权头与 401 认证失效处理都由主客户端统一负责
+const client = apiService.getAxiosClient();
 
 // ========== Agent 配置文件 API ==========
 

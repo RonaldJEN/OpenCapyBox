@@ -12,38 +12,35 @@ const { mockAxiosInstance } = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('axios', () => {
-  class MockAxiosHeaders {
-    private headers: Record<string, string>;
-
-    constructor(init?: Record<string, string>) {
-      this.headers = init ? { ...init } : {};
-    }
-
-    set(key: string, value: string) {
-      this.headers[key] = value;
-    }
-  }
-
-  return {
-    AxiosHeaders: MockAxiosHeaders,
-    default: {
-      create: vi.fn(() => mockAxiosInstance),
-    },
-  };
-});
+vi.mock('axios', () => ({
+  default: {
+    create: vi.fn(() => mockAxiosInstance),
+  },
+}));
 
 describe('configApi', () => {
   let configApi: typeof import('../../services/configApi');
+  let apiService: typeof import('../../services/api').apiService;
 
   beforeEach(async () => {
     vi.clearAllMocks();
     vi.resetModules();
+    apiService = (await import('../../services/api')).apiService;
     configApi = await import('../../services/configApi');
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('复用主客户端，不另建 axios 实例', async () => {
+    const axiosModule = await import('axios');
+    expect(axiosModule.default.create).toHaveBeenCalledTimes(1);
+    expect(apiService.getAxiosClient()).toBe(mockAxiosInstance);
+
+    mockAxiosInstance.get.mockResolvedValue({ data: { jobs: [] } });
+    await configApi.getCronJobs();
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/cron/jobs');
   });
 
   it('allows the skills recovery request to wait up to 240 seconds', async () => {
