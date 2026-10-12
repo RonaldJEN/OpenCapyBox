@@ -12,11 +12,15 @@ import {
   type TableHTMLAttributes,
 } from 'react';
 import { PanelLeftClose, PanelLeftOpen, X } from 'lucide-react';
+import { toString } from 'mdast-util-to-string';
 import ReactMarkdown, { type Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import remarkParse from 'remark-parse';
+import { unified } from 'unified';
+import { markdownMathRehypePlugins, markdownRemarkPlugins } from '../../utils/markdownMath';
 
 import { apiService } from '../../services/api';
 import { AuthenticatedImage } from '../AuthenticatedImage';
+import { markdownMathComponents } from '../MarkdownMath';
 import { openBlobPreviewInWindow } from './htmlBlobPreview';
 
 interface MarkdownReportPreviewProps {
@@ -29,6 +33,7 @@ interface MarkdownHeading {
   depth: number;
   text: string;
   id: string;
+  offset: number;
 }
 
 const EXTERNAL_TARGET_PATTERN = /^[a-z][a-z\d+.-]*:/i;
@@ -90,14 +95,6 @@ function flattenText(node: ReactNode): string {
     .join('');
 }
 
-function plainHeadingText(value: string): string {
-  return value
-    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/[`*_~]/g, '')
-    .trim();
-}
-
 function slugBase(value: string): string {
   const slug = value
     .normalize('NFKC')
@@ -115,36 +112,44 @@ function uniqueSlug(value: string, counts: Map<string, number>): string {
   return count === 0 ? base : `${base}-${count + 1}`;
 }
 
+// 与渲染使用同一套 remark 插件解析，标题的源偏移与 ReactMarkdown 传给组件的 node.position 一致。
+const headingParser = unified().use(remarkParse).use(markdownRemarkPlugins);
+
+// FilePreview 头部目录与 MarkdownReportPreview 在同一次渲染里对同一份原文各取一次，共用一次解析。
+let lastExtracted: { content: string; headings: MarkdownHeading[] } | null = null;
+
+/**
+ * 从 Markdown 语法树提取 1–3 级标题，按文档顺序一次性分配 ID。
+ * 代码块、列表与引用容器由解析器判定；目录与正文都按 `offset` 读取这里的 ID，渲染期间不再计数。
+ * 脚注内容不属于正文结构：被引用时渲染在文末脚注区，未被引用时不输出，其中的标题都不进目录。
+ */
 export function extractMarkdownHeadings(content: string): MarkdownHeading[] {
+  if (lastExtracted?.content === content) return lastExtracted.headings;
   const headings: MarkdownHeading[] = [];
   const counts = new Map<string, number>();
-  let fenced = false;
-
-  content.split(/\r?\n/).forEach((line) => {
-    if (/^\s*(```|~~~)/.test(line)) {
-      fenced = !fenced;
+  const visit = (node: any) => {
+    if (node.type === 'footnoteDefinition') return;
+    if (node.type === 'heading' && node.depth <= 3) {
+      const text = toString(node).trim();
+      if (text) headings.push({ depth: node.depth, text, id: uniqueSlug(text, counts), offset: node.position.start.offset });
       return;
     }
-    if (fenced) return;
-
-    const match = line.match(/^\s{0,3}(#{1,3})\s+(.+?)\s*#*\s*$/);
-    if (!match) return;
-    const text = plainHeadingText(match[2]);
-    if (!text) return;
-    headings.push({ depth: match[1].length, text, id: uniqueSlug(text, counts) });
-  });
-
+    node.children?.forEach(visit);
+  };
+  visit(headingParser.parse(content));
+  lastExtracted = { content, headings };
   return headings;
 }
 
 function createHeadingComponent(
   depth: 1 | 2 | 3,
-  counts: Map<string, number>,
+  idByOffset: Map<number, string>,
 ): NonNullable<Components[`h${typeof depth}`]> {
-  const Heading = ({ children }: { children?: ReactNode }) => {
+  // GFM 脚注区的标题不在目录索引里（插件生成的没有源位置，脚注内容里的不进目录），保留插件给出的属性。
+  const Heading = ({ node, children, ...props }: { node?: any; children?: ReactNode }) => {
     const Tag = `h${depth}` as const;
-    const id = uniqueSlug(flattenText(children), counts);
-    return <Tag id={id}>{children}</Tag>;
+    const id = node.position && idByOffset.get(node.position.start.offset);
+    return <Tag {...props} {...(id ? { id } : {})}>{children}</Tag>;
   };
   return Heading;
 }
@@ -206,7 +211,10 @@ export function MarkdownReportPreview({
   const tocId = useId();
   const tocToggleRef = useRef<HTMLButtonElement>(null);
   const reportViewportRef = useRef<HTMLDivElement>(null);
-  const renderSlugCounts = new Map<string, number>();
+  const headingIdByOffset = useMemo(
+    () => new Map(headings.map((heading) => [heading.offset, heading.id])),
+    [headings],
+  );
 
   useEffect(() => {
     setTocOpen(false);
@@ -248,9 +256,10 @@ export function MarkdownReportPreview({
   };
 
   const components: Components = {
-    h1: createHeadingComponent(1, renderSlugCounts),
-    h2: createHeadingComponent(2, renderSlugCounts),
-    h3: createHeadingComponent(3, renderSlugCounts),
+    ...markdownMathComponents,
+    h1: createHeadingComponent(1, headingIdByOffset),
+    h2: createHeadingComponent(2, headingIdByOffset),
+    h3: createHeadingComponent(3, headingIdByOffset),
     table: ({ children, ...props }: TableHTMLAttributes<HTMLTableElement>) => (
       <div className="file-preview-markdown-table" tabIndex={0} aria-label="可横向滚动的表格">
         <table {...props}>{children}</table>
@@ -369,7 +378,7 @@ export function MarkdownReportPreview({
 
         <div ref={reportViewportRef} className="file-preview-report-viewport">
           <article className="file-preview-report prose">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+            <ReactMarkdown remarkPlugins={markdownRemarkPlugins} rehypePlugins={markdownMathRehypePlugins} components={components}>
               {content}
             </ReactMarkdown>
           </article>

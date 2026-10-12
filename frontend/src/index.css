@@ -298,3 +298,29 @@ textarea::placeholder {
   font-weight: 400;
   opacity: 0.5;
 }
+
+/* Markdown 公式：\text{中文} 回落到正文中文字体（KaTeX 默认回落到宋体），字号向正文收敛 */
+body .katex {
+  font-family: KaTeX_Main, "Times New Roman", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", serif;
+  font-size: 1.1em;
+}
+
+/* 独立公式在块内横向滚动，不撑宽聊天列 */
+.markdown-math-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/*
+ * 行内公式的不可拆片段（分式、矩阵）超宽时在片段内横向滚动。
+ * - line-height: 0 让片段盒高等于 KaTeX strut，配合 MarkdownMath 组件写入的 vertical-align 使基线与正文对齐；
+ * - KaTeX 相对定位的上下标与中文字形会超出 strut，用 padding 留出绘制空间、等量负 margin 抵消占位，避免被裁切或出现多余滚动条。
+ */
+.katex .base.markdown-math-inline-base {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  line-height: 0;
+  padding: 0.25em 0.15em;
+  margin: -0.25em -0.15em;
+}

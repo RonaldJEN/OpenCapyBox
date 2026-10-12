@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { markdownMathRehypePlugins, markdownRemarkPlugins } from '../utils/markdownMath';
 import FeedbackMessage from './FeedbackMessage';
+import { markdownMathComponents } from './MarkdownMath';
 import {
   Check,
   Layers,
@@ -88,7 +89,9 @@ function fileForMemoryTab(tab: MemoryTab): AgentFileName {
 function MarkdownView({ content }: { content: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={markdownRemarkPlugins}
+      rehypePlugins={markdownMathRehypePlugins}
+      components={markdownMathComponents}
       className="prose max-w-none text-[13.5px] leading-7 text-[#1c1a16] [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_h1]:text-xl [&_h2]:text-lg [&_h3]:text-base [&_li]:my-1 [&_p]:my-3"
     >
       {content}

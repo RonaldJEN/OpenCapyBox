@@ -132,7 +132,7 @@ Session 文件工作台是主布局的一部分，不适用普通右侧 Overlay 
 
 | 类型 | 预览语义 |
 |---|---|
-| Markdown | GFM、默认关闭的可折叠 outline、平面报告排版、表格滚动；当前 Session 直接进入所见即所得编辑，外部只读来源保持渲染预览；相对图片和文件链接通过 session 鉴权 URL 解析，拒绝越界 |
+| Markdown | GFM、默认关闭的可折叠 outline、平面报告排版、表格滚动；只读渲染预览的数学公式与 CJK 强调规则同 [frontend-chat-spec §2.3](./frontend-chat-spec.md)；当前 Session 直接进入所见即所得编辑，外部只读来源保持渲染预览；相对图片和文件链接通过 session 鉴权 URL 解析，拒绝越界 |
 | HTML | `srcDoc` iframe `sandbox="allow-scripts"`、源码、下载、安全 Blob 新标签 |
 | TXT/LOG | 纯文本只读阅读，固定自动换行、系统字体、15px / 1.7 行高；保留原始空白和换行，连续字符可在任意位置软换行。正文直接铺在白色内容区，24–32px 内边距，不嵌套卡片或横向滚动容器。不提供换行/字体选项或专用工具栏，不改写原文 |
 | 代码/JSON | 语法高亮、行号/换行、复制，继续使用代码预览器 |
@@ -168,10 +168,14 @@ Office 首次派生期间显示“正在生成 PDF 预览”；等待 2500ms 后
 - 关闭 dirty 标签或文件面板时，在调用栈内先让编辑器把当前内容交给应用级 outbox，然后立即关闭；远端请求在后台完成。不得因为编辑器尚未挂载、网络失败或版本变化阻塞操作，也不得弹出放弃确认。
 - 切换 Session 或新建会话遵循同一规则：同步抓取当前 owner 草稿后立即应用目标会话，远端保存静默进行。所有草稿、保存和回执携带稳定 session/path 或 workspace/entry key 与 generation；A 的迟到事务不得作用于 B。页面重载后只恢复 Session outbox；尚未远端成功的 Workspace 草稿允许丢失并从服务端 current head 重新打开。
 - ChatV2 的 direct send 先按本轮 Workspace 附件 `entry_id[]` 定向调用面板保存；这些作为模型输入的 dirty 文件必须得到 `ok && !stale` 回执后才能发送，失败时保留 composer 且不创建 Round。随后 send/resume 再同步捕获其余 dirty editor 到各自 outbox，远端保存、自动合并和未决重试在后台继续；Workspace 确定性终态失败会丢弃该文件草稿，但不得清除 composer。只有非附件 `{source,path}` 进入本轮有界 `pending_file_drafts`，只在 Agent 请求上下文披露同步状态，不在前端显示全局提示，也不传草稿正文。
-- 服务端灌入不得触发 PUT；只有用户在所见即所得画布中的真实内容变化才标记 dirty。
+- 服务端灌入不得触发 PUT；只有用户在所见即所得画布中的真实内容变化才标记 dirty。Vditor 读出的 Markdown 是 Lute 对画布的重新序列化，与原文不是同一表示（行内 `$$` 变独立公式块、setext `---` 变 `----`、脚注缩进等），不能直接与服务端原文比较：编辑器在每次载入/外部写入后记录「原文 ↔ 画布序列化」基线，序列化仍等于基线即视为未修改，`getMarkdown()` 返回原文且不发 `onChange`；改回原样同样回到原文。因此只打开、滚动、使用目录后关闭、切换或导入工作区都不会把规范化文本写回；用户真实修改后按 Vditor 序列化保存（整篇格式可能随之规范化，属于所见即所得编辑的已知代价）。切换文件时新画布在初始化完成前不接受外部写入，由初始化流程灌入最新内容并建立基线。
 - 目录默认关闭；存在多个章节时，顶部工具栏显示真实“展开目录/收起目录”按钮，并公开 `aria-expanded` / `aria-controls`。
 - 展开后目录为独立左侧 outline，使用 1px divider 与正文分隔；目录和正文各自滚动，关闭后正文占满并居中。
 - 目录链接保留真实 heading 锚点并以 `aria-current="location"` 标识当前章节；窄容器下目录转为可关闭的覆盖层。
+- 目录由与渲染相同插件链的 Markdown 语法树提取 1–3 级标题（含 setext、列表/引用内标题，排除各类代码块与脚注内容：脚注未被引用时不渲染，被引用时位于文末脚注区，都不属于正文结构），按文档顺序一次性生成去重 ID 并记录源偏移；正文 heading 按源偏移读取同一 ID，渲染期间不计数，React StrictMode 重复渲染不改变 ID。目录文字为标题纯文本，公式取 LaTeX 原文（如 `收益 x^2`）。
+- 文件预览头部的目录条目与滚动目标必须同源，不按标题文字匹配，也不把 remark 语法树与 Vditor（Lute）DOM 按位置对齐（两者对 YAML front matter、setext、纯图片标题的判定不同）：
+  - Vditor 编辑：条目与目标都取自画布 DOM 的 1–3 级标题（`VditorMarkdownEditor` 在初始化、输入与外部 `setValue` 后上报 `onOutlineChange`，标题结构不变时不上报；`scrollToHeading(i)` 滚动到同一列表的第 i 项），排除 Vditor 脚注块与 HTML 块预览中的标题及空标题；条目文字与画布显示一致（公式取源码、转义反斜杠不显示，纯图片标题取 alt）。画布就绪前与销毁后目录为空，不显示目录按钮。编辑时不再为目录逐键解析 Markdown。
+  - 只读预览：条目取上述语法树目录，按 `MarkdownReportPreview` 写入的同一标题 ID 定位。
 - Markdown 下载按钮直接下载服务器上的原始 Markdown 文件，不提供格式选择或 Word 转换；下载不触发编辑保存。
 
 ### 6.2 电子表格编辑工作区
@@ -237,9 +241,9 @@ Office 首次派生期间显示“正在生成 PDF 预览”；等待 2500ms 后
 - [ ] 模型更新已打开的 clean 工作区文件时仅右侧命中标签原位更新且旧内容不中断；首次内容未 ready 时 revision 再变化仍保持 loading，不露出类型降级卡；dirty 标签继续保存，后端自动合并且人的重叠内容不丢，不显示冲突决策 UI
 - [ ] waiting/resume/cancel/failed 期间文件工作台不破坏聊天状态
 - [ ] 运行中的 Agent 与并发 Session/Workspace 文件预览共存；文件请求不持有 DB 连接等待 Sandbox，不重建绑定，连接池无 overflow/blocked lock
-- [ ] Markdown 直接进入单一所见即所得画布；当前编辑与生成时快照共享右侧工作台壳但 content identity 隔离，revision conflict 停止自动重试且旧草稿不覆盖当前/只读内容
+- [ ] Markdown 直接进入单一所见即所得画布；当前编辑与生成时快照共享右侧工作台壳但 content identity 隔离，revision conflict 停止自动重试且旧草稿不覆盖当前/只读内容；未编辑的 Markdown（含 Lute 会规范化的行内 `$$`、setext 标题、脚注）打开后关闭/切换不发 PUT，真实修改后才保存
 - [ ] Markdown 下载按钮可键盘操作，直接下载原文件，不显示格式菜单或触发派生转换
-- [ ] Markdown 目录默认关闭，展开/收起、当前章节、独立滚动和窄屏覆盖层语义正确
+- [ ] Markdown 目录默认关闭，展开/收起、当前章节、独立滚动和窄屏覆盖层语义正确；头部目录在 Vditor（画布 DOM）与只读预览（标题 ID）中都能定位带公式的同名标题，不受 YAML front matter、纯图片标题、脚注、HTML 块预览与空标题影响，编辑器就绪前不显示
 - [ ] Markdown 相对资源、HTML/DOCX/PDF/XLSX/PPTX/图片/代码/ZIP 均有真实预览或明确降级
 - [ ] CSV/XLSX 修改值/公式后保真自动保存并刷新最近修改时间；链接/批注/数字格式与 CSV 编码换行 round-trip 不丢失；XLS/ET 强制只读且不发写请求
 - [ ] 100 页 PPTX 主区只挂载当前页±2 Canvas，缩略图懒渲染且定位/滚动同步；后台刷新在新 PDF.js 文档和第一页 ready 前保留旧 deck，失败或迟到响应不清空/回切

@@ -1,5 +1,6 @@
 import {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
   useRef,
@@ -13,10 +14,13 @@ import 'vditor/dist/js/lute/lute.min.js';
 
 import { apiService } from '../../services/api';
 import { resolveMarkdownSessionPath } from './MarkdownReportPreview';
+import { type MarkdownOutlineItem, vditorOutlineHeadings } from './markdownOutline';
 
 interface VditorMarkdownEditorProps {
   markdown: string;
   onChange: (markdown: string) => void;
+  /** 画布中的正文标题；与 scrollToHeading 的序号一一对应。 */
+  onOutlineChange: (outline: MarkdownOutlineItem[]) => void;
   filePath: string;
   buildSessionFileUrl: (resolvedPath: string) => string;
   toolbarOpen: boolean;
@@ -24,6 +28,7 @@ interface VditorMarkdownEditorProps {
 
 export interface VditorMarkdownEditorHandle {
   getMarkdown: () => string;
+  scrollToHeading: (index: number) => void;
 }
 
 const EXTERNAL_IMAGE_PATTERN = /^(?:[a-z][a-z\d+.-]*:|\/\/)/i;
@@ -101,6 +106,7 @@ function decorateIntentionalEmptyParagraphs(root: ParentNode) {
 export const VditorMarkdownEditor = forwardRef<VditorMarkdownEditorHandle, VditorMarkdownEditorProps>(function VditorMarkdownEditor({
   markdown,
   onChange,
+  onOutlineChange,
   filePath,
   buildSessionFileUrl,
   toolbarOpen,
@@ -111,20 +117,55 @@ export const VditorMarkdownEditor = forwardRef<VditorMarkdownEditorHandle, Vdito
   const latestMarkdownRef = useRef(markdown);
   const emittedMarkdownRef = useRef(markdown);
   const onChangeRef = useRef(onChange);
+  const onOutlineChangeRef = useRef(onOutlineChange);
+  const outlineSignatureRef = useRef('');
   const objectUrlBySourceRef = useRef(new Map<string, string>());
   const sourceByObjectUrlRef = useRef(new Map<string, string>());
+  // 画布就绪后才有基线；为空时不可能有用户修改。
+  const baselineRef = useRef<{ source: string; serialized: string } | null>(null);
   const [ready, setReady] = useState(false);
 
   latestMarkdownRef.current = markdown;
   onChangeRef.current = onChange;
+  onOutlineChangeRef.current = onOutlineChange;
+
+  const serializeCanvas = useCallback((value: string) => restoreSessionImageSources(
+    serializeIntentionalTrailingParagraphs(value, editableElementRef.current),
+    sourceByObjectUrlRef.current,
+  ), []);
+
+  /**
+   * Vditor 读出的 Markdown 是 Lute 对画布的重新序列化，与服务端原文不是同一表示
+   * （行内 `$$` 变独立块、setext `---` 变 `----` 等）。载入或外部写入后记下「原文 ↔ 画布序列化」基线，
+   * 序列化仍等于基线就是未修改，对外给原文：规范化结果不能当成用户修改写回（服务端灌入不得触发 PUT）。
+   */
+  const toSourceMarkdown = useCallback((serialized: string) => (
+    serialized === baselineRef.current!.serialized ? baselineRef.current!.source : serialized
+  ), []);
+
+  const captureBaseline = useCallback((source: string) => {
+    baselineRef.current = { source, serialized: serializeCanvas(editorRef.current!.getValue()) };
+  }, [serializeCanvas]);
+
+  // 画布内容变化后上报目录；标题结构不变时不触发父组件渲染。
+  const reportOutline = useCallback(() => {
+    const outline = vditorOutlineHeadings(editableElementRef.current!).map(({ depth, text }) => ({ depth, text }));
+    const signature = JSON.stringify(outline);
+    if (signature === outlineSignatureRef.current) return;
+    outlineSignatureRef.current = signature;
+    onOutlineChangeRef.current(outline);
+  }, []);
 
   useImperativeHandle(forwardedRef, () => ({
-    getMarkdown: () => {
-      const current = editorRef.current?.getValue() ?? emittedMarkdownRef.current;
-      const serialized = serializeIntentionalTrailingParagraphs(current, editableElementRef.current);
-      return restoreSessionImageSources(serialized, sourceByObjectUrlRef.current);
+    getMarkdown: () => (
+      baselineRef.current
+        ? toSourceMarkdown(serializeCanvas(editorRef.current!.getValue()))
+        : emittedMarkdownRef.current
+    ),
+    scrollToHeading: (index: number) => {
+      vditorOutlineHeadings(editableElementRef.current!)[index].element.scrollIntoView({ block: 'start', behavior: 'smooth' });
     },
-  }), []);
+  }), [serializeCanvas, toSourceMarkdown]);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -185,11 +226,13 @@ export const VditorMarkdownEditor = forwardRef<VditorMarkdownEditorHandle, Vdito
 
     // FilePreview 的 autosave 已经 debounce；再叠一层会让快速关闭丢掉最后的输入。
     const emitInput = (value: string) => {
-      const serialized = serializeIntentionalTrailingParagraphs(value, editableElement);
-      const restored = restoreSessionImageSources(serialized, sourceByObjectUrl);
-      if (restored === emittedMarkdownRef.current) return;
-      emittedMarkdownRef.current = restored;
-      if (!disposed) onChangeRef.current(restored);
+      // Vditor 的 destroy 不清除 undoDelay 计时器，延迟的 input 回调可能在销毁后才到达。
+      if (disposed) return;
+      reportOutline();
+      const markdown = toSourceMarkdown(serializeCanvas(value));
+      if (markdown === emittedMarkdownRef.current) return;
+      emittedMarkdownRef.current = markdown;
+      onChangeRef.current(markdown);
     };
 
     const preserveContinuousEnter = (event: KeyboardEvent) => {
@@ -337,6 +380,8 @@ export const VditorMarkdownEditor = forwardRef<VditorMarkdownEditorHandle, Vdito
         hydrateImages(mount);
         decorateMachineCommentBlocks(mount);
         decorateIntentionalEmptyParagraphs(mount);
+        captureBaseline(latestMarkdown);
+        reportOutline();
         setReady(true);
       },
     });
@@ -344,25 +389,32 @@ export const VditorMarkdownEditor = forwardRef<VditorMarkdownEditorHandle, Vdito
 
     return () => {
       disposed = true;
+      // 画布即将销毁，旧目录不能再指向它。
+      outlineSignatureRef.current = '[]';
+      onOutlineChangeRef.current([]);
       observer?.disconnect();
       editableElement?.removeEventListener('keydown', preserveContinuousEnter, true);
       editableElement?.removeEventListener('beforeinput', releaseEmptyParagraphPlaceholder, true);
       editableElement?.removeEventListener('input', captureNativeInput);
       editableElement?.removeEventListener('compositionend', captureNativeInput);
       editableElementRef.current = null;
+      baselineRef.current = null;
       editor.destroy();
       editorRef.current = null;
       objectUrlBySource.forEach((url) => URL.revokeObjectURL(url));
       objectUrlBySource.clear();
       sourceByObjectUrl.clear();
     };
-  }, [buildSessionFileUrl, filePath]);
+  }, [buildSessionFileUrl, captureBaseline, filePath, reportOutline, serializeCanvas, toSourceMarkdown]);
 
   useEffect(() => {
-    if (!ready || markdown === emittedMarkdownRef.current) return;
+    // 切换文件时上面的 effect 在同一次提交里重建画布，ready 仍是旧值；新画布还没有基线，由 after 自行灌入最新内容。
+    if (!ready || !baselineRef.current || markdown === emittedMarkdownRef.current) return;
     emittedMarkdownRef.current = markdown;
     editorRef.current?.setValue(markdown, true);
-  }, [markdown, ready]);
+    captureBaseline(markdown);
+    reportOutline();
+  }, [captureBaseline, markdown, ready, reportOutline]);
 
   return (
     <div className="file-preview-vditor-shell" data-toolbar-open={toolbarOpen} aria-busy={!ready}>

@@ -126,3 +126,13 @@ describe('SettingsCenter', () => {
     expect(vi.mocked(getAgentFile).mock.calls.filter(([name]) => name === 'user')).toHaveLength(2);
   });
 });
+
+describe('SettingsCenter Markdown 公式', () => {
+  it('记忆文件只读视图渲染公式', async () => {
+    vi.mocked(getAgentFile).mockImplementation(async (name: string) => ({
+      name, file_type: name, content: '偏好：$$ \\text{风险} \\le 1 $$', version: 1,
+    }));
+    render(<SettingsCenter />);
+    await waitFor(() => expect(document.querySelector('.katex annotation')?.textContent).toBe('\\text{风险} \\le 1'));
+  });
+});

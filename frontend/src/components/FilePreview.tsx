@@ -81,6 +81,7 @@ import {
 } from './file-preview/previewRegistry';
 import './file-preview/filePreview.css';
 import type { VditorMarkdownEditorHandle } from './file-preview/VditorMarkdownEditor';
+import type { MarkdownOutlineItem } from './file-preview/markdownOutline';
 import type { SpreadsheetEditorHandle } from './file-preview/SpreadsheetEditor';
 import FeedbackMessage, { DEFAULT_FEEDBACK_AUTO_DISMISS_MS } from './FeedbackMessage';
 import { WorkspaceDestinationPicker } from './workspace/WorkspaceDestinationPicker';
@@ -273,6 +274,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   const [markdownRevision, setMarkdownRevision] = useState(0);
   const [markdownToolbarOpen, setMarkdownToolbarOpen] = useState(false);
   const [markdownTocOpen, setMarkdownTocOpen] = useState(false);
+  const [vditorOutline, setVditorOutline] = useState<MarkdownOutlineItem[]>([]);
   const [docxHtml, setDocxHtml] = useState('');
   const [spreadsheetSource, setSpreadsheetSource] = useState<ArrayBuffer | null>(null);
   const [spreadsheetDirty, setSpreadsheetDirty] = useState(false);
@@ -372,10 +374,14 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   const spreadsheetReadOnly = descriptor?.kind === 'spreadsheet' && (
     effectiveReadOnly || Boolean(retainedSessionDraft) || descriptor.type === 'xls' || descriptor.type === 'et'
   );
+  // 头部目录的条目与滚动目标同源：Vditor 编辑时取自画布 DOM（onOutlineChange / scrollToHeading），
+  // 只读预览取语法树并按 MarkdownReportPreview 写入的标题 ID 定位。两套解析器的结构不按位置对齐。
+  const editingMarkdown = descriptor?.kind === 'markdown' && !effectiveReadOnly && !retainedSessionDraft;
   const markdownHeadings = useMemo(
-    () => descriptor?.kind === 'markdown' ? extractMarkdownHeadings(markdownDraft) : [],
-    [descriptor?.kind, markdownDraft],
+    () => descriptor?.kind === 'markdown' && !editingMarkdown ? extractMarkdownHeadings(markdownDraft) : [],
+    [descriptor?.kind, editingMarkdown, markdownDraft],
   );
+  const markdownOutline: MarkdownOutlineItem[] = editingMarkdown ? vditorOutline : markdownHeadings;
 
   const getPreviewApiUrl = () => {
     if (!file) return '';
@@ -1696,12 +1702,15 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     return () => window.clearTimeout(timer);
   }, [workspaceNotice]);
 
-  const scrollToMarkdownHeading = (text: string) => {
-    const candidates = contentViewportRef.current?.querySelectorAll<HTMLElement>('h1, h2, h3');
-    const target = Array.from(candidates || []).find(
-      (heading) => heading.textContent?.replace(/\s+/g, ' ').trim() === text,
-    );
-    target?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  const scrollToMarkdownHeading = (index: number) => {
+    if (editingMarkdown) {
+      markdownEditorRef.current!.scrollToHeading(index);
+      return;
+    }
+    const { id } = markdownHeadings[index];
+    Array.from(contentViewportRef.current!.querySelectorAll<HTMLElement>('h1, h2, h3'))
+      .find((heading) => heading.id === id)!
+      .scrollIntoView({ block: 'start', behavior: 'smooth' });
   };
 
   if (!file || !descriptor) return null;
@@ -1779,6 +1788,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
                 filePath={file.path}
                 buildSessionFileUrl={buildMarkdownSessionFileUrl}
                 toolbarOpen={markdownToolbarOpen}
+                onOutlineChange={setVditorOutline}
                 onChange={(nextMarkdown) => {
                   markdownRevisionRef.current += 1;
                   markdownRemoteSavedRef.current = false;
@@ -1940,7 +1950,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     <div className={cardClassName} onClick={inline ? undefined : (event) => event.stopPropagation()} data-testid={inline ? 'file-preview-inline' : undefined}>
       <div className={headerClassName}>
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          {descriptor.kind === 'markdown' && markdownHeadings.length > 1 && (
+          {descriptor.kind === 'markdown' && markdownOutline.length > 1 && (
             <button
               type="button"
               aria-label={markdownTocOpen ? '收起目录' : '展开目录'}
@@ -2101,18 +2111,18 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       )}
 
       <div ref={contentViewportRef} className={`${contentClassName} relative`}>
-        {descriptor.kind === 'markdown' && markdownTocOpen && markdownHeadings.length > 1 && (
+        {descriptor.kind === 'markdown' && markdownTocOpen && markdownOutline.length > 1 && (
           <aside className="absolute inset-y-0 left-0 z-30 flex w-[224px] flex-col border-r border-claude-border bg-white shadow-xl" aria-label="Markdown 目录">
             <div className="flex h-10 shrink-0 items-center justify-between border-b border-claude-border px-3">
               <span className="text-xs font-semibold text-claude-text">目录</span>
               <button type="button" onClick={() => setMarkdownTocOpen(false)} className="rounded p-1 text-claude-muted hover:bg-claude-hover" aria-label="收起目录"><X size={14} aria-hidden="true" /></button>
             </div>
             <nav className="min-h-0 flex-1 overflow-y-auto p-2">
-              {markdownHeadings.map((heading) => (
+              {markdownOutline.map((heading, index) => (
                 <button
-                  key={heading.id}
+                  key={`${index}:${heading.text}`}
                   type="button"
-                  onClick={() => scrollToMarkdownHeading(heading.text)}
+                  onClick={() => scrollToMarkdownHeading(index)}
                   className="block w-full truncate rounded-md px-2 py-1.5 text-left text-xs text-claude-secondary hover:bg-claude-hover hover:text-claude-text"
                   style={{ paddingLeft: `${8 + (heading.depth - 1) * 10}px` }}
                   title={heading.text}

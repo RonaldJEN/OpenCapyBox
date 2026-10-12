@@ -106,6 +106,7 @@ describe('VditorMarkdownEditor', () => {
         ref={ref}
         markdown="# 初始内容"
         onChange={onChange}
+        onOutlineChange={() => {}}
         filePath="reports/report.md"
         buildSessionFileUrl={buildSessionFileUrl}
         toolbarOpen={false}
@@ -128,6 +129,7 @@ describe('VditorMarkdownEditor', () => {
         ref={ref}
         markdown="# 服务端新版本"
         onChange={onChange}
+        onOutlineChange={() => {}}
         filePath="reports/report.md"
         buildSessionFileUrl={buildSessionFileUrl}
         toolbarOpen
@@ -146,6 +148,7 @@ describe('VditorMarkdownEditor', () => {
       <VditorMarkdownEditor
         markdown="第一行"
         onChange={() => {}}
+        onOutlineChange={() => {}}
         filePath="report.md"
         buildSessionFileUrl={(path) => path}
         toolbarOpen={false}
@@ -178,6 +181,7 @@ describe('VditorMarkdownEditor', () => {
         ref={ref}
         markdown="第一行"
         onChange={onChange}
+        onOutlineChange={() => {}}
         filePath="report.md"
         buildSessionFileUrl={(path) => path}
         toolbarOpen={false}
@@ -204,6 +208,7 @@ describe('VditorMarkdownEditor', () => {
       <VditorMarkdownEditor
         markdown={'第一行\n\n&nbsp;'}
         onChange={() => {}}
+        onOutlineChange={() => {}}
         filePath="report.md"
         buildSessionFileUrl={(path) => path}
         toolbarOpen={false}
@@ -219,6 +224,7 @@ describe('VditorMarkdownEditor', () => {
       <VditorMarkdownEditor
         markdown="初稿"
         onChange={onChange}
+        onOutlineChange={() => {}}
         filePath="report.md"
         buildSessionFileUrl={(path) => path}
         toolbarOpen={false}
@@ -239,6 +245,7 @@ describe('VditorMarkdownEditor', () => {
         ref={ref}
         markdown={source}
         onChange={() => {}}
+        onOutlineChange={() => {}}
         filePath="report.md"
         buildSessionFileUrl={(path) => path}
         toolbarOpen={false}
@@ -263,7 +270,7 @@ describe('VditorMarkdownEditor', () => {
 
   it('原生输入立即交付草稿，不等待 Vditor 延迟回调且不重复交付', async () => {
     const onChange = vi.fn();
-    render(<VditorMarkdownEditor markdown="正文" onChange={onChange} filePath="report.md" buildSessionFileUrl={() => ''} toolbarOpen={false} />);
+    render(<VditorMarkdownEditor markdown="正文" onChange={onChange} onOutlineChange={() => {}} filePath="report.md" buildSessionFileUrl={() => ''} toolbarOpen={false} />);
     const editor = await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
     instances[0].value = 'AAA正文';
     fireEvent.input(editor);
@@ -285,6 +292,7 @@ describe('VditorMarkdownEditor', () => {
         ref={ref}
         markdown="![趋势图](./assets/chart.png)"
         onChange={onChange}
+        onOutlineChange={() => {}}
         filePath="reports/report.md"
         buildSessionFileUrl={(path) => `/api/session-files/${path}`}
         toolbarOpen={false}
@@ -306,5 +314,144 @@ describe('VditorMarkdownEditor', () => {
 
     unmount();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:session-image');
+  });
+
+  it('Lute 规范化不算修改：未编辑时对外给原文，真实修改才上报，改回原样回到原文，外部写入重建基线', async () => {
+    const onChange = vi.fn();
+    const ref = createRef<VditorMarkdownEditorHandle>();
+    const source = '正文 $$x$$。\n\n概览\n---\n';
+    const normalized = '正文 \n\n$$\nx\n$$\n\n。\n\n概览\n----\n';
+    const buildUrl = (path: string) => path;
+    const view = (markdown: string) => (
+      <VditorMarkdownEditor
+        ref={ref}
+        markdown={markdown}
+        onChange={onChange}
+        onOutlineChange={() => {}}
+        filePath="report.md"
+        buildSessionFileUrl={buildUrl}
+        toolbarOpen={false}
+      />
+    );
+    const { rerender } = render(view(source));
+    // 与 Lute 一样，画布读出的是重新序列化后的 Markdown，而不是原文。
+    let canvas = normalized;
+    (instances[0] as unknown as { getValue: () => string }).getValue = () => canvas;
+    await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+
+    expect(ref.current!.getMarkdown()).toBe(source);
+    act(() => instances[0].options.input(canvas));
+    expect(onChange).not.toHaveBeenCalled();
+
+    canvas = `${normalized}补充`;
+    act(() => instances[0].options.input(canvas));
+    expect(onChange).toHaveBeenLastCalledWith(canvas);
+    expect(ref.current!.getMarkdown()).toBe(canvas);
+
+    canvas = normalized;
+    act(() => instances[0].options.input(canvas));
+    expect(onChange).toHaveBeenLastCalledWith(source);
+    expect(ref.current!.getMarkdown()).toBe(source);
+
+    onChange.mockClear();
+    canvas = '服务端新版本（已规范化）';
+    rerender(view('服务端新版本'));
+    expect(instances[0].setValue).toHaveBeenLastCalledWith('服务端新版本', true);
+    expect(ref.current!.getMarkdown()).toBe('服务端新版本');
+    act(() => instances[0].options.input(canvas));
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('同一次渲染里切换文件并换内容时，不向尚未就绪的新画布写入，新画布以最新内容建立基线', async () => {
+    const onChange = vi.fn();
+    const ref = createRef<VditorMarkdownEditorHandle>();
+    const buildUrl = (path: string) => path;
+    const view = (filePath: string, markdown: string) => (
+      <VditorMarkdownEditor
+        ref={ref}
+        markdown={markdown}
+        onChange={onChange}
+        onOutlineChange={() => {}}
+        filePath={filePath}
+        buildSessionFileUrl={buildUrl}
+        toolbarOpen={false}
+      />
+    );
+    const { rerender } = render(view('a.md', '# A'));
+    await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+
+    rerender(view('b.md', '# B'));
+    expect(instances).toHaveLength(2);
+    expect(instances[1].options.value).toBe('# B');
+    expect(instances[1].setValue).not.toHaveBeenCalled();
+    await waitFor(() => expect(ref.current!.getMarkdown()).toBe('# B'));
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('目录取自画布标题：内容变化后上报、按序号滚动到同一画布元素，销毁时清空', async () => {
+    const onOutlineChange = vi.fn();
+    const ref = createRef<VditorMarkdownEditorHandle>();
+    const { unmount } = render(
+      <VditorMarkdownEditor
+        ref={ref}
+        markdown="正文"
+        onChange={() => {}}
+        onOutlineChange={onOutlineChange}
+        filePath="report.md"
+        buildSessionFileUrl={(path) => path}
+        toolbarOpen={false}
+      />,
+    );
+    const editor = await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+    expect(onOutlineChange).toHaveBeenLastCalledWith([]);
+
+    // Lute 把 YAML front matter 渲染为独立块；remark 会把同一段 `---` 之间的内容当成 setext 标题。
+    editor.innerHTML = [
+      '<div class="vditor-wysiwyg__block" data-type="yaml-front-matter"><pre><code>title: 报告</code></pre></div>',
+      '<h1>报告</h1>',
+      '<h2>收益 <span data-type="backslash"><span>\\</span>(</span>x^2<span data-type="backslash"><span>\\</span>)</span></h2>',
+      '<h2>结论</h2>',
+    ].join('');
+    act(() => instances[0].options.input('# 报告'));
+    expect(onOutlineChange).toHaveBeenLastCalledWith([
+      { depth: 1, text: '报告' },
+      { depth: 2, text: '收益 (x^2)' },
+      { depth: 2, text: '结论' },
+    ]);
+
+    onOutlineChange.mockClear();
+    act(() => instances[0].options.input('# 报告 '));
+    expect(onOutlineChange).not.toHaveBeenCalled(); // 标题结构不变时不触发父组件渲染。
+
+    const scrolled: Element[] = [];
+    Element.prototype.scrollIntoView = vi.fn(function scrollIntoView(this: Element) { scrolled.push(this); });
+    ref.current!.scrollToHeading(1);
+    expect(scrolled).toEqual([editor.querySelectorAll('h2')[0]]);
+    delete (Element.prototype as Partial<Element>).scrollIntoView;
+
+    unmount();
+    expect(onOutlineChange).toHaveBeenLastCalledWith([]);
+  });
+
+  it('销毁后 Vditor 延迟到达的 input 回调被忽略，不抛错也不上报', async () => {
+    const onChange = vi.fn();
+    const onOutlineChange = vi.fn();
+    const { unmount } = render(
+      <VditorMarkdownEditor
+        markdown="# 正文"
+        onChange={onChange}
+        onOutlineChange={onOutlineChange}
+        filePath="report.md"
+        buildSessionFileUrl={(path) => path}
+        toolbarOpen={false}
+      />,
+    );
+    await screen.findByRole('textbox', { name: 'Markdown 所见即所得编辑器' });
+    unmount();
+    onOutlineChange.mockClear();
+
+    expect(() => instances[0].options.input('# 正文改')).not.toThrow();
+    expect(onChange).not.toHaveBeenCalled();
+    expect(onOutlineChange).not.toHaveBeenCalled();
   });
 });

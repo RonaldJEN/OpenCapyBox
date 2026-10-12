@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { createRef, forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { describe, expect, it, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import JSZip from 'jszip';
@@ -10,6 +10,7 @@ import {
   resetSessionDraftOutboxForTests,
 } from '../../services/sessionDraftOutbox';
 import { resetWorkspaceDraftOutboxForTests } from '../../services/workspaceDraftOutbox';
+import { vditorOutlineHeadings } from '../../components/file-preview/markdownOutline';
 import {
   FilePreview,
   type FilePreviewHandle,
@@ -24,6 +25,8 @@ import {
 const originalCreateObjectURL = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');
 const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL');
 let markdownAdapterInitializationCount = 0;
+// 模拟 Vditor 所见即所得区域渲染出的 DOM（标题、脚注块、HTML 块预览）。
+let mockVditorDom = '';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -131,25 +134,38 @@ vi.mock('../../components/file-preview/VditorMarkdownEditor', () => {
   const MockMarkdownEditor = forwardRef(function MockMarkdownEditor({
     markdown,
     onChange,
+    onOutlineChange,
   }: {
     markdown: string;
     onChange: (markdown: string) => void;
+    onOutlineChange: (outline: Array<{ depth: number; text: string }>) => void;
   }, ref) {
     const valueRef = useRef(markdown);
+    const canvasRef = useRef<HTMLDivElement>(null);
     useEffect(() => { valueRef.current = markdown; }, [markdown]);
     useEffect(() => {
       markdownAdapterInitializationCount += 1;
     }, []);
-    useImperativeHandle(ref, () => ({ getMarkdown: () => valueRef.current }), []);
+    useEffect(() => {
+      // 与真实编辑器一样，目录与滚动目标都取自画布 DOM。
+      if (mockVditorDom) onOutlineChange(vditorOutlineHeadings(canvasRef.current!).map(({ depth, text }) => ({ depth, text })));
+    }, [onOutlineChange]);
+    useImperativeHandle(ref, () => ({
+      getMarkdown: () => valueRef.current,
+      scrollToHeading: (index: number) => vditorOutlineHeadings(canvasRef.current!)[index].element.scrollIntoView(),
+    }), []);
     return (
-      <textarea
-        aria-label="Markdown 所见即所得编辑器"
-        value={markdown}
-        onChange={(event) => {
-          valueRef.current = event.target.value;
-          onChange(event.target.value);
-        }}
-      />
+      <>
+        <textarea
+          aria-label="Markdown 所见即所得编辑器"
+          value={markdown}
+          onChange={(event) => {
+            valueRef.current = event.target.value;
+            onChange(event.target.value);
+          }}
+        />
+        {mockVditorDom && <div ref={canvasRef} className="vditor-wysiwyg" dangerouslySetInnerHTML={{ __html: mockVditorDom }} />}
+      </>
     );
   });
   return {
@@ -200,6 +216,7 @@ describe('FilePreview custom source', () => {
     resetWorkspaceDraftOutboxForTests();
     vi.clearAllMocks();
     markdownAdapterInitializationCount = 0;
+    mockVditorDom = '';
     workspaceListGetMock.mockResolvedValue({
       data: { items: [], next_cursor: null, workspace_revision: 1 },
     });
@@ -1679,5 +1696,102 @@ describe('FilePreview custom source', () => {
       ['Alpha', 'one,two'],
       ['Beta', 'line 1\nline "2"'],
     ]);
+  });
+
+  describe('Markdown 头部目录定位', () => {
+    const scrolled: Element[] = [];
+    beforeEach(() => {
+      scrolled.length = 0;
+      Element.prototype.scrollIntoView = vi.fn(function scrollIntoView(this: Element) { scrolled.push(this); });
+    });
+    afterEach(() => {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+    });
+
+    const openHeaderToc = () => {
+      // jsdom 计算 KaTeX MathML 标题的可访问名称会抛错，标题栏按文本定位。
+      const header = screen.getByText('report.md', { selector: 'h2' }).parentElement!;
+      fireEvent.click(within(header).getByRole('button', { name: '展开目录' }));
+      return within(screen.getByRole('complementary', { name: 'Markdown 目录' })).getAllByRole('button')
+        .filter((button) => button.getAttribute('aria-label') !== '收起目录');
+    };
+
+    it('Vditor 编辑时目录取自画布：front matter、HTML 预览、脚注与空标题都不错位，同名公式标题各自定位', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve('---\ntitle: 公式报告\n---\n\n# 公式报告\n\n<h2>HTML 标题</h2>\n\n## 收益 \\(x^2\\)\n\n##\n\n[^a]: ## 脚注标题\n\n## 收益 \\(x^2\\)\n\n概览\n---\n'),
+      }));
+      // 与 Vditor 3.11 的 Lute 对同一 Markdown 的输出结构一致；remark 会把 front matter 读成 setext 标题，两边不按位置对齐。
+      mockVditorDom = [
+        '<div class="vditor-wysiwyg__block" data-type="yaml-front-matter"><pre><code data-type="yaml-front-matter">title: 公式报告</code></pre></div>',
+        '<h1>公式报告</h1>',
+        '<div data-type="html-block"><pre><code>&lt;h2&gt;HTML 标题&lt;/h2&gt;</code></pre><pre class="vditor-wysiwyg__preview"><h2>HTML 标题</h2></pre></div>',
+        '<h2 data-testid="first-yield">收益 <span data-type="backslash"><span>\\</span>(</span>x^2<span data-type="backslash"><span>\\</span>)</span></h2>',
+        '<h2></h2>',
+        '<div data-type="footnotes-block"><ol data-type="footnotes-defs-ol"><li data-type="footnotes-li"><h2>脚注标题</h2></li></ol></div>',
+        '<h2 data-testid="second-yield">收益 <span data-type="backslash"><span>\\</span>(</span>x^2<span data-type="backslash"><span>\\</span>)</span></h2>',
+        '<h2 data-testid="overview">概览</h2>',
+      ].join('');
+      render(
+        <FilePreview
+          inline
+          file={{ ...markdownFile, source: 'workspace', entry_id: 'entry-toc', workspace_path: 'report.md', version_id: 'version-1', revision: 1 }}
+          sessionId="workspace:persistent"
+          onClose={() => {}}
+          previewUrlBuilder={() => '/api/workspace/entries/entry-toc/content?preview=true'}
+        />,
+      );
+      await findMarkdownEditor();
+
+      const items = openHeaderToc();
+      expect(items.map((item) => item.textContent)).toEqual(['公式报告', '收益 (x^2)', '收益 (x^2)', '概览']);
+      fireEvent.click(items[1]);
+      fireEvent.click(items[2]);
+      fireEvent.click(items[3]);
+      expect(scrolled).toHaveLength(3);
+      expect(scrolled[0]).toBe(screen.getByTestId('first-yield'));
+      expect(scrolled[1]).toBe(screen.getByTestId('second-yield'));
+      expect(scrolled[2]).toBe(screen.getByTestId('overview'));
+    });
+
+    it('编辑器画布就绪前不显示头部目录', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve('# 报告\n\n## 概览\n\n## 结论') }));
+      render(
+        <FilePreview
+          inline
+          file={{ ...markdownFile, source: 'workspace', entry_id: 'entry-toc', workspace_path: 'report.md', version_id: 'version-1', revision: 1 }}
+          sessionId="workspace:persistent"
+          onClose={() => {}}
+          previewUrlBuilder={() => '/api/workspace/entries/entry-toc/content?preview=true'}
+        />,
+      );
+      await findMarkdownEditor();
+      expect(screen.queryByRole('button', { name: '展开目录' })).not.toBeInTheDocument();
+    });
+
+    it('只读预览按标题 ID 定位：front matter、纯图片标题与文末脚注区都不错位', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve('---\ntitle: 报告\n---\n\n# ![Logo](https://example.com/logo.png)\n\n## 收益 \\(x^2\\)\n\n正文[^1]\n\n## 结束\n\n[^1]: 来源'),
+      }));
+      render(
+        <FilePreview
+          file={markdownFile}
+          sessionId="ignored-session-id"
+          onClose={() => {}}
+          previewUrlBuilder={(file) => `/api/cron/runs/run-1/files/${encodeURIComponent(file.path)}?preview=true`}
+        />,
+      );
+      const article = await screen.findByRole('article');
+      await waitFor(() => expect(article.querySelector('.katex')).not.toBeNull());
+
+      const items = openHeaderToc();
+      expect(items.map((item) => item.textContent)).toEqual(['title: 报告', 'Logo', '收益 x^2', '结束']);
+      items.forEach((item) => fireEvent.click(item));
+      expect(scrolled).toHaveLength(4);
+      ['h2#title-报告', 'h1#logo', 'h2#收益-x2', 'h2#结束'].forEach((selector, index) => (
+        expect(scrolled[index]).toBe(article.querySelector(selector))
+      ));
+    });
   });
 });

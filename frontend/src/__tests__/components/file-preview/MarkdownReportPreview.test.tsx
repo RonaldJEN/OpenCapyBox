@@ -1,3 +1,4 @@
+import { StrictMode } from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -304,5 +305,64 @@ describe('Markdown 会话资源解析', () => {
     expect(screen.getByText('越界文件')).toHaveAttribute('aria-disabled', 'true');
     expect(screen.getByLabelText('越界图片路径无效')).toBeInTheDocument();
     expect(buildSessionFileUrl).not.toHaveBeenCalled();
+  });
+});
+
+describe('Markdown 只读预览公式', () => {
+  it('行内与独立公式按共享配置渲染，代码块保持原文', () => {
+    render(<MarkdownReportPreview content={'# 报告\n\n行内 \\(x^2\\)\n\n$$\n\\sum_{i=1}^n i\n$$\n\n```\n\\(raw\\)\n```'} />);
+    const article = screen.getByRole('article');
+    expect(article.querySelector('p .katex annotation')?.textContent).toBe('x^2');
+    expect(article.querySelector('.markdown-math-display .katex-display annotation')?.textContent).toBe('\\sum_{i=1}^n i');
+    expect(article.textContent).toContain('\\(raw\\)');
+  });
+
+  it('KaTeX 内部错误只降级该公式，预览其余内容照常渲染', () => {
+    render(<MarkdownReportPreview content={'# 报告\n\n前文\n\n$$\n\\begin{CD} A @>a>> B @ \\end{CD}\n$$\n\n后文 \\(y\\)'} />);
+    const article = screen.getByRole('article');
+    expect(article.querySelector('.katex-error')?.textContent).toBe('\\begin{CD} A @>a>> B @ \\end{CD}');
+    expect(article.querySelector('p .katex annotation')?.textContent).toBe('y');
+  });
+
+  it('GFM 脚注生成的无源位置标题正常渲染并保留插件属性', () => {
+    render(<MarkdownReportPreview content={'# 标题\n\n## 正文节\n\n正文[^1]\n\n[^1]: 来源'} />);
+    const article = screen.getByRole('article');
+    expect(article.querySelector('h2#footnote-label')).not.toBeNull();
+    expect(article.querySelector('section[data-footnotes] li')?.textContent).toContain('来源');
+    fireEvent.click(screen.getByRole('button', { name: '展开目录' }));
+    const links = within(screen.getByRole('navigation', { name: '文档目录' })).getAllByRole('link');
+    expect(links.map((link) => link.textContent)).toEqual(['标题', '正文节']);
+  });
+
+  it('脚注内容里的标题不进入目录，无论是否被引用', () => {
+    render(<MarkdownReportPreview content={'# 标题\n\n## 正文节\n\n正文[^used]\n\n[^unused]: ## 未引用脚注标题\n\n[^used]: ## 已引用脚注标题'} />);
+    expect(screen.getByText('2 个章节')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '展开目录' }));
+    const links = within(screen.getByRole('navigation', { name: '文档目录' })).getAllByRole('link');
+    expect(links.map((link) => link.textContent)).toEqual(['标题', '正文节']);
+    links.forEach((link) => expect(document.getElementById(decodeURIComponent(link.getAttribute('href')!.slice(1)))).toBeInstanceOf(HTMLHeadingElement));
+  });
+
+  it('StrictMode 下重复标题、列表代码块后的标题都能由目录定位', () => {
+    render(
+      <StrictMode>
+        <MarkdownReportPreview content={'# 报告\n\n## 收益 $$x^2$$\n\n## 收益 $$x^2$$\n\n- 列表\n\n  ```\n  code\n  ```\n\n## 结束'} />
+      </StrictMode>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: '展开目录' }));
+    const links = within(screen.getByRole('navigation', { name: '文档目录' })).getAllByRole('link');
+    expect(links.map((link) => link.textContent)).toEqual(['报告', '收益 x^2', '收益 x^2', '结束']);
+    const ids = links.map((link) => decodeURIComponent(link.getAttribute('href')!.slice(1)));
+    expect(ids).toEqual(['报告', '收益-x2', '收益-x2-2', '结束']);
+    expect(Array.from(screen.getByRole('article').querySelectorAll('h1, h2')).map((heading) => heading.id)).toEqual(ids);
+  });
+
+  it('带公式的标题与目录共用原文生成的 ID', () => {
+    render(<MarkdownReportPreview content={'# 报告\n\n## 收益 $$x^2$$\n\n正文\n\n## 风险 \\(\\sigma\\)\n\n正文'} />);
+    fireEvent.click(screen.getByRole('button', { name: '展开目录' }));
+    const toc = screen.getByRole('navigation', { name: '文档目录' });
+    const targets = within(toc).getAllByRole('link').map((link) => link.getAttribute('href')!.slice(1));
+    expect(targets).toHaveLength(3);
+    targets.forEach((id) => expect(document.getElementById(decodeURIComponent(id))).toBeInstanceOf(HTMLHeadingElement));
   });
 });

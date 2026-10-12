@@ -335,3 +335,17 @@ describe('CronMessageCenter unread behavior', () => {
     expect(runDateGroupKey(isoUtc)).toBe(runDateGroupKey(isoOffset));
   });
 });
+
+describe('CronMessageCenter 执行输出公式', () => {
+  it('执行输出中的 $$ 与 \\[ \\] 渲染为公式', async () => {
+    vi.mocked(configApi.getCronRuns).mockResolvedValue({
+      runs: [{ ...baseRun, is_read: true, output: '净基差：$$ \\text{现价} - F $$\n\n\\[\n\\frac{1}{2}\n\\]' }],
+      total: 1, offset: 0, limit: 20,
+    });
+    vi.mocked(configApi.getUnreadCount).mockResolvedValue({ count: 0 });
+    render(<CronMessageCenter onUnreadChange={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: /daily_iraq_news/i }));
+    const annotations = Array.from(document.querySelectorAll('.katex annotation')).map((node) => node.textContent!.trim());
+    expect(annotations).toEqual(['\\text{现价} - F', '\\frac{1}{2}']);
+  });
+});

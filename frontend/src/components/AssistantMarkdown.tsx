@@ -1,7 +1,8 @@
 import { createContext, memo, useContext, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { markdownMathRehypePlugins, markdownRemarkPlugins } from '../utils/markdownMath';
 import { CodeBlock } from './CodeBlock';
+import { markdownMathElement } from './MarkdownMath';
 import { AuthenticatedImage } from './AuthenticatedImage';
 import type { AssistantFileReference, FileInfo } from '../types';
 import { assistantFileReferenceToFileInfo, resolveAssistantFileReferenceFromHref } from '../utils/assistantFileRefs';
@@ -83,6 +84,8 @@ function AssistantMarkdownView({
     const readingId = (node: any) => `answer:${readingNodeId}:${node.tagName}:${node.position?.start?.offset ?? node.data?.readingPath}`;
     return {
         code: ({ node, className, children, ...props }: any) => {
+          const math = markdownMathElement(className, node);
+          if (math) return math;
           const match = /language-(\w+)/.exec(className || '');
           const language = match ? match[1] : '';
           const isInline = !match && !children?.toString().includes('\n');
@@ -137,6 +140,9 @@ function AssistantMarkdownView({
           return null;
         },
         a: MarkdownFileLink,
+        div: ({ node, children, ...props }: any) => (
+          <div data-reading-block={readingId(node)} {...props}>{children}</div>
+        ),
         blockquote: ({ children, ...props }: any) => (
           <blockquote
             className="border-l-[3px] border-claude-border pl-4 my-5 not-italic text-claude-text"
@@ -188,7 +194,7 @@ function AssistantMarkdownView({
   const fileLinks = useMemo(() => ({ fileReferences, onOpenFile }), [fileReferences, onOpenFile]);
   return (
     <FileLinkContext.Provider value={fileLinks}>
-    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[readingPaths]} components={components}
+    <ReactMarkdown remarkPlugins={markdownRemarkPlugins} rehypePlugins={[readingPaths, ...markdownMathRehypePlugins]} components={components}
     >
       {content}
     </ReactMarkdown>

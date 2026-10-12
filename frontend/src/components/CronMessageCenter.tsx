@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { markdownMathRehypePlugins, markdownRemarkPlugins } from '../utils/markdownMath';
 import { Download, FileText, ChevronDown, ChevronUp, FolderTree } from 'lucide-react';
 import { FilePreview } from './FilePreview';
+import { markdownMathComponents } from './MarkdownMath';
 import {
   getCronRuns,
   getUnreadCount,
@@ -494,7 +495,7 @@ const CronMessageCenter: React.FC<Props> = ({ unreadCount = 0, onUnreadChange = 
                   <div className="px-4 py-3">
                     <div className="text-xs font-medium text-claude-secondary mb-2">执行输出</div>
                     <div className="prose prose-sm max-w-none text-claude-text bg-claude-surface/50 rounded-lg p-3 overflow-x-auto [&_pre]:bg-claude-bg [&_pre]:border [&_pre]:border-claude-border [&_pre]:rounded [&_code]:text-xs [&_table]:text-xs">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      <ReactMarkdown remarkPlugins={markdownRemarkPlugins} rehypePlugins={markdownMathRehypePlugins} components={markdownMathComponents}>
                         {run.output}
                       </ReactMarkdown>
                     </div>
