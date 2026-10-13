@@ -3588,6 +3588,23 @@ class Agent:
 
                 response = result
 
+                # Completion status is independent of JSON validity: even a
+                # complete-looking call from a truncated response must not run.
+                if response.finish_reason in {"length", "incomplete", "content_filter"}:
+                    if response.finish_reason == "length":
+                        arguments_error = (
+                            "tool_arguments_truncated: model output exceeded its limit. "
+                            "No tools from this response were executed. Regenerate complete "
+                            "arguments with shorter content or split the work into smaller calls."
+                        )
+                    else:
+                        arguments_error = (
+                            "tool_response_incomplete: model response did not complete. "
+                            "No tools from this response were executed."
+                        )
+                    for rejected_call in response.tool_calls or []:
+                        rejected_call.arguments_error = arguments_error
+
                 response_tool_calls_payload = (
                     [tc.model_dump() for tc in response.tool_calls]
                     if response.tool_calls
@@ -3781,6 +3798,37 @@ class Agent:
                         yield emitter.step_finished(step_name)
                         yield emitter.run_finished(outcome="interrupt", result={"reason": "user_cancelled"})
                         return
+
+                    # A rejected parse is not an execution attempt. In particular,
+                    # its placeholder {} must not poison loop detection for a
+                    # later, valid no-argument call (or a regenerated full call).
+                    if tool_call.arguments_error:
+                        for event in self._tool_call_events(
+                            emitter,
+                            tool_call_id=tool_call_id,
+                            function_name=function_name,
+                            arguments=arguments,
+                        ):
+                            yield event
+                        rejected_result = ToolResult(success=False, error=tool_call.arguments_error)
+                        rejected = _ExecutedToolCall(
+                            index=tool_call_index,
+                            tool_call_id=tool_call_id,
+                            function_name=function_name,
+                            arguments=arguments,
+                            result=rejected_result,
+                            result_content=self._tool_result_content(function_name, rejected_result),
+                            execution_time_ms=0,
+                        )
+                        yield emitter.tool_call_result(
+                            success=False,
+                            tool_call_id=tool_call_id,
+                            content=rejected.result_content,
+                            execution_time_ms=0,
+                        )
+                        self._record_tool_result(rejected)
+                        tool_call_index += 1
+                        continue
 
                     tool = self.tools.get(function_name)
                     _fingerprint, _repeat_policy, loop_error, loop_terminal = tool_loop_guard.check(
@@ -4129,7 +4177,7 @@ class Agent:
                         next_index = tool_call_index + 1
                         while next_index < len(tool_calls):
                             _next_id, next_name, _next_args = self._tool_call_identity(tool_calls[next_index])
-                            if next_name != "sub_agent":
+                            if next_name != "sub_agent" or tool_calls[next_index].arguments_error:
                                 break
                             batch.append((next_index, tool_calls[next_index]))
                             next_index += 1

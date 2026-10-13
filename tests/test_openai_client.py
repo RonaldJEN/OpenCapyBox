@@ -729,7 +729,7 @@ class TestStreamingToolCallValidation:
         assert result.tool_calls is None
 
     @pytest.mark.asyncio
-    async def test_stream_skips_tool_call_with_non_dict_arguments(self, openai_client):
+    async def test_stream_preserves_tool_call_with_non_dict_arguments(self, openai_client):
         tool_delta = MagicMock()
         tool_delta.index = 0
         tool_delta.id = "call_1"
@@ -756,4 +756,9 @@ class TestStreamingToolCallValidation:
             params={"model": "TestModel", "messages": [], "stream": True}
         )
 
-        assert result.tool_calls is None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].id == "call_1"
+        assert result.tool_calls[0].function.arguments == {}
+        assert result.tool_calls[0].arguments_error.startswith(
+            "tool_arguments_invalid: expected_object."
+        )

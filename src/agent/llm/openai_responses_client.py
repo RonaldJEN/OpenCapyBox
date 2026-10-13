@@ -9,7 +9,7 @@ from typing import Any
 from ..retry import async_retry
 from ..schema import FunctionCall, LLMResponse, Message, ToolCall
 from ..schema.schema import AssistantMessageStreamEvent, AssistantTextMessage, TokenUsage
-from .json_parser import robust_json_parse
+from .json_parser import ToolArgumentsError, parse_tool_arguments
 from .openai_client import OpenAIClient, STREAM_CHUNK_TIMEOUT
 from .tool_schema import tools_to_responses_schema
 
@@ -230,13 +230,16 @@ class OpenAIResponsesClient(OpenAIClient):
                     provider_message_id=getattr(item, "id", None),
                 ))
             elif item_type == "function_call":
-                raw_arguments = str(getattr(item, "arguments", "") or "")
-                arguments = robust_json_parse(raw_arguments, getattr(item, "name", ""))
-                if not isinstance(arguments, dict):
-                    arguments = {"_raw": raw_arguments}
+                arguments_error = None
+                try:
+                    arguments = parse_tool_arguments(getattr(item, "arguments", None))
+                except ToolArgumentsError as error:
+                    arguments = {}
+                    arguments_error = str(error)
                 tool_calls.append(ToolCall(
                     id=str(getattr(item, "call_id", "") or f"tc_{uuid.uuid4().hex}"),
                     type="function",
+                    arguments_error=arguments_error,
                     function=FunctionCall(
                         name=str(getattr(item, "name", "") or ""),
                         arguments=arguments,
@@ -253,7 +256,15 @@ class OpenAIResponsesClient(OpenAIClient):
                 ))
 
         status = getattr(response, "status", "completed")
-        finish_reason = "tool_calls" if tool_calls else "length" if status == "incomplete" else "stop"
+        if status == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            reason = getattr(details, "reason", None)
+            finish_reason = {
+                "max_output_tokens": "length",
+                "content_filter": "content_filter",
+            }.get(reason, "incomplete")
+        else:
+            finish_reason = "tool_calls" if tool_calls else "stop"
         return LLMResponse(
             content=content,
             thinking=thinking or None,

@@ -782,6 +782,14 @@ Web send/resume/abort 入口先由 `WebChatAdapter` / `WebResumeAdapter` /
 - 首次命中时不执行候选工具，但仍写入配对的 synthetic tool result，明确要求换策略，并给模型一次恢复机会；若下一步仍调用同一被拒绝 pattern，则为同一 assistant 批次的其余调用补齐 skipped result，发出 `RUN_ERROR(tool_loop_detected)` 并将 Round 置为失败；真正不同且成功的策略会解除该 pattern 的恢复态。
 - Round 收尾不得额外调用模型提取或写入长期记忆；只允许同步本轮已由显式工具/文件操作产生的 dirty 配置文件，并按 [memory-spec.md](./memory-spec.md) 维护对话轮检索索引。
 
+#### 工具参数解析与拒绝
+
+- 各供应商 client 只接受**一个完整 JSON 对象**作为工具参数：不补引号/括号、不拆 Markdown 代码块、不从前后文字中抽取、不替换中文引号，字符串内容原样交给工具。空字符串视为 `{}`；重复键（任意层级）、`NaN`/`Infinity`、顶层非对象一律非法。Anthropic 非流式响应中 SDK 已解码的 `input` 只做同样的值校验，不改写对象；Anthropic 流式请求必须用 `messages.create(stream=True)` 消费原始事件，自行累计 `input_json_delta`、`stop_reason` 与 usage，不得使用 SDK 的 `messages.stream()` helper——它会对每个 delta 预先做 partial JSON 解析，遇到非法 JSON 时在迭代器内抛错，导致整次响应失败而不是返回该调用的工具错误。
+- 解析失败的调用不丢弃：保留原 `tool_call_id` 与工具名，参数置为 `{}`，错误记录在 `ToolCall.arguments_error`。错误文本为 `tool_arguments_invalid: <类别>`（如 `invalid_json`、`duplicate_key`）并说明工具未执行、需重新生成完整参数；不回显参数键名或正文，也不带行列号。
+- LLM 响应 `finish_reason` 为 `length`、`incomplete` 或 `content_filter` 时，该响应内**所有**工具调用（包括语法完整的）一并拒绝：`length` 记为 `tool_arguments_truncated`，其余记为 `tool_response_incomplete`。OpenAI Responses 的 `incomplete_details.reason` 映射为 `max_output_tokens → length`、`content_filter → content_filter`、其他 → `incomplete`。
+- 被拒绝的调用不执行，不经过权限判定与审计，不进入 runtime 工具循环防护的 check/observe，也不与相邻 `sub_agent` 合并并行；只发射 TOOL_CALL 事件与失败的 TOOL_CALL_RESULT，并写入配对的 `Error: ...` tool result。
+- 拒绝后由模型自行修正，harness 不设额外重试计数或熔断，唯一上限是 `AGENT_MAX_STEPS`。
+
 #### Producer-Consumer 模式
 
 LLM 流式响应采用 `asyncio.Queue` 解耦：
@@ -1332,7 +1340,8 @@ SSE 连接建立
 | **resume 在 continuation 前失败**      | `interaction_resolved` 尚未持久化即收到 `NO_PENDING_INTERRUPT` / `RESUME_CONFLICT` / `INVALID_INTERACTION_RESPONSE` / `AGENT_INIT_FAILED` 等 | 视为控制面错误，不终态化原 Round；释放 claim/slot并保留权威 waiting 或并发 winner 状态                                                      | 前端回拉 history 后恢复卡片、运行态或既有终态                    |
 | **工具执行超时**                       | `tool_timeout=300s`                                                                                                                                  | 工具返回超时错误信息并标记`outcome_uncertain=true`；Agent 继续执行，权限审计记 `unknown` 而非 `failed`                                | Agent 告知用户超时；远端副作用可能已经发生，不应把它当作确定失败 |
 | **LLM 返回空响应**                     | 检测空内容                                                                                                                                             | 给予一次 nudge 机会（注入提示重新生成）；连续空响应 →`RUN_ERROR`                                                                         | 首次空响应用户无感知；连续空响应收到错误                         |
-| **输出截断**                           | `finish_reason=length`                                                                                                                               | 自动重试一次（调整 prompt 或 context）                                                                                                      | 用户无感知（自动恢复）                                           |
+| **输出截断**                           | `finish_reason=length`                                                                                                                               | 无工具调用：注入续写提示自动重试一次；带工具调用：本响应全部工具调用拒绝执行，回 `tool_arguments_truncated` 由模型重新生成，仅受 `AGENT_MAX_STEPS` 约束 | 无工具调用时无感知；带工具调用时可见失败的工具结果               |
+| **工具参数非法**                       | 供应商 client 严格解析失败（非法 JSON、重复键、非有限数、顶层非对象）                                                                                  | 保留调用 id，不执行工具，回 `tool_arguments_invalid` 由模型重新生成；不修复参数、不另设重试上限                                              | 可见一条失败的工具结果，随后模型重试                             |
 | **SSE 断开**                           | 连接关闭检测                                                                                                                                           | Producer 继续运行在`_active_runners` 中，等待客户端重连通过 subscribe 恢复                                                                | 前端检测断开，自动重连并通过 subscribe 恢复事件流                |
 | **Subscribe 基础设施断连**             | 连接关闭/网络错误                                                                                                                                      | 服务端 producer 不因 Web consumer 断开而取消；客户端按最后 sequence 重连 running/waiting Round                                              | 短暂断线自动恢复；无应用级 5 分钟 TIMEOUT                        |
 | **same-Round continuation 启动崩溃**   | `interaction_resolved` 尚未提交时 claim 过期或显式释放                                                                                               | 安全回收后停回`waiting_interaction`；工具审批仅允许重放 `requested` / `approved` / 可投影 denial，不重放 `executing`                | 刷新后仍可继续或看到保守 unknown                                 |

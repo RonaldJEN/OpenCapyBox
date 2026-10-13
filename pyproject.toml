@@ -23,7 +23,7 @@ dependencies = [
     "tiktoken>=0.5.0",
     "prompt-toolkit>=3.0.0",
     # LLM Clients
-    "anthropic>=0.39.0",
+    "anthropic>=0.51.0",
     "openai>=2.8.0",
     # Web Framework
     "fastapi>=0.104.0",

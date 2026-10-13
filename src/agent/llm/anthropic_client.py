@@ -12,7 +12,7 @@ from ..retry import RetryConfig, async_retry
 from ..schema import FunctionCall, LLMResponse, Message, ToolCall
 from ..schema.schema import TokenUsage
 from .base import LLMClientBase
-from .json_parser import robust_json_parse
+from .json_parser import ToolArgumentsError, parse_tool_arguments, validate_tool_arguments
 from .tool_schema import tools_to_anthropic_schema
 
 logger = logging.getLogger(__name__)
@@ -243,14 +243,22 @@ class AnthropicClient(LLMClientBase):
             elif block.type == "thinking":
                 thinking_content += block.thinking
             elif block.type == "tool_use":
-                # Parse Anthropic tool_use block
+                # The SDK has already decoded this input; validate the values
+                # still observable here without rewriting the object.
+                arguments_error = None
+                try:
+                    arguments = validate_tool_arguments(block.input)
+                except ToolArgumentsError as error:
+                    arguments = {}
+                    arguments_error = str(error)
                 tool_calls.append(
                     ToolCall(
                         id=block.id,
                         type="function",
+                        arguments_error=arguments_error,
                         function=FunctionCall(
                             name=block.name,
-                            arguments=block.input,
+                            arguments=arguments,
                         ),
                     )
                 )
@@ -328,9 +336,16 @@ class AnthropicClient(LLMClientBase):
         text_content = ""
         thinking_content = ""
         tool_calls = []
+        stop_reason = None
+        input_tokens = 0
+        output_tokens = 0
 
-        # Use async streaming API (non-blocking for asyncio event loop)
-        async with self.client.messages.stream(**params) as stream:
+        # Consume raw events instead of the SDK's messages.stream() helper: the
+        # helper re-parses every input_json_delta with jiter and raises inside
+        # its iterator on invalid JSON, which would abort the whole response
+        # instead of returning a tool error for that call.
+        stream = await self.client.messages.create(**params, stream=True)
+        async with stream:
             event_iter = stream.__aiter__()
             while True:
                 try:
@@ -352,7 +367,18 @@ class AnthropicClient(LLMClientBase):
                     )
 
                 # Handle different event types
-                if event.type == "content_block_start":
+                if event.type == "message_start":
+                    input_tokens = event.message.usage.input_tokens
+                    output_tokens = event.message.usage.output_tokens
+
+                elif event.type == "message_delta":
+                    stop_reason = event.delta.stop_reason
+                    output_tokens = event.usage.output_tokens
+                    # Optional cumulative field; same rule as the SDK's final snapshot.
+                    if event.usage.input_tokens is not None:
+                        input_tokens = event.usage.input_tokens
+
+                elif event.type == "content_block_start":
                     block = event.content_block
                     if block.type == "thinking":
                         # Thinking block started
@@ -362,7 +388,7 @@ class AnthropicClient(LLMClientBase):
                         tool_calls.append({
                             "id": block.id,
                             "name": block.name,
-                            "input": {},
+                            "input": block.input,
                         })
 
                 elif event.type == "content_block_delta":
@@ -400,50 +426,27 @@ class AnthropicClient(LLMClientBase):
                                     current_tool["input"]  # partial_arguments
                                 )
 
-                elif event.type == "content_block_stop":
-                    # Block finished
-                    # Parse accumulated tool input JSON if needed
-                    if tool_calls:
-                        last_tool = tool_calls[-1]
-                        if isinstance(last_tool["input"], str):
-                            # 🔥 使用健壮的 JSON 解析器，尝试修复格式问题
-                            parsed_input = robust_json_parse(last_tool["input"], last_tool["name"])
-
-                            if parsed_input is None:
-                                # 所有修复尝试都失败，标记为解析失败
-                                logger.error(
-                                    f"Tool call '{last_tool['name']}' will be skipped due to unparseable arguments."
-                                )
-                                last_tool["parse_failed"] = True
-                            else:
-                                # 解析成功（可能是修复后的）
-                                last_tool["input"] = parsed_input
-
-        # Get final message for finish_reason
-        final_message = await stream.get_final_message()
-
         # Convert tool_calls to ToolCall objects
         parsed_tool_calls = []
         for tc in tool_calls:
-            # 🔥 跳过解析失败的工具调用
-            if tc.get("parse_failed", False):
-                continue
-
-            # 确保 input 是字典类型
-            if not isinstance(tc["input"], dict):
-                logger.error(
-                    f"Tool call '{tc['name']}' has invalid input type: {type(tc['input'])}. "
-                    f"Expected dict, got {type(tc['input']).__name__}. Skipping."
-                )
-                continue
+            arguments_error = None
+            try:
+                if isinstance(tc["input"], str):
+                    arguments = parse_tool_arguments(tc["input"])
+                else:
+                    arguments = validate_tool_arguments(tc["input"])
+            except ToolArgumentsError as error:
+                arguments = {}
+                arguments_error = str(error)
 
             parsed_tool_calls.append(
                 ToolCall(
                     id=tc["id"],
                     type="function",
+                    arguments_error=arguments_error,
                     function=FunctionCall(
                         name=tc["name"],
-                        arguments=tc["input"],
+                        arguments=arguments,
                     ),
                 )
             )
@@ -452,8 +455,12 @@ class AnthropicClient(LLMClientBase):
             content=text_content,
             thinking=thinking_content if thinking_content else None,
             tool_calls=parsed_tool_calls if parsed_tool_calls else None,
-            finish_reason="length" if final_message.stop_reason == "max_tokens" else (final_message.stop_reason or "stop"),
-            usage=self._extract_usage(final_message),
+            finish_reason="length" if stop_reason == "max_tokens" else (stop_reason or "stop"),
+            usage=TokenUsage(
+                prompt_tokens=input_tokens,
+                completion_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+            ),
         )
 
     async def generate_stream(

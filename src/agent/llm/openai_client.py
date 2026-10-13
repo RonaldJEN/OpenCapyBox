@@ -14,7 +14,7 @@ from ..schema import FunctionCall, LLMResponse, Message, ToolCall
 from ..schema.schema import TokenUsage
 from ..schema.run_context import current_run_context
 from .base import LLMClientBase
-from .json_parser import robust_json_parse
+from .json_parser import ToolArgumentsError, parse_tool_arguments
 from .tool_schema import tools_to_openai_schema
 
 logger = logging.getLogger(__name__)
@@ -326,8 +326,12 @@ class OpenAIClient(LLMClientBase):
         tool_calls = []
         if message.tool_calls:
             for i, tool_call in enumerate(message.tool_calls):
-                # Parse arguments from JSON string
-                arguments = json.loads(tool_call.function.arguments)
+                arguments_error = None
+                try:
+                    arguments = parse_tool_arguments(tool_call.function.arguments)
+                except ToolArgumentsError as error:
+                    arguments = {}
+                    arguments_error = str(error)
 
                 # 🔧 确保 ID 不为空：如果 API 没提供有效 ID，生成一个
                 tc_id = tool_call.id if tool_call.id and tool_call.id.strip() else f"tc_{uuid.uuid4().hex[:16]}_{i}"
@@ -336,6 +340,7 @@ class OpenAIClient(LLMClientBase):
                     ToolCall(
                         id=tc_id,
                         type="function",
+                        arguments_error=arguments_error,
                         function=FunctionCall(
                             name=tool_call.function.name,
                             arguments=arguments,
@@ -523,7 +528,6 @@ class OpenAIClient(LLMClientBase):
         for idx in sorted(tool_calls_dict.keys()):
             tc = tool_calls_dict[idx]
 
-            # 🔥 使用健壮的 JSON 解析器，尝试修复格式问题
             tool_name_raw = tc["function"]["name"]
             tool_name = tool_name_raw.strip() if isinstance(tool_name_raw, str) else ""
             if not tool_name:
@@ -532,25 +536,13 @@ class OpenAIClient(LLMClientBase):
 
             arguments_str = tc["function"]["arguments"]
 
-            if not arguments_str or not arguments_str.strip():
+            # Preserve failed calls so the execution layer can return a tool error.
+            arguments_error = None
+            try:
+                arguments = parse_tool_arguments(arguments_str)
+            except ToolArgumentsError as error:
                 arguments = {}
-            else:
-                # 尝试健壮解析
-                arguments = robust_json_parse(arguments_str, tool_name)
-
-                # 如果所有修复尝试都失败，跳过此工具调用
-                if arguments is None:
-                    logger.error(
-                        f"Tool call '{tool_name}' will be skipped due to unparseable arguments."
-                    )
-                    continue
-
-            if not isinstance(arguments, dict):
-                logger.warning(
-                    f"Tool call '{tool_name}' will be skipped because parsed arguments are not a dict: "
-                    f"{type(arguments).__name__}"
-                )
-                continue
+                arguments_error = str(error)
 
             # 🔧 确保 ID 不为空：如果流式响应中没有收到有效 ID，生成一个
             tc_id = tc["id"] if tc["id"] and tc["id"].strip() else f"tc_{uuid.uuid4().hex[:16]}_{idx}"
@@ -559,6 +551,7 @@ class OpenAIClient(LLMClientBase):
                 ToolCall(
                     id=tc_id,
                     type="function",
+                    arguments_error=arguments_error,
                     function=FunctionCall(
                         name=tool_name,
                         arguments=arguments,

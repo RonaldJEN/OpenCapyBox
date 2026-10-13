@@ -24,6 +24,8 @@ class ToolCall(BaseModel):
     id: str
     type: str  # "function"
     function: FunctionCall
+    # Preserve rejected calls for a matching tool result without executing them.
+    arguments_error: str | None = None
 
 
 AssistantMessagePhase = Literal["commentary", "final_answer"]

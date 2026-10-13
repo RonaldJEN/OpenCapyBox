@@ -920,7 +920,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=0.39.0" },
+    { name = "anthropic", specifier = ">=0.51.0" },
     { name = "coverage-badge", marker = "extra == 'dev'", specifier = ">=1.1.0" },
     { name = "croniter", specifier = ">=6.0.0,<7.0.0" },
     { name = "cryptography", specifier = ">=42.0.0" },
