@@ -216,6 +216,8 @@ Profile 配置更新仅保留当前行的 `updated_at` 和 `version`，MVP 不�
 
 - `apply_patch` 在 Responses 请求中声明为 `type=custom`，输入由 Codex Lark grammar 约束，不经过 JSON 参数生成；其他 Provider 可使用同名 JSON fallback。
 - 补丁支持 Add、Update、Delete、Move 与同一文件多个 ordered `@@` hunk。执行写入前先读取并计算整份 Patch 的全部源文件变化；重复操作同一源文件、缺失文件或任一 context 无法匹配时整份 Patch 不写入。
+- Update 允许只有上下文行、没有增删行的 hunk；该块仍参与匹配并推进查找游标，供后续 hunk 定位。只有正文为空的 hunk（包括仅有 `@@` 或 `@@ anchor`）才以 `PATCH_EMPTY_CHUNK` 拒绝；不带 hunk 的 Move-only 仍合法。
+- 完整补丁先做语法校验，失败时在访问沙箱前返回 `PATCH_INVALID_SYNTAX` 或 `PATCH_EMPTY_CHUNK`，明确未写入，并在可确定时给出文件、块及行位置。诊断作为普通工具错误返回模型修正；确定的语法失败不计入 runtime 无进展 ledger、不另设重复或变体预算，继续受 `AGENT_MAX_STEPS` 总预算约束。
 - 单个 Update 先对一个源快照计算全部 hunk，再写入一次。匹配依次尝试精确、忽略行尾空白、忽略首尾空白、统一常见 Unicode 破折号/引号/空格；无法匹配时该文件不写入。
 - 文本更新保留未修改行的原始换行符，新行采用文件主换行符；Session 路径继续使用 SHA-256 CAS 与原子替换。
 - Add/Move 复用现有写入分类和父目录创建；Delete 仅处理普通文件并在删除前校验 SHA。根 `AGENTS.md` 对所有补丁操作保持只读。

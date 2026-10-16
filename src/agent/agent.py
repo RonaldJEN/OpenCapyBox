@@ -430,6 +430,16 @@ class _ToolLoopGuard:
         result_content: str,
         arguments: Any = None,
     ) -> None:
+        if (
+            tool_name == "apply_patch"
+            and not result.success
+            and not result.outcome_uncertain
+            and result.error_code in {"PATCH_INVALID_SYNTAX", "PATCH_EMPTY_CHUNK"}
+        ):
+            # Parsing failed before file preparation or writes. Return its
+            # diagnostic for correction without consuming no-progress recovery;
+            # max_steps still bounds the run and existing protections stay intact.
+            return
         outcome = (
             "uncertain"
             if result.outcome_uncertain

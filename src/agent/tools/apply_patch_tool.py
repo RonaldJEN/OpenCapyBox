@@ -30,15 +30,18 @@ end_patch: "*** End Patch" LF?
 hunk: add_hunk | delete_hunk | update_hunk
 add_hunk: "*** Add File: " filename LF add_line+
 delete_hunk: "*** Delete File: " filename LF
-update_hunk: "*** Update File: " filename LF change_move? change?
+update_hunk: "*** Update File: " filename LF (change_move change? | change)
 
 filename: /(.+)/
-add_line: "+" /(.*)/ LF -> line
+add_line: "+" /[^\n]+/? LF -> line
 
 change_move: "*** Move to: " filename LF
-change: (change_context | change_line)+ eof_line?
+change: change_context? change_body (change_context change_body)* eof_line?
 change_context: ("@@" | "@@ " /(.+)/) LF
-change_line: ("+" | "-" | " ") /(.*)/ LF
+change_body: change_line+
+change_line: context_line | mutation_line
+context_line: " " /[^\n]+/? LF
+mutation_line: ("+" | "-") /[^\n]+/? LF
 eof_line: "*** End of File" LF
 
 %import common.LF
@@ -47,6 +50,22 @@ eof_line: "*** End of File" LF
 
 class PatchError(ValueError):
     """A patch is malformed or cannot be applied to the observed file."""
+
+
+class PatchSyntaxError(PatchError):
+    """Deterministic parse failure, raised before any sandbox access."""
+
+    def __init__(self, message: str, *, code: str = "PATCH_INVALID_SYNTAX"):
+        super().__init__(message)
+        self.code = code
+
+
+_CHUNK_RULE = (
+    "Every update chunk must contain at least one line starting with ' ', '+' or '-'. "
+    "Context-only chunks are allowed and locate subsequent chunks. "
+    "An '@@' header alone is not a chunk body. "
+    "A move-only update may omit chunks entirely. "
+)
 
 
 class _DeleteConflictError(RuntimeError):
@@ -101,12 +120,12 @@ class _SourceLine:
 
 def parse_patch(patch: str) -> ParsedPatch:
     if not isinstance(patch, str) or not patch.strip():
-        raise PatchError("patch must not be empty")
+        raise PatchSyntaxError("patch must not be empty")
     lines = patch.strip().splitlines()
     if not lines or lines[0].strip() != "*** Begin Patch":
-        raise PatchError("The first line of the patch must be '*** Begin Patch'")
+        raise PatchSyntaxError("The first line of the patch must be '*** Begin Patch'")
     if lines[-1].strip() != "*** End Patch":
-        raise PatchError("The last line of the patch must be '*** End Patch'")
+        raise PatchSyntaxError("The last line of the patch must be '*** End Patch'")
 
     actions: list[PatchAction] = []
     index = 1
@@ -120,13 +139,13 @@ def parse_patch(patch: str) -> ParsedPatch:
             while index < last and not _is_file_header(lines[index]):
                 line = lines[index]
                 if not line.startswith("+"):
-                    raise PatchError(
+                    raise PatchSyntaxError(
                         f"Invalid add-file line {index + 1}: every line must start with '+'"
                     )
                 added.append(line[1:])
                 index += 1
             if not added:
-                raise PatchError(f"Add file hunk for path '{path}' is empty")
+                raise PatchSyntaxError(f"Add file hunk for path '{path}' is empty")
             actions.append(PatchAction(
                 kind="add",
                 path=path,
@@ -142,7 +161,7 @@ def parse_patch(patch: str) -> ParsedPatch:
             continue
 
         if not header.startswith("*** Update File: "):
-            raise PatchError(
+            raise PatchSyntaxError(
                 f"Invalid patch hunk on line {index + 1}: expected Add, Delete, or Update File"
             )
 
@@ -158,17 +177,24 @@ def parse_patch(patch: str) -> ParsedPatch:
         old_lines: list[str] = []
         new_lines: list[str] = []
         context_indices: list[tuple[int, int]] = []
-        changed = False
         end_of_file = False
         added_lines = 0
         removed_lines = 0
+        chunk_start_line: int | None = None
 
         def flush_chunk() -> None:
-            nonlocal context, old_lines, new_lines, context_indices, changed, end_of_file
-            if context is None and not old_lines and not new_lines:
+            nonlocal context, old_lines, new_lines, context_indices, end_of_file
+            nonlocal chunk_start_line
+            if chunk_start_line is None:
                 return
-            if not changed:
-                raise PatchError(f"Update chunk for path '{path}' contains no changes")
+            if not old_lines and not new_lines:
+                raise PatchSyntaxError(
+                    f"文件 '{path}' 的第{len(chunks) + 1}个修改块"
+                    f"（补丁第{chunk_start_line}行开始）没有正文。"
+                    "每块至少包含一条以空格、'+' 或 '-' 开头的正文行；"
+                    "仅有 @@ 或 @@ 定位文本的空块无效。文件尚未修改。",
+                    code="PATCH_EMPTY_CHUNK",
+                )
             chunks.append(PatchChunk(
                 context=context,
                 old_lines=tuple(old_lines),
@@ -180,28 +206,31 @@ def parse_patch(patch: str) -> ParsedPatch:
             old_lines = []
             new_lines = []
             context_indices = []
-            changed = False
             end_of_file = False
+            chunk_start_line = None
 
         while index < last and not _is_file_header(lines[index]):
             line = lines[index]
             if line == "@@" or line.startswith("@@ "):
                 flush_chunk()
+                chunk_start_line = index + 1
                 context = line[3:] if line.startswith("@@ ") else None
                 index += 1
                 continue
             if line.strip() == "*** End of File":
                 if context is None and not old_lines and not new_lines:
-                    raise PatchError(f"Misplaced end-of-file marker on line {index + 1}")
+                    raise PatchSyntaxError(f"Misplaced end-of-file marker on line {index + 1}")
                 end_of_file = True
                 index += 1
                 if index < last and not _is_file_header(lines[index]):
-                    raise PatchError("Patch content follows an end-of-file marker")
+                    raise PatchSyntaxError("Patch content follows an end-of-file marker")
                 continue
             if not line or line[0] not in {" ", "+", "-"}:
-                raise PatchError(
+                raise PatchSyntaxError(
                     f"Invalid update line {index + 1}: expected ' ', '+', '-', or '@@'"
                 )
+            if chunk_start_line is None:
+                chunk_start_line = index + 1
             marker, content = line[0], line[1:]
             if marker == " ":
                 context_indices.append((len(old_lines), len(new_lines)))
@@ -210,16 +239,14 @@ def parse_patch(patch: str) -> ParsedPatch:
             elif marker == "+":
                 new_lines.append(content)
                 added_lines += 1
-                changed = True
             else:
                 old_lines.append(content)
                 removed_lines += 1
-                changed = True
             index += 1
 
         flush_chunk()
         if not chunks and move_path is None:
-            raise PatchError(f"Update file hunk for path '{path}' is empty")
+            raise PatchSyntaxError(f"Update file hunk for path '{path}' is empty")
         actions.append(PatchAction(
             kind="update",
             path=path,
@@ -230,14 +257,14 @@ def parse_patch(patch: str) -> ParsedPatch:
         ))
 
     if not actions:
-        raise PatchError("No files were modified")
+        raise PatchSyntaxError("No files were modified")
     return ParsedPatch(actions=tuple(actions))
 
 
 def _patch_path(header: str, prefix: str) -> str:
     path = header[len(prefix):].strip()
     if not path or "\x00" in path:
-        raise PatchError("Patch path must not be empty")
+        raise PatchSyntaxError("Patch path must not be empty")
     return path
 
 
@@ -464,7 +491,8 @@ class SandboxApplyPatchTool(Tool):
             "content lines start with `+`. Update sections use `@@` hunks whose lines start "
             "with a space, `-`, or `+`. Do not use unified-diff `---`/`+++` headers. "
             "Example: `*** Begin Patch\n*** Update File: path/to/file.py\n@@\n-old\n+new\n"
-            "*** End Patch`. Read existing files before updating them."
+            "*** End Patch`. Read existing files before updating them. "
+            + _CHUNK_RULE
         )
 
     @property
@@ -486,7 +514,8 @@ class SandboxApplyPatchTool(Tool):
             "name": self.name,
             "description": (
                 "The `apply_patch` tool can be used to edit files. This is a "
-                "FREEFORM tool, so do not wrap the patch in JSON."
+                "FREEFORM tool, so do not wrap the patch in JSON. "
+                + _CHUNK_RULE
             ),
             "format": {
                 "type": "grammar",
@@ -496,9 +525,17 @@ class SandboxApplyPatchTool(Tool):
         }
 
     async def execute(self, patch: str) -> ToolResult:
-        applied: list[str] = []
         try:
             parsed = parse_patch(patch)
+        except PatchSyntaxError as exc:
+            return ToolResult(
+                success=False,
+                error_code=exc.code,
+                error=f"{exc.code}: {exc}",
+                content="补丁语法解析失败，文件尚未修改。请改写补丁结构；重新读取文件不会修复此语法错误。",
+            )
+        applied: list[str] = []
+        try:
             prepared = await self._prepare_patch(parsed)
             for action in prepared:
                 await self._apply_action(action, applied)

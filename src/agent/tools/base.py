@@ -13,6 +13,8 @@ class ToolResult(BaseModel):
     success: bool
     content: str = ""
     error: str | None = None
+    # Explicit tool-owned classification; never infer retry safety from error text.
+    error_code: str | None = None
     content_blocks: list[dict[str, Any]] | None = None
     # Durable UI resources produced by a tool call. These are not sent back to
     # the model as tool text; Agent.run_agui projects them as CUSTOM events.

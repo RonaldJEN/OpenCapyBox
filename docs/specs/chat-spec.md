@@ -778,6 +778,7 @@ Web send/resume/abort 入口先由 `WebChatAdapter` / `WebResumeAdapter` /
 - 完整观察到 `A → B → A → B`，且 A/B 均为相同只读调用、两次结果各自未变化后，下一次再次调用 A 或 B 时识别为无进展循环；不得在尚未观察第二次 B 的结果前预测性阻止。成功 mutation 会清空旧的读/搜索观察。声明为 polling 的工具使用独立有界阈值，但相同 uncertain 结果最多实际尝试 2 次。
 - `bash` 命令文本不凭首个单词猜测读写属性；MCP annotation 只能把默认策略收紧，远端自称 `readOnlyHint=true` 不得放宽重试权限。带 `mode` 的记忆工具按具体调用区分 read 与 write/append。
 - 文件变更工具 `apply_patch` 额外按规范化路径记账：单目标 Patch 的写入结果不确定后，同一路径的后续文件变更被阻止，直到 `read_file` 得到确定结果；多文件 Patch 的相同调用不得自动重放。
+- `apply_patch` 在访问沙箱前确定的语法错误（`PATCH_INVALID_SYNTAX` / `PATCH_EMPTY_CHUNK`）未发生写入，不计入上述无进展 ledger；以普通工具错误返回模型修正，不因重复错误或错误变体另设重试预算或终止 Round，仅受 `AGENT_MAX_STEPS` 总预算约束。文件 context 不匹配等运行期错误仍遵循既有循环防护；语法失败不解除已有的 uncertain 或成功 mutation 记账。
 - 确定存在的缺失文件读取只解除它自己验证的那个路径的 uncertain 记账与对应恢复态，不得清空其他无关 pattern 的恢复态；只有成功调用才按既有规则收敛全局恢复态。
 - 首次命中时不执行候选工具，但仍写入配对的 synthetic tool result，明确要求换策略，并给模型一次恢复机会；若下一步仍调用同一被拒绝 pattern，则为同一 assistant 批次的其余调用补齐 skipped result，发出 `RUN_ERROR(tool_loop_detected)` 并将 Round 置为失败；真正不同且成功的策略会解除该 pattern 的恢复态。
 - Round 收尾不得额外调用模型提取或写入长期记忆；只允许同步本轮已由显式工具/文件操作产生的 dirty 配置文件，并按 [memory-spec.md](./memory-spec.md) 维护对话轮检索索引。
@@ -789,6 +790,7 @@ Web send/resume/abort 入口先由 `WebChatAdapter` / `WebResumeAdapter` /
 - LLM 响应 `finish_reason` 为 `length`、`incomplete` 或 `content_filter` 时，该响应内**所有**工具调用（包括语法完整的）一并拒绝：`length` 记为 `tool_arguments_truncated`，其余记为 `tool_response_incomplete`。OpenAI Responses 的 `incomplete_details.reason` 映射为 `max_output_tokens → length`、`content_filter → content_filter`、其他 → `incomplete`。
 - 被拒绝的调用不执行，不经过权限判定与审计，不进入 runtime 工具循环防护的 check/observe，也不与相邻 `sub_agent` 合并并行；只发射 TOOL_CALL 事件与失败的 TOOL_CALL_RESULT，并写入配对的 `Error: ...` tool result。
 - 拒绝后由模型自行修正，harness 不设额外重试计数或熔断，唯一上限是 `AGENT_MAX_STEPS`。
+- 上述 JSON 参数拒绝与补丁正文的语法校验不同：Responses custom `apply_patch` 使用原始补丁文本，其他 Provider 的 JSON fallback 仍先遵循本节参数规则。补丁语法错误发生在工具执行阶段，正常经过权限判定、工具事件与审计，不写入 `ToolCall.arguments_error`；具体补丁语法与未写入诊断见 [sandbox-spec.md](./sandbox-spec.md#codex-freeform-补丁)。
 
 #### Producer-Consumer 模式
 
