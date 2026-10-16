@@ -96,7 +96,7 @@ describe('SessionList 組件', () => {
 
     render(<SessionList onSessionSelect={vi.fn()} />);
 
-    expect(await screen.findByTestId('session-load-error')).toHaveTextContent('会话加载失败，请重试。');
+    expect(await screen.findByTestId('session-load-error')).toHaveTextContent('会话列表暂时无法加载');
     expect(screen.queryByTestId('session-loading-state')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '重试' }));
     expect(screen.getByTestId('session-loading-state')).toBeInTheDocument();
@@ -104,13 +104,51 @@ describe('SessionList 組件', () => {
     expect(apiService.getSessions).toHaveBeenCalledTimes(2);
   });
 
-  it('超时等非认证失败仍显示会话加载失败并保留重试', async () => {
+  it('超时等非认证失败显示列表无法加载状态并保留重试', async () => {
     vi.mocked(apiService.getSessions).mockRejectedValueOnce({ code: 'ECONNABORTED', message: 'timeout' });
 
     render(<SessionList onSessionSelect={vi.fn()} />);
 
-    expect(await screen.findByTestId('session-load-error')).toHaveTextContent('会话加载失败，请重试。');
+    expect(await screen.findByTestId('session-load-error')).toHaveTextContent('会话列表暂时无法加载');
     expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument();
+  });
+
+  it('列表加载失败是持续状态：超过一次性提示时长仍保留说明与重试，且不提供关闭', async () => {
+    vi.useFakeTimers();
+    vi.mocked(apiService.getSessions).mockRejectedValueOnce({ code: 'ECONNABORTED', message: 'timeout' });
+
+    render(<SessionList onSessionSelect={vi.fn()} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByTestId('session-load-error')).toHaveTextContent('会话列表暂时无法加载');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(screen.getByTestId('session-load-error')).toHaveTextContent('会话列表暂时无法加载');
+    expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '关闭提示' })).not.toBeInTheDocument();
+  });
+
+  it('失败后的后台刷新进行中保持无法加载状态，不误显示暂无对话记录，成功后恢复列表', async () => {
+    vi.useFakeTimers();
+    let resolveRefresh!: (value: { sessions: typeof mockSessions }) => void;
+    vi.mocked(apiService.getSessions)
+      .mockRejectedValueOnce({ code: 'ECONNABORTED', message: 'timeout' })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve; }));
+
+    render(<SessionList onSessionSelect={vi.fn()} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByTestId('session-load-error')).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(apiService.getSessions).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('session-load-error')).toHaveTextContent('会话列表暂时无法加载');
+    expect(screen.queryByTestId('session-empty-state')).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveRefresh({ sessions: mockSessions });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.queryByTestId('session-load-error')).not.toBeInTheDocument();
+    expect(screen.getByText('測試會話 1')).toBeInTheDocument();
   });
 
   it('應該顯示會話列表', async () => {

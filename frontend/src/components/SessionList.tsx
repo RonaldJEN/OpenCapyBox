@@ -7,7 +7,6 @@ import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale/zh-CN';
 import { ConfirmDialog } from './ConfirmDialog';
 import { SessionRenameForm } from './SessionRenameForm';
-import FeedbackMessage from './FeedbackMessage';
 import { WorkspaceSidebarContent } from './workspace/WorkspaceSidebarContent';
 import type { WorkspaceEntry } from '../types/workspace';
 import { discardSessionDrafts } from '../services/sessionDraftOutbox';
@@ -156,7 +155,6 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
     const requestSeq = ++searchRequestSeqRef.current;
     const normalizedQuery = query.trim();
     setSearchLoading(normalizedQuery.length > 0);
-    setSessionLoadError('');
 
     try {
       const response = normalizedQuery
@@ -169,10 +167,12 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
         : response.sessions;
       if (!normalizedQuery) allSessionsRef.current = nextSessions;
       setSessions(nextSessions);
+      // 加载失败是列表状态：只有成功拿到列表才解除，刷新进行中不能先回到“暂无对话记录”。
+      setSessionLoadError('');
     } catch (error) {
       if (requestSeq !== searchRequestSeqRef.current) return;
       console.error('Failed to load sessions:', error);
-      setSessionLoadError('会话加载失败，请重试。');
+      setSessionLoadError('会话列表暂时无法加载');
     } finally {
       if (requestSeq === searchRequestSeqRef.current) {
         setLoading(false);
@@ -490,8 +490,8 @@ export function SessionList({ currentSessionId, onSessionSelect, refreshTrigger,
             </div>
           </div>
         ) : sessionLoadError ? (
-          <div data-testid="session-load-error" className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 text-center">
-            <FeedbackMessage tone="error" className="whitespace-normal text-[12px] font-medium text-claude-error">{sessionLoadError}</FeedbackMessage>
+          <div data-testid="session-load-error" role="alert" className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 text-center">
+            <p className="whitespace-normal text-[13px] font-medium text-claude-secondary">{sessionLoadError}</p>
             <button
               type="button"
               onClick={() => {
