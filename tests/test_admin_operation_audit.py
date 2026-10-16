@@ -284,6 +284,22 @@ def test_user_agent_that_contains_credentials_is_redacted(audit_db):
     assert "top-secret-token" not in row.user_agent
 
 
+def test_audit_ip_ignores_client_supplied_proxy_headers(audit_db):
+    # 与登录事件同一口径：只认 uvicorn 解析后的 request.client，管理员自带的代理头不能改写审计 IP
+    response = _client_for_router(_lifecycle_router({}), audit_db).get(
+        "/admin/ok",
+        headers={
+            "X-Forwarded-For": "6.6.6.6",
+            "X-Real-IP": "6.6.6.6",
+        },
+    )
+
+    assert response.status_code == 200
+    with audit_db() as db:
+        row = db.query(AdminOperationLog).one()
+    assert row.ip_address == "testclient"
+
+
 def test_missing_audit_declaration_blocks_authenticated_handler(audit_db):
     executed = {"count": 0}
     router = APIRouter(route_class=AdminAuditRoute)

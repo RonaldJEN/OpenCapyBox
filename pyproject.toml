@@ -27,7 +27,7 @@ dependencies = [
     "openai>=2.8.0",
     # Web Framework
     "fastapi>=0.104.0",
-    "uvicorn>=0.24.0",
+    "uvicorn>=0.31.0",  # FORWARDED_ALLOW_IPS 支持 CIDR 起始版本，来源 IP 解析依赖此能力
     "sqlalchemy==2.0.52",
     "psycopg2-binary>=2.9.0",
     "python-dotenv>=1.0.0",

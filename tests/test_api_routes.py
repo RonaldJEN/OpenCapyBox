@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from src.api.routes import auth, sessions, config as config_routes
 from src.api.models.auth_login_event import AuthLoginEvent
@@ -79,8 +80,8 @@ class TestAuthRouter:
         assert data["is_admin"] is False
         assert data["message"] == "登录成功"
 
-    def test_login_records_forwarded_ip_event(self, client, mock_settings):
-        """登录成功后应记录代理透传的客户端 IP。"""
+    def test_login_records_client_host_and_ignores_proxy_headers(self, client, mock_settings):
+        """应用层不读代理头：客户端自带的 X-Forwarded-For / X-Real-IP 不得成为来源 IP。"""
         response = client.post(
             "/auth/login",
             data={"username": "testuser", "password": "testpass"},
@@ -97,35 +98,30 @@ class TestAuthRouter:
 
         assert event.username == "testuser"
         assert event.auth_type == "simple"
-        assert event.ip_address == "198.51.100.7"
+        assert event.ip_address == "testclient"
         assert event.user_agent == "pytest-browser"
         assert event.login_at is not None
 
-    def test_login_records_real_ip_event_when_forwarded_for_missing(self, client, mock_settings):
-        response = client.post(
+    def test_login_ip_strips_trusted_proxies_and_ignores_forged_forwarded_for(
+        self, client, mock_settings
+    ):
+        """按部署口径（容器 nginx + Ingress 网段可信）经 uvicorn 解析后取真实用户 IP。"""
+        proxied = TestClient(
+            ProxyHeadersMiddleware(client.app, trusted_hosts="127.0.0.1,10.244.0.0/16"),
+            client=("127.0.0.1", 50000),
+        )
+        response = proxied.post(
             "/auth/login",
             data={"username": "testuser", "password": "testpass"},
-            headers={"X-Real-IP": "203.0.113.9"},
+            # 6.6.6.6 为用户伪造，198.51.100.7 为 Ingress 追加的真实来源，10.244.1.5 为 Ingress Pod
+            headers={"X-Forwarded-For": "6.6.6.6, 198.51.100.7, 10.244.1.5"},
         )
 
         assert response.status_code == 200
         with client.SessionLocal() as db:  # type: ignore[attr-defined]
             event = db.query(AuthLoginEvent).filter(AuthLoginEvent.user_id == "testuser").one()
 
-        assert event.ip_address == "203.0.113.9"
-
-    def test_login_records_request_client_host_when_proxy_headers_missing(self, client, mock_settings):
-        response = client.post(
-            "/auth/login",
-            data={"username": "testuser", "password": "testpass"},
-        )
-
-        assert response.status_code == 200
-        with client.SessionLocal() as db:  # type: ignore[attr-defined]
-            event = db.query(AuthLoginEvent).filter(AuthLoginEvent.user_id == "testuser").one()
-
-        assert event.ip_address
-        assert event.ip_address not in ("198.51.100.7", "203.0.113.9")
+        assert event.ip_address == "198.51.100.7"
 
     def test_login_failure_does_not_record_ip_event(self, client, mock_settings):
         response = client.post(
@@ -175,7 +171,6 @@ class TestAuthRouter:
             response = client.post(
                 "/auth/login",
                 data={"username": "zhangsan", "password": "domain-pass"},
-                headers={"X-Real-IP": "203.0.113.9"},
             )
 
         assert response.status_code == 200
@@ -185,7 +180,7 @@ class TestAuthRouter:
 
         assert event.username == "zhangsan"
         assert event.auth_type == "ldap"
-        assert event.ip_address == "203.0.113.9"
+        assert event.ip_address == "testclient"
 
     def test_login_wrong_password(self, client, mock_settings):
         """測試密碼錯誤"""

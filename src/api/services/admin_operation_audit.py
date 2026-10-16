@@ -25,6 +25,7 @@ from fastapi.routing import APIRoute
 
 from src.api.models.admin_operation_log import AdminOperationLog
 from src.api.models.database import SessionLocal
+from src.api.utils.client_ip import get_client_ip
 from src.api.utils.timezone import now_naive
 
 logger = logging.getLogger(__name__)
@@ -425,7 +426,7 @@ def begin_admin_audit(request: Request, actor_user_id: str) -> str | None:
     request_id = str(uuid.uuid4())
     route = request.scope.get("route")
     route_template = getattr(route, "path", None) or request.url.path
-    client_host = request.client.host if request.client else None
+    client_host = get_client_ip(request)
     user_agent = request.headers.get("user-agent")
 
     row = AdminOperationLog(

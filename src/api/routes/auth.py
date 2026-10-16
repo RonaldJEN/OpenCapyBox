@@ -19,24 +19,9 @@ from src.api.services.mobile_auth_service import (
     fetch_mobile_gateway_user,
     login_mobile_sso_user,
 )
+from src.api.utils.client_ip import get_client_ip
 
 router = APIRouter()
-
-
-def _get_client_ip(request: Request) -> str | None:
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        first_ip = forwarded_for.split(",", 1)[0].strip()
-        if first_ip:
-            return first_ip
-
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        stripped = real_ip.strip()
-        if stripped:
-            return stripped
-
-    return request.client.host if request.client else None
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -59,7 +44,7 @@ def login(
     record_login_event(
         db,
         user=user,
-        ip_address=_get_client_ip(request),
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
     token, expires_in = create_access_token(user_id, token_generation=token_generation)
@@ -113,7 +98,7 @@ async def create_mobile_session(
     record_login_event(
         db,
         user=user,
-        ip_address=_get_client_ip(request),
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
     token, expires_in = create_access_token(

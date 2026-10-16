@@ -59,7 +59,11 @@ JWT payload 包含 `user_id` 和 `gen`（凭据代次）。Token 过期时间：
 | `user_agent` | Text | nullable | 浏览器 User-Agent |
 | `login_at` | DateTime | indexed | 登录时间 |
 
-IP 提取顺序：`X-Forwarded-For` 首个 IP → `X-Real-IP` → FastAPI `request.client.host`；写入前去除首尾空白并截断到 64 字符。部署时应确保后端仅接收可信反向代理流量，避免客户端直连伪造代理头。
+来源 IP 取 `request.client.host`，写入前去除首尾空白并截断到 64 字符。统一实现在 `src/api/utils/client_ip.py` 的 `get_client_ip()`，管理操作审计（`admin_operation_logs.ip_address`）复用同一函数，两处口径一致。
+
+代理链由 uvicorn 的 ProxyHeadersMiddleware 按环境变量 `FORWARDED_ALLOW_IPS` 解析：从 `X-Forwarded-For` 右侧逐个剥掉可信代理，取第一个不可信地址作为 `request.client.host`。应用层不读取 `X-Forwarded-For` / `X-Real-IP`，客户端自带的伪造值不会成为来源 IP。依赖 uvicorn ≥ 0.31.0：更早版本的可信清单只做字面量匹配，不支持 CIDR 网段，配置网段后 Ingress 地址不会被剥掉。
+
+部署要求：K8s 环境必须设置 `FORWARDED_ALLOW_IPS=127.0.0.1,<代理网段>`（`127.0.0.1` 为容器内 nginx）。代理网段须按实际代理拓扑（Ingress Controller 所在 Pod/节点网段，及其前置 LB 是否改写 `X-Forwarded-For`）由集群配置确认，不能从单条 nginx `remote=` 地址推断。不得设为 `*`（等价于取最左侧，可被伪造），也不得包含办公网段（用户真实 IP 会被当作代理剥掉）。未设置时默认只信任 `127.0.0.1`，记录到的是 Ingress IP。
 
 ### 2.4 LDAP 配置
 

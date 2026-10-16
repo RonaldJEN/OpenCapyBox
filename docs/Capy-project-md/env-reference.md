@@ -159,6 +159,7 @@ Agent 逻辑层
 |------|------|--------|------|
 | `UVICORN_WORKERS` | 否 | `1` | Uvicorn worker 数（Docker/K8s 部署时生效）；第一版必须保持单 worker |
 | `LOG_LEVEL` | 否 | `info` | 日志级别 |
+| `FORWARDED_ALLOW_IPS` | K8s 必填 | `127.0.0.1` | uvicorn 原生读取的可信代理清单（逗号分隔；CIDR 需 uvicorn ≥ 0.31.0）。应设为 `127.0.0.1,<代理网段>`，网段按实际代理拓扑由集群配置确认，不能从单条 nginx `remote=` 地址推断；不得设为 `*` 或包含办公网段，否则用户可用 `X-Forwarded-For` 伪造来源 IP。未设置时登录事件与管理审计记录的是 Ingress IP。详见 `docs/specs/auth-spec.md` §2.3 |
 
 ## 搜索与 Embedding
 

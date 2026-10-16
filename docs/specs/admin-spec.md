@@ -270,7 +270,7 @@
 - Query：`from?`、`to?`、`action?`、`risk_level?`、`target_user_id?`、`session_id?`、`outcome?`、`cursor?`、`limit?`；`risk_level` 仅接受 `high` / `normal`，并与其他条件取交集。
 - 默认范围：最近 24 小时；`limit` 默认 50、最大 200。
 - 分页：按 `(started_at, id)` 倒序游标分页，响应为 `{items, next_cursor, has_more}`。
-- 结果：每项包含管理员、稳定动作编码、派生风险级别、目标标识、Session/Step 标识、结果、HTTP 状态、来源 IP、User-Agent、Request ID、脱敏变更字段及脱敏补充信息。
+- 结果：每项包含管理员、稳定动作编码、派生风险级别、目标标识、Session/Step 标识、结果、HTTP 状态、来源 IP、User-Agent、Request ID、脱敏变更字段及脱敏补充信息。来源 IP 与登录事件同一口径（uvicorn 按 `FORWARDED_ALLOW_IPS` 解析后的 `request.client.host`，请求自带的代理头不生效，见 `auth-spec.md` §2.3）。
 - `audit_log.list` 属于 L1，每次查看或刷新操作日志都记录一次敏感查阅；本次请求对应的 `started` 行不进入本次查询结果，完成后可在后续查询中看到。
 
 ### GET /api/admin/operation-logs/export
