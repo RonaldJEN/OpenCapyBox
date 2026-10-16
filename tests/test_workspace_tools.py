@@ -111,8 +111,8 @@ async def test_workspace_stage_uses_execution_root():
         "sha256": "a" * 64,
         "manifest_sha256": None,
     }
-    assert "current execution Workspace" in tool.description
-    assert "current execution Workspace" in tool.parameters["properties"]["destination_path"]["description"]
+    assert "current Session directory" in tool.description
+    assert "current Session directory" in tool.parameters["properties"]["destination_path"]["description"]
     tool._call.assert_awaited_once_with(
         "stage_entry",
         "user-1",

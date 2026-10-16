@@ -76,6 +76,8 @@ async def test_direct_round_persists_resolved_preferred_skill_display_snapshot()
     service.history_service = history_service
     service.session_id = "session-1"
     service.user_id = "user-1"
+    service.model_id = "deepseek-v4-flash"
+    service._model_config = SimpleNamespace(display_name="DeepSeek V4 Flash")
     service.skill_loader = MagicMock()
     service._resolve_run_context = AsyncMock(return_value=AgentRunContext(
         preferences=ResolvedTurnPreferencesContext(
@@ -123,6 +125,8 @@ async def test_direct_round_persists_resolved_preferred_skill_display_snapshot()
     ] == [{"server_id": "server-a", "display_name": "东方财富数据"}]
     assert history_service.create_round.call_args.kwargs["thinking_mode"] == "enabled"
     assert history_service.create_round.call_args.kwargs["reasoning_effort"] == "max"
+    assert history_service.create_round.call_args.kwargs["model_id"] == "deepseek-v4-flash"
+    assert history_service.create_round.call_args.kwargs["model_display_name"] == "DeepSeek V4 Flash"
 
 
 def test_agent_service_resolves_supported_turn_reasoning():
@@ -222,6 +226,7 @@ async def test_direct_round_materializes_omitted_catalog_reasoning_default():
     service.history_service = history_service
     service.session_id = "session-1"
     service.user_id = "user-1"
+    service.model_id = "deepseek-v4-flash"
     service.skill_loader = None
     service._model_config = SimpleNamespace(
         effective_thinking_mode="enabled",
@@ -285,6 +290,9 @@ async def test_run_started_carries_authoritative_round_skill_snapshot():
     service.session_id = "session-1"
     service.cancel_token = None
     service._active_run_count = 0
+    service._subagent_activities = {}
+    service.model_id = "deepseek-v4-flash"
+    service._model_config = SimpleNamespace(display_name="DeepSeek V4 Flash")
     service.agent = MagicMock()
 
     async def fake_run_agui(**_kwargs):
@@ -310,6 +318,8 @@ async def test_run_started_carries_authoritative_round_skill_snapshot():
     assert event.preferred_mcp_connections == [
         {"server_id": "server-a", "display_name": "东方财富数据"},
     ]
+    assert event.model_id == "deepseek-v4-flash"
+    assert event.model_display_name == "DeepSeek V4 Flash"
     saved_event = history_service.save_agui_event.await_args.args[1]
     assert saved_event.model_dump(by_alias=True)["preferredSkills"] == [
         {"key": "pdf", "display_name": "PDF 文档"},
@@ -662,6 +672,8 @@ def test_preferred_skill_policy_is_absent_when_get_skill_is_not_exposed():
         Message(role="system", content="base system"),
         Message(role="user", id="run-1:user", run_id="run-1", content="hello"),
     ]
+    agent.supports_image = True
+    agent.supports_video = True
     agent._build_runtime_context_block = lambda: "runtime\n"
     agent._build_dynamic_runtime_prompt = lambda: ""
 
@@ -684,6 +696,8 @@ def test_mcp_preference_projects_only_when_tool_search_is_exposed():
         Message(role="system", content="base system"),
         Message(role="user", id="run-1:user", run_id="run-1", content="hello"),
     ]
+    agent.supports_image = True
+    agent.supports_video = True
     agent._build_runtime_context_block = lambda: "runtime\n"
     agent._build_dynamic_runtime_prompt = lambda: ""
     context = _run_context(mcp_connections=(("server-a", "东方财富数据"),))
