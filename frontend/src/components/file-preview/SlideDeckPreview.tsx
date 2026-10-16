@@ -13,6 +13,7 @@ import type {
   RenderTask,
 } from 'pdfjs-dist';
 import FeedbackMessage from '../FeedbackMessage';
+import { loadPdfJs } from './pdfJsLoader';
 import './SlideDeckPreview.css';
 
 interface SlideDeckPreviewProps {
@@ -45,30 +46,6 @@ interface LazySlideThumbnailProps {
   pageNumber: number;
   scrollRootRef: RefObject<HTMLDivElement>;
   onSelect: (pageNumber: number) => void;
-}
-
-type PdfJs = typeof import('pdfjs-dist');
-
-let pdfJsPromise: Promise<PdfJs> | null = null;
-
-function loadPdfJs(): Promise<PdfJs> {
-  if (!pdfJsPromise) {
-    pdfJsPromise = Promise.all([
-      import('pdfjs-dist'),
-      import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
-    ])
-      .then(([pdfJs, workerModule]) => {
-        if (!pdfJs.GlobalWorkerOptions.workerSrc) {
-          pdfJs.GlobalWorkerOptions.workerSrc = workerModule.default;
-        }
-        return pdfJs;
-      })
-      .catch((error: unknown) => {
-        pdfJsPromise = null;
-        throw error;
-      });
-  }
-  return pdfJsPromise;
 }
 
 function getError(error: unknown): Error {

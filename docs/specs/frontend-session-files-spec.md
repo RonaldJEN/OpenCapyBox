@@ -138,7 +138,7 @@ Session 文件工作台是主布局的一部分，不适用普通右侧 Overlay 
 | 代码/JSON | 语法高亮、行号/换行、复制，继续使用代码预览器 |
 | 图片/SVG | 适应窗口、缩放、旋转；SVG 不注入主 DOM |
 | PDF | 浏览器/PDF viewer 内联预览与下载 |
-| DOC/DOCX | 首选 `render=pdf`；DOCX 转换失败可用 DOMPurify 清洗后的 Mammoth HTML，DOC 失败则下载 |
+| DOC/DOCX | 首选 `render=pdf`，由 PDF.js 渲染页面与文字层（可选取复制），自带缩放/适合宽度、页码跳转、文档内搜索（Enter/Shift+Enter、Ctrl+F 聚焦）工具栏；工具栏可换行，搜索组（搜索框与上一个/下一个）最小宽度 180px，窄栏放不下时整组换到第二行，搜索框不得被压缩到不可用；PDF 有标题书签（LibreOffice 由 docx 标题样式生成）时提供“目录”开关，左侧默认关闭的标题索引点击即跳转；不嵌入浏览器 PDF 查看器，因此不出现第二个“下载”入口，也不显示 PDF 元数据中的旧标题，下载只走头部的原文件下载。DOCX 转换失败可用 DOMPurify 清洗后的 Mammoth HTML，DOC 失败则下载；PDF.js 无法打开派生 PDF 时显示可重试错误 |
 | PPT/PPTX | 首选 `render=pdf`，再由 PDF.js 提供缩略图、连续滚动、当前页同步、±2 主 Canvas 虚拟挂载和最高 2× DPR；失败降级浏览器 PDF/下载 |
 | `.slides` | 当前没有可用的 schema renderer 或 PDF 转换器；显示明确降级提示并仅提供下载，不声称兼容第三方私有格式 |
 | CSV/XLSX | Univer 值/公式编辑工作区（公式栏、行列头、多 sheet、撤销/重做）；当前 Session 文件可编辑，写回必须保留未修改的文件结构与元数据 |
@@ -206,13 +206,13 @@ Office 首次派生期间显示“正在生成 PDF 预览”；等待 2500ms 后
 `GET /api/sessions/{id}/files/{path}?preview=true&render=pdf`：
 
 - 仅 DOC/DOCX/PPT/PPTX；
-- 在用户 OpenSandbox 单进程内完成最大 50 MiB 的有界快照、hash 与复制；API 主机不得读取或运行不可信 Office 内容；
+- 有界快照（最大 50 MiB）、hash、复制、缓存探测、加锁、转换、校验、发布、淘汰与清理全部在用户 OpenSandbox 的一次命令、单个进程内完成（每条沙箱命令有约 1 秒固定开销）；API 主机不得读取或运行不可信 Office 内容；
 - 临时 PDF 最大 100 MiB，shell `timeout -k` 与 SDK timeout 双重限制；
 - 内容 hash + 扩展名 + renderer 版本作为缓存键；
-- 相同内容使用原子目录锁；每请求唯一 scratch/profile，验证 PDF magic/大小后原子 rename，禁止 partial cache 命中；
+- 相同内容使用原子目录锁；每请求唯一 `.incoming-*` scratch，LibreOffice profile 位于其下，验证 PDF magic/大小后原子 rename，禁止 partial cache 命中；LRU 淘汰在释放缓存锁后执行，当前条目计入容量但受保护；
 - 缓存位于 session 隐藏 `.opencapybox-preview/`，不出现在目录列表，并随 session 删除；
-- 浏览器取消、快速切换、shell/SDK 超时均必须先完成当前 `.incoming-*`、临时 LibreOffice profile 和所持缓存锁清理；下一次预览在复制源文件的同一沙箱命令内自愈清除超过 300 秒的严格命名 `.incoming-<32位小写十六进制>` 残留，不删除当前请求或已发布 hash 缓存；
-- PPT/PPTX 的 ready 不以 PDF Blob 下载完成为准：PDF.js 必须成功打开文档并读取第一页后才提交新 version。已有 deck 刷新时使用双缓冲保留旧 document；新 deck ready 后原子切换并释放旧 loading task，刷新失败或较旧请求迟到时继续显示旧 deck；
+- 当前 `.incoming-*`、临时 LibreOffice profile 和所持缓存锁由沙箱进程自身 `finally` 清理；浏览器取消、快速切换时 API 等该进程结束后才传播取消；下一次预览在同一沙箱命令内自愈清除超过 300 秒的严格命名 `.incoming-<32位小写十六进制>` 残留，不删除当前请求或已发布 hash 缓存；
+- PPT/PPTX 与 DOC/DOCX 的 ready 都不以 PDF Blob 下载完成为准：PDF.js 必须成功打开文档并读取第一页后才提交新 version。已有 deck 刷新时保留旧 document，新 deck ready 后原子切换并释放旧 loading task，刷新失败或较旧请求迟到时继续显示旧内容。DOC/DOCX 复用同一个 PDFViewer 并同样双缓冲：新 PDF 下载与解析期间旧文档持续显示（不卸下、无 loading 遮罩），新文档读到第一页后再 `setDocument` 原子切换并释放旧 loading task；新文档解析失败时旧文档原样保留，不重新解析；解析中的请求一旦失效（来源换新，或被更新请求取代而新 PDF 尚未到达），其迟到的解析结果必须丢弃并销毁，不得替换正文。页码映射必须按文档隔离（依赖 `pdfjs-dist` ≥ 5.5；5.4 的 `PagesMapper` 是全局单例，同时挂载的 PPTX/DOCX 预览会互相改写页数导致 `getPage` 被拒），同时挂载的多个 PDF.js 预览互不影响。DOC/DOCX 以“适合宽度”打开；分页以 `hidden` 保活时容器宽度为 0，在隐藏中完成加载的文档必须在恢复显示时按当前预设模式重算，用户手动缩放保持不变；显示中的其他宽度变化（竖向滚动条出现/消失、拖动分栏）不自动重算，避免打断首次渲染与缩放来回跳动，需要时由“适合宽度”按钮重算；卸载时先清空 PDFViewer 再销毁文档，避免 PDF.js 静态文字层登记持有已渲染页面；`pdf_viewer.css` 随查看器模块按需加载，不进入应用入口 CSS；
 - 失败不改变 Round/Session 状态，前端按格式降级。
 
 ## 9. 聊天运行时不变量
@@ -247,6 +247,7 @@ Office 首次派生期间显示“正在生成 PDF 预览”；等待 2500ms 后
 - [ ] Markdown 相对资源、HTML/DOCX/PDF/XLSX/PPTX/图片/代码/ZIP 均有真实预览或明确降级
 - [ ] CSV/XLSX 修改值/公式后保真自动保存并刷新最近修改时间；链接/批注/数字格式与 CSV 编码换行 round-trip 不丢失；XLS/ET 强制只读且不发写请求
 - [ ] 100 页 PPTX 主区只挂载当前页±2 Canvas，缩略图懒渲染且定位/滚动同步；后台刷新在新 PDF.js 文档和第一页 ready 前保留旧 deck，失败或迟到响应不清空/回切
+- [ ] DOC/DOCX 派生 PDF 由 PDF.js 渲染：无 iframe、无第二个下载入口、不显示 PDF 元数据标题；缩放/适合宽度/页码跳转/搜索计数与上一个/下一个可用，刷新期间与解析失败时保留旧文档；有书签时目录可展开并跳转；先开 PPTX 再开 DOCX 后切回 PPTX，各页与缩略图仍可渲染；在隐藏分页中完成加载的 DOCX 切回时按容器宽度显示
 - [ ] HTML 内嵌使用无 `allow-same-origin` 的 sandbox `srcDoc`，load/error/deadline 均能结束 loading；新标签为 sandbox wrapper Blob
 - [ ] HTML popup blocked、TTL/pagehide 回收、内嵌 timeout 与 Office 并发锁/partial cache/尺寸/超时/失败有测试
 - [ ] 窄宽仍可用总开关和 splitter 往返聊天/文件，且不丢草稿

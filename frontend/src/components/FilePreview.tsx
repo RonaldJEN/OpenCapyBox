@@ -73,6 +73,7 @@ import { formatDownloadError } from '../utils/errorMessages';
 import { buildSandboxFileUrl, getFileExtLabel } from '../utils/fileUtils';
 import { extractMarkdownHeadings, MarkdownReportPreview } from './file-preview/MarkdownReportPreview';
 import { SlideDeckPreview } from './file-preview/SlideDeckPreview';
+import { DocumentPdfPreview } from './file-preview/DocumentPdfPreview';
 import { openHtmlBlobPreview } from './file-preview/htmlBlobPreview';
 import {
   resolvePreviewDescriptor,
@@ -164,7 +165,7 @@ interface ZipEntry {
   directory: boolean;
 }
 
-interface PresentationPreviewSource {
+interface OfficePdfSource {
   blob: Blob;
   key: string;
   requestId: number;
@@ -284,9 +285,8 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   const [zipEntries, setZipEntries] = useState<ZipEntry[]>([]);
   const [zipQuery, setZipQuery] = useState('');
   const [binaryPreviewUrl, setBinaryPreviewUrl] = useState('');
-  const [convertedPdfUrl, setConvertedPdfUrl] = useState('');
-  const [presentationSource, setPresentationSource] = useState<PresentationPreviewSource | null>(null);
-  const [presentationRequestId, setPresentationRequestId] = useState(0);
+  const [officePdfSource, setOfficePdfSource] = useState<OfficePdfSource | null>(null);
+  const [officePdfRequestId, setOfficePdfRequestId] = useState(0);
   const [htmlFrameLoading, setHtmlFrameLoading] = useState(false);
   const [viewMode, setViewMode] = useState<PreviewViewMode>('rendered');
   const [wrapLongLines, setWrapLongLines] = useState(false);
@@ -304,8 +304,8 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   const [workspaceDraftLossNotice, setWorkspaceDraftLossNotice] = useState<WorkspaceDraftLossNotice | null>(null);
   const loading = previewLoadState === 'initial-loading' || previewLoadState === 'refreshing';
   const backgroundRefreshing = previewLoadState === 'refreshing';
-  const hasCurrentPresentationSource = Boolean(
-    presentationSource && presentationSource.requestId === presentationRequestId,
+  const hasCurrentOfficePdfSource = Boolean(
+    officePdfSource && officePdfSource.requestId === officePdfRequestId,
   );
   const requestIdRef = useRef(0);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
@@ -639,7 +639,9 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     const controller = new AbortController();
     const shouldRefreshInPlace = refreshInPlace && sameOwner && contentLoadedRef.current;
     refreshingRequestIdRef.current = shouldRefreshInPlace ? requestId : null;
-    setPresentationRequestId(nextDescriptor.kind === 'presentation' ? requestId : 0);
+    setOfficePdfRequestId(
+      nextDescriptor.kind === 'presentation' || nextDescriptor.kind === 'document' ? requestId : 0,
+    );
 
     setError('');
     setPreviewNotice('');
@@ -675,8 +677,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       setZipEntries([]);
       setZipQuery('');
       setBinaryPreviewUrl('');
-      setConvertedPdfUrl('');
-      setPresentationSource(null);
+      setOfficePdfSource(null);
       setHtmlFrameLoading(false);
       setViewMode('rendered');
       setWrapLongLines(false);
@@ -734,15 +735,14 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   useEffect(() => {
     const isInitialOfficeLoad = previewLoadState === 'initial-loading'
       && (descriptor?.kind === 'document' || descriptor?.kind === 'presentation')
-      && (descriptor.kind !== 'presentation' || !hasCurrentPresentationSource)
-      && (descriptor.kind !== 'document' || !convertedPdfUrl);
+      && !hasCurrentOfficePdfSource;
     if (!isInitialOfficeLoad) {
       setOfficePreviewSlow(false);
       return undefined;
     }
     const timer = window.setTimeout(() => setOfficePreviewSlow(true), OFFICE_PREVIEW_SLOW_HINT_MS);
     return () => window.clearTimeout(timer);
-  }, [convertedPdfUrl, descriptor?.kind, hasCurrentPresentationSource, previewLoadState]);
+  }, [descriptor?.kind, hasCurrentOfficePdfSource, previewLoadState]);
 
   useEffect(() => {
     const viewport = contentViewportRef.current;
@@ -761,12 +761,6 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
       if (binaryPreviewUrl) URL.revokeObjectURL(binaryPreviewUrl);
     };
   }, [binaryPreviewUrl]);
-
-  useEffect(() => {
-    return () => {
-      if (convertedPdfUrl) URL.revokeObjectURL(convertedPdfUrl);
-    };
-  }, [convertedPdfUrl]);
 
   useEffect(() => {
     if (inline || !file) return undefined;
@@ -900,16 +894,12 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
         if (pdfCacheKey) writeCachedPreview(pdfCacheKey, { kind: 'binary', blob: pdfBlob });
       }
       if (requestId !== requestIdRef.current) return;
-      if (officeDescriptor.kind === 'presentation') {
-        setPresentationSource({
-          blob: pdfBlob,
-          key: `${pdfCacheKey || 'presentation'}::${requestId}`,
-          requestId,
-        });
-      } else {
-        setConvertedPdfUrl(URL.createObjectURL(pdfBlob));
-        commitLoadedVersion(requestId);
-      }
+      // 版本在 PDF.js 成功打开文档后由 handleOfficePdfReady 提交。
+      setOfficePdfSource({
+        blob: pdfBlob,
+        key: `${pdfCacheKey || officeDescriptor.kind}::${requestId}`,
+        requestId,
+      });
       return;
     } catch (conversionError) {
       if (requestId !== requestIdRef.current || isAbortError(conversionError)) return;
@@ -945,25 +935,32 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
     }
   };
 
-  const handlePresentationReady = (sourceKey: string) => {
-    const source = presentationSource;
+  const currentOfficePdfSource = (sourceKey: string) => {
+    const source = officePdfSource;
     if (
       !source
       || source.key !== sourceKey
-      || source.requestId !== presentationRequestId
+      || source.requestId !== officePdfRequestId
       || source.requestId !== requestIdRef.current
-    ) return;
+    ) return null;
+    return source;
+  };
+
+  const handleOfficePdfReady = (sourceKey: string) => {
+    const source = currentOfficePdfSource(sourceKey);
+    if (!source) return;
     commitLoadedVersion(source.requestId);
   };
 
+  const handleDocumentPdfError = (sourceKey: string) => {
+    const source = currentOfficePdfSource(sourceKey);
+    if (!source) return;
+    reportLoadError(source.requestId, '文档预览加载失败');
+  };
+
   const handlePresentationError = (sourceKey: string) => {
-    const source = presentationSource;
-    if (
-      !source
-      || source.key !== sourceKey
-      || source.requestId !== presentationRequestId
-      || source.requestId !== requestIdRef.current
-    ) return;
+    const source = currentOfficePdfSource(sourceKey);
+    if (!source) return;
     if (refreshingRequestIdRef.current === source.requestId && contentLoadedRef.current) {
       reportLoadError(source.requestId, '更新幻灯片预览失败');
       return;
@@ -1833,8 +1830,18 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
           <PlainTextPreview text={textContent} />
         );
       case 'document':
-        if (convertedPdfUrl) {
-          return <PdfFrame src={convertedPdfUrl} title={`${file.name} PDF 预览`} onError={() => setError('PDF 加载失败')} />;
+        if (officePdfSource) {
+          return (
+            <DocumentPdfPreview
+              source={officePdfSource.blob}
+              sourceKey={officePdfSource.key}
+              requestId={officePdfSource.requestId}
+              activeRequestId={officePdfRequestId}
+              title={file.name}
+              onReady={handleOfficePdfReady}
+              onError={(_error, sourceKey) => handleDocumentPdfError(sourceKey)}
+            />
+          );
         }
         if (docxHtml) {
           return (
@@ -1892,15 +1899,15 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
           </div>
         );
       case 'presentation':
-        return presentationSource
+        return officePdfSource
           ? (
               <SlideDeckPreview
-                source={presentationSource.blob}
-                sourceKey={presentationSource.key}
-                requestId={presentationSource.requestId}
-                activeRequestId={presentationRequestId}
+                source={officePdfSource.blob}
+                sourceKey={officePdfSource.key}
+                requestId={officePdfSource.requestId}
+                activeRequestId={officePdfRequestId}
                 title={file.name}
-                onReady={handlePresentationReady}
+                onReady={handleOfficePdfReady}
                 onError={(_error, sourceKey) => handlePresentationError(sourceKey)}
               />
             )
@@ -1942,8 +1949,8 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
   const supportsViewToggle = descriptor.kind === 'html';
   const supportsMarkdownEdit = descriptor.kind === 'markdown' && !effectiveReadOnly && !retainedSessionDraft;
   const supportsWrapToggle = viewMode === 'source' || descriptor.kind === 'code' || descriptor.kind === 'text';
-  const presentationRendererStarting = descriptor.kind === 'presentation'
-    && hasCurrentPresentationSource
+  const officePdfRendererStarting = (descriptor.kind === 'presentation' || descriptor.kind === 'document')
+    && hasCurrentOfficePdfSource
     && previewLoadState === 'initial-loading';
 
   const previewCard = (
@@ -2140,7 +2147,7 @@ export const FilePreview = forwardRef<FilePreviewHandle, FilePreviewProps>(funct
               <RotateCcw size={13} aria-hidden="true" />重试加载
             </button>
           </div>
-        ) : loading && !backgroundRefreshing && !presentationRendererStarting ? (
+        ) : loading && !backgroundRefreshing && !officePdfRendererStarting ? (
           <div className="flex flex-col items-center justify-center gap-4 py-24 text-center" data-testid="file-preview-loading" role="status" aria-live="polite">
             <div className="flex space-x-2" aria-hidden="true">{[0, 1, 2].map((index) => <div key={index} className="h-2 w-2 animate-dot-pulse rounded-full bg-claude-accent" style={{ animationDelay: `${index * 200}ms` }} />)}</div>
             {(descriptor.kind === 'document' || descriptor.kind === 'presentation') && (

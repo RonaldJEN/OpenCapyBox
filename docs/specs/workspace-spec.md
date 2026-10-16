@@ -106,7 +106,7 @@ Chat/Cron 调用方负责按 `none/read/edit/manage` 决定是否暴露相应工
 - 左侧切到会话列表再返回工作区时，已打开标签、entry 深链、目录展开状态和聊天滚动位置保持不变；返回动作同时刷新根目录、当前展开目录和有效搜索结果，不能继续展示隐藏期间的旧实体投影。选择具体 Session 或显式关闭才切换 owner。
 - Markdown/CSV/XLSX 每次真实编辑立即把完整草稿交给当前页面生命周期内的应用级内存 outbox；关闭标签、面板或切换 owner 时先同步触发一次内容抓取，然后立即完成用户动作，远端保存由 outbox 串行执行。网络歧义、5xx 和 `MUTATION_IN_PROGRESS` 只使用原 key 指数退避；确定性 4xx 或幂等 `failed` 立即停止重试、丢弃本地 Workspace 草稿、重新读取服务端 current head，并在该文件内持续提示“修改未保存，已恢复最近保存版本”。页面刷新、崩溃或关闭允许丢失尚未远端成功的 Workspace 草稿；不得自动换 key、强制覆盖或显示全局同步警告。
 - 聊天流、Round 状态或其他父级状态重渲染时，已打开的工作区预览不得重新请求或重新初始化；只有文件身份、内容版本或 owner 变化才能触发内容重载。同一 `current_version_id` 的重命名/移动只更新标签和路径，不丢草稿、不误报内容冲突；但首次内容尚未 ready 时必须按新路径继续加载，不得卡在空白预览。
-- AI/Cron 更新当前已打开的 clean 文件时，只有已存在 ready 内容才进入后台刷新，编辑器在新内容 ready 后原子切换正文与 version；首次加载期间的 revision 变化继续使用稳定 loading，不得提前显示空内容或类型降级卡。PPTX 的 ready 以 PDF.js 成功打开文档并读取第一页为准，刷新失败继续保留旧 deck；旧自动保存或预览响应按 content generation/request id 丢弃。dirty 文件继续保留本地草稿与原 base version并自动保存；服务端把 AI 的非重叠修改合入，重叠位置保留人的草稿，成功后再原位刷新合并版本。
+- AI/Cron 更新当前已打开的 clean 文件时，只有已存在 ready 内容才进入后台刷新，编辑器在新内容 ready 后原子切换正文与 version；首次加载期间的 revision 变化继续使用稳定 loading，不得提前显示空内容或类型降级卡。PPTX 与 DOC/DOCX 的 ready 以 PDF.js 成功打开文档并读取第一页为准，刷新失败继续保留旧内容；旧自动保存或预览响应按 content generation/request id 丢弃。dirty 文件继续保留本地草稿与原 base version并自动保存；服务端把 AI 的非重叠修改合入，重叠位置保留人的草稿，成功后再原位刷新合并版本。
 - 普通用户界面不显示 change set、冲突队列、“AI 修改待确认”、查看提案、发布、拒绝、加载新版本或放弃草稿动作；审计记录只供系统恢复和排障。
 - 普通 Chat wire 不发送 `workspace_change_proposed/workspace_change_conflict` 决策事件；未完成状态只通过工具内部文本告知 Agent “后台重试、不要删除或重建”，成功正式 mutation 才发送 `workspace_resource_changed`。
 - 助手工作区文件卡只按原 entry_id 打开；404 时显示已删除，不读历史副本、不恢复、不按同名新条目替代。

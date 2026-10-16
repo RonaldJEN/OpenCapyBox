@@ -63,7 +63,7 @@
 | C18 | 子Agent继承sandbox/session，但没有显式传workspace_dir | `src/api/services/agent_service.py:679` |
 | C19 | 配置即时同步、AgentPool独立初始化同步、MemoryService同步、dirty轮末同步均存在 | `src/api/services/tool_factory.py:70`；`agent_pool_service.py:436`、`:754`；`memory_service.py:642`；`agent_service.py:3355`、`:4176` |
 | C20 | 数据cleanup冻结旧sandbox_id；现有kill先清用户mount | `src/api/services/sandbox_cleanup_service.py:193`；`sandbox_service.py:1067` |
-| C21 | Office预览是平台固定soffice命令，不是模型自定义命令 | `src/api/services/file_preview_service.py:392`、`:528` |
+| C21 | Office预览是平台固定soffice命令，不是模型自定义命令 | `src/api/services/file_preview_service.py:148`、`:175` |
 | C22 | 全局Sandbox镜像/TTL；创建未传CPU/内存/PID/网络参数 | `src/api/config.py:198`；`src/api/services/sandbox_service.py:508` |
 | C23 | 新模型import + create_all + 手写幂等列/约束迁移；无Alembic | `src/api/models/database.py:14`、`:151`、`:322`、`:449` |
 | C24 | 用户purge是手写顺序，包含删除cleanup与UserSandbox | `src/api/services/auth_service.py:422` |

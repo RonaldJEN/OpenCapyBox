@@ -130,6 +130,33 @@ vi.mock('../../components/file-preview/SlideDeckPreview', () => ({
   },
 }));
 
+const documentPdfViewer = vi.hoisted(() => ({ failNext: false }));
+
+vi.mock('../../components/file-preview/DocumentPdfPreview', () => ({
+  DocumentPdfPreview: ({
+    sourceKey,
+    requestId,
+    activeRequestId,
+    title,
+    onReady,
+    onError,
+  }: {
+    sourceKey: string;
+    requestId: number;
+    activeRequestId: number;
+    title: string;
+    onReady: (sourceKey: string) => void;
+    onError: (error: Error, sourceKey: string) => void;
+  }) => {
+    useEffect(() => {
+      if (requestId !== activeRequestId) return;
+      if (documentPdfViewer.failNext) onError(new Error('PDF.js failed'), sourceKey);
+      else onReady(sourceKey);
+    }, [activeRequestId, onError, onReady, requestId, sourceKey]);
+    return <div data-testid="document-pdf-preview" data-source-key={sourceKey}>{title}</div>;
+  },
+}));
+
 vi.mock('../../components/file-preview/VditorMarkdownEditor', () => {
   const MockMarkdownEditor = forwardRef(function MockMarkdownEditor({
     markdown,
@@ -1637,15 +1664,12 @@ describe('FilePreview custom source', () => {
     expect(screen.getByRole('button', { name: '下载原文件' })).toBeInTheDocument();
   });
 
-  it('DOCX 派生 PDF 在内嵌查看器 load 前保持稳定遮罩', async () => {
-    mockObjectUrlApis('blob:docx-pdf');
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      headers: { get: () => 'application/pdf' },
-      blob: () => Promise.resolve(new Blob(['%PDF'], { type: 'application/pdf' })),
-    }));
+  it('DOCX 派生 PDF 交给 PDF.js 查看器，不再嵌入浏览器 PDF 查看器', async () => {
+    const pdfResponse = deferred<unknown>();
+    const fetchMock = vi.fn().mockImplementation(() => pdfResponse.promise);
+    vi.stubGlobal('fetch', fetchMock);
 
-    render(
+    const { container } = render(
       <FilePreview
         file={{ name: 'report.docx', path: 'report.docx', size: 2048, modified: '2026-08-26T01:15:00Z', type: 'docx' }}
         sessionId="session-docx"
@@ -1653,16 +1677,50 @@ describe('FilePreview custom source', () => {
       />,
     );
 
-    const iframe = await screen.findByTitle('report.docx PDF 预览');
-    expect(iframe).toHaveClass('opacity-0');
-    expect(screen.getByTestId('pdf-iframe-loading')).toBeInTheDocument();
-
-    fireEvent.load(iframe);
-
-    await waitFor(() => {
-      expect(iframe).toHaveClass('opacity-100');
-      expect(screen.queryByTestId('pdf-iframe-loading')).not.toBeInTheDocument();
+    expect(screen.getByText('正在生成 PDF 预览')).toBeInTheDocument();
+    await act(async () => {
+      pdfResponse.resolve({
+        ok: true,
+        headers: { get: () => 'application/pdf' },
+        blob: () => Promise.resolve(new Blob(['%PDF'], { type: 'application/pdf' })),
+      });
     });
+
+    const viewer = await screen.findByTestId('document-pdf-preview');
+    expect(viewer).toHaveTextContent('report.docx');
+    expect(viewer.getAttribute('data-source-key')).toContain('::render=pdf::');
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/sessions/session-docx/files/report.docx?preview=true&render=pdf',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(screen.queryByTestId('file-preview-loading')).not.toBeInTheDocument();
+    expect(container.querySelector('iframe')).toBeNull();
+    expect(screen.getAllByRole('button', { name: '下载文件' })).toHaveLength(1);
+  });
+
+  it('PDF.js 无法打开 DOCX 派生 PDF 时显示可重试的错误', async () => {
+    documentPdfViewer.failNext = true;
+    try {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        headers: { get: () => 'application/pdf' },
+        blob: () => Promise.resolve(new Blob(['%PDF'], { type: 'application/pdf' })),
+      }));
+
+      render(
+        <FilePreview
+          file={{ name: 'broken.docx', path: 'broken.docx', size: 2048, modified: '2026-08-26T01:16:00Z', type: 'docx' }}
+          sessionId="session-docx"
+          onClose={() => {}}
+        />,
+      );
+
+      expect(await screen.findByText('文档预览加载失败')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '重试加载' })).toBeInTheDocument();
+      expect(screen.queryByTestId('document-pdf-preview')).not.toBeInTheDocument();
+    } finally {
+      documentPdfViewer.failNext = false;
+    }
   });
 
   it('falls back to sanitized Mammoth HTML when DOCX PDF conversion fails', async () => {

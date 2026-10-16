@@ -1,5 +1,10 @@
 import asyncio
-import json
+import hashlib
+import os
+import subprocess
+import sys
+import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,247 +12,380 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from src.api.routes import sessions
+from src.api.services import file_preview_service
 from src.api.services.file_preview_service import (
+    OFFICE_PREVIEW_SCRIPT_TIMEOUT_SECONDS,
     FilePreviewConversionError,
     FilePreviewSourceNotFoundError,
     FilePreviewTimeoutError,
     FilePreviewTooLargeError,
     FilePreviewUnavailableError,
     FilePreviewUnsupportedError,
-    MAX_RENDERED_PDF_BYTES,
-    OFFICE_PREVIEW_INCOMING_STALE_SECONDS,
     RenderedOfficePreview,
     _complete_cleanup_before_cancellation,
-    _prune_office_preview_cache,
+    _preview_cache_key,
     render_office_document_to_pdf,
 )
 from tests.helpers import make_fake_execution
 
 
-CONTENT_DIGEST = "a" * 64
+HEREDOC_PREFIX = "python3 - <<'PY'\n"
+HEREDOC_SUFFIX = "\nPY"
+FAKE_PDF = b"%PDF-1.7 fake"
+
+# 替身 soffice：记录调用次数，按 mode 产出 PDF、垃圾文件、无输出或指定退出码。
+FAKE_SOFFICE = """
+import os, sys, time
+mode, output_dir, counter = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(counter, "a") as handle:
+    handle.write("x")
+if mode == "slow-ok":
+    time.sleep(0.6)
+    mode = "ok"
+if mode == "ok":
+    with open(os.path.join(output_dir, "source.pdf"), "wb") as handle:
+        handle.write(b"%PDF-1.7 fake")
+elif mode == "garbage":
+    with open(os.path.join(output_dir, "source.pdf"), "wb") as handle:
+        handle.write(b"not a pdf")
+elif mode != "none":
+    sys.exit(int(mode))
+"""
 
 
-@pytest.mark.asyncio
-async def test_trusted_workspace_cache_hit_does_not_read_source_again():
-    sandbox = MagicMock()
-    with (
-        patch(
-            "src.api.services.file_preview_service._validated_pdf_size",
-            new=AsyncMock(return_value=8192),
-        ),
-        patch(
-            "src.api.services.file_preview_service._snapshot_office_source",
-            new=AsyncMock(),
-        ) as snapshot,
-        patch(
-            "src.api.services.file_preview_service._touch_and_prune_office_preview_cache",
-            new=AsyncMock(),
-        ),
-        patch(
-            "src.api.services.file_preview_service._cleanup_preview_working_files",
-            new=AsyncMock(),
-        ) as cleanup,
-    ):
-        rendered = await render_office_document_to_pdf(
-            sandbox,
-            source_filename="report.pptx",
-            source_path="/home/user/workdir/.opencapybox/objects/aa/content",
-            session_root="/home/user/workdir",
-            cache_root="/home/user/workdir/.opencapybox/derived/office",
-            source_sha256=CONTENT_DIGEST,
-            source_size=4096,
+class _OfficeSandbox:
+    """在本机真实执行沙箱脚本的替身，只把 soffice 换成可控的假转换器。"""
+
+    def __init__(self, tmp_path, monkeypatch):
+        self.root = tmp_path / "session"
+        self.root.mkdir()
+        self.cache_root = self.root / ".opencapybox-preview"
+        self.counter = tmp_path / "conversions.log"
+        self.counter.write_text("")
+        self.mode = "ok"
+        self.command_count = 0
+        self.commands = SimpleNamespace(run=self._run)
+        converter = tmp_path / "fake_soffice.py"
+        converter.write_text(FAKE_SOFFICE, encoding="utf-8")
+        monkeypatch.setattr(
+            file_preview_service,
+            "_office_convert_argv",
+            lambda *, profile_dir, output_dir, snapshot_path: [
+                sys.executable,
+                str(converter),
+                self.mode,
+                output_dir,
+                str(self.counter),
+            ],
         )
 
-    snapshot.assert_not_awaited()
-    cleanup.assert_not_awaited()
-    assert rendered.size == 8192
-    assert rendered.sandbox_path.endswith("/source.pdf")
+    async def _run(self, command, *, opts):
+        assert opts.timeout.total_seconds() == OFFICE_PREVIEW_SCRIPT_TIMEOUT_SECONDS
+        assert command.startswith(HEREDOC_PREFIX) and command.endswith(HEREDOC_SUFFIX)
+        self.command_count += 1
+        script = command[len(HEREDOC_PREFIX):-len(HEREDOC_SUFFIX)]
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-"],
+            input=script.encode("utf-8"),
+            capture_output=True,
+        )
+        return make_fake_execution(
+            stdout_text=completed.stdout.decode("utf-8"),
+            exit_code=completed.returncode,
+        )
+
+    def write_source(self, name: str, content: bytes = b"docx-bytes") -> None:
+        (self.root / name).write_bytes(content)
+
+    async def render(self, name: str, **kwargs) -> RenderedOfficePreview:
+        return await render_office_document_to_pdf(
+            self,
+            source_filename=name,
+            source_path=str(self.root / name),
+            session_root=str(self.root),
+            **kwargs,
+        )
+
+    def conversions(self) -> int:
+        return len(self.counter.read_text())
+
+    def cache_entries(self) -> list[str]:
+        return sorted(os.listdir(self.cache_root))
+
+    def seed_cache(self, cache_key: str, content: bytes = FAKE_PDF, *, age: float = 0):
+        directory = self.cache_root / cache_key
+        directory.mkdir(parents=True)
+        pdf = directory / "source.pdf"
+        pdf.write_bytes(content)
+        stamp = time.time() - age
+        os.utime(pdf, (stamp, stamp))
+        return directory
+
+
+@pytest.fixture
+def office_sandbox(tmp_path, monkeypatch):
+    return _OfficeSandbox(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_preview_cache_pruner_only_targets_complete_hash_directories_and_protects_current():
-    command_run = AsyncMock(return_value=make_fake_execution(stdout_text='{"removed_bytes": 1}'))
-    sandbox = MagicMock()
-    sandbox.commands.run = command_run
+async def test_office_preview_converts_once_then_serves_cache_with_one_command_each(office_sandbox):
+    office_sandbox.write_source("报告.docx", b"report-v1")
 
-    await _prune_office_preview_cache(
-        sandbox,
-        cache_root="/home/user/workdir/.opencapybox/derived/office",
-        max_bytes=512,
-        protected_cache_key="a" * 64,
-    )
+    first = await office_sandbox.render("报告.docx")
+    second = await office_sandbox.render("报告.docx")
 
-    command = command_run.await_args.args[0]
-    assert "re.fullmatch(r'[0-9a-f]{64}', name)" in command
-    assert "os.path.isdir(os.path.join(directory, '.lock'))" in command
-    assert "if name == protected" in command
-    assert ".incoming-" not in command
-
-
-def _snapshot_execution(*, size: int = 12, reason: str | None = None):
-    payload = (
-        {"ok": False, "reason": reason}
-        if reason
-        else {"ok": True, "size": size, "sha256": CONTENT_DIGEST}
-    )
-    return make_fake_execution(stdout_text=json.dumps(payload, separators=(",", ":")))
-
-
-def _sandbox_with_commands(*executions):
-    sandbox = MagicMock()
-    sandbox.commands.run = AsyncMock(side_effect=list(executions))
-    sandbox.files.read_bytes = AsyncMock()
-    sandbox.files.read_bytes_stream = None
-    return sandbox
+    expected_key = _preview_cache_key(hashlib.sha256(b"report-v1").hexdigest(), ".docx")
+    assert first.cache_key == second.cache_key == expected_key
+    assert first.filename == "报告.pdf"
+    assert first.size == len(FAKE_PDF)
+    with open(first.sandbox_path, "rb") as reader:
+        assert reader.read() == FAKE_PDF
+    assert office_sandbox.conversions() == 1
+    assert office_sandbox.command_count == 2
+    assert office_sandbox.cache_entries() == [expected_key]
+    assert os.listdir(office_sandbox.cache_root / expected_key) == ["source.pdf"]
 
 
 @pytest.mark.asyncio
-async def test_office_preview_reuses_valid_cached_pdf():
-    sandbox = _sandbox_with_commands(
-        _snapshot_execution(),
-        make_fake_execution(stdout_text="4096"),
-        make_fake_execution(stdout_text="", exit_code=0),
+async def test_trusted_workspace_cache_hit_does_not_read_source(office_sandbox):
+    digest = "a" * 64
+    office_sandbox.seed_cache(_preview_cache_key(digest, ".pptx"))
+
+    rendered = await office_sandbox.render(
+        "deck.pptx",
+        source_sha256=digest,
+        source_size=4096,
     )
-    rendered = await render_office_document_to_pdf(
-        sandbox,
-        source_filename="报告.docx",
-        source_path="/home/user/sessions/s1/报告.docx",
-        session_root="/home/user/sessions/s1",
-    )
-    assert rendered.filename == "报告.pdf"
-    assert rendered.sandbox_path.endswith("/source.pdf")
-    assert rendered.size == 4096
-    commands = [call.args[0] for call in sandbox.commands.run.await_args_list]
-    assert not any("soffice" in command for command in commands)
-    assert all(call.kwargs.get("opts") is not None for call in sandbox.commands.run.await_args_list)
+
+    assert rendered.size == len(FAKE_PDF)
+    assert office_sandbox.conversions() == 0
 
 
 @pytest.mark.asyncio
-async def test_office_preview_converts_in_unique_scratch_then_atomically_publishes():
-    sandbox = _sandbox_with_commands(
-        _snapshot_execution(),
-        make_fake_execution(stdout_text="", exit_code=1),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="OWNER", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=1),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="/usr/bin/soffice", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="8192", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="8192", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
-    )
-    rendered = await render_office_document_to_pdf(
-        sandbox,
-        source_filename="deck.pptx",
-        source_path="/home/user/sessions/s1/deck.pptx",
-        session_root="/home/user/sessions/s1",
-    )
-    assert "/.opencapybox-preview/" in rendered.sandbox_path
-    assert rendered.filename == "deck.pdf"
-    assert rendered.size == 8192
-    commands = [call.args[0] for call in sandbox.commands.run.await_args_list]
-    snapshot = next(command for command in commands if "python3 - <<'PY'" in command)
-    assert f"stale_incoming_seconds = {OFFICE_PREVIEW_INCOMING_STALE_SECONDS}" in snapshot
-    assert "re.compile(r'^\\.incoming-[0-9a-f]{32}$')" in snapshot
-    assert "shutil.rmtree(entry.path)" in snapshot
-    conversion = next(command for command in commands if "--convert-to" in command)
-    assert "timeout -k 5 90 soffice" in conversion
-    assert ".incoming-" in conversion
-    assert any(command.startswith("mv -f --") for command in commands)
-    assert any("head -c 5" in command for command in commands)
+async def test_trusted_cache_miss_rejects_content_that_differs_from_metadata(office_sandbox):
+    office_sandbox.write_source("deck.pptx", b"tampered")
+    trusted_key = _preview_cache_key("b" * 64, ".pptx")
+
+    with pytest.raises(FilePreviewConversionError, match="版本元数据不一致"):
+        await office_sandbox.render(
+            "deck.pptx",
+            source_sha256="b" * 64,
+            source_size=len(b"tampered"),
+        )
+
+    assert office_sandbox.conversions() == 0
+    assert office_sandbox.cache_entries() == [trusted_key]
+    assert os.listdir(office_sandbox.cache_root / trusted_key) == []
 
 
 @pytest.mark.asyncio
-async def test_office_preview_rejects_unsupported_and_oversized_source():
+async def test_office_preview_rejects_unsupported_missing_and_oversized_source(
+    office_sandbox, monkeypatch
+):
     with pytest.raises(FilePreviewUnsupportedError):
-        await render_office_document_to_pdf(
-            _sandbox_with_commands(),
-            source_filename="notes.txt",
-            source_path="/home/user/sessions/s1/notes.txt",
-            session_root="/home/user/sessions/s1",
-        )
+        await office_sandbox.render("notes.txt")
 
-    sandbox = _sandbox_with_commands(
-        _snapshot_execution(reason="too_large"),
-        make_fake_execution(stdout_text="", exit_code=0),
-    )
-    with pytest.raises(FilePreviewTooLargeError, match="50 MiB"):
-        await render_office_document_to_pdf(
-            sandbox,
-            source_filename="huge.docx",
-            source_path="/home/user/sessions/s1/huge.docx",
-            session_root="/home/user/sessions/s1",
-        )
-
-
-@pytest.mark.asyncio
-async def test_office_preview_maps_missing_source_separately():
-    sandbox = _sandbox_with_commands(
-        _snapshot_execution(reason="missing"),
-        make_fake_execution(stdout_text="", exit_code=0),
-    )
     with pytest.raises(FilePreviewSourceNotFoundError):
+        await office_sandbox.render("missing.docx")
+
+    monkeypatch.setattr(file_preview_service, "MAX_OFFICE_PREVIEW_BYTES", 4)
+    office_sandbox.write_source("huge.docx", b"12345")
+    with pytest.raises(FilePreviewTooLargeError, match="50 MiB"):
+        await office_sandbox.render("huge.docx")
+
+    assert office_sandbox.conversions() == 0
+    assert office_sandbox.cache_entries() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "error_type", "message"),
+    [
+        ("1", FilePreviewConversionError, "文档转换失败"),
+        ("124", FilePreviewTimeoutError, "文档转换超时"),
+        ("137", FilePreviewTimeoutError, "文档转换超时"),
+        ("127", FilePreviewUnavailableError, "未安装 Office 预览组件"),
+        ("none", FilePreviewConversionError, "未生成可用的 PDF"),
+        ("garbage", FilePreviewConversionError, "未生成可用的 PDF"),
+    ],
+)
+async def test_office_preview_maps_converter_failures_and_cleans_up(
+    office_sandbox, mode, error_type, message
+):
+    office_sandbox.mode = mode
+    office_sandbox.write_source("broken.docx")
+
+    with pytest.raises(error_type, match=message):
+        await office_sandbox.render("broken.docx")
+
+    [cache_key] = office_sandbox.cache_entries()
+    assert os.listdir(office_sandbox.cache_root / cache_key) == []
+
+
+@pytest.mark.asyncio
+async def test_office_preview_rejects_oversized_rendered_and_cached_pdf(
+    office_sandbox, monkeypatch
+):
+    monkeypatch.setattr(file_preview_service, "MAX_RENDERED_PDF_BYTES", 4)
+    office_sandbox.write_source("big.docx", b"fresh")
+    with pytest.raises(FilePreviewTooLargeError, match="转换后的 PDF"):
+        await office_sandbox.render("big.docx")
+    [fresh_key] = office_sandbox.cache_entries()
+    assert os.listdir(office_sandbox.cache_root / fresh_key) == []
+
+    office_sandbox.write_source("cached.docx", b"cached")
+    cached_key = _preview_cache_key(hashlib.sha256(b"cached").hexdigest(), ".docx")
+    cached_dir = office_sandbox.seed_cache(cached_key)
+    with pytest.raises(FilePreviewTooLargeError, match="转换后的 PDF"):
+        await office_sandbox.render("cached.docx")
+    assert os.listdir(cached_dir) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_content_requests_publish_once(office_sandbox):
+    office_sandbox.mode = "slow-ok"
+    office_sandbox.write_source("same.docx")
+
+    first, second = await asyncio.gather(
+        office_sandbox.render("same.docx"),
+        office_sandbox.render("same.docx"),
+    )
+
+    assert first.cache_key == second.cache_key
+    assert first.size == second.size == len(FAKE_PDF)
+    assert office_sandbox.conversions() == 1
+
+
+@pytest.mark.asyncio
+async def test_office_preview_reclaims_stale_lock(office_sandbox):
+    office_sandbox.write_source("locked.docx", b"locked")
+    cache_key = _preview_cache_key(hashlib.sha256(b"locked").hexdigest(), ".docx")
+    lock = office_sandbox.cache_root / cache_key / ".lock"
+    lock.mkdir(parents=True)
+    stale = time.time() - file_preview_service.OFFICE_PREVIEW_LOCK_STALE_SECONDS - 5
+    os.utime(lock, (stale, stale))
+
+    rendered = await office_sandbox.render("locked.docx")
+
+    assert rendered.cache_key == cache_key
+    assert office_sandbox.conversions() == 1
+    assert os.listdir(office_sandbox.cache_root / cache_key) == ["source.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_office_preview_self_heals_only_stale_incoming_directories(office_sandbox):
+    stale = time.time() - file_preview_service.OFFICE_PREVIEW_INCOMING_STALE_SECONDS - 5
+    stale_incoming = office_sandbox.cache_root / f".incoming-{'1' * 32}"
+    fresh_incoming = office_sandbox.cache_root / f".incoming-{'2' * 32}"
+    unrelated = office_sandbox.cache_root / ".incoming-notes"
+    for directory in (stale_incoming, fresh_incoming, unrelated):
+        (directory / "profile").mkdir(parents=True)
+    for directory in (stale_incoming, unrelated):
+        os.utime(directory, (stale, stale))
+    office_sandbox.write_source("report.docx")
+
+    await office_sandbox.render("report.docx")
+
+    assert not stale_incoming.exists()
+    assert fresh_incoming.exists()
+    assert unrelated.exists()
+
+
+@pytest.mark.asyncio
+async def test_office_preview_prunes_oldest_complete_cache_entries(office_sandbox):
+    oldest = office_sandbox.seed_cache("a" * 64, age=300)
+    newer = office_sandbox.seed_cache("b" * 64, age=200)
+    locked = office_sandbox.seed_cache("c" * 64, age=400)
+    (locked / ".lock").mkdir()
+    office_sandbox.write_source("report.docx")
+
+    rendered = await office_sandbox.render(
+        "report.docx",
+        cache_max_bytes=2 * len(FAKE_PDF),
+    )
+
+    assert not oldest.exists()
+    assert newer.exists()
+    assert locked.exists()
+    assert (office_sandbox.cache_root / rendered.cache_key / "source.pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_office_preview_script_crash_maps_to_unavailable(office_sandbox, monkeypatch):
+    monkeypatch.setattr(
+        file_preview_service,
+        "_office_convert_argv",
+        lambda **_kwargs: ["opencapybox-missing-timeout-binary"],
+    )
+    office_sandbox.write_source("report.docx")
+
+    with pytest.raises(FilePreviewUnavailableError, match="沙箱预览服务不可用"):
+        await office_sandbox.render("report.docx")
+
+
+@pytest.mark.asyncio
+async def test_office_preview_maps_sandbox_transport_failure_to_unavailable():
+    sandbox = MagicMock()
+    sandbox.commands.run = AsyncMock(side_effect=ConnectionError("execd down"))
+
+    with pytest.raises(FilePreviewUnavailableError, match="沙箱预览服务不可用"):
         await render_office_document_to_pdf(
             sandbox,
-            source_filename="missing.docx",
-            source_path="/home/user/sessions/s1/missing.docx",
+            source_filename="report.docx",
+            source_path="/home/user/sessions/s1/report.docx",
             session_root="/home/user/sessions/s1",
         )
 
 
 @pytest.mark.asyncio
-async def test_office_preview_reports_conversion_failure_and_cleans_lock():
-    sandbox = _sandbox_with_commands(
-        _snapshot_execution(),
-        make_fake_execution(stdout_text="", exit_code=1),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="OWNER", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=1),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="/usr/bin/soffice", exit_code=0),
-        make_fake_execution(stdout_text="secret diagnostic", exit_code=1),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
+async def test_office_preview_missing_exit_code_maps_to_unavailable():
+    # SDK 未收到 complete 事件（服务端超时、流中断）时 exit_code 为 None，且没有 JSON 输出。
+    sandbox = MagicMock()
+    sandbox.commands.run = AsyncMock(
+        return_value=make_fake_execution(stdout_text="", exit_code=None)
     )
-    with pytest.raises(FilePreviewConversionError, match="文档转换失败") as exc:
+
+    with pytest.raises(FilePreviewUnavailableError, match="沙箱预览服务不可用"):
         await render_office_document_to_pdf(
             sandbox,
-            source_filename="broken.docx",
-            source_path="/home/user/sessions/s1/broken.docx",
+            source_filename="report.docx",
+            source_path="/home/user/sessions/s1/report.docx",
             session_root="/home/user/sessions/s1",
         )
-    assert "secret diagnostic" not in str(exc.value)
-    commands = [call.args[0] for call in sandbox.commands.run.await_args_list]
-    assert commands[-1].startswith("rmdir --")
 
 
 @pytest.mark.asyncio
-async def test_office_preview_maps_shell_timeout():
-    sandbox = _sandbox_with_commands(
-        _snapshot_execution(),
-        make_fake_execution(stdout_text="", exit_code=1),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="OWNER", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=1),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="/usr/bin/soffice", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=124),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
-    )
-    with pytest.raises(FilePreviewTimeoutError):
-        await render_office_document_to_pdf(
+async def test_office_preview_cancellation_waits_for_sandbox_script():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+
+    async def run(_command, *, opts):
+        started.set()
+        await release.wait()
+        completed.set()
+        return make_fake_execution(stdout_text='{"ok":false,"reason":"busy"}')
+
+    sandbox = MagicMock()
+    sandbox.commands.run = run
+    request = asyncio.create_task(
+        render_office_document_to_pdf(
             sandbox,
-            source_filename="slow.pptx",
-            source_path="/home/user/sessions/s1/slow.pptx",
+            source_filename="report.docx",
+            source_path="/home/user/sessions/s1/report.docx",
             session_root="/home/user/sessions/s1",
         )
+    )
+    await started.wait()
+    request.cancel()
+    await asyncio.sleep(0)
+    assert not request.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert completed.is_set()
 
 
 @pytest.mark.asyncio
@@ -275,89 +413,6 @@ async def test_office_cleanup_finishes_before_propagating_request_cancellation()
     with pytest.raises(asyncio.CancelledError):
         await request
     assert completed.is_set()
-
-
-@pytest.mark.asyncio
-async def test_office_preview_rejects_oversized_cached_pdf():
-    sandbox = _sandbox_with_commands(
-        _snapshot_execution(),
-        make_fake_execution(stdout_text=str(MAX_RENDERED_PDF_BYTES + 1)),
-        make_fake_execution(stdout_text="", exit_code=0),
-        make_fake_execution(stdout_text="", exit_code=0),
-    )
-    with pytest.raises(FilePreviewTooLargeError, match="转换后的 PDF"):
-        await render_office_document_to_pdf(
-            sandbox,
-            source_filename="report.docx",
-            source_path="/home/user/sessions/s1/report.docx",
-            session_root="/home/user/sessions/s1",
-        )
-
-
-class _ConcurrentCommandRunner:
-    def __init__(self):
-        self.locked = False
-        self.ready = False
-        self.released = asyncio.Event()
-        self.conversions = 0
-
-    async def __call__(self, command, **_kwargs):
-        if "python3 - <<'PY'" in command:
-            return _snapshot_execution()
-        if "head -c 5" in command:
-            if ".incoming-" in command:
-                return make_fake_execution(stdout_text="8192")
-            return make_fake_execution(
-                stdout_text="8192" if self.ready else "",
-                exit_code=0 if self.ready else 1,
-            )
-        if command.startswith("mkdir -p"):
-            return make_fake_execution(stdout_text="")
-        if "echo OWNER" in command:
-            if self.locked:
-                return make_fake_execution(stdout_text="WAITER")
-            self.locked = True
-            return make_fake_execution(stdout_text="OWNER")
-        if "while test -d" in command:
-            await self.released.wait()
-            return make_fake_execution(stdout_text="")
-        if command.startswith("command -v soffice"):
-            return make_fake_execution(stdout_text="/usr/bin/soffice")
-        if "soffice" in command:
-            self.conversions += 1
-            await asyncio.sleep(0.02)
-            return make_fake_execution(stdout_text="")
-        if command.startswith("mv -f --"):
-            self.ready = True
-            return make_fake_execution(stdout_text="")
-        if command.startswith("rmdir --"):
-            self.locked = False
-            self.released.set()
-            return make_fake_execution(stdout_text="")
-        return make_fake_execution(stdout_text="")
-
-
-@pytest.mark.asyncio
-async def test_concurrent_same_content_requests_publish_once():
-    runner = _ConcurrentCommandRunner()
-    sandbox = MagicMock()
-    sandbox.commands.run = runner.__call__
-    first, second = await asyncio.gather(
-        render_office_document_to_pdf(
-            sandbox,
-            source_filename="same.docx",
-            source_path="/home/user/sessions/s1/same.docx",
-            session_root="/home/user/sessions/s1",
-        ),
-        render_office_document_to_pdf(
-            sandbox,
-            source_filename="same.docx",
-            source_path="/home/user/sessions/s1/same.docx",
-            session_root="/home/user/sessions/s1",
-        ),
-    )
-    assert first.cache_key == second.cache_key
-    assert runner.conversions == 1
 
 
 @pytest.mark.asyncio
