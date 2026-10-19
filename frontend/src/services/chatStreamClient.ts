@@ -5,6 +5,7 @@ import type {
   ChatContentBlock,
   PendingFileDraftInfo,
   RoundData,
+  SendRejection,
   StreamDeltaMeta,
   TurnReasoningSelection,
 } from '../types';
@@ -122,7 +123,7 @@ interface StartSendArgs extends StreamIdentity, StreamHandlers {
   preferredMcpServerIds?: string[];
   reasoning?: TurnReasoningSelection;
   pendingFileDrafts?: PendingFileDraftInfo[];
-  onRejectedBeforeAccept?: () => void;
+  onRejectedBeforeAccept?: (rejection: SendRejection) => void;
   onControlConflict?: (message: string, code: string, serverRunId?: string) => void;
 }
 
@@ -699,7 +700,7 @@ export function startSendStream(args: StartSendArgs): RuntimeSubscription {
   const notifyRejectedBeforeAccept = (message: string, code?: string) => {
     if (streamAccepted || preAcceptRejectionNotified) return;
     preAcceptRejectionNotified = true;
-    args.onRejectedBeforeAccept?.();
+    args.onRejectedBeforeAccept?.({ message, code });
     // Rejection removes the optimistic run. Keep its feedback on the session,
     // so the following RUN_ERROR does not depend on that run still existing.
     args.onError?.(message, code);

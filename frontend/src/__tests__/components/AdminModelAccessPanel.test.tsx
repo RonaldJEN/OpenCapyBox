@@ -63,6 +63,7 @@ const modelsResponse = {
     default_model_id: null,
     cron_default_model_id: null,
     subagent_default_model_id: null,
+    vision_fallback_model_id: null,
   },
 };
 
@@ -123,6 +124,60 @@ describe('AdminModelAccessPanel', () => {
 
     await waitFor(() => {
       expect(deleteAdminModel).toHaveBeenCalledWith('delete-model', undefined);
+    });
+  });
+
+  it('删除当前视觉挂件模型时提示将关闭挂件，不要求替换模型', async () => {
+    vi.mocked(getAdminModels).mockResolvedValue({
+      ...modelsResponse,
+      models: [{ ...modelsResponse.models[0], id: 'vision-model', name: '视觉模型', supports_image: true, max_images: 8 }],
+      settings: { ...modelsResponse.settings, vision_fallback_model_id: 'vision-model' },
+    });
+
+    render(<AdminModelAccessPanel apiErrorDetail={() => '请求失败'} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /删除/ }));
+    expect(await screen.findByText('该模型是当前视觉挂件，删除后视觉挂件将关闭。')).toBeInTheDocument();
+    expect(screen.queryByLabelText('替换模型')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /确认删除/ }));
+
+    await waitFor(() => {
+      expect(deleteAdminModel).toHaveBeenCalledWith('vision-model', undefined);
+    });
+  });
+
+  it('视觉挂件只列出支持图片的启用模型，并随默认模型设置一起保存', async () => {
+    vi.mocked(getAdminModels).mockResolvedValue({
+      ...modelsResponse,
+      models: [
+        modelsResponse.models[0],
+        {
+          ...modelsResponse.models[0],
+          id: 'vision-model',
+          name: '视觉模型',
+          supports_image: true,
+          max_images: 8,
+        },
+      ],
+      settings: { ...modelsResponse.settings, default_model_id: 'delete-model' },
+    });
+
+    render(<AdminModelAccessPanel apiErrorDetail={() => '请求失败'} />);
+
+    const select = await screen.findByLabelText('视觉挂件');
+    const optionValues = Array.from((select as HTMLSelectElement).options).map((option) => option.value);
+    expect(optionValues).toEqual(['', 'vision-model']);
+
+    fireEvent.change(select, { target: { value: 'vision-model' } });
+    fireEvent.click(screen.getByRole('button', { name: /保存默认模型/ }));
+
+    await waitFor(() => {
+      expect(updateAdminModelSettings).toHaveBeenCalledWith({
+        default_model_id: 'delete-model',
+        cron_default_model_id: null,
+        subagent_default_model_id: null,
+        vision_fallback_model_id: 'vision-model',
+      });
     });
   });
 

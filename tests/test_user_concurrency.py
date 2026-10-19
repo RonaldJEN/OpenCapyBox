@@ -1,6 +1,7 @@
 """用户级并发限制测试 - 数据库锁（跨 worker）"""
 
 import asyncio
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import timedelta
@@ -1768,6 +1769,219 @@ class TestSendMessageConcurrencyBlock:
         assert "INTERACTION_PENDING" in body
         assert "interaction still pending" in body
         assert "INTERNAL_ERROR" not in body
+        release_lock.assert_called_once()
+
+    async def test_send_vision_fallback_failure_returns_pre_admission_stream_error(self):
+        from src.api.routes.chat import send_message_stream
+        from src.api.schemas.chat import SendMessageRequest
+        from src.api.services.vision_fallback_service import VisionFallbackError
+
+        mock_db = MagicMock()
+        mock_session = MagicMock(
+            id="session-1",
+            user_id="testuser",
+            status="active",
+            model_id="model-1",
+        )
+
+        def query_side_effect(model):
+            from src.api.models.session import Session as SessionModel
+            from src.api.models.user_sandbox import UserSandbox
+            from src.api.models.round import Round as RoundModel
+            from src.api.models.run_cancel_request import RunCancelRequest as RunCancelRequestModel
+
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                chain.filter.return_value.first.return_value = None
+            elif model is RoundModel:
+                chain.filter.return_value.count.return_value = 1
+            elif model is RunCancelRequestModel:
+                chain.filter.return_value.first.return_value = None
+            return chain
+
+        mock_db.query.side_effect = query_side_effect
+        mock_agent_service = MagicMock()
+
+        with patch("src.api.routes.chat.enforce_token_limits", return_value=None), patch(
+            "src.api.routes.chat._acquire_lock_and_clear_cancel",
+            new_callable=AsyncMock,
+            return_value="lock-send",
+        ), patch("src.api.routes.chat.get_agent_pool") as get_pool, patch(
+            "src.api.routes.chat._turn_orchestrator.submit_turn",
+            new_callable=AsyncMock,
+            side_effect=VisionFallbackError("视觉助手 视觉模型 识别图片 b.png 失败：超时"),
+        ), patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as release_lock:
+            get_pool.return_value.get_or_create = AsyncMock(return_value=mock_agent_service)
+            response = await send_message_stream(
+                "session-1",
+                SendMessageRequest(content=[{"type": "text", "text": "看图"}]),
+                user_id="testuser",
+                db=mock_db,
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        body = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
+        run_errors = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ") and "RUN_ERROR" in line
+        ]
+        assert [(event["code"], event["message"]) for event in run_errors] == [
+            ("VISION_FALLBACK_FAILED", "图片识别失败，请重试"),
+        ]
+        # 技术细节只进日志，不发给用户
+        assert "b.png" not in body
+        assert "INTERNAL_ERROR" not in body
+        release_lock.assert_called_once()
+
+    async def test_send_renews_run_lock_while_preparing_round(self):
+        """Round 创建前的准备阶段（视觉挂件识别）随心跳续期运行锁，避免超过陈旧阈值被新请求回收。"""
+        from src.api.routes.chat import send_message_stream
+        from src.api.schemas.chat import SendMessageRequest
+        from src.api.services.vision_fallback_service import VisionFallbackError
+
+        mock_db = MagicMock()
+        mock_session = MagicMock(
+            id="session-1",
+            user_id="testuser",
+            status="active",
+            model_id="model-1",
+        )
+
+        def query_side_effect(model):
+            from src.api.models.session import Session as SessionModel
+            from src.api.models.user_sandbox import UserSandbox
+            from src.api.models.round import Round as RoundModel
+
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                chain.filter.return_value.first.return_value = None
+            elif model is RoundModel:
+                chain.filter.return_value.count.return_value = 1
+            return chain
+
+        mock_db.query.side_effect = query_side_effect
+
+        async def slow_prepare(turn, **kwargs):
+            await asyncio.sleep(0.1)
+            raise VisionFallbackError("视觉助手 视觉模型 识别图片 a.png 失败：超时")
+
+        settings = MagicMock(sse_heartbeat_interval=0.02, agent_init_timeout_seconds=5)
+
+        with patch("src.api.routes.chat.enforce_token_limits", return_value=None), patch(
+            "src.api.routes.chat._acquire_lock_and_clear_cancel",
+            new_callable=AsyncMock,
+            return_value="lock-send",
+        ), patch("src.api.routes.chat.get_agent_pool") as get_pool, patch(
+            "src.api.routes.chat.get_settings", return_value=settings
+        ), patch(
+            "src.api.routes.chat._turn_orchestrator.submit_turn",
+            new_callable=AsyncMock,
+            side_effect=slow_prepare,
+        ), patch(
+            "src.api.routes.chat._has_cancel_activity_since_in_new_session", return_value=False
+        ), patch(
+            "src.api.routes.chat._touch_user_run_lock_in_new_session"
+        ) as touch_lock, patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            get_pool.return_value.get_or_create = AsyncMock(return_value=MagicMock())
+            response = await send_message_stream(
+                "session-1",
+                SendMessageRequest(content=[{"type": "text", "text": "看图"}]),
+                user_id="testuser",
+                db=mock_db,
+            )
+            [chunk async for chunk in response.body_iterator]
+
+        assert touch_lock.call_count >= 2
+        touch_lock.assert_called_with(user_id="testuser", lock_id="lock-send")
+
+    async def test_send_abort_during_vision_recognition_does_not_start_run(self):
+        """识别期间 abort 已释放锁：识别结束后复核命中，不创建 Round、不启动执行。"""
+        from src.api.routes.chat import send_message_stream
+        from src.api.schemas.chat import SendMessageRequest
+        from src.api.services.agent_service import RunAbortedBeforeStartError
+
+        mock_db = MagicMock()
+        mock_session = MagicMock(
+            id="session-1",
+            user_id="testuser",
+            status="active",
+            model_id="model-1",
+        )
+
+        def query_side_effect(model):
+            from src.api.models.session import Session as SessionModel
+            from src.api.models.user_sandbox import UserSandbox
+            from src.api.models.round import Round as RoundModel
+
+            chain = MagicMock()
+            if model is SessionModel:
+                chain.filter.return_value.first.return_value = mock_session
+            elif model is UserSandbox:
+                chain.filter.return_value.first.return_value = None
+            elif model is RoundModel:
+                chain.filter.return_value.count.return_value = 1
+            return chain
+
+        mock_db.query.side_effect = query_side_effect
+
+        async def submit_turn(turn, **kwargs):
+            # 模拟 prepare_chat_round：识别结束后复核取消状态
+            if kwargs["abort_requested"]():
+                raise RunAbortedBeforeStartError()
+            raise AssertionError("abort 后不应继续创建 Round")
+
+        with patch("src.api.routes.chat.enforce_token_limits", return_value=None), patch(
+            "src.api.routes.chat._acquire_lock_and_clear_cancel",
+            new_callable=AsyncMock,
+            return_value="lock-send",
+        ), patch("src.api.routes.chat.get_agent_pool") as get_pool, patch(
+            "src.api.routes.chat._turn_orchestrator.submit_turn",
+            new_callable=AsyncMock,
+            side_effect=submit_turn,
+        ), patch(
+            # init-window 复核未命中，识别后复核命中
+            "src.api.routes.chat._has_cancel_activity_since_in_new_session",
+            side_effect=[False, True],
+        ), patch(
+            "src.api.routes.chat._complete_cancel_request_in_new_session",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch(
+            "src.api.routes.chat._release_user_run_lock_in_new_session",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as release_lock:
+            get_pool.return_value.get_or_create = AsyncMock(return_value=MagicMock())
+            response = await send_message_stream(
+                "session-1",
+                SendMessageRequest(content=[{"type": "text", "text": "看图"}]),
+                user_id="testuser",
+                db=mock_db,
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        body = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
+        run_errors = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ") and "RUN_ERROR" in line
+        ]
+        assert [(event["code"], event["message"]) for event in run_errors] == [
+            ("USER_ABORT", "Aborted by user"),
+        ]
         release_lock.assert_called_once()
 
     async def test_first_message_waiting_stream_persists_and_emits_title(self, lock_db_session):

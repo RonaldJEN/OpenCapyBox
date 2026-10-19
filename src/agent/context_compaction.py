@@ -203,11 +203,27 @@ def project_message_media_capabilities(
             content.append({"type": "text", "text": str(block)})
             continue
         block_type = block.get("type")
-        if block_type == "image_url" and not supports_image:
-            content.append({
-                "type": "text",
-                "text": "[历史图片未随本次请求发送：当前模型不支持图片输入。]",
-            })
+        if block_type == "image_url":
+            # 视觉挂件的描述只发给不支持图片的模型；能看图的模型直接收原图。
+            vision = block.get("vision_description")
+            if supports_image:
+                image_block = dict(block)
+                image_block.pop("vision_description", None)
+                content.append(image_block)
+            elif vision:
+                location = f"（{vision['path']}）" if vision["path"] else " "
+                content.append({
+                    "type": "text",
+                    "text": (
+                        f"[图片 {vision['name']}{location}由视觉助手 {vision['model_name']} 代读：\n"
+                        f"{vision['text']}\n如需细节，可用 read_image_file 带 question 追问。]"
+                    ),
+                })
+            else:
+                content.append({
+                    "type": "text",
+                    "text": "[历史图片未随本次请求发送：当前模型不支持图片输入。]",
+                })
             continue
         if block_type == "video_url" and not supports_video:
             content.append({

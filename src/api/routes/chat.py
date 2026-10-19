@@ -41,6 +41,7 @@ from src.api.utils.agui_encoder import EventEncoder
 from src.api.services.agent_service import (
     DuplicateRoundError,
     InvalidInteractionResponseError,
+    RunAbortedBeforeStartError,
 )
 from src.api.services.agent_interaction_service import InteractionConflictError
 from src.api.services.agui_event_bus import AguiEventBus, get_agui_event_bus
@@ -51,6 +52,7 @@ from src.api.services.running_rounds import get_main_running_round
 from src.api.services.subagent_graph_service import get_subagent_graph_service
 from src.api.services.turn_orchestrator import TurnExecution, get_turn_orchestrator
 from src.api.services.web_chat_adapter import WebCancelAdapter, WebChatAdapter, WebResumeAdapter
+from src.api.services.vision_fallback_service import VisionFallbackError
 from src.api.services.workspace_service import WorkspaceError
 from src.api.services.model_access_service import assert_user_can_access_model, resolve_default_model_for_user
 from src.api.models.round import Round
@@ -275,6 +277,16 @@ def _has_cancel_activity_since_in_new_session(
             session_id=session_id,
             started_at=started_at,
         )
+
+
+def _touch_user_run_lock_in_new_session(*, user_id: str, lock_id: str) -> None:
+    """Round 创建前续期运行锁；TurnOrchestrator 的锁心跳在 Round 创建后才接管。"""
+    with SessionLocal() as db:
+        db.query(UserRunLock).filter(
+            UserRunLock.user_id == user_id,
+            UserRunLock.lock_id == lock_id,
+        ).update({UserRunLock.updated_at: now_naive()}, synchronize_session=False)
+        db.commit()
 
 
 def _is_retryable_db_error(exc: OperationalError) -> bool:
@@ -890,6 +902,12 @@ async def send_message_stream(
                 lock_id=lock_id,
                 run_started_at=run_guard_started_at,
                 attachment_progress=on_attachment_progress,
+                # 与上方 init-window 防漏同一判定：视觉挂件识别结束后再复核一次。
+                abort_requested=lambda: _has_cancel_activity_since_in_new_session(
+                    user_id=user_id,
+                    session_id=chat_session_id,
+                    started_at=run_guard_started_at,
+                ),
             ))
             progress_task = asyncio.create_task(attachment_progress_queue.get())
             heartbeat_task = asyncio.create_task(
@@ -910,6 +928,8 @@ async def send_message_stream(
                             attachment_progress_queue.get()
                         )
                     if heartbeat_task in done:
+                        # 附件冻结与视觉挂件识别可能超过锁陈旧阈值：随心跳续期，防止被新请求回收。
+                        _touch_user_run_lock_in_new_session(user_id=user_id, lock_id=lock_id)
                         yield event_encoder.encode(CustomEvent(
                             name="heartbeat",
                             value={"timestamp": int(datetime.now().timestamp() * 1000)},
@@ -938,6 +958,20 @@ async def send_message_stream(
                     message=e.message,
                     code=e.code,
                 ))
+                return
+            except VisionFallbackError as e:
+                # Round 尚未创建；前端按发送前拒绝处理并恢复草稿，用户可直接重新发送。
+                # 技术原因只进日志，给用户的是能看懂的一句话。
+                logger.warning("视觉挂件识别上传图片失败: session=%s error=%s", chat_session_id, e)
+                yield event_encoder.encode(RunErrorEvent(
+                    message="图片识别失败，请重试",
+                    code="VISION_FALLBACK_FAILED",
+                ))
+                return
+            except RunAbortedBeforeStartError:
+                # 识别期间用户已 abort，锁已由 abort 接口释放；不创建 Round。
+                yield event_encoder.encode(RunErrorEvent(message="Aborted by user", code="USER_ABORT"))
+                await _complete_cancel_request_in_new_session(user_id=user_id, session_id=chat_session_id)
                 return
             except Exception:
                 logger.error("submit turn failed before orchestrated SSE started", exc_info=True)

@@ -230,6 +230,7 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
   const models = useMemo(() => modelsData?.models || [], [modelsData]);
   const users = useMemo(() => usersData?.users || [], [usersData]);
   const enabledModels = useMemo(() => models.filter((model) => model.enabled), [models]);
+  const visionModels = useMemo(() => enabledModels.filter((model) => model.supports_image), [enabledModels]);
   const enabledModelIds = useMemo(() => new Set(enabledModels.map((model) => model.id)), [enabledModels]);
   const defaultGroup = groups.find((group) => group.is_default);
   const businessGroups = groups.filter((group) => !group.is_default);
@@ -248,6 +249,10 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
   const deleteTargetNeedsReplacement = Boolean(
     deleteTargetModel
     && ((deleteTargetModel.session_count || 0) > 0 || deleteTargetDefaultUsages.length > 0),
+  );
+  // 视觉挂件不迁移到替换模型：删除即关闭（见 admin-spec）。
+  const deleteTargetIsVisionFallback = Boolean(
+    deleteTargetModel && modelsData?.settings.vision_fallback_model_id === deleteTargetModel.id,
   );
 
   useEffect(() => {
@@ -472,6 +477,7 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
         default_model_id: defaultModel,
         cron_default_model_id: String(formData.get('cron_default_model_id') || '') || null,
         subagent_default_model_id: String(formData.get('subagent_default_model_id') || '') || null,
+        vision_fallback_model_id: String(formData.get('vision_fallback_model_id') || '') || null,
       });
     }, '默认模型设置已保存');
   };
@@ -541,6 +547,7 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
                 modelsData?.settings.default_model_id,
                 modelsData?.settings.cron_default_model_id,
                 modelsData?.settings.subagent_default_model_id,
+                modelsData?.settings.vision_fallback_model_id,
                 enabledModels.length,
               ].join(':')}
             >
@@ -563,6 +570,13 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
                 <select name="subagent_default_model_id" defaultValue={modelsData?.settings.subagent_default_model_id || ''}>
                   <option value="">继承普通默认</option>
                   {enabledModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+                </select>
+              </label>
+              <label className="admin-model-field" title="主模型不支持图片时，由该模型识别用户上传的图片和 read_image_file 读取的图片">
+                视觉挂件
+                <select name="vision_fallback_model_id" defaultValue={modelsData?.settings.vision_fallback_model_id || ''}>
+                  <option value="">关闭</option>
+                  {visionModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
                 </select>
               </label>
               <button
@@ -933,6 +947,7 @@ export default function AdminModelAccessPanel({ apiErrorDetail, refreshToken = 0
                 <p>该模型没有历史会话引用。</p>
               )}
               {deleteTargetDefaultUsages.length ? <p>同步替换：{deleteTargetDefaultUsages.join('、')}。</p> : null}
+              {deleteTargetIsVisionFallback ? <p>该模型是当前视觉挂件，删除后视觉挂件将关闭。</p> : null}
               {deleteTargetNeedsReplacement ? (
                 <label className="admin-model-field">
                   替换模型

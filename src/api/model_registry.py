@@ -463,6 +463,7 @@ class ModelRegistry:
         default_embedding_model_id: str = "",
         cron_default_model_id: str = "",
         subagent_default_model_id: str = "",
+        vision_fallback_model_id: str = "",
         source: str = "yaml",
     ):
         self._models = models
@@ -471,6 +472,7 @@ class ModelRegistry:
         self._default_embedding_model_id = default_embedding_model_id
         self._cron_default_model_id = cron_default_model_id or default_model_id
         self._subagent_default_model_id = subagent_default_model_id or default_model_id
+        self._vision_fallback_model_id = vision_fallback_model_id
         self.source = source
 
     @classmethod
@@ -525,6 +527,7 @@ class ModelRegistry:
         default_model_id = raw.get("default_model", "")
         cron_default_model_id = raw.get("cron_default_model", "") or default_model_id
         subagent_default_model_id = raw.get("subagent_default_model", "") or default_model_id
+        vision_fallback_model_id = raw.get("vision_fallback_model", "")
         models: dict[str, ModelConfig] = {}
 
         for model_id, cfg in raw["models"].items():
@@ -590,6 +593,7 @@ class ModelRegistry:
             default_embedding_model_id=default_embedding_model_id,
             cron_default_model_id=cron_default_model_id,
             subagent_default_model_id=subagent_default_model_id,
+            vision_fallback_model_id=vision_fallback_model_id,
             source="yaml",
         )
         registry.validate_on_startup()
@@ -675,6 +679,16 @@ class ModelRegistry:
             )
         return config
 
+    def get_vision_fallback(self) -> Optional[ModelConfig]:
+        """獲取視覺掛件模型；未配置時返回 None。
+
+        配置失效（模型不存在 / 停用 / 不支持圖片）已在 validate_on_startup
+        階段清空並告警，這裡只會返回可用模型或 None。
+        """
+        if not self._vision_fallback_model_id:
+            return None
+        return self._models[self._vision_fallback_model_id]
+
     def validate_on_startup(self) -> None:
         """啟動時校驗所有已啟用模型的 API Key 可用性
 
@@ -721,6 +735,17 @@ class ModelRegistry:
                     self._default_model_id = fallback.id
                 else:
                     logger.error("所有模型均不可用，請檢查 .env 配置")
+
+        # 驗證視覺掛件仍可用；API key 缺失等原因導致不可用時關閉掛件，
+        # 主模型不支持圖片的請求回到"不支持圖片輸入"的既有行為。
+        if self._vision_fallback_model_id:
+            vision = self._models.get(self._vision_fallback_model_id)
+            if vision is None or not vision.enabled or not vision.supports_image:
+                logger.warning(
+                    "視覺掛件模型 '%s' 不可用（不存在、已停用或不支持圖片），已關閉視覺掛件",
+                    self._vision_fallback_model_id,
+                )
+                self._vision_fallback_model_id = ""
 
     def list_models(self, enabled_only: bool = True) -> list[ModelConfig]:
         """列出模型配置"""

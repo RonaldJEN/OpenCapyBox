@@ -29,6 +29,51 @@ describe('ChatInput drag/drop behavior', () => {
     }
   });
 
+  it('识别失败提示自动消失后，视觉挂件说明仍然显示', () => {
+    vi.useFakeTimers();
+    const notice = '当前模型不能直接看图，发送后会先自动识别图片内容。';
+    const view = render(
+      <ChatInput
+        value="看看图片"
+        onChange={() => {}}
+        onSend={() => {}}
+        imageInputNotice={notice}
+        attachmentError="图片识别失败，点一下图片即可重试"
+      />,
+    );
+    try {
+      act(() => vi.advanceTimersByTime(3000));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.getByText(notice)).toBeInTheDocument();
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it('识别失败的图片显示点击重试，点击直接重新发送而不是预览', () => {
+    const onSend = vi.fn();
+    const onPreviewAttachment = vi.fn();
+    render(
+      <ChatInput
+        value="看看图片"
+        onChange={() => {}}
+        onSend={onSend}
+        onPreviewAttachment={onPreviewAttachment}
+        imageInputNotice="当前模型不能直接看图，发送后会先自动识别图片内容。"
+        attachedFiles={[{
+          name: 'chart.png', type: 'image/png', path: 'attachments/a/chart.png', size: 5, modified: '',
+          source: 'session', uploadStatus: 'ready', visionFailed: true,
+        }]}
+      />,
+    );
+
+    expect(screen.getByText('识别失败')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'chart.png 识别失败，点击重新发送' }));
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onPreviewAttachment).not.toHaveBeenCalled();
+  });
+
   it.each([1000, 1001])('单次粘贴 %i 个 Unicode 字符时，仅超过 1000 才转附件', (length) => {
     const onPasteText = vi.fn();
     const onChange = vi.fn();

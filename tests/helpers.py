@@ -386,14 +386,24 @@ class MockRegistry:
             ...
     """
 
-    def __init__(self, supports_image: bool = False, max_images: int = 0, **kwargs):
+    def __init__(
+        self,
+        supports_image: bool = False,
+        max_images: int = 0,
+        vision_fallback=None,
+        **kwargs,
+    ):
         self._cfg = MockModelConfig(supports_image=supports_image, max_images=max_images, **kwargs)
+        self._vision_fallback = vision_fallback
 
     def get_or_raise(self, _model_id: str):
         return self._cfg
 
     def get_default(self):
         return self._cfg
+
+    def get_vision_fallback(self):
+        return self._vision_fallback
 
 
 # ============== AGUI 事件收集 ==============

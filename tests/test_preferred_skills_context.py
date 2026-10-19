@@ -101,6 +101,8 @@ async def test_direct_round_persists_resolved_preferred_skill_display_snapshot()
         return_value=[{"type": "text", "text": "hello"}]
     )
     service._validate_multimodal_blocks = MagicMock()
+    service._vision_fallback = None
+    service._vision_descriptions = {}
     service._build_agent_user_content = MagicMock(return_value="hello")
     service._blocks_to_plain_text = MagicMock(return_value="hello")
     service._extract_user_attachments = MagicMock(return_value=[])
@@ -236,6 +238,8 @@ async def test_direct_round_materializes_omitted_catalog_reasoning_default():
         return_value=[{"type": "text", "text": "hello"}]
     )
     service._validate_multimodal_blocks = MagicMock()
+    service._vision_fallback = None
+    service._vision_descriptions = {}
     service._build_agent_user_content = MagicMock(return_value="hello")
     service._blocks_to_plain_text = MagicMock(return_value="hello")
     service._extract_user_attachments = MagicMock(return_value=[])

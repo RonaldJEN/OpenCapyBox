@@ -55,6 +55,7 @@
 | `default_model_id` | 普通 Web 会话默认模型 |
 | `cron_default_model_id` | Cron 默认模型；为空时使用普通默认模型 |
 | `subagent_default_model_id` | Subagent 默认模型；为空时使用普通默认模型 |
+| `vision_fallback_model_id` | 视觉挂件模型；主模型不支持图片时代为看图。NULL 表示关闭。必须指向已启用且 `supports_image=true` 的模型 |
 
 ### 模型权限表
 
@@ -69,6 +70,7 @@
 - 鉴权：需要当前登录用户。
 - 响应只返回当前用户可访问且启用的模型；管理员可访问全部启用模型。
 - `default_model` / `subagent_default_model` 必须落在当前用户可访问模型集合内；若全局默认不可访问，则回退到该用户可访问列表的第一个模型。
+- `vision_fallback` 为视觉挂件信息（`{id, name, max_images}`），未配置或已失效时为 `null`。挂件是系统能力，不受用户模型权限组限制；前端用它决定不支持图片的模型能否接收对话图片以及数量上限。
 - 响应不包含 `api_key`、`api_base` 等敏感字段。
 
 ```json
@@ -96,7 +98,8 @@
     }
   ],
   "default_model": "model-id",
-  "subagent_default_model": "model-id"
+  "subagent_default_model": "model-id",
+  "vision_fallback": {"id": "vision-model-id", "name": "Vision Display Name", "max_images": 20}
 }
 ```
 
@@ -120,6 +123,7 @@
 - AgentPool 缓存以 session 与模型身份共同判断可复用性。模型变化只摘除旧热实例并建立新实例；不得关闭仍在执行的实例、打断其后台命令或暂停共享用户沙箱。
 - 累计 checkpoint 记录其 `source_model_id`。跨模型恢复仍复用摘要与精确 suffix，工具调用和结果配对保持；来源模型不同或旧 checkpoint 的来源为 NULL 时，仅清除供应商/协议专属的 opaque replay metadata，不得丢弃摘要正文或永久退回全量事件重建。
 - 持久化和 Agent 内存历史保留原始图片/视频块；供应商请求只投影当前模型支持的媒体。切到不支持图片或视频的模型时，仅在该请求副本把不支持的历史媒体替换为“当前模型未接收该图片/视频”的文本标记，保留同消息文本、文件引用和 tool call/result 配对；不得借此触发摘要、截断或改写历史。切回支持该媒体的模型时，原始块必须重新可用。
+- 图片块带 `vision_description`（视觉挂件在发送时生成，见 `chat-spec`）时：不支持图片的模型在请求副本中收到 `[图片 <name>（<path>）由视觉助手 <model> 代读：<描述> 如需细节，可用 read_image_file 带 question 追问。]`（`path` 为空时省略括号部分）；支持图片的模型收到去掉 `vision_description` 字段的原图块。历史中的原块始终不变。
 
 ### 配置驱动零硬编码
 
@@ -156,7 +160,7 @@
 - 从 DB 读取 `supported_reasoning_efforts_json` 时不得用 `str(item)` 强转：非字符串项必须报错暴露损坏数据，而不是静默生成一个永远匹配不上的等级。`tags` 是自由标签，不适用该严格规则。
 
 - 当 `llm_models` 为空时，从 `models.yaml` 导入初始模型，并把启用模型加入默认权限包。
-- `models.yaml` 中的 `default_model`、`cron_default_model`、`subagent_default_model` 会写入 `llm_model_settings`。
+- `models.yaml` 中的 `default_model`、`cron_default_model`、`subagent_default_model`、`vision_fallback_model` 会写入 `llm_model_settings`。
 - DB 已有模型时，不再用 `models.yaml` 覆盖运行时目录。
 - 新增数据库列只使用数据库迁移默认值；已有模型记录绝不从 `models.yaml` 回填。
 
@@ -169,6 +173,14 @@
 | `subagent_default_model_id` | `AgentService` 的 subagent runner、`SubagentGraphService.create_edge()` | `sub_agent` child Agent run 和 graph 边的默认模型 |
 
 `sub_agent` 创建 child Agent 时使用 `get_subagent_default()`，不继承父会话当前选择的模型，避免主 Agent 与子任务的模型职责混在一起。
+
+### 视觉挂件
+
+- `vision_fallback_model_id` 不是"某个场景的默认主模型"，而是辅助角色：主模型不支持图片时只把看图这一步交给它，结果以文字交回主模型，主模型、推理设置和上下文都不变。主模型支持图片时完全不经过挂件。
+- `ModelRegistry.get_vision_fallback()` 返回挂件 `ModelConfig` 或 `None`。`validate_on_startup()` 发现挂件模型不存在、已停用（含 API key 缺失被自动停用）或不支持图片时，记录 WARNING 并关闭挂件，行为回到"不支持图片输入"，不阻断启动。
+- 消费方：Web 会话、Cron、Subagent 的 Agent 在构建时按主模型能力决定是否持有挂件（`AgentService._vision_fallback`）；挂件同时服务用户上传图片（见 `chat-spec`）与 `read_image_file`（见 `sandbox-spec`）。
+- 系统基座 prompt 固定在 `src/api/services/vision_fallback_service.py`：只转述可见内容、文字逐字转录、表格转 Markdown、图表写明坐标轴与数值、看不清标注"（不确定）"、中文、不超过 2000 字。
+- 挂件调用以单次非流式请求发出，不带工具，沿用该模型自身的推理与重试配置（调用期间清空 `current_run_context`，主模型本轮的思考开关 / 推理等级不传给挂件）；每次调用写 INFO 日志（模型、图片数、token 用量、耗时）。用户上传图片发生在 Round 创建前，无法写入 `llm_call_records`（`round_id` 外键），因此挂件调用统一不写该表。
 
 ### Fallback 机制
 

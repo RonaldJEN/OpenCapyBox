@@ -175,7 +175,7 @@
 
 - 响应：`{models, settings}`。
 - `models` 字段：`id`、`name`、`provider`、`openai_protocol`、`api_base`、`model_name`、`max_tokens`、`context_window`、`auto_compact_token_limit`、`tool_output_truncation_bytes`、`reasoning_format`、`reasoning_split`、`enable_thinking`、`thinking_mode`、`thinking_wire_format`、`reasoning_effort`、`default_reasoning_level`、`supported_reasoning_efforts`、`supports_thinking`、`supports_image`、`max_images`、`supports_video`、`max_videos`、`enabled`、`tags`、`api_key_set`、`group_names`、`session_count`、`created_at`、`updated_at`。
-- `settings` 字段：`default_model_id`、`cron_default_model_id`、`subagent_default_model_id`。
+- `settings` 字段：`default_model_id`、`cron_default_model_id`、`subagent_default_model_id`、`vision_fallback_model_id`。
 
 ### POST /api/admin/models
 
@@ -186,15 +186,16 @@
 
 ### PATCH /api/admin/models/settings
 
-- Body：`{default_model_id, cron_default_model_id?, subagent_default_model_id?}`。
-- 语义：更新普通对话、Cron、Subagent 默认模型；Cron/Subagent 为空时归一化为普通默认模型。
-- 约束：默认模型必须存在且启用；成功后 reload model registry。
+- Body：`{default_model_id, cron_default_model_id?, subagent_default_model_id?, vision_fallback_model_id?}`。
+- 语义：更新普通对话、Cron、Subagent 默认模型与视觉挂件模型；Cron/Subagent 为空时归一化为普通默认模型。该接口整体替换设置行，`vision_fallback_model_id` 缺省或为空表示关闭视觉挂件，客户端必须回传当前值以保持不变。
+- 约束：默认模型必须存在且启用；视觉挂件模型必须存在、启用且 `supports_image=true`，否则返回 400；成功后 reload model registry。视觉挂件发生变化时失效全部 AgentPool 缓存（运行中的 Round 延迟重建），因为 `read_image_file` 的模式在 Agent 构建时确定。
+- 管理端 UI：默认模型卡片中的"视觉挂件"下拉框只列出支持图片的启用模型，含"关闭"选项。
 
 ### PATCH /api/admin/models/{model_id}
 
 - Body：模型配置增量字段；`api_key=null` 或缺省表示保留旧密钥。
 - 语义：更新模型目录项并 reload model registry。
-- 约束：推理等级列表遵循与创建相同的规范化和长度规则；provider 变为非 OpenAI 时 `openai_protocol` 归一化为 `NULL`、`thinking_wire_format` 归一化为 `none`；provider 变为 OpenAI 且未指定协议时使用 `chat_completions`；停用模型会从所有模型权限包中移除；请求结构错误返回 422，`ModelConfig` 跨字段/协议校验失败返回 400，模型不存在返回 404。
+- 约束：推理等级列表遵循与创建相同的规范化和长度规则；provider 变为非 OpenAI 时 `openai_protocol` 归一化为 `NULL`、`thinking_wire_format` 归一化为 `none`；provider 变为 OpenAI 且未指定协议时使用 `chat_completions`；停用模型会从所有模型权限包中移除；请求结构错误返回 422，`ModelConfig` 跨字段/协议校验失败返回 400，模型不存在返回 404。停用视觉挂件模型或关闭其图片能力后，registry 重载时自动关闭视觉挂件（见 `models-spec`）。
 
 ### DELETE /api/admin/models/{model_id}
 
@@ -204,6 +205,7 @@
 - 约束：
   - 替换模型不能是当前模型，必须存在且启用。
   - 若模型正在作为普通/Cron/Subagent 默认模型使用，且未提供替换模型，返回 400。
+  - 删除视觉挂件模型不做阻止，也不因此要求替换模型；若该模型是当前视觉挂件，删除时把 `vision_fallback_model_id` 清空（关闭视觉挂件），不迁移到替换模型。删除弹窗提示"该模型是当前视觉挂件，删除后视觉挂件将关闭"。
   - 若历史 Session 使用该模型，且未提供替换模型，返回 409。
   - 提供替换模型时，迁移默认模型设置、`sessions.model_id` 与模型权限包绑定，再删除旧模型。
 

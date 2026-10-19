@@ -20,6 +20,7 @@ import {
   FolderTree,
   Loader2,
   Plus,
+  RotateCw,
   Search,
   Square,
   X,
@@ -84,6 +85,8 @@ interface ChatInputProps {
   attachedFiles?: ComposerAttachment[];
   /** 根据当前模型派生的图片兼容性，与上传状态分开。 */
   imageInputError?: string;
+  /** 图片将由视觉挂件代读时的说明，不阻止发送。 */
+  imageInputNotice?: string;
   attachmentError?: string;
   attachmentErrorKey?: unknown;
   onRemoveAttachment?: (index: number) => void;
@@ -131,6 +134,7 @@ export function ChatInput({
   textareaRef: externalTextareaRef,
   attachedFiles = [],
   imageInputError,
+  imageInputNotice,
   attachmentError,
   attachmentErrorKey,
   onRemoveAttachment,
@@ -473,9 +477,11 @@ export function ChatInput({
                 ?? `legacy:${file.path}:${file.name}:${file.modified}:${file.size}`;
               const status = file.uploadStatus ?? 'ready';
               const incompatible = !!imageInputError && isConversationImageInput(file);
+              // 只在仍由视觉挂件代读时显示；切到能看图的模型后失败标记不再有意义。
+              const visionFailed = !!file.visionFailed && !!imageInputNotice;
               const hasProgress = typeof file.uploadProgress === 'number';
               const progress = Math.max(0, Math.min(100, file.uploadProgress ?? 0));
-              const statusLabel = incompatible ? '不兼容' : status === 'waiting'
+              const statusLabel = incompatible ? '不兼容' : visionFailed ? '识别失败' : status === 'waiting'
                 ? '等待上传'
                 : status === 'uploading'
                   ? (hasProgress ? `上传中 ${progress}%` : '上传中')
@@ -489,14 +495,21 @@ export function ChatInput({
                 <button
                   type="button"
                   onClick={() => {
+                    if (visionFailed) {
+                      if (canSend) onSend();
+                      return;
+                    }
                     if (onPreviewAttachment) {
                       onPreviewAttachment(file);
                       return;
                     }
                     setPreviewFile(file);
                   }}
-                  className="group relative h-20 w-28 overflow-hidden rounded-xl border border-claude-border bg-white transition-colors hover:border-claude-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40"
-                  title={`预览 ${file.name}`}
+                  className={`group relative h-20 w-28 overflow-hidden rounded-xl border bg-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-claude-accent/40 ${
+                    visionFailed ? 'border-claude-error/60 hover:border-claude-error' : 'border-claude-border hover:border-claude-border-strong'
+                  }`}
+                  title={visionFailed ? `${file.name} 识别失败，点击重新发送` : `预览 ${file.name}`}
+                  aria-label={visionFailed ? `${file.name} 识别失败，点击重新发送` : undefined}
                   aria-describedby={incompatible ? attachmentErrorId : undefined}
                 >
                   <div className={`absolute top-1.5 right-1.5 text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-wide z-10 ${getFileBadgeClass(file)}`}>
@@ -519,10 +532,16 @@ export function ChatInput({
                   <div className="absolute inset-x-0 bottom-0 bg-black/55 text-white text-[10px] px-1.5 py-1 truncate">
                     {file.name}
                   </div>
+                  {visionFailed && (
+                    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-1 bg-black/45 text-white transition-colors group-hover:bg-black/55">
+                      <RotateCw className="h-4 w-4 transition-transform duration-300 group-hover:rotate-90" aria-hidden="true" />
+                      <span className="text-[11px] font-medium">点击重试</span>
+                    </div>
+                  )}
                 </button>
 
                 <div
-                  className={`mt-1 min-h-4 truncate text-[10px] ${incompatible ? 'text-claude-error' : 'text-claude-muted'}`}
+                  className={`mt-1 min-h-4 truncate text-[10px] ${incompatible || visionFailed ? 'text-claude-error' : 'text-claude-muted'}`}
                   aria-live="polite"
                   title={incompatible ? imageInputError : status === 'error' ? file.uploadError : undefined}
                 >
@@ -571,7 +590,7 @@ export function ChatInput({
                       e.stopPropagation();
                       onRemoveAttachment(index);
                     }}
-                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-white border border-claude-border text-claude-muted hover:text-claude-error flex items-center justify-center shadow-sm"
+                    className="absolute -top-1.5 -right-1.5 z-30 w-5 h-5 rounded-full bg-white border border-claude-border text-claude-muted hover:text-claude-error flex items-center justify-center shadow-sm"
                     aria-label={`移除 ${file.name}`}
                   >
                     <X className="w-3 h-3" />
@@ -588,6 +607,10 @@ export function ChatInput({
           <FeedbackMessage tone="error" messageKey={attachmentMessageKey} className="mb-2 text-xs text-claude-error">
             {attachmentMessage}
           </FeedbackMessage>
+        )}
+        {/* 错误提示约 3 秒自行隐藏但不通知这里，说明文字不能依赖错误为空才显示。 */}
+        {imageInputNotice && (
+          <p className="mb-2 text-xs text-claude-muted">{imageInputNotice}</p>
         )}
 
         {/* 输入框容器 — 膠囊形 */}

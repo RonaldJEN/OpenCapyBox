@@ -28,7 +28,8 @@ async def list_models(
         {
             "models": [{"id", "name", "provider", "supports_thinking", "max_tokens", "tags"}],
             "default_model": "minimax-text-01",
-            "subagent_default_model": "minimax-text-01"
+            "subagent_default_model": "minimax-text-01",
+            "vision_fallback": null | {"id", "name", "max_images"}
         }
     """
     try:
@@ -41,10 +42,21 @@ async def list_models(
             kind="subagent",
             registry=registry,
         )
+        # 視覺掛件是系統能力，不受用戶模型權限組限制。
+        vision_fallback = registry.get_vision_fallback()
         return {
             "models": [model.to_public_dict() for model in models],
             "default_model": default_model.id,
             "subagent_default_model": subagent_default_model.id,
+            "vision_fallback": (
+                {
+                    "id": vision_fallback.id,
+                    "name": vision_fallback.display_name,
+                    "max_images": vision_fallback.max_images,
+                }
+                if vision_fallback
+                else None
+            ),
         }
     except HTTPException:
         raise

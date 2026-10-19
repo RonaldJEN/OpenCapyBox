@@ -1088,6 +1088,73 @@ class TestSandboxReadImageTool:
         assert "outside workspace" in (result.error or "")
 
 
+def _png_payload() -> str:
+    raw = b"\x89PNG\r\n\x1a\n"
+    return json.dumps({"size": len(raw), "data": base64.b64encode(raw).decode("ascii")})
+
+
+def _vision_fallback(answer: AsyncMock, max_images: int = 3) -> MagicMock:
+    fallback = MagicMock()
+    fallback.config.display_name = "视觉模型"
+    fallback.config.max_images = max_images
+    fallback.answer = answer
+    return fallback
+
+
+class TestSandboxReadImageToolVisionFallback:
+    """主模型不支持图片、配置了视觉挂件时 read_image_file 的行为。"""
+
+    def test_fallback_mode_exposes_question_parameter(self, mock_sandbox):
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            supports_image=False,
+            vision_fallback=_vision_fallback(AsyncMock()),
+        )
+
+        assert "question" in tool.parameters["properties"]
+        assert "vision assistant" in tool.description
+
+    @pytest.mark.asyncio
+    async def test_question_is_answered_by_vision_fallback(self, mock_sandbox):
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=_png_payload()))
+        answer = AsyncMock(return_value="第三季度为 42")
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=False,
+            vision_fallback=_vision_fallback(answer),
+        )
+
+        result = await tool.execute(paths=["chart.png"], question="第三季度是多少")
+
+        assert result.success is True
+        assert result.content_blocks is None
+        assert result.content == (
+            "[视觉助手 视觉模型 读取了 1 张图片：chart.png]\n"
+            "[问题] 第三季度是多少\n"
+            "[回答]\n第三季度为 42"
+        )
+        images, question = answer.await_args.args
+        assert question == "第三季度是多少"
+        assert images[0].name == "chart.png"
+        assert images[0].data_url.startswith("data:image/png;base64,")
+
+    @pytest.mark.asyncio
+    async def test_without_question_requests_full_description(self, mock_sandbox):
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=_png_payload()))
+        answer = AsyncMock(return_value="一张柱状图")
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=False,
+            vision_fallback=_vision_fallback(answer),
+        )
+
+        result = await tool.execute(paths=["chart.png"])
+
+        assert "[问题] （完整描述）" in result.content
+        assert answer.await_args.args[1] is None
+
 # ============== SandboxWriteTool ==============
 
 class TestSandboxWriteTool:

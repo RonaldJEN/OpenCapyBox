@@ -761,7 +761,7 @@ export function ChatRuntimeProvider({
         ),
         reasoning,
         pendingFileDrafts,
-        onRejectedBeforeAccept: () => {
+        onRejectedBeforeAccept: (rejection) => {
           if (isCurrentTransport(clientRunKey, transportEpoch, connectionId)) {
             controlConflictHandled = true;
             dispatch({
@@ -769,7 +769,7 @@ export function ChatRuntimeProvider({
               sessionId,
               clientRunKey,
             });
-            onRejectedBeforeAccept?.();
+            onRejectedBeforeAccept?.(rejection);
           }
         },
         onControlConflict: (_message, _code, serverRunId) => {
@@ -809,7 +809,9 @@ export function ChatRuntimeProvider({
           }
           guardAndDispatch(envelope);
         },
-        onError: (message) => {
+        onError: (message, code) => {
+          // 图片识别失败由输入框在恢复的草稿上就地提示（可点图片重试），不占用会话级错误条。
+          if (code === 'VISION_FALLBACK_FAILED') return;
           dispatchSessionError(
             sessionId,
             clientRunKey,

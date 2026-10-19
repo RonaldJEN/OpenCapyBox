@@ -263,7 +263,13 @@ def test_default_sandbox_profile_assignment_is_normalized_to_null(admin_integrat
         db.close()
 
 
-def _add_test_llm_model(db, *, model_id: str, enabled: bool = True) -> None:
+def _add_test_llm_model(
+    db,
+    *,
+    model_id: str,
+    enabled: bool = True,
+    supports_image: bool = False,
+) -> None:
     db.add(LLMModel(
         model_id=model_id,
         display_name=model_id,
@@ -275,6 +281,8 @@ def _add_test_llm_model(db, *, model_id: str, enabled: bool = True) -> None:
         # Must leave the same real provider-input budget enforced by admin
         # create/update validation: context - output - 3000 >= 8192.
         context_window=16384,
+        supports_image=supports_image,
+        max_images=8 if supports_image else 0,
         enabled=enabled,
     ))
 
@@ -666,6 +674,92 @@ def test_delete_model_rejects_disabled_replacement(admin_integration_client):
     db = SessionLocal()
     try:
         assert db.query(LLMModel).filter(LLMModel.model_id == "old-disabled-replacement-model").first() is not None
+    finally:
+        db.close()
+
+
+def _seed_vision_fallback_settings(db, *, vision_model_id: str | None) -> None:
+    _add_test_llm_model(db, model_id="vision-text-model", enabled=True)
+    db.add(LLMModelSettings(
+        id=1,
+        default_model_id="vision-text-model",
+        cron_default_model_id="vision-text-model",
+        subagent_default_model_id="vision-text-model",
+        vision_fallback_model_id=vision_model_id,
+    ))
+
+
+def test_update_model_settings_sets_vision_fallback_and_rebuilds_agents(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        _seed_vision_fallback_settings(db, vision_model_id=None)
+        _add_test_llm_model(db, model_id="vision-image-model", enabled=True, supports_image=True)
+        db.commit()
+    finally:
+        db.close()
+
+    pool = MagicMock()
+    pool.invalidate_all_async = AsyncMock(return_value=0)
+    with patch("src.api.routes.admin.get_agent_pool", return_value=pool):
+        response = client.patch("/admin/models/settings", json={
+            "default_model_id": "vision-text-model",
+            "vision_fallback_model_id": "vision-image-model",
+        })
+
+    assert response.status_code == 200
+    assert response.json()["vision_fallback_model_id"] == "vision-image-model"
+    pool.invalidate_all_async.assert_awaited_once()
+
+    db = SessionLocal()
+    try:
+        settings = db.query(LLMModelSettings).filter(LLMModelSettings.id == 1).one()
+        assert settings.vision_fallback_model_id == "vision-image-model"
+    finally:
+        db.close()
+
+
+def test_update_model_settings_rejects_vision_fallback_without_image_support(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        _seed_vision_fallback_settings(db, vision_model_id=None)
+        _add_test_llm_model(db, model_id="vision-bad-model", enabled=True)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.patch("/admin/models/settings", json={
+        "default_model_id": "vision-text-model",
+        "vision_fallback_model_id": "vision-bad-model",
+    })
+
+    assert response.status_code == 400
+    assert "必须支持图片输入" in response.json()["detail"]
+
+
+def test_delete_vision_fallback_model_closes_vision_fallback(admin_integration_client):
+    client, SessionLocal = admin_integration_client
+
+    db = SessionLocal()
+    try:
+        _seed_vision_fallback_settings(db, vision_model_id="vision-image-model")
+        _add_test_llm_model(db, model_id="vision-image-model", enabled=True, supports_image=True)
+        db.commit()
+    finally:
+        db.close()
+
+    # 仅作为视觉挂件使用：不要求替换模型，删除即关闭挂件
+    response = client.delete("/admin/models/vision-image-model")
+
+    assert response.status_code == 200
+    db = SessionLocal()
+    try:
+        assert db.query(LLMModel).filter(LLMModel.model_id == "vision-image-model").first() is None
+        settings = db.query(LLMModelSettings).filter(LLMModelSettings.id == 1).one()
+        assert settings.vision_fallback_model_id is None
     finally:
         db.close()
 

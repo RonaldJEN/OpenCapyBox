@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import contextvars
+import hashlib
 import inspect
 import json
 import logging
@@ -55,6 +56,7 @@ from src.api.services.agui_event_bus import (
 from src.api.services.run_completion_service import RunCompletionService
 from src.api.services.context_checkpoint_service import ContextCheckpointService
 from src.api.services.sandbox_service import get_sandbox_service
+from src.api.services.vision_fallback_service import VisionFallbackService, VisionImage
 from src.api.services.subagent_graph_service import get_subagent_graph_service
 from src.api.services.subagent_activity import SubagentActivity
 from src.api.schemas.subagent_graph import SubagentTaskSnapshot
@@ -78,6 +80,10 @@ class DuplicateRoundError(Exception):
     def __init__(self, existing_round_id: str):
         self.existing_round_id = existing_round_id
         super().__init__(f"Duplicate round: {existing_round_id}")
+
+
+class RunAbortedBeforeStartError(Exception):
+    """发送前准备阶段（视觉挂件识别）期间用户已 abort，本轮不创建 Round。"""
 
 
 class InvalidInteractionResponseError(ValueError):
@@ -242,6 +248,10 @@ class AgentService:
         self.workspace_context = dict(workspace_context or {})
         self.agent: Agent | None = None
         self._model_config = None
+        self._vision_fallback: VisionFallbackService | None = None
+        # 视觉挂件已识别成功的图片描述（本条正文 + 图片 Data URL 的 sha256 → 描述）。发送失败后重试
+        # 只重新识别失败的图片；本轮受理后清空，因为描述已随用户消息持久化。
+        self._vision_descriptions: dict[str, str] = {}
         self._last_saved_index = 0
         self._pending_interrupt_round_ids: dict[str, str] = {}
         self.skill_loader = None  # 保存 skill_loader 引用
@@ -327,6 +337,15 @@ class AgentService:
                 model_config,
                 fallback_configs=fallback_configs,
             )
+            # 主模型不支持图片时，由管理员配置的视觉挂件代为看图（上传图片与 read_image_file）。
+            vision_fallback_config = (
+                None if model_config.supports_image else registry.get_vision_fallback()
+            )
+            self._vision_fallback = (
+                VisionFallbackService(vision_fallback_config)
+                if vision_fallback_config is not None
+                else None
+            )
 
         except FileNotFoundError as e:
             raise RuntimeError(
@@ -360,6 +379,7 @@ class AgentService:
             exclude=self.tool_exclude,
             supports_image=model_config.supports_image,
             max_images=model_config.max_images,
+            vision_fallback=self._vision_fallback,
             build_metadata=tool_build_metadata,
             workspace_access=self.workspace_access,
             workspace_actor=self.workspace_actor,
@@ -2126,12 +2146,20 @@ class AgentService:
         image_count = sum(1 for b in blocks if b.get("type") == "image_url")
         video_count = sum(1 for b in blocks if b.get("type") == "video_url")
 
-        if image_count > 0 and not model_config.supports_image:
-            raise ValueError(f"模型 '{model_config.id}' 不支持图片输入")
-        if image_count > model_config.max_images:
-            raise ValueError(
-                f"模型 '{model_config.id}' 最多支持 {model_config.max_images} 张图片，当前 {image_count} 张"
-            )
+        if image_count > 0:
+            if model_config.supports_image:
+                image_limit = model_config.max_images
+                limit_owner = f"模型 '{model_config.id}'"
+            elif self._vision_fallback is not None:
+                # 主模型不能看图时由视觉挂件代读，数量上限取挂件模型。
+                image_limit = self._vision_fallback.config.max_images
+                limit_owner = f"视觉助手 '{self._vision_fallback.config.display_name}'"
+            else:
+                raise ValueError(f"模型 '{model_config.id}' 不支持图片输入")
+            if image_count > image_limit:
+                raise ValueError(
+                    f"{limit_owner} 最多支持 {image_limit} 张图片，当前 {image_count} 张"
+                )
 
         if video_count > 0 and not model_config.supports_video:
             raise ValueError(f"模型 '{model_config.id}' 不支持视频输入")
@@ -2162,6 +2190,51 @@ class AgentService:
                 f"请减少图片数量或压缩后重试。"
             )
 
+    async def _describe_conversation_images(self, blocks: list[dict[str, Any]]) -> None:
+        """主模型不支持图片时，用视觉挂件为本轮每张对话图片生成描述，写入图片块。
+
+        在 Round 创建前执行。等本轮全部图片识别结束后，任一图片失败即抛出
+        VisionFallbackError，本轮不落库；识别成功的描述留在缓存里，重试时直接复用。
+        """
+        image_blocks = [block for block in blocks if block.get("type") == "image_url"]
+        if not image_blocks:
+            return
+        focus = "\n".join(
+            str(block["text"]) for block in blocks if block.get("type") == "text" and block.get("text")
+        ) or None
+        vision = self._vision_fallback
+
+        async def describe(index: int, block: dict[str, Any]) -> None:
+            # file 是可选元数据（见 ImageContentBlock）：缺省时按序号命名，path 为空。
+            file_obj = block.get("file") or {}
+            name = file_obj.get("name") or f"图片{index + 1}"
+            data_url = block["image_url"]["url"]
+            # 描述按正文写重点：改了正文再重试要重新识别。
+            cache_key = hashlib.sha256(json.dumps([focus, data_url]).encode()).hexdigest()
+            text = self._vision_descriptions.get(cache_key)
+            if text is None:
+                text = await vision.describe(
+                    VisionImage(name=name, data_url=data_url),
+                    focus=focus,
+                )
+                self._vision_descriptions[cache_key] = text
+            block["vision_description"] = {
+                "model_id": vision.config.id,
+                "model_name": vision.config.display_name,
+                "name": name,
+                "path": file_obj.get("path"),
+                "text": text,
+            }
+
+        # 一张失败不中断其他图片：全部结束后再抛出，成功的描述已进缓存。
+        results = await asyncio.gather(
+            *(describe(index, block) for index, block in enumerate(image_blocks)),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
     def _build_agent_user_content(self, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """構建發往 LLM 的用戶內容，將 file block 映射為 text block。"""
         agent_blocks: list[dict[str, Any]] = []
@@ -2174,12 +2247,13 @@ class AgentService:
                 url = image_url.get("url", "")
                 if not url:
                     raise ValueError("image_url.url 不能为空")
-                agent_blocks.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": url},
-                    }
-                )
+                agent_block: dict[str, Any] = {
+                    "type": "image_url",
+                    "image_url": {"url": url},
+                }
+                if "vision_description" in block:
+                    agent_block["vision_description"] = block["vision_description"]
+                agent_blocks.append(agent_block)
             elif block_type == "video_url":
                 video_url = block.get("video_url") or {}
                 url = video_url.get("url", "")
@@ -2342,8 +2416,12 @@ class AgentService:
         idempotency_key: str | None = None,
         contexts: list[Context] | None = None,
         attachment_progress: AttachmentProgressCallback | None = None,
+        abort_requested: Callable[[], bool] | None = None,
     ) -> PreparedAgentRun:
-        """Create the user round and update Agent memory before execution."""
+        """Create the user round and update Agent memory before execution.
+
+        abort_requested: 视觉挂件识别结束后、创建 Round 前复核用户是否已 abort。
+        """
         if not self.agent:
             raise RuntimeError("Agent not initialized")
 
@@ -2388,6 +2466,11 @@ class AgentService:
             on_progress=attachment_progress,
         )
         try:
+            if self._vision_fallback is not None:
+                await self._describe_conversation_images(normalized_blocks)
+                # 识别耗时十几秒，期间 abort 接口可能已收敛并释放运行锁：不得再创建 Round。
+                if abort_requested is not None and abort_requested():
+                    raise RunAbortedBeforeStartError()
             agent_content = self._build_agent_user_content(normalized_blocks)
             user_message_for_history = self._blocks_to_plain_text(normalized_blocks)
             user_attachments = self._extract_user_attachments(normalized_blocks)
@@ -2430,6 +2513,8 @@ class AgentService:
             if attachment_capture is not None:
                 await self._discard_workspace_attachment_capture(attachment_capture)
             raise
+        # 本轮已受理，图片描述已写入图片块随消息持久化，不再需要重试缓存。
+        self._vision_descriptions.clear()
 
         # 幂等衝突：另一個 Worker 已搶先創建了相同 idempotency_key 的 Round
         if idempotency_key and created_round.id != run_id:

@@ -180,6 +180,7 @@ def seed_model_catalog_from_yaml_if_empty(db: DBSession, yaml_path: str | Path |
         default_model_id=raw.get("default_model") or None,
         cron_default_model_id=raw.get("cron_default_model") or raw.get("default_model") or None,
         subagent_default_model_id=raw.get("subagent_default_model") or raw.get("default_model") or None,
+        vision_fallback_model_id=raw.get("vision_fallback_model") or None,
     )
     db.merge(settings)
     db.commit()
@@ -236,6 +237,7 @@ def load_registry_from_db(db: DBSession) -> ModelRegistry:
     default_model_id = settings.default_model_id if settings else ""
     cron_default_model_id = settings.cron_default_model_id if settings else default_model_id
     subagent_default_model_id = settings.subagent_default_model_id if settings else default_model_id
+    vision_fallback_model_id = settings.vision_fallback_model_id if settings else ""
     embedding_models = {}
     default_embedding_model_id = ""
     try:
@@ -252,6 +254,7 @@ def load_registry_from_db(db: DBSession) -> ModelRegistry:
         default_embedding_model_id=default_embedding_model_id,
         cron_default_model_id=cron_default_model_id or "",
         subagent_default_model_id=subagent_default_model_id or "",
+        vision_fallback_model_id=vision_fallback_model_id or "",
         source="db",
     )
     registry.validate_on_startup()
