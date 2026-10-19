@@ -729,6 +729,35 @@ describe('chatStreamClient', () => {
     expect(subscription.getLatestSequence?.()).toBe(8);
   });
 
+  it('passes the server RUN_ERROR code to the pre-accept rejection callback', async () => {
+    const onRejectedBeforeAccept = vi.fn();
+    const onError = vi.fn();
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"type":"RUN_ERROR","message":"图片识别失败，请重试","code":"VISION_FALLBACK_FAILED"}\n\n',
+        ));
+        controller.close();
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, body }));
+
+    const subscription = startSendStream({
+      ...identity(),
+      content: [{ type: 'text', text: '看图' }],
+      onEnvelope: () => {},
+      onRejectedBeforeAccept,
+      onError,
+    });
+    await subscription.promise;
+
+    expect(onRejectedBeforeAccept).toHaveBeenCalledWith({
+      message: '图片识别失败，请重试',
+      code: 'VISION_FALLBACK_FAILED',
+    });
+    expect(onError).toHaveBeenCalledWith('图片识别失败，请重试', 'VISION_FALLBACK_FAILED');
+  });
+
   it('rejects a non-terminal waiting subscribe after projecting the full history snapshot', async () => {
     const envelopes: StreamEnvelope[] = [];
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(responseWithChunkThenError(

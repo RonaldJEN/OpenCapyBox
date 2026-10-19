@@ -15,9 +15,10 @@ from src.api.model_registry import (
     VALID_PROVIDERS,
     VALID_REASONING_FORMATS,
 )
-from src.api.models.llm_model import LLMModel
+from src.api.models.llm_model import LLMModel, LLMModelSettings
 from src.api.services.model_access_service import (
     db_model_to_config,
+    load_registry_from_db,
     seed_model_catalog_from_yaml_if_empty,
 )
 
@@ -706,6 +707,39 @@ class TestSeedCatalogValidation:
             db.close()
             engine.dispose()
 
+    def test_seed_and_db_load_carry_vision_fallback(self, tmp_path):
+        path = tmp_path / "models.yaml"
+        path.write_text(
+            yaml.dump({
+                "default_model": "text-model",
+                "vision_fallback_model": "vision-model",
+                "models": {
+                    "text-model": {
+                        "provider": "openai", "api_base": "https://t.com/v1",
+                        "api_key": "test-key", "model_name": "t1",
+                    },
+                    "vision-model": {
+                        "provider": "openai", "api_base": "https://v.com/v1",
+                        "api_key": "test-key", "model_name": "v1",
+                        "supports_image": True, "max_images": 6,
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        db, engine = self._sqlite_session()
+        try:
+            seed_model_catalog_from_yaml_if_empty(db, path)
+            settings = db.query(LLMModelSettings).one()
+            assert settings.vision_fallback_model_id == "vision-model"
+
+            with patch.object(ModelRegistry, "load_yaml", side_effect=FileNotFoundError("no yaml")):
+                registry = load_registry_from_db(db)
+            assert registry.get_vision_fallback().id == "vision-model"
+        finally:
+            db.close()
+            engine.dispose()
+
     def test_db_read_surfaces_non_string_reasoning_levels(self, tmp_path):
         path = self._seed_yaml(tmp_path)
         db, engine = self._sqlite_session()
@@ -840,6 +874,25 @@ class TestModelRegistryQuery:
         """未配置 subagent_default_model 时，加载阶段继承 default_model"""
         assert registry.get_subagent_default().id == "enabled-model"
 
+    def test_get_vision_fallback_returns_image_model(self):
+        """配置支持图片的视觉挂件时返回该模型"""
+        vision = ModelConfig(
+            id="vision-model", display_name="Vision", provider="openai",
+            api_base="https://v.com", api_key="key", model_name="v1",
+            supports_image=True, max_images=8,
+        )
+        text_only = ModelConfig(
+            id="text-model", display_name="Text", provider="openai",
+            api_base="https://t.com", api_key="key", model_name="t1",
+        )
+        r = ModelRegistry(
+            models={"vision-model": vision, "text-model": text_only},
+            default_model_id="text-model",
+            vision_fallback_model_id="vision-model",
+        )
+        r.validate_on_startup()
+        assert r.get_vision_fallback().id == "vision-model"
+
     def test_list_models_enabled_only(self, registry):
         """僅列出啟用的模型"""
         models = registry.list_models(enabled_only=True)
@@ -903,6 +956,26 @@ class TestValidateOnStartup:
         registry = ModelRegistry(models=models, default_model_id="model-y")
         registry.validate_on_startup()
         assert models["model-y"].enabled is True
+
+    def test_vision_fallback_cleared_when_model_disabled_by_missing_key(self):
+        """视觉挂件模型因 API key 缺失被停用时，关闭挂件而不是在使用时报错"""
+        os.environ.pop("MISSING_VISION_KEY", None)
+        models = {
+            "text": ModelConfig(
+                id="text", display_name="T", provider="openai",
+                api_base="https://t.com", api_key="literal-key", model_name="t1",
+            ),
+            "vision": ModelConfig(
+                id="vision", display_name="V", provider="openai",
+                api_base="https://v.com", api_key="${MISSING_VISION_KEY}", model_name="v1",
+                supports_image=True, max_images=4,
+            ),
+        }
+        registry = ModelRegistry(
+            models=models, default_model_id="text", vision_fallback_model_id="vision",
+        )
+        registry.validate_on_startup()
+        assert registry.get_vision_fallback() is None
 
     def test_default_fallback_on_disabled(self):
         """默認模型停用時自動切換到可用模型"""

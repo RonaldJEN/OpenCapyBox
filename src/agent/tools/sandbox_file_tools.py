@@ -20,13 +20,17 @@ import logging
 import posixpath
 import shlex
 import uuid
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 
 from opensandbox import Sandbox
 
 from .base import Tool, ToolResult
 from .session_file_references import stat_session_file_reference
+
+if TYPE_CHECKING:
+    # 只给类型标注用；模块加载时导入会形成 视觉服务 → agent → tools → 视觉服务 的循环导入。
+    from src.api.services.vision_fallback_service import VisionFallbackService
 
 logger = logging.getLogger(__name__)
 
@@ -546,7 +550,11 @@ except Exception as e:
 
 
 class SandboxReadImageTool(Tool):
-    """Read sandbox image files and return image_url content blocks for visual models."""
+    """Read sandbox image files for the model.
+
+    Visual models receive image_url content blocks. Text-only models with a
+    configured vision fallback get the fallback model's text answer instead.
+    """
 
     repeat_policy = "read_only"
 
@@ -557,6 +565,7 @@ class SandboxReadImageTool(Tool):
         *,
         supports_image: bool = False,
         max_images: int = 0,
+        vision_fallback: "VisionFallbackService | None" = None,
         max_single_image_bytes: int = MAX_SINGLE_IMAGE_BYTES,
         max_total_image_bytes: int = MAX_TOTAL_IMAGE_BYTES,
     ):
@@ -564,8 +573,14 @@ class SandboxReadImageTool(Tool):
         self._workspace_dir = _normalize_workspace_dir(workspace_dir)
         self._supports_image = bool(supports_image)
         self._model_max_images = int(max_images or 0)
+        # 主模型能直接看图时不走挂件
+        self._vision_fallback = None if self._native_vision else vision_fallback
         self._max_single_image_bytes = max_single_image_bytes
         self._max_total_image_bytes = max_total_image_bytes
+
+    @property
+    def _native_vision(self) -> bool:
+        return self._supports_image and self._model_max_images > 0
 
     @property
     def name(self) -> str:
@@ -573,6 +588,14 @@ class SandboxReadImageTool(Tool):
 
     @property
     def description(self) -> str:
+        if self._vision_fallback is not None:
+            return (
+                "Read one or more sandbox image files. The current model cannot view images directly, "
+                "so a vision assistant reads them and returns a text answer. Put what you need from the "
+                "images (values, text, layout, state, errors) in `question`, as specifically as possible; "
+                "omit it to get full descriptions. You may call again on the same images with a different "
+                "question. Supports .png, .jpg, .jpeg, and .webp files in the current Session directory."
+            )
         return (
             "Read one or more sandbox image files and attach them to the next model request as visual context. "
             "Supports .png, .jpg, .jpeg, and .webp files in the current Session directory."
@@ -593,12 +616,30 @@ class SandboxReadImageTool(Tool):
                     "description": "Maximum number of images to read from paths (default 10).",
                     "default": 10,
                 },
+                **(
+                    {
+                        "question": {
+                            "type": "string",
+                            "description": (
+                                "What you want to learn from the images, answered by the vision assistant. "
+                                "Omit for full descriptions."
+                            ),
+                        },
+                    }
+                    if self._vision_fallback is not None
+                    else {}
+                ),
             },
             "required": ["paths"],
         }
 
-    async def execute(self, paths: list[str], max_images: int = 10) -> ToolResult:
-        if not self._supports_image or self._model_max_images <= 0:
+    async def execute(
+        self,
+        paths: list[str],
+        max_images: int = 10,
+        question: str | None = None,
+    ) -> ToolResult:
+        if not self._native_vision and self._vision_fallback is None:
             return ToolResult(
                 success=False,
                 content="",
@@ -621,7 +662,12 @@ class SandboxReadImageTool(Tool):
         if requested_max <= 0:
             return ToolResult(success=False, content="", error="max_images must be greater than 0")
 
-        allowed_count = min(requested_max, self._model_max_images)
+        model_max_images = (
+            self._model_max_images
+            if self._vision_fallback is None
+            else self._vision_fallback.config.max_images
+        )
+        allowed_count = min(requested_max, model_max_images)
         if len(clean_paths) > allowed_count:
             return ToolResult(
                 success=False,
@@ -692,6 +738,22 @@ class SandboxReadImageTool(Tool):
                 }
             )
             read_summaries.append(f"- {raw_path} ({mime_type}, {size} bytes)")
+
+        if self._vision_fallback is not None:
+            from src.api.services.vision_fallback_service import VisionImage
+
+            images = [
+                VisionImage(name=block["file"]["name"], data_url=block["image_url"]["url"])
+                for block in content_blocks
+            ]
+            answer = await self._vision_fallback.answer(images, question)
+            names = ", ".join(image.name for image in images)
+            content = (
+                f"[视觉助手 {self._vision_fallback.config.display_name} 读取了 {len(images)} 张图片：{names}]\n"
+                f"[问题] {question or '（完整描述）'}\n"
+                f"[回答]\n{answer}"
+            )
+            return ToolResult(success=True, content=content)
 
         content = "已读取图片并加入下一轮模型视觉上下文：\n" + "\n".join(read_summaries)
         return ToolResult(success=True, content=content, content_blocks=content_blocks)

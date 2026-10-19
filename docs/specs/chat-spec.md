@@ -400,14 +400,37 @@ type WorkspaceFile = {
 
 **图片约束**:
 
-- 约束对象是作为视觉输入提交的 `image_url` block。模型必须支持图片（`supports_image=true`），否则拒绝；带 `composer_draft_attachment_id` 的草稿图片沿用同一校验，不因文件已上传或 claim 成功而视为模型可用。
+- 约束对象是作为视觉输入提交的 `image_url` block。模型必须支持图片（`supports_image=true`）或已配置视觉挂件（`llm_model_settings.vision_fallback_model_id`，见 `models-spec`），否则拒绝；带 `composer_draft_attachment_id` 的草稿图片沿用同一校验，不因文件已上传或 claim 成功而视为模型可用。
 - Composer 的文件选择、图片粘贴、拖拽添加必须按当前模型统一校验，在发起临时上传前拦截不支持的图片，不创建“已就绪”附件；提示“当前模型不支持图片输入，请切换至支持图片的模型后再上传。”
 - 已有图片后切换模型时保留附件，按新模型实时显示“不兼容”并禁用发送，提示切换模型或移除图片；切回支持的模型后恢复兼容状态。发送前再次按本次模型快照校验，不能只依赖添加时的判断。
 - 后端在创建 Round、写入本轮 Agent 上下文及冻结 Workspace 文件前校验本次视觉输入；前端拦截不替代此校验。Workspace 单独上传图片，以及通过 `file` block 提供给工具处理的图片文件，遵守普通文件契约，不因模型缺少图片输入能力而拒绝。
 - 单张图片大小上限：20MB
 - 总图片大小上限：50MB
-- 单次消息图片数量上限：由模型配置 `max_images` 决定
+- 单次消息图片数量上限：由模型配置 `max_images` 决定；主模型不支持图片、由视觉挂件代读时取挂件模型的 `max_images`
 - `read_image_file` 工具从沙箱读取图片后注入的视觉上下文必须遵守同一数量与 Data URL 大小上限。
+
+**视觉挂件代读（主模型不支持图片）**:
+
+- 时机：通过图片校验与 Workspace 附件冻结之后、`create_round` 之前，对本轮每张对话图片并行调用挂件 `describe`。用户本条消息的文字作为关注点一并传给挂件（无文字则不传），挂件仍须给出完整描述，便于后续轮次复用。
+- 结果写入图片块的附加字段 `vision_description: {model_id, model_name, name, path, text}`，随用户消息一起持久化到 `conversation_messages`；原 `image_url` 完整保留。`file` 元数据是可选的：缺省时 `name` 为 `图片N`（N 为本轮图片序号），`path` 为 `null`。描述只在发送时生成一次，后续轮次复用，不重复调用。请求投影规则见 `models-spec`：不支持图片的模型收到描述文本，支持图片的模型收到去掉该字段的原图。
+- 历史与回放：`_blocks_to_plain_text`、`user_attachments`、历史 v2 不受影响；前端不展示 `vision_description`。
+- 失败：等本轮全部图片识别结束（一张失败不中断其他图片），任一图片描述失败（超时、供应商错误、返回为空）即抛出 `VisionFallbackError`，不创建 Round、不写入 Agent 上下文，已冻结的 Workspace 附件快照按既有失败路径丢弃。SSE 在 `RUN_STARTED` 之前发出 `RUN_ERROR(code="VISION_FALLBACK_FAILED", message="图片识别失败，请重试")`，技术原因（模型、图片名、异常）只写后端 WARNING 日志；前端按发送前拒绝处理并恢复草稿（正文、附件、模型选择），并把图片标为"识别失败、点击重试"（见 `frontend-chat-spec`）。重试即重新发送：识别成功的描述按"本条正文 + 图片 Data URL"的 sha256 缓存在该会话的 AgentService 实例上，重试时直接复用，只重新识别失败的图片；修改正文后重试，关注点变了，全部图片重新识别；本轮 Round 创建后清空缓存（描述已随消息持久化）。AgentService 重建（进程重启、换模型、AgentPool 失效）后缓存丢失，重试退回整批识别。
+- 取消：识别期间用户调用 `/abort` 会立即释放运行锁。识别结束后、`create_round` 之前，用与 Agent 初始化窗口相同的判定（`run_cancel_requests.requested_at > run_started_at`）复核一次；命中则不创建 Round，SSE 发出 `RUN_ERROR(code="USER_ABORT", message="Aborted by user")`。
+- 耗时：挂件调用发生在发送阶段，期间 SSE 持续发送 heartbeat，并随每次 heartbeat 续期 `user_run_locks`（单次识别请求含重试可达数分钟，不续期会超过 `SSE_SUBSCRIBE_TIMEOUT` 被新请求当作陈旧锁回收，导致同会话并发创建 Round）；实测 `qwen3.6-plus`（开启思考）单张截图完整描述约 17 秒，此时间计入首个事件前的等待。
+
+**`read_image_file` 三种模式**:
+
+| 主模型支持图片 | 视觉挂件 | 行为 |
+| --- | --- | --- |
+| 是 | 任意 | 读图并作为 `image_url` 内容块注入下一轮模型请求（原有行为） |
+| 否 | 已配置 | 读图后交给挂件，返回文字，不产生 `content_blocks` |
+| 否 | 未配置 | 返回"当前模型不支持图片输入"错误（原有行为） |
+
+- 挂件模式下工具多一个可选参数 `question`，由主模型写明想从图中得到什么；有问题时挂件按问题回答，无问题时依次完整描述。工具描述同步改为引导主模型提具体问题，可对同一组图片换问题重复调用（`repeat_policy=read_only`）。主模型支持图片时参数与描述保持原样，`question` 不出现。
+- 返回格式固定：`[视觉助手 <model> 读取了 N 张图片：a.png, b.png]`、`[问题] <question 或（完整描述）>`、`[回答]` 加正文。
+- 一次最多读取的图片数取挂件模型 `max_images`；单张 / 总量 Data URL 上限与读取方式不变。
+- 挂件调用失败不终止本轮：`VisionFallbackError` 从工具抛出，按通用工具异常路径转为 `success=false` 的工具结果交回主模型，由主模型决定重试或告知用户；工具内部不做额外重试。读取沙箱图片本身的失败（路径、格式、大小）沿用原错误。
+- 模式在 Agent 构建时确定；管理员更换挂件后由 AgentPool 失效重建生效。
 
 #### 响应
 
@@ -442,6 +465,8 @@ SSE 事件流格式遵循 AG-UI 协议（详见 [第 4.6 节](#46-ag-ui-事件�
 | `AGENT_INIT_TIMEOUT`  | Agent 初始化超过配置的总墙钟期限；取消初始化任务并释放运行锁                                                                      |
 | `ROUND_IN_PROGRESS`   | 幂等键冲突：相同`idempotency_key` 的 Round 已在执行中                                                                          |
 | `INTERACTION_PENDING` | 当前 session 已有同一 Round 的 pending Interaction；这是未创建新 Round 的控制面拒绝，客户端必须恢复权威 waiting 状态与未受理草稿 |
+| `VISION_FALLBACK_FAILED` | 视觉挂件识别上传图片失败；未创建 Round，客户端恢复草稿并提示重试（见"视觉挂件代读"）                                        |
+| `USER_ABORT`          | Agent 初始化或视觉挂件识别期间用户已 abort；未创建 Round，运行锁已由 abort 接口释放                                              |
 | `INTERNAL_ERROR`      | 其他内部错误                                                                                                                     |
 
 无 durable sequence 的流内错误只结束当前 HTTP transport，不自动证明任何既有 Round 已终态。客户端必须依据错误类型与 `history/v2` 区分控制面拒绝、订阅故障和真正的运行终态。
@@ -886,7 +911,7 @@ INSERT INTO rounds (..., idempotency_key)
 
 #### Worker 死亡检测
 
-- 每 15s 心跳刷新 `user_run_locks.updated_at`（由 `SSE_HEARTBEAT_INTERVAL` 控制）
+- 每 15s 心跳刷新 `user_run_locks.updated_at`（由 `SSE_HEARTBEAT_INTERVAL` 控制）：Round 创建前的发送准备阶段（附件冻结、视觉挂件识别）由发送流随每次 SSE heartbeat 刷新，Round 创建后由 `TurnOrchestrator` 锁心跳刷新
 - 超过 `SSE_SUBSCRIBE_TIMEOUT`（默认 300s）未刷新 → 视为 stale lock；下一次获取用户 slot 时先检查 continuation ownership：仍有效的 continuation claim 或工具 execution lease 保留原 lock/slot；两类 lease 都已过期且 Round 为 `running` 时一律视为已越过 started 边界并收敛 durable failed，不得停回 `waiting_interaction`。过期的 `executing` 工具必须先收敛 `unknown`，再以工具审批保守文案终态化；没有 continuation 的孤儿 running Round 按普通失败终态收敛
 - `abort` 统一采用“接口即时收敛”策略：
   1. 写入 append-only 取消审计行（用于本进程 registry 命中状态与诊断）

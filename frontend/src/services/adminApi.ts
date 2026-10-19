@@ -481,6 +481,7 @@ export interface AdminModelSettings {
   default_model_id: string | null;
   cron_default_model_id: string | null;
   subagent_default_model_id: string | null;
+  vision_fallback_model_id: string | null;
 }
 
 export interface AdminModelsResponse {
@@ -616,6 +617,7 @@ export async function updateAdminModelSettings(payload: {
   default_model_id: string;
   cron_default_model_id?: string | null;
   subagent_default_model_id?: string | null;
+  vision_fallback_model_id: string | null;
 }): Promise<AdminModelSettings> {
   const resp = await client.patch<AdminModelSettings>('/admin/models/settings', payload);
   return resp.data;

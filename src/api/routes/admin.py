@@ -375,8 +375,15 @@ class AdminModelSettingsPayload(BaseModel):
     default_model_id: str = Field(..., min_length=1, max_length=100)
     cron_default_model_id: str | None = Field(default=None, max_length=100)
     subagent_default_model_id: str | None = Field(default=None, max_length=100)
+    vision_fallback_model_id: str | None = Field(default=None, max_length=100)
 
-    @field_validator("default_model_id", "cron_default_model_id", "subagent_default_model_id", mode="before")
+    @field_validator(
+        "default_model_id",
+        "cron_default_model_id",
+        "subagent_default_model_id",
+        "vision_fallback_model_id",
+        mode="before",
+    )
     @classmethod
     def _strip_settings_ids(cls, value):
         if isinstance(value, str):
@@ -466,11 +473,13 @@ def _settings_payload(db: DBSession) -> dict[str, Any]:
             "default_model_id": None,
             "cron_default_model_id": None,
             "subagent_default_model_id": None,
+            "vision_fallback_model_id": None,
         }
     return {
         "default_model_id": settings.default_model_id,
         "cron_default_model_id": settings.cron_default_model_id,
         "subagent_default_model_id": settings.subagent_default_model_id,
+        "vision_fallback_model_id": settings.vision_fallback_model_id,
     }
 
 
@@ -493,6 +502,16 @@ def _ensure_model_ids_exist(db: DBSession, model_ids: list[str], *, enabled_only
         disabled = [mid for mid in normalized if not existing[mid]]
         if disabled:
             raise HTTPException(status_code=400, detail=f"停用模型不能作为默认模型: {disabled}")
+
+
+def _ensure_vision_fallback_model(db: DBSession, model_id: str) -> None:
+    model = db.query(LLMModel).filter(LLMModel.model_id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=400, detail=f"视觉挂件模型不存在: {model_id}")
+    if not model.enabled:
+        raise HTTPException(status_code=400, detail=f"停用模型不能作为视觉挂件: {model_id}")
+    if not model.supports_image:
+        raise HTTPException(status_code=400, detail=f"视觉挂件模型必须支持图片输入: {model_id}")
 
 
 def _validate_model_config_values(data: dict[str, Any]) -> ModelConfig:
@@ -737,6 +756,11 @@ def _delete_admin_model(
         if defaults_reassigned:
             settings.updated_at = now_naive()
 
+    # 删除即关闭视觉挂件，不迁移到替换模型（替换模型未必支持图片）。
+    if settings and settings.vision_fallback_model_id == model_id:
+        settings.vision_fallback_model_id = None
+        settings.updated_at = now_naive()
+
     sessions_reassigned = 0
     if session_count and replacement_model_id:
         sessions_reassigned = int(
@@ -799,6 +823,8 @@ def _update_model_settings(db: DBSession, payload: AdminModelSettingsPayload) ->
     cron_id = payload.cron_default_model_id or payload.default_model_id
     subagent_id = payload.subagent_default_model_id or payload.default_model_id
     _ensure_model_ids_exist(db, [payload.default_model_id, cron_id, subagent_id], enabled_only=True)
+    if payload.vision_fallback_model_id:
+        _ensure_vision_fallback_model(db, payload.vision_fallback_model_id)
     settings = db.query(LLMModelSettings).filter(LLMModelSettings.id == 1).first()
     if not settings:
         settings = LLMModelSettings(id=1)
@@ -806,6 +832,7 @@ def _update_model_settings(db: DBSession, payload: AdminModelSettingsPayload) ->
     settings.default_model_id = payload.default_model_id
     settings.cron_default_model_id = cron_id
     settings.subagent_default_model_id = subagent_id
+    settings.vision_fallback_model_id = payload.vision_fallback_model_id
     settings.updated_at = now_naive()
     db.commit()
     reload_model_registry()
@@ -2620,8 +2647,12 @@ async def update_admin_model_settings(
     _: str = Depends(get_current_admin_user),
     db: DBSession = Depends(get_db),
 ):
-    """更新普通/Cron/Subagent 默认模型。"""
+    """更新普通/Cron/Subagent 默认模型与视觉挂件模型。"""
+    previous_vision_fallback = _settings_payload(db)["vision_fallback_model_id"]
     result = _update_model_settings(db, payload)
+    if result["vision_fallback_model_id"] != previous_vision_fallback:
+        # read_image_file 的模式在 Agent 构建时确定，挂件变化后需重建缓存实例。
+        await get_agent_pool().invalidate_all_async()
     enrich_admin_audit(request, changed_fields=payload.model_dump())
     return result
 

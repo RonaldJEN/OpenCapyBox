@@ -1023,6 +1023,7 @@ describe('App 配置抽屉交互', () => {
       }>;
       default_model: string;
       subagent_default_model: string;
+      vision_fallback: null;
     }) => void;
     vi.mocked(apiService.getModels).mockReturnValueOnce(new Promise((resolve) => {
       resolveModels = resolve;
@@ -1066,6 +1067,7 @@ describe('App 配置抽屉交互', () => {
         ],
         default_model: 'glm-default',
         subagent_default_model: 'glm-default',
+        vision_fallback: null,
       });
     });
 

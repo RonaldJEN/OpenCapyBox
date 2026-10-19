@@ -390,10 +390,18 @@ export interface TurnReasoningSelection {
   effort: string | null;
 }
 
+/** 主模型不支持图片时代为看图的视觉挂件（管理员在后台配置）。 */
+export interface VisionFallbackInfo {
+  id: string;
+  name: string;
+  max_images: number;
+}
+
 export interface ModelsResponse {
   models: ModelInfo[];
   default_model: string;
   subagent_default_model: string;
+  vision_fallback: VisionFallbackInfo | null;
 }
 
 // 会话类型
@@ -686,7 +694,15 @@ export type ComposerAttachment = ChatFile & {
   localFile?: File;
   pastedText?: string;
   previewUrl?: string;
+  /** 视觉挂件识别该图片失败，卡片显示"点击重试"。 */
+  visionFailed?: boolean;
 };
+
+/** 服务端在受理本轮之前拒绝发送时的原因（RUN_ERROR 的 message/code）。 */
+export interface SendRejection {
+  message: string;
+  code?: string;
+}
 
 export interface DraftUploadResult {
   attachment_id: string;

@@ -47,6 +47,7 @@ from src.agent.tools.workspace_tools import (
 )
 
 from src.api.services.sandbox_service import get_sandbox_service
+from src.api.services.vision_fallback_service import VisionFallbackService
 from src.api.services.skill_inventory_service import (
     SkillInventoryIdentity,
     cached_sandbox_identity,
@@ -152,6 +153,7 @@ async def create_agent_tools(
     exclude: Optional[Set[str]] = None,
     supports_image: bool = False,
     max_images: int = 0,
+    vision_fallback: VisionFallbackService | None = None,
     build_metadata: dict[str, object] | None = None,
     workspace_access: str = "manage",
     workspace_actor: str = "chat",
@@ -199,6 +201,7 @@ async def create_agent_tools(
             workspace_dir=workspace_dir,
             supports_image=supports_image,
             max_images=max_images,
+            vision_fallback=vision_fallback,
         )),
         ("SandboxApplyPatchTool", lambda: SandboxApplyPatchTool(
             sandbox=sandbox,

@@ -25,7 +25,7 @@ import { getCronRuns, getUnreadCount } from './services/configApi';
 import { startSessionDraftOutbox } from './services/sessionDraftOutbox';
 import { startWorkspaceDraftOutbox } from './services/workspaceDraftOutbox';
 import { ChatRuntimeProvider, useChatRuntime } from './runtime/ChatRuntimeProvider';
-import { SessionStatus, type ModelInfo, type Session } from './types';
+import { SessionStatus, type ModelInfo, type Session, type VisionFallbackInfo } from './types';
 import type { WorkspaceEntry } from './types/workspace';
 import { workspaceApi } from './services/workspaceApi';
 import { emitWorkspaceChangeInvalidations, subscribeWorkspaceMutation } from './services/workspaceEvents';
@@ -120,6 +120,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
   const [sessionFilesOwnsBoundary, setSessionFilesOwnsBoundary] = useState(false);
   const [catalogDefaultModelId, setCatalogDefaultModelId] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [visionFallback, setVisionFallback] = useState<VisionFallbackInfo | null>(null);
   const [optimisticSession, setOptimisticSession] = useState<Session | null>(null);
   const [activePanel, setActivePanel] = useState<ConfigPanel>(null);
   const [panelMounted, setPanelMounted] = useState(false);
@@ -522,6 +523,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
         ? res.default_model
         : models[0]?.id || '';
       setAvailableModels(models);
+      setVisionFallback(res.vision_fallback);
       setCatalogDefaultModelId(defaultModelId);
     }).catch((err) => {
       console.error('Failed to load models:', err);
@@ -973,6 +975,7 @@ function HomePageContent({ refreshTrigger }: HomePageContentProps) {
               catalogDefaultModelId={catalogDefaultModelId}
               onDraftInteraction={invalidateRunningSessionRestore}
               availableModels={availableModels}
+              visionFallback={visionFallback}
               onCreateSession={handleCreateSessionForChat}
               onSessionCreated={handleSessionCreatedForChat}
               onFilesFullChange={setSessionFilesOwnsBoundary}

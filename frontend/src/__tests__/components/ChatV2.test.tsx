@@ -1748,6 +1748,66 @@ describe('ChatV2 组件', () => {
       }));
     });
 
+    it('不支持图片的模型在配置视觉挂件后可上传图片，并按 image_url 发送', async () => {
+      const onCreateSession = vi.fn().mockResolvedValue('vision-fallback-session');
+      vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+      vi.mocked(apiService.claimDraftAttachments).mockImplementation(async (_session, _draft, ids) => ids.map((id) => ({
+        attachment_id: id, composer_draft_attachment_id: id, name: 'chart.png',
+        path: `attachments/${id}/chart.png`, size: 5, type: 'image/png', modified: '',
+      })));
+      const { container } = render(
+        <ChatV2 sessionId="" {...defaultProps} onCreateSession={onCreateSession}
+          visionFallback={{ id: 'vision-model', name: '视觉模型', max_images: 2 }} />,
+      );
+      fireEvent.change(container.querySelector('input[type="file"]')!, {
+        target: { files: [new File(['image'], 'chart.png', { type: 'image/png' })] },
+      });
+      await screen.findByText('已就绪');
+      expect(screen.queryByText('不兼容')).not.toBeInTheDocument();
+      expect(screen.getByText('当前模型不能直接看图，发送后会先自动识别图片内容。')).toBeInTheDocument();
+
+      fireEvent.change(screen.getByRole('textbox'), { target: { value: '图里第三季度是多少' } });
+      fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+      await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(apiService.sendMessageStreamV2).mock.calls[0][1]).toContainEqual(expect.objectContaining({
+        type: 'image_url', image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) },
+      }));
+    });
+
+    it('视觉挂件识别失败时恢复草稿，图片标为识别失败，点图片即重新发送', async () => {
+      vi.mocked(apiService.getSessionHistoryV2).mockResolvedValue({
+        rounds: [], session_id: 'vision-retry-session', total: 0,
+      } as any);
+      vi.mocked(apiService.sendMessageStreamV2).mockResolvedValue(undefined);
+      vi.mocked(apiService.claimDraftAttachments).mockImplementation(async (_session, _draft, ids) => ids.map((id) => ({
+        attachment_id: id, composer_draft_attachment_id: id, name: 'chart.png',
+        path: `attachments/${id}/chart.png`, size: 5, type: 'image/png', modified: '',
+      })));
+      vi.mocked(startSendStream).mockImplementationOnce((args: any) => {
+        args.onRejectedBeforeAccept?.({ message: '图片识别失败，请重试', code: 'VISION_FALLBACK_FAILED' });
+        args.onError?.('图片识别失败，请重试', 'VISION_FALLBACK_FAILED');
+        return { abort: vi.fn(), promise: Promise.resolve(), getLatestSequence: () => 0 } as any;
+      });
+      const { container } = render(
+        <ChatV2 sessionId="vision-retry-session" {...defaultProps}
+          visionFallback={{ id: 'vision-model', name: '视觉模型', max_images: 2 }} />,
+      );
+      const textbox = await screen.findByPlaceholderText('输入指令...');
+      fireEvent.change(container.querySelector('input[type="file"]')!, {
+        target: { files: [new File(['image'], 'chart.png', { type: 'image/png' })] },
+      });
+      await screen.findByText('已就绪');
+      fireEvent.change(textbox, { target: { value: '图里第三季度是多少' } });
+      fireEvent.keyDown(textbox, { key: 'Enter' });
+
+      expect(await screen.findByText('图片识别失败，点一下图片即可重试')).toBeInTheDocument();
+      expect(screen.getByText('识别失败')).toBeInTheDocument();
+      expect(screen.getByPlaceholderText('输入指令...')).toHaveValue('图里第三季度是多少');
+
+      fireEvent.click(screen.getByRole('button', { name: 'chart.png 识别失败，点击重新发送' }));
+      await waitFor(() => expect(apiService.sendMessageStreamV2).toHaveBeenCalledTimes(1));
+    });
+
     it('上传失败图片切到不支持模型后不能重试，切回后可重试原附件', async () => {
       vi.mocked(apiService.uploadDraftAttachment).mockRejectedValueOnce(new Error('network unavailable'));
       const { container } = render(

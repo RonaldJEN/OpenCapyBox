@@ -7,6 +7,7 @@ import type {
   PendingFileDraftInfo,
   PreferredMcpConnectionSnapshot,
   RoundData,
+  SendRejection,
   TurnReasoningSelection,
 } from '../types';
 
@@ -175,7 +176,7 @@ export interface SendMessageInput {
   reasoning?: TurnReasoningSelection;
   pendingFileDrafts?: PendingFileDraftInfo[];
   onStreamAccepted?: () => void;
-  onRejectedBeforeAccept?: () => void;
+  onRejectedBeforeAccept?: (rejection?: SendRejection) => void;
 }
 
 export const emptyAgentState = (): AgentState => ({

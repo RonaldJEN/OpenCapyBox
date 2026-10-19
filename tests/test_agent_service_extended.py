@@ -1,5 +1,6 @@
 """AgentService（Sandbox 版）測試"""
 
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
@@ -536,6 +537,35 @@ class TestAgentServiceChatAgui:
         # a retry must not reach it.
         service._materialize_workspace_attachments.assert_not_awaited()
         service.history_service.create_round.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_abort_during_vision_recognition_does_not_create_round(self, service):
+        from src.api.services.agent_service import RunAbortedBeforeStartError
+
+        service._vision_fallback = MagicMock()
+        service._describe_conversation_images = AsyncMock()
+
+        with patch.object(service, "_load_persisted_interrupt", return_value=None):
+            with pytest.raises(RunAbortedBeforeStartError):
+                await service.prepare_chat_round(
+                    user_content=[{"type": "text", "text": "看图"}],
+                    abort_requested=lambda: True,
+                )
+
+        service._describe_conversation_images.assert_awaited_once()
+        service.history_service.create_round.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_accepted_round_clears_vision_description_cache(self, service):
+        """本轮受理后描述已随消息持久化，重试缓存清空。"""
+        service._vision_fallback = MagicMock()
+        service._describe_conversation_images = AsyncMock()
+        service._vision_descriptions = {"image-sha": "上次失败重试留下的描述"}
+
+        with patch.object(service, "_load_persisted_interrupt", return_value=None):
+            await service.prepare_chat_round(user_content=[{"type": "text", "text": "看图"}])
+
+        assert service._vision_descriptions == {}
 
 
     @pytest.mark.asyncio
@@ -1599,6 +1629,7 @@ class TestAgentServiceInitializeAgent:
         registry.get_default.return_value = model_config
         registry.get_or_raise.return_value = model_config
         registry.list_models.return_value = [model_config]
+        registry.get_vision_fallback.return_value = None
         with patch("src.api.services.agent_service.get_model_registry", return_value=registry):
             yield
 
@@ -1787,6 +1818,132 @@ class TestValidateMultimodalBlocks:
         with self._patch_registry(supports_image=False, max_images=0):
             with pytest.raises(ValueError, match="不支持图片输入"):
                 self.svc._validate_multimodal_blocks(blocks)
+
+    def _vision_fallback(self, max_images: int):
+        fallback = MagicMock()
+        fallback.config.max_images = max_images
+        fallback.config.display_name = "视觉模型"
+        return fallback
+
+    def test_text_only_model_with_vision_fallback_passes(self):
+        """主模型不支持圖片但配置了視覺掛件時放行"""
+        self.svc._vision_fallback = self._vision_fallback(max_images=2)
+        blocks = [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA"}}]
+        with self._patch_registry(supports_image=False, max_images=0):
+            self.svc._validate_multimodal_blocks(blocks)
+
+    def test_vision_fallback_image_limit_applies(self):
+        """走視覺掛件時圖片數量上限取掛件模型"""
+        self.svc._vision_fallback = self._vision_fallback(max_images=1)
+        blocks = [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA"}} for _ in range(2)]
+        with self._patch_registry(supports_image=False, max_images=0):
+            with pytest.raises(ValueError, match="视觉助手 '视觉模型' 最多支持 1 张图片"):
+                self.svc._validate_multimodal_blocks(blocks)
+
+
+class TestDescribeConversationImages:
+    """主模型不支持圖片時，發送前由視覺掛件為對話圖片生成描述。"""
+
+    def _service(self, describe: AsyncMock):
+        svc = make_agent_service(session_id="session-vision")
+        fallback = MagicMock()
+        fallback.config.id = "vision-model"
+        fallback.config.display_name = "视觉模型"
+        fallback.describe = describe
+        svc._vision_fallback = fallback
+        return svc
+
+    @staticmethod
+    def _image(name: str, path: str | None = None):
+        file_obj = {"name": name}
+        if path:
+            file_obj["path"] = path
+        return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{name}"}, "file": file_obj}
+
+    @pytest.mark.asyncio
+    async def test_each_image_gets_description_with_user_text_as_focus(self):
+        describe = AsyncMock(side_effect=lambda image, focus: f"{image.name} 的描述")
+        svc = self._service(describe)
+        blocks = [
+            {"type": "text", "text": "比较这两张图"},
+            self._image("a.png", "uploads/a.png"),
+            self._image("b.png", "uploads/b.png"),
+        ]
+
+        await svc._describe_conversation_images(blocks)
+
+        assert blocks[1]["vision_description"] == {
+            "model_id": "vision-model",
+            "model_name": "视觉模型",
+            "name": "a.png",
+            "path": "uploads/a.png",
+            "text": "a.png 的描述",
+        }
+        assert blocks[2]["vision_description"]["text"] == "b.png 的描述"
+        assert {call.kwargs["focus"] for call in describe.await_args_list} == {"比较这两张图"}
+        assert describe.await_args_list[0].args[0].data_url == "data:image/png;base64,a.png"
+
+    @pytest.mark.asyncio
+    async def test_image_without_file_metadata_gets_numbered_name_and_no_path(self):
+        """file 是 ImageContentBlock 的可选元数据，裸 image_url 也必须能识别。"""
+        describe = AsyncMock(return_value="描述")
+        svc = self._service(describe)
+        blocks = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}]
+
+        await svc._describe_conversation_images(blocks)
+
+        assert describe.await_args.args[0].name == "图片1"
+        assert blocks[0]["vision_description"]["name"] == "图片1"
+        assert blocks[0]["vision_description"]["path"] is None
+
+    @pytest.mark.asyncio
+    async def test_retry_only_redescribes_failed_images(self):
+        """一张失败不中断其他图片；重试时复用已成功的描述，只重新识别失败的图片。"""
+        from src.api.services.vision_fallback_service import VisionFallbackError
+
+        attempts: list[str] = []
+
+        async def describe(image, focus):
+            attempts.append(image.name)
+            if image.name == "b.png" and attempts.count("b.png") == 1:
+                raise VisionFallbackError("视觉助手 视觉模型 识别图片 b.png 失败：超时")
+            await asyncio.sleep(0)  # a.png 在 b.png 失败之后才结束
+            return f"{image.name} 的描述"
+
+        svc = self._service(AsyncMock(side_effect=describe))
+
+        with pytest.raises(VisionFallbackError, match="b.png"):
+            await svc._describe_conversation_images([self._image("a.png"), self._image("b.png")])
+        assert attempts == ["a.png", "b.png"]
+
+        retry_blocks = [self._image("a.png"), self._image("b.png")]
+        await svc._describe_conversation_images(retry_blocks)
+
+        assert attempts == ["a.png", "b.png", "b.png"]
+        assert [block["vision_description"]["text"] for block in retry_blocks] == [
+            "a.png 的描述",
+            "b.png 的描述",
+        ]
+
+        # 改了正文：描述的关注点变了，不能复用旧描述
+        await svc._describe_conversation_images([{"type": "text", "text": "换个问题"}, self._image("a.png")])
+        assert attempts == ["a.png", "b.png", "b.png", "a.png"]
+
+    def test_agent_content_carries_vision_description(self):
+        svc = make_agent_service(session_id="session-vision")
+        description = {"model_id": "m", "model_name": "M", "name": "a.png", "path": None, "text": "t"}
+        block = self._image("a.png")
+        block["vision_description"] = description
+
+        agent_blocks = svc._build_agent_user_content([block])
+
+        assert agent_blocks == [{
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,a.png"},
+            "vision_description": description,
+        }]
+
+
 
 
 class TestWriteFileDirtyMemoryDetection:

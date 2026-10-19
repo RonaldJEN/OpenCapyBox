@@ -111,6 +111,7 @@ class TurnOrchestrator:
         lock_id: str | None = None,
         run_started_at: datetime | None = None,
         attachment_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        abort_requested: Callable[[], bool] | None = None,
     ) -> TurnExecution:
         if self._submit_handler is not None:
             return await self._submit_handler(turn)
@@ -123,6 +124,7 @@ class TurnOrchestrator:
         prepared = await engine.start_turn(
             turn,
             attachment_progress=attachment_progress,
+            abort_requested=abort_requested,
         )
         return self._execution_from_prepared(
             turn=turn,

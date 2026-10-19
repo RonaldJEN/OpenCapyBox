@@ -179,6 +179,7 @@ _CHANGED_VALUE_KEYS = frozenset(
         "default_model_id",
         "cron_default_model_id",
         "subagent_default_model_id",
+        "vision_fallback_model_id",
     }
 )
 

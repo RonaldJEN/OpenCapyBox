@@ -1524,7 +1524,7 @@
 
 .admin-model-default-form {
   display: grid;
-  grid-template-columns: repeat(3, minmax(160px, 1fr)) auto;
+  grid-template-columns: repeat(4, minmax(140px, 1fr)) auto;
   gap: 14px;
   align-items: end;
 }

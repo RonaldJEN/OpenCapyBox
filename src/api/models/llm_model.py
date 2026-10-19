@@ -48,5 +48,7 @@ class LLMModelSettings(Base):
     default_model_id = Column(String(100), nullable=True)
     cron_default_model_id = Column(String(100), nullable=True)
     subagent_default_model_id = Column(String(100), nullable=True)
+    # 主模型不支持图片时代为看图的模型；NULL 表示关闭视觉挂件。
+    vision_fallback_model_id = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=now_naive, nullable=False)
     updated_at = Column(DateTime, default=now_naive, onupdate=now_naive, nullable=False)

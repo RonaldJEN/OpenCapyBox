@@ -24,7 +24,9 @@ import {
   RoundData,
   SubagentTask,
   ToolApprovalPayload,
+  SendRejection,
   TurnReasoningSelection,
+  VisionFallbackInfo,
 } from '../types';
 import type { WorkspaceEntry } from '../types/workspace';
 import {
@@ -46,7 +48,7 @@ import {
 } from '../runtime/ChatRuntimeProvider';
 import { readFileAsDataUrl } from '../utils/imageUtils';
 import { toFileInfo, isImageFile } from '../utils/fileUtils';
-import { getImageInputError, isConversationImageInput } from '../utils/chatImageInput';
+import { getImageInputError, getImageInputNotice, isConversationImageInput } from '../utils/chatImageInput';
 import {
   emptyTurnPreferenceDraft,
   type TurnPreferenceDraft,
@@ -205,6 +207,7 @@ interface ChatV2Props {
   catalogDefaultModelId: string;
   onDraftInteraction?: () => void;
   availableModels?: ModelInfo[];
+  visionFallback?: VisionFallbackInfo | null;
   onCreateSession?: (modelId?: string) => Promise<string>;
   onSessionCreated?: (sessionId: string) => void;
   onFilesFullChange?: (full: boolean) => void;
@@ -246,6 +249,7 @@ function ChatV2View(props: ChatV2Props) {
     catalogDefaultModelId,
     onDraftInteraction,
     availableModels = [],
+    visionFallback = null,
     onCreateSession,
     onSessionCreated,
     onFilesFullChange,
@@ -389,7 +393,8 @@ function ChatV2View(props: ChatV2Props) {
   const input = currentMessageDraft.input;
   const attachedFiles = currentMessageDraft.attachedFiles;
   const currentDraftId = currentMessageDraft.draftId;
-  const imageInputError = getImageInputError(attachedFiles, selectedModel);
+  const imageInputError = getImageInputError(attachedFiles, selectedModel, 'send', visionFallback);
+  const imageInputNotice = getImageInputNotice(attachedFiles, selectedModel, visionFallback);
   const attachmentError = attachmentUploadError?.draftId === currentDraftId
     && attachmentUploadError.modelId === selectedModelId ? attachmentUploadError.message : '';
   const creatingCurrentDraft = creatingDraftId === currentDraftId;
@@ -797,7 +802,7 @@ function ChatV2View(props: ChatV2Props) {
       blocks.push({ type: 'text', text: trimmed });
     }
 
-    const imageError = getImageInputError(files, selectedModel);
+    const imageError = getImageInputError(files, selectedModel, 'send', visionFallback);
     if (imageError) throw new Error(imageError);
 
     for (const file of files) {
@@ -817,7 +822,9 @@ function ChatV2View(props: ChatV2Props) {
         continue;
       }
       const isImage = isImageFile(file);
-      if (isImage && file.data_url && (selectedModel?.supports_image ?? false)) {
+      // 主模型不支持图片但有视觉挂件时仍按图片发送，由后端交给挂件识别。
+      const acceptsImageInput = (selectedModel?.supports_image ?? false) || visionFallback !== null;
+      if (isImage && file.data_url && acceptsImageInput) {
         blocks.push({
           type: 'image_url',
           image_url: { url: file.data_url },
@@ -936,7 +943,7 @@ function ChatV2View(props: ChatV2Props) {
       const ownerModelId = composerDraftsRef.current.reasoningDrafts[key]?.modelId;
       const ownerModel = availableModels.find((model) => model.id === ownerModelId);
       if (isConversationImageInput(file) && ownerDraft
-        && getImageInputError(ownerDraft.attachedFiles, ownerModel)) {
+        && getImageInputError(ownerDraft.attachedFiles, ownerModel, 'send', visionFallback)) {
         // Keep accepted images queued until their own draft becomes compatible.
         // Other drafts and ordinary files can continue using the free slots.
         uploadQueueRef.current.push(job);
@@ -980,7 +987,7 @@ function ChatV2View(props: ChatV2Props) {
   useLayoutEffect(() => { drainUploadQueueRef.current = drainUploadQueue; });
   useEffect(() => {
     drainUploadQueueRef.current();
-  }, [composerDrafts, availableModels]);
+  }, [composerDrafts, availableModels, visionFallback]);
 
   const queueAttachment = (key: string, file: ComposerAttachment) => {
     const controller = new AbortController();
@@ -995,7 +1002,7 @@ function ChatV2View(props: ChatV2Props) {
     if (!draft) return;
     const candidates = Array.from(files as ArrayLike<File>);
     const imageError = candidates.some(isConversationImageInput)
-      ? getImageInputError([...draft.attachedFiles, ...candidates], selectedModel, 'upload') : '';
+      ? getImageInputError([...draft.attachedFiles, ...candidates], selectedModel, 'upload', visionFallback) : '';
     setAttachmentUploadError(imageError
       ? { draftId: draft.draftId, modelId: selectedModelId, message: imageError } : null);
     const acceptedFiles = imageError ? candidates.filter((file) => !isConversationImageInput(file)) : candidates;
@@ -1084,7 +1091,7 @@ function ChatV2View(props: ChatV2Props) {
     const file = draft?.attachedFiles[index];
     if (!file?.localFile || !file.clientId || file.uploadStatus !== 'error') return;
     const imageError = isConversationImageInput(file)
-      ? getImageInputError(draft.attachedFiles, selectedModel, 'upload') : '';
+      ? getImageInputError(draft.attachedFiles, selectedModel, 'upload', visionFallback) : '';
     if (imageError) {
       setAttachmentUploadError({ draftId: draft.draftId, modelId: selectedModelId, message: imageError });
       return;
@@ -1462,8 +1469,17 @@ function ChatV2View(props: ChatV2Props) {
     let restoreDraftKey = initialSessionKey;
     let submissionRestored = false;
     let submissionAccepted = false;
-    const restoreSubmissionSnapshot = () => {
+    const restoreSubmissionSnapshot = (rejection?: SendRejection) => {
       if (submissionRestored || submissionAccepted) return;
+      // 视觉挂件识别失败：整轮未受理，恢复后的图片标为"识别失败"，点图片即重新发送。
+      const visionFailed = rejection?.code === 'VISION_FALLBACK_FAILED';
+      if (visionFailed) {
+        setAttachmentUploadError({
+          draftId: messageSnapshot.draftId,
+          modelId: selectedModelId,
+          message: '图片识别失败，点一下图片即可重试',
+        });
+      }
       submissionRestored = true;
       commitComposerDrafts((previous) => {
         const current = previous.messageDrafts[restoreDraftKey];
@@ -1483,7 +1499,9 @@ function ChatV2View(props: ChatV2Props) {
                 current?.revision ?? clearedMessageRevision,
                 clearedMessageRevision,
               ) + 1,
-              attachedFiles: [...messageSnapshot.attachedFiles],
+              attachedFiles: messageSnapshot.attachedFiles.map((file) => (
+                visionFailed && isConversationImageInput(file) ? { ...file, visionFailed: true } : file
+              )),
             },
           },
           preferenceDrafts: {
@@ -1699,7 +1717,7 @@ function ChatV2View(props: ChatV2Props) {
         content: contentBlocks,
         attachments: draftAttachments.map(({ localFile: _file, previewUrl: _url, pastedText: _text,
           clientId: _clientId, draftId: _draftId, uploadStatus: _status,
-          uploadProgress: _progress, uploadError: _error, ...file }) => file),
+          uploadProgress: _progress, uploadError: _error, visionFailed: _visionFailed, ...file }) => file),
         preferredSkillKeys: preferenceSnapshot.skillKeys,
         preferredMcpConnections: preferenceSnapshot.mcpConnections,
         reasoning: reasoningSnapshot || undefined,
@@ -1974,6 +1992,7 @@ function ChatV2View(props: ChatV2Props) {
             autoFocus={!sessionId}
             attachedFiles={attachedFiles}
             imageInputError={imageInputError}
+            imageInputNotice={imageInputNotice}
             attachmentError={attachmentError}
             attachmentErrorKey={attachmentError ? attachmentUploadError : `${currentDraftId}:${selectedModelId}`}
             onRemoveAttachment={handleRemoveAttachment}

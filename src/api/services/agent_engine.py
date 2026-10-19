@@ -23,6 +23,7 @@ class AgentEngine(Protocol):
         turn: NormalizedInboundTurn,
         *,
         attachment_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        abort_requested: Callable[[], bool] | None = None,
     ) -> PreparedAgentRun: ...
 
     async def answer_interaction(
@@ -55,6 +56,7 @@ class InProcessAgentEngine:
         turn: NormalizedInboundTurn,
         *,
         attachment_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        abort_requested: Callable[[], bool] | None = None,
     ) -> PreparedAgentRun:
         kwargs = {
             "user_content": turn.content,
@@ -64,6 +66,8 @@ class InProcessAgentEngine:
             kwargs["contexts"] = turn.context
         if attachment_progress is not None:
             kwargs["attachment_progress"] = attachment_progress
+        if abort_requested is not None:
+            kwargs["abort_requested"] = abort_requested
         return await self.service.prepare_chat_round(**kwargs)
 
     async def answer_interaction(

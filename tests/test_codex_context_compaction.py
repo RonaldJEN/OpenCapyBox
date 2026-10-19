@@ -7,6 +7,7 @@ import pytest
 
 from src.agent.agent import Agent
 from src.agent.context_compaction import (
+    project_message_media_capabilities,
     DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES,
     SUMMARY_PREFIX,
     SUMMARIZATION_PROMPT,
@@ -219,6 +220,54 @@ def test_normalization_strips_unsupported_media():
             "text": "[历史图片未随本次请求发送：当前模型不支持图片输入。]",
         },
     ]
+
+
+def _described_image(path):
+    return {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,x"},
+        "vision_description": {
+            "model_id": "vision-model",
+            "model_name": "视觉模型",
+            "name": "chart.png",
+            "path": path,
+            "text": "柱状图，Q3 为 42",
+        },
+    }
+
+
+def test_projection_sends_vision_description_to_text_only_model():
+    message = Message(role="user", content=[_described_image("uploads/chart.png")])
+
+    projected = project_message_media_capabilities(message, supports_image=False, supports_video=False)
+
+    assert projected.content == [{
+        "type": "text",
+        "text": (
+            "[图片 chart.png（uploads/chart.png）由视觉助手 视觉模型 代读：\n"
+            "柱状图，Q3 为 42\n"
+            "如需细节，可用 read_image_file 带 question 追问。]"
+        ),
+    }]
+    # 请求副本不得改写历史原图块
+    assert message.content[0]["type"] == "image_url"
+
+
+def test_projection_omits_path_when_image_had_no_file_metadata():
+    message = Message(role="user", content=[_described_image(None)])
+
+    projected = project_message_media_capabilities(message, supports_image=False, supports_video=False)
+
+    assert projected.content[0]["text"].startswith("[图片 chart.png 由视觉助手 视觉模型 代读：\n")
+
+
+def test_projection_strips_vision_description_for_image_model():
+    message = Message(role="user", content=[_described_image("uploads/chart.png")])
+
+    projected = project_message_media_capabilities(message, supports_image=True, supports_video=False)
+
+    assert projected.content == [{"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}]
+    assert "vision_description" in message.content[0]
 
 
 def test_tool_output_uses_codex_record_time_byte_policy():
