@@ -17,11 +17,13 @@
 ### Composer 草稿临时附件
 
 - 选文件使用 `POST /api/composer-drafts/{draft_id}/attachments` 的 multipart；`attachment_id` 是前端生成并在重试中复用的 UUID。该请求只写 `composer_draft_attachments` ledger 和当前用户已冻结 Sandbox 的 `.composer-drafts/{draft_id}/{attachment_id}/{name}`，绝不创建 Session，也不写持久 Workspace。
-- 成功返回 `{attachment_id,draft_id,name,size,type,sha256,status:"ready"}`。同一身份、同一内容的上传幂等；同一身份对应不同内容返回 409；写入失败保留失败 ledger，客户端可用同一身份重试。
+- 成功返回 `{attachment_id,draft_id,name,size,type,sha256,status:"ready",synced_bytes}`。单个文件上限 200MB（`_MAX_ATTACHMENT_BYTES`，与前端、nginx 同值），超限返回 413。同一身份、同一内容的上传幂等；同一身份对应不同内容返回 409；写入失败保留失败 ledger，客户端可用同一身份重试。
+- 同一身份、同一内容再次上传时 ledger 仍为 `uploading`：心跳新鲜（`updated_at` 在 30 秒内）表示上一次请求的写入者还活着，返回 200 与当前行（`status:"uploading"`、`synced_bytes`），不发起第二次写入（附着）；心跳陈旧表示写入者已死（进程重启等），推进 `generation` 后按新上传处理（接管）。第二跳（后端 → 沙箱）进行中每 10 秒刷新 `updated_at` 作为心跳，`synced_bytes` 按秒节流写入已发送字节数。
+- `GET /api/composer-drafts/{draft_id}/attachments/{attachment_id}` 返回与上传相同的结构，供客户端在保存阶段轮询进度；`uploading` 且心跳陈旧时 `status` 报告为 `"failed"`。行不存在、不属于当前用户或 `draft_id` 不符返回 404。
 - 新建真实 Session 后，发送前调用 `POST /api/sessions/{session_id}/draft-attachments/claim`，body 为 `{draft_id,attachment_ids}`，响应 `{files:[FileInfo]}`。每次最多20项，前端对更多附件顺序分批、全部成功后再提交消息；这不是整条消息的附件数量上限。它把原始字节复制到稳定且普通文件列表可见的 `sessions/{session_id}/attachments/{attachment_id}/{name}` 并返回可复用的 Session 文件块；同一 Session 的重复 claim 不重复复制，部分批次成功后仍能用原身份重试。claim 只是 prepared，不代表本轮已发送。
 - Round 创建事务在草稿 ledger 行锁下重新校验用户、Session、附件 ID 和权威路径，并将 `claimed → attached` 与 Round 原子提交；上传/复制完成以 generation 条件更新，网络 I/O 不持有数据库事务。部分复制失败保留目标路径便于重试或清理，其他待处理项不进入永久 claiming。
 - claim 异常或协程取消都必须结束本次 `claiming`：仍持有 generation 时恢复 `ready` 并保留原目标身份；删除/到期已取得归属时，对可能迟到写入的精确目标重新激活清理任务，并返回 409 而不是误报 503 可重试。取消继续向上传播，不转换为成功或普通重试响应。
-- `DELETE /api/composer-drafts/{draft_id}/attachments/{attachment_id}` 幂等；先删除时保留 tombstone，阻止晚到上传复活。删除和24小时到期只为草稿源及无真实 Round 引用的准备目标排入异步清理；Round 引用按权威路径核对，兼容历史缺附件 ID。`attached` 表示真实 Round 保护，其 `deleted_at` 可表示草稿源已进入回收流程、目标仍保留，不代表物理清理已完成；物理完成以对应 `SandboxCleanupJob` 为准。迟到写入会重新激活精确清理任务。旧沙箱绑定不可用时的历史限制见 sandbox-spec §4“Composer 草稿附件目录”。
+- `DELETE /api/composer-drafts/{draft_id}/attachments/{attachment_id}` 幂等；先删除时保留 tombstone，阻止晚到上传复活。删除和24小时到期只为草稿源及无真实 Round 引用的准备目标排入异步清理；Round 引用按权威路径核对，兼容历史缺附件 ID。`attached` 表示真实 Round 保护，其 `deleted_at` 可表示草稿源已进入回收流程、目标仍保留，不代表物理清理已完成；物理完成以对应 `SandboxCleanupJob` 为准。迟到写入会重新激活精确清理任务；行只是被接管（generation 推进而 `deleted_at` 为空）时，迟到写入者不清理目录；其写入成功则按当前行状态返回，写入失败仍返回 503（客户端只认当前任务的请求结果，旧请求的迟到结果一律忽略）。旧沙箱绑定不可用时的历史限制见 sandbox-spec §4“Composer 草稿附件目录”。
 
 ## 2. 数据模型
 

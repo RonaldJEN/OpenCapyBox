@@ -23,6 +23,13 @@ async def upload_draft_attachment(draft_id: str, attachment_id: str = Form(...),
         user_id=user_id, draft_id=draft_id, attachment_id=attachment_id, file=file)
 
 
+@router.get("/composer-drafts/{draft_id}/attachments/{attachment_id}")
+async def get_draft_attachment(draft_id: str, attachment_id: str, user_id: str = Depends(get_current_user),
+                               db: DBSession = Depends(get_db)):
+    """上传进行中轮询同步到沙箱的进度；uploading 行心跳陈旧时报告为 failed。"""
+    return ComposerDraftAttachmentService(db).status(user_id=user_id, draft_id=draft_id, attachment_id=attachment_id)
+
+
 @router.delete("/composer-drafts/{draft_id}/attachments/{attachment_id}", status_code=204)
 async def delete_draft_attachment(draft_id: str, attachment_id: str, user_id: str = Depends(get_current_user),
                                   db: DBSession = Depends(get_db)):

@@ -1173,10 +1173,24 @@ class APIService {
       {
         headers: { 'Content-Type': 'multipart/form-data' },
         signal,
+        // 第二跳（后端 → 沙箱）耗时随文件大小变化，前端不按固定时间放弃；请求一定会结束：
+        // 后端有停滞超时，nginx 有 600 秒上限，进程挂了 nginx 立即返回 502。
+        timeout: 0,
         onUploadProgress: (event) => onProgress(event.total
           ? Math.min(100, Math.round(event.loaded / event.total * 100))
           : undefined),
       },
+    );
+    return response.data;
+  }
+
+  async getDraftAttachmentStatus(
+    draftId: string,
+    attachmentId: string,
+    signal: AbortSignal,
+  ): Promise<DraftUploadResult> {
+    const response = await this.client.get<DraftUploadResult>(
+      `/composer-drafts/${draftId}/attachments/${attachmentId}`, { signal },
     );
     return response.data;
   }

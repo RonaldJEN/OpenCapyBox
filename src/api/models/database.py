@@ -361,6 +361,7 @@ _PENDING_COLUMNS = [
     ("context_checkpoints", "source_message_sequence", "INTEGER NOT NULL DEFAULT 0"),
     ("context_checkpoints", "source_model_id", "VARCHAR(100)"),
     ("context_checkpoints", "source_event_sequence", "INTEGER NOT NULL DEFAULT 0"),
+    ("composer_draft_attachments", "synced_bytes", "INTEGER NOT NULL DEFAULT 0"),
     ("context_checkpoints", "trigger_phase", "VARCHAR(30) NOT NULL DEFAULT 'pre_turn'"),
     ("context_checkpoints", "summary_text", "TEXT NOT NULL DEFAULT ''"),
     ("user_run_locks", "lock_id", "VARCHAR(36) DEFAULT ''"),

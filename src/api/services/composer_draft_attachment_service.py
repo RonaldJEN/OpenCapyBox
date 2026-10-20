@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
+import io
 import os
 import posixpath
 import shlex
+import time
 import uuid
 from datetime import timedelta
 
@@ -25,6 +29,11 @@ from src.api.utils.timezone import now_naive
 
 
 _TTL = timedelta(hours=24)
+_MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
+# 第二跳（后端 → 沙箱）心跳：写入者每 10 秒刷新 updated_at；30 秒没刷新视为写入者已死，重试可接管。
+_SYNC_HEARTBEAT_INTERVAL = 10.0
+_SYNC_STALE_AFTER = timedelta(seconds=30)
+_SYNC_PROGRESS_FLUSH_INTERVAL = 1.0
 
 
 def _safe_name(filename: str | None) -> str:
@@ -42,7 +51,28 @@ def _draft_path(row: ComposerDraftAttachment) -> str:
     return f"{_draft_root(row)}/{row.name}"
 
 
+def _sync_is_stale(row: ComposerDraftAttachment) -> bool:
+    return row.state == "uploading" and now_naive() - row.updated_at > _SYNC_STALE_AFTER
+
+
+class _ProgressReader(io.BytesIO):
+    """SDK 把文件对象交给 httpx 分块读取；每读走一块就报告已发送到沙箱的字节数。"""
+
+    def __init__(self, data: bytes, on_progress):
+        super().__init__(data)
+        self._on_progress = on_progress
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = super().read(size)
+        self._on_progress(self.tell())
+        return chunk
+
+
 def _serialize(row: ComposerDraftAttachment) -> dict:
+    status = "ready" if row.state in {"ready", "claimed", "attached"} else row.state
+    if _sync_is_stale(row):
+        # 写入者已死（进程重启等）：对客户端就是失败，重试会接管。
+        status = "failed"
     return {
         "attachment_id": row.attachment_id,
         "draft_id": row.draft_id,
@@ -50,7 +80,8 @@ def _serialize(row: ComposerDraftAttachment) -> dict:
         "size": row.size_bytes,
         "type": row.content_type or posixpath.splitext(row.name)[1].lstrip(".").lower() or "file",
         "sha256": row.content_sha256,
-        "status": "ready" if row.state in {"ready", "claimed", "attached"} else row.state,
+        "status": status,
+        "synced_bytes": row.synced_bytes,
     }
 
 
@@ -89,6 +120,8 @@ class ComposerDraftAttachmentService:
         if not draft_id or len(draft_id) > 64 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in draft_id):
             raise HTTPException(status_code=422, detail="draft_id 无效")
         content = await file.read()
+        if len(content) > _MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail="文件超过 200MB，请通过文件面板上传")
         name = _safe_name(file.filename)
         digest = hashlib.sha256(content).hexdigest()
         existing = self.db.query(ComposerDraftAttachment).filter(
@@ -103,7 +136,10 @@ class ComposerDraftAttachmentService:
                 raise HTTPException(status_code=409, detail="attachment_id 已对应另一份文件")
             if existing.state in {"ready", "claimed", "attached"}:
                 return _serialize(existing)
-            if existing.state != "failed":
+            if existing.state == "uploading" and not _sync_is_stale(existing):
+                # 上一次请求的写入者还活着：附着到它，不发起第二次写入，客户端轮询等待。
+                return _serialize(existing)
+            if existing.state not in {"failed", "uploading"}:
                 raise HTTPException(status_code=409, detail="草稿附件正在变更")
 
         # Reserve before awaiting Sandbox initialization. A concurrent delete
@@ -114,6 +150,8 @@ class ComposerDraftAttachmentService:
         row.size_bytes = len(content)
         row.content_sha256 = digest
         row.state = "uploading"
+        row.synced_bytes = 0
+        # 心跳陈旧的 uploading 行在这里被接管：generation 推进后原写入者的守卫更新全部失效。
         row.generation = int(row.generation or 0) + 1
         generation = row.generation
         row.expires_at = now_naive() + _TTL
@@ -130,6 +168,7 @@ class ComposerDraftAttachmentService:
         # profile replacement cannot redirect this attachment to another owner.
         from src.api.routes.sessions import _ensure_sandbox, _get_sandbox_binding_state
         sandbox = None
+        heartbeat = asyncio.create_task(self._sync_heartbeat(attachment_id, generation))
         try:
             binding = _get_sandbox_binding_state(self.db, user_id)
             sandbox = await _ensure_sandbox(sandbox_service, user_id, self.db, binding_state=binding)
@@ -146,18 +185,34 @@ class ComposerDraftAttachmentService:
             if owned != 1:
                 raise HTTPException(status_code=409, detail="草稿附件已被移除")
             destination = resolve_sandbox_path(f".composer-drafts/{draft_id}/{attachment_id}/{name}", mount_path)
+            # 先写按 generation 命名的临时文件，校验通过再改名：接管后新旧写入者互不覆盖，
+            # 两份内容由 sha256 保证一致。目录按附件独占，临时文件用固定短名，
+            # 不在原文件名后再加后缀（接近 255 字节的文件名会超出系统上限）。
+            part = f"{posixpath.dirname(destination)}/.g{generation}.part"
             from src.api.routes.sessions import _extract_exit_code
             mkdir = await sandbox.commands.run(f"mkdir -p {shlex.quote(posixpath.dirname(destination))}")
             if _extract_exit_code(mkdir) != 0:
                 raise RuntimeError("无法创建草稿附件目录")
+            last_flush = 0.0
+
+            def report_progress(synced_bytes: int) -> None:
+                nonlocal last_flush
+                if time.monotonic() - last_flush < _SYNC_PROGRESS_FLUSH_INTERVAL:
+                    return
+                last_flush = time.monotonic()
+                self._touch_sync(attachment_id, generation, synced_bytes=synced_bytes)
+
+            payload = _ProgressReader(content, report_progress)
             write = getattr(sandbox.files, "write", None)
             if callable(write):
-                await write(destination, content)
+                await write(part, payload)
             else:
-                await sandbox.files.write_file(destination, content)
+                await sandbox.files.write_file(part, payload)
+            self._touch_sync(attachment_id, generation, synced_bytes=len(content))
             verification = await sandbox.commands.run(
-                f"test \"$(wc -c < {shlex.quote(destination)})\" = {len(content)} && "
-                f"test \"$(sha256sum {shlex.quote(destination)} | cut -d ' ' -f1)\" = {shlex.quote(digest)}"
+                f"test \"$(wc -c < {shlex.quote(part)})\" = {len(content)} && "
+                f"test \"$(sha256sum {shlex.quote(part)} | cut -d ' ' -f1)\" = {shlex.quote(digest)} && "
+                f"mv -f {shlex.quote(part)} {shlex.quote(destination)}"
             )
             if _extract_exit_code(verification) != 0:
                 raise RuntimeError("草稿附件落盘校验失败")
@@ -176,12 +231,17 @@ class ComposerDraftAttachmentService:
             if failed != 1:
                 self.db.expire_all()
                 deleted = self.db.query(ComposerDraftAttachment).filter_by(attachment_id=attachment_id).one_or_none()
-                if deleted and deleted.sandbox_id and deleted.mount_path:
+                # 只有记录真被删除才清理目录；被接管时新一代写入者仍在用这个目录。
+                if deleted and deleted.deleted_at and deleted.sandbox_id and deleted.mount_path:
                     self._enqueue_path_cleanup(deleted, _draft_root(deleted))
                     self.db.commit()
             if not isinstance(exc, Exception) or isinstance(exc, HTTPException):
                 raise
             raise HTTPException(status_code=503, detail="草稿附件保存失败，可重试") from exc
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
         updated = self.db.query(ComposerDraftAttachment).filter(
             ComposerDraftAttachment.attachment_id == attachment_id,
             ComposerDraftAttachment.state == "uploading",
@@ -190,11 +250,14 @@ class ComposerDraftAttachmentService:
         self.db.commit()
         if updated != 1:
             self.db.expire_all()
-            deleted = self.db.query(ComposerDraftAttachment).filter_by(attachment_id=attachment_id).one_or_none()
-            if deleted and deleted.sandbox_id and deleted.mount_path:
-                self._enqueue_path_cleanup(deleted, _draft_root(deleted))
-                self.db.commit()
-            raise HTTPException(status_code=409, detail="草稿附件已被移除")
+            current = self.db.query(ComposerDraftAttachment).filter_by(attachment_id=attachment_id).one_or_none()
+            if current is None or current.deleted_at is not None:
+                if current and current.sandbox_id and current.mount_path:
+                    self._enqueue_path_cleanup(current, _draft_root(current))
+                    self.db.commit()
+                raise HTTPException(status_code=409, detail="草稿附件已被移除")
+            # 已被新一代接管：内容一致，文件由新一代收尾，这里按当前状态返回。
+            return _serialize(current)
         self.db.expire_all()
         row = self.db.query(ComposerDraftAttachment).filter_by(attachment_id=attachment_id).one()
         return _serialize(row)
@@ -301,6 +364,30 @@ class ComposerDraftAttachmentService:
         return {"attachment_id": row.attachment_id, "name": row.name, "path": row.claimed_path,
                 "size": row.size_bytes, "type": row.content_type or "file", "modified": row.updated_at.isoformat(),
                 "revision": None, "composer_draft_attachment_id": row.attachment_id}
+
+    def _touch_sync(self, attachment_id: str, generation: int, *, synced_bytes: int | None = None) -> None:
+        """用独立短会话刷新心跳 / 进度，不占用请求级会话的事务；只对仍属于本代的 uploading 行生效。"""
+        values = {"updated_at": now_naive()}
+        if synced_bytes is not None:
+            values["synced_bytes"] = synced_bytes
+        with DBSession(bind=self.db.get_bind()) as db:
+            db.query(ComposerDraftAttachment).filter(
+                ComposerDraftAttachment.attachment_id == attachment_id,
+                ComposerDraftAttachment.state == "uploading",
+                ComposerDraftAttachment.generation == generation,
+            ).update(values, synchronize_session=False)
+            db.commit()
+
+    async def _sync_heartbeat(self, attachment_id: str, generation: int) -> None:
+        while True:
+            await asyncio.sleep(_SYNC_HEARTBEAT_INTERVAL)
+            self._touch_sync(attachment_id, generation)
+
+    def status(self, *, user_id: str, draft_id: str, attachment_id: str) -> dict:
+        row = self.db.query(ComposerDraftAttachment).filter_by(attachment_id=attachment_id).one_or_none()
+        if row is None or row.user_id != user_id or row.draft_id != draft_id:
+            raise HTTPException(status_code=404, detail="草稿附件不存在")
+        return _serialize(row)
 
     async def delete(self, *, user_id: str, draft_id: str, attachment_id: str) -> None:
         try:

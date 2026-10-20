@@ -1,6 +1,6 @@
 """Durable ledger for files selected before a real Session exists."""
 
-from sqlalchemy import Column, DateTime, Index, Integer, String
+from sqlalchemy import Column, DateTime, Index, Integer, String, text
 
 from .database import Base
 from src.api.utils.timezone import now_naive
@@ -20,6 +20,8 @@ class ComposerDraftAttachment(Base):
     content_type = Column(String(255), nullable=True)
     size_bytes = Column(Integer, nullable=True)
     content_sha256 = Column(String(64), nullable=True)
+    # 第二跳（后端 → 沙箱）已发送的字节数，上传进行中按秒节流写入
+    synced_bytes = Column(Integer, nullable=False, default=0, server_default=text("0"))
     sandbox_id = Column(String(100), nullable=True)
     mount_path = Column(String(500), nullable=True)
     state = Column(String(20), nullable=False, default="uploading")

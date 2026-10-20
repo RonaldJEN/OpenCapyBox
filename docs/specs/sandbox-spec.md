@@ -90,7 +90,7 @@
 
 ### Composer 草稿附件目录
 
-- 草稿附件物理目录是当前用户 Sandbox mount 下严格受控的 `.composer-drafts/{draft_id}/{attachment_id}/`，不是 Workspace，也不是隐藏 Session。ledger 冻结 `user_id`、Sandbox ID、mount、文件名、大小和 SHA-256 后才允许 I/O；网络 I/O 不持有数据库事务。
+- 草稿附件物理目录是当前用户 Sandbox mount 下严格受控的 `.composer-drafts/{draft_id}/{attachment_id}/`，不是 Workspace，也不是隐藏 Session。ledger 冻结 `user_id`、Sandbox ID、mount、文件名、大小和 SHA-256 后才允许 I/O；网络 I/O 不持有数据库事务。文件先写入同目录的固定短名临时文件 `.g{generation}.part`（目录按附件独占；不在原文件名后加后缀，避免接近 255 字节的文件名超出系统上限），沙箱内按大小与 SHA-256 校验通过后 `mv -f` 为 `{name}`；接管后新旧写入者各写各的 part，内容由 SHA-256 保证一致。写入失败或写入者死亡残留的 part 不立即删除，随草稿根目录在删除 / 24 小时到期时一并清理。第二跳期间 ledger 的 `updated_at` 每 10 秒刷新作为写入者心跳，`synced_bytes` 记录已发送到沙箱的字节数（见 sessions-spec 的附着 / 接管规则）。
 - 上传通过共享健康验证获取 Sandbox；已回收的缓存进入既有控制面确认与恢复流程。I/O 中的 SDK 404 只失效本次对象并保留附件 failed 状态，下一次同 attachment_id 上传重新获取 Sandbox；不在已开始写入的请求内切换代际重放，也不把文件 404 直接当成容器丢失。
 - claim 的专属 Session 目标固定为 `sessions/{session_id}/attachments/{attachment_id}/`，使该文件可由普通 Session 文件列表展示。删除和 24 小时到期通过既有 `SandboxCleanupJob` 排入异步清理，仅处理严格匹配的草稿根或未被 Round 引用的专属目标，不扫描同级目录、不跟随 symlink；cleanup lease/generation 防止迟到回调复活或误删新文件。
 - 后台目录清理继续使用任务冻结的 Sandbox ID 调用 `get_existing`，不自动改绑或创建容器。明确的绑定变更、Profile 不匹配、绑定缺失或容器终态（terminated/failed/not_found）使任务进入 `blocked`，保留原目标与错误原因，不标记物理删除成功、不自动重排。临时连接、状态查询等故障仍重试，间隔从 30 秒指数增长，最多 30 分钟；不得把普通文件/SDK 404 当作容器终态。

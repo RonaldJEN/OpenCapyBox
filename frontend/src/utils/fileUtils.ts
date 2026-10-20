@@ -17,6 +17,10 @@ import {
 } from 'lucide-react';
 import type { FileInfo, AttachmentInfo } from '../types';
 
+/** 对话附件大小上限；与后端 `_MAX_ATTACHMENT_BYTES` 及 nginx `client_max_body_size` 对齐。 */
+export const MAX_COMPOSER_FILE_MB = 200;
+export const MAX_COMPOSER_FILE_BYTES = MAX_COMPOSER_FILE_MB * 1024 * 1024;
+
 // ─── 文件類型推斷 ────────────────────────────────────────────────
 
 /**

@@ -486,7 +486,7 @@ export function ChatInput({
                 : status === 'uploading'
                   ? (hasProgress ? `上传中 ${progress}%` : '上传中')
                   : status === 'saving'
-                    ? '正在保存'
+                    ? (typeof file.syncProgress === 'number' ? `同步到沙箱 ${file.syncProgress}%` : '正在保存')
                     : status === 'error'
                       ? '上传失败'
                       : '已就绪';

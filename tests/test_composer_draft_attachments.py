@@ -110,10 +110,149 @@ async def test_upload_recovers_missing_cached_sandbox_before_writing(db, upload_
     assert row.mount_path == "/home/user"
     assert row.content_sha256 == hashlib.sha256(b"hello").hexdigest()
     sandboxes.old.commands.run.assert_not_awaited()
-    sandboxes.replacement.files.write.assert_awaited_once_with(
-        f"/home/user/.composer-drafts/draft_1/{row.attachment_id}/hello.md", b"hello",
-    )
+    (part_path, payload), _ = sandboxes.replacement.files.write.await_args
+    assert part_path == f"/home/user/.composer-drafts/draft_1/{row.attachment_id}/.g1.part"
+    assert payload.getvalue() == b"hello"
     assert db.query(Session).count() == 1
+
+
+ATT_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def _uploading_hello_row(*, updated_at=None):
+    """与 _upload_test_attachment 同名同内容、仍在上传中的 ledger 行。"""
+    row = _row(state="uploading")
+    row.name, row.size_bytes, row.content_sha256 = "hello.md", 5, hashlib.sha256(b"hello").hexdigest()
+    if updated_at is not None:
+        row.updated_at = updated_at
+    return row
+
+
+@pytest.mark.asyncio
+async def test_upload_streams_part_file_and_records_sync_progress(db, upload_sandboxes):
+    """第二跳按块读取时把已发送字节写进 synced_bytes；先写 .part，校验通过再改名。"""
+    from sqlalchemy.orm import Session as DBSession
+    sandboxes = upload_sandboxes
+    seen: list[int] = []
+
+    async def write(path, payload):
+        while payload.read(2):  # 模拟 httpx 分块读取文件对象
+            with DBSession(bind=db.get_bind()) as side:
+                seen.append(side.get(ComposerDraftAttachment, ATT_ID).synced_bytes)
+
+    sandboxes.replacement.files.write = AsyncMock(side_effect=write)
+
+    result = await _upload_test_attachment(db)
+
+    assert result["status"] == "ready"
+    assert seen[0] == 2 and result["synced_bytes"] == 5
+    (part_path, _payload), _ = sandboxes.replacement.files.write.await_args
+    assert part_path.endswith(f"/{ATT_ID}/.g1.part")
+    verify_command = sandboxes.replacement.commands.run.await_args.args[0]
+    assert "sha256sum" in verify_command and f"mv -f {part_path}" in verify_command
+
+
+@pytest.mark.asyncio
+async def test_upload_attaches_to_live_writer_without_second_write(db, upload_sandboxes):
+    """同一附件仍在上传且心跳新鲜：返回当前进度，不再碰沙箱。"""
+    row = _uploading_hello_row()
+    row.synced_bytes = 2
+    db.add(row); db.commit()
+
+    result = await _upload_test_attachment(db)
+
+    assert result["status"] == "uploading" and result["synced_bytes"] == 2
+    upload_sandboxes.replacement.files.write.assert_not_awaited()
+    upload_sandboxes.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_upload_takes_over_stale_writer(db, upload_sandboxes):
+    """心跳陈旧的 uploading 行：generation 推进后按新上传写入。"""
+    db.add(_uploading_hello_row(updated_at=now_naive() - timedelta(seconds=90))); db.commit()
+
+    result = await _upload_test_attachment(db)
+
+    db.expire_all()
+    assert result["status"] == "ready"
+    assert db.get(ComposerDraftAttachment, ATT_ID).generation == 2
+    (part_path, _payload), _ = upload_sandboxes.replacement.files.write.await_args
+    assert part_path.endswith("/.g2.part")
+
+
+@pytest.mark.asyncio
+async def test_sync_heartbeat_refreshes_updated_at_during_write(db, upload_sandboxes, monkeypatch):
+    """第二跳进行中写入者按间隔刷新 updated_at，status 才不会把活着的写入者判成陈旧。"""
+    import asyncio
+    from sqlalchemy.orm import Session as DBSession
+    monkeypatch.setattr("src.api.services.composer_draft_attachment_service._SYNC_HEARTBEAT_INTERVAL", 0.01)
+    seen: list = []
+
+    async def write(path, payload):
+        with DBSession(bind=db.get_bind()) as side:
+            seen.append(side.get(ComposerDraftAttachment, ATT_ID).updated_at)
+        await asyncio.sleep(0.05)
+        with DBSession(bind=db.get_bind()) as side:
+            seen.append(side.get(ComposerDraftAttachment, ATT_ID).updated_at)
+
+    upload_sandboxes.replacement.files.write = AsyncMock(side_effect=write)
+
+    result = await _upload_test_attachment(db)
+
+    assert result["status"] == "ready"
+    assert seen[1] > seen[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("superseded_by", ["takeover", "delete"])
+async def test_late_writer_cleans_up_only_when_row_deleted(db, upload_sandboxes, superseded_by):
+    """写入期间被接管：不清理目录、不报错；被删除：排清理并 409（现状）。"""
+    from sqlalchemy.orm import Session as DBSession
+
+    async def write(path, payload):
+        with DBSession(bind=db.get_bind()) as side:
+            row = side.get(ComposerDraftAttachment, ATT_ID)
+            row.generation += 1
+            if superseded_by == "delete":
+                row.state, row.deleted_at = "deleted", now_naive()
+            side.commit()
+
+    upload_sandboxes.replacement.files.write = AsyncMock(side_effect=write)
+
+    if superseded_by == "takeover":
+        result = await _upload_test_attachment(db)
+        assert result["status"] == "uploading"
+        assert db.query(SandboxCleanupJob).count() == 0
+    else:
+        with pytest.raises(HTTPException) as excinfo:
+            await _upload_test_attachment(db)
+        assert excinfo.value.status_code == 409
+        assert db.query(SandboxCleanupJob).count() == 1
+
+
+def test_status_reports_progress_and_marks_stale_writer_failed(db):
+    row = _uploading_hello_row()
+    row.synced_bytes = 1
+    db.add(row); db.commit()
+    service = ComposerDraftAttachmentService(db)
+    ids = dict(draft_id="draft_1", attachment_id=ATT_ID)
+
+    status = service.status(user_id="owner", **ids)
+    assert (status["status"], status["synced_bytes"]) == ("uploading", 1)
+    with pytest.raises(HTTPException) as excinfo:
+        service.status(user_id="someone-else", **ids)
+    assert excinfo.value.status_code == 404
+
+    row.updated_at = now_naive() - timedelta(seconds=90); db.commit()
+    assert service.status(user_id="owner", **ids)["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_files_over_limit(db, monkeypatch):
+    monkeypatch.setattr("src.api.services.composer_draft_attachment_service._MAX_ATTACHMENT_BYTES", 4)
+    with pytest.raises(HTTPException) as excinfo:
+        await _upload_test_attachment(db)
+    assert excinfo.value.status_code == 413
 
 
 @pytest.mark.asyncio

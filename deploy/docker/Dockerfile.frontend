@@ -15,8 +15,8 @@ RUN printf 'server {\n\
   root /usr/share/nginx/html;\n\
   index index.html;\n\
   \n\
-  # 设置文件上传大小限制为 100MB\n\
-  client_max_body_size 100M;\n\
+  # 对话附件上限 200MB（后端与前端同值），multipart 头部留少量余量\n\
+  client_max_body_size 205M;\n\
   \n\
   location / {\n\
     try_files $uri $uri/ /index.html;\n\
@@ -27,10 +27,10 @@ RUN printf 'server {\n\
     proxy_set_header X-Real-IP $remote_addr;\n\
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\
     \n\
-    # API 代理的超时设置（大文件上传需要更长时间）\n\
-    proxy_read_timeout 300;\n\
+    # API 代理的超时设置：大文件上传请求要等后端把文件同步到沙箱后才返回（200MB 要求出口 >= 0.35MB/s）\n\
+    proxy_read_timeout 600;\n\
     proxy_connect_timeout 300;\n\
-    proxy_send_timeout 300;\n\
+    proxy_send_timeout 600;\n\
     \n\
     # SSE 流式代理（AG-UI 事件流）\n\
     proxy_buffering off;\n\

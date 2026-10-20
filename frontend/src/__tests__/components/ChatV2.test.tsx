@@ -44,6 +44,7 @@ vi.mock('../../services/api', () => ({
     resumeStream: vi.fn(),
     uploadFile: vi.fn(),
     uploadDraftAttachment: vi.fn(),
+    getDraftAttachmentStatus: vi.fn(),
     removeDraftAttachment: vi.fn(),
     claimDraftAttachments: vi.fn(),
     getRunningSessions: vi.fn(),
@@ -387,6 +388,7 @@ describe('ChatV2 组件', () => {
       type: file.type,
       sha256: 'test-sha256',
       status: 'ready',
+      synced_bytes: file.size,
     }));
     vi.mocked(apiService.removeDraftAttachment).mockResolvedValue(undefined);
     vi.mocked(apiService.claimDraftAttachments).mockResolvedValue([]);
@@ -1669,7 +1671,7 @@ describe('ChatV2 组件', () => {
         return new Promise((resolve) => {
           completeUploads.push(() => resolve({
             draft_id: draftId, attachment_id: attachmentId, name: file.name,
-            size: file.size, type: file.type, sha256: 'sha', status: 'ready',
+            size: file.size, type: file.type, sha256: 'sha', status: 'ready', synced_bytes: file.size,
           }));
         });
       });
@@ -1963,7 +1965,7 @@ describe('ChatV2 组件', () => {
     rerender(<ChatV2 sessionId="session-b" {...defaultProps} />);
     await act(async () => {
       resolveUpload({
-        attachment_id: 'attachment-a', draft_id: 'draft-a', sha256: 'sha', status: 'ready',
+        attachment_id: 'attachment-a', draft_id: 'draft-a', sha256: 'sha', status: 'ready', synced_bytes: 1,
         name: 'session-a.txt', size: 1, type: 'text/plain',
       });
     });
@@ -1999,7 +2001,7 @@ describe('ChatV2 组件', () => {
 
     await act(async () => {
       resolveUpload({
-        attachment_id: 'attachment-pending', draft_id: 'draft-pending', sha256: 'sha', status: 'ready',
+        attachment_id: 'attachment-pending', draft_id: 'draft-pending', sha256: 'sha', status: 'ready', synced_bytes: 7,
         name: 'pending.txt', size: 7, type: 'text/plain',
       });
     });
@@ -2139,7 +2141,7 @@ describe('ChatV2 组件', () => {
       .mockImplementationOnce(() => new Promise(() => {}))
       .mockImplementation(async (draftId, attachmentId, file) => ({
         draft_id: draftId, attachment_id: attachmentId, name: file.name, size: file.size,
-        type: file.type, sha256: 'sha', status: 'ready',
+        type: file.type, sha256: 'sha', status: 'ready', synced_bytes: file.size,
       }));
 
     const { container, rerender } = render(<ChatV2 sessionId="session-a" {...defaultProps} />);
@@ -3080,6 +3082,145 @@ describe('ChatV2 组件', () => {
 
     await act(async () => {
       resolveHistory({ rounds: [], session_id: 'test-session', total: 0 });
+    });
+  });
+
+  describe('草稿附件同步到沙箱', () => {
+    const syncStatus = (overrides: Partial<DraftUploadResult>): DraftUploadResult => ({
+      draft_id: 'draft', attachment_id: 'att', name: 'big.bin', size: 10,
+      type: 'application/octet-stream', sha256: 'x', status: 'uploading', synced_bytes: 0, ...overrides,
+    });
+    const bigFile = () => new File(['0123456789'], 'big.bin', { type: 'application/octet-stream' });
+    const pickFiles = (container: HTMLElement, files: File[]) => {
+      fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files } });
+    };
+    const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+    const holdUpload = () => {
+      let finishUpload!: (result: DraftUploadResult) => void;
+      vi.mocked(apiService.uploadDraftAttachment).mockImplementation((_d, _a, _f, _s, onProgress) => {
+        onProgress(100);
+        return new Promise<DraftUploadResult>((resolve) => { finishUpload = resolve; });
+      });
+      return (result: DraftUploadResult) => act(async () => {
+        finishUpload(result);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+    };
+
+    it('字节到达后端后每秒轮询同步进度，POST 返回后就绪并停止轮询', async () => {
+      vi.useFakeTimers();
+      try {
+        const finishUpload = holdUpload();
+        vi.mocked(apiService.getDraftAttachmentStatus).mockResolvedValue(syncStatus({ synced_bytes: 4 }));
+        const { container } = render(<ChatV2 sessionId="" {...defaultProps} />);
+
+        pickFiles(container, [bigFile()]);
+        await tick(0);
+        expect(screen.getByText('正在保存')).toBeInTheDocument();
+
+        await tick(1000);
+        expect(screen.getByText('同步到沙箱 40%')).toBeInTheDocument();
+        expect(apiService.getDraftAttachmentStatus).toHaveBeenCalledTimes(1);
+
+        await finishUpload(syncStatus({ status: 'ready', synced_bytes: 10 }));
+        expect(screen.getByText('已就绪')).toBeInTheDocument();
+        await tick(3000);
+        expect(apiService.getDraftAttachmentStatus).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('POST 返回 uploading 时附着到后端进行中的写入：不重传，轮询到就绪', async () => {
+      vi.useFakeTimers();
+      try {
+        vi.mocked(apiService.uploadDraftAttachment).mockResolvedValue(syncStatus({ synced_bytes: 0 }));
+        vi.mocked(apiService.getDraftAttachmentStatus)
+          .mockResolvedValueOnce(syncStatus({ synced_bytes: 5 }))
+          .mockResolvedValueOnce(syncStatus({ status: 'ready', synced_bytes: 10 }));
+        const { container } = render(<ChatV2 sessionId="" {...defaultProps} />);
+
+        pickFiles(container, [bigFile()]);
+        await tick(0);
+        await tick(1000);
+        expect(screen.getByText('同步到沙箱 50%')).toBeInTheDocument();
+        await tick(1000);
+        expect(screen.getByText('已就绪')).toBeInTheDocument();
+        expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('上传请求返回前，查询到上一代的 failed 或查询出错都不作数，POST 返回 ready 即就绪', async () => {
+      vi.useFakeTimers();
+      try {
+        const finishUpload = holdUpload();
+        // 重试时后端还在收尾：状态接口先 404，再返回上一代的 failed。
+        vi.mocked(apiService.getDraftAttachmentStatus)
+          .mockRejectedValueOnce(new Error('Request failed with status code 404'))
+          .mockResolvedValue(syncStatus({ status: 'failed', synced_bytes: 3 }));
+        const { container } = render(<ChatV2 sessionId="" {...defaultProps} />);
+
+        pickFiles(container, [bigFile()]);
+        await tick(8000);
+        expect(screen.getByText('正在保存')).toBeInTheDocument();
+        expect(screen.queryByText('上传失败')).not.toBeInTheDocument();
+
+        await finishUpload(syncStatus({ status: 'ready', synced_bytes: 10 }));
+        expect(screen.getByText('已就绪')).toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('附着后状态查询持续失败时提示暂时无法确认', async () => {
+      vi.useFakeTimers();
+      try {
+        vi.mocked(apiService.uploadDraftAttachment).mockResolvedValue(syncStatus({ synced_bytes: 0 }));
+        vi.mocked(apiService.getDraftAttachmentStatus).mockRejectedValue(new Error('Network Error'));
+        const { container } = render(<ChatV2 sessionId="" {...defaultProps} />);
+
+        pickFiles(container, [bigFile()]);
+        await tick(4000);
+        expect(screen.getByText('正在保存')).toBeInTheDocument();
+        await tick(1000);
+        expect(screen.getByText('上传失败')).toBeInTheDocument();
+        expect(screen.getByTitle('暂时无法确认，请重试')).toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('附着后轮询得到 failed：提示同步到沙箱中断', async () => {
+      vi.useFakeTimers();
+      try {
+        vi.mocked(apiService.uploadDraftAttachment).mockResolvedValue(syncStatus({ synced_bytes: 0 }));
+        vi.mocked(apiService.getDraftAttachmentStatus).mockResolvedValue(syncStatus({ status: 'failed' }));
+        const { container } = render(<ChatV2 sessionId="" {...defaultProps} />);
+
+        pickFiles(container, [bigFile()]);
+        await tick(1000);
+        expect(screen.getByText('上传失败')).toBeInTheDocument();
+        expect(screen.getByTitle('同步到沙箱中断，请重试')).toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('超过 200MB 的文件选择时即拒绝并提示，同批其他文件照常上传', async () => {
+      const huge = new File([''], 'huge.bin', { type: 'application/octet-stream' });
+      Object.defineProperty(huge, 'size', { value: 200 * 1024 * 1024 + 1 });
+      const small = new File(['ok'], 'small.txt', { type: 'text/plain' });
+      const { container } = render(<ChatV2 sessionId="" {...defaultProps} />);
+
+      pickFiles(container, [huge, small]);
+
+      expect(await screen.findByText('文件超过 200MB，请通过文件面板上传')).toBeInTheDocument();
+      await screen.findByText('已就绪');
+      expect(apiService.uploadDraftAttachment).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(apiService.uploadDraftAttachment).mock.calls[0][2]).toBe(small);
+      expect(screen.queryByText('huge.bin')).not.toBeInTheDocument();
     });
   });
 

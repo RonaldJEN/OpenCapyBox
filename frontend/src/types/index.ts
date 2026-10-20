@@ -690,6 +690,8 @@ export type ComposerAttachment = ChatFile & {
   draftId?: string;
   uploadStatus?: 'waiting' | 'uploading' | 'saving' | 'ready' | 'error';
   uploadProgress?: number;
+  /** 第二跳（后端 → 沙箱）同步进度百分比，"正在保存"阶段轮询得到。 */
+  syncProgress?: number;
   uploadError?: string;
   localFile?: File;
   pastedText?: string;
@@ -711,7 +713,10 @@ export interface DraftUploadResult {
   size: number;
   type: string;
   sha256: string;
-  status: 'ready';
+  /** uploading：后端仍在把文件同步到沙箱（含附着到上一次请求）；failed：写入者已死，重试可接管。 */
+  status: 'ready' | 'uploading' | 'failed';
+  /** 已同步到沙箱的字节数。 */
+  synced_bytes: number;
 }
 
 // 文件列表响应

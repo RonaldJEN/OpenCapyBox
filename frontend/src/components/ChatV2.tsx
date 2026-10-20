@@ -27,6 +27,7 @@ import {
   SendRejection,
   TurnReasoningSelection,
   VisionFallbackInfo,
+  DraftUploadResult,
 } from '../types';
 import type { WorkspaceEntry } from '../types/workspace';
 import {
@@ -47,7 +48,7 @@ import {
   useChatRuntimeOptional,
 } from '../runtime/ChatRuntimeProvider';
 import { readFileAsDataUrl } from '../utils/imageUtils';
-import { toFileInfo, isImageFile } from '../utils/fileUtils';
+import { toFileInfo, isImageFile, MAX_COMPOSER_FILE_BYTES, MAX_COMPOSER_FILE_MB } from '../utils/fileUtils';
 import { getImageInputError, getImageInputNotice, isConversationImageInput } from '../utils/chatImageInput';
 import {
   emptyTurnPreferenceDraft,
@@ -197,6 +198,69 @@ function isPristineMessageDraft(draft: MessageDraft): boolean {
   return draft.revision === 0
     && draft.input.length === 0
     && draft.attachedFiles.length === 0;
+}
+
+const SYNC_POLL_INTERVAL_MS = 1000;
+const SYNC_STATUS_MAX_FAILURES = 5;
+
+/** 第二跳（后端 → 沙箱）的终态或轮询放弃，文案直接给用户看。 */
+class DraftSyncError extends Error {}
+
+function syncPercent(status: DraftUploadResult): number | undefined {
+  return status.size ? Math.min(100, Math.round((status.synced_bytes / status.size) * 100)) : undefined;
+}
+
+/**
+ * 上传请求返回前只用轮询显示进度：后端此时可能还在收尾（nginx 转发、解析 multipart、算哈希），
+ * 状态接口返回的是上一代数据（重试时是旧的 failed，新附件是 404），都不作数；终态只看上传请求本身。
+ */
+async function showDraftSyncProgress(
+  draftId: string,
+  attachmentId: string,
+  signal: AbortSignal,
+  onProgress: (percent: number | undefined) => void,
+): Promise<void> {
+  while (!signal.aborted) {
+    await new Promise((resolve) => setTimeout(resolve, SYNC_POLL_INTERVAL_MS));
+    if (signal.aborted) return;
+    let status: DraftUploadResult;
+    try {
+      status = await apiService.getDraftAttachmentStatus(draftId, attachmentId, signal);
+    } catch {
+      // 上传请求还没返回，查询出错不说明任何事。
+      continue;
+    }
+    if (status.status === 'uploading') onProgress(syncPercent(status));
+  }
+}
+
+/**
+ * 上传请求返回 uploading（附着到上一次请求仍在进行的写入）后，由轮询决定终态；
+ * 初始 404 与偶发网络错误重查几次，持续失败才放弃。
+ */
+async function watchDraftSync(
+  draftId: string,
+  attachmentId: string,
+  signal: AbortSignal,
+  onProgress: (percent: number | undefined) => void,
+): Promise<DraftUploadResult> {
+  let failures = 0;
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, SYNC_POLL_INTERVAL_MS));
+    if (signal.aborted) throw new DOMException('aborted', 'AbortError');
+    let status: DraftUploadResult;
+    try {
+      status = await apiService.getDraftAttachmentStatus(draftId, attachmentId, signal);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      failures += 1;
+      if (failures >= SYNC_STATUS_MAX_FAILURES) throw new DraftSyncError('暂时无法确认，请重试');
+      continue;
+    }
+    if (status.status !== 'uploading') return status;
+    failures = 0;
+    onProgress(syncPercent(status));
+  }
 }
 
 interface ChatV2Props {
@@ -950,30 +1014,51 @@ function ChatV2View(props: ChatV2Props) {
         continue;
       }
       activeUploadsRef.current += 1;
+      // 旧请求不覆盖新结果：只有仍是该附件当前任务的请求才能回写状态。
       const patchFile = (patch: Partial<ComposerAttachment>) => {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || uploadControllersRef.current.get(file.clientId!) !== controller) return;
         updateMessageDraft(key, (draft) => ({
           ...draft,
           attachedFiles: draft.attachedFiles.map((item) => item.clientId === file.clientId
             ? { ...item, ...patch } as ComposerAttachment : item),
         }), file.draftId);
       };
-      patchFile({ uploadStatus: 'uploading', uploadProgress: undefined, uploadError: undefined });
+      patchFile({ uploadStatus: 'uploading', uploadProgress: undefined, uploadError: undefined, syncProgress: undefined });
       void (async () => {
+        // 第二跳（后端 → 沙箱）进度：字节到达后端后轮询状态，但在上传请求返回前只显示进度，不定终态。
+        const progressAbort = new AbortController();
+        const onSyncProgress = (percent: number | undefined) => patchFile({ syncProgress: percent });
+        let progressStarted = false;
+        const startProgress = () => {
+          if (progressStarted) return;
+          progressStarted = true;
+          void showDraftSyncProgress(file.draftId!, file.clientId!, progressAbort.signal, onSyncProgress);
+        };
         try {
-          const uploaded = await apiService.uploadDraftAttachment(
+          let uploaded = await apiService.uploadDraftAttachment(
             file.draftId!, file.clientId!, file.localFile!, controller.signal,
-            (percent) => patchFile({
-              uploadProgress: percent,
-              uploadStatus: percent === 100 ? 'saving' : 'uploading',
-            }),
+            (percent) => {
+              patchFile({ uploadProgress: percent, uploadStatus: percent === 100 ? 'saving' : 'uploading' });
+              if (percent === 100) startProgress();
+            },
           );
+          progressAbort.abort();
+          if (uploaded.status === 'uploading') {
+            // 后端还在替上一次请求写沙箱（附着）：不重传，从这里起由轮询给出终态。
+            patchFile({ uploadStatus: 'saving', uploadProgress: 100 });
+            uploaded = await watchDraftSync(file.draftId!, file.clientId!, controller.signal, onSyncProgress);
+          }
+          if (uploaded.status !== 'ready') throw new DraftSyncError('同步到沙箱中断，请重试');
           const dataUrl = isImageFile(file) ? await readFileAsDataUrl(file.localFile!) : undefined;
           patchFile({ name: uploaded.name, size: uploaded.size, data_url: dataUrl,
-            uploadStatus: 'ready', uploadProgress: 100 });
+            uploadStatus: 'ready', uploadProgress: 100, syncProgress: undefined });
         } catch (error) {
-          patchFile({ uploadStatus: 'error', uploadError: formatUploadError(error) });
+          patchFile({
+            uploadStatus: 'error', syncProgress: undefined,
+            uploadError: error instanceof DraftSyncError ? error.message : formatUploadError(error),
+          });
         } finally {
+          progressAbort.abort();
           activeUploadsRef.current -= 1;
           if (uploadControllersRef.current.get(file.clientId!) === controller) {
             uploadControllersRef.current.delete(file.clientId!);
@@ -1001,11 +1086,15 @@ function ChatV2View(props: ChatV2Props) {
     const draft = composerDraftsRef.current.messageDrafts[currentDraftKey];
     if (!draft) return;
     const candidates = Array.from(files as ArrayLike<File>);
+    const oversized = candidates.filter((file) => file.size > MAX_COMPOSER_FILE_BYTES);
+    const sizeError = oversized.length ? `文件超过 ${MAX_COMPOSER_FILE_MB}MB，请通过文件面板上传` : '';
     const imageError = candidates.some(isConversationImageInput)
       ? getImageInputError([...draft.attachedFiles, ...candidates], selectedModel, 'upload', visionFallback) : '';
-    setAttachmentUploadError(imageError
-      ? { draftId: draft.draftId, modelId: selectedModelId, message: imageError } : null);
-    const acceptedFiles = imageError ? candidates.filter((file) => !isConversationImageInput(file)) : candidates;
+    const addError = [sizeError, imageError].filter(Boolean).join('；');
+    setAttachmentUploadError(addError
+      ? { draftId: draft.draftId, modelId: selectedModelId, message: addError } : null);
+    const acceptedFiles = candidates.filter((file) => !oversized.includes(file)
+      && !(imageError && isConversationImageInput(file)));
     if (!acceptedFiles.length) return;
     const additions: ComposerAttachment[] = acceptedFiles.map((file) => {
       const previewUrl = URL.createObjectURL(file);
