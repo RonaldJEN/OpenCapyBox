@@ -18,6 +18,11 @@ RUN printf 'server {\n\
   # 对话附件上限 200MB（后端与前端同值），multipart 头部留少量余量\n\
   client_max_body_size 205M;\n\
   \n\
+  # .mjs（pdf.js module Worker）：默认 mime.types 不映射 mjs，须显式给 JS 类型\n\
+  location ~* [.]mjs$ {\n\
+    types { application/javascript mjs; }\n\
+    try_files $uri =404;\n\
+  }\n\
   location / {\n\
     try_files $uri $uri/ /index.html;\n\
   }\n\
