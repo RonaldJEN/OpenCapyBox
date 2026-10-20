@@ -1515,6 +1515,63 @@ async def test_discovery_schedules_visible_tool_index_warmup():
 
 
 @pytest.mark.asyncio
+async def test_summary_written_during_catalog_build_does_not_make_it_stale():
+    installation = _installation(server_description=None)
+    repository = FakeRepository([installation])
+    connector = FakeConnector()
+    connector.tools[installation.installation_id] = [{
+        "name": "search",
+        "description": "Search",
+        "inputSchema": {"type": "object"},
+    }]
+    summarized = EffectiveMcpInstallation(
+        **{**installation.__dict__, "server_description": "对接检索。能做：检索。适合：查询。"},
+    )
+
+    def schedule(_installation):
+        # The background summary of this very build lands before the final
+        # consistency re-read.
+        repository.installations = [summarized]
+
+    runtime = McpRuntime(
+        repository=repository,
+        connector=connector,
+        capability_summary_scheduler=schedule,
+    )
+
+    catalog = await runtime.resolve_catalog("user-1")
+
+    assert [tool.raw_name for tool in catalog.tools] == ["search"]
+    assert catalog.connections[0].server_description == "对接检索。能做：检索。适合：查询。"
+
+
+@pytest.mark.asyncio
+async def test_discovery_schedules_capability_summary_for_personal_servers_only():
+    personal = _installation(installation_id="install-personal", server_id="server-personal")
+    official = EffectiveMcpInstallation(
+        **{**personal.__dict__, "installation_id": "install-official",
+           "server_id": "server-official", "source": "official"},
+    )
+    repository = FakeRepository([personal, official])
+    connector = FakeConnector()
+    tools = [{"name": "search", "description": "Search", "inputSchema": {"type": "object"}}]
+    connector.tools[personal.installation_id] = tools
+    connector.tools[official.installation_id] = tools
+    scheduled = []
+    runtime = McpRuntime(
+        repository=repository,
+        connector=connector,
+        capability_summary_scheduler=lambda installation: scheduled.append(installation.server_id),
+    )
+
+    await runtime._discover_installation(personal)
+    # Discovered with this user's credential: never feeds the shared summary.
+    await runtime._discover_installation(official)
+
+    assert scheduled == ["server-personal"]
+
+
+@pytest.mark.asyncio
 async def test_optional_discovery_failure_does_not_expose_cached_snapshot():
     installation = _installation()
     repository = FakeRepository([installation])

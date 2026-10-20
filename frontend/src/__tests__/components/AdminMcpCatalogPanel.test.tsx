@@ -10,6 +10,7 @@ import {
   updateAdminMcpServer,
   updatePersonalMcpNetworkPolicy,
   type McpServer,
+  type PersonalMcpNetworkPolicy,
 } from '../../services/mcpApi';
 
 vi.mock('../../services/mcpApi', () => ({
@@ -113,7 +114,173 @@ describe('AdminMcpCatalogPanel', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
-  it('连接测试失败使用错误提示而不是绿色成功 toast', async () => {
+  it('说明由测试结果自动生成：表单不提供输入，空说明显示生成提示', async () => {
+    vi.mocked(getAdminMcpServers).mockResolvedValue([{ ...server, description: '' }]);
+    render(<AdminMcpCatalogPanel />);
+
+    await screen.findByText('内部知识库');
+    expect(screen.getByText('测试连接后自动生成能力摘要')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '新增官方 MCP' }));
+    expect(screen.getByLabelText('服务名称')).toBeInTheDocument();
+    expect(screen.queryByLabelText('说明')).not.toBeInTheDocument();
+  });
+
+  it('测试成功后按有界延迟只刷新目录，不重置白名单草稿', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(getAdminMcpServers)
+        .mockResolvedValueOnce([{ ...server, description: '' }])
+        .mockResolvedValueOnce([{ ...server, description: '' }])
+        .mockResolvedValue([server]);
+      render(<AdminMcpCatalogPanel />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(getAdminMcpServers).toHaveBeenCalledTimes(1);
+
+      // Typing in the whitelist while the probe is in flight (up to 15 s for a
+      // real MCP) must survive the refresh that follows the test result.
+      let finishTest!: (result: { ok: boolean; tools_count: number; latency_ms: number; error: null }) => void;
+      vi.mocked(testAdminMcpServer).mockImplementationOnce(() => new Promise((resolve) => { finishTest = resolve; }));
+      fireEvent.click(screen.getByRole('button', { name: '测试 内部知识库' }));
+      fireEvent.change(screen.getByLabelText('个人 MCP 域名白名单'), { target: { value: 'company.cc.com' } });
+      await act(async () => {
+        finishTest({ ok: true, tools_count: 6, latency_ms: 25, error: null });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(getAdminMcpServers).toHaveBeenCalledTimes(2);
+      expect(getPersonalMcpNetworkPolicy).toHaveBeenCalledTimes(1);
+      expect(screen.getByLabelText('个人 MCP 域名白名单')).toHaveValue('company.cc.com');
+
+      // ...and the background refreshes afterwards fetch only the catalog too.
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(getAdminMcpServers).toHaveBeenCalledTimes(3);
+      expect(getPersonalMcpNetworkPolicy).toHaveBeenCalledTimes(1);
+      expect(screen.getByLabelText('个人 MCP 域名白名单')).toHaveValue('company.cc.com');
+      expect(screen.getByText('公司知识检索')).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+      expect(getAdminMcpServers).toHaveBeenCalledTimes(6);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('迟到的摘要刷新不覆盖更新的目录', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveRefresh!: (servers: McpServer[]) => void;
+      vi.mocked(getAdminMcpServers).mockResolvedValue([server]);
+      vi.mocked(updateAdminMcpServer).mockResolvedValue({ ...server, status: 'disabled' });
+      render(<AdminMcpCatalogPanel />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+      fireEvent.click(screen.getByRole('button', { name: '测试 内部知识库' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      // The summary refresh at 5 s is slow...
+      vi.mocked(getAdminMcpServers)
+        .mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve; }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      // ...while the admin disables the server and the full reload shows it.
+      vi.mocked(getAdminMcpServers).mockResolvedValue([{ ...server, status: 'disabled' }]);
+      fireEvent.click(screen.getByRole('button', { name: '停用' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(document.querySelector('.admin-mcp-status')).toHaveTextContent('已停用');
+
+      await act(async () => {
+        resolveRefresh([server]);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(document.querySelector('.admin-mcp-status')).toHaveTextContent('已停用');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('目录刷新不丢弃稍后返回的白名单', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolvePolicy!: (policy: PersonalMcpNetworkPolicy) => void;
+      vi.mocked(getAdminMcpServers).mockResolvedValue([server]);
+      const { rerender } = render(<AdminMcpCatalogPanel refreshToken={0} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+      // A successful test schedules the summary refreshes...
+      fireEvent.click(screen.getByRole('button', { name: '测试 内部知识库' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(getAdminMcpServers).toHaveBeenCalledTimes(2);
+
+      // ...then a full reload starts whose policy half is slow...
+      vi.mocked(getPersonalMcpNetworkPolicy)
+        .mockImplementationOnce(() => new Promise((resolve) => { resolvePolicy = resolve; }));
+      rerender(<AdminMcpCatalogPanel refreshToken={1} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(getAdminMcpServers).toHaveBeenCalledTimes(3);
+
+      // ...the summary refresh due at 5 s yields to it...
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(getAdminMcpServers).toHaveBeenCalledTimes(3);
+
+      // ...the late policy answer still lands...
+      await act(async () => {
+        resolvePolicy({ domain_suffixes: ['late.example.com'], cidrs: [], version: 2, updated_at: null, disabled_installations: 0 });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByLabelText('个人 MCP 域名白名单')).toHaveValue('late.example.com');
+
+      // ...and the next scheduled refresh (12 s) catches up without touching it.
+      await act(async () => { await vi.advanceTimersByTimeAsync(7000); });
+      expect(getAdminMcpServers).toHaveBeenCalledTimes(4);
+      expect(screen.getByLabelText('个人 MCP 域名白名单')).toHaveValue('late.example.com');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('后台目录刷新失败不弹错误', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(getAdminMcpServers).mockResolvedValue([server]);
+      render(<AdminMcpCatalogPanel />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.click(screen.getByRole('button', { name: '测试 内部知识库' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+      vi.mocked(getAdminMcpServers).mockRejectedValueOnce(new Error('503'));
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(getAdminMcpServers).toHaveBeenCalledTimes(3);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.getByText('内部知识库')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('目录刷新不吞掉白名单加载错误', async () => {
+    vi.useFakeTimers();
+    try {
+      let rejectPolicy!: (reason: unknown) => void;
+      vi.mocked(getAdminMcpServers).mockResolvedValue([server]);
+      const { rerender } = render(<AdminMcpCatalogPanel refreshToken={0} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+      fireEvent.click(screen.getByRole('button', { name: '测试 内部知识库' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      vi.mocked(getPersonalMcpNetworkPolicy)
+        .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectPolicy = reject; }));
+      rerender(<AdminMcpCatalogPanel refreshToken={1} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+
+      await act(async () => {
+        rejectPolicy(new Error('白名单加载失败'));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByRole('alert')).toHaveTextContent('白名单加载失败');
+      expect(screen.getByText('内部知识库')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('连接测试失败使用错误提示而不是绿色成功 toast，并刷新出探针写回的状态', async () => {
     vi.mocked(testAdminMcpServer).mockResolvedValueOnce({
       ok: false,
       tools_count: 0,
@@ -121,11 +288,54 @@ describe('AdminMcpCatalogPanel', () => {
       error: '鉴权失败',
     });
     render(<AdminMcpCatalogPanel />);
+    await screen.findByText('内部知识库');
+    // The probe auto-disabled the failing required+published server.
+    vi.mocked(getAdminMcpServers).mockResolvedValue([{ ...server, status: 'disabled', last_error: '鉴权失败' }]);
 
-    fireEvent.click(await screen.findByRole('button', { name: '测试 内部知识库' }));
+    fireEvent.click(screen.getByRole('button', { name: '测试 内部知识库' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('鉴权失败');
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(document.querySelector('.admin-mcp-status')).toHaveTextContent('已停用');
+  });
+
+  it('测试返回的目录刷新不抢走在途全量加载的白名单与加载态', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolvePolicy!: (policy: PersonalMcpNetworkPolicy) => void;
+      let finishTest!: (result: { ok: boolean; tools_count: number; latency_ms: number; error: null }) => void;
+      vi.mocked(getAdminMcpServers).mockResolvedValue([server]);
+      const { rerender } = render(<AdminMcpCatalogPanel refreshToken={0} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+      // A probe is in flight...
+      vi.mocked(testAdminMcpServer).mockImplementationOnce(() => new Promise((resolve) => { finishTest = resolve; }));
+      fireEvent.click(screen.getByRole('button', { name: '测试 内部知识库' }));
+      // ...the admin triggers a full reload whose policy half is slow...
+      vi.mocked(getPersonalMcpNetworkPolicy)
+        .mockImplementationOnce(() => new Promise((resolve) => { resolvePolicy = resolve; }));
+      rerender(<AdminMcpCatalogPanel refreshToken={1} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      // ...and the probe returns first, refreshing the catalog (to an empty one,
+      // so the pending full load's loading state becomes observable).
+      vi.mocked(getAdminMcpServers).mockResolvedValue([]);
+      await act(async () => {
+        finishTest({ ok: true, tools_count: 6, latency_ms: 25, error: null });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText('正在加载官方 MCP...')).toBeInTheDocument();
+
+      // The full load's policy half still lands and settles its loading state.
+      await act(async () => {
+        resolvePolicy({ domain_suffixes: ['late.example.com'], cidrs: [], version: 2, updated_at: null, disabled_installations: 0 });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.queryByText('正在加载官方 MCP...')).not.toBeInTheDocument();
+      expect(screen.getByLabelText('个人 MCP 域名白名单')).toHaveValue('late.example.com');
+      expect(screen.getByRole('button', { name: '新增官方 MCP' })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('并发操作刷新时只接收最后一次列表响应', async () => {
@@ -191,7 +401,6 @@ describe('AdminMcpCatalogPanel', () => {
     await waitFor(() => {
       expect(createAdminMcpServer).toHaveBeenCalledWith({
         name: '行情服务',
-        description: null,
         url: 'https://market.example.com/mcp',
         status: 'draft',
         auth_type: 'headers',

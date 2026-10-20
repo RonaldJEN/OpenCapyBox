@@ -54,7 +54,6 @@ export interface McpToolList {
 
 export interface McpServerPayload {
   name: string;
-  description?: string | null;
   url: string;
   auth_type: McpAuthMode;
   bearer_token?: string;
@@ -321,8 +320,12 @@ export async function updateMcpToolVisibility(
   return normalizeToolList(response.data);
 }
 
+// 导入逐项串行发现工具，耗时随条目数增长；与 deploy/docker/Dockerfile.frontend 里 nginx 的
+// proxy_read_timeout（600 秒）一致。
+export const MCP_IMPORT_TIMEOUT_MS = 600_000;
+
 export async function importMcpConfig(config: unknown): Promise<McpImportResult> {
-  const response = await client.post('/mcp/import', config);
+  const response = await client.post('/mcp/import', config, { timeout: MCP_IMPORT_TIMEOUT_MS });
   return normalizeImportResult(response.data);
 }
 

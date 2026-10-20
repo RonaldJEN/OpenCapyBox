@@ -46,6 +46,7 @@ import {
   type McpToolList,
 } from '../services/mcpApi';
 import { extractValidationErrorMessage } from '../utils/errorMessages';
+import { clearSummaryRefresh, scheduleSummaryRefresh } from '../utils/mcpSummary';
 import FeedbackMessage from './FeedbackMessage';
 import './McpConnectionsPanel.css';
 
@@ -61,13 +62,14 @@ interface McpConnectionsPanelProps {
 interface LoadServersOptions {
   allowDuringMutation?: boolean;
   expectedMutationEpoch?: number;
+  // 后台刷新：不进入加载态，也不清掉用户正在看的操作提示。
+  silent?: boolean;
 }
 
 type MessageTone = 'success' | 'warning';
 
 interface EditorValues {
   name: string;
-  description: string;
   url: string;
   authType: McpAuthMode;
   bearerToken: string;
@@ -98,7 +100,6 @@ interface ToolManagerState {
 function emptyValues(): EditorValues {
   return {
     name: '',
-    description: '',
     url: '',
     authType: 'none',
     bearerToken: '',
@@ -111,7 +112,6 @@ function emptyValues(): EditorValues {
 function valuesFromServer(server: McpServer): EditorValues {
   return {
     name: server.name,
-    description: server.description,
     url: server.url,
     authType: server.auth_type,
     bearerToken: '',
@@ -292,6 +292,7 @@ export default function McpConnectionsPanel({
   const toolReturnFocusRef = useRef<HTMLElement | null>(null);
   const deleteReturnFocusRef = useRef<HTMLElement | null>(null);
   const loadRequestRef = useRef(0);
+  const loadsInFlightRef = useRef(0);
   const mutationEpochRef = useRef(0);
   const mutationsInFlightRef = useRef(0);
   const reconciliationNeededRef = useRef(false);
@@ -344,9 +345,15 @@ export default function McpConnectionsPanel({
     }
     const expectedMutationEpoch = options.expectedMutationEpoch ?? mutationEpochRef.current;
     if (expectedMutationEpoch !== mutationEpochRef.current) return;
+    // A background refresh must not take the request sequence away from a
+    // load the user asked for; the next scheduled refresh will catch up.
+    if (options.silent && loadsInFlightRef.current > 0) return;
     const requestId = ++loadRequestRef.current;
-    setLoading(true);
-    setError('');
+    loadsInFlightRef.current += 1;
+    if (!options.silent) {
+      setLoading(true);
+      setError('');
+    }
     try {
       const nextServers = await getMcpServers();
       if (
@@ -356,13 +363,17 @@ export default function McpConnectionsPanel({
         setServers(nextServers);
       }
     } catch (loadError) {
+      // A failed background refresh is retried by the next scheduled one and
+      // must not surface as feedback the user did not ask for.
       if (
-        requestId === loadRequestRef.current
+        !options.silent
+        && requestId === loadRequestRef.current
         && expectedMutationEpoch === mutationEpochRef.current
       ) {
         setError(errorText(loadError, 'MCP 连接加载失败'));
       }
     } finally {
+      loadsInFlightRef.current -= 1;
       if (requestId === loadRequestRef.current) setLoading(false);
     }
   }, []);
@@ -370,6 +381,17 @@ export default function McpConnectionsPanel({
   useEffect(() => {
     void loadServers();
   }, [loadServers]);
+
+  // 能力摘要在发现成功后由后台生成；测试/启用/导入成功后按有界延迟重新拉取列表。
+  const summaryRefreshTimersRef = useRef<number[]>([]);
+  const refreshForSummary = useCallback(() => {
+    scheduleSummaryRefresh(summaryRefreshTimersRef, () => { void loadServers({ silent: true }); });
+  }, [loadServers]);
+  useEffect(() => () => clearSummaryRefresh(summaryRefreshTimersRef), []);
+  // 页面保活：离开连接页时停掉剩余的刷新，不在后台继续请求。
+  useEffect(() => {
+    if (!active) clearSummaryRefresh(summaryRefreshTimersRef);
+  }, [active]);
 
   const beginMutation = useCallback((): number => {
     if (mutationsInFlightRef.current > 0) reconciliationNeededRef.current = true;
@@ -589,6 +611,8 @@ export default function McpConnectionsPanel({
       toolReturnFocusRef.current?.focus();
       setMessageTone('success');
       setMessage('工具发布设置已保存');
+      // The summary covers the published tool set; the server re-derives it.
+      if (server.source === 'personal') refreshForSummary();
     } catch (saveError) {
       const saveErrorText = errorText(saveError, '工具发布设置保存失败');
       if (errorStatus(saveError) === 409) {
@@ -660,7 +684,6 @@ export default function McpConnectionsPanel({
     if (!editor) return;
     const values = editor.values;
     const name = values.name.trim();
-    const description = values.description.trim();
     const url = values.url.trim();
     const authType = editor.mode === 'connection' && editor.server
       ? editor.server.auth_type
@@ -769,7 +792,6 @@ export default function McpConnectionsPanel({
       } else if (editor.server) {
         stagedServer = await updateMcpServer(editor.server.id, {
           name,
-          description: description || null,
           url,
           auth_type: authType,
           enabled: activationNeeded ? false : values.enabled,
@@ -785,7 +807,6 @@ export default function McpConnectionsPanel({
       } else {
         stagedServer = await createMcpServer({
           name,
-          description: description || null,
           url,
           auth_type: authType,
           enabled: activationNeeded ? false : values.enabled,
@@ -809,6 +830,9 @@ export default function McpConnectionsPanel({
         ? (editor.mode === 'connection' ? '连接设置已保存' : '个人 MCP 已保存')
         : `连接已启用，发现 ${discoveredToolsCount} 个工具`);
       await loadServers({ allowDuringMutation: true, expectedMutationEpoch: mutationEpoch });
+      // A rename re-derives the summary server-side from the existing snapshot.
+      const renamed = editor.mode === 'personal' && editor.server !== null && editor.initial.name !== name;
+      if (discoveredToolsCount !== null || renamed) refreshForSummary();
     } catch (saveError) {
       const failure = errorText(saveError, 'MCP 保存失败');
       if (persistedBeforeFailure && stagedServer) {
@@ -860,6 +884,7 @@ export default function McpConnectionsPanel({
         if (nextEnabled) {
           setMessageTone('success');
           setMessage(`连接已启用，发现 ${updated.tools_count ?? 0} 个工具`);
+          refreshForSummary();
         }
       } catch (toggleError) {
         setServers((items) => items.map((item) => (
@@ -886,6 +911,7 @@ export default function McpConnectionsPanel({
         await loadServers({ allowDuringMutation: true, expectedMutationEpoch: mutationEpoch });
         onPermissionsInvalidated?.();
         if (!result.ok) throw new Error(result.error || '连接测试失败');
+        refreshForSummary();
         setMessageTone('success');
         setMessage(formatTestResult(result));
       } finally {
@@ -949,6 +975,7 @@ export default function McpConnectionsPanel({
         setActiveTab('personal');
         onPermissionsInvalidated?.();
         await loadServers({ allowDuringMutation: true, expectedMutationEpoch: mutationEpoch });
+        if (result.imported > 0) refreshForSummary();
       } finally {
         finishMutation();
       }
@@ -1126,7 +1153,7 @@ export default function McpConnectionsPanel({
                     {server.required ? <span className="required">平台必需</span> : null}
                     {server.credential_set ? <span className="credential"><LockKeyhole size={11} />已配置凭证</span> : null}
                   </div>
-                  <p>{server.description || '暂无说明'}</p>
+                  <p title={server.description || undefined}>{server.description || (server.source === 'official' ? '管理员测试连接后自动生成能力摘要' : '测试或启用后自动生成能力摘要')}</p>
                   <code title={server.url}>{server.url}</code>
                   <div className="mcp-user-card-meta">
                     <span>{enableBusy
@@ -1382,7 +1409,6 @@ export default function McpConnectionsPanel({
               {editor.mode === 'personal' ? (
                 <>
                   <label>连接名称<input value={editor.values.name} onChange={(event) => updateEditor('name', event.target.value)} placeholder="例如：内部知识库" /></label>
-                  <label>说明<textarea value={editor.values.description} onChange={(event) => updateEditor('description', event.target.value)} placeholder="说明这个服务提供什么能力" /></label>
                   <label>Streamable HTTP URL<input value={editor.values.url} onChange={(event) => updateEditor('url', event.target.value)} placeholder="https://mcp.example.com/mcp 或 http://mcp.internal/mcp" /></label>
                 </>
               ) : (

@@ -18,7 +18,7 @@ import re
 import weakref
 from collections import OrderedDict
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from time import time
 from typing import Any, AsyncIterator, Callable, Protocol
@@ -329,6 +329,12 @@ class McpSessionConnector(Protocol):
         *,
         on_dispatch: Callable[[], None] | None = None,
     ) -> Any: ...
+
+
+def _without_summary(
+    installations: list[EffectiveMcpInstallation],
+) -> list[EffectiveMcpInstallation]:
+    return [replace(item, server_description=None) for item in installations]
 
 
 def _stable_hash(value: Any) -> str:
@@ -2050,12 +2056,16 @@ class McpRuntime:
         tool_index_warmup_scheduler: (
             Callable[[list[McpToolSnapshot]], None] | None
         ) = None,
+        capability_summary_scheduler: (
+            Callable[[EffectiveMcpInstallation], None] | None
+        ) = None,
         clock: Callable[[], float] = time,
     ):
         settings = get_settings()
         self.repository = repository or _SqlAlchemyMcpRepository()
         self.connector = connector or _SdkSessionConnector()
         self._tool_index_warmup_scheduler = tool_index_warmup_scheduler
+        self._capability_summary_scheduler = capability_summary_scheduler
         self._cache_max_users = int(
             cache_max_users
             if cache_max_users is not None
@@ -2410,11 +2420,15 @@ class McpRuntime:
                 self.catalog_configuration_fingerprint(user_id)
             )
             final_fingerprint = self.catalog_fingerprint(user_id)
+            # The capability summary is routing text written in the background
+            # by an earlier discovery of this very build; it is not
+            # configuration and must not make the catalog stale.
             if (
                 final_fingerprint_before != final_fingerprint
                 or final_configuration_fingerprint_before
                 != final_configuration_fingerprint
-                or current_installations != all_installations
+                or _without_summary(current_installations)
+                != _without_summary(all_installations)
             ):
                 raise McpToolSnapshotStale(
                     "MCP configuration changed during catalog discovery"
@@ -2521,6 +2535,12 @@ class McpRuntime:
         self._assert_unique_model_names(visible)
         if self._tool_index_warmup_scheduler is not None:
             self._tool_index_warmup_scheduler(visible)
+        # The committed snapshot is the source of the connection's capability
+        # summary. Only personal servers: an official server's snapshot here was
+        # discovered with this user's credential and must not reach the shared
+        # description.
+        if self._capability_summary_scheduler is not None and installation.source == "personal":
+            self._capability_summary_scheduler(installation)
         return visible
 
     @staticmethod
@@ -2769,8 +2789,14 @@ def get_mcp_runtime() -> McpRuntime:
                 for tool in tools
             ])
 
+        def _schedule_capability_summary(installation: EffectiveMcpInstallation) -> None:
+            from src.api.services.mcp_summary_service import schedule_capability_summary
+
+            schedule_capability_summary(installation.server_id)
+
         _GLOBAL_MCP_RUNTIME = McpRuntime(
             tool_index_warmup_scheduler=_schedule_tool_index_warmup,
+            capability_summary_scheduler=_schedule_capability_summary,
         )
     return _GLOBAL_MCP_RUNTIME
 

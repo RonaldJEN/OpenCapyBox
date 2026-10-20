@@ -126,6 +126,209 @@ describe('McpConnectionsPanel', () => {
     }));
   });
 
+  it('说明由发现结果自动生成：表单不提供输入，空说明显示生成提示', async () => {
+    vi.mocked(getMcpServers).mockResolvedValue([
+      makeServer({ description: '' }),
+      makeServer({ ...personal, description: '' }),
+      makeServer({ id: 'official-2', name: '官方研报库', installation_id: 'installation-3' }),
+    ]);
+    render(<McpConnectionsPanel />);
+
+    expect(await screen.findByText('管理员测试连接后自动生成能力摘要')).toBeInTheDocument();
+    expect(screen.getByText('检索已审核的企业知识')).toHaveAttribute('title', '检索已审核的企业知识');
+    fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+    expect(screen.getByText('测试或启用后自动生成能力摘要')).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole('button', { name: '添加连接' })[0]);
+    expect(screen.getByLabelText('连接名称')).toBeInTheDocument();
+    expect(screen.queryByLabelText('说明')).not.toBeInTheDocument();
+  });
+
+  it('测试成功后按 5/12/25/45 秒有界刷新列表，带出后台生成或重算的摘要', async () => {
+    vi.useFakeTimers();
+    try {
+      const renamed = makeServer({ ...personal, name: '我的检索服务' });
+      vi.mocked(getMcpServers).mockResolvedValue([official, renamed]);
+      render(<McpConnectionsPanel />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+      expect(getMcpServers).toHaveBeenCalledTimes(1);
+
+      fireEvent.click(screen.getByRole('button', { name: '测试 我的检索服务' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(getMcpServers).toHaveBeenCalledTimes(2);
+
+      // The summary is regenerated in the background (here: after a rename);
+      // the card picks it up on a later bounded refresh.
+      vi.mocked(getMcpServers).mockResolvedValue([
+        official,
+        { ...renamed, description: '对接检索服务（新名字）。能做：检索文档。适合：资料查询。' },
+      ]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(3);
+      expect(screen.getByText('对接检索服务（新名字）。能做：检索文档。适合：资料查询。')).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(7000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(4);
+      await act(async () => { await vi.advanceTimersByTimeAsync(13000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(5);
+      await act(async () => { await vi.advanceTimersByTimeAsync(20000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(6);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(6);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('后台摘要刷新不清除正在显示的操作错误', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<McpConnectionsPanel />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+      fireEvent.click(screen.getByRole('button', { name: '测试 我的检索服务' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+      // 4 s later another test fails; the 5 s background refresh must leave
+      // that error alone.
+      vi.mocked(testMcpServer).mockResolvedValueOnce({ ok: false, tools_count: 0, latency_ms: 5, error: '连接失败' });
+      await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+      fireEvent.click(screen.getByRole('button', { name: '测试 我的检索服务' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(screen.getByRole('alert')).toHaveTextContent('连接失败');
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+      expect(getMcpServers).toHaveBeenCalledTimes(4);
+      expect(screen.getByRole('alert')).toHaveTextContent('连接失败');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('仅改名保存后也会按延迟刷新，带出重算的摘要', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(updateMcpServer).mockResolvedValueOnce({ ...personal, name: '改名后的服务' });
+      render(<McpConnectionsPanel />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+      fireEvent.click(screen.getByRole('button', { name: '编辑 我的检索服务' }));
+      fireEvent.change(screen.getByLabelText('连接名称'), { target: { value: '改名后的服务' } });
+      fireEvent.click(screen.getByRole('button', { name: '保存连接' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(activateMcpServer).not.toHaveBeenCalled();
+      expect(getMcpServers).toHaveBeenCalledTimes(2);
+
+      vi.mocked(getMcpServers).mockResolvedValue([
+        official,
+        { ...personal, name: '改名后的服务', description: '对接改名后的服务。能做：检索。适合：查询。' },
+      ]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(3);
+      expect(screen.getByText('对接改名后的服务。能做：检索。适合：查询。')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('离开连接页后停止摘要刷新，刷新失败也不产生提示', async () => {
+    vi.useFakeTimers();
+    try {
+      const { rerender } = render(<McpConnectionsPanel active />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+      fireEvent.click(screen.getByRole('button', { name: '测试 我的检索服务' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(getMcpServers).toHaveBeenCalledTimes(2);
+
+      // The first background refresh fails silently...
+      vi.mocked(getMcpServers).mockRejectedValueOnce(new Error('503'));
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(3);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+      // ...and leaving the page cancels the remaining ones.
+      rerender(<McpConnectionsPanel active={false} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('手动刷新在途时静默刷新让路，不顶掉其结果', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveManual!: (servers: McpServer[]) => void;
+      render(<McpConnectionsPanel />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+      fireEvent.click(screen.getByRole('button', { name: '测试 我的检索服务' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(getMcpServers).toHaveBeenCalledTimes(2);
+
+      // A manual refresh (official tab toolbar) is still pending when the 5 s
+      // silent refresh is due.
+      vi.mocked(getMcpServers).mockImplementationOnce(() => new Promise((resolve) => { resolveManual = resolve; }));
+      fireEvent.click(screen.getByRole('tab', { name: /官方 MCP/ }));
+      fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(3);
+
+      await act(async () => {
+        resolveManual([{ ...official, description: '手动刷新带回的摘要' }, personal]);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText('手动刷新带回的摘要')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('个人连接保存工具发布设置后按延迟刷新摘要', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<McpConnectionsPanel />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+      fireEvent.click(screen.getByRole('button', { name: '管理 我的检索服务 的工具' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.click(screen.getByRole('switch', { name: '停用工具 删除文档' }));
+      fireEvent.click(screen.getByRole('button', { name: '保存工具设置' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(updateMcpToolVisibility).toHaveBeenCalledTimes(1);
+      expect(getMcpServers).toHaveBeenCalledTimes(1);
+
+      vi.mocked(getMcpServers).mockResolvedValue([
+        official,
+        { ...personal, description: '只读检索。能做：检索文档。适合：查询。' },
+      ]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(2);
+      expect(screen.getByText('只读检索。能做：检索文档。适合：查询。')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('测试失败不安排摘要刷新', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(testMcpServer).mockResolvedValueOnce({ ok: false, tools_count: 0, latency_ms: 5, error: '连接失败' });
+      render(<McpConnectionsPanel />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.click(screen.getByRole('tab', { name: /个人 MCP/ }));
+      fireEvent.click(screen.getByRole('button', { name: '测试 我的检索服务' }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(getMcpServers).toHaveBeenCalledTimes(2);
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+      expect(getMcpServers).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('按官方和个人来源分开展示连接', async () => {
     render(<McpConnectionsPanel />);
 

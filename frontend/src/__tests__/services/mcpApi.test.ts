@@ -177,7 +177,7 @@ describe('mcpApi', () => {
     await expect(exportMcpConfig()).resolves.toEqual({ mcpServers: {} });
 
     expect(client.post).toHaveBeenNthCalledWith(1, '/mcp/servers/srv-1/test');
-    expect(client.post).toHaveBeenNthCalledWith(2, '/mcp/import', { mcpServers: {} });
+    expect(client.post).toHaveBeenNthCalledWith(2, '/mcp/import', { mcpServers: {} }, { timeout: 600_000 });
     expect(client.get).toHaveBeenCalledWith('/mcp/export');
   });
 

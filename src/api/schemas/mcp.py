@@ -52,14 +52,13 @@ class _CredentialInput(BaseModel):
 
 class AdminMcpServerCreate(_CredentialInput):
     name: str = Field(..., min_length=1, max_length=100)
-    description: str | None = Field(default=None, max_length=4000)
     url: str = Field(..., min_length=1, max_length=4096)
     status: McpStatus = "draft"
     allow_private_network: bool = False
     allow_insecure_http: bool = False
     required: bool = False
 
-    @field_validator("name", "description", "url", mode="before")
+    @field_validator("name", "url", mode="before")
     @classmethod
     def _strip_strings(cls, value):
         if isinstance(value, str):
@@ -70,7 +69,6 @@ class AdminMcpServerCreate(_CredentialInput):
 
 class AdminMcpServerPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
-    description: str | None = Field(default=None, max_length=4000)
     url: str | None = Field(default=None, min_length=1, max_length=4096)
     status: McpStatus | None = None
     auth_type: McpAuthType | None = None
@@ -81,7 +79,7 @@ class AdminMcpServerPatch(BaseModel):
     allow_insecure_http: bool | None = None
     required: bool | None = None
 
-    @field_validator("name", "description", "url", "bearer_token", mode="before")
+    @field_validator("name", "url", "bearer_token", mode="before")
     @classmethod
     def _strip_strings(cls, value):
         if isinstance(value, str):
@@ -118,13 +116,12 @@ class AdminMcpServerPatch(BaseModel):
 
 class UserMcpServerCreate(_CredentialInput):
     name: str = Field(..., min_length=1, max_length=100)
-    description: str | None = Field(default=None, max_length=4000)
     url: str = Field(..., min_length=1, max_length=4096)
     # New connections are staged disabled. Activation performs discovery and
     # publishes the connection in one validated transaction.
     enabled: bool = False
 
-    @field_validator("name", "description", "url", mode="before")
+    @field_validator("name", "url", mode="before")
     @classmethod
     def _strip_strings(cls, value):
         if isinstance(value, str):

@@ -357,6 +357,7 @@ _PENDING_COLUMNS = [
     ("llm_models", "thinking_wire_format", "VARCHAR(32) NOT NULL DEFAULT 'enable_thinking'"),
     ("llm_models", "supported_reasoning_efforts_json", "TEXT"),
     ("llm_model_settings", "vision_fallback_model_id", "VARCHAR(100)"),
+    ("mcp_servers", "description_source_hash", "VARCHAR(64)"),
     ("context_checkpoints", "source_message_sequence", "INTEGER NOT NULL DEFAULT 0"),
     ("context_checkpoints", "source_model_id", "VARCHAR(100)"),
     ("context_checkpoints", "source_event_sequence", "INTEGER NOT NULL DEFAULT 0"),

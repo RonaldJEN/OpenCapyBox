@@ -1005,7 +1005,6 @@ def create_admin_server(
         source="official",
         owner_user_id=None,
         name=payload.name,
-        description=payload.description,
         url=url,
         status=payload.status,
         auth_type=payload.auth_type,
@@ -1051,7 +1050,6 @@ def update_admin_server(
     old_allow_insecure_http = bool(server.allow_insecure_http)
     for field in (
         "name",
-        "description",
         "status",
         "auth_type",
         "allow_private_network",
@@ -1177,7 +1175,6 @@ def create_personal_server(
         source="personal",
         owner_user_id=user_id,
         name=payload.name,
-        description=payload.description,
         url=url,
         status="published",
         auth_type=payload.auth_type,
@@ -1230,7 +1227,7 @@ def update_personal_server(
     data = payload.model_dump(exclude_unset=True)
     old_url = str(server.url)
     old_auth_type = server.auth_type
-    for field in ("name", "description", "auth_type"):
+    for field in ("name", "auth_type"):
         if field in data:
             setattr(server, field, data[field])
     if "url" in data:
@@ -1296,6 +1293,12 @@ def update_personal_server(
     server.version = int(server.version or 0) + 1
     bump_config_version(db, user_id)
     _commit(db, conflict_detail="个人 MCP 名称已存在")
+    if "name" in data:
+        from src.api.services.mcp_summary_service import schedule_capability_summary
+
+        # The name is part of the summary's source; re-derive it from the
+        # existing snapshot instead of waiting for the next discovery.
+        schedule_capability_summary(server_id)
     db.refresh(server)
     return server_to_payload(db, server, user_id=user_id)
 
@@ -1510,6 +1513,13 @@ def update_tool_visibility(
             db,
             conflict_detail="MCP 工具发布设置已被其他操作修改，请刷新后重试",
         )
+        if server.source == "personal":
+            from src.api.services.mcp_summary_service import schedule_capability_summary
+
+            # The summary describes the published tool set, so it follows the
+            # policy. Official summaries come from the platform probe and are
+            # not per-user.
+            schedule_capability_summary(server_id)
     return list_server_tools(db, user_id, server_id)
 
 
@@ -1818,7 +1828,18 @@ async def test_admin_server(db: DBSession, server_id: str) -> dict[str, Any]:
         current_server.status = "disabled"
         current_server.version = int(current_server.version or 0) + 1
         bump_config_version(db, None)
+    probe_generation = current_server.last_tested_at
     db.commit()
+    if safe_error is None:
+        from src.api.services.mcp_summary_service import schedule_capability_summary
+
+        # Official servers have no platform snapshot: summarize this probe's
+        # tools, bound to the generation it stamped.
+        schedule_capability_summary(
+            server_id,
+            tools=tools,
+            probe_generation=probe_generation,
+        )
     return {
         "ok": safe_error is None,
         "tools_count": len(tools) if safe_error is None else 0,
@@ -1968,6 +1989,12 @@ async def test_user_server(
         current_server.last_tested_at = now_naive()
         current_server.last_error = safe_error
     db.commit()
+    # Official summaries come only from the platform probe: tools discovered
+    # with a user's own credential must not leak into the shared description.
+    if safe_error is None and is_personal:
+        from src.api.services.mcp_summary_service import schedule_capability_summary
+
+        schedule_capability_summary(server_id)
     if safe_error is None and warmup_candidates:
         from src.api.services.mcp_tool_search_service import (
             get_mcp_tool_search_service,
@@ -2215,6 +2242,7 @@ async def activate_user_server(
                 )
                 current_server.last_tested_at = now_naive()
                 current_server.last_error = None
+            summarize = current_server.source == "personal"
             bump_config_version(db, user_id)
     except HTTPException:
         db.rollback()
@@ -2227,6 +2255,10 @@ async def activate_user_server(
             detail=f"MCP 激活失败：{safe_error}",
         ) from exc
     db.commit()
+    if summarize:
+        from src.api.services.mcp_summary_service import schedule_capability_summary
+
+        schedule_capability_summary(server_id)
     if warmup_candidates:
         from src.api.services.mcp_tool_search_service import (
             get_mcp_tool_search_service,
@@ -2260,7 +2292,6 @@ async def import_personal_servers(
                 user_id,
                 UserMcpServerCreate(
                     name=name,
-                    description=config.description,
                     url=config.url,
                     auth_type="headers" if config.headers else "none",
                     headers=config.headers,

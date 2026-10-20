@@ -41,6 +41,7 @@ import {
   type PersonalMcpNetworkPolicy,
 } from '../services/mcpApi';
 import { extractValidationErrorMessage } from '../utils/errorMessages';
+import { clearSummaryRefresh, scheduleSummaryRefresh } from '../utils/mcpSummary';
 import FeedbackMessage from './FeedbackMessage';
 import './AdminMcpCatalogPanel.css';
 
@@ -51,7 +52,6 @@ interface AdminMcpCatalogPanelProps {
 
 interface AdminMcpForm {
   name: string;
-  description: string;
   url: string;
   status: McpServerStatus;
   authType: McpAuthMode;
@@ -66,7 +66,6 @@ interface AdminMcpForm {
 function emptyForm(): AdminMcpForm {
   return {
     name: '',
-    description: '',
     url: '',
     status: 'draft',
     authType: 'none',
@@ -82,7 +81,6 @@ function emptyForm(): AdminMcpForm {
 function formFromServer(server: McpServer): AdminMcpForm {
   return {
     name: server.name,
-    description: server.description,
     url: server.url,
     status: server.status,
     authType: server.auth_type,
@@ -211,34 +209,69 @@ export default function AdminMcpCatalogPanel({
     editingServer?.credential_set && !credentialContextChanged,
   );
 
+  // 目录列表有自己的请求序号，全量加载和目录刷新共用，迟到的任一方都不得覆盖更新的
+  // 列表；白名单与 loading 只属于全量加载，用 loadRequestRef，目录刷新不碰它们。
+  const catalogRequestRef = useRef(0);
+  const loadsInFlightRef = useRef(0);
   const loadServers = useCallback(async () => {
     const requestId = ++loadRequestRef.current;
+    const catalogRequestId = ++catalogRequestRef.current;
+    loadsInFlightRef.current += 1;
     setLoading(true);
     setError('');
-    try {
-      const [nextServers, nextPolicy] = await Promise.all([
-        getAdminMcpServers(),
-        getPersonalMcpNetworkPolicy(),
-      ]);
-      if (requestId === loadRequestRef.current) {
-        setServers(nextServers);
+    const [catalogResult, policyResult] = await Promise.allSettled([
+      getAdminMcpServers(),
+      getPersonalMcpNetworkPolicy(),
+    ]);
+    loadsInFlightRef.current -= 1;
+    if (catalogRequestId === catalogRequestRef.current) {
+      if (catalogResult.status === 'fulfilled') setServers(catalogResult.value);
+      else setError(errorText(catalogResult.reason));
+    }
+    if (requestId === loadRequestRef.current) {
+      if (policyResult.status === 'fulfilled') {
+        const nextPolicy = policyResult.value;
         setNetworkPolicy(nextPolicy);
         const domains = nextPolicy.domain_suffixes.join('\n');
         const cidrs = nextPolicy.cidrs.join('\n');
         setDomainSuffixesText(domains);
         setCidrsText(cidrs);
         setInitialPolicyText({ domains, cidrs });
+      } else {
+        setError(errorText(policyResult.reason));
       }
-    } catch (loadError) {
-      if (requestId === loadRequestRef.current) setError(errorText(loadError));
-    } finally {
-      if (requestId === loadRequestRef.current) setLoading(false);
+      setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void loadServers();
   }, [loadServers, refreshToken]);
+
+  // 只刷新目录列表，不回填白名单表单：测试连接和后台摘要到达都只改目录，
+  // 不能清掉正在编辑的白名单草稿。
+  const refreshCatalog = useCallback(async (options: { userInitiated?: boolean } = {}) => {
+    // A background refresh never takes the catalog sequence away from a full
+    // load the user asked for; the next scheduled refresh catches up. A
+    // user-initiated one (after a test) must land, but it only touches the
+    // catalog sequence, so the full load's whitelist and loading still settle.
+    if (!options.userInitiated && loadsInFlightRef.current > 0) return;
+    const requestId = ++catalogRequestRef.current;
+    try {
+      const nextServers = await getAdminMcpServers();
+      if (requestId === catalogRequestRef.current) setServers(nextServers);
+    } catch (loadError) {
+      // 后台刷新失败不打扰用户，下一次计划内的刷新会再试；用户发起的刷新照常报错。
+      if (options.userInitiated && requestId === catalogRequestRef.current) setError(errorText(loadError));
+    }
+  }, []);
+
+  // 能力摘要在发现成功后由后台生成；测试成功后按有界延迟重新拉取目录。
+  const summaryRefreshTimersRef = useRef<number[]>([]);
+  const refreshForSummary = useCallback(() => {
+    scheduleSummaryRefresh(summaryRefreshTimersRef, () => { void refreshCatalog(); });
+  }, [refreshCatalog]);
+  useEffect(() => () => clearSummaryRefresh(summaryRefreshTimersRef), []);
 
   useEffect(() => {
     onDirtyChange?.(formDirty || policyDirty);
@@ -333,7 +366,6 @@ export default function AdminMcpCatalogPanel({
   const saveServer = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const name = form.name.trim();
-    const description = form.description.trim();
     const url = form.url.trim();
     if (!name) {
       setFormError('请输入服务名称');
@@ -382,7 +414,6 @@ export default function AdminMcpCatalogPanel({
 
     const payload: AdminMcpServerPayload = {
       name,
-      description: description || null,
       url,
       status: form.status,
       auth_type: form.authType,
@@ -475,8 +506,11 @@ export default function AdminMcpCatalogPanel({
       // The probe persists last_tested_at/last_error and may auto-disable a
       // failing required+published server, so refresh regardless of ok before
       // surfacing the error, otherwise the UI keeps stale published state.
-      await loadServers();
+      // Catalog only: a test never changes the whitelist, and a full reload
+      // would wipe a draft typed while the probe (up to 15 s) was running.
+      await refreshCatalog({ userInitiated: true });
       if (!result.ok) throw new Error(result.error || '连接测试失败');
+      refreshForSummary();
       setMessage(testMessage(result));
     });
   };
@@ -658,7 +692,7 @@ export default function AdminMcpCatalogPanel({
                   <tr key={server.id}>
                     <td>
                       <strong>{server.name}</strong>
-                      <span>{server.description || '暂无说明'}</span>
+                      <span title={server.description || undefined}>{server.description || '测试连接后自动生成能力摘要'}</span>
                       <code title={server.url}>{server.url}</code>
                     </td>
                     <td>
@@ -725,7 +759,6 @@ export default function AdminMcpCatalogPanel({
             </div>
             <form onSubmit={(event) => void saveServer(event)}>
               <label>服务名称<input value={form.name} onChange={(event) => updateForm('name', event.target.value)} placeholder="例如：企业知识库" /></label>
-              <label>说明<textarea value={form.description} onChange={(event) => updateForm('description', event.target.value)} placeholder="告诉用户这个连接能做什么" /></label>
               <label>Streamable HTTP URL<input value={form.url} onChange={(event) => updateForm('url', event.target.value)} placeholder="https://mcp.example.com/mcp" /></label>
               <div className="admin-mcp-form-grid">
                 <label>发布状态<select value={form.status} onChange={(event) => updateForm('status', event.target.value as McpServerStatus)}><option value="draft">草稿</option><option value="published">已发布</option><option value="disabled">停用</option></select></label>

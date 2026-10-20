@@ -81,7 +81,13 @@ class McpServer(Base):
         index=True,
     )
     name = Column(String(100), nullable=False)
+    # Capability summary derived from the connection name and its published
+    # tool set (the owner's snapshot for personal servers, the platform probe's
+    # tools for official ones); users never edit it. The source hash
+    # fingerprints that source so a summary is regenerated only when name or
+    # tools change.
     description = Column(Text, nullable=True)
+    description_source_hash = Column(String(64), nullable=True)
     url = Column(Text, nullable=False)
     status = Column(
         String(20),

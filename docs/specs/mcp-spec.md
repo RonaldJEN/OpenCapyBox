@@ -24,6 +24,8 @@
 - `required`: 官方服务是否强制为所有用户装配
 - `version`: 单调递增，凭证/配置变更时自增，用于指纹与缓存
 - `last_tested_at` / `last_tools_count` / `last_error`: 平台探针结果（官方服务无 per-user 快照）
+- `description`: 连接能力摘要，由 §4.3.3 的生成器根据连接名与当前已发布的工具集派生；用户与管理员均不可编辑。创建与官方编辑 payload 中的 `description` 被忽略（兼容旧客户端），个人编辑为 `extra="forbid"`，传入返回 422
+- `description_source_hash`: 生成当前摘要所依据的来源指纹 `sha256(连接名, 工具集)`（固定 64 字符）；NULL 表示尚未生成
 - 唯一性：official 按 `name` 全局唯一；personal 按 `(owner_user_id, name)` 唯一
 
 ### `mcp_credentials` — 加密凭证
@@ -68,24 +70,24 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/servers` | 列出该用户可见的官方 + 个人服务，返回 `{servers, config_version}` |
-| POST | `/servers` | 以停用状态创建个人服务（201） |
-| PATCH | `/servers/{id}` | 编辑个人服务（`extra="forbid"`，禁止改网络策略/发布位） |
+| POST | `/servers` | 以停用状态创建个人服务（201）；`description` 被忽略 |
+| PATCH | `/servers/{id}` | 编辑个人服务（`extra="forbid"`，传 `description` 或网络策略/发布位返回 422） |
 | DELETE | `/servers/{id}` | 删除个人服务 |
 | PUT | `/servers/{id}/connection` | 暂存凭证或停用连接；普通启用仅接受当前指纹已有有效快照的兼容请求 |
 | POST | `/servers/{id}/test` | 服务端发起连接测试，返回 `McpTestResponse` |
 | POST | `/servers/{id}/activate` | 对当前或请求中拟提交的凭证执行发现，并原子写入快照与启用状态 |
 | GET | `/servers/{id}/tools` | 列出快照工具与发布状态 |
 | PUT | `/servers/{id}/tools/visibility` | 替换发布策略，需 `expected_revision` |
-| POST | `/import` | 批量导入（`mcpServers` 对象，≤100 个） |
-| GET | `/export` | 导出个人服务（**不含**凭证明文） |
+| POST | `/import` | 批量导入（`mcpServers` 对象，≤100 个）；条目中的 `description` 仅为兼容旧导出文件而接受，不写入。导入逐项串行发现，耗时随条目数增长，前端对该请求使用 600 秒超时（与 `deploy/docker/Dockerfile.frontend` 中 nginx 的 `proxy_read_timeout` 一致） |
+| GET | `/export` | 导出个人服务（**不含**凭证明文；`description` 为生成的能力摘要） |
 
 ### 3.2 管理员端 `/api/admin/mcp`（需管理员）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/servers` | 列出全部官方服务 |
-| POST | `/servers` | 创建官方服务（201） |
-| PATCH | `/servers/{id}` | 编辑官方服务（含 status/网络策略/required） |
+| POST | `/servers` | 创建官方服务（201）；`description` 被忽略 |
+| PATCH | `/servers/{id}` | 编辑官方服务（含 status/网络策略/required）；`description` 被忽略 |
 | DELETE | `/servers/{id}` | 删除官方服务 |
 | POST | `/servers/{id}/test` | 平台探针测试 |
 | GET | `/personal-network-policy` | 读取个人 MCP 域名/CIDR 白名单 |
@@ -131,8 +133,8 @@
 - Agent 池按代次失效；DB 代次为跨 worker 权威源，本地驱逐仅加速可见性
 - 目录构建按 `(server_id, installation_id)` 稳定排序并分为 required、optional 两阶段；required 优先发现和计入预算，只有 required 集合自身违反 installation 数、总 deadline、工具数或累计字节限制时才抛 `McpRequiredServerUnavailable`
 - optional 服务按稳定顺序整服务加入目录；发现失败、超时、模型工具名碰撞或加入后超过工具数/字节预算时，仅跳过该 optional 服务并记录脱敏 error，不得拖垮已验证的 required 目录
-- 网络发现完成、写缓存前再次采样 config generation 并重读完整 effective-installation 集合；前后不一致即拒绝混合代际目录
-- 成功贡献至少一个可见工具的连接会附带紧凑路由摘要（连接名 + 配置说明），由 Agent 仅在请求级 system 副本中列出；不得包含 URL、凭证或远端工具 schema，也不得写入长期消息历史
+- 网络发现完成、写缓存前再次采样 config generation 并重读完整 effective-installation 集合；前后不一致即拒绝混合代际目录。比较时忽略连接说明（§4.3.3 的摘要可能由本次构建中较早完成的发现在后台写回），最终 `connections` 取重读后的说明
+- 成功贡献至少一个可见工具的连接会附带紧凑路由摘要（连接名 + §4.3.3 的能力摘要），由 Agent 仅在请求级 system 副本中列出；不得包含 URL、凭证或远端工具 schema，也不得写入长期消息历史
 
 #### 4.3.1 `mcp_tool_search` 混合检索
 - 候选集合的唯一权威来源是当前 Agent 已装配且 exposure 为 `DEFERRED` 的工具；数据库中的旧快照、已隐藏工具、其他用户或其他 Agent 的索引行不能自行成为候选
@@ -151,6 +153,18 @@
 - direct Round 固化 `preferred_mcp_connections=[{server_id, display_name}]`，`RUN_STARTED.preferredMcpConnections` 与 `history/v2` 投影同一快照。该快照不是远程调用审计；只有真实 MCP 工具调用成功后才可声称连接已使用，成功 discovery 不算使用。
 - Interaction 持久化原 requested context；resume 按当时 catalog 重新解析运行偏好。waiting 期间停用、删除或发现失败的连接不再参与 continuation，但不得改写原 Round 展示快照。
 - 无效/不可用 server id 被忽略而不使发送失败；首选连接没有检索结果时继续执行普通跨连接检索。客户端不得提交 installation id、凭证或展示名。
+
+#### 4.3.3 连接能力摘要
+- 不变量：`mcp_servers.description` = f(连接名, 当前已发布的快照工具集)。它是 §4.3 路由摘要与 §4.3.1 检索文档中"连接说明"的唯一来源。该不变量允许延迟收敛：个人连接改名时立即按现有快照重算；官方连接没有平台快照，改名后旧摘要保留到下一次管理员测试
+- 单一触发点：任何写快照或改变其发布范围的路径在提交之后都只调用 `schedule_capability_summary(server_id)`，包括 `POST /servers/{id}/test`、`POST /servers/{id}/activate`（含导入逐项激活）、运行时目录发现（Agent 构建与 300 秒刷新）、个人连接改名以及个人连接的 `PUT /servers/{id}/tools/visibility`。因此老连接在下一次被模型使用时自动补齐摘要，远端工具变化后也会自动重算；探测失败不触发
+- 官方服务没有平台凭证下的快照，只由管理员 `POST /admin/mcp/servers/{id}/test` 把本次探针发现的工具清单连同该探针在事务内写入的 `last_tested_at` 传入生成；用户凭证发现到的工具可能含私有数据，运行时与用户探针对官方服务一律不触发
+- 来源与指纹：个人服务读 owner installation 的 `mcp_tool_snapshots` 并按 §4.2 发布策略过滤（摘要只描述模型实际能用的工具）；官方服务用探针传入的全部工具（发布策略按用户生效，共享说明无法按人裁剪）；工具按名称排序后连同连接名计算 `description_source_hash`，与已存值相同则不调用模型。快照为空或工具全部被隐藏时不生成，也不清空：此时该连接不会出现在路由摘要里（§4.3 只列出贡献了可见工具的连接），卡片上保留的旧摘要只是展示残留，下次有可见工具时按新指纹重算。提示词最多含 80 个工具、单条工具说明截 300 字
+- 模型：`get_model_registry().get_default()`（即模型设置中的默认模型）。摘要是归纳任务，不需要推理：对 OpenAI 协议、`thinking_wire_format` 能编码开关且（若声明了推理等级列表）包含 `off` 的模型，以 `thinking_mode=disabled` 且不带 `reasoning_effort` 调用；其他模型（Anthropic、`thinking_wire_format=none`、等级列表里没有 `off`）沿用目录配置原样调用，不得因改写配置而让生成一直失败。`current_run_context` 置空，不继承任何会话的推理覆盖。失败不写指纹，下一次发现自然重试；重试频率由 300 秒目录刷新与"仅使用中的连接才发现"限定，不另加退避
+- 输出：一行中文，固定格式「{一句话用途}。能做：{3–6 个动词短语}。适合：{3–5 个提问关键词}。」；写回前压成一行并截到 500 字（与请求级 system 提示块的截断一致，检索文档截 1024 字节）
+- 后台执行：生成是后台任务，请求路径不等待；同一 server 同时只跑一个，运行中再来的调度在结束后重放一次；进程内模型并发上限 2，单次预算 20 秒（`SUMMARY_TIMEOUT_SECONDS`）。模型调用期间不持任何数据库锁
+- 写回：`FOR UPDATE NOWAIT` 锁 server 行（后台任务与其余同步数据库代码一样跑在事件循环上，绝不等待行锁；行被编辑、探针或另一次摘要占用时立即失败并记日志，下一次发现按指纹重试），然后校验来源仍是当前来源：个人服务重新计算「当前连接名 + 快照」指纹并与生成所用指纹比对，官方服务重新计算「当前连接名 + 探针工具」指纹并要求 `last_tested_at` 仍是该探针的代次；不一致（期间工具集、连接名已变或有更新的探针）或已被同指纹结果写过即放弃，迟到的旧结果永不覆盖更新来源的摘要；否则只写 `description` 与指纹
+- 摘要是路由文本而非执行配置：写回**不**抬升 `version` 或目录代次，因此不会使正在构建的目录判为 stale，也不会让运行中 Agent 的 `mcp_tool_search` 拒绝当前目录；新摘要最迟在下一次 300 秒目录刷新随 Agent 重建进入路由摘要，并在该次快照写入时进入检索文档（与 §4.3.1 向量写入不递增代次的原则一致）
+- 失败：模型未配置、调用失败、超时或返回空文本时只记录日志（仅异常类型，不含异常正文，避免网关回显的请求文本或密钥进入日志）并保留旧说明；下一次发现按指纹重试
 
 ### 4.4 快照与执行绑定
 - 每次成功发现刷新 `mcp_tool_snapshots`（`schema_hash` + `connection_fingerprint`）
@@ -177,8 +191,10 @@
 - 已有凭证时，仅在 origin 与 `auth_type` 均未变化时提示“留空保留”；origin/auth 改变时明确提示旧凭证会被清除，若新类型仍需认证则保存前要求重新输入
 - MCP 编辑、工具发布或删除请求保存中，所有 X、背景、取消和 Escape 关闭入口均禁用；不能向用户表示已放弃而让服务端请求继续提交
 - MCP 连接、测试、导入、删除、启停及发布策略 mutation 成功后使权限工具目录失效；权限页面使用请求序号防止较慢旧响应覆盖新目录
-- 用户连接列表与管理端目录列表同样采用单调请求序号：仅最后发起的请求可以更新列表、错误与 loading 状态，迟到响应不得覆盖新数据
+- 用户连接列表与管理端目录列表同样采用单调请求序号：仅最后发起的请求可以更新列表、错误与 loading 状态，迟到响应不得覆盖新数据（管理端目录与白名单分用两个序号，见下文摘要刷新一条）
 - 导入结果分为全部成功（success）、部分成功（warning）和全部失败（error），不得把失败列表包装为绿色成功状态
+- 个人 MCP 新建/编辑与管理端服务表单不提供说明输入；卡片与目录列表单行展示生成的能力摘要并以 `title` 提供全文，为空时个人连接提示测试或启用后自动生成，官方连接提示由管理员测试连接后生成
+- 摘要在后台生成，列表响应不等待它：用户端在测试、启用（含连接设置内启用）、仅改名保存、个人连接保存工具发布设置或导入成功后，管理端在测试成功后，于 5、12、25、45 秒各重新拉取一次列表（用户端该刷新为静默刷新：不进入加载态、不清除正在显示的操作提示、失败不产生提示；离开保活的连接页即取消剩余刷新）（覆盖 20 秒单次预算、一次重放与并发 2 下的短暂排队；导入很多条时更长的排队由用户手动刷新兜底），新摘要和改名后重算的摘要由此出现在卡片上；再次操作重置计时。用户端与管理端的静默刷新在有全量加载在途时直接跳过，不抢占用户发起的加载的请求序号。管理端目录列表有独立请求序号，由全量加载和目录刷新共用，迟到的任一方都不得覆盖更新的列表；白名单、其错误与 loading 只属于全量加载，用另一个序号。测试连接返回后只做用户发起的目录刷新（不让路、失败报错；探针最长 15 秒，期间在白名单里输入的草稿不得被回填清掉，在途全量加载稍后返回的白名单与 loading 收尾也照常生效）；后台摘要刷新同样只拉目录，但在全量加载在途时让路且失败静默
 - 用户端和管理端的 MCP 成功及错误反馈统一显示 3 秒并可手动关闭，遵循 frontend-spec §4.5.1 的暂停规则；部分成功/未启用警告保留手动关闭。连接测试失败必须使用错误视觉与 `role="alert"`，不得复用绿色成功 toast；提示隐藏不改变连接测试结果或发布限制。
 - 数据连接是 `/connections` 一级页面，不归设置中心所有；首次访问后页面实例保活。离开该页面时必须清理一次性 MCP 反馈，返回时不得重新展示上一次操作结果；存在未保存编辑时，站内 PUSH/Back/Forward 与浏览器关闭均必须先拦截确认
 - 管理端同一 server 的测试、保存、启停、删除互斥；pending 状态按请求集合计数，较早请求结束不得提前解锁仍在途操作。编辑表单 dirty 时，关闭 drawer 或切换管理模块前必须确认
@@ -207,6 +223,8 @@
 | `expected_revision` 不匹配 | 409，前端重载后需重新编辑 |
 | 凭证损坏无法解密 | 该 installation 标记 configuration_error，工具不暴露（fail-closed） |
 | 导入超过 100 个 | 校验失败，整体拒绝 |
+| 能力摘要生成失败或超过 20 秒预算（默认模型未配置、调用异常、空返回、过慢） | 保留旧 `description`，已提交的激活/测试结果不受影响；下次发现按指纹重试 |
+| 生成期间工具集或连接名又变化 | 写回时来源指纹不一致即放弃；运行中收到的新调度在结束后重放一次，按新来源生成 |
 | 单个导入项写发布策略失败 | 该项服务与发布策略在同一事务内回滚（每项一个事务），不留孤儿服务；名称保持可用以便重试；其余项目不受影响 |
 
 ## 6. 测试锚点
@@ -216,3 +234,4 @@
 - [tests/test_mcp_security.py](../../tests/test_mcp_security.py)：SSRF、header 校验、异常脱敏
 - [tests/test_tool_search_hybrid.py](../../tests/test_tool_search_hybrid.py)：BM25、向量语义命中、RRF 与故障降级
 - [tests/test_tool_exposure.py](../../tests/test_tool_exposure.py)：候选范围、权限前后校验、limit 与会话激活
+- [tests/test_mcp_summary_service.py](../../tests/test_mcp_summary_service.py)：能力摘要按快照派生、来源指纹守卫、输入边界、输出规整与后台调度去重

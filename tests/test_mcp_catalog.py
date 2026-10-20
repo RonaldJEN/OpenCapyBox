@@ -9,7 +9,7 @@ from concurrent.futures import (
 from datetime import timedelta
 from pathlib import Path
 from threading import Event
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -97,8 +97,15 @@ def mcp_client():
     app.dependency_overrides[get_db] = override_db
     app.dependency_overrides[get_current_admin_user] = lambda: "admin"
     app.dependency_overrides[get_current_user] = lambda: "alice"
-    with TestClient(app) as client:
+    # Summaries are derived in the background by the model; tests only check
+    # that each committed discovery schedules one.
+    summary_scheduler = MagicMock()
+    with patch(
+        "src.api.services.mcp_summary_service.schedule_capability_summary",
+        new=summary_scheduler,
+    ), TestClient(app) as client:
         client.SessionLocal = SessionLocal  # type: ignore[attr-defined]
+        client.summary_scheduler = summary_scheduler  # type: ignore[attr-defined]
         yield client
     reset_all_tables(engine, Base.metadata)
     engine.dispose()
@@ -107,7 +114,6 @@ def mcp_client():
 def _create_official(client: TestClient, **overrides):
     payload = {
         "name": "official-search",
-        "description": "Official search MCP",
         "url": "https://93.184.216.34/mcp",
         "status": "published",
         "auth_type": "bearer",
@@ -746,10 +752,10 @@ def test_admin_crud_never_returns_secret(mcp_client: TestClient):
 
     patched = mcp_client.patch(
         f"/admin/mcp/servers/{created['id']}",
-        json={"description": "updated", "required": True},
+        json={"name": "official-search-renamed", "required": True},
     )
     assert patched.status_code == 200
-    assert patched.json()["description"] == "updated"
+    assert patched.json()["name"] == "official-search-renamed"
     assert patched.json()["required"] is True
 
     deleted = mcp_client.delete(f"/admin/mcp/servers/{created['id']}")
@@ -770,7 +776,7 @@ def test_admin_catalog_mutations_invalidate_all_local_agents(mcp_client: TestCli
         )
         patched = mcp_client.patch(
             f"/admin/mcp/servers/{created['id']}",
-            json={"description": "updated routing description"},
+            json={"name": "official-cache-invalidation-renamed"},
         )
         deleted = mcp_client.delete(f"/admin/mcp/servers/{created['id']}")
 
@@ -815,7 +821,7 @@ def test_user_catalog_mutations_invalidate_existing_conversation_agents(
 
         patched = mcp_client.patch(
             f"/mcp/servers/{server_id}",
-            json={"description": "company research and investment logic"},
+            json={"name": "personal-cache-invalidation-renamed"},
         )
         assert patched.status_code == 200, patched.text
 
@@ -1123,7 +1129,7 @@ def test_personal_server_is_owner_scoped_and_public_https_only(mcp_client: TestC
     mcp_client.app.dependency_overrides[get_current_user] = lambda: "bob"
     hidden = mcp_client.patch(
         f"/mcp/servers/{body['id']}",
-        json={"description": "stolen"},
+        json={"name": "stolen"},
     )
     assert hidden.status_code == 404
 
@@ -1170,7 +1176,7 @@ def test_catalog_fingerprint_refresh_bucket_only_applies_with_effective_installa
 
     updated = mcp_client.patch(
         f"/mcp/servers/{created.json()['id']}",
-        json={"description": "new routing metadata"},
+        json={"name": "periodically-refreshed-renamed"},
     )
     assert updated.status_code == 200, updated.text
     assert repository.catalog_configuration_fingerprint("alice") != configured
@@ -1183,11 +1189,14 @@ def test_effective_installation_carries_configured_routing_description(
         "/mcp/servers",
         json={
             "name": "同花顺股票 MCP",
-            "description": "A 股实时行情、个股资料、财务和公告",
             "url": "https://93.184.216.34/stock-mcp",
         },
     )
     assert created.status_code == 201, created.text
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        row = db.query(McpServer).filter(McpServer.id == created.json()["id"]).one()
+        row.description = "A 股实时行情、个股资料、财务和公告"
+        db.commit()
     activated = _activate(mcp_client, created.json()["id"])
     assert activated.status_code == 200, activated.text
 
@@ -1654,6 +1663,176 @@ def test_import_is_partial_and_export_omits_credentials(mcp_client: TestClient):
     assert len(body["errors"]) == 1
     assert "imported-secret" not in response.text
     assert "imported-secret" not in mcp_client.get("/mcp/export").text
+
+
+def test_description_is_derived_and_never_accepted_from_clients(mcp_client: TestClient):
+    admin_created = mcp_client.post(
+        "/admin/mcp/servers",
+        json={
+            "name": "official-described",
+            "description": "hand written",
+            "url": "https://93.184.216.34/mcp",
+            "auth_type": "none",
+        },
+    )
+    assert admin_created.status_code == 201, admin_created.text
+    assert admin_created.json()["description"] is None
+    ignored = mcp_client.patch(
+        f"/admin/mcp/servers/{admin_created.json()['id']}",
+        json={"description": "hand written"},
+    )
+    assert ignored.status_code == 200, ignored.text
+    assert ignored.json()["description"] is None
+
+    user_created = mcp_client.post(
+        "/mcp/servers",
+        json={
+            "name": "personal-described",
+            "description": "hand written",
+            "url": "https://93.184.216.34/mcp",
+        },
+    )
+    assert user_created.status_code == 201, user_created.text
+    assert user_created.json()["description"] is None
+    # Personal patches forbid unknown fields, so a stale client fails loudly.
+    rejected = mcp_client.patch(
+        f"/mcp/servers/{user_created.json()['id']}",
+        json={"description": "hand written"},
+    )
+    assert rejected.status_code == 422, rejected.text
+
+    imported = mcp_client.post(
+        "/mcp/import",
+        json={
+            "mcpServers": {
+                "imported-described": {
+                    "type": "streamable-http",
+                    "url": "https://93.184.216.34/mcp",
+                    "description": "legacy export text",
+                    "disabled": True,
+                }
+            }
+        },
+    )
+    assert imported.status_code == 200, imported.text
+    assert imported.json()["imported"] == 1
+    assert imported.json()["servers"][0]["description"] is None
+
+
+def test_each_committed_discovery_schedules_capability_summary(mcp_client: TestClient):
+    scheduler = mcp_client.summary_scheduler  # type: ignore[attr-defined]
+    remote_tools = [{
+        "name": "search",
+        "description": "Search reports",
+        "inputSchema": {"type": "object"},
+    }]
+
+    # Official servers have no platform snapshot: the admin probe passes its tools.
+    official = _create_official(mcp_client, auth_type="none", bearer_token=None)
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(return_value=(remote_tools, 2)),
+    ):
+        tested = mcp_client.post(f"/admin/mcp/servers/{official['id']}/test")
+    assert tested.json()["ok"] is True
+    scheduler.assert_called_once()
+    assert scheduler.call_args.args == (official["id"],)
+    assert scheduler.call_args.kwargs["tools"] == remote_tools
+    with mcp_client.SessionLocal() as db:  # type: ignore[attr-defined]
+        stamped = db.query(McpServer).filter(McpServer.id == official["id"]).one()
+        assert scheduler.call_args.kwargs["probe_generation"] == stamped.last_tested_at
+
+    # A user's own probe of an official connection may expose private tools;
+    # it never feeds the shared description.
+    scheduler.reset_mock()
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(return_value=(remote_tools, 2)),
+    ):
+        user_tested = mcp_client.post(f"/mcp/servers/{official['id']}/test")
+    assert user_tested.json()["ok"] is True, user_tested.text
+    activated = _activate(mcp_client, official["id"], tools=remote_tools)
+    assert activated.status_code == 200, activated.text
+    scheduler.assert_not_called()
+
+    # Personal servers are summarized from their committed snapshot.
+    personal = mcp_client.post(
+        "/mcp/servers",
+        json={"name": "personal-summarized", "url": "https://93.184.216.34/mcp"},
+    ).json()
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(side_effect=ConnectionError("offline")),
+    ):
+        failed = mcp_client.post(f"/mcp/servers/{personal['id']}/test")
+    assert failed.json()["ok"] is False
+    scheduler.assert_not_called()
+
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(return_value=(remote_tools, 2)),
+    ):
+        tested = mcp_client.post(f"/mcp/servers/{personal['id']}/test")
+    assert tested.json()["ok"] is True
+    scheduler.assert_called_once_with(personal["id"])
+
+    scheduler.reset_mock()
+    activated = _activate(mcp_client, personal["id"], tools=remote_tools)
+    assert activated.status_code == 200, activated.text
+    scheduler.assert_called_once_with(personal["id"])
+
+    # The name is part of the summary source: a rename re-derives it from the
+    # existing snapshot; an edit that keeps the name does not.
+    scheduler.reset_mock()
+    renamed = mcp_client.patch(
+        f"/mcp/servers/{personal['id']}",
+        json={"name": "personal-renamed"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    scheduler.assert_called_once_with(personal["id"])
+    scheduler.reset_mock()
+    same_name = mcp_client.patch(
+        f"/mcp/servers/{personal['id']}",
+        json={"url": "https://93.184.216.34/other"},
+    )
+    assert same_name.status_code == 200, same_name.text
+    scheduler.assert_not_called()
+
+    # The summary covers the published tool set, so a policy change on a
+    # personal connection re-derives it; on an official one it does not.
+    for server_id, expected_calls in ((personal["id"], 1), (official["id"], 0)):
+        scheduler.reset_mock()
+        tools_before = mcp_client.get(f"/mcp/servers/{server_id}/tools").json()
+        changed = mcp_client.put(
+            f"/mcp/servers/{server_id}/tools/visibility",
+            json={
+                "expected_revision": tools_before["visibility_revision"],
+                "enabled_tools": None,
+                "disabled_tools": ["search"],
+            },
+        )
+        assert changed.status_code == 200, changed.text
+        assert scheduler.call_count == expected_calls
+
+    scheduler.reset_mock()
+    with patch(
+        "src.api.services.mcp_service.probe_mcp_server",
+        new=AsyncMock(return_value=(remote_tools, 2)),
+    ):
+        imported = mcp_client.post(
+            "/mcp/import",
+            json={"mcpServers": {
+                "batch-a": {"type": "streamable-http", "url": "https://93.184.216.34/a"},
+                "batch-off": {
+                    "type": "streamable-http",
+                    "url": "https://93.184.216.34/off",
+                    "disabled": True,
+                },
+            }},
+        )
+    assert imported.status_code == 200, imported.text
+    by_name = {item["name"]: item for item in imported.json()["servers"]}
+    scheduler.assert_called_once_with(by_name["batch-a"]["id"])
 
 
 def test_import_duplicate_does_not_poison_following_valid_entry(mcp_client: TestClient):
