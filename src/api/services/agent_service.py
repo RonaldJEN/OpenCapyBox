@@ -380,6 +380,7 @@ class AgentService:
             supports_image=model_config.supports_image,
             max_images=model_config.max_images,
             vision_fallback=self._vision_fallback,
+            tool_output_truncation_bytes=model_config.tool_output_truncation_bytes,
             build_metadata=tool_build_metadata,
             workspace_access=self.workspace_access,
             workspace_actor=self.workspace_actor,

@@ -369,6 +369,7 @@ class MockModelConfig:
         self.max_images = max_images
         self.supports_video = supports_video
         self.max_videos = max_videos
+        self.tool_output_truncation_bytes = 42667
         self.provider = "openai"
         self.supports_reasoning_control = False
         self.supported_reasoning_efforts = []

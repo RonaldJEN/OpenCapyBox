@@ -16,6 +16,7 @@ from src.agent.tools.sandbox_file_tools import (
     SandboxReadTool,
     SandboxReadImageTool,
 )
+from src.agent.context_compaction import DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES
 from src.agent.tools.apply_patch_tool import SandboxApplyPatchTool
 from src.agent.tools.present_files_tool import SandboxPresentFilesTool
 from src.agent.tools.sandbox_bash_tool import (
@@ -154,6 +155,7 @@ async def create_agent_tools(
     supports_image: bool = False,
     max_images: int = 0,
     vision_fallback: VisionFallbackService | None = None,
+    tool_output_truncation_bytes: int = DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES,
     build_metadata: dict[str, object] | None = None,
     workspace_access: str = "manage",
     workspace_actor: str = "chat",
@@ -202,6 +204,7 @@ async def create_agent_tools(
             supports_image=supports_image,
             max_images=max_images,
             vision_fallback=vision_fallback,
+            tool_output_truncation_bytes=tool_output_truncation_bytes,
         )),
         ("SandboxApplyPatchTool", lambda: SandboxApplyPatchTool(
             sandbox=sandbox,
@@ -251,6 +254,10 @@ async def create_agent_tools(
 
     if workspace_actor != "chat":
         exclude.add("SandboxPresentFilesTool")
+    # 主模型不能看图且没有视觉挂件：read_image_file 什么都读不了，不暴露给模型，
+    # 否则它会收到一份"最多 0 张"的自相矛盾定义。
+    if not (supports_image and max_images > 0) and vision_fallback is None:
+        exclude.add("SandboxReadImageTool")
 
     workspace_tool_kwargs = {
         "db_session_factory": db_session_factory,

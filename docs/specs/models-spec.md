@@ -178,8 +178,8 @@
 
 - `vision_fallback_model_id` 不是"某个场景的默认主模型"，而是辅助角色：主模型不支持图片时只把看图这一步交给它，结果以文字交回主模型，主模型、推理设置和上下文都不变。主模型支持图片时完全不经过挂件。
 - `ModelRegistry.get_vision_fallback()` 返回挂件 `ModelConfig` 或 `None`。`validate_on_startup()` 发现挂件模型不存在、已停用（含 API key 缺失被自动停用）或不支持图片时，记录 WARNING 并关闭挂件，行为回到"不支持图片输入"，不阻断启动。
-- 消费方：Web 会话、Cron、Subagent 的 Agent 在构建时按主模型能力决定是否持有挂件（`AgentService._vision_fallback`）；挂件同时服务用户上传图片（见 `chat-spec`）与 `read_image_file`（见 `sandbox-spec`）。
-- 系统基座 prompt 固定在 `src/api/services/vision_fallback_service.py`：只转述可见内容、文字逐字转录、表格转 Markdown、图表写明坐标轴与数值、看不清标注"（不确定）"、中文、不超过 2000 字。
+- 消费方：Web 会话、Cron、Subagent 的 Agent 在构建时按主模型能力决定是否持有挂件（`AgentService._vision_fallback`）；挂件同时服务用户上传图片与 `read_image_file`（均见 `chat-spec`）。
+- 系统基座 prompt 固定在 `src/api/services/vision_fallback_service.py`：只转述可见内容、文字逐字转录、表格转 Markdown、图表写明坐标轴与系列且数据点以"类别 / 系列 / 数值"三列 Markdown 表格列出（读不出写"（不确定）"，不得按趋势推算补齐）、看不清标注"（不确定）"、中文、每张图片不超过 2000 字。
 - 挂件调用以单次非流式请求发出，不带工具，沿用该模型自身的推理与重试配置（调用期间清空 `current_run_context`，主模型本轮的思考开关 / 推理等级不传给挂件）；每次调用写 INFO 日志（模型、图片数、token 用量、耗时）。用户上传图片发生在 Round 创建前，无法写入 `llm_call_records`（`round_id` 外键），因此挂件调用统一不写该表。
 
 ### Fallback 机制

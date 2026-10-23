@@ -25,6 +25,10 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from opensandbox import Sandbox
 
+from ..context_compaction import (
+    DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES,
+    tool_output_byte_budget,
+)
 from .base import Tool, ToolResult
 from .session_file_references import stat_session_file_reference
 
@@ -549,6 +553,15 @@ except Exception as e:
     return raw, size
 
 
+# 挂件逐图模式每张图的回答字数软上限是挂件提示词里的 VISION_ANSWER_MAX_CHARS（按纯中文 3 字节
+# 一字估算，实际回答混有数字、表格符号和换行，通常用不满），结果拼成一条工具输出后受
+# Agent 通用截断（主模型 tool_output_truncation_bytes × 1.2，中间截断并留标记）约束。工具按主模型
+# 的实际预算估算一次能读几张，再与挂件自身 max_images 取较小者；挂件的 max_images（如 20）仍是
+# 用户上传入口的上限。默认预算 42667 字节下估为 8 张，预算 10000 字节下估为 2 张；标题行和分段
+# 标签不计入，两张都写满纯中文时会被截掉末尾几十字，截断处带标记。
+VISION_FALLBACK_BYTES_PER_CHAR = 3
+
+
 class SandboxReadImageTool(Tool):
     """Read sandbox image files for the model.
 
@@ -568,11 +581,13 @@ class SandboxReadImageTool(Tool):
         vision_fallback: "VisionFallbackService | None" = None,
         max_single_image_bytes: int = MAX_SINGLE_IMAGE_BYTES,
         max_total_image_bytes: int = MAX_TOTAL_IMAGE_BYTES,
+        tool_output_truncation_bytes: int = DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES,
     ):
         self._sandbox = sandbox
         self._workspace_dir = _normalize_workspace_dir(workspace_dir)
         self._supports_image = bool(supports_image)
         self._model_max_images = int(max_images or 0)
+        self._tool_output_truncation_bytes = int(tool_output_truncation_bytes)
         # 主模型能直接看图时不走挂件
         self._vision_fallback = None if self._native_vision else vision_fallback
         self._max_single_image_bytes = max_single_image_bytes
@@ -583,26 +598,58 @@ class SandboxReadImageTool(Tool):
         return self._supports_image and self._model_max_images > 0
 
     @property
+    def _image_limit(self) -> int:
+        """一次调用最多读取的图片数：原生模式取主模型上限，挂件模式取挂件上限与输出预算允许张数的较小者。"""
+        if self._vision_fallback is None:
+            return self._model_max_images
+        from src.api.services.vision_fallback_service import VISION_ANSWER_MAX_CHARS
+
+        budget = tool_output_byte_budget(self._tool_output_truncation_bytes)
+        bytes_per_image = VISION_ANSWER_MAX_CHARS * VISION_FALLBACK_BYTES_PER_CHAR
+        return min(self._vision_fallback.config.max_images, max(1, budget // bytes_per_image))
+
+    @property
     def name(self) -> str:
         return "read_image_file"
 
     @property
     def description(self) -> str:
+        # 分辨率要求对两种模式都成立：图片像素在主模型生成图片时就已定下，工具读取时不缩放。
+        resolution = (
+            " Images are read at their stored resolution and cannot be zoomed afterwards. Make text legible "
+            "before reading: render PDF pages at 200 DPI or more (A4 ≈ 1650×2340 px), take full-size "
+            "screenshots, and crop dense regions (small print, tables, chart axes) into separate images. "
+            "Supports .png, .jpg, .jpeg, and .webp files in the current Session directory."
+        )
         if self._vision_fallback is not None:
             return (
                 "Read one or more sandbox image files. The current model cannot view images directly, "
                 "so a vision assistant reads them and returns a text answer. Put what you need from the "
                 "images (values, text, layout, state, errors) in `question`, as specifically as possible; "
-                "omit it to get full descriptions. You may call again on the same images with a different "
-                "question. Supports .png, .jpg, .jpeg, and .webp files in the current Session directory."
+                "omit it to get full descriptions. By default each image is read separately with your "
+                "question and answered per file. Set `joint` to true to have the assistant view all images "
+                "together, for comparing or relating them: before/after differences, consistency between "
+                "images, content continuing across pages, or placing a cropped region back into the full "
+                "page. You may call again on the same images with a different question."
+                f" At most {self._image_limit} images per call; split larger sets into several calls."
+                + resolution
             )
+        # 原生模式的上限是模型单次请求能带的图片数，而历史里的图片（用户上传的、之前读过的）每轮
+        # 都会重发，所以按整个对话累计；不能引导主模型"分几次读"。Agent 把同一 step 内所有工具调用
+        # 读到的图片攒在一起、step 结束时校验一次，超限则整批不注入（_flush_pending_tool_content_blocks），
+        # 文案必须说清是整个 step 的图整批丢、不是只丢超出部分。
         return (
-            "Read one or more sandbox image files and attach them to the next model request as visual context. "
-            "Supports .png, .jpg, .jpeg, and .webp files in the current Session directory."
+            "Read one or more sandbox image files and attach them to the next model request as visual context."
+            f" The model can hold at most {self._image_limit} images in the conversation in total, counting "
+            "images already uploaded or read earlier. If the images read in one step (all read_image_file calls "
+            "made together) would push the total past that limit, none of them are delivered, even though the "
+            "calls themselves succeed."
+            + resolution
         )
 
     @property
     def parameters(self) -> dict[str, Any]:
+        limit = self._image_limit
         return {
             "type": "object",
             "properties": {
@@ -613,8 +660,10 @@ class SandboxReadImageTool(Tool):
                 },
                 "max_images": {
                     "type": "integer",
-                    "description": "Maximum number of images to read from paths (default 10).",
-                    "default": 10,
+                    "description": f"Maximum number of images to read from paths (at most {limit}).",
+                    "default": limit,
+                    "minimum": 1,
+                    "maximum": limit,
                 },
                 **(
                     {
@@ -624,6 +673,14 @@ class SandboxReadImageTool(Tool):
                                 "What you want to learn from the images, answered by the vision assistant. "
                                 "Omit for full descriptions."
                             ),
+                        },
+                        "joint": {
+                            "type": "boolean",
+                            "description": (
+                                "Read all images together in one pass so the assistant can compare or relate "
+                                "them. Default false: each image is read separately and answered per file."
+                            ),
+                            "default": False,
                         },
                     }
                     if self._vision_fallback is not None
@@ -636,16 +693,10 @@ class SandboxReadImageTool(Tool):
     async def execute(
         self,
         paths: list[str],
-        max_images: int = 10,
+        max_images: int | None = None,
         question: str | None = None,
+        joint: bool = False,
     ) -> ToolResult:
-        if not self._native_vision and self._vision_fallback is None:
-            return ToolResult(
-                success=False,
-                content="",
-                error="当前模型不支持图片输入，请切换 qwen3.6-plus/kimi-2.5 等支持图片的模型。",
-            )
-
         if isinstance(paths, str):
             paths = [paths]
         if not isinstance(paths, list):
@@ -655,19 +706,12 @@ class SandboxReadImageTool(Tool):
         if not clean_paths:
             return ToolResult(success=False, content="", error="paths cannot be empty")
 
-        try:
-            requested_max = int(max_images or 10)
-        except Exception:
-            requested_max = 10
+        limit = self._image_limit
+        requested_max = limit if max_images is None else int(max_images)
         if requested_max <= 0:
             return ToolResult(success=False, content="", error="max_images must be greater than 0")
 
-        model_max_images = (
-            self._model_max_images
-            if self._vision_fallback is None
-            else self._vision_fallback.config.max_images
-        )
-        allowed_count = min(requested_max, model_max_images)
+        allowed_count = min(requested_max, limit)
         if len(clean_paths) > allowed_count:
             return ToolResult(
                 success=False,
@@ -740,23 +784,61 @@ class SandboxReadImageTool(Tool):
             read_summaries.append(f"- {raw_path} ({mime_type}, {size} bytes)")
 
         if self._vision_fallback is not None:
-            from src.api.services.vision_fallback_service import VisionImage
-
-            images = [
-                VisionImage(name=block["file"]["name"], data_url=block["image_url"]["url"])
-                for block in content_blocks
-            ]
-            answer = await self._vision_fallback.answer(images, question)
-            names = ", ".join(image.name for image in images)
-            content = (
-                f"[视觉助手 {self._vision_fallback.config.display_name} 读取了 {len(images)} 张图片：{names}]\n"
-                f"[问题] {question or '（完整描述）'}\n"
-                f"[回答]\n{answer}"
-            )
-            return ToolResult(success=True, content=content)
+            return await self._answer_with_vision_fallback(content_blocks, question, joint)
 
         content = "已读取图片并加入下一轮模型视觉上下文：\n" + "\n".join(read_summaries)
         return ToolResult(success=True, content=content, content_blocks=content_blocks)
+
+    async def _answer_with_vision_fallback(
+        self,
+        content_blocks: list[dict[str, Any]],
+        question: str | None,
+        joint: bool,
+    ) -> ToolResult:
+        from src.api.services.vision_fallback_service import VisionFallbackError, VisionImage
+
+        vision = self._vision_fallback
+        # 用请求里的路径而不是 basename 标识每张图：不同目录下的同名文件（q1/page.png、
+        # q2/page.png）在分段标题和失败归属里必须能区分，主模型才能只重读失败的那一个。
+        images = [
+            VisionImage(name=block["file"]["path"], data_url=block["image_url"]["url"])
+            for block in content_blocks
+        ]
+        names = ", ".join(image.name for image in images)
+        header = (
+            f"[视觉助手 {vision.config.display_name} 读取了 {len(images)} 张图片：{names}]\n"
+            f"[问题] {question or '（完整描述）'}\n"
+        )
+        if joint or len(images) == 1:
+            answer = await vision.answer(images, question)
+            return ToolResult(success=True, content=f"{header}[回答]\n{answer}")
+
+        # 逐图并发：每张图独享输出预算，互不串扰；一张失败不丢其他图的结果，
+        # 失败原因放 error、成功部分放 content，主模型只需重读失败的文件。
+        results = await asyncio.gather(
+            *(vision.answer([image], question) for image in images),
+            return_exceptions=True,
+        )
+        # 只收挂件自己的失败；其他异常是代码问题，原样抛给 Agent 的通用工具异常路径。
+        # 同时出现多个时只能抛一个，其余先记日志，根因不能无声消失。
+        code_errors = [
+            result for result in results
+            if isinstance(result, BaseException) and not isinstance(result, VisionFallbackError)
+        ]
+        if code_errors:
+            for extra in code_errors[1:]:
+                logger.error("read_image_file 逐图调用另有异常", exc_info=extra)
+            raise code_errors[0]
+        sections = [
+            f"[回答 {image.name}]\n{answer}"
+            for image, answer in zip(images, results)
+            if not isinstance(answer, VisionFallbackError)
+        ]
+        failures = [str(exc) for exc in results if isinstance(exc, VisionFallbackError)]
+        content = header + "\n".join(sections) if sections else ""
+        if failures:
+            return ToolResult(success=False, content=content, error="\n".join(failures))
+        return ToolResult(success=True, content=content)
 
 
 class SandboxReadTool(Tool):

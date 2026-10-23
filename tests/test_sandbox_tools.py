@@ -29,6 +29,7 @@ from src.agent.tools.sandbox_file_tools import (
     SandboxWriteTool,
     SandboxEditTool,
 )
+from src.api.services.vision_fallback_service import VisionFallbackError
 from src.agent.tools.sandbox_note_tool import (
     SandboxSessionNoteTool,
     SandboxRecallNoteTool,
@@ -1005,6 +1006,26 @@ class TestSandboxReadImageTool:
         assert tool.name == "read_image_file"
         assert "paths" in tool.parameters.get("properties", {})
 
+    def test_description_tells_model_limit_and_resolution_upfront(self, mock_sandbox):
+        """主模型读图前就要知道上限和页面要渲染到多少像素，不靠撞报错学习。
+
+        原生模式的上限按整个对话累计（历史图片每轮重发），不能写"分几次读"：
+        Agent 对超限的那批整批不注入，而工具已报成功。
+        """
+        tool = SandboxReadImageTool(mock_sandbox, supports_image=True, max_images=5)
+
+        assert "at most 5 images in the conversation in total" in tool.description
+        assert "images read in one step" in tool.description
+        assert "none of them are delivered" in tool.description
+        assert "split larger sets" not in tool.description
+        assert "200 DPI" in tool.description
+        max_images = tool.parameters["properties"]["max_images"]
+        assert max_images["default"] == 5
+        assert max_images["minimum"] == 1
+        assert max_images["maximum"] == 5
+        assert "question" not in tool.parameters["properties"]
+        assert "joint" not in tool.parameters["properties"]
+
     @pytest.mark.asyncio
     async def test_read_image_success_returns_content_blocks(self, mock_sandbox):
         raw = b"\x89PNG\r\n\x1a\n"
@@ -1029,14 +1050,6 @@ class TestSandboxReadImageTool:
         assert result.content_blocks[0]["file"]["path"] == "chart.png"
 
     @pytest.mark.asyncio
-    async def test_read_image_non_visual_model(self, mock_sandbox):
-        tool = SandboxReadImageTool(mock_sandbox, supports_image=False, max_images=0)
-        result = await tool.execute(paths=["chart.png"])
-
-        assert result.success is False
-        assert "不支持图片输入" in (result.error or "")
-
-    @pytest.mark.asyncio
     async def test_read_image_rejects_unsupported_extension(self, mock_sandbox):
         tool = SandboxReadImageTool(mock_sandbox, supports_image=True, max_images=5)
         result = await tool.execute(paths=["notes.txt"])
@@ -1051,6 +1064,22 @@ class TestSandboxReadImageTool:
 
         assert result.success is False
         assert "最多读取 1 张图片" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_zero_max_images_is_rejected_not_treated_as_default(self, mock_sandbox):
+        tool = SandboxReadImageTool(mock_sandbox, supports_image=True, max_images=5)
+        result = await tool.execute(paths=["a.png"], max_images=0)
+
+        assert result.success is False
+        assert result.error == "max_images must be greater than 0"
+
+    @pytest.mark.asyncio
+    async def test_explicit_max_images_tightens_the_limit(self, mock_sandbox):
+        tool = SandboxReadImageTool(mock_sandbox, supports_image=True, max_images=5)
+        result = await tool.execute(paths=["a.png", "b.png"], max_images=1)
+
+        assert result.success is False
+        assert "最多读取 1 张图片，当前请求 2 张" in (result.error or "")
 
     @pytest.mark.asyncio
     async def test_read_image_rejects_data_url_over_single_limit(self, mock_sandbox):
@@ -1113,6 +1142,31 @@ class TestSandboxReadImageToolVisionFallback:
 
         assert "question" in tool.parameters["properties"]
         assert "vision assistant" in tool.description
+        assert tool.parameters["properties"]["joint"]["default"] is False
+        assert "`joint`" in tool.description
+        assert "At most 3 images per call" in tool.description
+        assert tool.parameters["properties"]["max_images"]["maximum"] == 3
+
+    @pytest.mark.parametrize(
+        ("truncation_bytes", "expected_limit"),
+        [
+            (42667, 8),   # 默认预算 ×1.2 ≈ 51 KB，每张 6 KB
+            (10000, 2),   # 开发库文本模型的实际预算：12 KB
+            (1000, 1),    # 再小也至少能读一张
+        ],
+    )
+    def test_fallback_limit_follows_main_model_output_budget(self, mock_sandbox, truncation_bytes, expected_limit):
+        """挂件允许 20 张，但逐图输出受主模型工具输出预算约束：上限按预算算出，不引导主模型一次读到被截断。"""
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            supports_image=False,
+            vision_fallback=_vision_fallback(AsyncMock(), max_images=20),
+            tool_output_truncation_bytes=truncation_bytes,
+        )
+
+        assert f"At most {expected_limit} images per call" in tool.description
+        assert tool.parameters["properties"]["max_images"]["default"] == expected_limit
+        assert tool.parameters["properties"]["max_images"]["maximum"] == expected_limit
 
     @pytest.mark.asyncio
     async def test_question_is_answered_by_vision_fallback(self, mock_sandbox):
@@ -1154,6 +1208,165 @@ class TestSandboxReadImageToolVisionFallback:
 
         assert "[问题] （完整描述）" in result.content
         assert answer.await_args.args[1] is None
+
+    @pytest.mark.asyncio
+    async def test_multiple_images_are_read_one_by_one_in_path_order(self, mock_sandbox):
+        """默认逐图：每张图单独带问题调用一次，结果按 paths 顺序分段，每张独享输出预算。"""
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=_png_payload()))
+        texts = {"a.png": "A 页全文", "b.png": "B 页全文"}
+        answer = AsyncMock(side_effect=lambda images, question: texts[images[0].name])
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=False,
+            vision_fallback=_vision_fallback(answer),
+        )
+
+        result = await tool.execute(paths=["a.png", "b.png"], question="逐字转写")
+
+        assert result.success is True
+        assert result.content == (
+            "[视觉助手 视觉模型 读取了 2 张图片：a.png, b.png]\n"
+            "[问题] 逐字转写\n"
+            "[回答 a.png]\nA 页全文\n"
+            "[回答 b.png]\nB 页全文"
+        )
+        assert answer.await_count == 2
+        for call in answer.await_args_list:
+            images, question = call.args
+            assert len(images) == 1
+            assert question == "逐字转写"
+
+    @pytest.mark.asyncio
+    async def test_joint_reads_all_images_in_one_call(self, mock_sandbox):
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=_png_payload()))
+        answer = AsyncMock(return_value="改后多了一个弹窗")
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=False,
+            vision_fallback=_vision_fallback(answer),
+        )
+
+        result = await tool.execute(paths=["before.png", "after.png"], question="对比差异", joint=True)
+
+        assert result.success is True
+        assert result.content.endswith("[回答]\n改后多了一个弹窗")
+        assert answer.await_count == 1
+        assert [image.name for image in answer.await_args.args[0]] == ["before.png", "after.png"]
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_keeps_successful_sections(self, mock_sandbox):
+        """逐图模式一张失败：error 说明失败的图，content 保留成功部分，主模型只需重读失败的文件。"""
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=_png_payload()))
+
+        async def answer_one(images, question):
+            if images[0].name == "b.png":
+                raise VisionFallbackError("视觉助手 视觉模型 识别图片 b.png 失败：TimeoutError: read timed out")
+            return "A 页全文"
+
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=False,
+            vision_fallback=_vision_fallback(AsyncMock(side_effect=answer_one)),
+        )
+
+        result = await tool.execute(paths=["a.png", "b.png"], question="逐字转写")
+
+        assert result.success is False
+        assert result.error == "视觉助手 视觉模型 识别图片 b.png 失败：TimeoutError: read timed out"
+        assert "[回答 a.png]\nA 页全文" in result.content
+        assert "[回答 b.png]" not in result.content
+
+    @pytest.mark.asyncio
+    async def test_non_vision_exception_propagates_instead_of_becoming_error_text(self, mock_sandbox):
+        """逐图模式只把挂件失败收进 error；代码问题原样抛出，交给 Agent 的通用工具异常路径。"""
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=_png_payload()))
+
+        async def answer_one(images, question):
+            if images[0].name == "b.png":
+                raise RuntimeError("bug in response handling")
+            return "A 页全文"
+
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=False,
+            vision_fallback=_vision_fallback(AsyncMock(side_effect=answer_one)),
+        )
+
+        with pytest.raises(RuntimeError, match="bug in response handling"):
+            await tool.execute(paths=["a.png", "b.png"], question="逐字转写")
+
+    @pytest.mark.asyncio
+    async def test_all_images_failing_returns_only_errors_in_order(self, mock_sandbox):
+        """逐图模式全部失败：content 为空，error 按 paths 顺序拼接每张图的失败原因。"""
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=_png_payload()))
+
+        async def answer_one(images, question):
+            raise VisionFallbackError(f"视觉助手 视觉模型 识别图片 {images[0].name} 失败：超时")
+
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=False,
+            vision_fallback=_vision_fallback(AsyncMock(side_effect=answer_one)),
+        )
+
+        result = await tool.execute(paths=["a.png", "b.png"], question="逐字转写")
+
+        assert result.success is False
+        assert result.content == ""
+        assert result.error == (
+            "视觉助手 视觉模型 识别图片 a.png 失败：超时\n"
+            "视觉助手 视觉模型 识别图片 b.png 失败：超时"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sections_and_failures_are_named_by_requested_path(self, mock_sandbox):
+        """不同目录下的同名文件按请求路径区分，主模型才知道该重读哪一个。"""
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=_png_payload()))
+
+        async def answer_one(images, question):
+            if images[0].name == "q2/page.png":
+                raise VisionFallbackError(f"视觉助手 视觉模型 识别图片 {images[0].name} 失败：超时")
+            return "第一季度页"
+
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=False,
+            vision_fallback=_vision_fallback(AsyncMock(side_effect=answer_one)),
+        )
+
+        result = await tool.execute(paths=["q1/page.png", "q2/page.png"], question="逐字转写")
+
+        assert result.success is False
+        assert "[回答 q1/page.png]\n第一季度页" in result.content
+        assert result.error == "视觉助手 视觉模型 识别图片 q2/page.png 失败：超时"
+
+    @pytest.mark.asyncio
+    async def test_multiple_code_errors_are_all_logged_before_raising(self, mock_sandbox, caplog):
+        """多张图各自抛出不同代码异常时只能抛一个，其余必须进日志，不能无声丢失。"""
+        mock_sandbox.commands.run = AsyncMock(return_value=make_fake_execution(stdout_text=_png_payload()))
+
+        async def answer_one(images, question):
+            if images[0].name == "a.png":
+                raise RuntimeError("parse bug")
+            raise KeyError("missing field")
+
+        tool = SandboxReadImageTool(
+            mock_sandbox,
+            workspace_dir="/home/user/sessions/s1",
+            supports_image=False,
+            vision_fallback=_vision_fallback(AsyncMock(side_effect=answer_one)),
+        )
+
+        with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="parse bug"):
+            await tool.execute(paths=["a.png", "b.png"], question="逐字转写")
+
+        assert "missing field" in caplog.text
 
 # ============== SandboxWriteTool ==============
 

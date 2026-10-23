@@ -59,7 +59,8 @@ class TestAgentServiceCreateTools:
 
         tool_names = [t.name for t in tools]
         assert "read_file" in tool_names
-        assert "read_image_file" in tool_names
+        # 文本模型且没有视觉挂件：什么都读不了，不暴露给模型。
+        assert "read_image_file" not in tool_names
         assert "apply_patch" in tool_names
         assert "present_files" in tool_names
         assert "write_file" not in tool_names
@@ -148,6 +149,33 @@ class TestAgentServiceCreateTools:
         image_tool = next(t for t in tools if t.name == "read_image_file")
         assert image_tool._supports_image is True
         assert image_tool._model_max_images == 3
+
+    @pytest.mark.asyncio
+    async def test_create_tools_exposes_image_tool_for_text_model_only_with_vision_fallback(self, service):
+        from unittest.mock import MagicMock
+        fallback = MagicMock()
+        fallback.config.max_images = 4
+        with patch("src.api.services.tool_factory.settings") as mock_settings:
+            mock_settings.bocha_search_appcode = None
+            mock_settings.skills_dir = ""
+            from src.api.services.tool_factory import create_agent_tools
+            from src.api.services.sandbox_service import get_sandbox_mount_path
+            tools, _ = await create_agent_tools(
+                sandbox=service.sandbox,
+                workspace_dir=service._workspace_dir,
+                mount=get_sandbox_mount_path(),
+                user_id=service.user_id,
+                db_session_factory=service._get_db_session_factory(),
+                supports_image=False,
+                max_images=0,
+                vision_fallback=fallback,
+                tool_output_truncation_bytes=10000,
+            )
+
+        image_tool = next(t for t in tools if t.name == "read_image_file")
+        # 挂件允许 4 张，但主模型 10000 字节的输出预算只放得下 2 张
+        assert image_tool.parameters["properties"]["max_images"]["maximum"] == 2
+        assert "At most 2 images per call" in image_tool.description
 
     @pytest.mark.asyncio
     async def test_partial_mcp_catalog_does_not_request_immediate_agent_retry(
@@ -1622,6 +1650,7 @@ class TestAgentServiceInitializeAgent:
             max_videos=0,
             context_window=128000,
             max_tokens=4096,
+            tool_output_truncation_bytes=42667,
             compute_token_limit=lambda: 50000,
         )
         registry = MagicMock()
@@ -1653,6 +1682,29 @@ class TestAgentServiceInitializeAgent:
                     MockAgent.return_value = MagicMock()
                     await service.initialize_agent()
                     assert service.agent is not None
+
+    @pytest.mark.asyncio
+    async def test_initialize_agent_passes_main_model_output_budget_to_tools(self, service):
+        """read_image_file 按主模型的工具输出预算算张数，预算必须从主模型配置透传到工具工厂。"""
+        service._provision_default_files_if_needed = MagicMock()
+        service._load_system_prompt = MagicMock(return_value="system")
+        service._restore_history = MagicMock()
+
+        with patch("src.api.services.agent_service.settings") as mock_settings, patch(
+            "src.api.services.agent_service.create_agent_tools",
+            new_callable=AsyncMock,
+            return_value=([], MagicMock()),
+        ) as mock_create_tools, patch("src.api.services.agent_service.LLMClient") as MockLLM, patch(
+            "src.api.services.agent_service.Agent"
+        ):
+            mock_settings.agent_max_steps = 10
+            mock_settings.agent_tool_timeout = 300
+            mock_settings.agent_subagent_max_parallel = 1
+            MockLLM.from_model_config.return_value = MagicMock()
+
+            await service.initialize_agent()
+
+        assert mock_create_tools.call_args.kwargs["tool_output_truncation_bytes"] == 42667
 
     @pytest.mark.asyncio
     async def test_runtime_skill_metadata_survives_refresh_failure(self, service):
@@ -1738,6 +1790,7 @@ class TestAgentServiceInitializeAgent:
                 max_videos=max_videos,
                 context_window=128000,
                 max_tokens=4096,
+                tool_output_truncation_bytes=42667,
                 compute_token_limit=lambda: 50000,
             )
 

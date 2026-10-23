@@ -101,10 +101,13 @@ def truncate_middle_tokens(value: str, max_tokens: int) -> str:
     return f"{prefix}…{removed_tokens} tokens truncated…{suffix}"
 
 
+def tool_output_byte_budget(configured_bytes: int = DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES) -> int:
+    """Codex's record-time 1.2x serialization allowance on top of the configured tool output bytes."""
+    return int(max(configured_bytes, 0) * TOOL_OUTPUT_SERIALIZATION_HEADROOM)
+
+
 def truncate_tool_output(value: str, configured_bytes: int = DEFAULT_TOOL_OUTPUT_TRUNCATION_BYTES) -> str:
-    """Apply Codex's record-time 1.2x serialization allowance."""
-    budget = int(max(configured_bytes, 0) * TOOL_OUTPUT_SERIALIZATION_HEADROOM)
-    return truncate_middle_bytes(value, budget)
+    return truncate_middle_bytes(value, tool_output_byte_budget(configured_bytes))
 
 
 def message_text(message: Message) -> str:
